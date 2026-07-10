@@ -293,6 +293,31 @@ test('model-aware acquire skips an account exhausted for the requested Opus tier
   am.releaseAccount(sonnet);
 });
 
+// Regression (2026-07-11): the 7d_oi window also covers the Fable/Mythos family
+// (claude-fable-5 is the top tier), but modelQuotaLabel only matched "opus", so
+// Fable requests were routed as unified — straight into Fable-exhausted accounts,
+// producing a fleet-wide 429 failover loop that stalled every client.
+test('model-aware acquire treats claude-fable-5 / mythos as the 7d_oi tier', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+
+  for (const model of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-4-8[1m]']) {
+    const acct = await am.acquireAccount(null, 0, null, null, model);
+    assert.equal(acct.name, 'fable-ready', `${model} must skip the 7d_oi-exhausted account`);
+    am.releaseAccount(acct);
+  }
+
+  const haiku = await am.acquireAccount(null, 0, null, null, 'claude-haiku-4-5-20251001');
+  assert.equal(haiku.name, 'fable-full', 'non-top-tier models must not be blocked by 7d_oi');
+  am.releaseAccount(haiku);
+});
+
 // Regression (review finding): a partial header pair — 7d-reset present but
 // 7d-utilization missing/garbled — leaves a reset timestamp with no utilization.
 // The expiry sweep used to be gated on `unified7d != null`, so that stale PAST

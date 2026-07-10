@@ -5,12 +5,15 @@ function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
 }
 
-// Anthropic's `7d_oi` window is the separate Opus-tier weekly allowance.
+// Anthropic's `7d_oi` window is the top-tier weekly allowance shown as
+// "Fable" in Claude's usage UI — it covers the Opus AND Fable/Mythos model
+// families (claude-opus-*, claude-fable-*, claude-mythos-* all draw from it;
+// verified against live traffic where claude-fable-5 429s reported 7d_oi).
 // Keep the mapping in one place so selection, retry-after, and 429 handling use
 // identical semantics. Unknown/future model tiers remain on unified routing.
 export function modelQuotaLabel(model) {
   if (typeof model !== 'string') return null;
-  return /(^|[-_.])opus($|[-_.])/i.test(model) ? '7d_oi' : null;
+  return /(^|[-_.])(opus|fable|mythos)($|[-_.\d])/i.test(model) ? '7d_oi' : null;
 }
 
 function emptyQuota() {

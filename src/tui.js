@@ -114,11 +114,12 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, onQuit }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
+    this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
     this.onQuit = onQuit;
 
     this.log = [];           // completed activity entries
@@ -362,6 +363,29 @@ export class TUI {
       }
     } catch (e) {
       this._addLog(`Sync failed: ${e.message}`);
+    }
+    // Reload also re-measures the WHOLE fleet's quota, not just the account
+    // list: the displayed usage drifts silently (spend from other devices or
+    // sessions never flows through this proxy), so R doubles as a "give me
+    // fresh numbers now" action. Runs after the config sync so probes use any
+    // just-refreshed credentials.
+    if (this.refreshQuota) {
+      try {
+        this._addLog('Re-measuring quota for all accounts...');
+        const r = await this.refreshQuota();
+        if (r === -1 || r == null) {
+          this._addLog('Quota refresh skipped — no request has flowed through the proxy yet');
+        } else if (r.measured === r.targets) {
+          this._addLog(`Quota re-measured for all ${r.measured} account(s)`);
+        } else {
+          // Honest partial result — some probes were skipped (expired token
+          // that would not refresh, auth error) or failed. Never report a
+          // blanket success while accounts silently kept stale numbers.
+          this._addLog(`Quota re-measured for ${r.measured}/${r.targets} account(s) — the rest failed or were skipped`);
+        }
+      } catch (e) {
+        this._addLog(`Quota refresh failed: ${e.message}`);
+      }
     }
   }
 
