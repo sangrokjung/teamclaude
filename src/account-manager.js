@@ -5,6 +5,14 @@ function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
 }
 
+// Anthropic's `7d_oi` window is the separate Opus-tier weekly allowance.
+// Keep the mapping in one place so selection, retry-after, and 429 handling use
+// identical semantics. Unknown/future model tiers remain on unified routing.
+export function modelQuotaLabel(model) {
+  if (typeof model !== 'string') return null;
+  return /(^|[-_.])opus($|[-_.])/i.test(model) ? '7d_oi' : null;
+}
+
 function emptyQuota() {
   return {
     // Standard API rate limits (API key accounts)
@@ -22,9 +30,9 @@ function emptyQuota() {
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
     // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
-    // being tracked without a code change. Display-only: it never feeds
-    // availability, because an account over its Fable weekly limit still
-    // serves every other model.
+    // being tracked without a code change. Selection consults this only when
+    // the incoming request belongs to the matching model tier, so an account
+    // over its Opus limit remains available to Sonnet/Haiku.
     modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
     resetsAt: null,        // soonest standard reset (session-order fallback)
     // Token and request windows can reset at DIFFERENT times; tracked separately
@@ -122,7 +130,7 @@ export class AccountManager {
    * otherwise be wasted) is consumed first, starting with the scarcer weekly
    * window. Returns null if every account is exhausted.
    */
-  getActiveAccount(exclude = null) {
+  getActiveAccount(exclude = null, model = null) {
     const now = Date.now();
 
     // Per-request failover: a prior account already returned a non-quota 429
@@ -131,7 +139,7 @@ export class AccountManager {
     // — this diverts only the overflow of one request; steady-state selection
     // still prefers the use-or-lose primary, keeping its prompt cache warm.
     // Returns null once every available account has been tried this request.
-    if (exclude && exclude.size) return this._selectBest(exclude);
+    if (exclude && exclude.size) return this._selectBest(exclude, model);
 
     const current = this.accounts[this.currentIndex];
 
@@ -141,7 +149,7 @@ export class AccountManager {
     // means a concurrent startup burst of any size spreads evenly instead of
     // hammering one unknown-quota account. Only once all are measured does the
     // use-or-lose priority below take over — with complete data.
-    const warmup = this._nextWarmup();
+    const warmup = this._nextWarmup(model);
     if (warmup) {
       if (warmup.index !== this.currentIndex) {
         console.log(`[TeamClaude] Warm-up: measuring account "${warmup.name}"`);
@@ -150,8 +158,8 @@ export class AccountManager {
       return warmup;
     }
 
-    if (!this._isAvailable(current)) {
-      const best = this._selectBest();
+    if (!this._isAvailable(current, model)) {
+      const best = this._selectBest(null, model);
       if (best) {
         if (best.index !== this.currentIndex) {
           console.log(`[TeamClaude] Switched to account "${best.name}" (current unavailable)`);
@@ -168,7 +176,7 @@ export class AccountManager {
     // failover — no timer-driven switching.
     if (this.reevalIntervalMs > 0 && now - this.lastEvalAt >= this.reevalIntervalMs) {
       this.lastEvalAt = now;
-      const best = this._selectBest();
+      const best = this._selectBest(null, model);
       if (best && best.index !== this.currentIndex) {
         console.log(`[TeamClaude] Re-prioritized to account "${best.name}" (weekly reset soonest)`);
         this.currentIndex = best.index;
@@ -181,7 +189,7 @@ export class AccountManager {
     // to an unknown-quota account — so a cold-start burst stays spread even
     // after per-account warm-up attempts are exhausted.
     if (!this._isMeasured(current)) {
-      const best = this._selectBest();
+      const best = this._selectBest(null, model);
       if (best) {
         this.currentIndex = best.index;
         return best;
@@ -225,25 +233,25 @@ export class AccountManager {
    * re-index, so an exclude/capped set captured before the request awaits
    * upstream can't later point at the wrong account.
    */
-  _cappedSet(exclude = null) {
+  _cappedSet(exclude = null, model = null) {
     const capped = new Set();
     for (const a of this.accounts) {
       if (exclude && exclude.has(a)) continue;
-      if (this._isAvailable(a) && !this._hasCapacity(a)) capped.add(a);
+      if (this._isAvailable(a, model) && !this._hasCapacity(a)) capped.add(a);
     }
     return capped;
   }
 
   /** Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.) */
-  anyUsable(exclude = null) {
+  anyUsable(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
   }
 
   /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) */
-  anyCapped(exclude = null) {
+  anyCapped(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
   }
 
   /**
@@ -257,7 +265,7 @@ export class AccountManager {
    * Single-threaded JS keeps this race-free: there is no await between selecting
    * the account and the inflight++ that reserves its slot.
    */
-  _tryAcquire(exclude = null, affinityKey = null) {
+  _tryAcquire(exclude = null, affinityKey = null, model = null) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
     const affOk = affinityKey != null
@@ -273,7 +281,7 @@ export class AccountManager {
     // normal selection. So it never exceeds a cap, revives an exhausted account,
     // or disturbs use-or-lose for new connections. (`accounts[idx] === a` rejects
     // a stale entry left by a removeAccount that re-indexed the array.)
-    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc))) {
+    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
       const a = this._affinity.get(affinityKey);
       // Require the home to be MEASURED — not just past its warm-up tries. A
       // headerless account stays unmeasured forever; pinning a connection to it
@@ -281,22 +289,22 @@ export class AccountManager {
       // spreading to gather quota data / let tokens refresh on use). Once an
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
-      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a)
+      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model)
           && this._hasCapacity(a) && !(exclude && exclude.has(a))) {
         a.inflight++;
         return a;
       }
     }
 
-    const capped = this._cappedSet(exclude);
+    const capped = this._cappedSet(exclude, model);
     const eff = ((exclude && exclude.size) || capped.size)
       ? new Set([...(exclude || []), ...capped])
       : null;
     // eff === null → full sticky / warm-up path (cold start, nothing capped).
     // eff set → getActiveAccount routes to _selectBest(eff), which already skips
     // every excluded + capped account.
-    const account = eff ? this.getActiveAccount(eff) : this.getActiveAccount();
-    if (account && this._isAvailable(account) && this._hasCapacity(account)
+    const account = eff ? this.getActiveAccount(eff, model) : this.getActiveAccount(null, model);
+    if (account && this._isAvailable(account, model) && this._hasCapacity(account)
         && !(eff && eff.has(account))) {
       account.inflight++;
       // (Re)write affinity ONLY when the connection has no still-usable home.
@@ -309,7 +317,7 @@ export class AccountManager {
       // (removed, unavailable, or exhausted — `_isAvailable` is false).
       if (affOk) {
         const home = this._affinity.get(affinityKey);
-        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home);
+        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
         if (!homeUsable) this._affinity.set(affinityKey, account);
       }
       return account;
@@ -330,16 +338,16 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
-  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null) {
+  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null, model = null) {
     if (signal?.aborted) return null;
-    const account = this._tryAcquire(exclude, affinityKey);
+    const account = this._tryAcquire(exclude, affinityKey, model);
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    if (timeoutMs <= 0 || !this.anyCapped(exclude) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs, signal, affinityKey);
+    if (timeoutMs <= 0 || !this.anyCapped(exclude, model) || this.isQueueFull()) return null;
+    return this._enqueue(exclude, timeoutMs, signal, affinityKey, model);
   }
 
   /** Is the overflow queue at its depth cap? */
@@ -367,9 +375,9 @@ export class AccountManager {
     return caps + this.maxQueueDepth;
   }
 
-  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null) {
+  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null, model = null) {
     return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey };
+      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey, model };
       waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
       // Cancel the wait if the client disconnects — otherwise an aborted request
       // would still acquire a slot later and be dispatched upstream, burning quota.
@@ -412,7 +420,7 @@ export class AccountManager {
   _drainWaiters() {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey);
+      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.model);
       if (account) {
         // _settleWaiter splices the waiter out, so don't advance i. If it was
         // already settled (shouldn't happen — settled waiters aren't in the list),
@@ -426,7 +434,7 @@ export class AccountManager {
       // releases its finite queue slot instead of blocking later, satisfiable
       // overflow requests until its timeout. A waiter that still has a cappable
       // account to hope for is left in place.
-      if (!this.anyCapped(waiter.exclude)) { this._settleWaiter(waiter, null); continue; }
+      if (!this.anyCapped(waiter.exclude, waiter.model)) { this._settleWaiter(waiter, null); continue; }
       i++;
     }
   }
@@ -442,9 +450,9 @@ export class AccountManager {
    * accounts are skipped, and when nothing else is eligible this returns null
    * (instead of recovering one) so the caller can pass the 429 through.
    */
-  _selectBest(exclude = null) {
+  _selectBest(exclude = null, model = null) {
     const has = a => (exclude ? exclude.has(a) : false);
-    const eligible = this.accounts.filter(a => this._isAvailable(a) && !has(a));
+    const eligible = this.accounts.filter(a => this._isAvailable(a, model) && !has(a));
     if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
 
     eligible.sort((a, b) => {
@@ -609,8 +617,8 @@ export class AccountManager {
    * routing anyway — ensureTokenFresh either refreshes it into a measurable
    * state or marks it `error`, which makes it unavailable here.)
    */
-  _isWarmupTarget(account) {
-    return this._isAvailable(account)
+  _isWarmupTarget(account, model = null) {
+    return this._isAvailable(account, model)
       && !this._isMeasured(account)
       && (account._warmupTries || 0) < this.maxWarmupTries;
   }
@@ -621,12 +629,12 @@ export class AccountManager {
    * counter synchronously, so concurrent calls pick different accounts even
    * before any response arrives. Returns null when no target remains.
    */
-  _nextWarmup() {
+  _nextWarmup(model = null) {
     const n = this.accounts.length;
     for (let i = 0; i < n; i++) {
       const idx = (this._warmupCursor + i) % n;
       const a = this.accounts[idx];
-      if (this._isWarmupTarget(a)) {
+      if (this._isWarmupTarget(a, model)) {
         this._warmupCursor = idx + 1;
         a._warmupTries = (a._warmupTries || 0) + 1;
         return a;
@@ -672,7 +680,7 @@ export class AccountManager {
         || Date.now() - (a._lastFruitlessProbeAt || 0) >= this.probeRetryAfterMs));
   }
 
-  _isAvailable(account) {
+  _isAvailable(account, model = null) {
     if (!account) return false;
 
     // Manually disabled accounts are out of rotation entirely. This single gate
@@ -691,12 +699,12 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
-    if (this._isNearQuota(account)) return false;
+    if (this._isNearQuota(account, model)) return false;
 
     return true;
   }
 
-  _isNearQuota(account) {
+  _isNearQuota(account, model = null) {
     const q = account.quota;
     const now = Date.now();
 
@@ -730,6 +738,11 @@ export class AccountManager {
         delete q.modelWeekly[label];
       }
     }
+
+    const modelLabel = modelQuotaLabel(model);
+    const modelWindow = modelLabel ? q.modelWeekly[modelLabel] : null;
+    if (modelWindow?.utilization != null
+        && modelWindow.utilization >= this.switchThreshold) return true;
 
     // Clear expired standard quotas — each window INDEPENDENTLY. The token and
     // request windows reset at different times; sweeping both on the collapsed
@@ -918,6 +931,17 @@ export class AccountManager {
     if (account.quota.unifiedStatus === 'rejected') return true;
     // Otherwise rely on measured utilization (unified or standard headers).
     return this._isNearQuota(account);
+  }
+
+  /** Is this account exhausted only for the requested model tier? */
+  isModelExhausted(accountIndex, model) {
+    const account = this._resolve(accountIndex);
+    const label = modelQuotaLabel(model);
+    if (!account || !label) return false;
+    // Sweep expired windows before reading the model-specific value.
+    this._isNearQuota(account);
+    const win = account.quota.modelWeekly[label];
+    return win?.utilization != null && win.utilization >= this.switchThreshold;
   }
 
   /**

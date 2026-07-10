@@ -2,6 +2,7 @@ import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isTokenExpiringSoon } from './oauth.js';
+import { modelQuotaLabel } from './account-manager.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -29,6 +30,41 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // for a session's sequential turns). Soft — overflow still spreads. Set
   // `sessionAffinity: false` to route purely by use-or-lose every request instead.
   const sessionAffinity = config.sessionAffinity !== false;
+  // Continuity mode keeps Claude Code requests inside the proxy while capacity
+  // or upstream rate limits recover, instead of surfacing a terminal-stopping
+  // 429. Unit tests can leave it off; the CLI server enables it by default.
+  const continuityMode = config.continuityMode === true;
+  const continuityMaxSleepMs = Number.isFinite(config.continuityMaxSleepMs)
+    ? Math.max(10, config.continuityMaxSleepMs)
+    : 30_000;
+  const continuityJitterMs = Number.isFinite(config.continuityJitterMs)
+    ? Math.max(0, config.continuityJitterMs)
+    : 500;
+  const rateLimitFailovers = Number.isFinite(config.rateLimitFailovers)
+    ? Math.max(0, Math.floor(config.rateLimitFailovers))
+    : 1;
+  let globalCooldownUntil = 0;
+
+  const continuity = {
+    enabled: continuityMode,
+    rateLimitFailovers,
+    maxSleepMs: continuityMaxSleepMs,
+    defer(seconds) {
+      const delay = Math.min(Math.max(1, seconds) * 1000, continuityMaxSleepMs);
+      globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + delay);
+    },
+    async waitGlobal(signal) {
+      const remaining = globalCooldownUntil - Date.now();
+      if (remaining > 0) await sleepOrAbort(remaining, signal);
+      if (remaining > 0 && !signal?.aborted && continuityJitterMs > 0) {
+        await sleepOrAbort(Math.floor(Math.random() * continuityJitterMs), signal);
+      }
+    },
+    async waitFor(seconds, signal) {
+      const delay = Math.min(Math.max(1, seconds) * 1000, continuityMaxSleepMs);
+      await sleepOrAbort(delay, signal);
+    },
+  };
   let requestCounter = 0;
   let inFlightProxied = 0; // proxied (non-status/oauth) requests currently being handled
 
@@ -290,7 +326,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null };
+        const ctx = { account: null, status: null, model: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, continuity };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -313,6 +349,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             return;
           }
           const body = Buffer.concat(bodyChunks);
+          ctx.model = extractRequestModel(body);
 
           // Stage a warm-up template from this request (no-op once committed / when
           // warm-up is off). It's COMMITTED only after forwardRequest returns a 2xx
@@ -524,15 +561,17 @@ const envInt = (name, def) => {
   return Number.isFinite(v) ? v : def;
 };
 
+function extractRequestModel(body) {
+  try {
+    const json = JSON.parse(body.toString());
+    return typeof json?.model === 'string' ? json.model : null;
+  } catch {
+    return null;
+  }
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
-
-  // Select account. On a failover retry (a prior account 429'd / 5xx'd for this
-  // request) ctx.tried* is non-empty → pick a different account, skipping the
-  // ones already tried.
-  const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
-    ? new Set([...ctx.tried429, ...ctx.tried5xx])
-    : null;
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
   // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
@@ -540,11 +579,44 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // at its cap (overflow queue) before giving up with a 429. Releasing this slot
   // before any account-switching retry is the caller's job, via releaseHeld().
   let account;
-  if (ctx.held != null) {
-    account = ctx.held;
-  } else {
-    account = await accountManager.acquireAccount(excludeForSelect, ctx.queueTimeoutMs, ctx.abortSignal, ctx.affinityKey);
-    if (account) ctx.held = account;
+  while (!account) {
+    if (ctx.continuity.enabled) await ctx.continuity.waitGlobal(ctx.abortSignal);
+    if (ctx.abortSignal?.aborted || res.destroyed) return;
+
+    // On a failover retry, skip accounts already tried for this request.
+    const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
+      ? new Set([...ctx.tried429, ...ctx.tried5xx])
+      : null;
+    if (ctx.held != null) {
+      account = ctx.held;
+    } else {
+      account = await accountManager.acquireAccount(
+        excludeForSelect,
+        ctx.queueTimeoutMs,
+        ctx.abortSignal,
+        ctx.affinityKey,
+        ctx.model,
+      );
+      if (account) ctx.held = account;
+    }
+
+    if (account || ctx.abortSignal?.aborted || res.destroyed) break;
+
+    const accts = accountManager.accounts;
+    const allAuthFailed = accts.length > 0 && accts.every(a => a.status === 'error');
+    const canEventuallyRecover = accts.some(a => a.enabled !== false && a.status !== 'error');
+    if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
+
+    const status = accountManager.getStatus();
+    const capped = accountManager.anyCapped(null, ctx.model);
+    const retryAfter = capped
+      ? 1
+      : computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — waiting ${Math.min(retryAfter * 1000, ctx.continuity.maxSleepMs)}ms`);
+    await ctx.continuity.waitFor(retryAfter, ctx.abortSignal);
+    ctx.tried429.clear();
+    ctx.tried5xx.clear();
+    retryCount = 0;
   }
   const releaseHeld = () => {
     if (ctx.held != null) {
@@ -577,7 +649,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     ctx.status = 429;
     const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold);
+    const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -769,6 +841,40 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Discard the 429 response body
       await upstreamRes.body?.cancel();
 
+      // A model-scoped exhaustion must only exclude this account for that model.
+      // Globally throttling it would unnecessarily remove healthy Sonnet/Haiku
+      // capacity for up to five minutes.
+      if (accountManager.isModelExhausted(account, ctx.model)) {
+        ctx.tried429.add(account);
+        console.log(`[TeamClaude] 429 (model quota exhausted) on "${account.name}" — switching for ${ctx.model}`);
+        if (!res.destroyed
+            && (accountManager.anyUsable(ctx.tried429, ctx.model)
+              || accountManager.anyCapped(ctx.tried429, ctx.model))) {
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+        releaseHeld();
+        if (ctx.continuity.enabled && !res.destroyed) {
+          const wait = computeRetryAfter(
+            accountManager.getStatus().accounts,
+            accountManager.switchThreshold,
+            ctx.model,
+          );
+          await ctx.continuity.waitFor(wait, ctx.abortSignal);
+          ctx.tried429.clear();
+          return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        }
+        ctx.status = 429;
+        if (!res.headersSent) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'rate_limit_error', message: `Model quota exhausted (retry in ${retryAfter}s).` },
+          }));
+        }
+        return;
+      }
+
       if (accountManager.isExhausted(account)) {
         // (a) Account-level exhaustion: throttle this account (so
         // getActiveAccount skips it until it resets) and immediately
@@ -787,7 +893,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // getActiveAccount returns null before this can fire. Cap anyway.
         if (retryCount >= maxRetries) {
           ctx.status = 429;
-          const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold);
+          const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold, ctx.model);
           if (!res.headersSent) {
             res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(ra) });
             res.end(JSON.stringify({
@@ -811,8 +917,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // been tried for this request (→ effectively global) is the 429 passed
       // through to the client; no account state is mutated either way.
       ctx.tried429.add(account);
-      if (!res.destroyed && retryCount < maxRetries
-          && (accountManager.anyUsable(ctx.tried429) || accountManager.anyCapped(ctx.tried429))) {
+      const failoverLimit = ctx.continuity.enabled
+        ? ctx.continuity.rateLimitFailovers
+        : maxRetries;
+      if (!res.destroyed && retryCount < maxRetries && ctx.tried429.size <= failoverLimit
+          && (accountManager.anyUsable(ctx.tried429, ctx.model)
+            || accountManager.anyCapped(ctx.tried429, ctx.model))) {
         console.log(`[TeamClaude] 429 (rate/transient) on "${account.name}" — switching account for this request`);
         if (logDir) {
           logSections.push(`=== RESPONSE 429 — rate/transient, switching account (not throttled) ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -820,6 +930,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }
         releaseHeld(); // free this account's slot before trying another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      if (ctx.continuity.enabled && !res.destroyed) {
+        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally`);
+        releaseHeld();
+        ctx.continuity.defer(retryAfter);
+        await ctx.continuity.waitGlobal(ctx.abortSignal);
+        ctx.tried429.clear();
+        ctx.tried5xx.clear();
+        return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
 
       console.log(`[TeamClaude] 429 (global) on "${account.name}" — every account tried, passing through`);
@@ -862,7 +982,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       ctx.tried5xx.add(account);
       const exclude5xx = new Set([...ctx.tried429, ...ctx.tried5xx]);
       if (!res.destroyed && retryCount < maxRetries
-          && (accountManager.anyUsable(exclude5xx) || accountManager.anyCapped(exclude5xx))) {
+          && (accountManager.anyUsable(exclude5xx, ctx.model)
+            || accountManager.anyCapped(exclude5xx, ctx.model))) {
         console.log(`[TeamClaude] ${code} on "${account.name}" — switching account for this request`);
         if (logDir) {
           logSections.push(`=== RESPONSE ${code} — transient upstream 5xx, switching account ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -1105,8 +1226,9 @@ function extractUsageFromBody(buffer, account, accountManager) {
 // whole fleet's wait at the short fallback even when every other account is
 // hours from reset. Disabled/auth-error accounts never return on a timer, so
 // they're skipped. Falls back to 60s when nothing contributes anything.
-function computeRetryAfter(accounts, threshold = 0.98) {
+function computeRetryAfter(accounts, threshold = 0.98, model = null) {
   const now = Date.now();
+  const modelLabel = modelQuotaLabel(model);
   let soonest = Infinity;
   const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
   for (const acct of accounts) {
@@ -1121,6 +1243,10 @@ function computeRetryAfter(accounts, threshold = 0.98) {
       freeAt = Math.max(freeAt, q.unified5hReset);
     if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
       freeAt = Math.max(freeAt, q.unified7dReset);
+    const modelWindow = modelLabel ? q.modelWeekly?.[modelLabel] : null;
+    if (modelWindow?.utilization != null && modelWindow.utilization >= threshold
+        && modelWindow.reset)
+      freeAt = Math.max(freeAt, modelWindow.reset);
     // Standard windows reset independently — use each window's OWN reset
     // (falling back to the collapsed resetsAt for snapshots predating the
     // split fields), so when both are binding the LATER one wins instead of

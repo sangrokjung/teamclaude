@@ -274,6 +274,25 @@ test('a model-scoped weekly limit over threshold does NOT make the account unava
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
+test('model-aware acquire skips an account exhausted for the requested Opus tier only', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'opus-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'opus-ready', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+
+  const opus = await am.acquireAccount(null, 0, null, null, 'claude-opus-4-6');
+  assert.equal(opus.name, 'opus-ready');
+  am.releaseAccount(opus);
+
+  const sonnet = await am.acquireAccount(null, 0, null, null, 'claude-sonnet-4-6');
+  assert.equal(sonnet.name, 'opus-full', 'model quota must not block other model tiers');
+  am.releaseAccount(sonnet);
+});
+
 // Regression (review finding): a partial header pair — 7d-reset present but
 // 7d-utilization missing/garbled — leaves a reset timestamp with no utilization.
 // The expiry sweep used to be gated on `unified7d != null`, so that stale PAST

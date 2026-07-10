@@ -8,6 +8,16 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
+function makeAccountsForServer(n) {
+  return Array.from({ length: n }, (_, i) => ({
+    name: `acct-${i}`,
+    type: 'oauth',
+    accessToken: `tok-${i}`,
+    refreshToken: `r-${i}`,
+    expiresAt: Date.now() + 3600_000,
+  }));
+}
+
 function startProxy(am, upstreamPort) {
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
@@ -15,6 +25,19 @@ function startProxy(am, upstreamPort) {
     activeWarmup: false, // isolate 429 failover from background warm-up probes
   });
   return proxy;
+}
+
+function startContinuityProxy(am, upstreamPort, overrides = {}) {
+  return createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: true,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 1,
+    ...overrides,
+  });
 }
 
 // An exhaustion 429 carries upstream quota signals (here: unified-status:
@@ -179,6 +202,153 @@ test('request-global 429 tries each account once then passes through, no poisoni
   } finally {
     proxy.close();
     upstream.close();
+  }
+});
+
+test('continuity mode contains a global 429 burst and recovers without surfacing it', async () => {
+  let upstreamHits = 0;
+  const recoverAt = Date.now() + 35;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    if (Date.now() < recoverAt) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ content: [] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(8), 0.98);
+  const proxy = startContinuityProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200, 'the proxy should hold and recover the request');
+    assert.ok(upstreamHits < 8, `global 429 should not sweep all accounts, got ${upstreamHits} hits`);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('continuity mode waits for quota reset instead of returning all-accounts-exhausted', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ content: [] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  am.accounts[0].quota.unified5h = 0.99;
+  am.accounts[0].quota.unified5hReset = Date.now() + 35;
+  const proxy = startContinuityProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(upstreamHits, 1, 'no upstream request should be sent before reset');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('proxy routes Opus away from an account with exhausted model-scoped quota', async () => {
+  let auth = '';
+  const upstream = http.createServer((req, res) => {
+    auth = req.headers.authorization || '';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ content: [] }));
+  });
+  const upstreamPort = await listen(upstream);
+  const accounts = makeAccountsForServer(2);
+  accounts[0].priority = 0;
+  accounts[1].priority = 1;
+  const am = new AccountManager(accounts, 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + 3600_000,
+  };
+  const proxy = startContinuityProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-opus-4-6', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.match(auth, /tok-1$/, 'Opus request should use the model-eligible account');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('client abort during continuity cooldown releases the account slot', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(429, { 'retry-after': '120', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  const proxy = startContinuityProxy(am, upstreamPort, {
+    continuityMaxSleepMs: 1000,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 0,
+  });
+  const proxyPort = await listen(proxy);
+  const ac = new AbortController();
+
+  try {
+    const pending = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      signal: ac.signal,
+    }).catch(err => err.name);
+    setTimeout(() => ac.abort(), 30);
+    assert.equal(await pending, 'AbortError');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('continuity mode does not wait forever when every account is disabled', async () => {
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  am.accounts[0].enabled = false;
+  const proxy = startContinuityProxy(am, 0);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+  } finally {
+    proxy.close();
   }
 });
 

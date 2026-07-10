@@ -83,6 +83,14 @@ export function createDefaultConfig() {
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,
+    // Keep client requests inside the proxy while quota/cooldowns recover rather
+    // than surfacing a 429 that interrupts an interactive Claude Code session.
+    continuityMode: true,
+    continuityMaxSleepMs: 30000,
+    continuityJitterMs: 500,
+    // One alternate account distinguishes a per-account rate cap from a global
+    // limit without multiplying one request across the whole fleet.
+    rateLimitFailovers: 1,
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

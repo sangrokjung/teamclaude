@@ -243,6 +243,9 @@ async function serverCommand() {
     process.exit(1);
   }
 
+  // Existing configs predate continuityMode; treat it as enabled unless the
+  // operator explicitly opts out.
+  config.continuityMode = config.continuityMode !== false;
   const server = createProxyServer(accountManager, config, hooks);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
