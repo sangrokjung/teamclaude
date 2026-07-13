@@ -91,6 +91,12 @@ export function createDefaultConfig() {
     // One alternate account distinguishes a per-account rate cap from a global
     // limit without multiplying one request across the whole fleet.
     rateLimitFailovers: 1,
+    // When the whole fleet is out of quota for a requested model, rewrite the
+    // request to these fallback models (in order) instead of surfacing the 429.
+    // Keys and targets are plain API model IDs (no "[1m]"-style suffixes); a
+    // suffixed incoming model falls back to its suffix-stripped entry.
+    // e.g. { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
+    modelFallbacks: {},
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

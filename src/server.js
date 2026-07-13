@@ -376,7 +376,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity };
+        const ctx = { account: null, status: null, model: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -626,6 +626,59 @@ function extractRequestModel(body) {
   }
 }
 
+// --- Model fallback (config.modelFallbacks) --------------------------------
+// When the whole fleet is out of quota for the REQUESTED model, the proxy can
+// rewrite the request to a configured fallback model and retry the fleet,
+// instead of surfacing a 429 that kills the client's turn:
+//   "modelFallbacks": { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
+// The chain is resolved ONCE per request from the original model (fallbacks of
+// fallbacks are not followed) and consumed in order; when it runs dry the
+// request falls through to the pre-existing 429 behavior unchanged. Lookup
+// tolerates a client-side bracket suffix ("claude-fable-5[1m]") by retrying
+// with the suffix stripped — the API itself knows no bracketed model IDs
+// (probed 2026-07-13: "claude-opus-4-8[1m]" → not_found_error), so configured
+// targets must be plain model IDs.
+function resolveModelFallbacks(modelFallbacks, model) {
+  if (!modelFallbacks || typeof modelFallbacks !== 'object' || !model) return null;
+  let chain = modelFallbacks[model];
+  if (!Array.isArray(chain)) {
+    const stripped = model.replace(/\[[^\]]*\]$/, '');
+    if (stripped !== model) chain = modelFallbacks[stripped];
+  }
+  if (!Array.isArray(chain)) return null;
+  const filtered = chain.filter(m => typeof m === 'string' && m && m !== model);
+  return filtered.length ? filtered : null;
+}
+
+// Advance to the next fallback model: returns { model, body } with the request
+// body's `model` field rewritten, or null when no fallback remains / applies.
+// Side effect: keeps req.headers' content-length honest for the rewritten body
+// (content-length is NOT hop-by-hop, so the upstream re-dispatch copies it —
+// a mismatch would make undici reject the request outright).
+function nextModelFallback(ctx, req, body) {
+  if (ctx.fallbackQueue === undefined) {
+    ctx.fallbackQueue = resolveModelFallbacks(ctx.modelFallbacks, ctx.model);
+  }
+  while (ctx.fallbackQueue && ctx.fallbackQueue.length) {
+    const next = ctx.fallbackQueue.shift();
+    if (next === ctx.model) continue;
+    let json;
+    try {
+      json = JSON.parse(body.toString());
+    } catch {
+      return null;
+    }
+    if (typeof json?.model !== 'string') return null;
+    json.model = next;
+    const newBody = Buffer.from(JSON.stringify(json));
+    if (req.headers['content-length'] != null) {
+      req.headers['content-length'] = String(newBody.length);
+    }
+    return { model: next, body: newBody };
+  }
+  return null;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
@@ -702,6 +755,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         },
       }));
       return;
+    }
+    // Fleet-wide dead end at selection time. If the REQUESTED model has no
+    // usable account (model-tier or full exhaustion — not a mere concurrency
+    // queue timeout, which must never silently change the client's model),
+    // walk the configured fallback chain before surfacing a 429.
+    if (!res.destroyed && !accountManager.anyUsable(null, ctx.model)) {
+      const fallback = nextModelFallback(ctx, req, body);
+      if (fallback) {
+        console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
+        ctx.model = fallback.model;
+        ctx.tried429.clear();
+        ctx.tried5xx.clear();
+        return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+      }
     }
     ctx.status = 429;
     const status = accountManager.getStatus();
@@ -918,6 +985,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
         releaseHeld();
+        // Every account is out of quota for THIS model tier. Before waiting on
+        // a (possibly days-away) weekly reset or surfacing a 429, walk the
+        // configured fallback chain — a rewrite to a still-served model keeps
+        // the client's turn alive.
+        {
+          const fallback = nextModelFallback(ctx, req, body);
+          if (fallback && !res.destroyed) {
+            console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (fleet exhausted for ${ctx.model})`);
+            ctx.model = fallback.model;
+            ctx.tried429.clear();
+            ctx.tried5xx.clear();
+            return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+          }
+        }
         if (ctx.continuity.enabled && !res.destroyed) {
           const wait = computeRetryAfter(
             accountManager.getStatus().accounts,
@@ -996,6 +1077,23 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
+      // Every account 429'd for this request. A fleet-wide "global" 429 is
+      // often a model-tier exhaustion upstream did not label (accounts with an
+      // unmeasured weekly window return bare 429s) — so before cooling down or
+      // passing the 429 through, walk the configured model fallback chain. A
+      // genuinely global/IP limit just 429s the fallback too and falls through
+      // to the existing behavior.
+      {
+        const fallback = nextModelFallback(ctx, req, body);
+        if (fallback && !res.destroyed) {
+          console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (every account 429'd for ${ctx.model})`);
+          releaseHeld();
+          ctx.model = fallback.model;
+          ctx.tried429.clear();
+          ctx.tried5xx.clear();
+          return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        }
+      }
       if (ctx.continuity.enabled && !res.destroyed) {
         console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally`);
         releaseHeld();
