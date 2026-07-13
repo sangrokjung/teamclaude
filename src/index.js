@@ -296,14 +296,24 @@ async function serverCommand() {
   });
 
   if (!tui) {
-    process.on('SIGINT', () => {
+    let shuttingDown = false;
+    const shutdown = () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+      const forceExit = setTimeout(() => {
+        console.error('[TeamClaude] Graceful shutdown timed out; forcing exit.');
+        server.closeAllConnections?.();
+        process.exit(0);
+      }, 5_000);
+      server.close(() => {
+        clearTimeout(forceExit);
+        process.exit(0);
+      });
+      server.closeIdleConnections?.();
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }
 
