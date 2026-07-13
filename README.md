@@ -4,6 +4,14 @@ Multi-account Claude proxy with automatic quota-based rotation for [Claude Code]
 
 Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
 
+> **This is the `qjc/resilient-routing` fork** (`1.2.0-qjc.x`) of [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), adding on top of upstream:
+>
+> - **Top-tier weekly-window model routing** — `claude-fable-*` / `claude-mythos-*` requests are mapped to the same model-scoped weekly window (`7d_oi`) as Opus, so a Fable-exhausted account is skipped for Fable/Mythos/Opus requests while still serving Sonnet/Haiku (upstream matched Opus only)
+> - **Model fallback chains (`modelFallbacks`)** — when the *whole fleet* is out of quota for the requested model, the request is rewritten to a configured fallback model and retried, instead of surfacing a 429 that kills the client's turn ([details below](#model-fallbacks-fork))
+> - **Bounded graceful shutdown** — SIGTERM/SIGINT force-exits after 5s even with live SSE/keep-alive connections, so a supervisor (launchd/systemd) can restart the proxy promptly
+>
+> Install this fork: `npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz` from a checkout of the `qjc/resilient-routing` branch (a tarball install copies files — a plain `npm install -g <dir>` symlinks, which breaks supervisors that can't read the checkout path, e.g. launchd vs. macOS `~/Documents` TCC).
+
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
 ## Features
@@ -229,6 +237,26 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
+| `modelFallbacks` | Fork only — per-model fallback chains applied when the whole fleet is out of quota for the requested model (optional, default `{}`; see below) |
+
+### Model fallbacks (fork)
+
+```json
+{
+  "modelFallbacks": {
+    "claude-fable-5": ["claude-opus-4-8"],
+    "claude-mythos-5": ["claude-opus-4-8"]
+  }
+}
+```
+
+When every account is out of quota for the *requested* model — a model-tier exhaustion (`7d_oi` at 100% fleet-wide), a selection-time dead end, or an unlabeled fleet-wide 429 — the proxy rewrites the request body's `model` to the next entry of the chain and retries the whole fleet, instead of passing the 429 through. Semantics:
+
+- The chain is resolved **once per request from the original model** (fallbacks of fallbacks are not followed) and consumed in order; when it runs dry, the pre-existing 429/continuity behavior applies unchanged.
+- Keys and targets must be **plain API model IDs**. A client-side bracket suffix (`claude-fable-5[1m]` — the API rejects such IDs as `not_found_error`) matches its suffix-stripped entry.
+- Fallback runs **before** a continuity-mode sleep on purpose: rewriting to a served model beats sleeping until a weekly reset.
+- A genuinely global/IP rate limit just 429s the fallback model too and falls through to the old behavior — no state is poisoned.
+- Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
 
 ## How It Works
 
@@ -240,6 +268,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 6. On a 429 the proxy classifies it:
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. If the limit appears global, continuity mode opens a shared cooldown and retries internally instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
+   - **Fleet-wide dead end for the requested model** (fork) → if a `modelFallbacks` chain is configured for that model, the request is rewritten to the next fallback model and retried across the fleet before any 429 is surfaced or any continuity sleep starts.
 7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
 8. If all accounts are exhausted, continuity mode holds the request and polls using the computed account/model reset time. Setting `continuityMode: false` restores the legacy 429 response with `retry-after`.
 9. **Quota survives restarts**: the server snapshots per-account quota/throttle state to `<config>.quota.json` (every minute and on exit) and restores it at startup, so a restart doesn't blank the dashboard or blind the use-or-lose ordering; expired windows are swept lazily and re-measured from live traffic
