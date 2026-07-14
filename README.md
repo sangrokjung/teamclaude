@@ -9,6 +9,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 > - **Top-tier weekly-window model routing** — `claude-fable-*` / `claude-mythos-*` requests are mapped to the model-scoped weekly window (`7d_oi`), so a Fable-exhausted account is skipped for those tiers while Opus remains available as the configured fallback
 > - **Model fallback chains (`modelFallbacks`)** — when the *whole fleet* is out of quota for the requested model, the request is rewritten to a configured fallback model and retried, instead of surfacing a 429 that kills the client's turn ([details below](#model-fallbacks-fork))
 > - **Bounded graceful shutdown** — SIGTERM/SIGINT force-exits after 5s even with live SSE/keep-alive connections, so a supervisor (launchd/systemd) can restart the proxy promptly
+> - **Network-error failover** — a pre-stream transient network error (`fetch failed`, `ECONNRESET`, …) fails the request over to another account instead of dropping the client connection (which surfaced as "Response stalled mid-stream" in Claude Code); mid-stream errors still close the connection since a partial response is not replayable
 >
 > Install this fork: `npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz` from a checkout of the `qjc/resilient-routing` branch (a tarball install copies files — a plain `npm install -g <dir>` symlinks, which breaks supervisors that can't read the checkout path, e.g. launchd vs. macOS `~/Documents` TCC).
 

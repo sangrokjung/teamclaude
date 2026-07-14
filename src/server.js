@@ -1262,8 +1262,24 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
         err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
 
-    // Transient network errors: just close the connection and let the client retry
+    // Transient network errors. Before any response bytes went out the request
+    // body is still buffered, so fail over to another account exactly like a
+    // 5xx — a per-connection blip (half-dead keep-alive, one flaky route) is
+    // often account-path-local, and destroying the client here surfaces as
+    // "Response stalled mid-stream" in Claude Code for no good reason. The
+    // account is NOT marked 'error' (a network blip is not a bad credential);
+    // exclusion is per-request via tried5xx. Mid-stream (headers already sent,
+    // partial data delivered) is not replayable — close so the client retries.
     if (isTransient) {
+      if (!res.headersSent && !res.destroyed && retryCount < maxRetries) {
+        ctx.tried5xx.add(account);
+        if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
+          || accountManager.anyCapped(ctx.tried5xx, ctx.model)) {
+          console.log(`[TeamClaude] Network error on "${account.name}" — switching account for this request`);
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+      }
       res.destroy();
       return;
     }

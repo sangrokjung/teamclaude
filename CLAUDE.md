@@ -52,7 +52,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
    - **Non-exhaustion 429**: try only `rateLimitFailovers` alternate accounts, then open a shared cooldown and retry internally when continuity mode is enabled. The account is not poisoned and a request-global limit is not amplified across the fleet.
 
    When the active account crosses `switchThreshold`, the *next* request switches to the highest-priority account (see Account selection below).
-7. **Transient network errors** (`ECONNRESET`/`ETIMEDOUT`/`fetch failed`) → `res.destroy()` so the client retries; they are not retried internally.
+7. **Transient network errors** (`ECONNRESET`/`ETIMEDOUT`/`fetch failed`): before any response bytes went out, the request fails over to another account like a 5xx (per-request `tried5xx` exclusion; the account is NOT marked `'error'` — a network blip is not a bad credential). Only mid-stream (headers sent, partial data delivered — not replayable) or with no account left does it `res.destroy()` so the client retries (qjc fork; upstream destroyed unconditionally, which surfaced as "Response stalled mid-stream" in Claude Code).
 8. All accounts unavailable → continuity mode waits for the computed reset and retries; legacy mode returns `429` with `retry-after`.
 
 ### Quota tracking (account-manager.js)
