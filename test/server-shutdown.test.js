@@ -9,7 +9,8 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
+const cliPath = process.env.TEAMCLAUDE_TEST_CLI
+  || fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -47,6 +48,10 @@ test('SIGTERM exits after a bounded grace period even with an active SSE respons
   const upstream = http.createServer((_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"type":"ping"}\n\n');
+    const heartbeat = setInterval(() => {
+      res.write('data: {"type":"ping"}\n\n');
+    }, 100);
+    res.once('close', () => clearInterval(heartbeat));
   });
   const upstreamPort = await listen(upstream);
   const proxyPort = await unusedPort();
