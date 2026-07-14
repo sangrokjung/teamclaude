@@ -267,10 +267,10 @@ test('continuity mode waits for quota reset instead of returning all-accounts-ex
   }
 });
 
-test('proxy routes Opus away from an account with exhausted model-scoped quota', async () => {
-  let auth = '';
-  const upstream = http.createServer((req, res) => {
-    auth = req.headers.authorization || '';
+test('proxy keeps Opus eligible when every account has exhausted Fable model quota', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ content: [] }));
   });
@@ -279,11 +279,13 @@ test('proxy routes Opus away from an account with exhausted model-scoped quota',
   accounts[0].priority = 0;
   accounts[1].priority = 1;
   const am = new AccountManager(accounts, 0.98);
-  am.accounts[0].quota.modelWeekly['7d_oi'] = {
-    utilization: 1,
-    reset: Date.now() + 3600_000,
-  };
-  const proxy = startContinuityProxy(am, upstreamPort);
+  for (const account of am.accounts) {
+    account.quota.modelWeekly['7d_oi'] = {
+      utilization: 1,
+      reset: Date.now() + 3600_000,
+    };
+  }
+  const proxy = startProxy(am, upstreamPort);
   const proxyPort = await listen(proxy);
 
   try {
@@ -294,7 +296,7 @@ test('proxy routes Opus away from an account with exhausted model-scoped quota',
     });
     await res.text();
     assert.equal(res.status, 200);
-    assert.match(auth, /tok-1$/, 'Opus request should use the model-eligible account');
+    assert.equal(upstreamHits, 1, 'Opus fallback must reach upstream despite exhausted Fable quota');
   } finally {
     proxy.close();
     upstream.close();

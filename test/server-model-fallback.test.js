@@ -107,24 +107,21 @@ test('unlabeled fleet-wide 429 → falls back to the configured model and succee
   }
 });
 
-// Labeled 7d_oi exhaustion on fable AND opus (they share the top-tier weekly
-// window), sonnet healthy — the chain must walk fable → opus → sonnet. This
-// exercises the model-exhausted dead end AND the selection-time dead end
-// (once both accounts are marked 7d_oi-exhausted, opus finds no usable
-// account at acquire time).
-test('labeled 7d_oi exhaustion → walks the chain until a served model', async () => {
-  const modelsSeen = [];
+test('labeled Fable 7d_oi exhaustion → falls back to Opus and succeeds', async () => {
+  const attempts = [];
   const upstream = http.createServer(async (req, res) => {
     const body = await readJsonBody(req);
-    modelsSeen.push(body.model);
-    if (body.model === 'claude-sonnet-5') ok200(res, { ok: true, served: body.model });
-    else modelWeekly429(res); // fable and opus both report the 7d_oi window at 1.0
+    attempts.push({ model: body.model, authorization: req.headers.authorization });
+    if (body.model === 'claude-fable-5') modelWeekly429(res);
+    else ok200(res, { ok: true, served: body.model });
   });
   const upstreamPort = await listen(upstream);
 
   const am = new AccountManager(makeAccounts(2), 0.98);
   const proxy = startProxy(am, upstreamPort, {
     modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8', 'claude-sonnet-5'] },
+    continuityMode: true,
+    rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);
 
@@ -132,8 +129,12 @@ test('labeled 7d_oi exhaustion → walks the chain until a served model', async 
     const res = await post(proxyPort, 'claude-fable-5');
     const json = await res.json();
     assert.equal(res.status, 200);
-    assert.equal(json.served, 'claude-sonnet-5');
-    assert.equal(modelsSeen[modelsSeen.length - 1], 'claude-sonnet-5');
+    assert.equal(json.served, 'claude-opus-4-8');
+    assert.deepEqual(attempts.slice(0, 2).map(a => a.model), ['claude-fable-5', 'claude-fable-5']);
+    assert.equal(new Set(attempts.slice(0, 2).map(a => a.authorization)).size, 2);
+    assert.equal(attempts[attempts.length - 1].model, 'claude-opus-4-8');
+    assert.ok(!attempts.some(a => a.model === 'claude-sonnet-5'));
+    assert.ok(am.accounts.every(a => a.quota.modelWeekly['7d_oi']?.utilization === 1));
     // 7d_oi exhaustion is model-scoped: accounts stay active (not throttled).
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {

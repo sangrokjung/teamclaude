@@ -274,30 +274,22 @@ test('a model-scoped weekly limit over threshold does NOT make the account unava
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
-test('model-aware acquire skips an account exhausted for the requested Opus tier only', async () => {
+test('Opus remains eligible when the Fable/Mythos 7d_oi window is exhausted', async () => {
   const am = new AccountManager([
-    { ...makeAccounts(1)[0], name: 'opus-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'opus-ready', accessToken: 'tok-ready', priority: 1 },
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fallback', accessToken: 'tok-ready', priority: 1 },
   ], 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
   };
 
-  const opus = await am.acquireAccount(null, 0, null, null, 'claude-opus-4-6');
-  assert.equal(opus.name, 'opus-ready');
+  const opus = await am.acquireAccount(null, 0, null, null, 'claude-opus-4-8');
+  assert.equal(opus.name, 'fable-full', 'Fable quota must not pre-block the Opus fallback');
   am.releaseAccount(opus);
-
-  const sonnet = await am.acquireAccount(null, 0, null, null, 'claude-sonnet-4-6');
-  assert.equal(sonnet.name, 'opus-full', 'model quota must not block other model tiers');
-  am.releaseAccount(sonnet);
 });
 
-// Regression (2026-07-11): the 7d_oi window also covers the Fable/Mythos family
-// (claude-fable-5 is the top tier), but modelQuotaLabel only matched "opus", so
-// Fable requests were routed as unified — straight into Fable-exhausted accounts,
-// producing a fleet-wide 429 failover loop that stalled every client.
-test('model-aware acquire treats claude-fable-5 / mythos as the 7d_oi tier', async () => {
+test('model-aware acquire skips an account exhausted for the requested Fable tier only', async () => {
   const am = new AccountManager([
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
     { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
@@ -307,15 +299,34 @@ test('model-aware acquire treats claude-fable-5 / mythos as the 7d_oi tier', asy
     reset: Date.now() + HOUR,
   };
 
-  for (const model of ['claude-fable-5', 'claude-mythos-5', 'claude-opus-4-8[1m]']) {
+  const fable = await am.acquireAccount(null, 0, null, null, 'claude-fable-5');
+  assert.equal(fable.name, 'fable-ready');
+  am.releaseAccount(fable);
+
+  const opus = await am.acquireAccount(null, 0, null, null, 'claude-opus-4-6');
+  assert.equal(opus.name, 'fable-full', 'Fable quota must not block the Opus fallback tier');
+  am.releaseAccount(opus);
+});
+
+test('model-aware acquire treats claude-fable-5 / mythos as the 7d_oi tier', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+  for (let i = 0; i < am.accounts.length; i++) {
+    setSession(am, i, 0.1, HOUR);
+    setWeekly(am, i, 0.1, HOUR);
+  }
+
+  for (const model of ['claude-fable-5', 'claude-mythos-5']) {
     const acct = await am.acquireAccount(null, 0, null, null, model);
     assert.equal(acct.name, 'fable-ready', `${model} must skip the 7d_oi-exhausted account`);
     am.releaseAccount(acct);
   }
-
-  const haiku = await am.acquireAccount(null, 0, null, null, 'claude-haiku-4-5-20251001');
-  assert.equal(haiku.name, 'fable-full', 'non-top-tier models must not be blocked by 7d_oi');
-  am.releaseAccount(haiku);
 });
 
 // Regression (review finding): a partial header pair — 7d-reset present but

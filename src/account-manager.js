@@ -6,14 +6,14 @@ function coerceMaxConcurrent(value, fallback) {
 }
 
 // Anthropic's `7d_oi` window is the top-tier weekly allowance shown as
-// "Fable" in Claude's usage UI — it covers the Opus AND Fable/Mythos model
-// families (claude-opus-*, claude-fable-*, claude-mythos-* all draw from it;
-// verified against live traffic where claude-fable-5 429s reported 7d_oi).
+// "Fable" in Claude's usage UI. It covers the Fable/Mythos model family;
+// Opus is a fallback tier and must remain eligible when this window is full.
+// Live claude-fable-5 429s report the binding claim in `7d_oi`.
 // Keep the mapping in one place so selection, retry-after, and 429 handling use
 // identical semantics. Unknown/future model tiers remain on unified routing.
 export function modelQuotaLabel(model) {
   if (typeof model !== 'string') return null;
-  return /(^|[-_.])(opus|fable|mythos)($|[-_.\d])/i.test(model) ? '7d_oi' : null;
+  return /(^|[-_.])(fable|mythos)($|[-_.\d])/i.test(model) ? '7d_oi' : null;
 }
 
 function emptyQuota() {
@@ -35,7 +35,7 @@ function emptyQuota() {
     // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
     // being tracked without a code change. Selection consults this only when
     // the incoming request belongs to the matching model tier, so an account
-    // over its Opus limit remains available to Sonnet/Haiku.
+    // over its Fable/Mythos limit remains available to Opus/Sonnet/Haiku.
     modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
     resetsAt: null,        // soonest standard reset (session-order fallback)
     // Token and request windows can reset at DIFFERENT times; tracked separately
