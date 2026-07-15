@@ -33,9 +33,9 @@ function emptyQuota() {
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
     // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
-    // being tracked without a code change. Selection consults this only when
-    // the incoming request belongs to the matching model tier, so an account
-    // over its Fable/Mythos limit remains available to Opus/Sonnet/Haiku.
+    // being tracked without a code change. These response-derived values are
+    // used to classify a live model-scoped 429 and compute its retry time, but
+    // never to pre-block selection: the request itself is the refresh path.
     modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
     resetsAt: null,        // soonest standard reset (session-order fallback)
     // Token and request windows can reset at DIFFERENT times; tracked separately
@@ -707,7 +707,7 @@ export class AccountManager {
     return true;
   }
 
-  _isNearQuota(account, model = null) {
+  _isNearQuota(account) {
     const q = account.quota;
     const now = Date.now();
 
@@ -733,19 +733,15 @@ export class AccountManager {
       account._partialProbes = 0; // fresh rollover → re-probes allowed again
       account._warmupTries = 0;
     }
-    // Clear expired model-scoped weekly windows (display-only, but a stale
-    // "94% Fable" bar after the window reset would mislead)
+    // Clear expired model-scoped weekly windows. They do not pre-block account
+    // selection, but stale values would still mislead the dashboard and 429
+    // retry-time calculation.
     for (const [label, win] of Object.entries(q.modelWeekly)) {
       if (win.reset && now >= win.reset) {
         console.log(`[TeamClaude] Account "${account.name}" ${label} quota reset`);
         delete q.modelWeekly[label];
       }
     }
-
-    const modelLabel = modelQuotaLabel(model);
-    const modelWindow = modelLabel ? q.modelWeekly[modelLabel] : null;
-    if (modelWindow?.utilization != null
-        && modelWindow.utilization >= this.switchThreshold) return true;
 
     // Clear expired standard quotas — each window INDEPENDENTLY. The token and
     // request windows reset at different times; sweeping both on the collapsed
@@ -841,7 +837,7 @@ export class AccountManager {
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    if (uStatus) account.quota.unifiedStatus = uStatus;
+    account.quota.unifiedStatus = uStatus || null;
 
     // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
     // for the top model tier ("Fable" in Claude's usage UI). These headers only
@@ -918,14 +914,9 @@ export class AccountManager {
    * into the account's quota state.
    *
    * Model-scoped windows (quota.modelWeekly, e.g. the Fable 7d_oi limit) are
-   * deliberately NOT consulted here. On a real upstream 429 for that model tier
-   * the top-level `unified-status` is `rejected` too (the binding claim is
-   * reflected there — verified against live traffic), so the exhaustion IS
-   * detected; folding 7d_oi in additionally would change nothing on real
-   * headers, and reacting to it alone would globally throttle an account that
-   * still serves every other model. Per-model routing (skip Fable-exhausted
-   * accounts only for Fable requests, without the 5-min global throttle) would
-   * need the request's model plumbed into selection — a separate feature.
+   * deliberately NOT consulted here. `isModelExhausted()` classifies them after
+   * a live response so server.js can fail over or fall back without globally
+   * throttling an account that still serves Opus/Sonnet/Haiku.
    */
   isExhausted(accountIndex) {
     const account = this._resolve(accountIndex);
@@ -1164,7 +1155,7 @@ export class AccountManager {
   }
 
   /**
-   * Snapshot of per-account quota state for persistence across restarts
+   * Snapshot of general per-account quota state for persistence across restarts
    * (credential-free). Quota lives only in memory otherwise, so a restart used
    * to blank the whole dashboard (and blind use-or-lose ordering) until traffic
    * organically re-measured every account.
@@ -1175,8 +1166,7 @@ export class AccountManager {
       name: a.name,
       quota: {
         ...a.quota,
-        modelWeekly: Object.fromEntries(
-          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+        modelWeekly: {},
       },
       rateLimitedUntil: a.rateLimitedUntil,
       usage: { ...a.usage },
@@ -1216,9 +1206,10 @@ export class AccountManager {
           // exhaustion and wrongly throttle the account. Only a live response
           // (updateQuota) may set it.
           unifiedStatus: null,
-          modelWeekly: Object.fromEntries(
-            Object.entries(s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object' ? s.quota.modelWeekly : {})
-              .map(([k, w]) => [k, { ...w }])),
+          // A model-scoped value is only observable on responses for that tier.
+          // Restoring it can pre-empt the very request needed to refresh it, so
+          // always re-measure model windows after a restart.
+          modelWeekly: {},
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };

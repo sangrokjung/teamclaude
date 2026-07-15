@@ -1058,13 +1058,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // request (per-request exclusion via ctx.tried429) so concurrent overflow
       // spreads to an idle account instead of failing. Crucially we do NOT
       // throttle the account: throttling on a request-global 429 would poison
-      // the fleet for unrelated requests. Only when every available account has
-      // been tried for this request (→ effectively global) is the 429 passed
-      // through to the client; no account state is mutated either way.
+      // the fleet for unrelated requests. The configured failover budget bounds
+      // this replay before fallback, continuity handling, or passthrough; no
+      // account state is mutated either way.
       ctx.tried429.add(account);
-      const failoverLimit = ctx.continuity.enabled
-        ? ctx.continuity.rateLimitFailovers
-        : maxRetries;
+      const failoverLimit = ctx.continuity.rateLimitFailovers;
       if (!res.destroyed && retryCount < maxRetries && ctx.tried429.size <= failoverLimit
           && (accountManager.anyUsable(ctx.tried429, ctx.model)
             || accountManager.anyCapped(ctx.tried429, ctx.model))) {
@@ -1077,16 +1075,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      // Every account 429'd for this request. A fleet-wide "global" 429 is
-      // often a model-tier exhaustion upstream did not label (accounts with an
-      // unmeasured weekly window return bare 429s) — so before cooling down or
-      // passing the 429 through, walk the configured model fallback chain. A
-      // genuinely global/IP limit just 429s the fallback too and falls through
-      // to the existing behavior.
+      // The configured alternate-account budget is exhausted. A repeated bare
+      // 429 can be a model-tier exhaustion upstream did not label, so before
+      // cooling down or passing it through, walk the configured model fallback
+      // chain. A genuinely global/IP limit also 429s the fallback and falls
+      // through to the existing behavior.
       {
         const fallback = nextModelFallback(ctx, req, body);
         if (fallback && !res.destroyed) {
-          console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (every account 429'd for ${ctx.model})`);
+          console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (429 failover budget exhausted for ${ctx.model})`);
           releaseHeld();
           ctx.model = fallback.model;
           ctx.tried429.clear();
@@ -1104,10 +1101,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
 
-      console.log(`[TeamClaude] 429 (global) on "${account.name}" — every account tried, passing through`);
+      console.log(`[TeamClaude] 429 (global) on "${account.name}" — failover budget exhausted, passing through`);
       ctx.status = 429;
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — global, passed through after trying all accounts ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — global, passed through after exhausting failover budget ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
       if (res.destroyed) return;

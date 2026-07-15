@@ -6,7 +6,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 
 > **This is the `qjc/resilient-routing` fork** (`1.2.0-qjc.x`) of [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), adding on top of upstream:
 >
-> - **Top-tier weekly-window model routing** — `claude-fable-*` / `claude-mythos-*` requests are mapped to the model-scoped weekly window (`7d_oi`), so a Fable-exhausted account is skipped for those tiers while Opus remains available as the configured fallback
+> - **Top-tier weekly-window model routing** — a live `claude-fable-*` / `claude-mythos-*` quota 429 is classified with the model-scoped weekly window (`7d_oi`) and failed over or sent through the configured fallback chain without globally throttling an account that can still serve Opus
 > - **Model fallback chains (`modelFallbacks`)** — when the *whole fleet* is out of quota for the requested model, the request is rewritten to a configured fallback model and retried, instead of surfacing a 429 that kills the client's turn ([details below](#model-fallbacks-fork))
 > - **Bounded graceful shutdown** — SIGTERM/SIGINT force-exits after 5s even with live SSE/keep-alive connections, so a supervisor (launchd/systemd) can restart the proxy promptly
 > - **Network-error failover** — a pre-stream transient network error (`fetch failed`, `ECONNRESET`, …) fails the request over to another account instead of dropping the client connection (which surfaced as "Response stalled mid-stream" in Claude Code); mid-stream errors still close the connection since a partial response is not replayable
@@ -18,14 +18,14 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
-- **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) fails the request over to another account so concurrent overflow spreads instead of erroring. Either way nothing blocks, and a request-global 429 only passes through after every account has been tried — never throttling the fleet
+- **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. A request-global 429 never throttles the fleet; after that bounded failover budget it enters continuity handling or passes through
 - **Interactive TUI** — real-time dashboard with color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
-- **Quota survives restarts** — per-account quota state is snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup, so a restart doesn't blank the dashboard or blind the account ordering
-- **Active warm-up** — after a (re)start the proxy probes still-unmeasured accounts with a minimal request (reusing the shape of the first real request), so the whole fleet's quota populates within seconds instead of waiting for traffic to reach each account
+- **Quota survives restarts** — general per-account quota state is snapshotted to `<config>.quota.json`; the warm-up probe template is captured again from the first accepted real request, and model-scoped values are deliberately re-measured so a stale Fable value cannot block its own refresh path
+- **Active warm-up** — after a (re)start the proxy probes eligible unmeasured accounts with a minimal request (reusing the captured request shape), so response-derived quota data populates without waiting for normal traffic to reach each account
 - **Server lifecycle** — `teamclaude stop` / `teamclaude restart` cleanly stop or replace the running server from any terminal
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also force-re-measures the whole fleet's quota, so the dashboard reflects usage spent outside this proxy (other devices/sessions)
+- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also best-effort re-measures eligible idle accounts so response-derived dashboard values catch up with usage spent outside this proxy
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Zero dependencies** — uses only Node.js built-in modules
@@ -35,8 +35,11 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install (from this repo)
-npm install -g github:jung-wan-kim/teamclaude
+# Install the QJC fork from its default branch
+git clone --branch qjc/resilient-routing https://github.com/sangrokjung/teamclaude.git
+cd teamclaude
+npm pack
+npm install -g ./karpeleslab-teamclaude-*.tgz
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -50,6 +53,11 @@ teamclaude server
 # In another terminal, run Claude Code through the proxy
 teamclaude run
 ```
+
+> **Important:** a running proxy does not automatically capture a plain `claude`
+> process. Start Claude Code with `teamclaude run`; otherwise it connects directly
+> with its single logged-in account and cannot rotate when that account reaches a
+> usage limit.
 
 You can also import existing Claude Code credentials instead of logging in:
 
@@ -122,7 +130,7 @@ If the configured port is already in use — for example another TeamClaude prox
 | `o` | Order the selected account: `↑`/`↓` move its rank, `a` resets the WHOLE order to `auto` (weekly-reset ordering), `c` clears just this account's rank |
 | `a` | Add account (import or API key) |
 | `d` | Delete an account (with confirmation) |
-| `R` | Reload accounts from config **and re-measure every account's quota** — revives lapsed OAuth tokens first, includes the model-scoped Fable window, and reports an honest `M/N` when some accounts fail or are skipped |
+| `R` | Reload accounts from config and best-effort re-measure eligible idle accounts — skips disabled, busy, and auth-error accounts and reports an honest `M/N`; `Fbl` refreshes only when the captured probe template returns a model-scoped weekly header |
 | `q` | Quit |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
@@ -158,6 +166,20 @@ CLI changes made while the server is running are picked up with **R** (reload) i
 teamclaude run
 ```
 
+`teamclaude run` injects the proxy URL when the Claude Code process starts.
+Starting or restarting TeamClaude later does **not** reroute an already-open
+direct session, which can still show "out of usage credits" for its single
+logged-in account while the proxy itself is healthy.
+
+Exit that direct session and resume it through TeamClaude from the same working
+directory:
+
+```bash
+teamclaude run -- --continue
+# Or resume a specific conversation:
+teamclaude run -- --resume <session-id>
+```
+
 Or manually set the environment:
 
 ```bash
@@ -165,12 +187,40 @@ eval $(teamclaude env)
 claude
 ```
 
+### Understand the quota numbers
+
+`teamclaude status` and the TUI show the latest quota headers observed by the
+proxy, not an on-demand account usage query. They can lag usage spent in another
+Claude Code session or on another device. Pressing **R** best-effort re-probes
+eligible idle accounts and refreshes only the headers returned by the captured
+probe template. Disabled, busy, and auth-error accounts are skipped; `Fbl` can
+remain stale until a real top-tier request captures a shape that returns the
+model-scoped weekly header.
+
+Current Claude Code OAuth builds also expose their own account usage view. It
+uses an OAuth-only implementation surface rather than a documented general
+Anthropic API, so TeamClaude does not depend on it for routing. When the views
+disagree, treat Claude Code's account usage view as the live account check and
+TeamClaude as the proxy's last observation.
+
+Every applicable window matters. A `Fbl` bar below 100% does not mean Fable can
+run when the general 5-hour or 7-day window is already at `switchThreshold`.
+For example, 59% Fable usage with 99% 5-hour usage is unavailable at the default
+98% threshold until the 5-hour window resets.
+
+> **QJC self-lock guard:** `modelWeekly` is response-derived. The fork does not
+> restore it after restart or use it to pre-block account selection; the next
+> top-tier request refreshes the value, and a live model-quota 429 drives scoped
+> failover or `modelFallbacks`. If a global installation carries additional
+> local patches, validate or reapply them in the service startup path because an
+> npm or Node upgrade can replace globally installed source files.
+
 ### Other commands
 
 ```bash
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
-teamclaude status            # Show live proxy status (requires running server)
+teamclaude status            # Show the proxy's last-observed quota status (requires running server)
 teamclaude stop              # Stop the running proxy server
 teamclaude restart           # Stop the running server and start a fresh one
 teamclaude remove <name>     # Remove an account
@@ -238,7 +288,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
-| `modelFallbacks` | Fork only — per-model fallback chains applied when the whole fleet is out of quota for the requested model (optional, default `{}`; see below) |
+| `modelFallbacks` | Fork only — per-model fallback chains applied after live model-quota exhaustion reaches all eligible accounts or the bounded unlabeled-429 failover budget is exhausted (optional, default `{}`; see below) |
 
 ### Model fallbacks (fork)
 
@@ -251,7 +301,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 }
 ```
 
-When every account is out of quota for the *requested* model — a model-tier exhaustion (`7d_oi` at 100% fleet-wide), a selection-time dead end, or an unlabeled fleet-wide 429 — the proxy rewrites the request body's `model` to the next entry of the chain and retries the whole fleet, instead of passing the 429 through. Semantics:
+When live model-tier exhaustion (`7d_oi`) reaches all eligible accounts, selection has no eligible account, or repeated unlabeled 429s exhaust `rateLimitFailovers`, the proxy rewrites the request body's `model` to the next entry of the chain and retries under normal routing instead of immediately passing the 429 through. Semantics:
 
 - The chain is resolved **once per request from the original model** (fallbacks of fallbacks are not followed) and consumed in order; when it runs dry, the pre-existing 429/continuity behavior applies unchanged.
 - Keys and targets must be **plain API model IDs**. A client-side bracket suffix (`claude-fable-5[1m]` — the API rejects such IDs as `not_found_error`) matches its suffix-stripped entry.
@@ -264,15 +314,15 @@ When every account is out of quota for the *requested* model — a model-tier ex
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
 3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
-4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate Fable/Mythos weekly limit) are also tracked; Fable/Mythos requests skip accounts over that model limit while Opus/Sonnet/Haiku can still use them
+4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track the proxy's last-observed session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate Fable/Mythos weekly limit) are re-measured after restart and classify live top-tier quota 429s without globally throttling accounts that still serve Opus/Sonnet/Haiku
 5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. An **active warm-up** additionally probes unmeasured accounts directly — a minimal 1-token request reusing the shape of the first real request — so the whole fleet is measured within seconds of the first post-restart request instead of waiting for traffic to reach each account (`activeWarmup: false` disables it). Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose weekly (7d) quota resets soonest (tie-breaks: soonest session reset, then lowest usage), so quota about to renew unused is drained first. Explicitly ranked accounts (`priority` / TUI `o`) are preferred before all of that; disabled accounts are excluded entirely. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On a 429 the proxy classifies it:
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. If the limit appears global, continuity mode opens a shared cooldown and retries internally instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
-   - **Fleet-wide dead end for the requested model** (fork) → if a `modelFallbacks` chain is configured for that model, the request is rewritten to the next fallback model and retried across the fleet before any 429 is surfaced or any continuity sleep starts.
-7. Transient network errors (connection reset, timeout) drop the connection so the client can retry
+   - **Requested-model dead end** (fork) → after live model-quota exhaustion reaches all eligible accounts or the unlabeled-429 failover budget is exhausted, a configured `modelFallbacks` chain rewrites the request to the next model before any 429 is surfaced or continuity sleep starts.
+7. Transient network errors (connection reset, timeout) fail over to another account before any response bytes are sent. Mid-stream errors, or a failure with no alternate account left, close the connection so the client can retry
 8. If all accounts are exhausted, continuity mode holds the request and polls using the computed account/model reset time. Setting `continuityMode: false` restores the legacy 429 response with `retry-after`.
-9. **Quota survives restarts**: the server snapshots per-account quota/throttle state to `<config>.quota.json` (every minute and on exit) and restores it at startup, so a restart doesn't blank the dashboard or blind the use-or-lose ordering; expired windows are swept lazily and re-measured from live traffic
+9. **Quota survives restarts**: the server snapshots general per-account quota/throttle state to `<config>.quota.json`. It captures a fresh warm-up probe template from the first accepted real request after restart; model-scoped weekly values are intentionally discarded on import and re-measured from live traffic so stale Fable data cannot self-lock its refresh path
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 
 ## License
