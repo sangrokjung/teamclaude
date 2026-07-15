@@ -166,7 +166,10 @@ CLI changes made while the server is running are picked up with **R** (reload) i
 teamclaude run
 ```
 
-`teamclaude run` injects the proxy URL when the Claude Code process starts.
+`teamclaude run` injects the proxy URL when the Claude Code process starts and
+removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
+Code keeps its Max/Pro OAuth subscription instead of silently preferring API
+credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
 Starting or restarting TeamClaude later does **not** reroute an already-open
 direct session, which can still show "out of usage credits" for its single
 logged-in account while the proxy itself is healthy.
