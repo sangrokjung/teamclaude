@@ -18,11 +18,12 @@ function makeAccountsForServer(n) {
   }));
 }
 
-function startProxy(am, upstreamPort) {
+function startProxy(am, upstreamPort, overrides = {}) {
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false, // isolate 429 failover from background warm-up probes
+    ...overrides,
   });
   return proxy;
 }
@@ -166,11 +167,46 @@ test('non-exhaustion 429 fails over to a healthy account (no throttle)', async (
   }
 });
 
-// Regression (adversarial review): a request-GLOBAL 429 (would 429 on every
-// account) must not poison the fleet. The request fails over through each
-// account once, then passes the 429 through — but leaves EVERY account active
-// (no throttle), so unrelated requests are unaffected.
-test('request-global 429 tries each account once then passes through, no poisoning', async () => {
+test('rateLimitFailovers is honored when continuity mode is disabled', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    upstreamHits++;
+    if ((req.headers['authorization'] || '').includes('tok-a')) {
+      res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'tok-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort, { rateLimitFailovers: 0 });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.equal(upstreamHits, 1, 'configured zero failovers must not sweep another account');
+    assert.ok(am.accounts.every(a => a.status === 'active'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Regression (adversarial review): a request-GLOBAL 429 must not poison the
+// fleet. The request tries only the configured number of alternate accounts,
+// then passes the 429 through with every account still active.
+test('request-global 429 honors bounded failovers without poisoning accounts', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
@@ -195,8 +231,8 @@ test('request-global 429 tries each account once then passes through, no poisoni
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     await res.text();
-    assert.equal(res.status, 429);                                  // passed through after trying all
-    assert.equal(upstreamHits, 3, `expected one try per account, got ${upstreamHits}`);
+    assert.equal(res.status, 429);
+    assert.equal(upstreamHits, 2, `expected initial + one configured failover, got ${upstreamHits}`);
     assert.ok(am.accounts.every(a => a.status === 'active'),        // no account poisoned/throttled
       `expected all accounts active, got ${am.accounts.map(a => a.status).join(',')}`);
   } finally {
