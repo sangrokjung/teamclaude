@@ -97,6 +97,7 @@ export function createDefaultConfig() {
     // suffixed incoming model falls back to its suffix-stripped entry.
     // e.g. { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
     modelFallbacks: {},
+    launchModel: null,
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

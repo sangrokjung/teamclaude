@@ -1,12 +1,43 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
+
+async function startStatusServer(dir, status) {
+  const script = join(dir, 'status-server.mjs');
+  await writeFile(script, `import http from 'node:http';
+const status = JSON.parse(Buffer.from(process.env.STATUS_BASE64, 'base64').toString());
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(status));
+});
+server.listen(0, '127.0.0.1', () => console.log(server.address().port));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`);
+  const child = spawn(process.execPath, [script], {
+    env: {
+      ...process.env,
+      STATUS_BASE64: Buffer.from(JSON.stringify(status)).toString('base64'),
+    },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const lines = createInterface({ input: child.stdout });
+  const [line] = await once(lines, 'line');
+  return { child, lines, port: Number(line) };
+}
+
+async function stopStatusServer(server) {
+  server.lines.close();
+  server.child.kill('SIGTERM');
+  await once(server.child, 'exit');
+}
 
 test('run preserves OAuth while clearing higher-precedence API credentials', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-env-'));
@@ -46,6 +77,103 @@ console.log(JSON.stringify({
     assert.equal(child.baseUrl, 'http://localhost:4567');
     assert.deepEqual(child.args, ['--model', 'fable']);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run starts Claude Code on the visible Opus 1M fallback when Fable is exhausted', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
+  let server;
+  try {
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({ args: process.argv.slice(2) }));
+`);
+    await chmod(fakeClaude, 0o755);
+    server = await startStatusServer(dir, {
+      accounts: [{
+        enabled: true,
+        status: 'active',
+        quota: {
+          unified5h: 0.2,
+          unified7d: 0.3,
+          modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() + 3600000 } },
+        },
+      }],
+    });
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port: server.port, apiKey: 'proxy-key' },
+      switchThreshold: 0.98,
+      launchModel: 'claude-fable-5',
+      modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    }));
+
+    const result = spawnSync(process.execPath, [entry, 'run'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH}`,
+        TEAMCLAUDE_CONFIG: configPath,
+      },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8[1m]']);
+    assert.match(result.stderr, /launching Claude Code as claude-opus-4-8\[1m\]/);
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run keeps a confirmed-available Fable model and respects an explicit other model', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
+  let server;
+  try {
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({ args: process.argv.slice(2) }));
+`);
+    await chmod(fakeClaude, 0o755);
+    server = await startStatusServer(dir, {
+      accounts: [{
+        enabled: true,
+        status: 'active',
+        quota: {
+          unified5h: 1,
+          unified5hReset: Date.now() - 1000,
+          unified7d: 0.3,
+          modelWeekly: { '7d_oi': { utilization: 0.5, reset: Date.now() + 3600000 } },
+        },
+      }],
+    });
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port: server.port, apiKey: 'proxy-key' },
+      switchThreshold: 0.98,
+      launchModel: 'claude-fable-5',
+      modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    }));
+    const env = {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      TEAMCLAUDE_CONFIG: configPath,
+    };
+
+    const defaultResult = spawnSync(process.execPath, [entry, 'run'], { encoding: 'utf8', env });
+    assert.equal(defaultResult.status, 0, defaultResult.stderr);
+    assert.deepEqual(JSON.parse(defaultResult.stdout.trim()).args, ['--model', 'claude-fable-5']);
+
+    const explicitResult = spawnSync(
+      process.execPath,
+      [entry, 'run', '--', '--model', 'sonnet'],
+      { encoding: 'utf8', env },
+    );
+    assert.equal(explicitResult.status, 0, explicitResult.stderr);
+    assert.deepEqual(JSON.parse(explicitResult.stdout.trim()).args, ['--model', 'sonnet']);
+  } finally {
+    if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });
   }
 });
