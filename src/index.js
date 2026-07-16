@@ -615,6 +615,117 @@ async function envCommand() {
 
 // ── run ─────────────────────────────────────────────────────
 
+function stripContextSuffix(model) {
+  return typeof model === 'string' ? model.replace(/\[[^\]]*\]$/, '') : model;
+}
+
+function modelArgValue(claudeArgs) {
+  for (let i = claudeArgs.length - 1; i >= 0; i--) {
+    if (claudeArgs[i] === '--model') return claudeArgs[i + 1] || null;
+    if (claudeArgs[i].startsWith('--model=')) return claudeArgs[i].slice('--model='.length) || null;
+  }
+  return null;
+}
+
+function setModelArg(claudeArgs, model) {
+  for (let i = claudeArgs.length - 1; i >= 0; i--) {
+    if (claudeArgs[i] === '--model') {
+      if (i + 1 < claudeArgs.length) claudeArgs[i + 1] = model;
+      else claudeArgs.push(model);
+      return;
+    }
+    if (claudeArgs[i].startsWith('--model=')) {
+      claudeArgs[i] = `--model=${model}`;
+      return;
+    }
+  }
+  claudeArgs.push('--model', model);
+}
+
+function fallbackChainFor(modelFallbacks, model) {
+  if (!modelFallbacks || typeof modelFallbacks !== 'object' || !model) return null;
+  const plain = stripContextSuffix(model);
+  let chain = modelFallbacks[plain];
+  if (!Array.isArray(chain) && /(^|[-_.])fable($|[-_.\d])/i.test(plain)) {
+    const key = Object.keys(modelFallbacks).find(k => /(^|[-_.])fable($|[-_.\d])/i.test(k));
+    if (key) chain = modelFallbacks[key];
+  }
+  if (!Array.isArray(chain) && /(^|[-_.])mythos($|[-_.\d])/i.test(plain)) {
+    const key = Object.keys(modelFallbacks).find(k => /(^|[-_.])mythos($|[-_.\d])/i.test(k));
+    if (key) chain = modelFallbacks[key];
+  }
+  return Array.isArray(chain) && chain.length ? chain : null;
+}
+
+function isGeneralQuotaBlocked(account, threshold) {
+  const q = account.quota || {};
+  const isBlocked = (utilization, reset) => {
+    if (utilization == null || utilization < threshold) return false;
+    const resetAt = reset == null ? null : new Date(reset).getTime();
+    return resetAt == null || resetAt > Date.now();
+  };
+  if (isBlocked(q.unified5h, q.unified5hReset)) return true;
+  if (isBlocked(q.unified7d, q.unified7dReset)) return true;
+  if (q.tokensLimit && q.tokensRemaining != null
+      && isBlocked(1 - q.tokensRemaining / q.tokensLimit, q.tokensReset || q.resetsAt)) return true;
+  if (q.requestsLimit && q.requestsRemaining != null
+      && isBlocked(1 - q.requestsRemaining / q.requestsLimit, q.requestsReset || q.resetsAt)) return true;
+  return false;
+}
+
+function topTierUnavailable(status, threshold) {
+  const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
+  const candidates = accounts.filter(a =>
+    a.enabled !== false && !['disabled', 'error', 'exhausted', 'throttled'].includes(a.status));
+  if (!candidates.length) return true;
+
+  let measured = 0;
+  for (const account of candidates) {
+    if (isGeneralQuotaBlocked(account, threshold)) continue;
+    const win = account.quota?.modelWeekly?.['7d_oi'];
+    const reset = win?.reset == null ? null : new Date(win.reset).getTime();
+    if (!Number.isFinite(win?.utilization) || (reset != null && reset <= Date.now())) continue;
+    measured++;
+    if (win.utilization < threshold) return false;
+  }
+  if (measured > 0) return true;
+  return candidates.every(a => isGeneralQuotaBlocked(a, threshold));
+}
+
+function displayModel(model) {
+  const plain = stripContextSuffix(model);
+  return plain === 'claude-opus-4-8' ? `${plain}[1m]` : model;
+}
+
+async function syncLaunchModel(config, claudeArgs, childEnv) {
+  const explicitModel = modelArgValue(claudeArgs) || childEnv.ANTHROPIC_MODEL || null;
+  const requestedModel = explicitModel || config.launchModel;
+  const chain = fallbackChainFor(config.modelFallbacks, requestedModel);
+  if (!requestedModel || !chain) {
+    if (!explicitModel && config.launchModel) setModelArg(claudeArgs, config.launchModel);
+    return;
+  }
+
+  const port = Number(config.proxy?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+
+  let status;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (response.ok) status = await response.json();
+  } catch {}
+
+  if (status && topTierUnavailable(status, config.switchThreshold ?? 0.98)) {
+    const fallback = displayModel(chain[0]);
+    setModelArg(claudeArgs, fallback);
+    console.error(`[TeamClaude] ${requestedModel} quota unavailable; launching Claude Code as ${fallback}.`);
+  } else if (!modelArgValue(claudeArgs) && !childEnv.ANTHROPIC_MODEL && config.launchModel) {
+    setModelArg(claudeArgs, config.launchModel);
+  }
+}
+
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
@@ -626,6 +737,7 @@ async function runCommand() {
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
+  await syncLaunchModel(config, claudeArgs, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.

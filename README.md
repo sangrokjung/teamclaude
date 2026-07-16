@@ -170,6 +170,13 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
+When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
+quota status before launch. If the configured top-tier model has measured quota
+but no measured account can serve it, Claude Code is started directly on the
+first configured fallback. For `claude-opus-4-8`, the launch argument is rendered
+as `claude-opus-4-8[1m]`, so Claude Code's header and `/status` show the model and
+context window actually serving the session. An explicit non-fallback `--model`
+or `ANTHROPIC_MODEL` remains authoritative.
 Starting or restarting TeamClaude later does **not** reroute an already-open
 direct session, which can still show "out of usage credits" for its single
 logged-in account while the proxy itself is healthy.
@@ -292,11 +299,13 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 | `modelFallbacks` | Fork only — per-model fallback chains applied after live model-quota exhaustion reaches all eligible accounts or the bounded unlabeled-429 failover budget is exhausted (optional, default `{}`; see below) |
+| `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; when its measured top-tier quota is unavailable, launch directly on the first `modelFallbacks` target so the Claude Code model display matches routing (optional, default `null`) |
 
 ### Model fallbacks (fork)
 
 ```json
 {
+  "launchModel": "claude-fable-5",
   "modelFallbacks": {
     "claude-fable-5": ["claude-opus-4-8"],
     "claude-mythos-5": ["claude-opus-4-8"]
@@ -308,6 +317,9 @@ When live model-tier exhaustion (`7d_oi`) reaches all eligible accounts, selecti
 
 - The chain is resolved **once per request from the original model** (fallbacks of fallbacks are not followed) and consumed in order; when it runs dry, the pre-existing 429/continuity behavior applies unchanged.
 - Keys and targets must be **plain API model IDs**. A client-side bracket suffix (`claude-fable-5[1m]` — the API rejects such IDs as `not_found_error`) matches its suffix-stripped entry.
+- `launchModel` keeps those API IDs plain in config. Only the Claude Code launch
+  display adds `[1m]` to Opus 4.8; Claude Code strips that suffix before sending
+  the request to the proxy.
 - Fallback runs **before** a continuity-mode sleep on purpose: rewriting to a served model beats sleeping until a weekly reset.
 - A genuinely global/IP rate limit just 429s the fallback model too and falls through to the old behavior — no state is poisoned.
 - Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
