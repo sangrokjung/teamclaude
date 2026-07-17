@@ -130,9 +130,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   function commitProbeTemplate(candidate, status, elicitsModelWeekly = false) {
     if (!activeWarmup || warmupClosed) return;
     if (!(status >= 200 && status < 300)) return; // only trust an accepted shape
-    if (probeTemplate && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
+    // A template RESTORED from the last run's snapshot is provisional: it let
+    // probes work before any traffic, but upstream accepted it in a previous
+    // process — the model may have been retired since. The first freshly
+    // accepted shape therefore always replaces it (fresh evidence wins; the
+    // Fable-window upgrade then re-applies organically among fresh commits).
+    if (probeTemplate && !probeTemplate._restored
+        && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
     probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
     setImmediate(() => { warmupUnmeasured(); });
+    // Note: the already-measured accounts still missing their Fable window are
+    // healed by the periodic top-up pass (topUpModelWeekly) and by an on-demand
+    // R — NOT here. Kicking a top-up off this commit would race a concurrent R's
+    // refreshQuotaAll (both set `_warming`), skewing its M/N count for no real
+    // gain, since the periodic pass fills the same windows within one interval.
   }
 
   function buildProbeBody(t) {
@@ -231,6 +242,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           account._partialProbes = (account._partialProbes || 0) + 1;
           account._lastFruitlessProbeAt = Date.now(); // paces the slow retry backstop
         }
+        // Model-weekly (Fable) top-up accounting: if this probe's response
+        // carried the window, clear the top-up budget; if it did NOT (this
+        // account/tier just doesn't report it) count toward the cap so the
+        // top-up pass below doesn't probe it forever.
+        if (Object.keys(account.quota.modelWeekly).length > 0) account._mwProbes = 0;
+        else account._mwProbes = (account._mwProbes || 0) + 1;
         console.log(`[TeamClaude] Warm-up measured account "${account.name}"`);
         return true; // quota actually folded — the forced-refresh path counts these
       } else if (accountManager.accounts[account.index] === account
@@ -257,22 +274,25 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     return false; // skipped, fruitless, or failed — nothing was measured
   }
 
-  // Forced fleet re-measure (TUI Reload / R): probe EVERY enabled idle account,
-  // measured or not, so the dashboard reflects fresh upstream numbers on demand
-  // — usage spent from other devices/sessions never flows through this proxy,
-  // so the displayed values can silently drift until the next organic
-  // measurement. Throttled/near-quota accounts are included on purpose (their
-  // exhausted-429 responses still carry authoritative quota headers); accounts
-  // with a request in flight are skipped (that response refreshes them), as
-  // are disabled and auth-error accounts. The convergence budgets are renewed
-  // first — an explicit user action is a fresh reason to probe. Returns the
-  // number of accounts probed, or -1 when no probe template exists yet
-  // (nothing has flowed through the proxy, so there is no known-accepted
-  // request shape to replay).
+  // Forced fleet re-measure (TUI Reload / R): probe EVERY idle account —
+  // measured or not, ENABLED OR DISABLED — so the dashboard reflects fresh
+  // upstream numbers on demand. Usage spent from other devices/sessions never
+  // flows through this proxy, so the displayed values can silently drift until
+  // the next organic measurement. Disabled accounts are out of *rotation*, not
+  // out of *monitoring*: R is an explicit "show me everything" action, and a
+  // probe is read-only (it reserves no rotation slot and routes no client
+  // traffic), so refreshing a disabled account's dashboard row is safe and is
+  // what the user expects. Throttled/near-quota accounts are included on purpose
+  // (their exhausted-429 responses still carry authoritative quota headers);
+  // only accounts with a request in flight are skipped (that response refreshes
+  // them anyway). The convergence budgets are renewed first — an explicit user
+  // action is a fresh reason to probe. Returns { targets, measured }, or -1 when
+  // no probe template exists yet (nothing has flowed through the proxy, so there
+  // is no known-accepted request shape to replay).
   async function refreshQuotaAll() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming);
+      a.status !== 'error' && a.inflight === 0 && !a._warming);
     // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
     // background failure could mark an account 'error' before any real request
     // proved auth), so an account that has sat idle past its token lifetime
@@ -283,12 +303,30 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(targets.map(a =>
       accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
     const alive = targets.filter(a => a.status !== 'error');
-    for (const a of alive) a._partialProbes = 0;
+    // Renew both probe budgets — R is an explicit "measure everything now".
+    for (const a of alive) { a._partialProbes = 0; a._mwProbes = 0; }
     const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
     // Honest accounting: `targets` is what the user asked to refresh, `measured`
     // is what actually got fresh data — the TUI reports M/N, never a blanket
     // "refreshed N" while probes silently skipped or failed.
     return { targets: targets.length, measured: outcomes.filter(Boolean).length };
+  }
+
+  // Model-weekly (Fable) top-up: an account fully measured for 5h/7d but missing
+  // its 7d_oi window (measured by lower-tier traffic/probe) is NOT an ordinary
+  // warm-up candidate, so nothing re-probes it — its `Fbl` bar stays blank
+  // indefinitely. Once the committed template is known to elicit the window,
+  // re-probe such accounts (bounded by _mwProbes) so the Fable numbers self-heal
+  // within a warm-up interval instead of waiting for the user to press R while
+  // that exact account is idle. Force-probes so the fully-measured guard doesn't
+  // exclude them; still skips in-flight/disabled/error accounts.
+  async function topUpModelWeekly() {
+    if (!activeWarmup || warmupClosed || !probeTemplate || !probeTemplate._elicitsModelWeekly) return;
+    const targets = accountManager.accounts.filter(a =>
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      && accountManager.needsModelWeekly(a));
+    if (!targets.length) return;
+    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
   }
 
   // Probe every currently-unmeasured idle account in parallel. Guarded so two
@@ -316,6 +354,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // the fan-out below re-probes → fresh data → ordering/display update.
       accountManager.sweepExpired();
       warmupUnmeasured();
+      topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
@@ -416,7 +455,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // response also tells us whether this request's model tier reports
             // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
             // limit) — the one property worth a one-way template upgrade.
-            if (!probeTemplate || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
+            if (!probeTemplate || probeTemplate._restored
+                || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
               const candidate = stageProbeTemplate(req, body);
               if (candidate) commitProbeTemplate(candidate, ctx.status, ctx.sawModelWeekly === true);
             }
@@ -475,6 +515,29 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // re-measure. Kept off the HTTP surface — it spends real upstream requests,
   // so only a deliberate local action should trigger it.
   server.refreshQuotaAll = refreshQuotaAll;
+
+  // Probe-template persistence (wired into the quota snapshot by index.js).
+  // The template is the only known-accepted request shape — without persisting
+  // it, a freshly restarted idle proxy can't probe at all: quota restores from
+  // the snapshot (accounts read "measured"), no traffic flows, so forced
+  // re-measure (TUI R) returns -1 until the first genuine request. Restoring
+  // the last run's template closes that gap; it is marked `_restored` so the
+  // first freshly accepted shape replaces it (see commitProbeTemplate).
+  server.exportProbeTemplate = () => (probeTemplate ? { ...probeTemplate } : null);
+  server.importProbeTemplate = (t) => {
+    // Never clobber live evidence: a committed-in-this-process template wins.
+    if (!activeWarmup || warmupClosed || probeTemplate) return false;
+    if (!t || typeof t !== 'object' || typeof t.model !== 'string' || !t.model) return false;
+    probeTemplate = {
+      model: t.model,
+      version: typeof t.version === 'string' && t.version ? t.version : '2023-06-01',
+      beta: typeof t.beta === 'string' && t.beta ? t.beta : null,
+      system: t.system ?? null,
+      _elicitsModelWeekly: t._elicitsModelWeekly === true,
+      _restored: true,
+    };
+    return true;
+  };
 
   return server;
 }

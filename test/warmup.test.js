@@ -285,6 +285,102 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
   }
 });
 
+// A disabled account is out of ROTATION but still monitored — R's forced
+// refresh must probe it for display (a probe routes no client traffic), else
+// its dashboard row (Fable window included) stays blank forever.
+test('refreshQuotaAll refreshes disabled accounts for display too', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    const h = RL_HEADERS();
+    h['anthropic-ratelimit-unified-7d_oi-utilization'] = '0.33';
+    h['anthropic-ratelimit-unified-7d_oi-reset'] = String(Math.floor((Date.now() + 24 * HOUR) / 1000));
+    res.writeHead(200, h);
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  am.setEnabled(am.accounts[1], false);            // account a1 disabled
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const r = await proxy.refreshQuotaAll();
+    assert.equal(r.targets, 2, 'the disabled account is included in the refresh targets');
+    assert.equal(r.measured, 2, 'both accounts (incl. disabled) got fresh data');
+    assert.equal(am.accounts[1].quota.modelWeekly['7d_oi']?.utilization, 0.33,
+      "disabled account's Fable window refreshed for display");
+    assert.equal(am.accounts[1].enabled, false, 'still disabled — probing did not re-enable it');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
+// The self-heal that fixes the "one enabled account stuck without its Fbl bar"
+// report: an account fully measured for 5h/7d but missing the Fable window is
+// not an ordinary warm-up candidate, so the periodic timer's top-up pass must
+// re-probe it once the template is known to elicit that window.
+test('the periodic top-up heals a fully-measured account missing only its Fable window', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    const h = RL_HEADERS();
+    h['anthropic-ratelimit-unified-7d_oi-utilization'] = '0.5';
+    h['anthropic-ratelimit-unified-7d_oi-reset'] = String(Math.floor((Date.now() + 24 * HOUR) / 1000));
+    res.writeHead(200, h);
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 30 });
+  const proxyPort = await listen(proxy);
+  try {
+    // A Fable-tier request flows → template becomes window-eliciting and the
+    // account is measured WITH the window.
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-top', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await waitFor(() => am.accounts[0].quota.modelWeekly['7d_oi'] != null);
+
+    // Simulate the real bug: the account was measured for 5h/7d by lower-tier
+    // traffic, so its Fable window is absent while it's otherwise fully
+    // measured — and thus not an ordinary warm-up candidate.
+    delete am.accounts[0].quota.modelWeekly['7d_oi'];
+    am.accounts[0]._mwProbes = 0;
+    assert.equal(am._fullyMeasured(am.accounts[0]), true);
+    assert.deepEqual(am.warmupCandidates(), [], 'ordinary warm-up would never re-probe it');
+    assert.equal(am.needsModelWeekly(am.accounts[0]), true, 'flagged for a top-up probe');
+
+    // The periodic top-up pass must heal it with no user action, because the
+    // committed template is known to elicit the window.
+    assert.equal(await waitFor(() => am.accounts[0].quota.modelWeekly['7d_oi']?.utilization === 0.5, 3000), true,
+      'the top-up pass filled the Fable window without any user action');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
+// needsModelWeekly convergence cap: an account whose upstream genuinely never
+// reports the window must stop being topped up after the cap.
+test('needsModelWeekly caps so a never-reporting account is not probed forever', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + HOUR;
+  a.quota.unified7d = 0.1; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+  assert.equal(am.needsModelWeekly(a), true, 'fully measured, no window → needs top-up');
+  a._mwProbes = am.maxWarmupTries;
+  assert.equal(am.needsModelWeekly(a), false, 'capped after maxWarmupTries fruitless top-ups');
+  // A window sweep is a fresh reason to look again.
+  a._mwProbes = am.maxWarmupTries;
+  a.quota.modelWeekly['7d_oi'] = { utilization: 0.4, reset: Date.now() - 1000 }; // expired
+  am.sweepExpired();
+  assert.equal(a._mwProbes, 0, 'sweep renewed the top-up budget');
+});
+
 // The Fable (7d_oi) weekly window only appears on responses to requests for
 // that model tier, so a template captured from e.g. a background haiku request
 // can never refresh the Fbl numbers — the user-visible symptom is "everything
@@ -677,4 +773,101 @@ test('activeWarmup:false sends no probes (only client traffic reaches upstream)'
 
   proxy.close();
   upstream.close();
+});
+
+// ── probe-template persistence across restarts ─────────────────────────────
+
+// Regression: the probe template was memory-only, so on a freshly restarted
+// idle proxy — quota restored from the snapshot (accounts read "measured"),
+// no traffic yet — forced re-measure (TUI R) returned -1 forever ("no request
+// has flowed through the proxy yet") and the dashboard kept stale numbers.
+// A template restored from the last run's snapshot must make R work with
+// ZERO traffic through the new process.
+test('a restored probe template lets forced re-measure work before any traffic (post-restart R)', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+
+  try {
+    // Freshly started, no traffic: forced re-measure is impossible...
+    assert.equal(await proxy.refreshQuotaAll(), -1);
+    // ...until the previous run's template is restored.
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: 'b1', system: 'sys' }), true);
+    const r = await proxy.refreshQuotaAll();
+    assert.deepEqual(r, { targets: 2, measured: 2 });
+    assert.ok(measured(am, 'a0') && measured(am, 'a1'), 'both accounts got fresh quota');
+    assert.ok(seen.length >= 2 && seen.every(s => JSON.parse(s.body).model === 'claude-prev'),
+      'probes replayed the restored shape');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A restored template is PROVISIONAL: upstream accepted it in a previous
+// process, so the first freshly accepted request shape must replace it (the
+// restored model may have been retired since the snapshot was written).
+test('the first fresh commit replaces a restored template (fresh evidence wins)', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  const port = await listen(proxy);
+
+  try {
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-stale' }), true);
+    // A genuine request (different model) flows and is accepted (2xx)...
+    await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-fresh', messages: [{ role: 'user', content: 'real' }] }),
+    });
+    // ...so the template converges to the fresh shape and probes use it.
+    await waitFor(() => proxy.exportProbeTemplate()?.model === 'claude-fresh');
+    assert.equal(proxy.exportProbeTemplate().model, 'claude-fresh');
+    assert.equal(proxy.exportProbeTemplate()._restored, undefined, 'no longer marked restored');
+    seen.length = 0;
+    const r = await proxy.refreshQuotaAll();
+    assert.equal(r.measured, r.targets);
+    assert.ok(seen.every(s => JSON.parse(s.body).model === 'claude-fresh'), 'probes use the fresh shape');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// Import guards: garbage never seeds a template, a live committed template is
+// never clobbered, and export round-trips what import stored.
+test('importProbeTemplate rejects garbage and never clobbers live evidence', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9', warmupIntervalMs: 0 });
+  await listen(proxy);
+  try {
+    for (const junk of [null, 'str', 42, {}, { model: '' }, { model: 7 }]) {
+      assert.equal(proxy.importProbeTemplate(junk), false, `rejected: ${JSON.stringify(junk)}`);
+    }
+    assert.equal(await proxy.refreshQuotaAll(), -1, 'still no template after garbage imports');
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-a', beta: 3, version: 7 }), true);
+    const t = proxy.exportProbeTemplate();
+    assert.equal(t.model, 'claude-a');
+    assert.equal(t.version, '2023-06-01', 'non-string version fell back to default');
+    assert.equal(t.beta, null, 'non-string beta dropped');
+    // A second import must NOT clobber the template already in place.
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-b' }), false);
+    assert.equal(proxy.exportProbeTemplate().model, 'claude-a');
+  } finally {
+    proxy.close();
+  }
 });
