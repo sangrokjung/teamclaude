@@ -1416,6 +1416,19 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
   }
 }
 
+// Anthropic usage objects split the prompt into three input families:
+// `input_tokens` EXCLUDES the prompt cache, whose tokens arrive separately as
+// `cache_creation_input_tokens` / `cache_read_input_tokens`. Claude Code keeps
+// nearly the whole 1M context in cache, so counting `input_tokens` alone made the
+// dashboard totals accumulate ~235 tokens/request (qjc, 2026-07-20 measured) —
+// the real volume lives in the cache fields. Fold all three.
+export function sumInputTokens(usage) {
+  if (!usage || typeof usage !== 'object') return 0;
+  return (usage.input_tokens || 0)
+    + (usage.cache_creation_input_tokens || 0)
+    + (usage.cache_read_input_tokens || 0);
+}
+
 function parseSSEUsage(event, account, accountManager) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
@@ -1423,7 +1436,7 @@ function parseSSEUsage(event, account, accountManager) {
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(account, data.message.usage.input_tokens, 0);
+      accountManager.updateUsage(account, sumInputTokens(data.message.usage), 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(account, 0, data.usage.output_tokens);
     }
@@ -1436,7 +1449,7 @@ function extractUsageFromBody(buffer, account, accountManager) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(account, json.usage.input_tokens, json.usage.output_tokens);
+      accountManager.updateUsage(account, sumInputTokens(json.usage), json.usage.output_tokens);
     }
   } catch {
     // not JSON or no usage
