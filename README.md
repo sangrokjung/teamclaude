@@ -239,6 +239,14 @@ run when the general 5-hour or 7-day window is already at `switchThreshold`.
 For example, 59% Fable usage with 99% 5-hour usage is unavailable at the default
 98% threshold until the 5-hour window resets.
 
+The per-account `Total: … tokens` counter folds **all three input families** —
+`input_tokens` (uncached prompt), `cache_creation_input_tokens`, and
+`cache_read_input_tokens` — plus output tokens. Anthropic's `input_tokens`
+excludes the prompt cache, and Claude Code keeps almost the whole context cached,
+so counting `input_tokens` alone made the total accumulate only a few hundred
+tokens per request; `sumInputTokens` in `server.js` sums the cache fields so the
+displayed total reflects real volume (qjc fork).
+
 > **QJC self-lock guard:** `modelWeekly` is response-derived. The fork does not
 > restore it after restart or use it to pre-block account selection; the next
 > top-tier request refreshes the value, and a live model-quota 429 drives scoped
