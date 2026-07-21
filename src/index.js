@@ -8,6 +8,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { TUI } from './tui.js';
+import { formatBytes } from './system-metrics.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -793,6 +794,15 @@ async function statusCommand() {
 
     const pidStr = running.pid ? `pid ${running.pid}, ` : '';
     console.log(`Server:         running (${pidStr}port ${running.port})`);
+    // Host CPU/RAM of the machine the proxy runs on (absent from older servers).
+    // CPU% is measured between two status calls, so the very first call shows "-".
+    if (data.host?.cpu && data.host?.memory) {
+      const h = data.host;
+      const cpu = h.cpu.usedPct != null ? `${h.cpu.usedPct}%` : '-';
+      const load = Array.isArray(h.cpu.loadavg) ? h.cpu.loadavg[0] : '-';
+      const m = h.memory;
+      console.log(`Host:           CPU ${cpu} (load ${load} / ${h.cpu.cores} cores)   RAM ${formatBytes(m.usedBytes)}/${formatBytes(m.totalBytes)} (${m.usedPct}%)`);
+    }
     console.log(`Active account: ${data.currentAccount}`);
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 

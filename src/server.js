@@ -3,6 +3,7 @@ import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { isTokenExpiringSoon } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
+import { createHostTracker } from './system-metrics.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -12,6 +13,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
+  const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   // How long a request may wait for a per-account concurrency slot to free when
@@ -377,7 +379,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        // `host` rides along so `teamclaude status` (a separate process) can show
+        // the machine the PROXY runs on — CPU% is measured between status calls
+        // by the tracker, RAM/loadavg are instantaneous.
+        res.end(JSON.stringify({ ...accountManager.getStatus(), host: hostTracker.sample() }, null, 2));
         return;
       }
 

@@ -10,8 +10,15 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 > - **Model fallback chains (`modelFallbacks`)** — when the *whole fleet* is out of quota for the requested model, the request is rewritten to a configured fallback model and retried, instead of surfacing a 429 that kills the client's turn ([details below](#model-fallbacks-fork))
 > - **Bounded graceful shutdown** — SIGTERM/SIGINT force-exits after 5s even with live SSE/keep-alive connections, so a supervisor (launchd/systemd) can restart the proxy promptly
 > - **Network-error failover** — a pre-stream transient network error (`fetch failed`, `ECONNRESET`, …) fails the request over to another account instead of dropping the client connection (which surfaced as "Response stalled mid-stream" in Claude Code); mid-stream errors still close the connection since a partial response is not replayable
+> - **Host CPU / RAM tracking** — the machine's live CPU%, load average, and RAM usage ride along on `/teamclaude/status`, print as a `Host:` line in `teamclaude status`, and show color-coded in the TUI header (70%+ yellow, 90%+ red) — running dozens of Claude Code sessions can exhaust the host itself, and that failure mode deserves a gauge next to the quota bars
 >
-> Install this fork: `npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz` from a checkout of the `qjc/resilient-routing` branch (a tarball install copies files — a plain `npm install -g <dir>` symlinks, which breaks supervisors that can't read the checkout path, e.g. launchd vs. macOS `~/Documents` TCC).
+> Install this fork with one command (npm copies files from a git install — no symlink):
+>
+> ```bash
+> npm install -g github:sangrokjung/teamclaude
+> ```
+>
+> From a *local checkout*, prefer `npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz` (a plain `npm install -g <dir>` symlinks, which breaks supervisors that can't read the checkout path, e.g. launchd vs. macOS `~/Documents` TCC).
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
@@ -28,6 +35,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also best-effort re-measures every idle account, including disabled accounts for display, and reports an honest `M/N`
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
+- **Host CPU / RAM tracking** — live host CPU%, 1/5/15-min load average, and RAM usage in the TUI header, `teamclaude status`, and the `/teamclaude/status` JSON (`host` field); measured with Node built-ins only
 - **Zero dependencies** — uses only Node.js built-in modules
 
 ## Quick Start
@@ -35,11 +43,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install the QJC fork from its default branch
-git clone --branch qjc/resilient-routing https://github.com/sangrokjung/teamclaude.git
-cd teamclaude
-npm pack
-npm install -g ./karpeleslab-teamclaude-*.tgz
+# Install the QJC fork (one command — npm packs & copies the default branch)
+npm install -g github:sangrokjung/teamclaude
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -217,6 +222,22 @@ restarting the proxy. Inspect that supervisor's logs and health-check grace
 period; repeated forced restarts create a no-listener window that surfaces as
 `ConnectionRefused`. Do not run `teamclaude stop` from inside the affected
 proxied Claude Code session.
+
+### Host CPU / RAM line
+
+`teamclaude status` prints a `Host:` line for the machine the *proxy* runs on:
+
+```
+Host:           CPU 43.3% (load 18.99 / 16 cores)   RAM 63.2GB/64.0GB (98.8%)
+```
+
+CPU% is measured between two status calls (the counters are cumulative), so the
+very first call after a server start shows `-`. The TUI header shows the same
+numbers compactly (`CPU 43% · RAM 98% · Port 3456 ▲`), turning yellow at 70%
+and red at 90% — a host drowning in Claude Code sessions kills the proxy along
+with everything else, so it gets a gauge right next to the quota bars. The raw
+values (including the full 1/5/15-minute load-average triple and byte counts)
+are in the `host` field of `GET /teamclaude/status`.
 
 ### Understand the quota numbers
 

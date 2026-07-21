@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { createHostTracker } from './system-metrics.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -121,6 +122,7 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
     this.onQuit = onQuit;
+    this._host = createHostTracker(); // host CPU/RAM shown in the header
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -653,7 +655,18 @@ export class TUI {
     // ── Header
     const left = bold(' TeamClaude');
     const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    // Host CPU/RAM at a glance (render loop ticks often enough for live CPU%).
+    // Thresholds mirror the quota bars: calm → green-ish default, 70%+ warns,
+    // 90%+ screams — this box dying from overload is a real failure mode.
+    const h = this._host.sample();
+    const paint = (pct, s) => (pct == null ? dim(s) : pct >= 90 ? red(s) : pct >= 70 ? yellow(s) : s);
+    const cpuS = paint(h.cpu.usedPct, `CPU ${h.cpu.usedPct != null ? h.cpu.usedPct.toFixed(0) + '%' : '–'}`);
+    const memS = paint(h.memory.usedPct, `RAM ${h.memory.usedPct != null ? h.memory.usedPct.toFixed(0) + '%' : '–'}`);
+    // The host segment is optional: on a narrow terminal (W can be as low as 40)
+    // the full header would exceed W — Math.max floors the gap at 1 but the line
+    // itself would wrap and corrupt the fixed frame. Drop CPU/RAM before Port.
+    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} Port ${port} ${green('▲')} `;
+    if (vw(left) + vw(right) + 1 > W) right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
