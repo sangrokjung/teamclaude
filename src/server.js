@@ -349,7 +349,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsPartialRemeasure(a));
     if (!targets.length) return;
-    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
+    // Revive lapsed tokens FIRST (same rationale as refreshQuotaAll): a partial
+    // account is typically weekly-exhausted → out of rotation → zero client
+    // traffic → its OAuth token lapses past the 8h lifetime, and warmupAccount
+    // deliberately skips expiring-token accounts (background probes never
+    // refresh). Without this step the re-probe silently never happens and the
+    // session/Fable blanks persist (measured 2026-07-22: 6 accounts stuck).
+    // A refresh failure marks the account 'error', which drops it from future
+    // targets — no retry loop; a success is one refresh per ~8h, negligible.
+    await Promise.all(targets.map(a =>
+      accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status */ })));
+    const alive = targets.filter(a => a.status !== 'error');
+    if (!alive.length) return;
+    await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
   }
 
   // Probe every currently-unmeasured idle account in parallel. Guarded so two
