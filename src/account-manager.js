@@ -622,6 +622,30 @@ export class AccountManager {
   }
 
   /**
+   * A PARTIALLY-measured OAuth account: one unified window is present but the
+   * other is missing, so it is neither fully measured nor a candidate for either
+   * automatic re-probe path. This is the post-restart weekly-only case: the lazy
+   * sweep clears an EXPIRED session (5h) window while a still-future weekly (7d)
+   * window survives — and when that weekly window is exhausted no real traffic
+   * reaches the account to repopulate the rest either.
+   *
+   * Why `_isMeasured` (any-data) gating misses it: `_isMeasured` is already true
+   * from the surviving window, so `warmupUnmeasured` won't re-probe it; yet
+   * `needsModelWeekly` requires `_fullyMeasured`, so that path skips it too. Its
+   * session/Fable numbers would stay a permanent blank. Flag it for a FORCED
+   * re-probe (one response repopulates both windows). `_partialProbes` — already
+   * managed by warmupAccount (reset to 0 on a fully-measured probe, incremented
+   * on a half-measured one) — caps the retries so a genuinely half-reporting
+   * upstream is not probed every interval forever.
+   */
+  needsPartialRemeasure(account) {
+    return account.type === 'oauth'
+      && this._isMeasured(account)
+      && !this._fullyMeasured(account)
+      && (account._partialProbes || 0) < this.maxWarmupTries;
+  }
+
+  /**
    * An account still needing warm-up: available, not yet MEASURED, under the
    * per-account attempt cap.
    *

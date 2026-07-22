@@ -331,6 +331,27 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
   }
 
+  // Partial-quota top-up: after a restart the lazy sweep clears an expired
+  // session (5h) window while a still-future weekly (7d) window survives, so an
+  // account is measured for one window only. `_isMeasured` (any-data) is already
+  // true, so warmupUnmeasured skips it; it isn't fully measured, so
+  // needsModelWeekly skips it too — and if the surviving weekly window is
+  // exhausted, no real traffic reaches it. Its session/Fable numbers stay a
+  // permanent blank. Re-probe such accounts (bounded by _partialProbes) so one
+  // response repopulates both windows. Force-probes so the near-quota guard
+  // doesn't exclude an exhausted account (its exhausted-429 still carries
+  // authoritative 5h/7d headers); still skips in-flight/disabled/error accounts.
+  // Unlike topUpModelWeekly this needs no window-eliciting template — any
+  // accepted probe shape repopulates the unified windows.
+  async function topUpPartialQuota() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return;
+    const targets = accountManager.accounts.filter(a =>
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      && accountManager.needsPartialRemeasure(a));
+    if (!targets.length) return;
+    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
+  }
+
   // Probe every currently-unmeasured idle account in parallel. Guarded so two
   // triggers (first-commit + the interval) can't run overlapping fan-outs.
   async function warmupUnmeasured() {
@@ -356,6 +377,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // the fan-out below re-probes → fresh data → ordering/display update.
       accountManager.sweepExpired();
       warmupUnmeasured();
+      topUpPartialQuota(); // heal half-measured accounts (a window swept, the other survives)
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
