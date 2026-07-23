@@ -1,26 +1,100 @@
-# TeamClaude / TeamCodex
+<p align="center">
+  <img src="docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
+</p>
 
-Multi-account proxy with automatic quota-based rotation for Claude Code and OpenAI Codex CLI.
+<h1 align="center">TeamClaude · TeamCodex</h1>
 
-It manages Claude and Codex subscription accounts in separate local pools, replacing upstream credentials per request and switching accounts when one reaches its session or weekly quota limit.
+<p align="center">
+  <strong>One local proxy. Every coding account. No interrupted sessions.</strong>
+</p>
 
-> **This is the `qjc/resilient-routing` fork** (`1.2.3-qjc.x`) of [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), based on upstream `v1.2.3` and adding:
->
-> - **Top-tier weekly-window model routing** — a live `claude-fable-*` / `claude-mythos-*` quota 429 is classified with the model-scoped weekly window (`7d_oi`) and failed over or sent through the configured fallback chain without globally throttling an account that can still serve Opus
-> - **Model fallback chains (`modelFallbacks`)** — when the *whole fleet* is out of quota for the requested model, the request is rewritten to a configured fallback model and retried, instead of surfacing a 429 that kills the client's turn ([details below](#model-fallbacks-fork))
-> - **Bounded graceful shutdown** — SIGTERM/SIGINT force-exits after 5s even with live SSE/keep-alive connections, so a supervisor (launchd/systemd) can restart the proxy promptly
-> - **Network-error failover** — a pre-stream transient network error (`fetch failed`, `ECONNRESET`, …) fails the request over to another account instead of dropping the client connection (which surfaced as "Response stalled mid-stream" in Claude Code); mid-stream errors still close the connection since a partial response is not replayable
-> - **Host CPU / RAM tracking** — the machine's live CPU%, load average, and RAM usage ride along on `/teamclaude/status`, print as a `Host:` line in `teamclaude status`, and show color-coded in the TUI header (70%+ yellow, 90%+ red) — running dozens of Claude Code sessions can exhaust the host itself, and that failure mode deserves a gauge next to the quota bars
->
-> Install this fork with one command (npm copies files from a git install — no symlink):
->
-> ```bash
-> npm install -g github:sangrokjung/teamclaude
-> ```
->
-> From a *local checkout*, prefer `npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz` (a plain `npm install -g <dir>` symlinks, which breaks supervisors that can't read the checkout path, e.g. launchd vs. macOS `~/Documents` TCC).
+<p align="center">
+  Run Claude Code and OpenAI Codex CLI through independent multi-account pools<br>
+  with quota-aware routing, instant failover, and a live terminal dashboard.
+</p>
 
-![TeamClaude TUI](screenshots/teamclaude.png)
+<p align="center">
+  <img src="https://img.shields.io/badge/tests-200%20passing-58e3a2?style=flat-square" alt="200 tests passing">
+  <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18+">
+  <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="Zero runtime dependencies">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start"><strong>Quick Start</strong></a> ·
+  <a href="#codex-multi-account-setup"><strong>Codex Setup</strong></a> ·
+  <a href="#live-dashboard"><strong>Dashboard</strong></a> ·
+  <a href="#how-it-works"><strong>Architecture</strong></a>
+</p>
+
+> [!NOTE]
+> Claude and Codex use separate configs, ports, and account pools. Both proxies can stay online together, while Codex CLI and Hermes Agent keep using one stable local endpoint.
+
+## Live dashboard
+
+<p align="center">
+  <img src="docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
+</p>
+
+<p align="center"><sub>Actual TeamCodex TUI layout rendered with sanitized demo accounts.</sub></p>
+
+## Why this exists
+
+AI coding subscriptions have independent session and weekly limits. A long-running
+terminal should not die just because one account reaches its cap. TeamClaude and
+TeamCodex keep the client connected to a stable local endpoint and move new work to
+the best available account automatically.
+
+<table>
+  <tr>
+    <td width="50%">
+      <strong>⚡ Seamless failover</strong><br>
+      Switch accounts on quota, rate, network, or upstream failures without changing the client command.
+    </td>
+    <td width="50%">
+      <strong>🧭 Quota-aware routing</strong><br>
+      Spend the account whose weekly allowance resets soonest, preserving quota that would otherwise expire unused.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <strong>🧠 Cache-friendly affinity</strong><br>
+      Keep sequential turns on the same account while spreading concurrent overflow across the pool.
+    </td>
+    <td width="50%">
+      <strong>🖥️ Operable by humans</strong><br>
+      Inspect usage, switch accounts, disable unhealthy entries, and reorder priorities from the TUI.
+    </td>
+  </tr>
+</table>
+
+<details>
+<summary><strong>What the QJC resilient-routing fork adds</strong></summary>
+
+This is the `qjc/resilient-routing` fork (`1.2.3-qjc.x`) of
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), based on
+upstream `v1.2.3`.
+
+- **Codex subscription pooling** with isolated official OAuth login sessions.
+- **Top-tier weekly-window model routing** for model-scoped `7d_oi` quota.
+- **Model fallback chains** through configurable `modelFallbacks`.
+- **Bounded graceful shutdown** for reliable launchd/systemd restarts.
+- **Network-error failover** with a bounded one-sweep retry budget.
+- **Host CPU and RAM tracking** in status JSON, CLI output, and the TUI.
+- **Hermes Agent compatibility** through the stable TeamCodex endpoint.
+
+Install this fork with one command:
+
+```bash
+npm install -g github:sangrokjung/teamclaude
+```
+
+From a local checkout, prefer
+`npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz`. A plain
+`npm install -g <dir>` symlinks the checkout, which can break supervisors that
+cannot read that path.
+
+</details>
 
 ## Features
 
@@ -456,6 +530,26 @@ When live model-tier exhaustion (`7d_oi`) reaches all eligible accounts, selecti
 - Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
 
 ## How It Works
+
+```mermaid
+flowchart LR
+    CC["Claude Code"] --> TC["TeamClaude · :3456"]
+    CX["Codex CLI"] --> TX["TeamCodex · :3457"]
+    HA["Hermes Agent"] --> TX
+
+    TC --> CA{"Claude account pool"}
+    TX --> OA{"Codex account pool"}
+
+    CA --> C1["Account A"]
+    CA --> C2["Account B"]
+    CA --> C3["Account C"]
+    OA --> O1["Account A"]
+    OA --> O2["Account B"]
+    OA --> O3["Account C"]
+
+    C1 & C2 & C3 --> AN["Anthropic API"]
+    O1 & O2 & O3 --> OP["OpenAI Codex API"]
+```
 
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
