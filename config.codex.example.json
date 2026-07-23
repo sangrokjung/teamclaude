@@ -1,0 +1,35 @@
+{
+  "provider": "codex",
+  "proxy": {
+    "port": 3457,
+    "apiKey": "tc-change-me-to-a-secret"
+  },
+  "upstream": "https://chatgpt.com/backend-api/codex",
+  "switchThreshold": 0.98,
+  "maxConcurrentPerAccount": 3,
+  "sessionAffinity": true,
+  "overflowQueueTimeoutMs": 15000,
+  "activeWarmup": false,
+  "accounts": [
+    {
+      "name": "codex-pro-1",
+      "provider": "codex",
+      "type": "oauth",
+      "accountUuid": "chatgpt-account-id-1",
+      "accountId": "chatgpt-account-id-1",
+      "accessToken": "import-with-teamclaude-codex-login",
+      "refreshToken": "import-with-teamclaude-codex-login",
+      "priority": 1
+    },
+    {
+      "name": "codex-pro-2",
+      "provider": "codex",
+      "type": "oauth",
+      "accountUuid": "chatgpt-account-id-2",
+      "accountId": "chatgpt-account-id-2",
+      "accessToken": "import-with-teamclaude-codex-login",
+      "refreshToken": "import-with-teamclaude-codex-login",
+      "priority": 2
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshCodexAccessToken } from './codex.js';
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
@@ -58,9 +59,12 @@ export class AccountManager {
       index,
       name: acct.name,
       type: acct.type,
+      provider: acct.provider || 'anthropic',
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
+      idToken: acct.idToken || null,
+      accountId: acct.accountId || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
       // Manual on/off switch. A disabled account is excluded from ALL rotation
@@ -872,18 +876,27 @@ export class AccountManager {
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    const codexPrimary = parseFloat(headers['x-codex-primary-used-percent']);
+    const codexSecondary = parseFloat(headers['x-codex-secondary-used-percent']);
+    const u5h = Number.isFinite(codexPrimary)
+      ? codexPrimary / 100
+      : parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const u7d = Number.isFinite(codexSecondary)
+      ? codexSecondary / 100
+      : parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
-    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
+    const r5h = headers['x-codex-primary-reset-at']
+      || headers['anthropic-ratelimit-unified-5h-reset'];
+    const r7d = headers['x-codex-secondary-reset-at']
+      || headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
-    account.quota.unifiedStatus = uStatus || null;
+    const codexReached = headers['x-codex-rate-limit-reached-type'];
+    account.quota.unifiedStatus = uStatus || (codexReached ? 'rejected' : null);
 
     // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
     // for the top model tier ("Fable" in Claude's usage UI). These headers only
@@ -929,9 +942,11 @@ export class AccountManager {
     if (this._isNearQuota(account)) {
       const pct = account.quota.unified7d != null
         ? (account.quota.unified7d * 100).toFixed(1)
-        : account.quota.tokensLimit
-          ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
-          : '?';
+        : account.quota.unified5h != null
+          ? (account.quota.unified5h * 100).toFixed(1)
+          : account.quota.tokensLimit
+            ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
+            : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
   }
@@ -1012,10 +1027,17 @@ export class AccountManager {
     account._refreshPromise = (async () => {
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
-        const newTokens = await refreshAccessToken(account.refreshToken);
+        const newTokens = account.provider === 'codex'
+          ? await refreshCodexAccessToken(account.refreshToken)
+          : await refreshAccessToken(account.refreshToken);
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        if (newTokens.idToken) account.idToken = newTokens.idToken;
+        if (newTokens.accountId) {
+          account.accountId = newTokens.accountId;
+          account.accountUuid = newTokens.accountId;
+        }
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         // Only persist if the account is still live at its claimed index. If it was
         // removed during the (awaited) network refresh, its `.index` is stale and
@@ -1047,13 +1069,24 @@ export class AccountManager {
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
-  updateAccountTokens(accountIndex, { accessToken, refreshToken, expiresAt }) {
+  updateAccountTokens(accountIndex, {
+    accessToken,
+    refreshToken,
+    expiresAt,
+    idToken,
+    accountId,
+  }) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    if (idToken) account.idToken = idToken;
+    if (accountId) {
+      account.accountId = accountId;
+      account.accountUuid = accountId;
+    }
     if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
@@ -1062,6 +1095,8 @@ export class AccountManager {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
+      idToken: account.idToken,
+      accountId: account.accountId,
     });
   }
 
@@ -1074,9 +1109,12 @@ export class AccountManager {
       index,
       name: acctData.name,
       type: acctData.type,
+      provider: acctData.provider || 'anthropic',
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
+      idToken: acctData.idToken || null,
+      accountId: acctData.accountId || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
       enabled: acctData.enabled !== false,
@@ -1276,6 +1314,7 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        provider: a.provider,
         status: a.status,
         enabled: a.enabled !== false,
         priority: a.priority ?? null,

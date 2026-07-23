@@ -2,15 +2,29 @@
 
 import { spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import {
+  buildCodexProxyArgs,
+  importCodexCredentials,
+  parseCodexCredentialsJson,
+  refreshCodexAccessToken,
+} from './codex.js';
 import { TUI } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 
 const args = process.argv.slice(2);
+const cliProvider = args[0] === 'codex' ? 'codex' : 'anthropic';
+if (cliProvider === 'codex') {
+  args.shift();
+  process.env.TEAMCLAUDE_PROVIDER = 'codex';
+}
 const command = args[0];
 
 switch (command) {
@@ -87,6 +101,8 @@ switch (command) {
 
 async function serverCommand() {
   const config = await loadOrCreateConfig();
+  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  const codexMode = isCodexMode(config);
 
   // --log-to <dir>
   const logTo = argValue('--log-to');
@@ -95,9 +111,14 @@ async function serverCommand() {
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
-    console.error('  teamclaude import           Import from Claude Code');
-    console.error('  teamclaude login            OAuth login via browser');
-    console.error('  teamclaude login --api      Add an API key');
+    if (codexMode) {
+      console.error('  teamclaude codex login      Isolated Codex OAuth login');
+      console.error('  teamclaude codex import     Import the current Codex login');
+    } else {
+      console.error('  teamclaude import           Import from Claude Code');
+      console.error('  teamclaude login            OAuth login via browser');
+      console.error('  teamclaude login --api      Add an API key');
+    }
     process.exit(1);
   }
 
@@ -168,6 +189,11 @@ async function serverCommand() {
       config.accounts[memIdx].accessToken = newTokens.accessToken;
       config.accounts[memIdx].refreshToken = newTokens.refreshToken;
       config.accounts[memIdx].expiresAt = newTokens.expiresAt;
+      if (newTokens.idToken) config.accounts[memIdx].idToken = newTokens.idToken;
+      if (newTokens.accountId) {
+        config.accounts[memIdx].accountId = newTokens.accountId;
+        config.accounts[memIdx].accountUuid = newTokens.accountId;
+      }
     }
     atomicConfigUpdate(diskConfig => {
       // Persist ONLY the refreshed account's tokens. We deliberately do NOT ingest
@@ -182,6 +208,11 @@ async function serverCommand() {
         diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
         diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
         diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
+        if (newTokens.idToken) diskConfig.accounts[cfgIdx].idToken = newTokens.idToken;
+        if (newTokens.accountId) {
+          diskConfig.accounts[cfgIdx].accountId = newTokens.accountId;
+          diskConfig.accounts[cfgIdx].accountUuid = newTokens.accountId;
+        }
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
@@ -212,6 +243,8 @@ async function serverCommand() {
             accessToken: am.credential,
             refreshToken: am.refreshToken,
             expiresAt: am.expiresAt,
+            idToken: am.idToken,
+            accountId: am.accountId,
           } : a;
           const diskAcct = (a.accountUuid && diskConfig.accounts.find(d => d.accountUuid === a.accountUuid))
             || diskConfig.accounts.find(d => d.name === a.name);
@@ -291,19 +324,23 @@ async function serverCommand() {
       const sep = '='.repeat(60);
       console.log('');
       console.log(sep);
-      console.log('  TeamClaude Proxy');
+      console.log(codexMode ? '  TeamCodex Proxy' : '  TeamClaude Proxy');
       console.log(sep);
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
-      console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
+      console.log(`  Upstream:   ${config.upstream || (codexMode ? 'https://chatgpt.com/backend-api/codex' : 'https://api.anthropic.com')}`);
       console.log('');
       accounts.forEach((a, i) => {
         console.log(`  [${i + 1}] ${a.name} (${a.type})`);
       });
       console.log('');
-      console.log('  Run Claude through proxy:  teamclaude run');
-      console.log('  Show env vars:             teamclaude env');
+      console.log(codexMode
+        ? '  Run Codex through proxy:   teamclaude codex run'
+        : '  Run Claude through proxy:  teamclaude run');
+      console.log(codexMode
+        ? '  Show env vars:             teamclaude codex env'
+        : '  Show env vars:             teamclaude env');
       console.log(sep);
       console.log('');
     }
@@ -500,6 +537,8 @@ async function restartCommand() {
 
 async function importCommand() {
   const config = await loadOrCreateConfig();
+  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  const codexMode = isCodexMode(config);
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -510,36 +549,58 @@ async function importCommand() {
     // or flat: --json '{"accessToken":"...","refreshToken":"...","expiresAt":...}'
     try {
       const raw = JSON.parse(jsonStr);
-      const data = raw.claudeAiOauth || raw;
-      if (!data.accessToken) {
-        console.error('JSON must contain "accessToken" (directly or under "claudeAiOauth")');
-        process.exit(1);
+      if (codexMode) {
+        creds = parseCodexCredentialsJson(raw);
+      } else {
+        const data = raw.claudeAiOauth || raw;
+        if (!data.accessToken) {
+          console.error('JSON must contain "accessToken" (directly or under "claudeAiOauth")');
+          process.exit(1);
+        }
+        creds = {
+          accessToken: data.accessToken,
+          refreshToken: data.refreshToken,
+          expiresAt: data.expiresAt,
+        };
       }
-      creds = {
-        accessToken: data.accessToken,
-        refreshToken: data.refreshToken,
-        expiresAt: data.expiresAt,
-      };
     } catch (err) {
       console.error(`Failed to parse --json: ${err.message}`);
       process.exit(1);
     }
   } else {
-    const fromPath = argValue('--from') || '~/.claude/.credentials.json';
+    const fromPath = argValue('--from')
+      || (codexMode ? '~/.codex/auth.json' : '~/.claude/.credentials.json');
     try {
-      creds = await importCredentials(fromPath);
+      creds = codexMode
+        ? await importCodexCredentials(fromPath)
+        : await importCredentials(fromPath);
     } catch (err) {
       console.error(`Failed to import from ${fromPath}: ${err.message}`);
       process.exit(1);
     }
   }
 
-  await upsertOAuthAccount(config, name, creds, 'import');
+  if (codexMode) {
+    await upsertCodexAccount(config, name, creds, 'import');
+  } else {
+    await upsertOAuthAccount(config, name, creds, 'import');
+  }
 }
 
 // ── login ───────────────────────────────────────────────────
 
 async function loginCommand() {
+  const config = await loadOrCreateConfig();
+  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  if (isCodexMode(config)) {
+    if (args.includes('--api')) {
+      console.error('Codex subscription pooling supports ChatGPT OAuth accounts only.');
+      process.exit(1);
+    }
+    await loginCodexCommand(config);
+    return;
+  }
+
   if (args.includes('--api')) {
     await loginApiCommand();
     return;
@@ -570,6 +631,34 @@ async function loginCommand() {
     default:
       console.error(`Invalid choice: ${choice.trim()}`);
       process.exit(1);
+  }
+}
+
+async function loginCodexCommand(config) {
+  const codexHome = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
+  const loginArgs = ['login', '-c', 'cli_auth_credentials_store="file"'];
+  if (args.includes('--device-auth')) loginArgs.push('--device-auth');
+
+  try {
+    console.log('Starting isolated Codex OAuth login...');
+    const result = spawnSync('codex', loginArgs, {
+      stdio: 'inherit',
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    if (result.error) {
+      if (result.error.code === 'ENOENT') {
+        console.error('Codex CLI not found in PATH. Install it first.');
+      } else {
+        console.error(`Failed to start Codex login: ${result.error.message}`);
+      }
+      process.exit(1);
+    }
+    if (result.status !== 0) process.exit(result.status ?? 1);
+
+    const creds = await importCodexCredentials(join(codexHome, 'auth.json'));
+    await upsertCodexAccount(config, argValue('--name'), creds, 'login');
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
   }
 }
 
@@ -623,6 +712,10 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
+  if (isCodexMode(config)) {
+    console.log('teamclaude codex run');
+    return;
+  }
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
@@ -744,19 +837,40 @@ async function runCommand() {
   const config = await loadOrCreateConfig();
 
   // Everything after 'run' (skip -- separator if present)
-  const claudeArgs = args.slice(1);
-  if (claudeArgs[0] === '--') claudeArgs.shift();
+  const clientArgs = args.slice(1);
+  if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
+  if (isCodexMode(config)) {
+    delete childEnv.OPENAI_API_KEY;
+    delete childEnv.CODEX_API_KEY;
+    delete childEnv.CODEX_ACCESS_TOKEN;
+    delete childEnv.TEAMCLAUDE_CODEX_PROXY_TOKEN;
+    const codexArgs = buildCodexProxyArgs(config.proxy.port, clientArgs);
+    const result = spawnSync('codex', codexArgs, {
+      stdio: 'inherit',
+      env: childEnv,
+    });
+    if (result.error) {
+      if (result.error.code === 'ENOENT') {
+        console.error('Codex CLI not found in PATH. Install it first.');
+      } else {
+        console.error(`Failed to start codex: ${result.error.message}`);
+      }
+      process.exit(1);
+    }
+    process.exit(result.status ?? 1);
+  }
+
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
-  await syncLaunchModel(config, claudeArgs, childEnv);
+  await syncLaunchModel(config, clientArgs, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
-  const result = spawnSync('claude', claudeArgs, {
+  const result = spawnSync('claude', clientArgs, {
     stdio: 'inherit',
     env: childEnv,
   });
@@ -867,22 +981,38 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
+      const newTokens = a.provider === 'codex'
+        ? await refreshCodexAccessToken(a.refreshToken)
+        : await refreshAccessToken(a.refreshToken);
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
+      if (newTokens.idToken) a.idToken = newTokens.idToken;
+      if (newTokens.accountId) {
+        a.accountId = newTokens.accountId;
+        a.accountUuid = newTokens.accountId;
+      }
+      if (newTokens.email) a.email = newTokens.email;
+      if (newTokens.planType) a.planType = newTokens.planType;
       configDirty = true;
-    } catch (err) {
-      // refresh failed — fetchProfile will report the specific error
-    }
+    } catch {}
   }));
   if (configDirty) await saveConfig(config);
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
-    config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
-    )
+    config.accounts.map(a => {
+      if (a.type !== 'oauth' || !a.accessToken) return null;
+      if (a.provider === 'codex') {
+        return {
+          accountUuid: a.accountId || a.accountUuid,
+          email: a.email || null,
+          planType: a.planType || null,
+          provider: 'codex',
+        };
+      }
+      return fetchProfile(a.accessToken);
+    })
   );
 
   // Deduplicate by accountUuid — keep the last (most recently added) entry
@@ -901,7 +1031,7 @@ async function accountsCommand() {
         // Update stored UUID and name from profile
         if (profiles[i] && !profiles[i].error) {
           a.accountUuid = profiles[i].accountUuid;
-          if (profiles[i].email) a.name = profiles[i].email;
+          if (a.provider !== 'codex' && profiles[i].email) a.name = profiles[i].email;
         }
       }
     }
@@ -921,24 +1051,34 @@ async function accountsCommand() {
 
     // OAuth account
     const hasProfile = p && !p.error;
+    if (a.provider === 'codex') {
+      const plan = p?.planType || a.planType || 'subscription';
+      const src = a.source ? `, ${a.source}` : '';
+      console.log(`  [${i + 1}] ${a.name} (Codex ${plan}${src})`);
+      if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
+      if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
+      continue;
+    }
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
     const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
-    if (verbose && a.expiresAt) {
-      const remaining = a.expiresAt - Date.now();
-      if (remaining <= 0) {
-        console.log(`       Token: expired`);
-      } else {
-        const mins = Math.floor(remaining / 60000);
-        const hrs = Math.floor(mins / 60);
-        const expiry = hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`;
-        console.log(`       Token: expires in ${expiry}`);
-      }
-    }
+    if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
   }
+}
+
+function printTokenExpiry(expiresAt) {
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) {
+    console.log('       Token: expired');
+    return;
+  }
+  const mins = Math.floor(remaining / 60000);
+  const hrs = Math.floor(mins / 60);
+  const expiry = hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`;
+  console.log(`       Token: expires in ${expiry}`);
 }
 
 // ── api ─────────────────────────────────────────────────────
@@ -970,12 +1110,18 @@ async function apiCommand() {
 
   const credential = account.accessToken || account.apiKey;
   const isOAuth = account.type === 'oauth';
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  const codexMode = isCodexMode(config);
+  const upstream = config.upstream || (codexMode
+    ? 'https://chatgpt.com/backend-api/codex'
+    : 'https://api.anthropic.com');
   const url = path.startsWith('http') ? path : `${upstream}${path}`;
 
   const headers = isOAuth
     ? { 'Authorization': `Bearer ${credential}` }
     : { 'x-api-key': credential };
+  if (codexMode && account.accountId) {
+    headers['ChatGPT-Account-ID'] = account.accountId;
+  }
 
   const fetchOpts = { method, headers };
   if (data) {
@@ -1086,6 +1232,38 @@ async function setPriorityCommand() {
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
+  if (cliProvider === 'codex') {
+    console.log(`TeamCodex - Multi-account Codex subscription proxy
+
+Usage: teamclaude codex [command] [options]
+
+Commands:
+  server              Start the Codex proxy server
+  stop                Stop the running Codex proxy
+  restart             Restart the Codex proxy
+  login               Add an account with an isolated official Codex OAuth login
+  import              Import the current ~/.codex/auth.json
+  run [-- args...]    Run Codex through the multi-account proxy
+  env                 Print an equivalent Codex launch command
+  status              Show proxy & account status
+  accounts            List configured Codex accounts
+  remove <name>       Remove an account
+  disable <name>      Disable an account
+  enable <name>       Re-enable an account
+  priority <name> <n> Set selection priority ("auto" clears it)
+  api <path>          Call a ChatGPT backend endpoint with one account
+  help                Show this help
+
+Options:
+  --name NAME         Set account name (import/login)
+  --from PATH         Codex auth path (default: ~/.codex/auth.json)
+  --device-auth       Use the Codex device login flow
+  --log-to DIR        Log full requests/responses to DIR
+
+Config: ${getConfigPath()}
+`);
+    return;
+  }
   console.log(`TeamClaude - Multi-account Claude proxy
 
 Usage: teamclaude [command] [options]
@@ -1175,6 +1353,49 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
   console.log(`Saved to ${getConfigPath()}`);
 }
 
+async function upsertCodexAccount(config, name, creds, source = 'unknown') {
+  if (!name) name = creds.email;
+  if (!name) {
+    let n = 1;
+    do { name = `codex-account-${n++}`; } while (config.accounts.some(a => a.name === name));
+  }
+
+  const account = {
+    name,
+    provider: 'codex',
+    type: 'oauth',
+    source,
+    accountUuid: creds.accountId,
+    accountId: creds.accountId,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    idToken: creds.idToken,
+    expiresAt: creds.expiresAt,
+    email: creds.email,
+    planType: creds.planType,
+  };
+
+  let idx = config.accounts.findIndex(a =>
+    a.accountUuid === creds.accountId || a.accountId === creds.accountId);
+  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
+
+  if (idx >= 0) {
+    const previous = config.accounts[idx];
+    if (previous.enabled !== undefined) account.enabled = previous.enabled;
+    if (previous.priority !== undefined) account.priority = previous.priority;
+    if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+    config.accounts[idx] = account;
+    console.log(`Updated Codex account "${name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added Codex account "${name}"`);
+  }
+
+  config.provider = 'codex';
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+}
+
 // ── config sync helpers ─────────────────────────────────────
 
 /**
@@ -1239,13 +1460,27 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        const creds = diskAcct.provider === 'codex'
+          ? await importCodexCredentials(diskAcct.importFrom)
+          : await importCredentials(diskAcct.importFrom);
+        freshCred = {
+          accessToken: creds.accessToken,
+          refreshToken: creds.refreshToken,
+          expiresAt: creds.expiresAt,
+          idToken: creds.idToken,
+          accountId: creds.accountId,
+        };
       } catch (err) {
         console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
       }
     } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
-      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+      freshCred = {
+        accessToken: diskAcct.accessToken,
+        refreshToken: diskAcct.refreshToken,
+        expiresAt: diskAcct.expiresAt,
+        idToken: diskAcct.idToken,
+        accountId: diskAcct.accountId,
+      };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
     }
@@ -1254,7 +1489,8 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
+        mgr.refreshToken !== freshCred.refreshToken ||
+        (freshCred.accountId && mgr.accountId !== freshCred.accountId);
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
@@ -1274,16 +1510,31 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
 // ── helpers ─────────────────────────────────────────────────
 
+function isCodexMode(config) {
+  return config?.provider === 'codex' || cliProvider === 'codex';
+}
+
 async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
       if (acct.importFrom) {
         try {
-          const creds = await importCredentials(acct.importFrom);
+          const creds = acct.provider === 'codex'
+            ? await importCodexCredentials(acct.importFrom)
+            : await importCredentials(acct.importFrom);
           // Carry accountUuid through so the live account can be matched UUID-first
           // on sync (otherwise it stays null and a name change misroutes the update).
-          accounts.push({ name: acct.name, type: 'oauth', accountUuid: acct.accountUuid, maxConcurrent: acct.maxConcurrent, enabled: acct.enabled, priority: acct.priority, ...creds });
+          accounts.push({
+            name: acct.name,
+            provider: acct.provider || config.provider || 'anthropic',
+            type: 'oauth',
+            accountUuid: acct.accountUuid,
+            maxConcurrent: acct.maxConcurrent,
+            enabled: acct.enabled,
+            priority: acct.priority,
+            ...creds,
+          });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
         } catch (err) {
           console.error(`Failed to import "${acct.name}": ${err.message}`);

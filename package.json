@@ -1,7 +1,7 @@
 {
   "name": "@karpeleslab/teamclaude",
   "version": "1.2.3-qjc.1",
-  "description": "Multi-account Claude proxy with automatic quota-based rotation",
+  "description": "Multi-account Claude Code and Codex proxy with quota-based rotation",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -18,6 +18,8 @@
   "keywords": [
     "claude",
     "anthropic",
+    "codex",
+    "openai",
     "proxy",
     "load-balancer",
     "multi-account"

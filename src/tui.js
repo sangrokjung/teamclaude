@@ -1,4 +1,5 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -332,7 +333,7 @@ export class TUI {
 
   _keyAdd(k) {
     if (k === 'i') { this._doImport(); this.mode = 'normal'; }
-    else if (k === 'k') {
+    else if (k === 'k' && this.config.provider !== 'codex') {
       this.mode = 'input';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
@@ -392,6 +393,10 @@ export class TUI {
   }
 
   async _doImport() {
+    if (this.config.provider === 'codex') {
+      await this._doImportCodex();
+      return;
+    }
     try {
       this._addLog('Importing credentials...');
       const creds = await importCredentials('~/.claude/.credentials.json');
@@ -466,6 +471,58 @@ export class TUI {
       await this.saveConfig(this.config);
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
+    }
+  }
+
+  async _doImportCodex() {
+    try {
+      this._addLog('Importing Codex credentials...');
+      const creds = await importCodexCredentials();
+      let name = creds.email;
+      if (!name) {
+        let n = 1;
+        do { name = `codex-account-${n++}`; } while (this.config.accounts.some(a => a.name === name));
+      }
+      const entry = {
+        name,
+        provider: 'codex',
+        type: 'oauth',
+        source: 'import',
+        accountUuid: creds.accountId,
+        accountId: creds.accountId,
+        accessToken: creds.accessToken,
+        refreshToken: creds.refreshToken,
+        idToken: creds.idToken,
+        expiresAt: creds.expiresAt,
+        email: creds.email,
+        planType: creds.planType,
+      };
+      let idx = this.config.accounts.findIndex(a =>
+        a.accountUuid === creds.accountId || a.accountId === creds.accountId);
+      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+
+      if (idx >= 0) {
+        const previous = this.config.accounts[idx];
+        if (previous.enabled !== undefined) entry.enabled = previous.enabled;
+        if (previous.priority !== undefined) entry.priority = previous.priority;
+        this.config.accounts[idx] = entry;
+        const live = this.am.accounts.find(a =>
+          a.accountUuid === creds.accountId || a.name === previous.name);
+        if (live) {
+          this.am.updateAccountTokens(live, creds);
+          live.name = name;
+        } else {
+          this.am.addAccount(entry);
+        }
+        this._addLog(`Updated Codex account "${name}"`);
+      } else {
+        this.config.accounts.push(entry);
+        this.am.addAccount(entry);
+        this._addLog(`Imported Codex account "${name}"`);
+      }
+      await this.saveConfig(this.config);
+    } catch (e) {
+      this._addLog(`Codex import failed: ${e.message}`);
     }
   }
 
@@ -653,8 +710,8 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' TeamClaude');
-    const port = this.config.proxy?.port || 3456;
+    const left = bold(this.config.provider === 'codex' ? ' TeamCodex' : ' TeamClaude');
+    const port = this.config.proxy?.port || (this.config.provider === 'codex' ? 3457 : 3456);
     // Host CPU/RAM at a glance (render loop ticks often enough for live CPU%).
     // Thresholds mirror the quota bars: calm → green-ish default, 70%+ warns,
     // 90%+ screams — this box dying from overload is a real failure mode.
@@ -846,7 +903,9 @@ export class TUI {
       case 'order':
         return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto-all (reset order, weekly-reset)  ${bold('c')}lear rank  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
-        return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
+        return this.config.provider === 'codex'
+          ? ` ${bold('i')}mport Codex login  ${bold('Esc')} cancel`
+          : ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputBuf}█`;
       default:

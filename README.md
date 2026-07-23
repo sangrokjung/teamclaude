@@ -1,8 +1,8 @@
-# TeamClaude
+# TeamClaude / TeamCodex
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+Multi-account proxy with automatic quota-based rotation for Claude Code and OpenAI Codex CLI.
 
-Sits transparently between Claude Code and the Anthropic API, managing multiple Claude Max (or API key) accounts and automatically switching when one approaches its session or weekly quota limit.
+It manages Claude and Codex subscription accounts in separate local pools, replacing upstream credentials per request and switching accounts when one reaches its session or weekly quota limit.
 
 > **This is the `qjc/resilient-routing` fork** (`1.2.3-qjc.x`) of [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), based on upstream `v1.2.3` and adding:
 >
@@ -25,6 +25,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
+- **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. A request-global 429 never throttles the fleet; after that bounded failover budget it enters continuity handling or passes through
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
@@ -70,6 +71,86 @@ You can also import existing Claude Code credentials instead of logging in:
 claude /login           # Log into an account in Claude Code
 teamclaude import       # Import its credentials
 ```
+
+## Codex Multi-account Setup
+
+Codex uses a separate config (`~/.config/teamcodex.json`) and port (`3457`), so
+the Claude and Codex proxies can run at the same time.
+
+```bash
+# Add accounts with isolated official Codex OAuth sessions.
+# Each login uses a temporary CODEX_HOME, so its refresh token is owned only by
+# TeamCodex after import and cannot race the normal ~/.codex/auth.json.
+teamclaude codex login --name codex-pro-1
+teamclaude codex login --name codex-pro-2
+
+# Start the Codex proxy
+teamclaude codex server
+
+# In another terminal, run the interactive Codex CLI through the account pool
+teamclaude codex run
+
+# Non-interactive Codex commands are forwarded after `--`
+teamclaude codex run -- exec "summarize this repository"
+```
+
+You can import the account currently logged into the official Codex CLI instead:
+
+```bash
+codex login
+teamclaude codex import --name codex-pro-1
+```
+
+The isolated `teamclaude codex login` flow is recommended. A direct import copies
+the same rotating refresh token used by `~/.codex/auth.json`; running plain
+`codex` afterward can rotate that token outside the proxy. If that happens,
+re-import the account or log it in again through `teamclaude codex login`.
+
+`teamclaude codex run` starts an HTTP-only Responses provider that still uses
+Codex's first-party ChatGPT auth path (`requires_openai_auth = true`) and
+redirects `chatgpt_base_url` to the local proxy. This preserves the
+subscription-only model catalog while preventing the default Responses
+WebSocket from bypassing the HTTP proxy. The proxy discards the client's
+incoming bearer token and account ID before forwarding, then injects the
+selected pool account's credentials. The official Codex CLI must still have a
+normal ChatGPT login to initialize its first-party auth path, but that
+credential is never forwarded upstream by TeamCodex.
+
+Codex usage is learned from response headers as traffic flows, so newly added
+accounts show unmeasured quota until each account handles a request.
+
+Common controls mirror the Claude pool:
+
+```bash
+teamclaude codex status
+teamclaude codex accounts
+teamclaude codex disable codex-pro-1
+teamclaude codex enable codex-pro-1
+teamclaude codex priority codex-pro-2 0
+teamclaude codex restart
+```
+
+### Hermes Agent through TeamCodex
+
+Keep the Codex proxy running and point Hermes at the stable local endpoint:
+
+```yaml
+# ~/.hermes/config.yaml
+model:
+  default: gpt-5.6-sol
+  provider: openai-codex
+  base_url: http://127.0.0.1:3457
+```
+
+If Hermes has `openai-codex` entries in its credential pool, set each entry's
+`base_url` to the same local endpoint as well. Restart the Hermes gateway after
+changing its configuration. Hermes keeps talking to one stable URL while
+TeamCodex selects, refreshes, and rotates the upstream Codex account.
+
+Run `teamclaude codex server` in a TTY to open the Codex account dashboard.
+It uses the Codex config and port independently from the Claude dashboard, so
+both proxies can stay online at the same time. For a non-interactive health
+check, use `teamclaude codex status`.
 
 ## Adding Accounts
 

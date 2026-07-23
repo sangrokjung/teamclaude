@@ -12,7 +12,10 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 export function createProxyServer(accountManager, config, hooks = {}) {
-  const upstream = config.upstream || 'https://api.anthropic.com';
+  const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
+  const upstream = config.upstream || (provider === 'codex'
+    ? 'https://chatgpt.com/backend-api/codex'
+    : 'https://api.anthropic.com');
   const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -90,7 +93,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // refreshes tokens or mutates account status, reserves a real cap slot so it
   // can't push an account over maxConcurrent, and only learns from a 2xx (or an
   // account-level quota 429). `config.activeWarmup: false` disables it all.
-  const activeWarmup = config.activeWarmup !== false;
+  const activeWarmup = provider === 'anthropic' && config.activeWarmup !== false;
   const warmupIntervalMs = Number.isFinite(config.warmupIntervalMs)
     ? Math.max(0, config.warmupIntervalMs)
     : 5 * 60 * 1000;
@@ -399,9 +402,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     try {
       // Auth check — skip for localhost connections
       const clientKey = req.headers['x-api-key'];
+      const authorization = req.headers.authorization;
+      const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        ? authorization.slice('Bearer '.length)
+        : null;
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
+      if (proxyApiKey && clientKey !== proxyApiKey && bearerKey !== proxyApiKey && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -442,7 +449,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // Let client token refresh requests pass through to upstream untouched.
         // The proxy manages its own tokens via ensureTokenFresh(); intercepting
         // or rewriting client refreshes would cause token rotation conflicts.
-        if (req.method === 'POST' && req.url === '/v1/oauth/token') {
+        if (provider === 'anthropic'
+            && req.method === 'POST' && req.url === '/v1/oauth/token') {
           await relayRaw(req, res, upstream, maxBodyBytes);
           return; // outer finally decrements inFlightProxied
         }
@@ -454,7 +462,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -934,13 +942,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
     if (lk === 'x-api-key') continue;
+    if (lk === 'authorization') continue;
+    if (lk === 'chatgpt-account-id') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
     headers[key] = value;
   }
 
-  if (isOAuth) {
+  if (ctx.provider === 'codex') {
+    headers['authorization'] = `Bearer ${account.credential}`;
+    if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+  } else if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
     headers['x-api-key'] = account.credential;
@@ -990,7 +1003,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // Extract rate limit headers
     const rateLimitHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-codex-')) {
         rateLimitHeaders[key] = value;
       }
     }
@@ -1478,6 +1491,12 @@ function parseSSEUsage(event, account, accountManager) {
       accountManager.updateUsage(account, sumInputTokens(data.message.usage), 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(account, 0, data.usage.output_tokens);
+    } else if (data.type === 'response.completed' && data.response?.usage) {
+      accountManager.updateUsage(
+        account,
+        sumInputTokens(data.response.usage),
+        data.response.usage.output_tokens,
+      );
     }
   } catch {
     // not valid JSON, skip
