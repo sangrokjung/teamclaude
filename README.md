@@ -1,4 +1,10 @@
 <p align="center">
+  <strong>English</strong> ·
+  <a href="README.ko.md">한국어</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <img src="docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
 </p>
 
