@@ -271,7 +271,84 @@ test('a model-scoped weekly limit over threshold does NOT make the account unava
     'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
   });
   assert.equal(am._isAvailable(am.accounts[0]), true);
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-fable-5'), true,
+    'response-derived model quota must not pre-block its own refresh request');
   assert.equal(am.getActiveAccount().name, 'acct-0');
+});
+
+test('Opus remains eligible when the Fable/Mythos 7d_oi window is exhausted', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fallback', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+
+  const opus = await am.acquireAccount(null, 0, null, null, 'claude-opus-4-8');
+  assert.equal(opus.name, 'fable-full', 'Fable quota must not pre-block the Opus fallback');
+  am.releaseAccount(opus);
+});
+
+test('model-scoped cache never pre-blocks the request that can refresh it', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+
+  const fable = await am.acquireAccount(null, 0, null, null, 'claude-fable-5');
+  assert.equal(fable.name, 'fable-full', 'cached 7d_oi must not self-lock the preferred account');
+  am.releaseAccount(fable);
+});
+
+test('live 7d_oi data classifies Fable/Mythos 429s without pre-blocking selection', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
+  ], 0.98);
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + HOUR,
+  };
+  for (let i = 0; i < am.accounts.length; i++) {
+    setSession(am, i, 0.1, HOUR);
+    setWeekly(am, i, 0.1, HOUR);
+  }
+
+  for (const model of ['claude-fable-5', 'claude-mythos-5']) {
+    assert.equal(am.isModelExhausted(am.accounts[0], model), true,
+      `${model} must classify the live 7d_oi window`);
+    const acct = await am.acquireAccount(null, 0, null, null, model);
+    assert.equal(acct.name, 'fable-full', `${model} must still reach upstream to refresh the window`);
+    am.releaseAccount(acct);
+  }
+  assert.equal(am.isModelExhausted(am.accounts[0], 'claude-opus-4-8'), false);
+});
+
+test('a headerless response clears stale unifiedStatus across models', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const reset = String(Math.floor((Date.now() + HOUR) / 1000));
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-reset': reset,
+    'anthropic-ratelimit-unified-7d-utilization': '0.1',
+    'anthropic-ratelimit-unified-7d-reset': reset,
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-reset': reset,
+  });
+  assert.equal(am.isModelExhausted(0, 'claude-fable-5'), true);
+  assert.equal(am.isExhausted(0), true);
+
+  am.updateQuota(0, {});
+  assert.equal(am.accounts[0].quota.unifiedStatus, null);
+  assert.equal(am.isExhausted(0), false,
+    'a later transient 429 must not inherit another response status');
 });
 
 // Regression (review finding): a partial header pair — 7d-reset present but
@@ -347,7 +424,7 @@ test('sweepExpired clears rolled-over windows so warm-up can re-measure (idle pr
 
 // ── quota snapshot persistence (survives a server restart) ───────────────────
 
-test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a future throttle', () => {
+test('exportQuotaState → importQuotaState restores general quota but re-measures modelWeekly', () => {
   const now = Date.now();
   const am1 = new AccountManager(makeAccounts(2), 0.98);
   am1.accounts[0].accountUuid = 'uuid-0';
@@ -358,13 +435,21 @@ test('exportQuotaState → importQuotaState round-trips quota, modelWeekly and a
   am1.updateQuota(1, {});                            // bump usage counters only
 
   const snapshot = JSON.parse(JSON.stringify(am1.exportQuotaState())); // via-disk fidelity
+  assert.deepEqual(snapshot[0].quota.modelWeekly, {},
+    'response-derived model windows are not persisted');
+
+  snapshot[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: now + 4 * 24 * HOUR,
+  };
 
   const am2 = new AccountManager(makeAccounts(2), 0.98);
   am2.accounts[0].accountUuid = 'uuid-0';
   am2.importQuotaState(snapshot);
   assert.equal(am2.accounts[0].quota.unified5h, 0.54);
   assert.equal(am2.accounts[0].quota.unified7d, 0.86);
-  assert.equal(am2.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94);
+  assert.deepEqual(am2.accounts[0].quota.modelWeekly, {},
+    'response-derived model windows are dropped to avoid a restart self-lock');
   assert.equal(am2.accounts[0].status, 'throttled', 'future throttle restored');
   assert.equal(am2._isMeasured(am2.accounts[0]), true, 'restored account skips warm-up');
   assert.equal(am2.accounts[1].usage.totalRequests, 1, 'usage counters carried over');

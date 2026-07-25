@@ -10,6 +10,12 @@
   "overflowQueueTimeoutMs": 15000,
   "activeWarmup": true,
   "warmupIntervalMs": 300000,
+  "modelFallbacks": {
+    "claude-fable-5": [
+      "claude-opus-4-8",
+      "claude-sonnet-5"
+    ]
+  },
   "accounts": [
     {
       "name": "primary-max",

@@ -7,7 +7,10 @@ import { randomBytes } from 'node:crypto';
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  const fileName = process.env.TEAMCLAUDE_PROVIDER === 'codex'
+    ? 'teamcodex.json'
+    : 'teamclaude.json';
+  return join(configDir, fileName);
 }
 
 // Runtime state for the running server (pid/port), written next to the config so
@@ -64,12 +67,16 @@ export function writeQuotaCacheSync(data) {
 }
 
 export function createDefaultConfig() {
+  const provider = process.env.TEAMCLAUDE_PROVIDER === 'codex' ? 'codex' : 'anthropic';
   return {
+    provider,
     proxy: {
-      port: 3456,
+      port: provider === 'codex' ? 3457 : 3456,
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
-    upstream: 'https://api.anthropic.com',
+    upstream: provider === 'codex'
+      ? 'https://chatgpt.com/backend-api/codex'
+      : 'https://api.anthropic.com',
     switchThreshold: 0.98,
     // Max simultaneous in-flight requests per account before load spreads to the
     // next account (per-account `maxConcurrent` overrides this). Tune to just
@@ -83,6 +90,22 @@ export function createDefaultConfig() {
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,
+    // Keep client requests inside the proxy while quota/cooldowns recover rather
+    // than surfacing a 429 that interrupts an interactive Claude Code session.
+    continuityMode: true,
+    continuityMaxSleepMs: 30000,
+    continuityJitterMs: 500,
+    // One alternate account distinguishes a per-account rate cap from a global
+    // limit without multiplying one request across the whole fleet.
+    rateLimitFailovers: 1,
+    // When the whole fleet is out of quota for a requested model, rewrite the
+    // request to these fallback models (in order) instead of surfacing the 429.
+    // Keys and targets are plain API model IDs (no "[1m]"-style suffixes); a
+    // suffixed incoming model falls back to its suffix-stripped entry.
+    // e.g. { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
+    modelFallbacks: {},
+    activeWarmup: provider === 'anthropic',
+    launchModel: null,
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

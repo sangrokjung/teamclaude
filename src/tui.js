@@ -1,4 +1,6 @@
 import { importCredentials, fetchProfile } from './oauth.js';
+import { importCodexCredentials } from './codex.js';
+import { createHostTracker } from './system-metrics.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -121,6 +123,7 @@ export class TUI {
     this.syncAccounts = syncAccounts;
     this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
     this.onQuit = onQuit;
+    this._host = createHostTracker(); // host CPU/RAM shown in the header
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -330,7 +333,7 @@ export class TUI {
 
   _keyAdd(k) {
     if (k === 'i') { this._doImport(); this.mode = 'normal'; }
-    else if (k === 'k') {
+    else if (k === 'k' && this.config.provider !== 'codex') {
       this.mode = 'input';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
@@ -390,6 +393,10 @@ export class TUI {
   }
 
   async _doImport() {
+    if (this.config.provider === 'codex') {
+      await this._doImportCodex();
+      return;
+    }
     try {
       this._addLog('Importing credentials...');
       const creds = await importCredentials('~/.claude/.credentials.json');
@@ -464,6 +471,58 @@ export class TUI {
       await this.saveConfig(this.config);
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
+    }
+  }
+
+  async _doImportCodex() {
+    try {
+      this._addLog('Importing Codex credentials...');
+      const creds = await importCodexCredentials();
+      let name = creds.email;
+      if (!name) {
+        let n = 1;
+        do { name = `codex-account-${n++}`; } while (this.config.accounts.some(a => a.name === name));
+      }
+      const entry = {
+        name,
+        provider: 'codex',
+        type: 'oauth',
+        source: 'import',
+        accountUuid: creds.accountId,
+        accountId: creds.accountId,
+        accessToken: creds.accessToken,
+        refreshToken: creds.refreshToken,
+        idToken: creds.idToken,
+        expiresAt: creds.expiresAt,
+        email: creds.email,
+        planType: creds.planType,
+      };
+      let idx = this.config.accounts.findIndex(a =>
+        a.accountUuid === creds.accountId || a.accountId === creds.accountId);
+      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+
+      if (idx >= 0) {
+        const previous = this.config.accounts[idx];
+        if (previous.enabled !== undefined) entry.enabled = previous.enabled;
+        if (previous.priority !== undefined) entry.priority = previous.priority;
+        this.config.accounts[idx] = entry;
+        const live = this.am.accounts.find(a =>
+          a.accountUuid === creds.accountId || a.name === previous.name);
+        if (live) {
+          this.am.updateAccountTokens(live, creds);
+          live.name = name;
+        } else {
+          this.am.addAccount(entry);
+        }
+        this._addLog(`Updated Codex account "${name}"`);
+      } else {
+        this.config.accounts.push(entry);
+        this.am.addAccount(entry);
+        this._addLog(`Imported Codex account "${name}"`);
+      }
+      await this.saveConfig(this.config);
+    } catch (e) {
+      this._addLog(`Codex import failed: ${e.message}`);
     }
   }
 
@@ -651,9 +710,20 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(' TeamClaude');
-    const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    const left = bold(this.config.provider === 'codex' ? ' TeamCodex' : ' TeamClaude');
+    const port = this.config.proxy?.port || (this.config.provider === 'codex' ? 3457 : 3456);
+    // Host CPU/RAM at a glance (render loop ticks often enough for live CPU%).
+    // Thresholds mirror the quota bars: calm → green-ish default, 70%+ warns,
+    // 90%+ screams — this box dying from overload is a real failure mode.
+    const h = this._host.sample();
+    const paint = (pct, s) => (pct == null ? dim(s) : pct >= 90 ? red(s) : pct >= 70 ? yellow(s) : s);
+    const cpuS = paint(h.cpu.usedPct, `CPU ${h.cpu.usedPct != null ? h.cpu.usedPct.toFixed(0) + '%' : '–'}`);
+    const memS = paint(h.memory.usedPct, `RAM ${h.memory.usedPct != null ? h.memory.usedPct.toFixed(0) + '%' : '–'}`);
+    // The host segment is optional: on a narrow terminal (W can be as low as 40)
+    // the full header would exceed W — Math.max floors the gap at 1 but the line
+    // itself would wrap and corrupt the fixed frame. Drop CPU/RAM before Port.
+    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} Port ${port} ${green('▲')} `;
+    if (vw(left) + vw(right) + 1 > W) right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
@@ -667,11 +737,14 @@ export class TUI {
       // two (Ses / Wk) on mid widths, one on narrow ones.
       const showThree = W >= 92;
       const showBoth = W >= 70;
+      // The +4 in each offset reserves the width of the leading row-number
+      // column (" NN." + its separator), so adding it doesn't push the bars
+      // past the terminal edge and clip the rightmost (Fbl) bar.
       const bw = showThree
-        ? Math.max(5, Math.min(20, Math.floor((W - 62) / 3)))
+        ? Math.max(5, Math.min(20, Math.floor((W - 66) / 3)))
         : showBoth
-          ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-          : Math.max(5, Math.min(20, W - 45));
+          ? Math.max(5, Math.min(20, Math.floor((W - 60) / 2)))
+          : Math.max(5, Math.min(20, W - 49));
 
       // Sync the cursor position to the anchored account before drawing — the
       // display order may have changed since the last frame (quota updates
@@ -735,6 +808,11 @@ export class TUI {
     const sel = isMoving ? cyan('⇅') : isSel ? cyan('>') : ' ';
     const cur = isCur ? green('►') : ' ';
 
+    // Row number — the account's 1-based position in the displayed order, so
+    // the list is easy to reference at a glance. Right-aligned to 2 cols (fleet
+    // sizes are small; a 3rd digit just widens the gutter for 100+ accounts).
+    const num = gray(String(pos + 1).padStart(2) + '.');
+
     // Name (bold if selected)
     const rawName = a.name.slice(0, 12).padEnd(12);
     const name = isSel ? bold(rawName) : rawName;
@@ -797,7 +875,7 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    let line = ` ${sel}${cur} ${num} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
@@ -825,7 +903,9 @@ export class TUI {
       case 'order':
         return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto-all (reset order, weekly-reset)  ${bold('c')}lear rank  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
-        return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
+        return this.config.provider === 'codex'
+          ? ` ${bold('i')}mport Codex login  ${bold('Esc')} cancel`
+          : ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputBuf}█`;
       default:

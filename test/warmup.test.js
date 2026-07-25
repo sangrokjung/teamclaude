@@ -285,6 +285,257 @@ test('refreshQuotaAll re-probes already-measured accounts with fresh values', as
   }
 });
 
+// A disabled account is out of ROTATION but still monitored — R's forced
+// refresh must probe it for display (a probe routes no client traffic), else
+// its dashboard row (Fable window included) stays blank forever.
+test('refreshQuotaAll refreshes disabled accounts for display too', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    const h = RL_HEADERS();
+    h['anthropic-ratelimit-unified-7d_oi-utilization'] = '0.33';
+    h['anthropic-ratelimit-unified-7d_oi-reset'] = String(Math.floor((Date.now() + 24 * HOUR) / 1000));
+    res.writeHead(200, h);
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  am.setEnabled(am.accounts[1], false);            // account a1 disabled
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 0 });
+  const proxyPort = await listen(proxy);
+  try {
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const r = await proxy.refreshQuotaAll();
+    assert.equal(r.targets, 2, 'the disabled account is included in the refresh targets');
+    assert.equal(r.measured, 2, 'both accounts (incl. disabled) got fresh data');
+    assert.equal(am.accounts[1].quota.modelWeekly['7d_oi']?.utilization, 0.33,
+      "disabled account's Fable window refreshed for display");
+    assert.equal(am.accounts[1].enabled, false, 'still disabled — probing did not re-enable it');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
+// The self-heal that fixes the "one enabled account stuck without its Fbl bar"
+// report: an account fully measured for 5h/7d but missing the Fable window is
+// not an ordinary warm-up candidate, so the periodic timer's top-up pass must
+// re-probe it once the template is known to elicit that window.
+test('the periodic top-up heals a fully-measured account missing only its Fable window', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    const h = RL_HEADERS();
+    h['anthropic-ratelimit-unified-7d_oi-utilization'] = '0.5';
+    h['anthropic-ratelimit-unified-7d_oi-reset'] = String(Math.floor((Date.now() + 24 * HOUR) / 1000));
+    res.writeHead(200, h);
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 30 });
+  const proxyPort = await listen(proxy);
+  try {
+    // A Fable-tier request flows → template becomes window-eliciting and the
+    // account is measured WITH the window.
+    await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-top', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await waitFor(() => am.accounts[0].quota.modelWeekly['7d_oi'] != null);
+
+    // Simulate the real bug: the account was measured for 5h/7d by lower-tier
+    // traffic, so its Fable window is absent while it's otherwise fully
+    // measured — and thus not an ordinary warm-up candidate.
+    delete am.accounts[0].quota.modelWeekly['7d_oi'];
+    am.accounts[0]._mwProbes = 0;
+    assert.equal(am._fullyMeasured(am.accounts[0]), true);
+    assert.deepEqual(am.warmupCandidates(), [], 'ordinary warm-up would never re-probe it');
+    assert.equal(am.needsModelWeekly(am.accounts[0]), true, 'flagged for a top-up probe');
+
+    // The periodic top-up pass must heal it with no user action, because the
+    // committed template is known to elicit the window.
+    assert.equal(await waitFor(() => am.accounts[0].quota.modelWeekly['7d_oi']?.utilization === 0.5, 3000), true,
+      'the top-up pass filled the Fable window without any user action');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
+// needsModelWeekly convergence cap: an account whose upstream genuinely never
+// reports the window must stop being topped up after the cap.
+test('needsModelWeekly caps so a never-reporting account is not probed forever', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + HOUR;
+  a.quota.unified7d = 0.1; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+  assert.equal(am.needsModelWeekly(a), true, 'fully measured, no window → needs top-up');
+  a._mwProbes = am.maxWarmupTries;
+  assert.equal(am.needsModelWeekly(a), false, 'capped after maxWarmupTries fruitless top-ups');
+  // A window sweep is a fresh reason to look again.
+  a._mwProbes = am.maxWarmupTries;
+  a.quota.modelWeekly['7d_oi'] = { utilization: 0.4, reset: Date.now() - 1000 }; // expired
+  am.sweepExpired();
+  assert.equal(a._mwProbes, 0, 'sweep renewed the top-up budget');
+});
+
+// ── unit: needsPartialRemeasure() ──────────────────────────────────────────
+// After a restart the lazy sweep clears an EXPIRED session (5h) window while a
+// still-future weekly (7d) window survives, leaving an OAuth account measured
+// for one window only. It's invisible to BOTH automatic re-probe paths, so a
+// forced partial re-probe is needed to repopulate its session/Fable numbers.
+
+test('needsPartialRemeasure flags a half-measured (weekly-only) OAuth account', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const partial = am.accounts[0];
+  // The session window was swept; the weekly window survived AND is exhausted
+  // (0.99 ≥ threshold), so no real traffic reaches this account either.
+  partial.quota.unified7d = 0.99;
+  partial.quota.unified7dReset = Date.now() + 24 * HOUR;
+
+  assert.equal(am._isMeasured(partial), true, 'weekly data alone counts as measured');
+  assert.equal(am._fullyMeasured(partial), false, 'but the session window is missing');
+  // Both automatic paths skip it: warmupUnmeasured because it's weekly-exhausted
+  // (unavailable), needsModelWeekly because it isn't fully measured.
+  assert.equal(am.warmupCandidates().includes(partial), false, 'ordinary warm-up skips it');
+  assert.equal(am.needsModelWeekly(partial), false, 'needsModelWeekly requires fully measured');
+  // → only the forced partial re-probe path catches it.
+  assert.equal(am.needsPartialRemeasure(partial), true, 'partially measured → needs a forced re-probe');
+});
+
+test('needsPartialRemeasure is false for a fully-measured account', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.1; a.quota.unified5hReset = Date.now() + HOUR;
+  a.quota.unified7d = 0.2; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+  assert.equal(am._fullyMeasured(a), true);
+  assert.equal(am.needsPartialRemeasure(a), false, 'nothing missing → not a re-probe target');
+});
+
+test('needsPartialRemeasure is false for API-key accounts', () => {
+  const am = new AccountManager([{ name: 'k', type: 'api', apiKey: 'sk' }], 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.tokensLimit = 1000; a.quota.tokensRemaining = 900; // standard (API-key) data
+  assert.equal(am._isMeasured(a), true);
+  assert.equal(am.needsPartialRemeasure(a), false, 'type gate excludes non-oauth accounts');
+});
+
+test('needsPartialRemeasure caps after maxWarmupTries fruitless probes', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const a = am.accounts[0];
+  a.quota.unified7d = 0.5; a.quota.unified7dReset = Date.now() + 24 * HOUR; // half-measured
+  assert.equal(am.needsPartialRemeasure(a), true, 'half-measured → needs a re-probe');
+  a._partialProbes = am.maxWarmupTries;
+  assert.equal(am.needsPartialRemeasure(a), false, 'capped after maxWarmupTries');
+});
+
+// ── integration: topUpPartialQuota through the real warmupAccount probe path ──
+// Proves the cap is not just a unit predicate but actually stops the periodic
+// top-up from probing forever. The mechanism under test lives in warmupAccount
+// (server.js): a probe that leaves the account still half-measured runs
+// `account._partialProbes = (account._partialProbes||0)+1`, and one that fully
+// measures it resets it to 0 — so `needsPartialRemeasure`'s cap converges. These
+// exercise it end-to-end via the periodic timer (topUpPartialQuota is a private
+// closure; the timer is its only public trigger).
+
+test('topUpPartialQuota caps probes on a genuinely half-reporting upstream (no infinite probing)', async () => {
+  let probeCount = 0;
+  // An upstream that answers a probe with ONLY the weekly (7d) window — never
+  // the session (5h) window — so an account it "measures" stays half-measured
+  // forever (a genuinely half-reporting upstream). Its 7d is exhausted (0.99),
+  // so the account is unavailable → NOT an ordinary warm-up candidate, making
+  // topUpPartialQuota the only path that probes it (a clean probe count).
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const c of req) raw += c;
+    if (raw.includes('"max_tokens":1')) probeCount++;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-7d-utilization': '0.99',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
+  await listen(proxy);
+  try {
+    // Put the account into the exact post-restart partial state FIRST (weekly
+    // window present + exhausted, session window absent, fresh budget) — set
+    // before the template goes live so no unmeasured-warm-up probe can race in.
+    const a = am.accounts[0];
+    a.quota.unified7d = 0.99; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+    a._partialProbes = 0;
+    // Inject a known-accepted probe template (no client traffic needed) so the
+    // periodic top-up can probe.
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-x' }), true);
+    assert.equal(am.needsPartialRemeasure(a), true, 'starts eligible for a partial re-probe');
+    assert.equal(am.warmupCandidates().includes(a), false,
+      'exhausted → ordinary warm-up skips it (topUpPartialQuota is the only prober)');
+
+    // The periodic timer fires topUpPartialQuota repeatedly. Each probe leaves
+    // the account half-measured (upstream never sends 5h), so _partialProbes
+    // climbs to the cap and then needsPartialRemeasure goes false — probing stops.
+    assert.equal(await waitFor(() => (a._partialProbes || 0) >= am.maxWarmupTries, 3000), true,
+      'the top-up probed up to the cap');
+    assert.equal(am.needsPartialRemeasure(a), false, 'capped after maxWarmupTries fruitless probes');
+
+    // Prove it STAYS capped: snapshot the probe count, wait ~10 more timer
+    // intervals, and confirm no further probes fire — the cap holds (no leak).
+    const settled = probeCount;
+    assert.ok(settled >= am.maxWarmupTries, `probed at least the cap (${settled} ≥ ${am.maxWarmupTries})`);
+    await new Promise(r => setTimeout(r, 200));
+    assert.equal(probeCount, settled, 'no further probes after the cap — infinite probing is prevented');
+    assert.equal(a._partialProbes, am.maxWarmupTries, 'counter held at the cap, not climbing');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
+test('topUpPartialQuota resolves a half-measured account when a probe returns both windows', async () => {
+  // The probe now gets a COMPLETE response (both 5h and 7d) → the account
+  // becomes fully measured and its partial-remeasure budget resets to 0.
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+      'anthropic-ratelimit-unified-7d-utilization': '0.99',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
+  await listen(proxy);
+  try {
+    const a = am.accounts[0];
+    // Half-measured: weekly present + exhausted (so it's unavailable → only
+    // topUpPartialQuota probes it, not ordinary warm-up), session absent.
+    a.quota.unified7d = 0.99; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+    a._partialProbes = 1; // pretend a couple of fruitless probes already happened
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-x' }), true);
+    assert.equal(am._fullyMeasured(a), false, 'session window missing');
+    assert.equal(am.needsPartialRemeasure(a), true);
+    assert.equal(am.warmupCandidates().includes(a), false, 'topUpPartialQuota is the only prober');
+
+    // The periodic top-up probes it; the complete response fully measures it.
+    assert.equal(await waitFor(() => am._fullyMeasured(a), 3000), true, 'probe repopulated both windows');
+    assert.equal(a.quota.unified5h != null, true, 'session window repopulated');
+    assert.equal(a._partialProbes, 0, 'fruitless-probe budget reset on a full measurement');
+    assert.equal(am.needsPartialRemeasure(a), false, 'no longer a partial-remeasure target — resolved');
+  } finally {
+    await new Promise(r2 => proxy.close(r2));
+    await new Promise(r2 => upstream.close(r2));
+  }
+});
+
 // The Fable (7d_oi) weekly window only appears on responses to requests for
 // that model tier, so a template captured from e.g. a background haiku request
 // can never refresh the Fbl numbers — the user-visible symptom is "everything
