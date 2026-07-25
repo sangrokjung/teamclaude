@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="多个 AI 编程账户通过一个可靠的本地代理连接" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="多个 AI 编程账户通过一个可靠的本地代理连接" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -48,6 +48,8 @@ teamcodex server          # 启动代理，然后执行 `teamcodex run`
 
 `teamcodex` 和 `teamclaude` 两个命令都会安装，行为完全一致。
 
+想直接从仓库安装也可以：`npm i -g github:sangrokjung/teamclaude`，这种方式始终跟随默认分支。
+
 ## 关于使用条款
 
 **本项目仅用于管理你自己拥有的账号，不支持也不鼓励账号共享、代充或转售。**
@@ -74,7 +76,7 @@ Fork 谱系：[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude
 ## 实时仪表盘
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="显示三个演示账户的 TeamCodex 终端仪表盘" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="显示三个演示账户的 TeamCodex 终端仪表盘" width="100%">
 </p>
 
 <p align="center"><sub>使用脱敏演示账户渲染的真实 TeamCodex TUI 布局。</sub></p>
@@ -130,7 +132,7 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 
 ```bash
 # 安装
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 
 # 添加 Claude 账户——会打开浏览器 OAuth
 teamclaude login

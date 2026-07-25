@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -48,6 +48,9 @@ teamcodex server          # start the proxy, then `teamcodex run`
 
 Both `teamcodex` and `teamclaude` are installed as commands and behave identically.
 
+Prefer installing straight from the repository? `npm i -g github:sangrokjung/teamclaude`
+works too and always tracks the default branch.
+
 ## Is this against the Terms of Service?
 
 No. This does not share, resell, or pool accounts between people.
@@ -81,7 +84,7 @@ Upstream has features this fork does not, so pick whichever fits your setup.
 ## Live dashboard
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
 </p>
 
 <p align="center"><sub>Actual TeamCodex TUI layout rendered with sanitized demo accounts.</sub></p>
@@ -134,7 +137,7 @@ upstream `v1.2.3`.
 Install this fork with one command:
 
 ```bash
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 ```
 
 From a local checkout, prefer
@@ -166,8 +169,8 @@ cannot read that path.
 Requires Node.js 18+.
 
 ```bash
-# Install the QJC fork (one command — npm packs & copies the default branch)
-npm install -g github:sangrokjung/teamclaude
+# Install from npm
+npm install -g teamcodex
 
 # Add your first account (opens browser for OAuth)
 teamclaude login

@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="여러 AI 코딩 계정이 하나의 안정적인 로컬 프록시로 연결되는 모습" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="여러 AI 코딩 계정이 하나의 안정적인 로컬 프록시로 연결되는 모습" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -48,6 +48,9 @@ teamcodex server          # 프록시 시작 후 `teamcodex run`
 
 `teamcodex`와 `teamclaude` 두 명령이 함께 설치되고 동작은 같습니다.
 
+저장소에서 바로 받고 싶다면 `npm i -g github:sangrokjung/teamclaude`도 동작합니다.
+이쪽은 항상 기본 브랜치를 따라갑니다.
+
 ## 이용약관에 문제가 없나요?
 
 없습니다. 이 도구는 계정을 여러 사람이 나눠 쓰거나, 재판매하거나, 남에게 중계하지 않습니다.
@@ -79,7 +82,7 @@ teamcodex server          # 프록시 시작 후 `teamcodex run`
 ## 실시간 대시보드
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="데모 계정 3개가 표시된 TeamCodex 터미널 대시보드" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="데모 계정 3개가 표시된 TeamCodex 터미널 대시보드" width="100%">
 </p>
 
 <p align="center"><sub>민감한 계정 정보를 제거한 데모 데이터로 렌더링한 실제 TeamCodex TUI 구성입니다.</sub></p>
@@ -136,7 +139,7 @@ Node.js 18 이상이 필요합니다.
 
 ```bash
 # 설치
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 
 # Claude 계정 추가 — 브라우저 OAuth가 열립니다
 teamclaude login
