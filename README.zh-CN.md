@@ -36,6 +36,37 @@
 > [!NOTE]
 > Claude 与 Codex 分别使用独立的配置文件、端口和账户池。两个代理可以同时在线，Codex CLI 与 Hermes Agent 始终连接同一个稳定的本地地址。
 
+## 安装
+
+```bash
+npm i -g teamcodex
+
+teamcodex import          # 读取已有的 Claude Code 登录
+teamcodex codex import    # 读取已有的 ~/.codex/auth.json
+teamcodex server          # 启动代理，然后执行 `teamcodex run`
+```
+
+`teamcodex` 和 `teamclaude` 两个命令都会安装，行为完全一致。
+
+## 关于使用条款
+
+**本项目仅用于管理你自己拥有的账号，不支持也不鼓励账号共享、代充或转售。**
+
+它做的事情，就是把你手动切换自己账号的动作自动化。所有请求都在你自己的机器上发出，
+每个请求都带该账号自身的 OAuth token，凭证不会离开本机，也不会为第三方做任何中转。
+
+它不会增加你的额度，也不会绕过任何限制。它只是让你已经付费的额度不至于白白过期。
+
+如果是团队使用，每个成员仍然用自己的订阅登录。多人共用一个席位不在支持范围内。
+如果官方明确表示不允许这类工具，本项目会相应调整功能或停止维护。
+
+## 与上游项目的关系
+
+本项目 fork 自 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)。
+上游在 Claude 侧的实现非常扎实，值得单独使用。这个分支是因为需要**Codex（ChatGPT OAuth）
+多账号池**才走了另一条路，上游并未覆盖这部分，此外还加了模型降级链和网络层故障转移。
+上游也有本分支没有的功能，按自己的场景选择即可。
+
 ## 实时仪表盘
 
 <p align="center">

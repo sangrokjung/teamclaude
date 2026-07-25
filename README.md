@@ -36,6 +36,43 @@
 > [!NOTE]
 > Claude and Codex use separate configs, ports, and account pools. Both proxies can stay online together, while Codex CLI and Hermes Agent keep using one stable local endpoint.
 
+## Install
+
+```bash
+npm i -g teamcodex
+
+teamcodex import          # pick up your existing Claude Code login
+teamcodex codex import    # pick up your existing ~/.codex/auth.json
+teamcodex server          # start the proxy, then `teamcodex run`
+```
+
+Both `teamcodex` and `teamclaude` are installed as commands and behave identically.
+
+## Is this against the Terms of Service?
+
+No. This does not share, resell, or pool accounts between people.
+
+It routes **your own** authenticated sessions from **one machine**, which is exactly
+what you would do by switching accounts by hand, minus the manual re-login. Every
+request is signed with that account's own OAuth token, nothing is proxied on behalf
+of third parties, and no credential ever leaves your machine.
+
+It does not increase your quota and it does not bypass any limit. It stops the quota
+you already paid for from expiring unused.
+
+If you work in a team, every member still authenticates with their own subscription.
+Using this to let several people share a single seat is not supported, and if a vendor
+states that this class of tool is disallowed, this project will be changed or retired
+accordingly.
+
+## Credit and relationship to upstream
+
+This started as a fork of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude),
+which does the Claude side very well and is worth using on its own. This fork went a
+different direction when it needed **Codex (ChatGPT OAuth) account pooling**, which
+upstream does not cover, plus a model fallback chain and network-level failover.
+Upstream has features this fork does not, so pick whichever fits your setup.
+
 ## Live dashboard
 
 <p align="center">
