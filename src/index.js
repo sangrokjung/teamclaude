@@ -320,6 +320,7 @@ async function serverCommand() {
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
+      console.log(`[TeamClaude] Continuity mode: ${config.continuityMode ? 'on' : 'OFF — fleet-wide exhaustion surfaces 429s to clients'}`);
     } else {
       const sep = '='.repeat(60);
       console.log('');
@@ -329,6 +330,7 @@ async function serverCommand() {
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
+      console.log(`  Continuity: ${config.continuityMode ? 'on' : 'OFF — fleet-wide exhaustion surfaces 429s to clients'}`);
       console.log(`  Upstream:   ${config.upstream || (codexMode ? 'https://chatgpt.com/backend-api/codex' : 'https://api.anthropic.com')}`);
       console.log('');
       accounts.forEach((a, i) => {
