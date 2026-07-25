@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-TeamClaude is a transparent HTTP proxy that sits between Claude Code and the Anthropic API, managing multiple Claude (Max/Pro/API-key) accounts and rotating between them when one nears its session (5h) or weekly (7d) quota. Published as `@karpeleslab/teamclaude`.
+TeamClaude is a transparent HTTP proxy that sits between Claude Code and the Anthropic API, managing multiple Claude (Max/Pro/API-key) accounts and rotating between them when one nears its session (5h) or weekly (7d) quota. Published as `@karpeleslab/teamclaude`. The qjc fork adds a second, fully isolated **Codex mode** that pools ChatGPT OAuth accounts in front of the ChatGPT Codex backend (see "Codex mode" below).
 
 ## Commands
 
@@ -19,6 +19,9 @@ npx eslint src/                    # lint (flat config in eslint.config.js; no l
 
 # Use a throwaway config instead of ~/.config/teamclaude.json:
 TEAMCLAUDE_CONFIG=./config.json node src/index.js server
+
+# Codex (ChatGPT) pool — separate config ~/.config/teamcodex.json, default port 3457:
+node src/index.js codex server     # every subcommand works with the `codex` prefix
 ```
 
 `config.json` is gitignored; `config.example.json` is the template. To exercise the proxy end-to-end, start `server` in one terminal and `node src/index.js run` (or `eval $(node src/index.js env)` then `claude`) in another.
@@ -31,14 +34,27 @@ TEAMCLAUDE_CONFIG=./config.json node src/index.js server
 
 ## Architecture
 
-Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Six files, each a clear layer:
+Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Eight files, each a clear layer:
 
 - **`src/index.js`** — CLI dispatcher + all non-server commands (`stop`, `restart`, `import`, `login`, `env`, `status`, `accounts`, `remove`, `api`). Owns the **config-sync wiring** between the running server, the TUI, and external CLI invocations (see below), and the **server-lifecycle helpers** (`findRunningServer`/`stopRunningServer` — discover a running proxy via the state file `getServerStatePath()`, falling back to a port probe + `lsof`, then SIGTERM→SIGKILL it; `server` writes the state file on listen and removes it on exit).
 - **`src/server.js`** — the HTTP proxy and the request-forwarding loop (`forwardRequest`), including account acquisition (concurrency slot), retry, rate-limit handling, SSE streaming, and optional request logging.
 - **`src/account-manager.js`** — `AccountManager` class: in-memory account state, use-or-lose selection, **per-account concurrency cap + overflow queue** (`acquireAccount`/`releaseAccount`), quota tracking from response headers, and token-refresh coalescing. The single source of truth for *live* credentials while the server runs.
 - **`src/oauth.js`** — OAuth PKCE login, token refresh, profile fetch, and credential import from Claude Code. No proxy state here — pure functions.
-- **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`). Written `0o600`.
+- **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`; `TEAMCLAUDE_PROVIDER=codex` switches the default file to `~/.config/teamcodex.json`). Written `0o600`.
+- **`src/codex.js`** — Codex-mode helpers, no proxy state: parse/import ChatGPT OAuth credentials (`~/.codex/auth.json` shape), token refresh against `auth.openai.com`, and `buildCodexProxyArgs` (the `-c model_provider` overrides that point the Codex CLI at the proxy).
+- **`src/system-metrics.js`** — host CPU/RAM/loadavg sampler; `GET /teamclaude/status` rides a `host` object along so `teamclaude status` and the TUI header can show the proxy machine's load.
 - **`src/tui.js`** — full-screen terminal dashboard (alternate screen buffer). Only used when both stdin and stdout are TTYs; otherwise the server logs plainly.
+
+### Codex mode (qjc fork)
+
+`teamclaude codex <cmd>` (or config `provider: "codex"`) runs a second, fully isolated pool for **ChatGPT OAuth accounts** in front of `https://chatgpt.com/backend-api/codex` — own config (`~/.config/teamcodex.json`, default port 3457), own quota/server-state files, zero overlap with the Claude pool. Key differences from Anthropic mode:
+
+- **Accounts are ChatGPT OAuth only.** `codex login` runs the Codex CLI login inside a throwaway `CODEX_HOME` and imports the resulting `auth.json`; `codex import` reads an existing `~/.codex/auth.json`. Refresh routes by `account.provider` to `refreshCodexAccessToken` (auth.openai.com, Codex client id).
+- **Auth headers**: requests are forwarded with the account's `Bearer` token plus `chatgpt-account-id` (client-sent `authorization`/`chatgpt-account-id` are stripped first).
+- **Quota**: `x-codex-primary/secondary-used-percent` (+ `-reset-at`, `x-codex-rate-limit-reached-type`) are normalized into the same unified 5h/7d model in `updateQuota`, so selection, `switchThreshold`, throttling, and the TUI all work unchanged.
+- **`codex run`** launches the Codex CLI with `buildCodexProxyArgs` overrides (`model_provider` base_url → the proxy) — analogous to `run` keeping Claude Code in subscription mode.
+- **`activeWarmup` defaults off** in codex mode (no capture-and-replay probe shape for the Codex backend); the `/v1/oauth/token` relay is Anthropic-mode only.
+- Ops note: like Anthropic mode, a running server does **not** see accounts added later via CLI — reload via TUI `R` or restart (`syncAccountsFromDisk`); a headless daemon needs the restart path.
 
 ### Request flow (`forwardRequest` in server.js)
 
