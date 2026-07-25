@@ -65,6 +65,11 @@ teamcodex server          # 프록시 시작 후 `teamcodex run`
 
 ## 원본 프로젝트와의 관계
 
+포크 계보는 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → 이 저장소입니다.
+페이지 상단의 포크 뱃지는 바로 위 부모만 표시하기 때문에 원저자가 아니라 jung-wan-kim으로
+보입니다.
+
 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)에서 갈라져 나왔습니다.
 원본은 클로드 쪽 구현이 탄탄하고 그것만으로도 충분히 좋은 프로젝트입니다. 이 포크는 원본이
 다루지 않는 **Codex(ChatGPT OAuth) 계정 풀링**이 필요해서 다른 방향으로 갔고, 모델 폴백

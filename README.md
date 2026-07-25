@@ -67,6 +67,11 @@ accordingly.
 
 ## Credit and relationship to upstream
 
+Fork chain: [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → this repository.
+The fork badge at the top of this page shows the immediate parent, which is why it reads
+jung-wan-kim rather than the original author.
+
 This started as a fork of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude),
 which does the Claude side very well and is worth using on its own. This fork went a
 different direction when it needed **Codex (ChatGPT OAuth) account pooling**, which

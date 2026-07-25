@@ -62,6 +62,10 @@ teamcodex server          # 启动代理，然后执行 `teamcodex run`
 
 ## 与上游项目的关系
 
+Fork 谱系：[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → 本仓库。
+页面顶部的 fork 标识只显示直接上级，所以显示的是 jung-wan-kim 而不是原作者。
+
 本项目 fork 自 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)。
 上游在 Claude 侧的实现非常扎实，值得单独使用。这个分支是因为需要**Codex（ChatGPT OAuth）
 多账号池**才走了另一条路，上游并未覆盖这部分，此外还加了模型降级链和网络层故障转移。
