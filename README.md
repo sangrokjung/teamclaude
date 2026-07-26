@@ -122,7 +122,7 @@ the best available account automatically.
 <details>
 <summary><strong>What the QJC resilient-routing fork adds</strong></summary>
 
-This is the `qjc/resilient-routing` fork (`1.2.3-qjc.x`) of
+This is the `qjc/resilient-routing` fork, published to npm as `teamcodex`, of
 [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), based on
 upstream `v1.2.3`.
 
@@ -141,7 +141,7 @@ npm install -g teamcodex
 ```
 
 From a local checkout, prefer
-`npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz`. A plain
+`npm pack && npm install -g ./teamcodex-<version>.tgz`. A plain
 `npm install -g <dir>` symlinks the checkout, which can break supervisors that
 cannot read that path.
 
@@ -381,6 +381,10 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
+If the proxy is not running, `teamclaude run` now starts it in the background
+and waits for the listener before launching Claude Code. The server keeps that
+public listener in a supervisor process, so a crashed proxy worker is replaced
+while new connections wait instead of failing with `ConnectionRefused`.
 When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
 quota status before launch. If the configured top-tier model has measured quota
 but no measured account can serve it, Claude Code is started directly on the
@@ -411,8 +415,10 @@ claude
 ### Troubleshoot `ConnectionRefused`
 
 `Unable to connect to API (ConnectionRefused)` means Claude Code could not reach
-the local TeamClaude listener. Check the proxy from a separate terminal so the
-diagnostic action does not terminate the session that depends on it:
+the local TeamClaude supervisor. New sessions started with `teamclaude run`
+automatically start a missing supervisor; a worker-only crash keeps the listener
+bound and is recovered automatically. If the supervisor itself was stopped,
+check it from a separate terminal:
 
 ```bash
 teamclaude status
@@ -423,11 +429,9 @@ teamclaude restart
 teamclaude run -- --continue
 ```
 
-If the listener PID keeps changing, a supervisor such as launchd or systemd is
-restarting the proxy. Inspect that supervisor's logs and health-check grace
-period; repeated forced restarts create a no-listener window that surfaces as
-`ConnectionRefused`. Do not run `teamclaude stop` from inside the affected
-proxied Claude Code session.
+The PID shown by `lsof` is the stable TeamClaude supervisor. Its worker PID may
+change after a crash without creating a no-listener window. Do not run
+`teamclaude stop` from inside the affected proxied Claude Code session.
 
 ### Host CPU / RAM line
 
