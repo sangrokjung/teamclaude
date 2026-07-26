@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a capability or a change in behavior
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things are out of scope and will be declined:
+        features that help several people share one subscription seat, and anything that
+        adds a runtime dependency (this project ships with zero on purpose).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting
+      description: Describe the situation, not the solution. What did you try to do and where did it break down?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. If you already have a shape in mind, describe it.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This does not require a new runtime dependency
+          required: false
+        - label: This is about routing my own accounts, not sharing one account between people
+          required: true
