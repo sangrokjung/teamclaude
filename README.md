@@ -63,6 +63,11 @@ of third parties, and no credential ever leaves your machine.
 It does not increase your quota and it does not bypass any limit. It stops the quota
 you already paid for from expiring unused.
 
+Worth noting: Claude Code's own `/extra-usage` flow already offers to sign into a
+**different account you own** when you hit a limit. "Switch to another of my accounts
+to keep working" is something the first-party client itself surfaces. This automates
+that same switch instead of making you click through it by hand.
+
 If you work in a team, every member still authenticates with their own subscription.
 Using this to let several people share a single seat is not supported, and if a vendor
 states that this class of tool is disallowed, this project will be changed or retired
