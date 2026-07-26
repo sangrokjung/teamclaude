@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { isTokenExpiringSoon } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
+import { SseFramer, sseErrorEvent } from './sse.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -48,6 +49,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const rateLimitFailovers = Number.isFinite(config.rateLimitFailovers)
     ? Math.max(0, Math.floor(config.rateLimitFailovers))
     : 1;
+  // Mid-stream recovery: relay SSE one whole event at a time and convert an
+  // abnormal upstream end (network death / silent truncation without a terminal
+  // event) into a well-formed retryable `overloaded_error` SSE event instead of
+  // killing the client socket. Claude Code auto-retries that; it does NOT retry
+  // a raw mid-stream connection loss ("Connection closed mid-response").
+  // Anthropic-only: the Codex backend's in-stream error contract differs, so
+  // codex mode keeps the legacy passthrough. `streamRecovery: false` opts out.
+  const streamRecovery = provider === 'anthropic' && config.streamRecovery !== false;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -462,7 +471,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -1320,38 +1329,80 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       responseHeaders[key] = value;
     }
 
-    res.writeHead(upstreamRes.status, responseHeaders);
-
-    if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      res.end();
-      return;
-    }
-
     const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
 
-    if (isStreaming) {
+    if (isStreaming && upstreamRes.body) {
       const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account, accountManager, streamLog);
+      // With recovery on, response headers are DEFERRED until the first whole
+      // SSE frame arrives: an upstream that dies before producing anything
+      // leaves the client response untouched and fully replayable on another
+      // account — a transparent failover beats asking the client to retry.
+      const ensureHeaders = () => {
+        if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+      };
+      if (!ctx.streamRecovery) ensureHeaders(); // legacy: headers first, bytes as they come
+      const outcome = await streamResponse(
+        upstreamRes.body, res, account, accountManager, streamLog, ctx.streamRecovery, ensureHeaders);
+      if (outcome.preStreamFailure && !res.headersSent && !res.destroyed) {
+        // Nothing reached the client. Replay on another account exactly like a
+        // pre-stream transient error (per-request exclusion, no account
+        // poisoning); when no alternate remains, surface a proper HTTP 529 —
+        // the one shape every client reliably auto-retries.
+        console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} before any data on "${account.name}" — replaying on another account`);
+        if (logDir) {
+          logSections.push(`=== STREAM ${outcome.preStreamFailure} before any data — replaying ===`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        ctx.tried5xx.add(account);
+        const excludeStream = new Set([...ctx.tried429, ...ctx.tried5xx]);
+        if (retryCount < maxRetries
+            && (accountManager.anyUsable(excludeStream, ctx.model)
+              || accountManager.anyCapped(excludeStream, ctx.model))) {
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+        ctx.status = 529;
+        res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: 'Upstream stream failed before any data. Please retry.' },
+        }));
+        return;
+      }
+      if (outcome.injected) {
+        // NOT an account failure: the response was already partially delivered,
+        // so the only recovery that helps is the CLIENT retrying — which the
+        // injected error event triggers. No account state is mutated.
+        console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
+      }
       if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
+        logSections.push(`=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===\n${streamLog.join('')}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      // Non-SSE. With recovery on, buffer the whole body BEFORE sending
+      // headers: if the upstream connection dies while reading, headers are
+      // not yet sent, so the error unwinds into the transient-failover path
+      // below and retries on another account. The legacy path (codex /
+      // streamRecovery:false) keeps the original order — headers first — so
+      // its wire behavior stays as before (no replay, no reordering).
+      if (!ctx.streamRecovery) res.writeHead(upstreamRes.status, responseHeaders);
+      const buf = upstreamRes.body ? Buffer.from(await upstreamRes.arrayBuffer()) : Buffer.alloc(0);
       extractUsageFromBody(buf, account, accountManager);
       if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+        if (buf.length === 0) {
+          logSections.push(`=== RESPONSE BODY ===\n(empty)`);
+        } else {
+          try {
+            logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
+          } catch {
+            logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+          }
         }
         writeRequestLog(logDir, reqId, logSections);
       }
-      res.end(buf);
+      if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+      res.end(buf.length ? buf : undefined);
     }
   } catch (err) {
     // Client disconnected → we aborted the upstream fetch (ctx.abortSignal). This
@@ -1369,10 +1420,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       writeRequestLog(logDir, reqId, logSections);
     }
 
+    // Undici surfaces a connection that dies WHILE READING THE BODY differently
+    // from one that dies at dispatch: `TypeError: terminated` with the socket
+    // error as `cause` (code UND_ERR_SOCKET/ECONNRESET), not a top-level code.
+    // Since non-SSE bodies are now buffered before headers go out, that path is
+    // retryable too — misclassifying it would wrongly poison the account.
+    const TRANSIENT_CODES = new Set([
+      'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
+      'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+    ]);
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.message.includes('terminated') ||
+        TRANSIENT_CODES.has(err.code) ||
+        TRANSIENT_CODES.has(err.cause?.code));
 
     // Transient network errors. Before any response bytes went out the request
     // body is still buffered, so fail over to another account exactly like a
@@ -1381,7 +1442,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // "Response stalled mid-stream" in Claude Code for no good reason. The
     // account is NOT marked 'error' (a network blip is not a bad credential);
     // exclusion is per-request via tried5xx. Mid-stream (headers already sent,
-    // partial data delivered) is not replayable — close so the client retries.
+    // partial data delivered) is not replayable: with streamRecovery on, SSE
+    // errors never reach here (streamResponse converts them into an injected
+    // retryable error event); this destroy remains the backstop for the legacy
+    // codex/opt-out path — close so the client retries.
     if (isTransient) {
       if (!res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
@@ -1392,7 +1456,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
       }
-      res.destroy();
+      // Legacy/codex mid-stream: streamResponse's finally already ENDED the
+      // response cleanly (graceful FIN) before the error propagated here.
+      // Destroying on top of that end could turn it into an RST that loses the
+      // flushed tail — only destroy a response that is genuinely unfinished.
+      if (!res.writableEnded) res.destroy();
       return;
     }
 
@@ -1415,57 +1483,149 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ *
+ * With `recover` (anthropic mode, `config.streamRecovery !== false`) the stream
+ * is relayed one WHOLE SSE event at a time (SseFramer), and an abnormal end —
+ * the upstream read failing mid-stream, or the upstream ending without a
+ * terminal event (message_stop / error) — appends a synthetic retryable
+ * `overloaded_error` event and ends the response cleanly, so the client's own
+ * retry logic recovers the turn. Without `recover` (codex mode / opt-out) the
+ * legacy behavior is kept: bytes pass through untouched and a read error
+ * propagates to the caller (which destroys the client socket).
+ *
+ * With recovery, `ensureHeaders` defers the client's response headers until the
+ * first whole frame is forwarded; a failure BEFORE that point returns
+ * { preStreamFailure } with the response untouched, so the caller can replay
+ * the whole request on another account instead of involving the client at all.
+ *
+ * Returns { injected, reason, preStreamFailure }.
  */
-async function streamResponse(webStream, res, account, accountManager, streamLog) {
+async function streamResponse(webStream, res, account, accountManager, streamLog, recover = false, ensureHeaders = null) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  const framer = recover ? new SseFramer() : null;
+  const outcome = { injected: false, reason: null, preStreamFailure: null };
+
+  // Append a well-formed retryable error frame and end. Only called when every
+  // byte written so far ended at an event boundary (the framer guarantees it),
+  // so the client's SSE parser sees a clean error event, never half a payload.
+  const endWithRetryableError = (reason) => {
+    outcome.injected = true;
+    outcome.reason = reason;
+    res.end(sseErrorEvent(
+      `TeamClaude: upstream stream ${reason}; the response is incomplete — please retry.`));
+  };
+
+  // Forward bytes + fold their text into logging/usage parsing. Returns
+  // res.write()'s backpressure verdict.
+  const forwardChunk = (bytes) => {
+    ensureHeaders?.(); // first whole frame is ready — commit the deferred headers
+    const ok = res.write(bytes);
+    const text = decoder.decode(bytes, { stream: true });
+    if (streamLog) streamLog.push(text);
+    sseBuffer += text;
+    const events = sseBuffer.split('\n\n');
+    sseBuffer = events.pop(); // keep incomplete event
+    // Usage parsing is best-effort: a "partial event" that grows this large is
+    // a giant content delta or a CRLF-only stream — nothing parseSSEUsage could
+    // read either way. Drop it instead of buffering without bound.
+    if (sseBuffer.length > 1_048_576) sseBuffer = '';
+    for (const event of events) {
+      parseSSEUsage(event, account, accountManager);
+    }
+    return ok;
+  };
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      let step;
+      try {
+        step = await reader.read();
+      } catch (err) {
+        // Upstream died mid-stream.
+        if (framer && !res.destroyed && !res.writableEnded) {
+          const detail = err?.cause?.code || err?.code || err?.name || 'network error';
+          if (!res.headersSent) {
+            // Nothing was forwarded yet (headers still deferred): the request
+            // is fully replayable — hand the decision back to the caller.
+            outcome.preStreamFailure = `errored (${detail})`;
+            return outcome;
+          }
+          if (!framer.sawTerminal && !framer.passthrough) {
+            // Events are already out, so another account cannot help THIS
+            // response — but a clean retryable error event keeps the client's
+            // automatic retry alive, where a destroyed socket fails the turn.
+            endWithRetryableError(`errored mid-response (${detail})`);
+            return outcome;
+          }
+          // Terminal already delivered — close out normally. Or framing
+          // degraded to passthrough (oversized frame): an injection could land
+          // mid-event and corrupt the parse, so end plainly like legacy.
+          break;
+        }
+        if (framer) break; // client gone — nothing left to salvage
+        throw err; // legacy mode: caller decides (destroys the client socket)
+      }
+      if (step.done) break;
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
-
-      const text = decoder.decode(value, { stream: true });
-
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
-
-      // Parse SSE events for usage tracking
-      sseBuffer += text;
-      const events = sseBuffer.split('\n\n');
-      sseBuffer = events.pop(); // keep incomplete event
-
-      for (const event of events) {
-        parseSSEUsage(event, account, accountManager);
-      }
+      const bytes = framer ? framer.push(step.value) : step.value;
+      if (!bytes || bytes.length === 0) continue; // partial frame still buffering
 
       // Handle backpressure — also bail out if client disconnects,
-      // because 'drain' will never fire on a destroyed socket
-      if (!ok) {
+      // because 'drain' will never fire on a destroyed socket. Both listeners
+      // are removed once either fires, so a long stream with many backpressure
+      // pauses doesn't accumulate dead 'close' listeners.
+      if (!forwardChunk(bytes)) {
         await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
+          const settle = () => {
+            res.removeListener('drain', settle);
+            res.removeListener('close', settle);
+            resolve();
+          };
+          res.once('drain', settle);
+          res.once('close', settle);
         });
         if (res.destroyed) break;
       }
     }
 
-    // Parse any remaining buffer
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, account, accountManager);
+    // Parse any remaining (partial / never-forwarded) text for usage tracking
+    const tail = framer && framer.pending.length ? decoder.decode(framer.pending) : '';
+    if ((sseBuffer + tail).trim()) {
+      parseSSEUsage(sseBuffer + tail, account, accountManager);
+    }
+
+    if (framer && !res.destroyed && !res.writableEnded) {
+      if (framer.sawTerminal) {
+        // Complete stream — flush any trailing bytes after the terminal event
+        // (comments / blank lines) for byte fidelity; finally ends normally.
+        if (framer.pending.length) res.write(framer.pending);
+      } else if (!res.headersSent) {
+        // Ended before a single whole frame: fully replayable by the caller.
+        outcome.preStreamFailure = 'ended without data';
+        return outcome;
+      } else if (!framer.passthrough) {
+        // The upstream ended without message_stop/error: a silently truncated
+        // response. The partial frame (if any) was never forwarded, so the
+        // injected error lands on a clean event boundary.
+        endWithRetryableError('ended mid-response without a terminal event');
+        return outcome;
+      }
+      // else: framing degraded to passthrough — the last relayed bytes may sit
+      // mid-event, where an injected frame would corrupt the parse. End plainly.
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
+    // Only end a response whose headers went out — a deferred-headers response
+    // being handed back for replay (preStreamFailure) must stay untouched.
+    if (res.headersSent && !res.writableEnded) res.end();
   }
+  return outcome;
 }
 
 // Anthropic usage objects split the prompt into three input families:

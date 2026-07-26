@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { fork, spawn, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -18,6 +19,10 @@ import {
 } from './codex.js';
 import { TUI } from './tui.js';
 import { formatBytes } from './system-metrics.js';
+import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+
+const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
+const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 
 const args = process.argv.slice(2);
 const cliProvider = args[0] === 'codex' ? 'codex' : 'anthropic';
@@ -100,8 +105,473 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  if (process.env[SUPERVISED_WORKER_ENV] === '1') {
+    await proxyWorkerCommand();
+    return;
+  }
+  await superviseServerCommand();
+}
+
+async function superviseServerCommand() {
   const config = await loadOrCreateConfig();
-  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  const port = config?.proxy?.port;
+  const existing = await findRunningServer(config);
+  if (existing && existing.port === port) {
+    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
+    console.error('  See it:      teamclaude status');
+    console.error('  Stop it:     teamclaude stop');
+    console.error('  Restart it:  teamclaude restart');
+    process.exitCode = 1;
+    return;
+  }
+
+  const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
+    ? Math.max(1, config.maxConcurrentPerAccount)
+    : 3;
+  const accountCapacity = (config.accounts || []).reduce((sum, account) => {
+    if (account.enabled === false) return sum;
+    return sum + (Number.isFinite(account.maxConcurrent)
+      ? Math.max(1, account.maxConcurrent)
+      : defaultConcurrent);
+  }, 0);
+  const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
+    ? Math.max(0, config.overflowQueueMaxDepth)
+    : 256;
+  const maxPublicRequests = Math.max(1, accountCapacity + queueCapacity);
+  const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
+    ? config.maxRequestBytes
+    : 32 * 1024 * 1024;
+  // Mirror of the worker's streamRecovery gate (see server.js): SSE relays are
+  // framed to whole events so a worker crash mid-response can be converted into
+  // a clean, client-retryable `overloaded_error` SSE event instead of a
+  // destroyed client socket ("Connection closed mid-response" in Claude Code,
+  // which does NOT auto-retry a raw connection loss).
+  const streamRecovery = !isCodexMode(config) && config.streamRecovery !== false;
+  const workerWaiters = new Set();
+  const clientAgents = new WeakMap();
+  const statePath = getServerStatePath();
+  let worker = null;
+  let workerReady = false;
+  let workerPort = null;
+  let hasBeenReady = false;
+  let stopping = false;
+  let activePublicRequests = 0;
+  let restartCount = 0;
+  let restartTimer = null;
+  let stableTimer = null;
+  let forceTimer = null;
+  let finish;
+
+  const listener = http.createServer((req, res) => {
+    const clientKey = req.headers['x-api-key'];
+    const authorization = req.headers.authorization;
+    const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
+      ? authorization.slice('Bearer '.length)
+      : null;
+    const remoteAddr = req.socket.remoteAddress;
+    const isLocal = remoteAddr === '127.0.0.1'
+      || remoteAddr === '::1'
+      || remoteAddr === '::ffff:127.0.0.1';
+    if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
+      && bearerKey !== config.proxy.apiKey && !isLocal) {
+      req.resume();
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+      }));
+      return;
+    }
+    if (activePublicRequests >= maxPublicRequests) {
+      req.resume();
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });
+      res.end(JSON.stringify({ error: { type: 'overloaded_error', message: 'Proxy supervisor queue is full' } }));
+      return;
+    }
+    activePublicRequests += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activePublicRequests -= 1;
+    };
+    res.once('finish', release);
+    res.once('close', release);
+    handlePublicRequest(req, res).catch(err => {
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'proxy_error', message: err.message } }));
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+    });
+  });
+  process.once('exit', () => {
+    try { unlinkSync(statePath); } catch {}
+    if (worker?.exitCode == null) {
+      try { worker.kill('SIGKILL'); } catch {}
+    }
+  });
+
+  function bufferRequest(req) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let size = 0;
+      let tooLarge = false;
+      req.on('data', chunk => {
+        size += chunk.length;
+        if (size > maxRequestBytes) {
+          tooLarge = true;
+          chunks.length = 0;
+        } else if (!tooLarge) {
+          chunks.push(chunk);
+        }
+      });
+      req.once('end', () => {
+        if (tooLarge) {
+          const err = new Error('Request body too large');
+          err.statusCode = 413;
+          reject(err);
+          return;
+        }
+        resolve(Buffer.concat(chunks));
+      });
+      req.once('error', reject);
+      req.once('aborted', () => reject(new Error('Client disconnected')));
+    });
+  }
+
+  function waitForWorker(res) {
+    if (workerReady && workerPort && worker) {
+      return Promise.resolve({ worker, port: workerPort });
+    }
+    return new Promise(resolve => {
+      const waiter = { resolve, res };
+      workerWaiters.add(waiter);
+      res.once('close', () => {
+        if (!workerWaiters.delete(waiter)) return;
+        resolve(null);
+      });
+    });
+  }
+
+  function clientAgent(req) {
+    let agent = clientAgents.get(req.socket);
+    if (agent) return agent;
+    agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    clientAgents.set(req.socket, agent);
+    req.socket.once('close', () => agent.destroy());
+    return agent;
+  }
+
+  function resetClientAgent(req) {
+    const agent = clientAgents.get(req.socket);
+    if (agent) agent.destroy();
+    clientAgents.delete(req.socket);
+  }
+
+  function wakeWorkerWaiters() {
+    const target = workerReady && workerPort && worker
+      ? { worker, port: workerPort }
+      : null;
+    for (const waiter of workerWaiters) {
+      workerWaiters.delete(waiter);
+      waiter.resolve(target);
+    }
+  }
+
+  function closePublicListener(force = false) {
+    try { listener.close(); } catch {}
+    workerReady = false;
+    workerPort = null;
+    wakeWorkerWaiters();
+    if (force) listener.closeAllConnections?.();
+  }
+
+  async function handlePublicRequest(req, res) {
+    let body;
+    try {
+      body = await bufferRequest(req);
+    } catch (err) {
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(err.statusCode || 400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: err.message } }));
+      }
+      return;
+    }
+    await forwardToWorker(req, res, body, 0);
+  }
+
+  async function forwardToWorker(req, res, body, attempt) {
+    const target = await waitForWorker(res);
+    if (!target) {
+      // Woken with no worker (shutdown cleared readiness, or the client left).
+      // Never leave a live client hanging with no response — it would sit
+      // through the whole shutdown grace period.
+      if (!res.destroyed && !res.headersSent) {
+        res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: 'Proxy is restarting; retry shortly.' },
+        }));
+      } else if (!res.destroyed) {
+        res.destroy();
+      }
+      return;
+    }
+    if (res.destroyed) return;
+
+    await new Promise(resolve => {
+      let responseStarted = false;
+      let settled = false;
+      let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
+      let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      const headers = { ...req.headers, host: `127.0.0.1:${target.port}`, connection: 'keep-alive' };
+      delete headers['transfer-encoding'];
+      headers['content-length'] = String(body.length);
+      const upstreamReq = http.request({
+        host: '127.0.0.1',
+        port: target.port,
+        path: req.url,
+        method: req.method,
+        headers,
+        agent: clientAgent(req),
+      });
+
+      const retryOrFail = err => {
+        if (settled) return;
+        settled = true;
+        // The client went away: OUR close handler destroyed the upstream leg,
+        // so this error is self-inflicted. The worker is healthy — recycling
+        // it here would let one aborted terminal (a single Esc during the
+        // seconds-long first-byte wait) SIGKILL the shared worker and cut
+        // every other terminal's in-flight stream.
+        if (clientGone || res.destroyed) {
+          resolve();
+          return;
+        }
+        if (responseStarted) {
+          // The worker died mid-response. A framed SSE relay only ever forwarded
+          // whole events, so the client's response can still be ENDED with a
+          // well-formed retryable `overloaded_error` event — Claude Code retries
+          // that by itself, where a destroyed socket fails the whole turn.
+          // Non-SSE (or terminal already delivered / opt-out) keeps the honest
+          // legacy destroy.
+          if (sseFramer && !sseFramer.passthrough && !res.destroyed && !res.writableEnded) {
+            console.error('[TeamClaude] Proxy worker died mid-stream; ending client response with a retryable error event.');
+            res.end(sseFramer.sawTerminal
+              ? undefined
+              : sseErrorEvent('TeamClaude: proxy worker restarted mid-response; the response is incomplete — please retry.'));
+          } else if (!res.destroyed) {
+            // Non-SSE, opt-out, or framing degraded to passthrough (an
+            // injection could land mid-event): the honest legacy destroy.
+            res.destroy(err);
+          }
+          resolve();
+          return;
+        }
+        if (target.worker === worker) {
+          workerReady = false;
+          workerPort = null;
+          resetClientAgent(req);
+          if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
+        }
+        if (!stopping && !res.destroyed && attempt < 3) {
+          forwardToWorker(req, res, body, attempt + 1).then(resolve);
+          return;
+        }
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'Proxy worker unavailable' } }));
+        }
+        resolve();
+      };
+
+      upstreamReq.once('response', upstreamRes => {
+        responseStarted = true;
+        if (res.destroyed) {
+          upstreamRes.destroy();
+          resolve();
+          return;
+        }
+        const responseHeaders = { ...upstreamRes.headers };
+        delete responseHeaders.connection;
+        delete responseHeaders['keep-alive'];
+        delete responseHeaders['transfer-encoding'];
+        res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
+        if (streamRecovery && isEventStream(upstreamRes.headers['content-type'])) {
+          // Frame-buffered SSE relay: forward only whole events so a worker
+          // crash mid-stream leaves the client's parser at a clean boundary
+          // (see retryOrFail above for the injected retryable error event).
+          const framer = new SseFramer();
+          sseFramer = framer;
+          upstreamRes.on('data', chunk => {
+            const bytes = framer.push(chunk);
+            // writableEnded guard: retryOrFail may have already ENDED this
+            // response (graceful injection); a straggler chunk must not
+            // write-after-end (uncaught ERR_STREAM_WRITE_AFTER_END).
+            if (!bytes || bytes.length === 0 || res.destroyed || res.writableEnded) return;
+            if (!res.write(bytes)) {
+              upstreamRes.pause();
+              res.once('drain', () => upstreamRes.resume());
+            }
+          });
+          upstreamRes.once('end', () => {
+            if (settled) return;
+            settled = true;
+            if (!res.destroyed && !res.writableEnded) {
+              // Clean worker end. The worker's own recovery already injects on
+              // truncation, so relay as-is; flush any un-framed tail (possible
+              // only when the worker ran with recovery off) for byte fidelity.
+              res.end(framer.pending.length ? framer.pending : undefined);
+            }
+            resolve();
+          });
+        } else {
+          upstreamRes.pipe(res);
+          upstreamRes.once('end', () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          });
+        }
+        upstreamRes.once('error', retryOrFail);
+        upstreamRes.once('aborted', () => retryOrFail(new Error('Proxy worker response aborted')));
+      });
+      upstreamReq.once('error', retryOrFail);
+      res.once('close', () => {
+        if (!res.writableEnded) {
+          clientGone = true; // must be set BEFORE the destroy surfaces as an 'error'
+          upstreamReq.destroy();
+        }
+      });
+      upstreamReq.end(body);
+    });
+  }
+
+  function launchWorker() {
+    if (stopping) return;
+    workerReady = false;
+    workerPort = null;
+    const childEnv = {
+      ...process.env,
+      [SUPERVISED_WORKER_ENV]: '1',
+      [SUPERVISOR_PID_ENV]: String(process.pid),
+    };
+    const child = fork(process.argv[1], ['server'], {
+      env: childEnv,
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    });
+    worker = child;
+    let becameReady = false;
+
+    child.on('message', message => {
+      if (message?.type !== 'teamclaude:ready' || child !== worker || !message.internalPort) return;
+      becameReady = true;
+      workerReady = true;
+      workerPort = message.internalPort;
+      hasBeenReady = true;
+      writeServerState({
+        pid: process.pid,
+        workerPid: child.pid,
+        port,
+        startedAt: new Date().toISOString(),
+        config: getConfigPath(),
+      }).catch(() => {});
+      clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
+      stableTimer.unref?.();
+      wakeWorkerWaiters();
+    });
+
+    child.once('error', err => {
+      console.error(`[TeamClaude] Failed to start proxy worker: ${err.message}`);
+    });
+
+    child.once('exit', (code, signal) => {
+      if (child === worker) {
+        worker = null;
+        workerReady = false;
+        workerPort = null;
+      }
+      clearTimeout(stableTimer);
+      if (stopping) {
+        // Give in-flight SSE relays a beat to finish their graceful
+        // mid-stream error injection (retryOrFail ends those responses off the
+        // worker socket's error event), then force-close any lingering idle
+        // keep-alive client connections — otherwise a gracefully ENDED (not
+        // destroyed) response leaves its socket idling and holds the
+        // supervisor's event loop open well past the shutdown grace period.
+        // unref'd: if nothing lingers, the process exits without waiting.
+        const lingerSweep = setTimeout(() => closePublicListener(true), 150);
+        lingerSweep.unref?.();
+        finish(0);
+        return;
+      }
+      if (code === 0) {
+        closePublicListener(true);
+        finish(0);
+        return;
+      }
+      if (!hasBeenReady && !becameReady) {
+        closePublicListener(true);
+        finish(code ?? 1);
+        return;
+      }
+
+      restartCount += 1;
+      const backoffMs = Math.min(100 * (2 ** (restartCount - 1)), 2_000);
+      console.error(
+        `[TeamClaude] Proxy worker stopped (${signal || `exit ${code}`}); restarting in ${backoffMs}ms.`,
+      );
+      restartTimer = setTimeout(launchWorker, backoffMs);
+    });
+  }
+
+  function requestShutdown() {
+    if (stopping) return;
+    stopping = true;
+    workerReady = false;
+    workerPort = null;
+    clearTimeout(restartTimer);
+    clearTimeout(stableTimer);
+    closePublicListener();
+    if (!worker) {
+      finish(0);
+      return;
+    }
+    worker.kill('SIGTERM');
+    forceTimer = setTimeout(() => {
+      if (worker) worker.kill('SIGKILL');
+    }, 6_000);
+    forceTimer.unref?.();
+  }
+
+  const exitCode = await new Promise(resolve => {
+    finish = code => {
+      clearTimeout(restartTimer);
+      clearTimeout(stableTimer);
+      clearTimeout(forceTimer);
+      resolve(code);
+    };
+    listener.once('error', err => {
+      handleServerListenError(err, port);
+    });
+    listener.listen(port, launchWorker);
+    process.once('SIGINT', requestShutdown);
+    process.once('SIGTERM', requestShutdown);
+  });
+
+  await clearServerState();
+  process.exitCode = exitCode;
+}
+
+async function proxyWorkerCommand() {
+  const config = await loadOrCreateConfig();
+  // Normalize by the FULL codex-mode signal (subcommand OR inherited env, see
+  // isCodexMode): createProxyServer keys on config.provider, and a supervised
+  // worker only carries the env var.
+  if (!config.provider && isCodexMode(config)) config.provider = 'codex';
   const codexMode = isCodexMode(config);
 
   // --log-to <dir>
@@ -276,17 +746,6 @@ async function serverCommand() {
     };
   }
 
-  // If a TeamClaude server is already running on this config's port, don't try to
-  // bind on top of it — point the user at stop/restart instead of a raw EADDRINUSE.
-  const existing = await findRunningServer(config);
-  if (existing && existing.port === port) {
-    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
-    console.error('  See it:      teamclaude status');
-    console.error('  Stop it:     teamclaude stop');
-    console.error('  Restart it:  teamclaude restart');
-    process.exit(1);
-  }
-
   // Existing configs predate continuityMode; treat it as enabled unless the
   // operator explicitly opts out.
   config.continuityMode = config.continuityMode !== false;
@@ -304,14 +763,12 @@ async function serverCommand() {
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(0, '127.0.0.1', () => {
     server.removeListener('error', onListenError);
-    // Record runtime state so `teamclaude status/stop/restart` can find us, and
-    // remove it on process exit (covers SIGINT/SIGTERM/TUI quit/normal exit). A
-    // SIGKILL leaves a stale file, which stop/server detect as dead and clean up.
-    writeServerState({ pid: process.pid, port, startedAt: new Date().toISOString(), config: getConfigPath() }).catch(() => {});
-    const stateP = getServerStatePath();
-    process.on('exit', () => { try { unlinkSync(stateP); } catch { /* already gone */ } });
+    const address = server.address();
+    if (process.connected && typeof address === 'object') {
+      process.send({ type: 'teamclaude:ready', port, internalPort: address.port });
+    }
     // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
     // → server.close → process.exit) and every minute as a crash backstop
     // (a SIGKILL loses at most the last interval). The 'exit' write is sync.
@@ -368,6 +825,7 @@ async function serverCommand() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   }
+  process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
 }
 
 // ── server lifecycle: discover / stop / restart ─────────────
@@ -459,6 +917,36 @@ async function findRunningServer(config) {
   // a server that's merely unreachable for a moment.
   if (state && !(state.pid && isPidAlive(state.pid))) await clearServerState();
   return null;
+}
+
+async function ensureProxyRunning(config) {
+  const running = await findRunningServer(config);
+  if (running) return running;
+
+  console.error('[TeamClaude] Proxy is not running; starting it automatically.');
+  const daemonEnv = { ...process.env };
+  delete daemonEnv[SUPERVISED_WORKER_ENV];
+  delete daemonEnv[SUPERVISOR_PID_ENV];
+  let launchError = null;
+  const daemon = spawn(process.execPath, [process.argv[1], 'server'], {
+    detached: true,
+    env: daemonEnv,
+    stdio: 'ignore',
+  });
+  daemon.once('error', err => { launchError = err; });
+  daemon.unref();
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (launchError) break;
+    const started = await findRunningServer(config);
+    if (started) return started;
+    if (daemon.exitCode != null) break;
+    await delay(100);
+  }
+
+  const detail = launchError ? `: ${launchError.message}` : '';
+  throw new Error(`Proxy failed to start${detail}. Run "teamclaude server" to inspect the startup error.`);
 }
 
 /**
@@ -837,6 +1325,14 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
 
 async function runCommand() {
   const config = await loadOrCreateConfig();
+  if (!isCodexMode(config)) {
+    try {
+      await ensureProxyRunning(config);
+    } catch (err) {
+      console.error(`[TeamClaude] ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   // Everything after 'run' (skip -- separator if present)
   const clientArgs = args.slice(1);
@@ -1513,7 +2009,13 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 // ── helpers ─────────────────────────────────────────────────
 
 function isCodexMode(config) {
-  return config?.provider === 'codex' || cliProvider === 'codex';
+  // The env leg matters for the SUPERVISED WORKER: it is forked with plain
+  // ['server'] args (cliProvider = 'anthropic') and only inherits
+  // TEAMCLAUDE_PROVIDER. getConfigPath() already picked teamcodex.json off the
+  // same env var, so a provider-less config file must not flip the worker into
+  // anthropic semantics (stream recovery, auth headers, default upstream).
+  return config?.provider === 'codex' || cliProvider === 'codex'
+    || process.env.TEAMCLAUDE_PROVIDER === 'codex';
 }
 
 async function resolveAccounts(config) {

@@ -154,6 +154,7 @@ teamclaude run
 
 > [!IMPORTANT]
 > 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamclaude run`으로 시작하세요.
+> `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 

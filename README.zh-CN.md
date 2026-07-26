@@ -147,6 +147,7 @@ teamclaude run
 
 > [!IMPORTANT]
 > 即使代理正在运行，普通的 `claude` 命令也不会自动使用代理。若要启用账户自动切换，请始终通过 `teamclaude run` 启动。
+> `teamclaude run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
 
 也可以导入 Claude Code 当前的登录信息：
 
