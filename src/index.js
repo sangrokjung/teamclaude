@@ -118,9 +118,9 @@ async function superviseServerCommand() {
   const existing = await findRunningServer(config);
   if (existing && existing.port === port) {
     console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
-    console.error('  See it:      teamclaude status');
-    console.error('  Stop it:     teamclaude stop');
-    console.error('  Restart it:  teamclaude restart');
+    console.error('  See it:      teamcodex status');
+    console.error('  Stop it:     teamcodex stop');
+    console.error('  Restart it:  teamcodex restart');
     process.exitCode = 1;
     return;
   }
@@ -466,7 +466,7 @@ async function superviseServerCommand() {
     let becameReady = false;
 
     child.on('message', message => {
-      if (message?.type !== 'teamclaude:ready' || child !== worker || !message.internalPort) return;
+      if (message?.type !== 'teamcodex:ready' || child !== worker || !message.internalPort) return;
       becameReady = true;
       workerReady = true;
       workerPort = message.internalPort;
@@ -582,12 +582,12 @@ async function proxyWorkerCommand() {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     if (codexMode) {
-      console.error('  teamclaude codex login      Isolated Codex OAuth login');
-      console.error('  teamclaude codex import     Import the current Codex login');
+      console.error('  teamcodex codex login      Isolated Codex OAuth login');
+      console.error('  teamcodex codex import     Import the current Codex login');
     } else {
-      console.error('  teamclaude import           Import from Claude Code');
-      console.error('  teamclaude login            OAuth login via browser');
-      console.error('  teamclaude login --api      Add an API key');
+      console.error('  teamcodex import           Import from Claude Code');
+      console.error('  teamcodex login            OAuth login via browser');
+      console.error('  teamcodex login --api      Add an API key');
     }
     process.exit(1);
   }
@@ -646,7 +646,7 @@ async function proxyWorkerCommand() {
   });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
-  // accounts added externally, e.g. by `teamclaude import` while server is running)
+  // accounts added externally, e.g. by `teamcodex import` while server is running)
   accountManager.onTokenRefresh((idx, newTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
@@ -723,7 +723,7 @@ async function proxyWorkerCommand() {
         // The TUI's in-memory config is authoritative for the account SET (an
         // account it deleted must stay deleted, not be resurrected from the disk
         // copy this atomic update re-read). An account added to disk by an external
-        // `teamclaude import/login` while the TUI runs is reconciled on the next
+        // `teamcodex import/login` while the TUI runs is reconciled on the next
         // reload (R) / restart via syncAccountsFromDisk — not merged here, since we
         // can't distinguish "added externally" from "deleted locally" at save time.
         diskConfig.accounts = mapped;
@@ -767,7 +767,7 @@ async function proxyWorkerCommand() {
     server.removeListener('error', onListenError);
     const address = server.address();
     if (process.connected && typeof address === 'object') {
-      process.send({ type: 'teamclaude:ready', port, internalPort: address.port });
+      process.send({ type: 'teamcodex:ready', port, internalPort: address.port });
     }
     // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
     // → server.close → process.exit) and every minute as a crash backstop
@@ -795,11 +795,11 @@ async function proxyWorkerCommand() {
       });
       console.log('');
       console.log(codexMode
-        ? '  Run Codex through proxy:   teamclaude codex run'
-        : '  Run Claude through proxy:  teamclaude run');
+        ? '  Run Codex through proxy:   teamcodex codex run'
+        : '  Run Claude through proxy:  teamcodex run');
       console.log(codexMode
-        ? '  Show env vars:             teamclaude codex env'
-        : '  Show env vars:             teamclaude env');
+        ? '  Show env vars:             teamcodex codex env'
+        : '  Show env vars:             teamcodex env');
       console.log(sep);
       console.log('');
     }
@@ -946,7 +946,7 @@ async function ensureProxyRunning(config) {
   }
 
   const detail = launchError ? `: ${launchError.message}` : '';
-  throw new Error(`Proxy failed to start${detail}. Run "teamclaude server" to inspect the startup error.`);
+  throw new Error(`Proxy failed to start${detail}. Run "teamcodex server" to inspect the startup error.`);
 }
 
 /**
@@ -1190,8 +1190,8 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  teamclaude import        Import from existing Claude Code credentials');
-    console.error('  teamclaude login --api   Add an API key instead');
+    console.error('  teamcodex import        Import from existing Claude Code credentials');
+    console.error('  teamcodex login --api   Add an API key instead');
     process.exit(1);
   }
 
@@ -1203,7 +1203,7 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   if (isCodexMode(config)) {
-    console.log('teamclaude codex run');
+    console.log('teamcodex codex run');
     return;
   }
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
@@ -1395,7 +1395,7 @@ async function statusCommand() {
   const running = await findRunningServer(config);
   if (!running) {
     console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
-    console.log('Start it with:  teamclaude server');
+    console.log('Start it with:  teamcodex server');
     process.exit(1);
   }
   const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
@@ -1469,7 +1469,7 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
+    console.log('Add one with: teamcodex import, teamcodex login, or teamcodex login --api');
     return;
   }
 
@@ -1586,8 +1586,8 @@ async function apiCommand() {
   const path = args[1];
 
   if (!path) {
-    console.error('Usage: teamclaude api <path> [--account NAME] [--method POST] [--data JSON]');
-    console.error('Example: teamclaude api /api/oauth/claude_cli/roles');
+    console.error('Usage: teamcodex api <path> [--account NAME] [--method POST] [--data JSON]');
+    console.error('Example: teamcodex api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
 
@@ -1652,7 +1652,7 @@ async function removeCommand() {
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name>');
+    console.error('Usage: teamcodex remove <account-name>');
     process.exit(1);
   }
 
@@ -1673,7 +1673,7 @@ async function removeCommand() {
 function noteRunningServerReload(config) {
   return findRunningServer(config).then(running => {
     if (running) {
-      console.log('A server is running — apply now with: teamclaude restart');
+      console.log('A server is running — apply now with: teamcodex restart');
       console.log('  (or press "R" in the TUI to reload from config).');
     }
   }).catch(() => {});
@@ -1682,7 +1682,7 @@ function noteRunningServerReload(config) {
 async function setEnabledCommand(enabled) {
   const name = args[1];
   if (!name) {
-    console.error(`Usage: teamclaude ${enabled ? 'enable' : 'disable'} <account-name>`);
+    console.error(`Usage: teamcodex ${enabled ? 'enable' : 'disable'} <account-name>`);
     process.exit(1);
   }
   // atomicConfigUpdate re-reads disk before writing, so a concurrent token
@@ -1703,7 +1703,7 @@ async function setPriorityCommand() {
   const name = args[1];
   const raw = args[2];
   if (!name || raw === undefined) {
-    console.error('Usage: teamclaude priority <account-name> <number|auto>');
+    console.error('Usage: teamcodex priority <account-name> <number|auto>');
     console.error('  Lower number = preferred first. Use "auto" (or "clear") to return the');
     console.error('  account to automatic ordering: weekly reset soonest is drained first.');
     process.exit(1);
@@ -1733,7 +1733,7 @@ function showHelp() {
   if (cliProvider === 'codex') {
     console.log(`TeamCodex - Multi-account Codex subscription proxy
 
-Usage: teamclaude codex [command] [options]
+Usage: teamcodex codex [command] [options]
 
 Commands:
   server              Start the Codex proxy server
@@ -1762,9 +1762,9 @@ Config: ${getConfigPath()}
 `);
     return;
   }
-  console.log(`TeamClaude - Multi-account Claude proxy
+  console.log(`TeamCodex - one local proxy for Claude Code and Codex accounts
 
-Usage: teamclaude [command] [options]
+Usage: teamcodex [command] [options]
 
 Commands:
   server              Start the proxy server (default)
@@ -1937,7 +1937,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 
     // Apply enable/disable + priority from disk FIRST — independent of credential
     // re-resolution below. A failed re-import (freshCred null) must NOT strand a
-    // `teamclaude disable`/`priority` set while the server runs. setEnabled drains
+    // `teamcodex disable`/`priority` set while the server runs. setEnabled drains
     // the overflow queue when re-enabling so a freed-up account is used at once.
     if (mgr) {
       const wantEnabled = diskAcct.enabled !== false;
@@ -2064,9 +2064,9 @@ function handleServerListenError(err, port) {
   if (err.code === 'EADDRINUSE') {
     console.error(`[TeamClaude] Port ${port} is already in use.`);
     console.error('Another TeamClaude proxy may already be running.');
-    console.error('  See it:     teamclaude status');
-    console.error('  Stop it:    teamclaude stop');
-    console.error('  Restart it: teamclaude restart');
+    console.error('  See it:     teamcodex status');
+    console.error('  Stop it:    teamcodex stop');
+    console.error('  Restart it: teamcodex restart');
   } else if (err.code === 'EACCES') {
     console.error(`[TeamClaude] Permission denied while listening on port ${port}.`);
     console.error('Choose a non-privileged port in the TeamClaude config.');

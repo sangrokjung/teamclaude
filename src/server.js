@@ -429,7 +429,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // `host` rides along so `teamclaude status` (a separate process) can show
+        // `host` rides along so `teamcodex status` (a separate process) can show
         // the machine the PROXY runs on — CPU% is measured between status calls
         // by the tracker, RAM/loadavg are instantaneous.
         res.end(JSON.stringify({ ...accountManager.getStatus(), host: hostTracker.sample() }, null, 2));

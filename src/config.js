@@ -14,7 +14,7 @@ export function getConfigPath() {
 }
 
 // Runtime state for the running server (pid/port), written next to the config so
-// `teamclaude status` / `stop` / `restart` can find and signal it without the
+// `teamcodex status` / `stop` / `restart` can find and signal it without the
 // user hunting for the PID. One file per config, so different configs (and ports)
 // never collide.
 export function getServerStatePath() {
@@ -142,7 +142,7 @@ export async function saveConfig(config) {
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * made by other processes (e.g. `teamcodex import` while the server runs).
  *
  * Calls are SERIALIZED within this process (via the chain below): atomicConfigUpdate
  * re-reads the whole file, mutates, and writes it all back, so two concurrent callers
