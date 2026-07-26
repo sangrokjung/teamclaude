@@ -46,7 +46,8 @@ teamcodex codex import    # 기존 ~/.codex/auth.json 가져오기
 teamcodex server          # 프록시 시작 후 `teamcodex run`
 ```
 
-`teamcodex`와 `teamclaude` 두 명령이 함께 설치되고 동작은 같습니다.
+명령은 `teamcodex` 하나입니다. `teamclaude` 바이너리는 일부러 설치하지 않습니다. 같은
+이름을 쓰는 원본 패키지와 충돌하지 않기 위해서입니다.
 
 저장소에서 바로 받고 싶다면 `npm i -g github:sangrokjung/teamclaude`도 동작합니다.
 이쪽은 항상 기본 브랜치를 따라갑니다.
@@ -57,7 +58,8 @@ teamcodex server          # 프록시 시작 후 `teamcodex run`
 
 **본인이 가진 계정**을 **본인 머신에서** 순환시킬 뿐입니다. 손으로 로그인을 갈아끼우는
 동작에서 수동 재로그인만 없앤 것이고, 요청마다 그 계정의 OAuth 토큰이 그대로 실립니다.
-크리덴셜은 머신 밖으로 나가지 않습니다.
+크리덴셜은 로컬에 보관되고, CLI가 원래 보내던 곳인 벤더 API로만 전송됩니다. 제3자는
+크리덴셜을 보지 못합니다.
 
 쿼터를 늘려주지도, 한도를 우회하지도 않습니다. 이미 결제한 쿼터가 그냥 소멸하는 것을
 막아줄 뿐입니다.

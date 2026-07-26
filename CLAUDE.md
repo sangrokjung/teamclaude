@@ -34,7 +34,7 @@ node src/index.js codex server     # every subcommand works with the `codex` pre
 
 ## Architecture
 
-Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Eight files, each a clear layer:
+Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Nine files, each a clear layer:
 
 - **`src/index.js`** — CLI dispatcher + all non-server commands (`stop`, `restart`, `import`, `login`, `env`, `status`, `accounts`, `remove`, `api`). Owns the **config-sync wiring** between the running server, the TUI, and external CLI invocations (see below), and the **server lifecycle**: a stable parent HTTP listener buffers requests and forwards them to a replaceable proxy worker, while `findRunningServer`/`stopRunningServer` discover and stop the parent via state file + port probe + `lsof`. `teamclaude run` auto-starts this supervisor when absent.
 - **`src/server.js`** — the HTTP proxy and the request-forwarding loop (`forwardRequest`), including account acquisition (concurrency slot), retry, rate-limit handling, SSE streaming, and optional request logging.

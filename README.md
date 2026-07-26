@@ -46,7 +46,8 @@ teamcodex codex import    # pick up your existing ~/.codex/auth.json
 teamcodex server          # start the proxy, then `teamcodex run`
 ```
 
-Both `teamcodex` and `teamclaude` are installed as commands and behave identically.
+The command is `teamcodex`. This package deliberately does not install a `teamclaude`
+binary so it cannot collide with upstream's package of that name.
 
 Prefer installing straight from the repository? `npm i -g github:sangrokjung/teamclaude`
 works too and always tracks the default branch.
@@ -57,8 +58,9 @@ No. This does not share, resell, or pool accounts between people.
 
 It routes **your own** authenticated sessions from **one machine**, which is exactly
 what you would do by switching accounts by hand, minus the manual re-login. Every
-request is signed with that account's own OAuth token, nothing is proxied on behalf
-of third parties, and no credential ever leaves your machine.
+request is signed with that account's own OAuth token, and nothing is proxied on behalf
+of third parties. Credentials are stored locally and only ever sent to the vendor's own
+endpoints, exactly as the CLI would send them. No third party sees them.
 
 It does not increase your quota and it does not bypass any limit. It stops the quota
 you already paid for from expiring unused.

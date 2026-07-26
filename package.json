@@ -5,8 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamcodex": "src/index.js",
-    "teamclaude": "src/index.js"
+    "teamcodex": "src/index.js"
   },
   "files": [
     "src/",

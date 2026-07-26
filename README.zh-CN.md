@@ -46,7 +46,7 @@ teamcodex codex import    # 读取已有的 ~/.codex/auth.json
 teamcodex server          # 启动代理，然后执行 `teamcodex run`
 ```
 
-`teamcodex` 和 `teamclaude` 两个命令都会安装，行为完全一致。
+命令只有 `teamcodex` 一个。本包刻意不安装 `teamclaude` 二进制，以免与同名的上游包冲突。
 
 想直接从仓库安装也可以：`npm i -g github:sangrokjung/teamclaude`，这种方式始终跟随默认分支。
 
@@ -55,7 +55,8 @@ teamcodex server          # 启动代理，然后执行 `teamcodex run`
 **本项目仅用于管理你自己拥有的账号，不支持也不鼓励账号共享、代充或转售。**
 
 它做的事情，就是把你手动切换自己账号的动作自动化。所有请求都在你自己的机器上发出，
-每个请求都带该账号自身的 OAuth token，凭证不会离开本机，也不会为第三方做任何中转。
+每个请求都带该账号自身的 OAuth token，也不会为第三方做任何中转。凭证保存在本地，
+只会发往官方 API，与 CLI 原本的发送目标完全相同，第三方无法接触到它。
 
 它不会增加你的额度，也不会绕过任何限制。它只是让你已经付费的额度不至于白白过期。
 
