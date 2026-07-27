@@ -206,9 +206,19 @@ async function superviseServerCommand() {
       }
     });
   });
+  // Only the process that actually claimed the state file may remove it. A start
+  // that loses the port race (EADDRINUSE against an already-running server) exits
+  // through this handler too, and deleting the LIVE server's state file there
+  // would strip findRunningServer of its recorded-port leg — the very thing that
+  // keeps a server discoverable after its config port was edited.
+  let ownsStateFile = false;
   process.once('exit', () => {
-    try { unlinkSync(statePath); } catch {}
-    if (worker?.exitCode == null) {
+    if (ownsStateFile) {
+      try { unlinkSync(statePath); } catch {}
+    }
+    // `worker?.exitCode == null` is true when worker is null (undefined == null),
+    // so the optional chain alone would send us into kill() on a null worker.
+    if (worker && worker.exitCode == null) {
       try { worker.kill('SIGKILL'); } catch {}
     }
   });
@@ -377,7 +387,22 @@ async function superviseServerCommand() {
           if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
         }
         if (!stopping && !res.destroyed && attempt < 3) {
-          forwardToWorker(req, res, body, attempt + 1).then(resolve);
+          // A rejection here (bad forwarded header, synchronous http.request
+          // option error) must still settle the outer promise. Without the
+          // rejection arm the awaiting frame never returns, the client hangs,
+          // and the unhandled rejection takes down the supervisor that owns
+          // the public port and every in-flight stream.
+          forwardToWorker(req, res, body, attempt + 1).then(resolve, retryErr => {
+            if (!res.headersSent && !res.destroyed) {
+              res.writeHead(502, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                error: { type: 'proxy_error', message: retryErr?.message || 'Proxy worker unavailable' },
+              }));
+            } else if (!res.destroyed) {
+              res.destroy(retryErr);
+            }
+            resolve();
+          });
           return;
         }
         if (!res.headersSent && !res.destroyed) {
@@ -477,7 +502,7 @@ async function superviseServerCommand() {
         port,
         startedAt: new Date().toISOString(),
         config: getConfigPath(),
-      }).catch(() => {});
+      }).then(() => { ownsStateFile = true; }, () => {});
       clearTimeout(stableTimer);
       stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
       stableTimer.unref?.();
@@ -554,10 +579,17 @@ async function superviseServerCommand() {
       clearTimeout(forceTimer);
       resolve(code);
     };
-    listener.once('error', err => {
+    // Drop the bind-time diagnosis once we own the port. Left attached, any
+    // later server error (EMFILE, ENOBUFS under load) would be reported as
+    // "port already in use" and exit the supervisor mid-stream.
+    const onListenError = err => {
       handleServerListenError(err, port);
+    };
+    listener.once('error', onListenError);
+    listener.listen(port, () => {
+      listener.removeListener('error', onListenError);
+      launchWorker();
     });
-    listener.listen(port, launchWorker);
     process.once('SIGINT', requestShutdown);
     process.once('SIGTERM', requestShutdown);
   });
