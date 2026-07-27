@@ -147,6 +147,15 @@ async function superviseServerCommand() {
   // destroyed client socket ("Connection closed mid-response" in Claude Code,
   // which does NOT auto-retry a raw connection loss).
   const streamRecovery = !isCodexMode(config) && config.streamRecovery !== false;
+  const workerHealthIntervalMs = Number.isFinite(config.workerHealthIntervalMs)
+    ? Math.max(50, config.workerHealthIntervalMs)
+    : 5_000;
+  const workerHealthTimeoutMs = Number.isFinite(config.workerHealthTimeoutMs)
+    ? Math.max(10, config.workerHealthTimeoutMs)
+    : 2_000;
+  const workerHealthFailureThreshold = Number.isFinite(config.workerHealthFailureThreshold)
+    ? Math.max(1, Math.floor(config.workerHealthFailureThreshold))
+    : 2;
   const workerWaiters = new Set();
   const clientAgents = new WeakMap();
   const statePath = getServerStatePath();
@@ -159,6 +168,9 @@ async function superviseServerCommand() {
   let restartCount = 0;
   let restartTimer = null;
   let stableTimer = null;
+  let healthTimer = null;
+  let healthInFlight = false;
+  let healthFailures = 0;
   let forceTimer = null;
   let finish;
 
@@ -496,6 +508,7 @@ async function superviseServerCommand() {
       workerReady = true;
       workerPort = message.internalPort;
       hasBeenReady = true;
+      healthFailures = 0;
       writeServerState({
         pid: process.pid,
         workerPid: child.pid,
@@ -553,6 +566,46 @@ async function superviseServerCommand() {
     });
   }
 
+  function checkWorkerHealth() {
+    if (stopping || healthInFlight || !workerReady || !workerPort || !worker) return;
+    const checkedWorker = worker;
+    const checkedPort = workerPort;
+    healthInFlight = true;
+    let settled = false;
+    const finishCheck = healthy => {
+      if (settled) return;
+      settled = true;
+      healthInFlight = false;
+      if (checkedWorker !== worker || stopping) return;
+      if (healthy) {
+        healthFailures = 0;
+        return;
+      }
+      healthFailures += 1;
+      if (healthFailures < workerHealthFailureThreshold) return;
+      console.error(`[TeamClaude] Proxy worker failed ${healthFailures} health checks; restarting it.`);
+      healthFailures = 0;
+      workerReady = false;
+      workerPort = null;
+      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+    };
+    const healthReq = http.get({
+      host: '127.0.0.1',
+      port: checkedPort,
+      path: '/teamclaude/status',
+      agent: false,
+    }, healthRes => {
+      healthRes.resume();
+      healthRes.once('end', () => finishCheck(healthRes.statusCode === 200));
+      healthRes.once('error', () => finishCheck(false));
+      healthRes.once('aborted', () => finishCheck(false));
+    });
+    healthReq.setTimeout(workerHealthTimeoutMs, () => {
+      healthReq.destroy(new Error('Proxy worker health check timed out'));
+    });
+    healthReq.once('error', () => finishCheck(false));
+  }
+
   function requestShutdown() {
     if (stopping) return;
     stopping = true;
@@ -560,6 +613,7 @@ async function superviseServerCommand() {
     workerPort = null;
     clearTimeout(restartTimer);
     clearTimeout(stableTimer);
+    clearInterval(healthTimer);
     closePublicListener();
     if (!worker) {
       finish(0);
@@ -576,6 +630,7 @@ async function superviseServerCommand() {
     finish = code => {
       clearTimeout(restartTimer);
       clearTimeout(stableTimer);
+      clearInterval(healthTimer);
       clearTimeout(forceTimer);
       resolve(code);
     };
@@ -589,6 +644,8 @@ async function superviseServerCommand() {
     listener.listen(port, () => {
       listener.removeListener('error', onListenError);
       launchWorker();
+      healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
+      healthTimer.unref?.();
     });
     process.once('SIGINT', requestShutdown);
     process.once('SIGTERM', requestShutdown);

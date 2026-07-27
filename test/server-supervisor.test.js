@@ -168,6 +168,59 @@ test('proxy worker crash keeps the listener alive and restarts without Connectio
   }
 });
 
+test('unresponsive proxy worker is replaced while the public listener stays available', { timeout: 15000 }, async t => {
+  if (process.platform === 'win32') {
+    t.skip('SIGSTOP is not available on Windows');
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-health-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    workerHealthIntervalMs: 50,
+    workerHealthTimeoutMs: 100,
+    workerHealthFailureThreshold: 2,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stoppedWorkerPid = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    stoppedWorkerPid = initial.workerPid;
+    process.kill(stoppedWorkerPid, 'SIGSTOP');
+
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(response.status, 200,
+      'the supervisor must recover a hung worker before Claude Code exhausts its retries');
+
+    const recovered = await waitUntil(async () => {
+      const next = await readState(statePath);
+      return next?.workerPid !== stoppedWorkerPid ? next : null;
+    }, 'unresponsive worker was not replaced');
+    assert.ok(isPidAlive(recovered.workerPid));
+    assert.equal(child.exitCode, null, 'the public listener must survive worker recovery');
+  } finally {
+    if (stoppedWorkerPid && isPidAlive(stoppedWorkerPid)) {
+      try { process.kill(stoppedWorkerPid, 'SIGKILL'); } catch {}
+    }
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor preserves proxy API-key authentication for remote clients', { timeout: 15000 }, async t => {
   const host = externalIPv4();
   if (!host) {

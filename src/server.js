@@ -12,6 +12,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+// How many continuity sleeps a single request may spend waiting on a model-tier
+// window before we surface the 429. Weekly windows do not clear while we poll,
+// so this is a ceiling on a wait that would otherwise be unbounded. At the
+// default continuityMaxSleepMs (30s) this is ~5 minutes.
+const MODEL_EXHAUST_WAIT_PASSES = 10;
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
   const upstream = config.upstream || (provider === 'codex'
@@ -1123,7 +1129,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
           }
         }
-        if (ctx.continuity.enabled && !res.destroyed) {
+        // Continuity polls: each pass sleeps at most continuityMaxSleepMs and
+        // retries. That is right for a 5h window, which really does clear while
+        // we wait. A model-tier window is WEEKLY, so with no fallback configured
+        // (the default `modelFallbacks: {}`) the same pass repeats until the week
+        // rolls over: the client hangs for days and every sleep burns one real
+        // upstream 429. Bound the polling; once the budget is spent the client
+        // gets its 429 and can back off far more cheaply than we can.
+        if (ctx.continuity.enabled && !res.destroyed
+            && (ctx.modelWaitPasses || 0) < MODEL_EXHAUST_WAIT_PASSES) {
+          ctx.modelWaitPasses = (ctx.modelWaitPasses || 0) + 1;
           const wait = computeRetryAfter(
             accountManager.getStatus().accounts,
             accountManager.switchThreshold,
