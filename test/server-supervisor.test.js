@@ -168,6 +168,53 @@ test('proxy worker crash keeps the listener alive and restarts without Connectio
   }
 });
 
+test('cleanly exited proxy worker restarts without closing the public listener', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-clean-exit-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+
+    process.kill(initial.workerPid, 'SIGINT');
+    await waitUntil(
+      () => !isPidAlive(initial.workerPid),
+      'cleanly exited worker remained alive',
+    );
+
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(response.status, 200,
+      'the supervisor listener must hold requests while a cleanly exited worker is replaced');
+
+    const recovered = await waitUntil(async () => {
+      const next = await readState(statePath);
+      return next?.workerPid !== initial.workerPid ? next : null;
+    }, 'replacement worker was not recorded');
+    assert.equal(recovered.pid, child.pid);
+    assert.ok(isPidAlive(recovered.workerPid));
+    assert.equal(child.exitCode, null,
+      'the supervisor process must survive a clean worker exit');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('unresponsive proxy worker is replaced while the public listener stays available', { timeout: 15000 }, async t => {
   if (process.platform === 'win32') {
     t.skip('SIGSTOP is not available on Windows');

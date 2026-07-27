@@ -515,7 +515,12 @@ async function superviseServerCommand() {
     let becameReady = false;
 
     child.on('message', message => {
-      if (message?.type !== 'teamcodex:ready' || child !== worker || !message.internalPort) return;
+      if (child !== worker) return;
+      if (message?.type === 'teamcodex:shutdown') {
+        requestShutdown({ workerWillExit: true });
+        return;
+      }
+      if (message?.type !== 'teamcodex:ready' || !message.internalPort) return;
       becameReady = true;
       workerReady = true;
       workerPort = message.internalPort;
@@ -555,11 +560,6 @@ async function superviseServerCommand() {
         // unref'd: if nothing lingers, the process exits without waiting.
         const lingerSweep = setTimeout(() => closePublicListener(true), 150);
         lingerSweep.unref?.();
-        finish(0);
-        return;
-      }
-      if (code === 0) {
-        closePublicListener(true);
         finish(0);
         return;
       }
@@ -618,7 +618,7 @@ async function superviseServerCommand() {
     healthReq.once('error', () => finishCheck(false));
   }
 
-  function requestShutdown() {
+  function requestShutdown({ workerWillExit = false } = {}) {
     if (stopping) return;
     stopping = true;
     workerReady = false;
@@ -631,7 +631,7 @@ async function superviseServerCommand() {
       finish(0);
       return;
     }
-    worker.kill('SIGTERM');
+    if (!workerWillExit) worker.kill('SIGTERM');
     forceTimer = setTimeout(() => {
       if (worker) worker.kill('SIGKILL');
     }, 6_000);
@@ -659,8 +659,8 @@ async function superviseServerCommand() {
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
     });
-    process.once('SIGINT', requestShutdown);
-    process.once('SIGTERM', requestShutdown);
+    process.once('SIGINT', () => requestShutdown());
+    process.once('SIGTERM', () => requestShutdown());
   });
 
   await clearServerState();
@@ -838,7 +838,18 @@ async function proxyWorkerCommand() {
       // (before listen), and the TUI only starts inside the listen callback, so
       // this closure never runs before the binding is initialized.
       refreshQuota: () => server.refreshQuotaAll(),
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: () => {
+        const closeWorker = () => server.close(() => process.exit(0));
+        if (!process.connected) {
+          closeWorker();
+          return;
+        }
+        try {
+          process.send({ type: 'teamcodex:shutdown' }, closeWorker);
+        } catch {
+          closeWorker();
+        }
+      },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
