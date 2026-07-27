@@ -1,6 +1,6 @@
 {
   "name": "teamcodex",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "One local proxy for both Claude Code and Codex. Quota-aware account rotation, zero dependencies.",
   "type": "module",
   "main": "src/index.js",

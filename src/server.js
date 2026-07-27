@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { isTokenExpiringSoon } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
-import { SseFramer, sseErrorEvent } from './sse.js';
+import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -1344,7 +1344,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       responseHeaders[key] = value;
     }
 
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
+    // Same predicate the supervisor relay uses (index.js). These two must agree:
+    // the supervisor only frames what the worker framed, so a local copy that
+    // drifts would silently break recovery on whatever the two classify differently.
+    const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
 
     if (isStreaming && upstreamRes.body) {
       const streamLog = logDir ? [] : null;

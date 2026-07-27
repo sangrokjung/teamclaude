@@ -450,7 +450,19 @@ async function superviseServerCommand() {
             if (!bytes || bytes.length === 0 || res.destroyed || res.writableEnded) return;
             if (!res.write(bytes)) {
               upstreamRes.pause();
-              res.once('drain', () => upstreamRes.resume());
+              // Race drain against close. A client that stalls and then
+              // disconnects never fires 'drain', so a bare once('drain') leaks
+              // one listener (and one paused upstream response) per backpressure
+              // pause for the life of the stream.
+              const onDrain = () => {
+                res.removeListener('close', onClose);
+                upstreamRes.resume();
+              };
+              const onClose = () => {
+                res.removeListener('drain', onDrain);
+              };
+              res.once('drain', onDrain);
+              res.once('close', onClose);
             }
           });
           upstreamRes.once('end', () => {
