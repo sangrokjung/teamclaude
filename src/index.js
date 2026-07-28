@@ -187,6 +187,14 @@ async function superviseServerCommand() {
   let forceTimer = null;
   let finish;
 
+  function rejectPublicRequest(req, res, statusCode, headers, payload) {
+    req.pause();
+    res.shouldKeepAlive = false;
+    res.once('finish', () => req.destroy());
+    res.writeHead(statusCode, { ...headers, connection: 'close' });
+    res.end(JSON.stringify(payload));
+  }
+
   const listener = http.createServer((req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
@@ -199,12 +207,10 @@ async function superviseServerCommand() {
       || remoteAddr === '::ffff:127.0.0.1';
     if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
       && bearerKey !== config.proxy.apiKey && !isLocal) {
-      req.resume();
-      res.writeHead(401, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
+      rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
         type: 'error',
         error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-      }));
+      });
       return;
     }
     const contentLength = req.headers['content-length'];
@@ -213,9 +219,13 @@ async function superviseServerCommand() {
       && (contentLength == null || contentLength === '0')
       && req.headers['transfer-encoding'] == null;
     if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
-      req.resume();
-      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });
-      res.end(JSON.stringify({ error: { type: 'overloaded_error', message: 'Proxy supervisor queue is full' } }));
+      rejectPublicRequest(
+        req,
+        res,
+        429,
+        { 'content-type': 'application/json', 'retry-after': '1' },
+        { error: { type: 'overloaded_error', message: 'Proxy supervisor queue is full' } },
+      );
       return;
     }
     if (!bypassAdmission) activePublicRequests += 1;

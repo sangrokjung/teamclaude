@@ -431,6 +431,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
 
+  function rejectEarlyRequest(req, res, statusCode, headers, payload) {
+    req.pause();
+    res.shouldKeepAlive = false;
+    res.once('finish', () => req.destroy());
+    res.writeHead(statusCode, { ...headers, connection: 'close' });
+    res.end(JSON.stringify(payload));
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       // Auth check — skip for localhost connections
@@ -442,11 +450,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       if (proxyApiKey && clientKey !== proxyApiKey && bearerKey !== proxyApiKey && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
+        rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
+        });
         return;
       }
 
@@ -475,12 +482,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // could flood, including via /v1/oauth/token).
       const admissionCapacity = Math.min(accountManager.totalCapacity(), maxBufferedRequests);
       if (inFlightProxied >= admissionCapacity) {
-        req.resume(); // drain & discard the body so the socket isn't leaked
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
-        }));
+        rejectEarlyRequest(
+          req,
+          res,
+          429,
+          { 'Content-Type': 'application/json', 'retry-after': '5' },
+          {
+            type: 'error',
+            error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
+          },
+        );
         return;
       }
       inFlightProxied++;

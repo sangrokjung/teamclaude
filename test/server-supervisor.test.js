@@ -300,6 +300,31 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     assert.equal(unauthenticated.status, 401);
     assert.equal(JSON.parse(unauthenticated.body).error.type, 'authentication_error');
 
+    const slowUnauthenticated = await new Promise((resolve, reject) => {
+      let resolved = false;
+      const pending = http.request({
+        host,
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, response => {
+        response.resume();
+        response.once('end', () => {
+          resolved = true;
+          resolve({
+            status: response.statusCode,
+            connection: response.headers.connection,
+          });
+        });
+      });
+      pending.once('error', err => {
+        if (!resolved) reject(err);
+      });
+      pending.write('1');
+    });
+    assert.deepEqual(slowUnauthenticated, { status: 401, connection: 'close' });
+
     const authenticated = await request({
       host,
       port,
@@ -693,6 +718,31 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
     });
     assert.equal(bodyBearingStatus, 429,
       'a status GET with a body must not bypass the supervisor buffer budget');
+
+    const slowRejected = await new Promise((resolve, reject) => {
+      let resolved = false;
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, response => {
+        response.resume();
+        response.once('end', () => {
+          resolved = true;
+          resolve({
+            status: response.statusCode,
+            connection: response.headers.connection,
+          });
+        });
+      });
+      request.once('error', err => {
+        if (!resolved) reject(err);
+      });
+      request.write('1');
+    });
+    assert.deepEqual(slowRejected, { status: 429, connection: 'close' });
 
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
