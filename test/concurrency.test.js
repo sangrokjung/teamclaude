@@ -846,6 +846,75 @@ test('global admission cap rejects past capacity before buffering (upstream unto
   proxy.close();
 });
 
+test('direct proxy releases admission after a partial request body deadline', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    requestBodyTimeoutMs: 100,
+  });
+  const port = await listen(proxy);
+  let partialRequest = null;
+
+  try {
+    const timeoutResponse = new Promise((resolve, reject) => {
+      let responseStarted = false;
+      partialRequest = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-length': '10' },
+      }, response => {
+        responseStarted = true;
+        response.resume();
+        response.once('end', () => resolve({
+          status: response.statusCode,
+          connection: response.headers.connection,
+        }));
+      });
+      partialRequest.once('error', err => {
+        if (!responseStarted) reject(err);
+      });
+      partialRequest.write('1');
+    });
+    await new Promise(resolve => setTimeout(resolve, 25));
+
+    const blocked = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(blocked.status, 429);
+
+    const timedOut = await Promise.race([
+      timeoutResponse,
+      new Promise(resolve => setTimeout(() => resolve(null), 1000)),
+    ]);
+    assert.deepEqual(timedOut, { status: 408, connection: 'close' });
+
+    const recovered = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal(hits, 1);
+  } finally {
+    partialRequest?.destroy();
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('buffer budget caps worker admission below a large account queue capacity', async () => {
   let hits = 0;
   const upstream = http.createServer((_req, res) => {

@@ -43,6 +43,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  const requestBodyTimeoutMs = Number.isFinite(config.requestBodyTimeoutMs)
+      && config.requestBodyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.requestBodyTimeoutMs))
+    : 30_000;
   const maxBufferedRequestBytes = Number.isFinite(config.maxBufferedRequestBytes)
       && config.maxBufferedRequestBytes > 0
     ? config.maxBufferedRequestBytes
@@ -439,7 +443,37 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     res.end(JSON.stringify(payload));
   }
 
+  function startRequestBodyDeadline(req, res) {
+    let timedOut = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      req.off('end', cleanup);
+      req.off('aborted', cleanup);
+      req.off('error', cleanup);
+    };
+    const onTimeout = () => {
+      timedOut = true;
+      cleanup();
+      if (!res.headersSent && !res.destroyed) {
+        rejectEarlyRequest(req, res, 408, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Request body timed out' },
+        });
+      } else if (!req.destroyed) {
+        req.destroy();
+      }
+    };
+    req.once('end', cleanup);
+    req.once('aborted', cleanup);
+    req.once('error', cleanup);
+    timer = setTimeout(onTimeout, requestBodyTimeoutMs);
+    timer.unref();
+    return { cleanup, didTimeout: () => timedOut };
+  }
+
   const server = http.createServer(async (req, res) => {
+    let bodyDeadline = null;
     try {
       // Auth check — skip for localhost connections
       const clientKey = req.headers['x-api-key'];
@@ -495,6 +529,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
       inFlightProxied++;
+      bodyDeadline = startRequestBodyDeadline(req, res);
       try {
         // Let client token refresh requests pass through to upstream untouched.
         // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -576,14 +611,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             res.removeListener('close', onClose);
           }
         } catch (err) {
-          ctx.status = ctx.status || 502;
-          console.error('[TeamClaude] Unhandled error:', err);
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              type: 'error',
-              error: { type: 'proxy_error', message: 'Internal proxy error' },
-            }));
+          if (bodyDeadline.didTimeout()) {
+            ctx.status = 408;
+          } else {
+            ctx.status = ctx.status || 502;
+            console.error('[TeamClaude] Unhandled error:', err);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                type: 'error',
+                error: { type: 'proxy_error', message: 'Internal proxy error' },
+              }));
+            }
           }
         } finally {
           // Release the concurrency slot held by this request (if any). A failover
@@ -599,10 +638,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
         }
       } finally {
+        bodyDeadline.cleanup();
         inFlightProxied--;
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      if (!bodyDeadline?.didTimeout()) {
+        console.error('[TeamClaude] Unhandled error:', err);
+      }
     }
   });
 
