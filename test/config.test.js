@@ -139,6 +139,44 @@ test('TUI account mutations do not resurrect removals or delete UUID replacement
   assert.equal(afterExternalAddition.accounts[0].accessToken, 'new-a-token');
 });
 
+test('stale TUI upsert does not revive an externally replaced or removed UUID', () => {
+  const oldAccount = {
+    name: 'A',
+    type: 'oauth',
+    accountUuid: 'old-a',
+    accessToken: 'old-a-token',
+  };
+  const snapshot = { accounts: [oldAccount] };
+  const accountManager = {
+    accounts: [{ ...oldAccount, credential: 'old-a-token' }],
+  };
+  const mutation = {
+    type: 'upsert',
+    account: oldAccount,
+    previous: oldAccount,
+  };
+
+  const externallyReplaced = {
+    accounts: [{
+      name: 'A',
+      type: 'oauth',
+      accountUuid: 'new-a',
+      accessToken: 'new-a-token',
+    }],
+  };
+  applyTuiAccountMutation(externallyReplaced, snapshot, accountManager, mutation);
+  assert.deepEqual(externallyReplaced.accounts, [{
+    name: 'A',
+    type: 'oauth',
+    accountUuid: 'new-a',
+    accessToken: 'new-a-token',
+  }]);
+
+  const externallyRemoved = { accounts: [] };
+  applyTuiAccountMutation(externallyRemoved, snapshot, accountManager, mutation);
+  assert.deepEqual(externallyRemoved.accounts, []);
+});
+
 test('config/quota writes are atomic: valid content, 0600, no temp leftovers', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-'));
   const cfgPath = join(dir, 'teamclaude.json');

@@ -147,10 +147,11 @@ function patchAccount(accounts, account, fields) {
 
 export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation) {
   if (mutation.type === 'upsert') {
-    const account = persistedAccount(snapshot, accountManager, mutation.account);
     const previous = mutation.previous
       ? findAccountByIdentity(diskConfig.accounts, mutation.previous)
       : null;
+    if (mutation.previous && !previous) return;
+    const account = persistedAccount(snapshot, accountManager, mutation.account);
     const current = findAccountByIdentity(diskConfig.accounts, account);
     const existing = previous || current;
     if (existing) {
