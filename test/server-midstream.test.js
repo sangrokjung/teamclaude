@@ -40,10 +40,10 @@ function startProxy(am, upstreamPort, overrides = {}) {
 
 // Streaming-aware client: resolves with everything that arrived and HOW the
 // response ended — cleanEnd (proper HTTP termination) vs a killed socket.
-function streamPost(port, { onFirstData, body } = {}) {
+function streamPost(port, { onFirstData, body, method = 'POST' } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: '127.0.0.1', port, path: '/v1/messages', method: 'POST',
+      host: '127.0.0.1', port, path: '/v1/messages', method,
       headers: { 'content-type': 'application/json' },
     }, res => {
       const chunks = [];
@@ -63,7 +63,8 @@ function streamPost(port, { onFirstData, body } = {}) {
       res.once('error', err => settle({ cleanEnd: false, error: err }));
     });
     req.once('error', reject);
-    req.end(JSON.stringify(body ?? { model: 'claude-fable-5', messages: [{ role: 'user', content: 'hi' }] }));
+    const payload = body ?? { model: 'claude-fable-5', messages: [{ role: 'user', content: 'hi' }] };
+    req.end(method === 'GET' || method === 'HEAD' ? undefined : JSON.stringify(payload));
   });
 }
 
@@ -123,7 +124,7 @@ test('mid-event socket kill → complete events + injected retryable error, clea
   }
 });
 
-test('continuity mode discards a broken partial SSE attempt and returns one complete retry', async () => {
+test('continuity mode does not internally replay a broken partial SSE POST', async () => {
   const complete = 'event: message_start\ndata: {"type":"message_start"}\n\n'
     + 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"complete answer"}}\n\n'
     + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -146,12 +147,10 @@ test('continuity mode discards a broken partial SSE attempt and returns one comp
 
   try {
     const r = await streamPost(proxyPort);
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 529);
     assert.equal(r.cleanEnd, true);
-    assert.equal(r.body, complete, 'client must receive only the successful transactional attempt');
-    assert.ok(!r.body.includes('broken partial'));
-    assert.ok(!r.body.includes('overloaded_error'));
-    assert.equal(requests, 2);
+    assert.equal(JSON.parse(r.body).error.type, 'overloaded_error');
+    assert.equal(requests, 1, 'an upstream-accepted POST must not be replayed internally');
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
     proxy.close();
@@ -186,7 +185,7 @@ test('continuity mode retries a broken SSE on the same account after fleet backo
   const proxyPort = await listen(proxy);
 
   try {
-    const r = await streamPost(proxyPort);
+    const r = await streamPost(proxyPort, { method: 'GET' });
     assert.equal(r.status, 200);
     assert.equal(r.cleanEnd, true);
     assert.equal(r.body, complete);
@@ -225,9 +224,7 @@ test('continuity mode bounds persistent pre-stream SSE failures', async () => {
 
   try {
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [] }),
+      method: 'GET',
       signal: AbortSignal.timeout(1000),
     });
     await res.text();
@@ -402,7 +399,7 @@ test('SSE death before ANY frame → transparent failover: client sees one clean
   const proxyPort = await listen(proxy);
 
   try {
-    const r = await streamPost(proxyPort);
+    const r = await streamPost(proxyPort, { method: 'GET' });
     assert.equal(r.status, 200);
     assert.equal(r.cleanEnd, true);
     assert.equal(r.body, full, 'the client must see ONE clean stream from the second account');
@@ -438,7 +435,7 @@ test('SSE death before ANY frame with no alternate account → proper retryable 
   }
 });
 
-test('non-SSE body death mid-read now fails over to another account (headers not yet sent)', async () => {
+test('non-SSE body death after an unsafe POST does not fail over', async () => {
   const hits = [];
   const upstream = http.createServer((req, res) => {
     hits.push(req.headers['authorization'] || '');
@@ -459,10 +456,10 @@ test('non-SSE body death mid-read now fails over to another account (headers not
 
   try {
     const r = await streamPost(proxyPort);
-    assert.equal(r.status, 200);
+    assert.equal(r.status, 502);
     assert.equal(r.cleanEnd, true);
-    assert.equal(JSON.parse(r.body).ok, true, 'the second account must serve the response');
-    assert.equal(hits.length, 2);
+    assert.equal(JSON.parse(r.body).error.type, 'proxy_error');
+    assert.equal(hits.length, 1, 'an upstream-accepted POST must not be replayed internally');
     assert.ok(am.accounts.every(a => a.status === 'active'), 'a body-read blip must not poison the account');
   } finally {
     proxy.close();
@@ -499,13 +496,15 @@ test('non-SSE response above maxResponseBytes returns 502 without poisoning the 
 
 test('stalled non-SSE response returns 502 without poisoning the account or retaining its slot', async () => {
   let upstreamClosed = false;
+  let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.write('{"partial":');
     res.once('close', () => { upstreamClosed = true; });
   });
   const upstreamPort = await listen(upstream);
-  const am = new AccountManager(makeAccounts(1), 0.98);
+  const am = new AccountManager(makeAccounts(2), 0.98);
   const proxy = startProxy(am, upstreamPort, { upstreamResponseTimeoutMs: 50 });
   const proxyPort = await listen(proxy);
 
@@ -519,6 +518,7 @@ test('stalled non-SSE response returns 502 without poisoning the account or reta
     const body = await res.json();
     assert.equal(res.status, 502);
     assert.equal(body.error?.type, 'proxy_error');
+    assert.equal(upstreamHits, 1, 'a timed-out POST must not be replayed on the alternate account');
     for (let i = 0; i < 20 && !upstreamClosed; i++) await delay(10);
     assert.equal(upstreamClosed, true, 'the deadline must cancel the stalled upstream body');
     assert.equal(am.accounts[0].status, 'active');
@@ -529,7 +529,7 @@ test('stalled non-SSE response returns 502 without poisoning the account or reta
   }
 });
 
-test('stalled non-SSE response fails over to an alternate account', async () => {
+test('stalled replay-safe request fails over to an alternate account', async () => {
   let hits = 0;
   const upstream = http.createServer((_req, res) => {
     hits += 1;
@@ -546,9 +546,7 @@ test('stalled non-SSE response fails over to an alternate account', async () => 
 
   try {
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [] }),
+      method: 'GET',
       signal: AbortSignal.timeout(1000),
     });
     assert.equal(res.status, 200);

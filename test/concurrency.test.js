@@ -640,7 +640,7 @@ test('a client disconnect during 5xx overload backoff releases the slot promptly
   process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '1000';
   try {
     const ac = new AbortController();
-    const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}', signal: ac.signal })
+    const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'GET', signal: ac.signal })
       .catch(() => 'aborted');
     await new Promise(r => setTimeout(r, 120)); // request has 529'd and is now in backoff sleep
     assert.equal(am.accounts[0].inflight, 1, 'slot held while backing off');

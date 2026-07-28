@@ -137,7 +137,7 @@ upstream `v1.2.3`.
 - **Top-tier weekly-window model routing** for model-scoped `7d_oi` quota.
 - **Model fallback chains** through configurable `modelFallbacks`.
 - **Bounded graceful shutdown** for reliable launchd/systemd restarts.
-- **Network-error failover** with a bounded one-sweep retry budget.
+- **Method-aware network recovery** with bounded failover for replay-safe requests and no hidden replay of ambiguous POSTs.
 - **Host CPU and RAM tracking** in status JSON, CLI output, and the TUI.
 - **Hermes Agent compatibility** through the stable TeamCodex endpoint.
 
@@ -561,8 +561,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
 | `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled) |
-| `continuityMode` | Hold requests in the proxy while quota, global rate limits, HTTP 529/5xx, or an incomplete SSE attempt recover instead of ending the Claude Code turn (optional, default `true`) |
-| `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt so partial output can be discarded and replayed transparently (optional, default `true`) |
+| `continuityMode` | Hold requests in the proxy while quota/global rate limits recover; HTTP 529/5xx, network errors, and incomplete SSE attempts are retried internally only for replay-safe methods, never for an ambiguous POST (optional, default `true`) |
+| `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt; broken replay-safe attempts may retry transparently, while an ambiguous POST is returned as a retryable error without hidden replay (optional, default `true`) |
 | `maxResponseBytes` | Maximum bytes buffered per upstream response before returning 502; covers transactional SSE, non-SSE, and OAuth relay responses (optional, default `67108864` = 64 MiB) |
 | `upstreamResponseTimeoutMs` | Total deadline for upstream response headers and buffered response bodies; long-lived SSE bodies are exempt after headers arrive (optional, default `300000` = 5 minutes) |
 | `requestBodyTimeoutMs` | Total deadline for receiving a client request body before returning 408 and releasing admission capacity (optional, default `30000` = 30 seconds) |
@@ -628,8 +628,8 @@ flowchart LR
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. If the limit appears global, continuity mode opens a shared cooldown and retries internally instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
    - **Requested-model dead end** (fork) → after live model-quota exhaustion reaches all eligible accounts or the unlabeled-429 failover budget is exhausted, a configured `modelFallbacks` chain rewrites the request to the next model before any 429 is surfaced or continuity sleep starts.
-7. Transient network errors (connection reset, timeout) fail over before response bytes are sent. In continuity mode, Anthropic SSE attempts are buffered until a terminal event; a broken partial attempt is discarded and replayed, while completed streams preserve byte fidelity. Buffers larger than 1 MiB spill to a private temporary file; transactional SSE, non-SSE, and OAuth relay responses are capped by `maxResponseBytes`.
-8. If all accounts are exhausted or upstream returns HTTP 529/5xx, continuity mode keeps the request inside the proxy with capped backoff. Persistent overload is bounded by `TEAMCLAUDE_OVERLOAD_RETRIES` (default `6`) and then returned to the client; a client disconnect aborts sooner. Setting `continuityMode: false` restores legacy handling for quota waits, global rate limits, and transactional stream replay.
+7. Transient network errors and incomplete Anthropic SSE attempts fail over internally only for replay-safe methods (`GET`/`HEAD`/`OPTIONS`). An ambiguous POST is never replayed inside the proxy after dispatch: it receives a complete retryable error so the client controls any retry. Completed streams preserve byte fidelity. Buffers larger than 1 MiB spill to a private temporary file; transactional SSE, non-SSE, and OAuth relay responses are capped by `maxResponseBytes`.
+8. If all accounts are exhausted, continuity mode keeps the request inside the proxy with capped waits. HTTP 529/5xx backoff is likewise internal only for replay-safe methods; an unsafe request passes the upstream error through without replay. Persistent overload is bounded by `TEAMCLAUDE_OVERLOAD_RETRIES` (default `6`) and a client disconnect aborts sooner. Setting `continuityMode: false` restores legacy handling for quota waits and global rate limits.
 9. **Quota survives restarts**: the server snapshots general per-account quota/throttle state plus the committed warm-up probe template to `<config>.quota.json` (every minute and on exit), so TUI **R** works before fresh traffic arrives. A restored template is provisional and the first freshly accepted request shape replaces it. Model-scoped weekly values are intentionally discarded on import and re-measured from live traffic so stale Fable data cannot self-lock its refresh path
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 

@@ -872,12 +872,9 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-// Upstream statuses that are transient and safe to retry instead of surfacing to
-// the client. 529 = "Overloaded" (Anthropic at capacity); 500/502/503/504 =
-// gateway / availability blips. Passing these straight through fails the client's
-// turn — e.g. Claude Code prints "API Error: 529 Overloaded" and stops — so
-// forwardRequest fails them over to another account and, when the whole fleet is
-// overloaded, retries with a bounded exponential backoff before giving up.
+// Candidate transient statuses. A separate method gate permits internal
+// failover/backoff only for replay-safe requests; an ambiguous POST passes
+// through because a 5xx does not prove the upstream skipped its execution.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
@@ -1153,6 +1150,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
+  const replaySafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
 
   // Build log sections
   const logSections = [];
@@ -1464,6 +1462,30 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const code = upstreamRes.status;
       await upstreamRes.body?.cancel();
 
+      // A 5xx only proves the response failed, not that the upstream skipped
+      // the request. Replaying a POST here can duplicate inference, tool side
+      // effects, and billing. Leave retries to the client unless the HTTP
+      // method itself is replay-safe.
+      if (!replaySafe) {
+        console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
+        ctx.status = code;
+        if (logDir) {
+          logSections.push(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        if (!res.destroyed && !res.headersSent) {
+          res.writeHead(code, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'overloaded_error',
+              message: `Upstream overloaded (HTTP ${code}). Request was not replayed.`,
+            },
+          }));
+        }
+        return;
+      }
+
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
       const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
@@ -1578,10 +1600,28 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return;
       }
       if (outcome.preStreamFailure && !res.headersSent && !res.destroyed) {
-        // Nothing reached the client. Replay on another account exactly like a
-        // pre-stream transient error (per-request exclusion, no account
-        // poisoning); when no alternate remains, surface a proper HTTP 529 —
-        // the one shape every client reliably auto-retries.
+        // Nothing reached the client, but upstream may already have accepted
+        // the request. Only replay-safe methods can move to another account;
+        // an unsafe POST is surfaced as a retryable error for the client to
+        // decide, avoiding a hidden duplicate execution inside the proxy.
+        if (!replaySafe) {
+          console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
+          if (logDir) {
+            logSections.push(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
+            writeRequestLog(logDir, reqId, logSections);
+          }
+          ctx.status = 529;
+          res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'overloaded_error',
+              message: 'Upstream stream failed after dispatch. Request was not replayed; please retry.',
+            },
+          }));
+          return;
+        }
+
         console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} before any data on "${account.name}" — replaying on another account`);
         if (logDir) {
           logSections.push(`=== STREAM ${outcome.preStreamFailure} before any data — replaying ===`);
@@ -1634,9 +1674,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      // Buffer non-SSE bodies before sending headers so body-read failures remain
-      // replayable and oversized upstream responses can be rejected as a clean
-      // 502 without exposing partial or attacker-controlled bytes to the client.
+      // Buffer non-SSE bodies before sending headers so replay-safe methods can
+      // recover from body-read failures and oversized upstream responses can be
+      // rejected cleanly without exposing partial attacker-controlled bytes.
       const buf = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
       if (buf === null) {
         ctx.status = 502;
@@ -1672,7 +1712,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       ctx.tried5xx.add(account);
-      if (retryCount < maxRetries
+      if (replaySafe && retryCount < maxRetries
           && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
             || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
         console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
@@ -1709,8 +1749,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // Undici surfaces a connection that dies WHILE READING THE BODY differently
     // from one that dies at dispatch: `TypeError: terminated` with the socket
     // error as `cause` (code UND_ERR_SOCKET/ECONNRESET), not a top-level code.
-    // Since non-SSE bodies are now buffered before headers go out, that path is
-    // retryable too — misclassifying it would wrongly poison the account.
+    // Buffered non-SSE bodies also reach this path; the method gate below
+    // decides whether transport recovery is safe without poisoning the account.
     const TRANSIENT_CODES = new Set([
       'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
       'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
@@ -1721,19 +1761,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         TRANSIENT_CODES.has(err.code) ||
         TRANSIENT_CODES.has(err.cause?.code));
 
-    // Transient network errors. Before any response bytes went out the request
-    // body is still buffered, so fail over to another account exactly like a
-    // 5xx — a per-connection blip (half-dead keep-alive, one flaky route) is
-    // often account-path-local, and destroying the client here surfaces as
-    // "Response stalled mid-stream" in Claude Code for no good reason. The
-    // account is NOT marked 'error' (a network blip is not a bad credential);
-    // exclusion is per-request via tried5xx. Mid-stream (headers already sent,
-    // partial data delivered) is not replayable: with streamRecovery on, SSE
-    // errors never reach here (streamResponse converts them into an injected
-    // retryable error event); this destroy remains the backstop for the legacy
-    // codex/opt-out path — close so the client retries.
+    // Transient network errors are ambiguous once dispatch starts: upstream may
+    // have accepted an unsafe request even when no response reached us. Keep
+    // account-local failover for replay-safe methods only. A network blip does
+    // not poison the account; exclusion remains per-request via tried5xx.
     if (isTransient) {
-      if (!res.headersSent && !res.destroyed && retryCount < maxRetries) {
+      if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
         if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
           || accountManager.anyCapped(ctx.tried5xx, ctx.model)) {
@@ -1742,15 +1775,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
       }
-      // Legacy/codex mid-stream: streamResponse's finally already ENDED the
-      // response cleanly (graceful FIN) before the error propagated here.
-      // Destroying on top of that end could turn it into an RST that loses the
-      // flushed tail — only destroy a response that is genuinely unfinished.
-      if (!res.writableEnded) res.destroy();
+      if (!replaySafe && !res.headersSent && !res.destroyed) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: 'Upstream connection failed after dispatch. Request was not replayed.',
+          },
+        }));
+      } else if (!res.writableEnded) {
+        // Legacy/codex mid-stream: only destroy a genuinely unfinished
+        // response; destroying after streamResponse ended it can discard tail.
+        res.destroy();
+      }
       return;
     }
 
-    if (retryCount < maxRetries && !res.headersSent) {
+    if (replaySafe && retryCount < maxRetries && !res.headersSent) {
       // Preserve a prior refresh-failure label, but label a new request-path
       // send failure so a later token rotation cannot blindly revive it.
       if (account.status !== 'error') account._errorFromRefresh = false;
@@ -1778,15 +1821,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
  * With `recover` (anthropic mode, `config.streamRecovery !== false`) the stream
  * is parsed one WHOLE SSE event at a time (SseFramer). With `transactional`
  * (continuity mode) no event is exposed until a terminal event arrives; an
- * abnormal attempt is discarded and returned as replayable, so the caller can
- * run the same request again without leaking partial output. Outside continuity
- * mode, an abnormal end keeps the legacy recovery contract: append a synthetic
- * retryable `overloaded_error` event and let the client retry.
+ * abnormal attempt is discarded and returned without leaking partial output.
+ * The caller may replay only a replay-safe method; unsafe requests are surfaced
+ * for the client to decide. Outside continuity mode, an abnormal end keeps the
+ * legacy recovery contract: append a synthetic retryable `overloaded_error`
+ * event and let the client retry.
  *
  * With recovery, `ensureHeaders` defers the client's response headers until the
  * first whole frame is forwarded; a failure BEFORE that point returns
- * { preStreamFailure } with the response untouched, so the caller can replay
- * the whole request on another account instead of involving the client at all.
+ * { preStreamFailure } with the response untouched, so the caller can either
+ * replay a safe method or surface an unsafe request without partial output.
  *
  * Returns { injected, reason, preStreamFailure }.
  */
@@ -1948,13 +1992,13 @@ async function streamResponse(
           const detail = err?.cause?.code || err?.code || err?.name || 'network error';
           if (transactional && !framer.sawTerminal) {
             // No semantic bytes from this attempt reached the client. Discard
-            // every staged frame and replay the original buffered request.
+            // every staged frame and let the caller apply the method-safety gate.
             outcome.preStreamFailure = `errored (${detail})`;
             return outcome;
           }
           if (!res.headersSent) {
-            // Nothing was forwarded yet (headers still deferred): the request
-            // is fully replayable — hand the decision back to the caller.
+            // Nothing was forwarded yet (headers still deferred): hand the
+            // method-aware replay decision back to the caller.
             outcome.preStreamFailure = `errored (${detail})`;
             return outcome;
           }

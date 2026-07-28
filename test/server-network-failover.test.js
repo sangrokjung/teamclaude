@@ -33,15 +33,17 @@ function startProxy(am, upstreamPort, overrides = {}) {
   });
 }
 
-function post(port, model = 'claude-fable-5') {
+function request(port, method = 'POST', model = 'claude-fable-5') {
   return fetch(`http://127.0.0.1:${port}/v1/messages`, {
-    method: 'POST',
+    method,
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+    body: method === 'GET' || method === 'HEAD'
+      ? undefined
+      : JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
   });
 }
 
-test('pre-stream network error fails over to another account and succeeds', async () => {
+test('pre-response network error does not replay an unsafe POST', async () => {
   const authsSeen = [];
   const upstream = http.createServer((req, res) => {
     const auth = req.headers['authorization'] || '';
@@ -60,12 +62,42 @@ test('pre-stream network error fails over to another account and succeeds', asyn
   const proxyPort = await listen(proxy);
 
   try {
-    const res = await post(proxyPort);
+    const res = await request(proxyPort);
     const json = await res.json();
-    assert.equal(res.status, 200);
-    assert.equal(json.ok, true);
-    assert.ok(authsSeen.length >= 2, `expected failover dispatch, saw ${authsSeen.length}`);
+    assert.equal(res.status, 502);
+    assert.equal(json.error?.type, 'proxy_error');
+    assert.equal(authsSeen.length, 1, 'an ambiguous POST must not be replayed internally');
     // A network blip must not poison the account (per-request exclusion only).
+    assert.ok(am.accounts.every(a => a.status === 'active'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('pre-response network error fails over for a replay-safe request', async () => {
+  const authsSeen = [];
+  const upstream = http.createServer((req, res) => {
+    const auth = req.headers['authorization'] || '';
+    authsSeen.push(auth);
+    if (auth.includes('tok-0')) {
+      req.socket.destroy();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await request(proxyPort, 'GET');
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).ok, true);
+    assert.ok(authsSeen.length >= 2, `expected failover dispatch, saw ${authsSeen.length}`);
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
     proxy.close();
@@ -86,7 +118,7 @@ test('network error on every account → connection closes (bounded, no account 
   const proxyPort = await listen(proxy);
 
   try {
-    await assert.rejects(() => post(proxyPort)); // client socket destroyed → fetch rejects
+    await assert.rejects(() => request(proxyPort, 'GET')); // client socket destroyed → fetch rejects
     assert.ok(hits <= 3, `expected bounded dispatches, got ${hits}`);
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
