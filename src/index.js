@@ -207,7 +207,11 @@ async function superviseServerCommand() {
       }));
       return;
     }
-    const bypassAdmission = req.method === 'GET' && req.url === '/teamclaude/status';
+    const contentLength = req.headers['content-length'];
+    const bypassAdmission = req.method === 'GET'
+      && req.url === '/teamclaude/status'
+      && (contentLength == null || contentLength === '0')
+      && req.headers['transfer-encoding'] == null;
     if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
       req.resume();
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });

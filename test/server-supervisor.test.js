@@ -677,6 +677,23 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
 
   try {
     await waitUntil(() => status(port), 'proxy did not start');
+    const bodyBearingStatus = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/teamclaude/status',
+        method: 'GET',
+        headers: { 'content-length': '2' },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', reject);
+      request.end('{}');
+    });
+    assert.equal(bodyBearingStatus, 429,
+      'a status GET with a body must not bypass the supervisor buffer budget');
+
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
