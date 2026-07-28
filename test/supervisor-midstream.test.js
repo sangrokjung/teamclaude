@@ -71,6 +71,114 @@ async function stopChild(child) {
   }
 }
 
+test('supervisor bounds an idle worker SSE relay and releases public admission', { timeout: 20000 }, async t => {
+  if (process.platform === 'win32') {
+    t.skip('SIGSTOP is not available on Windows');
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-idle-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  const streams = new Set();
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    const timer = setInterval(() => {
+      if (!res.destroyed) res.write('event: ping\ndata: {"type":"ping"}\n\n');
+    }, 20);
+    streams.add(res);
+    res.once('close', () => {
+      clearInterval(timer);
+      streams.delete(res);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+    streamIdleTimeoutMs: 200,
+    maxConcurrentPerAccount: 1,
+    overflowQueueMaxDepth: 0,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stoppedWorkerPid = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    let markFirstData;
+    const firstData = new Promise(resolve => { markFirstData = resolve; });
+    const resultPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      const chunks = [];
+      let outgoing;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ body: Buffer.concat(chunks).toString(), ...result });
+      };
+      const timer = setTimeout(() => {
+        outgoing.destroy();
+        finish({ cleanEnd: false, timedOut: true });
+      }, 1500);
+      outgoing = http.request({
+        host: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      }, res => {
+        res.on('data', chunk => {
+          chunks.push(chunk);
+          markFirstData();
+        });
+        res.once('end', () => finish({ cleanEnd: true, timedOut: false }));
+        res.once('aborted', () => finish({ cleanEnd: false, timedOut: false }));
+        res.once('error', () => finish({ cleanEnd: false, timedOut: false }));
+      });
+      outgoing.once('error', err => {
+        if (!settled) reject(err);
+      });
+      outgoing.end(JSON.stringify({ model: 'test-model', messages: [] }));
+    });
+
+    await firstData;
+    stoppedWorkerPid = initial.workerPid;
+    process.kill(stoppedWorkerPid, 'SIGSTOP');
+    const result = await resultPromise;
+
+    assert.equal(result.timedOut, false, 'the supervisor relay must enforce its own idle deadline');
+    assert.equal(result.cleanEnd, true);
+    assert.ok(result.body.includes('overloaded_error'));
+
+    process.kill(stoppedWorkerPid, 'SIGCONT');
+    stoppedWorkerPid = null;
+    for (const res of streams) res.destroy();
+    await waitUntil(async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`).catch(() => null);
+      return response?.status === 200;
+    }, 'public admission was not released after the idle relay');
+  } finally {
+    if (stoppedWorkerPid != null) {
+      try { process.kill(stoppedWorkerPid, 'SIGCONT'); } catch {}
+    }
+    for (const res of streams) res.destroy();
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('client abort before first byte must NOT kill the healthy shared worker', { timeout: 20000 }, async () => {
   // One terminal pressing Esc during the (seconds-long) first-byte wait used to
   // make the supervisor treat its own upstreamReq.destroy() error as a worker

@@ -24,6 +24,7 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 function publicRequestCapacity(config, accounts = config.accounts || []) {
   const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
@@ -164,6 +165,10 @@ async function superviseServerCommand() {
   // destroyed client socket ("Connection closed mid-response" in Claude Code,
   // which does NOT auto-retry a raw connection loss).
   const streamRecovery = !isCodexMode(config) && config.streamRecovery !== false;
+  const streamIdleTimeoutMs = Number.isFinite(config.streamIdleTimeoutMs)
+      && config.streamIdleTimeoutMs > 0
+    ? Math.floor(config.streamIdleTimeoutMs)
+    : DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   const workerHealthIntervalMs = Number.isFinite(config.workerHealthIntervalMs)
     ? Math.max(50, config.workerHealthIntervalMs)
     : 5_000;
@@ -410,6 +415,8 @@ async function superviseServerCommand() {
       let settled = false;
       let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
       let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      let streamIdleTimer = null;
+      let drainCleanup = null;
       const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
       let workerConnectionEstablished = false;
       const headers = { ...req.headers, host: `127.0.0.1:${target.port}`, connection: 'keep-alive' };
@@ -424,8 +431,60 @@ async function superviseServerCommand() {
         agent: clientAgent(req),
       });
 
+      const clearRelayTimers = () => {
+        if (streamIdleTimer !== null) {
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        }
+        drainCleanup?.();
+      };
+
+      const armStreamIdle = upstreamRes => {
+        if (streamIdleTimer !== null) clearTimeout(streamIdleTimer);
+        streamIdleTimer = setTimeout(() => {
+          streamIdleTimer = null;
+          const err = new Error(`Proxy worker SSE idle timeout after ${streamIdleTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          upstreamRes.destroy(err);
+        }, streamIdleTimeoutMs);
+        streamIdleTimer.unref?.();
+      };
+
+      const waitForPublicDrain = upstreamRes => {
+        if (drainCleanup) return;
+        if (streamIdleTimer !== null) {
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        }
+        let timer = null;
+        const cleanup = () => {
+          res.removeListener('drain', onDrain);
+          res.removeListener('close', onClose);
+          if (timer !== null) clearTimeout(timer);
+          if (drainCleanup === cleanup) drainCleanup = null;
+        };
+        const onDrain = () => {
+          cleanup();
+          armStreamIdle(upstreamRes);
+          upstreamRes.resume();
+        };
+        const onClose = () => cleanup();
+        drainCleanup = cleanup;
+        res.once('drain', onDrain);
+        res.once('close', onClose);
+        timer = setTimeout(() => {
+          cleanup();
+          const err = new Error(`Public SSE drain timeout after ${streamIdleTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          upstreamRes.destroy(err);
+          if (!res.destroyed) res.destroy(err);
+        }, streamIdleTimeoutMs);
+        timer.unref?.();
+      };
+
       const retryOrFail = err => {
         if (settled) return;
+        clearRelayTimers();
         settled = true;
         // The client went away: OUR close handler destroyed the upstream leg,
         // so this error is self-inflicted. The worker is healthy — recycling
@@ -515,43 +574,31 @@ async function superviseServerCommand() {
         delete responseHeaders['keep-alive'];
         delete responseHeaders['transfer-encoding'];
         res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
-        if (streamRecovery && isEventStream(upstreamRes.headers['content-type'])) {
-          // Frame-buffered SSE relay: forward only whole events so a worker
-          // crash mid-stream leaves the client's parser at a clean boundary
-          // (see retryOrFail above for the injected retryable error event).
-          const framer = new SseFramer();
+        if (isEventStream(upstreamRes.headers['content-type'])) {
+          const framer = streamRecovery ? new SseFramer() : null;
           sseFramer = framer;
+          armStreamIdle(upstreamRes);
           upstreamRes.on('data', chunk => {
-            const bytes = framer.push(chunk);
+            armStreamIdle(upstreamRes);
+            const bytes = framer ? framer.push(chunk) : chunk;
             // writableEnded guard: retryOrFail may have already ENDED this
             // response (graceful injection); a straggler chunk must not
             // write-after-end (uncaught ERR_STREAM_WRITE_AFTER_END).
             if (!bytes || bytes.length === 0 || res.destroyed || res.writableEnded) return;
             if (!res.write(bytes)) {
               upstreamRes.pause();
-              // Race drain against close. A client that stalls and then
-              // disconnects never fires 'drain', so a bare once('drain') leaks
-              // one listener (and one paused upstream response) per backpressure
-              // pause for the life of the stream.
-              const onDrain = () => {
-                res.removeListener('close', onClose);
-                upstreamRes.resume();
-              };
-              const onClose = () => {
-                res.removeListener('drain', onDrain);
-              };
-              res.once('drain', onDrain);
-              res.once('close', onClose);
+              waitForPublicDrain(upstreamRes);
             }
           });
           upstreamRes.once('end', () => {
             if (settled) return;
+            clearRelayTimers();
             settled = true;
             if (!res.destroyed && !res.writableEnded) {
               // Clean worker end. The worker's own recovery already injects on
               // truncation, so relay as-is; flush any un-framed tail (possible
               // only when the worker ran with recovery off) for byte fidelity.
-              res.end(framer.pending.length ? framer.pending : undefined);
+              res.end(framer?.pending.length ? framer.pending : undefined);
             }
             resolve();
           });
@@ -568,6 +615,7 @@ async function superviseServerCommand() {
       });
       upstreamReq.once('error', retryOrFail);
       res.once('close', () => {
+        clearRelayTimers();
         if (!res.writableEnded) {
           clientGone = true; // must be set BEFORE the destroy surfaces as an 'error'
           upstreamReq.destroy();
