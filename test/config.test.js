@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { atomicConfigUpdate, saveConfig, writeQuotaCacheSync, readQuotaCache } from '../src/config.js';
+import { applyTuiAccountMutation } from '../src/tui.js';
 
 // node --test runs each test file in its own process, so setting TEAMCLAUDE_CONFIG
 // (and the module-level write chain) here doesn't leak into other test files.
@@ -40,6 +41,102 @@ test('atomicConfigUpdate serializes concurrent writers (no lost update / no resu
     else process.env.TEAMCLAUDE_CONFIG = prev;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('TUI account patch preserves an account added by an external writer', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-tui-'));
+  const cfgPath = join(dir, 'teamclaude.json');
+  const prev = process.env.TEAMCLAUDE_CONFIG;
+  process.env.TEAMCLAUDE_CONFIG = cfgPath;
+  const snapshot = {
+    accounts: [{ name: 'A', type: 'apikey', apiKey: 'a' }],
+  };
+  const accountManager = {
+    accounts: [{ name: 'A', type: 'apikey', credential: 'a' }],
+  };
+  try {
+    await writeFile(cfgPath, JSON.stringify({
+      proxy: { port: 1 },
+      accounts: snapshot.accounts,
+    }, null, 2) + '\n', { mode: 0o600 });
+
+    await atomicConfigUpdate(config => {
+      config.accounts.push({ name: 'B', type: 'apikey', apiKey: 'b' });
+    });
+    await atomicConfigUpdate(diskConfig => {
+      applyTuiAccountMutation(diskConfig, snapshot, accountManager, {
+        type: 'patch',
+        account: snapshot.accounts[0],
+        fields: { enabled: false },
+      });
+    });
+
+    const final = JSON.parse(await readFile(cfgPath, 'utf8'));
+    assert.deepEqual(final.accounts.map(account => account.name), ['A', 'B']);
+    assert.equal(final.accounts[0].enabled, false);
+  } finally {
+    if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG;
+    else process.env.TEAMCLAUDE_CONFIG = prev;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('TUI account mutations do not resurrect removals or delete UUID replacements', () => {
+  const staleSnapshot = {
+    accounts: [
+      { name: 'A', type: 'oauth', accountUuid: 'old-a', accessToken: 'old-a-token' },
+      { name: 'B', type: 'apikey', apiKey: 'b' },
+    ],
+  };
+  const accountManager = {
+    accounts: [
+      { name: 'A', type: 'oauth', accountUuid: 'old-a', credential: 'old-a-token' },
+      { name: 'B', type: 'apikey', credential: 'b' },
+    ],
+  };
+  const afterExternalRemoval = {
+    accounts: [{ name: 'B', type: 'apikey', apiKey: 'b' }],
+  };
+  applyTuiAccountMutation(afterExternalRemoval, staleSnapshot, accountManager, {
+    type: 'batchPatch',
+    patches: staleSnapshot.accounts.map(account => ({
+      account,
+      fields: { priority: 0 },
+    })),
+  });
+  assert.deepEqual(afterExternalRemoval.accounts.map(account => account.name), ['B']);
+  assert.equal(afterExternalRemoval.accounts[0].priority, 0);
+
+  const afterExternalReplacement = {
+    accounts: [{ name: 'A', type: 'oauth', accountUuid: 'new-a', accessToken: 'new-a-token' }],
+  };
+  applyTuiAccountMutation(afterExternalReplacement, staleSnapshot, accountManager, {
+    type: 'remove',
+    account: staleSnapshot.accounts[0],
+  });
+  assert.deepEqual(afterExternalReplacement.accounts, [
+    { name: 'A', type: 'oauth', accountUuid: 'new-a', accessToken: 'new-a-token' },
+  ]);
+
+  const afterExternalAddition = {
+    accounts: [
+      staleSnapshot.accounts[0],
+      { name: 'C', type: 'apikey', apiKey: 'c' },
+    ],
+  };
+  const reimportSnapshot = {
+    accounts: [{ name: 'A', type: 'oauth', accountUuid: 'new-a', accessToken: 'new-a-token' }],
+  };
+  applyTuiAccountMutation(afterExternalAddition, reimportSnapshot, {
+    accounts: [{ name: 'A', type: 'oauth', accountUuid: 'new-a', credential: 'new-a-token' }],
+  }, {
+    type: 'upsert',
+    account: reimportSnapshot.accounts[0],
+    previous: staleSnapshot.accounts[0],
+  });
+  assert.deepEqual(afterExternalAddition.accounts.map(account => account.name), ['A', 'C']);
+  assert.equal(afterExternalAddition.accounts[0].accountUuid, 'new-a');
+  assert.equal(afterExternalAddition.accounts[0].accessToken, 'new-a-token');
 });
 
 test('config/quota writes are atomic: valid content, 0600, no temp leftovers', async () => {

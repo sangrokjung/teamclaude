@@ -17,7 +17,7 @@ import {
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
 } from './codex.js';
-import { TUI } from './tui.js';
+import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 
@@ -850,38 +850,8 @@ async function proxyWorkerCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        const mapped = config.accounts.map(a => {
-          // Match the live account by IDENTITY — never by array index:
-          // resolveAccounts() can skip a tokenless/bad config entry, so
-          // config.accounts and accountManager.accounts are not index-aligned, and
-          // an index map would overlay the wrong account's credentials. Two-phase
-          // (UUID first, then name): a single `uuid===x || name===x` find could
-          // return an earlier same-name account before reaching the real UUID match.
-          const am = (a.accountUuid && accountManager.accounts.find(x => x.accountUuid === a.accountUuid))
-            || accountManager.accounts.find(x => x.name === a.name);
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-            idToken: am.idToken,
-            accountId: am.accountId,
-          } : a;
-          const diskAcct = (a.accountUuid && diskConfig.accounts.find(d => d.accountUuid === a.accountUuid))
-            || diskConfig.accounts.find(d => d.name === a.name);
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
-        // The TUI's in-memory config is authoritative for the account SET (an
-        // account it deleted must stay deleted, not be resurrected from the disk
-        // copy this atomic update re-read). An account added to disk by an external
-        // `teamcodex import/login` while the TUI runs is reconciled on the next
-        // reload (R) / restart via syncAccountsFromDisk — not merged here, since we
-        // can't distinguish "added externally" from "deleted locally" at save time.
-        diskConfig.accounts = mapped;
+      saveConfig: (snapshot, mutation) => atomicConfigUpdate(diskConfig => {
+        applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation);
       }),
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
