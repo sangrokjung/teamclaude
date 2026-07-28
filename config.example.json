@@ -14,6 +14,7 @@
   "streamRecovery": true,
   "maxResponseBytes": 67108864,
   "upstreamResponseTimeoutMs": 300000,
+  "streamIdleTimeoutMs": 300000,
   "requestBodyTimeoutMs": 30000,
   "maxBufferedRequestBytes": 268435456,
   "modelFallbacks": {

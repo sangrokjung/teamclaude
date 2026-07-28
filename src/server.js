@@ -22,6 +22,7 @@ const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
@@ -85,6 +86,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       && config.upstreamResponseTimeoutMs > 0
     ? Math.floor(config.upstreamResponseTimeoutMs)
     : DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS;
+  const streamIdleTimeoutMs = Number.isFinite(config.streamIdleTimeoutMs)
+      && config.streamIdleTimeoutMs > 0
+    ? Math.floor(config.streamIdleTimeoutMs)
+    : DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -554,7 +559,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -823,6 +828,25 @@ function createUpstreamDeadline(parentSignal, timeoutMs) {
       parentSignal?.removeEventListener('abort', abortFromParent);
     },
   };
+}
+
+async function raceTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(message);
+          err.code = 'ETIMEDOUT';
+          reject(err);
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
 
 async function readBodyBounded(webStream, maxBytes) {
@@ -1586,6 +1610,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.streamRecovery && ctx.continuity.enabled,
         ensureHeaders,
         ctx.maxResponseBytes,
+        ctx.streamIdleTimeoutMs,
       );
       if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
         ctx.status = 502;
@@ -1844,6 +1869,7 @@ async function streamResponse(
   transactional = false,
   ensureHeaders = null,
   transactionMaxBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
@@ -1900,15 +1926,22 @@ async function streamResponse(
   };
 
   const waitForDrain = async () => {
-    if (res.destroyed || res.writableEnded) return;
-    await new Promise(resolve => {
-      const settle = () => {
-        res.removeListener('drain', settle);
-        res.removeListener('close', settle);
-        resolve();
+    if (res.destroyed || res.writableEnded) return false;
+    return new Promise(resolve => {
+      let timer = null;
+      const settle = (drained) => {
+        res.removeListener('drain', onDrain);
+        res.removeListener('close', onClose);
+        if (timer !== null) clearTimeout(timer);
+        if (!drained && !res.destroyed) res.destroy();
+        resolve(drained);
       };
-      res.once('drain', settle);
-      res.once('close', settle);
+      const onDrain = () => settle(true);
+      const onClose = () => settle(false);
+      res.once('drain', onDrain);
+      res.once('close', onClose);
+      timer = setTimeout(() => settle(false), streamIdleTimeoutMs);
+      timer.unref?.();
     });
   };
 
@@ -1952,7 +1985,7 @@ async function streamResponse(
     if (transactional) {
       return stageChunk(bytes);
     }
-    if (!forwardChunk(bytes)) await waitForDrain();
+    if (!forwardChunk(bytes) && !await waitForDrain()) return false;
     return !res.destroyed;
   };
 
@@ -1970,12 +2003,12 @@ async function streamResponse(
         );
         if (bytesRead === 0) throw new Error('Unable to replay buffered upstream stream');
         position += bytesRead;
-        if (!forwardChunk(chunk.subarray(0, bytesRead))) await waitForDrain();
+        if (!forwardChunk(chunk.subarray(0, bytesRead)) && !await waitForDrain()) return false;
       }
     } else {
       for (const bytes of bufferedFrames) {
         if (res.destroyed || res.writableEnded) return false;
-        if (!forwardChunk(bytes)) await waitForDrain();
+        if (!forwardChunk(bytes) && !await waitForDrain()) return false;
       }
     }
     return !res.destroyed;
@@ -1985,7 +2018,11 @@ async function streamResponse(
     while (true) {
       let step;
       try {
-        step = await reader.read();
+        step = await raceTimeout(
+          reader.read(),
+          streamIdleTimeoutMs,
+          `Upstream SSE idle timeout after ${streamIdleTimeoutMs}ms`,
+        );
       } catch (err) {
         // Upstream died mid-stream.
         if (framer && !res.destroyed && !res.writableEnded) {

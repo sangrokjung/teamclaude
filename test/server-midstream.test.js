@@ -587,6 +587,110 @@ test('upstream response deadline stops after SSE headers and does not truncate a
   }
 });
 
+test('stalled SSE response hits the idle deadline and releases its slot', async () => {
+  let requests = 0;
+  let upstreamClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    requests += 1;
+    if (requests > 1) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    res.once('close', () => { upstreamClosed = true; });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    streamIdleTimeoutMs: 40,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(res.status, 529);
+    assert.equal((await res.json()).error?.type, 'overloaded_error');
+    assert.equal(requests, 1, 'an idle POST must not be replayed internally');
+    for (let i = 0; i < 20 && !upstreamClosed; i++) await delay(10);
+    assert.equal(upstreamClosed, true, 'the idle deadline must cancel the upstream reader');
+    assert.equal(am.accounts[0].inflight, 0, 'the idle stream must release its account slot');
+
+    const again = await streamPost(proxyPort);
+    assert.equal(again.status, 200);
+    assert.equal(JSON.parse(again.body).ok, true);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('slow SSE reader hits the drain deadline and releases its slot', async () => {
+  const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(full);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    streamIdleTimeoutMs: 40,
+  });
+  proxy.prependListener('request', (req, res) => {
+    if (req.url !== '/v1/messages') return;
+    const write = res.write.bind(res);
+    res.write = (...args) => {
+      write(...args);
+      return false;
+    };
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port: proxyPort,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      }, res => {
+        res.resume();
+        const timer = setTimeout(() => {
+          req.destroy();
+          resolve({ closedByProxy: false });
+        }, 1000);
+        timer.unref();
+        const closed = () => {
+          clearTimeout(timer);
+          resolve({ closedByProxy: true });
+        };
+        res.once('aborted', closed);
+        res.once('error', closed);
+        res.once('close', closed);
+      });
+      req.once('error', reject);
+      req.end(JSON.stringify({ model: 'x', messages: [] }));
+    });
+
+    assert.equal(result.closedByProxy, true, 'the proxy must terminate a client that never drains');
+    for (let i = 0; i < 50 && am.accounts[0].inflight > 0; i++) await delay(10);
+    assert.equal(am.accounts[0].inflight, 0, 'the drain deadline must release its account slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('client disconnect mid-stream: upstream reader cancelled, slot released, no injection crash', async () => {
   let firstRes = null;
   let upstreamClosed = false;
