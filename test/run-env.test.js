@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process';
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 async function startStatusServer(dir, status) {
+  const payload = { switchThreshold: 0.98, ...status };
   const script = join(dir, 'status-server.mjs');
   await writeFile(script, `import http from 'node:http';
 const status = JSON.parse(Buffer.from(process.env.STATUS_BASE64, 'base64').toString());
@@ -24,7 +25,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
   const child = spawn(process.execPath, [script], {
     env: {
       ...process.env,
-      STATUS_BASE64: Buffer.from(JSON.stringify(status)).toString('base64'),
+      STATUS_BASE64: Buffer.from(JSON.stringify(payload)).toString('base64'),
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -41,7 +42,9 @@ async function stopStatusServer(server) {
 
 test('run preserves OAuth while clearing higher-precedence API credentials', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-env-'));
+  let server;
   try {
+    server = await startStatusServer(dir, { accounts: [] });
     const fakeClaude = join(dir, 'claude');
     const configPath = join(dir, 'config.json');
     await writeFile(fakeClaude, `#!/usr/bin/env node
@@ -54,7 +57,7 @@ console.log(JSON.stringify({
 }));
 `);
     await chmod(fakeClaude, 0o755);
-    await writeFile(configPath, JSON.stringify({ proxy: { port: 4567, apiKey: 'proxy-key' } }));
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port, apiKey: 'proxy-key' } }));
 
     const result = spawnSync(process.execPath, [entry, 'run', '--', '--model', 'fable'], {
       encoding: 'utf8',
@@ -74,9 +77,10 @@ console.log(JSON.stringify({
     assert.equal(child.apiKey, null);
     assert.equal(child.authToken, null);
     assert.equal(child.oauthToken, 'oauth-must-reach-child');
-    assert.equal(child.baseUrl, 'http://localhost:4567');
+    assert.equal(child.baseUrl, `http://localhost:${server.port}`);
     assert.deepEqual(child.args, ['--model', 'fable']);
   } finally {
+    if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });
   }
 });

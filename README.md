@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="Multiple AI coding accounts flowing through one resilient local proxy" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-200%20passing-58e3a2?style=flat-square" alt="200 tests passing">
+  <img src="https://img.shields.io/badge/tests-291%20passing-58e3a2?style=flat-square" alt="291 tests passing">
   <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18+">
   <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="Zero runtime dependencies">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT License"></a>
@@ -36,10 +36,62 @@
 > [!NOTE]
 > Claude and Codex use separate configs, ports, and account pools. Both proxies can stay online together, while Codex CLI and Hermes Agent keep using one stable local endpoint.
 
+## Install
+
+```bash
+npm i -g teamcodex
+
+teamcodex import          # pick up your existing Claude Code login
+teamcodex codex import    # pick up your existing ~/.codex/auth.json
+teamcodex server          # start the proxy, then `teamcodex run`
+```
+
+The command is `teamcodex`. This package deliberately does not install a `teamclaude`
+binary so it cannot collide with upstream's package of that name.
+
+Prefer installing straight from the repository? `npm i -g github:sangrokjung/teamclaude`
+works too and always tracks the default branch.
+
+## Is this against the Terms of Service?
+
+No. This does not share, resell, or pool accounts between people.
+
+It routes **your own** authenticated sessions from **one machine**, which is exactly
+what you would do by switching accounts by hand, minus the manual re-login. Every
+request is signed with that account's own OAuth token, and nothing is proxied on behalf
+of third parties. Credentials are stored locally and only ever sent to the vendor's own
+endpoints, exactly as the CLI would send them. No third party sees them.
+
+It does not increase your quota and it does not bypass any limit. It stops the quota
+you already paid for from expiring unused.
+
+Worth noting: Claude Code's own `/extra-usage` flow already offers to sign into a
+**different account you own** when you hit a limit. "Switch to another of my accounts
+to keep working" is something the first-party client itself surfaces. This automates
+that same switch instead of making you click through it by hand.
+
+If you work in a team, every member still authenticates with their own subscription.
+Using this to let several people share a single seat is not supported, and if a vendor
+states that this class of tool is disallowed, this project will be changed or retired
+accordingly.
+
+## Credit and relationship to upstream
+
+Fork chain: [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → this repository.
+The fork badge at the top of this page shows the immediate parent, which is why it reads
+jung-wan-kim rather than the original author.
+
+This started as a fork of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude),
+which does the Claude side very well and is worth using on its own. This fork went a
+different direction when it needed **Codex (ChatGPT OAuth) account pooling**, which
+upstream does not cover, plus a model fallback chain and network-level failover.
+Upstream has features this fork does not, so pick whichever fits your setup.
+
 ## Live dashboard
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
 </p>
 
 <p align="center"><sub>Actual TeamCodex TUI layout rendered with sanitized demo accounts.</sub></p>
@@ -77,7 +129,7 @@ the best available account automatically.
 <details>
 <summary><strong>What the QJC resilient-routing fork adds</strong></summary>
 
-This is the `qjc/resilient-routing` fork (`1.2.3-qjc.x`) of
+This is the `qjc/resilient-routing` fork, published to npm as `teamcodex`, of
 [jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude), based on
 upstream `v1.2.3`.
 
@@ -85,18 +137,18 @@ upstream `v1.2.3`.
 - **Top-tier weekly-window model routing** for model-scoped `7d_oi` quota.
 - **Model fallback chains** through configurable `modelFallbacks`.
 - **Bounded graceful shutdown** for reliable launchd/systemd restarts.
-- **Network-error failover** with a bounded one-sweep retry budget.
+- **Method-aware network recovery** with bounded failover for replay-safe requests and no hidden replay of ambiguous POSTs.
 - **Host CPU and RAM tracking** in status JSON, CLI output, and the TUI.
 - **Hermes Agent compatibility** through the stable TeamCodex endpoint.
 
 Install this fork with one command:
 
 ```bash
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 ```
 
 From a local checkout, prefer
-`npm pack && npm install -g ./karpeleslab-teamclaude-<version>.tgz`. A plain
+`npm pack && npm install -g ./teamcodex-<version>.tgz`. A plain
 `npm install -g <dir>` symlinks the checkout, which can break supervisors that
 cannot read that path.
 
@@ -124,8 +176,8 @@ cannot read that path.
 Requires Node.js 18+.
 
 ```bash
-# Install the QJC fork (one command — npm packs & copies the default branch)
-npm install -g github:sangrokjung/teamclaude
+# Install from npm
+npm install -g teamcodex
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -336,6 +388,10 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
+If the proxy is not running, `teamclaude run` now starts it in the background
+and waits for the listener before launching Claude Code. The server keeps that
+public listener in a supervisor process, so a crashed proxy worker is replaced
+while new connections wait instead of failing with `ConnectionRefused`.
 When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
 quota status before launch. If the configured top-tier model has measured quota
 but no measured account can serve it, Claude Code is started directly on the
@@ -366,8 +422,10 @@ claude
 ### Troubleshoot `ConnectionRefused`
 
 `Unable to connect to API (ConnectionRefused)` means Claude Code could not reach
-the local TeamClaude listener. Check the proxy from a separate terminal so the
-diagnostic action does not terminate the session that depends on it:
+the local TeamClaude supervisor. New sessions started with `teamclaude run`
+automatically start a missing supervisor; a worker-only crash keeps the listener
+bound and is recovered automatically. If the supervisor itself was stopped,
+check it from a separate terminal:
 
 ```bash
 teamclaude status
@@ -378,11 +436,9 @@ teamclaude restart
 teamclaude run -- --continue
 ```
 
-If the listener PID keeps changing, a supervisor such as launchd or systemd is
-restarting the proxy. Inspect that supervisor's logs and health-check grace
-period; repeated forced restarts create a no-listener window that surfaces as
-`ConnectionRefused`. Do not run `teamclaude stop` from inside the affected
-proxied Claude Code session.
+The PID shown by `lsof` is the stable TeamClaude supervisor. Its worker PID may
+change after a crash without creating a no-listener window. Do not run
+`teamclaude stop` from inside the affected proxied Claude Code session.
 
 ### Host CPU / RAM line
 
@@ -504,7 +560,14 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min). Set to `0` to disable the timer entirely — the active account then only changes when it becomes unavailable or via per-request 429 failover |
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
-| `continuityMode` | Hold requests in the proxy while quota or global rate limits recover instead of returning 429 (optional, default `true`) |
+| `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled) |
+| `continuityMode` | Hold requests in the proxy while quota/global rate limits recover; HTTP 529/5xx, network errors, and incomplete SSE attempts are retried internally only for replay-safe methods, never for an ambiguous POST (optional, default `true`) |
+| `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt; broken replay-safe attempts may retry transparently, while an ambiguous POST is returned as a retryable error without hidden replay (optional, default `true`) |
+| `maxResponseBytes` | Maximum bytes buffered per upstream response before returning 502; covers transactional SSE, non-SSE, and OAuth relay responses (optional, default `67108864` = 64 MiB) |
+| `upstreamResponseTimeoutMs` | Total deadline for upstream response headers and buffered non-SSE response bodies (optional, default `300000` = 5 minutes) |
+| `streamIdleTimeoutMs` | Maximum idle time between upstream SSE chunks or while waiting for a downstream client to drain; expiry cancels the stream and releases proxy capacity (optional, default `300000` = 5 minutes) |
+| `requestBodyTimeoutMs` | Total deadline for receiving a client request body before returning 408 and releasing admission capacity (optional, default `30000` = 30 seconds) |
+| `maxBufferedRequestBytes` | Total request-buffer memory budget used to cap admission before buffering; supervised requests count both supervisor and worker copies (optional, default `268435456` = 256 MiB) |
 | `continuityMaxSleepMs` | Maximum interval between continuity probes (optional, default `30000`) |
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
@@ -559,15 +622,15 @@ flowchart LR
 
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
 2. The proxy selects the active account and forwards requests with that account's credentials
-3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config
+3. OAuth tokens expiring within 5 minutes are automatically refreshed and persisted to config. A background keep-alive sweep also rotates idle and disabled accounts so their refresh-token chain does not lapse; set `tokenRefreshIntervalMs: 0` to disable it
 4. Rate limit headers from the API (`anthropic-ratelimit-unified-*`) track the proxy's last-observed session (5h) and weekly (7d) quota utilization. Model-scoped weekly windows (`7d_oi` — the separate Fable/Mythos weekly limit) are re-measured after restart and classify live top-tier quota 429s without globally throttling accounts that still serve Opus/Sonnet/Haiku
 5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. An **active warm-up** additionally probes unmeasured accounts directly — a minimal 1-token request reusing the shape of the first real request — so the whole fleet is measured within seconds of the first post-restart request instead of waiting for traffic to reach each account (`activeWarmup: false` disables it). Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose weekly (7d) quota resets soonest (tie-breaks: soonest session reset, then lowest usage), so quota about to renew unused is drained first. Explicitly ranked accounts (`priority` / TUI `o`) are preferred before all of that; disabled accounts are excluded entirely. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On a 429 the proxy classifies it:
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. If the limit appears global, continuity mode opens a shared cooldown and retries internally instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
    - **Requested-model dead end** (fork) → after live model-quota exhaustion reaches all eligible accounts or the unlabeled-429 failover budget is exhausted, a configured `modelFallbacks` chain rewrites the request to the next model before any 429 is surfaced or continuity sleep starts.
-7. Transient network errors (connection reset, timeout) fail over to another account before any response bytes are sent. Mid-stream errors, or a failure with no alternate account left, close the connection so the client can retry
-8. If all accounts are exhausted, continuity mode holds the request and polls using the computed account/model reset time. Setting `continuityMode: false` restores the legacy 429 response with `retry-after`.
+7. Transient network errors and incomplete Anthropic SSE attempts fail over internally only for replay-safe methods (`GET`/`HEAD`/`OPTIONS`). An ambiguous POST is never replayed inside the proxy after dispatch: it receives a complete retryable error so the client controls any retry. Completed streams preserve byte fidelity. Buffers larger than 1 MiB spill to a private temporary file; transactional SSE, non-SSE, and OAuth relay responses are capped by `maxResponseBytes`.
+8. If all accounts are exhausted, continuity mode keeps the request inside the proxy with capped waits. HTTP 529/5xx backoff is likewise internal only for replay-safe methods; an unsafe request passes the upstream error through without replay. Persistent overload is bounded by `TEAMCLAUDE_OVERLOAD_RETRIES` (default `6`) and a client disconnect aborts sooner. Setting `continuityMode: false` restores legacy handling for quota waits and global rate limits.
 9. **Quota survives restarts**: the server snapshots general per-account quota/throttle state plus the committed warm-up probe template to `<config>.quota.json` (every minute and on exit), so TUI **R** works before fresh traffic arrives. A restored template is provisional and the first freshly accepted request shape replaces it. Model-scoped weekly values are intentionally discarded on import and re-measured from live traffic so stale Fable data cannot self-lock its refresh path
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 

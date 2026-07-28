@@ -329,11 +329,12 @@ function startCallbackServer(expectedState) {
     });
     server.on('error', reject);
 
-    // Timeout after 2 minutes (unref so it doesn't keep the process alive)
+    // Timeout after 10 minutes (unref so it doesn't keep the process alive) —
+    // a fresh incognito login (password entry, 2FA) regularly outlives 2 minutes.
     const timer = setTimeout(() => {
-      rejectCode(new Error('Login timed out after 2 minutes'));
+      rejectCode(new Error('Login timed out after 10 minutes'));
       server.close();
-    }, 120_000);
+    }, 600_000);
     timer.unref();
   });
 }

@@ -1,0 +1,57 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste tokens, refresh tokens, or the contents of your config file.**
+        Redact account names if they contain anything identifying.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what actually happened.
+      placeholder: |
+        Ran `teamcodex run`, expected the session to continue when account A hit its 5h limit,
+        but the CLI exited with a 429 instead of failing over.
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `teamcodex status`
+      description: Redact account names. Quota numbers and reset times are the useful part.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `teamcodex --version` or the npm version you installed.
+      placeholder: "1.0.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which pool
+      options:
+        - Claude (default)
+        - Codex (teamcodex codex ...)
+        - Both running together
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version and OS
+      placeholder: "Node 22.3.0, macOS 15.1"
+    validations:
+      required: true

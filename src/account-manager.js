@@ -1,5 +1,7 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
+
+const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
@@ -1025,11 +1027,24 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
+      const previousTokens = {
+        accessToken: account.credential,
+        refreshToken: account.refreshToken,
+        expiresAt: account.expiresAt,
+      };
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
         const newTokens = account.provider === 'codex'
           ? await refreshCodexAccessToken(account.refreshToken)
           : await refreshAccessToken(account.refreshToken);
+        // Another live sync may have installed a newer rotated token while this
+        // network request was in flight. Never let the late result from the old
+        // refresh token replace that newer credential.
+        if (account.credential !== previousTokens.accessToken
+          || account.refreshToken !== previousTokens.refreshToken) {
+          console.log(`[TeamClaude] Discarded stale token refresh for account "${account.name}"`);
+          return;
+        }
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -1038,18 +1053,34 @@ export class AccountManager {
           account.accountId = newTokens.accountId;
           account.accountUuid = newTokens.accountId;
         }
+        // A token endpoint success only proves a prior refresh failure healed.
+        // Request-path errors (fresh-token 401 or non-transient send failure)
+        // stay parked until new external credentials arrive or the proxy restarts.
+        if (account.status === 'error' && account._errorFromRefresh) {
+          account.status = 'active';
+          delete account._errorFromRefresh;
+        }
+        delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         // Only persist if the account is still live at its claimed index. If it was
         // removed during the (awaited) network refresh, its `.index` is stale and
         // would misattribute the write to the survivor that shifted into that slot
         // — and a deleted account's tokens don't need persisting anyway.
-        if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
+        if (this.accounts[account.index] === account) {
+          await this._onTokenRefresh?.(account.index, newTokens, previousTokens);
+        }
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        account._refreshRetryAt = Date.now() + REFRESH_SWEEP_RETRY_MS;
         // Only mark as error if the access token is actually expired;
-        // a failed proactive refresh shouldn't kill a still-valid token
-        if (!account.expiresAt || Date.now() >= account.expiresAt) {
-          account.status = 'error';
+        // a failed proactive refresh shouldn't kill a still-valid token.
+        // Tag the cause only on the transition: a failed sweep must not relabel
+        // an account already parked by the request path as refresh-caused.
+        if (!account.expiresAt || Date.now() >= normalizeExpiresAt(account.expiresAt)) {
+          if (account.status !== 'error') {
+            account.status = 'error';
+            account._errorFromRefresh = true;
+          }
         }
       } finally {
         account._refreshPromise = null;
@@ -1057,6 +1088,33 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * Keep idle OAuth refresh chains alive and retry refresh-caused failures.
+   * Disabled accounts are included because disable only removes them from
+   * routing; refreshes are sequential and overlapping sweeps are skipped so a
+   * fleet-wide lapse cannot burst the token endpoint.
+   */
+  async refreshLapsedTokens() {
+    if (this._sweepInFlight) return 0;
+    this._sweepInFlight = true;
+    try {
+      const now = Date.now();
+      const targets = this.accounts.filter(a =>
+        a.type === 'oauth' && a.refreshToken
+        && (!a._refreshRetryAt || now >= a._refreshRetryAt)
+        && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
+      for (const account of targets) {
+        // A still-valid error account is a no-op unless expiry is unknown.
+        // This avoids rotating a request-rejected account every sweep.
+        await this.ensureTokenFresh(account, account.status === 'error' && !account.expiresAt)
+          .catch(() => { /* keep the account parked until a later sweep succeeds */ });
+      }
+      return targets.length;
+    } finally {
+      this._sweepInFlight = false;
+    }
   }
 
   /**
@@ -1075,10 +1133,15 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
-  }) {
+  }, persist = true) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
+    const previousTokens = {
+      accessToken: account.credential,
+      refreshToken: account.refreshToken,
+      expiresAt: account.expiresAt,
+    };
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
@@ -1087,17 +1150,21 @@ export class AccountManager {
       account.accountId = accountId;
       account.accountUuid = accountId;
     }
-    if (account.status === 'error') account.status = 'active';
+    if (account.status === 'error') {
+      account.status = 'active';
+      delete account._errorFromRefresh;
+    }
+    delete account._refreshRetryAt;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).
-    if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
+    if (persist && this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
       idToken: account.idToken,
       accountId: account.accountId,
-    });
+    }, previousTokens);
   }
 
   /**

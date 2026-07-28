@@ -17,8 +17,8 @@
       "type": "oauth",
       "accountUuid": "chatgpt-account-id-1",
       "accountId": "chatgpt-account-id-1",
-      "accessToken": "import-with-teamclaude-codex-login",
-      "refreshToken": "import-with-teamclaude-codex-login",
+      "accessToken": "import-with-teamcodex-codex-login",
+      "refreshToken": "import-with-teamcodex-codex-login",
       "priority": 1
     },
     {
@@ -27,8 +27,8 @@
       "type": "oauth",
       "accountUuid": "chatgpt-account-id-2",
       "accountId": "chatgpt-account-id-2",
-      "accessToken": "import-with-teamclaude-codex-login",
-      "refreshToken": "import-with-teamclaude-codex-login",
+      "accessToken": "import-with-teamcodex-codex-login",
+      "refreshToken": "import-with-teamcodex-codex-login",
       "priority": 2
     }
   ]

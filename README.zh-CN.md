@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="多个 AI 编程账户通过一个可靠的本地代理连接" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="多个 AI 编程账户通过一个可靠的本地代理连接" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -36,10 +36,52 @@
 > [!NOTE]
 > Claude 与 Codex 分别使用独立的配置文件、端口和账户池。两个代理可以同时在线，Codex CLI 与 Hermes Agent 始终连接同一个稳定的本地地址。
 
+## 安装
+
+```bash
+npm i -g teamcodex
+
+teamcodex import          # 读取已有的 Claude Code 登录
+teamcodex codex import    # 读取已有的 ~/.codex/auth.json
+teamcodex server          # 启动代理，然后执行 `teamcodex run`
+```
+
+命令只有 `teamcodex` 一个。本包刻意不安装 `teamclaude` 二进制，以免与同名的上游包冲突。
+
+想直接从仓库安装也可以：`npm i -g github:sangrokjung/teamclaude`，这种方式始终跟随默认分支。
+
+## 关于使用条款
+
+**本项目仅用于管理你自己拥有的账号，不支持也不鼓励账号共享、代充或转售。**
+
+它做的事情，就是把你手动切换自己账号的动作自动化。所有请求都在你自己的机器上发出，
+每个请求都带该账号自身的 OAuth token，也不会为第三方做任何中转。凭证保存在本地，
+只会发往官方 API，与 CLI 原本的发送目标完全相同，第三方无法接触到它。
+
+它不会增加你的额度，也不会绕过任何限制。它只是让你已经付费的额度不至于白白过期。
+
+顺带一提，Claude Code 自身的 `/extra-usage` 流程在触及限额时，就会提示你登录**自己名下的另一个账号**。
+"换成我自己的另一个账号继续工作"本来就是官方客户端主动提供的操作，本项目只是把这个切换自动化，
+省去手动点击。
+
+如果是团队使用，每个成员仍然用自己的订阅登录。多人共用一个席位不在支持范围内。
+如果官方明确表示不允许这类工具，本项目会相应调整功能或停止维护。
+
+## 与上游项目的关系
+
+Fork 谱系：[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → 本仓库。
+页面顶部的 fork 标识只显示直接上级，所以显示的是 jung-wan-kim 而不是原作者。
+
+本项目 fork 自 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)。
+上游在 Claude 侧的实现非常扎实，值得单独使用。这个分支是因为需要**Codex（ChatGPT OAuth）
+多账号池**才走了另一条路，上游并未覆盖这部分，此外还加了模型降级链和网络层故障转移。
+上游也有本分支没有的功能，按自己的场景选择即可。
+
 ## 实时仪表盘
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="显示三个演示账户的 TeamCodex 终端仪表盘" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="显示三个演示账户的 TeamCodex 终端仪表盘" width="100%">
 </p>
 
 <p align="center"><sub>使用脱敏演示账户渲染的真实 TeamCodex TUI 布局。</sub></p>
@@ -86,7 +128,9 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 - **手动账户控制** — 通过 CLI 或 TUI 执行 enable、disable、switch 和 priority。
 - **重启后恢复状态** — 将用量和 throttle 状态保存在独立的 quota 文件中。
 - **Active warm-up** — 复用真实请求格式，以最小请求快速测量各账户的用量。
-- **OAuth 自动刷新** — 自动刷新即将过期的认证信息并安全保存。
+- **OAuth 自动刷新** — 自动刷新即将过期的认证信息，并通过后台定期扫描刷新闲置和已禁用账户，避免 refresh 链失效。
+- **安全的内部重试边界** — 只在代理内部重试可安全重发的请求；结果不确定的 POST 不做隐藏重发，而是返回可重试的错误。
+- **资源上限** — 对请求、响应缓冲区和等待时间设置上限，过载时代理也不会卡死。
 - **零运行时依赖** — 仅使用 Node.js 内置模块。
 
 ## 快速开始
@@ -95,7 +139,7 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 
 ```bash
 # 安装
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 
 # 添加 Claude 账户——会打开浏览器 OAuth
 teamclaude login
@@ -110,6 +154,7 @@ teamclaude run
 
 > [!IMPORTANT]
 > 即使代理正在运行，普通的 `claude` 命令也不会自动使用代理。若要启用账户自动切换，请始终通过 `teamclaude run` 启动。
+> `teamclaude run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
 
 也可以导入 Claude Code 当前的登录信息：
 
@@ -255,6 +300,10 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
 | `accounts[].enabled` | 设为 `false` 时从轮换中排除账户 |
 | `accounts[].priority` | 数字越小，固定优先级越高 |
 | `modelFallbacks` | 各模型的备用模型链 |
+| `streamRecovery` | 按事件边界转发 SSE，并把中断的流收尾为可重试的错误 |
+| `tokenRefreshIntervalMs` | 闲置账户 OAuth 刷新扫描间隔（`0` = 关闭） |
+
+缓冲区、超时上限等完整配置项请参阅[英文 README](README.md#configuration)。
 
 ## 工作原理
 
@@ -285,7 +334,7 @@ flowchart LR
 5. 新启动的服务器会优先轮询尚未测量的账户。
 6. 配额型 429 会立即排除当前账户并切换到其他账户。
 7. 速率或并发型 429 只进行有限次数的分散，不会污染账户状态。
-8. 在发送响应字节之前发生的网络错误会使用其他账户重试。
+8. 网络错误或不完整的 SSE 流，只有可安全重发的请求才会在内部换账户重试；结果不确定的 POST 不做隐藏重发，而是返回可重试的错误。
 9. 所有账户受限时，连续性模式会等待最近的重置时间。
 10. 普通用量状态会在重启后恢复，模型级用量则通过真实流量重新测量。
 

@@ -1,15 +1,35 @@
 import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isTokenExpiringSoon } from './oauth.js';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
+import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
+
+function connectionHeaderNames(value) {
+  return new Set(
+    String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
+// How many continuity sleeps a single request may spend waiting on a model-tier
+// window before we surface the 429. Weekly windows do not clear while we poll,
+// so this is a ceiling on a wait that would otherwise be unbounded. At the
+// default continuityMaxSleepMs (30s) this is ~5 minutes.
+const MODEL_EXHAUST_WAIT_PASSES = 10;
+const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -30,6 +50,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  const requestBodyTimeoutMs = Number.isFinite(config.requestBodyTimeoutMs)
+      && config.requestBodyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.requestBodyTimeoutMs))
+    : 30_000;
+  const maxBufferedRequestBytes = Number.isFinite(config.maxBufferedRequestBytes)
+      && config.maxBufferedRequestBytes > 0
+    ? config.maxBufferedRequestBytes
+    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
+  const maxBufferedRequests = Math.floor(maxBufferedRequestBytes / maxBodyBytes);
   // Connection affinity: keep one client connection's sequential requests on the
   // same account for prompt-cache locality (HTTP/1.1 keep-alive reuses the socket
   // for a session's sequential turns). Soft — overflow still spreads. Set
@@ -48,6 +77,25 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const rateLimitFailovers = Number.isFinite(config.rateLimitFailovers)
     ? Math.max(0, Math.floor(config.rateLimitFailovers))
     : 1;
+  // Mid-stream recovery: relay SSE one whole event at a time and convert an
+  // abnormal upstream end (network death / silent truncation without a terminal
+  // event) into a well-formed retryable `overloaded_error` SSE event instead of
+  // killing the client socket. Claude Code auto-retries that; it does NOT retry
+  // a raw mid-stream connection loss ("Connection closed mid-response").
+  // Anthropic-only: the Codex backend's in-stream error contract differs, so
+  // codex mode keeps the legacy passthrough. `streamRecovery: false` opts out.
+  const streamRecovery = provider === 'anthropic' && config.streamRecovery !== false;
+  const maxResponseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes > 0
+    ? Math.floor(config.maxResponseBytes)
+    : DEFAULT_MAX_RESPONSE_BYTES;
+  const upstreamResponseTimeoutMs = Number.isFinite(config.upstreamResponseTimeoutMs)
+      && config.upstreamResponseTimeoutMs > 0
+    ? Math.floor(config.upstreamResponseTimeoutMs)
+    : DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS;
+  const streamIdleTimeoutMs = Number.isFinite(config.streamIdleTimeoutMs)
+      && config.streamIdleTimeoutMs > 0
+    ? Math.floor(config.streamIdleTimeoutMs)
+    : DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -398,7 +446,45 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
 
+  function rejectEarlyRequest(req, res, statusCode, headers, payload) {
+    req.pause();
+    res.shouldKeepAlive = false;
+    res.once('finish', () => req.destroy());
+    res.writeHead(statusCode, { ...headers, connection: 'close' });
+    res.end(JSON.stringify(payload));
+  }
+
+  function startRequestBodyDeadline(req, res) {
+    let timedOut = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      req.off('end', cleanup);
+      req.off('aborted', cleanup);
+      req.off('error', cleanup);
+    };
+    const onTimeout = () => {
+      timedOut = true;
+      cleanup();
+      if (!res.headersSent && !res.destroyed) {
+        rejectEarlyRequest(req, res, 408, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Request body timed out' },
+        });
+      } else if (!req.destroyed) {
+        req.destroy();
+      }
+    };
+    req.once('end', cleanup);
+    req.once('aborted', cleanup);
+    req.once('error', cleanup);
+    timer = setTimeout(onTimeout, requestBodyTimeoutMs);
+    timer.unref();
+    return { cleanup, didTimeout: () => timedOut };
+  }
+
   const server = http.createServer(async (req, res) => {
+    let bodyDeadline = null;
     try {
       // Auth check — skip for localhost connections
       const clientKey = req.headers['x-api-key'];
@@ -409,18 +495,22 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       if (proxyApiKey && clientKey !== proxyApiKey && bearerKey !== proxyApiKey && !isLocal) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
+        rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },
-        }));
+        });
         return;
       }
 
-      // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      const isStatusRequest = req.method === 'GET' && req.url === '/teamclaude/status';
+      const contentLength = req.headers['content-length'];
+      const bodyFreeStatus = isStatusRequest
+        && (contentLength == null || contentLength === '0')
+        && req.headers['transfer-encoding'] == null;
+
+      if (bodyFreeStatus) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // `host` rides along so `teamclaude status` (a separate process) can show
+        // `host` rides along so `teamcodex status` (a separate process) can show
         // the machine the PROXY runs on — CPU% is measured between status calls
         // by the tracker, RAM/loadavg are instantaneous.
         res.end(JSON.stringify({ ...accountManager.getStatus(), host: hostTracker.sample() }, null, 2));
@@ -429,29 +519,42 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Everything below buffers a request body (the OAuth relay AND the proxied
       // path) → global admission control to bound proxy memory: inFlightProxied
-      // may not exceed the fleet's useful capacity (sum of per-account caps +
-      // overflow queue depth), and we reject BEFORE buffering. Without this, body
+      // may not exceed the smaller of fleet capacity and the request-buffer
+      // memory budget, and we reject BEFORE buffering. Without this, body
       // buffering happens before any queue admission, so N concurrent uploads each
       // buffer up to maxBodyBytes regardless of queue depth — memory would grow
       // with connection count (localhost auth is skipped, so any local process
-      // could flood, including via /v1/oauth/token). Bound: totalCapacity × maxBodyBytes.
-      if (inFlightProxied >= accountManager.totalCapacity()) {
-        req.resume(); // drain & discard the body so the socket isn't leaked
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
-        }));
+      // could flood, including via /v1/oauth/token).
+      const admissionCapacity = Math.min(accountManager.totalCapacity(), maxBufferedRequests);
+      if (inFlightProxied >= admissionCapacity) {
+        rejectEarlyRequest(
+          req,
+          res,
+          429,
+          { 'Content-Type': 'application/json', 'retry-after': '5' },
+          {
+            type: 'error',
+            error: { type: 'rate_limit_error', message: 'Proxy at capacity; retry shortly.' },
+          },
+        );
         return;
       }
       inFlightProxied++;
+      bodyDeadline = startRequestBodyDeadline(req, res);
       try {
         // Let client token refresh requests pass through to upstream untouched.
         // The proxy manages its own tokens via ensureTokenFresh(); intercepting
         // or rewriting client refreshes would cause token rotation conflicts.
         if (provider === 'anthropic'
             && req.method === 'POST' && req.url === '/v1/oauth/token') {
-          await relayRaw(req, res, upstream, maxBodyBytes);
+          await relayRaw(
+            req,
+            res,
+            upstream,
+            maxBodyBytes,
+            maxResponseBytes,
+            upstreamResponseTimeoutMs,
+          );
           return; // outer finally decrements inFlightProxied
         }
 
@@ -462,7 +565,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -485,6 +588,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             return;
           }
           const body = Buffer.concat(bodyChunks);
+          if (isStatusRequest) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Status requests must not include a body.' },
+            }));
+            return;
+          }
           ctx.model = extractRequestModel(body);
 
           // Tie an abort signal to client disconnect so a request that's only
@@ -511,14 +622,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             res.removeListener('close', onClose);
           }
         } catch (err) {
-          ctx.status = ctx.status || 502;
-          console.error('[TeamClaude] Unhandled error:', err);
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({
-              type: 'error',
-              error: { type: 'proxy_error', message: 'Internal proxy error' },
-            }));
+          if (bodyDeadline.didTimeout()) {
+            ctx.status = 408;
+          } else {
+            ctx.status = ctx.status || 502;
+            console.error('[TeamClaude] Unhandled error:', err);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                type: 'error',
+                error: { type: 'proxy_error', message: 'Internal proxy error' },
+              }));
+            }
           }
         } finally {
           // Release the concurrency slot held by this request (if any). A failover
@@ -534,10 +649,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
         }
       } finally {
+        bodyDeadline.cleanup();
         inFlightProxied--;
       }
     } catch (err) {
-      console.error('[TeamClaude] Unhandled error:', err);
+      if (!bodyDeadline?.didTimeout()) {
+        console.error('[TeamClaude] Unhandled error:', err);
+      }
     }
   });
 
@@ -594,7 +712,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
  * Buffers the body bounded by maxBodyBytes (else 413) so the untouched
  * `/v1/oauth/token` path can't be used to exhaust proxy memory.
  */
-async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
+async function relayRaw(
+  req,
+  res,
+  upstream,
+  maxBodyBytes = Infinity,
+  maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  upstreamResponseTimeoutMs = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
+) {
   const bodyChunks = [];
   let bodyLen = 0;
   let tooLarge = false;
@@ -619,29 +744,59 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
   const ac = new AbortController();
   const onClose = () => ac.abort();
   res.on('close', onClose);
+  const deadline = createUpstreamDeadline(ac.signal, upstreamResponseTimeoutMs);
   try {
+    const requestHeaders = {};
+    const connectionHeaders = connectionHeaderNames(req.headers.connection);
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lowerKey = key.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lowerKey) || connectionHeaders.has(lowerKey)) continue;
+      if (lowerKey === 'x-api-key' || lowerKey === 'accept-encoding') continue;
+      requestHeaders[key] = value;
+    }
+    if (!requestHeaders['content-type']) requestHeaders['content-type'] = 'application/json';
+    if (!requestHeaders.accept) requestHeaders.accept = 'application/json';
+    if (!requestHeaders['user-agent']) requestHeaders['user-agent'] = 'node';
+
     const upstreamRes = await fetch(`${upstream}${req.url}`, {
       method: req.method,
-      headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
-        'accept': req.headers['accept'] || 'application/json',
-        'user-agent': req.headers['user-agent'] || 'node',
-      },
+      headers: requestHeaders,
       body: body.length > 0 ? body : undefined,
-      signal: ac.signal,
+      signal: deadline.signal,
     });
 
-    const responseBody = await upstreamRes.text();
+    const responseBody = await readBodyBounded(upstreamRes.body, maxResponseBytes);
+    if (responseBody === null) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: 'Upstream response exceeded the proxy limit.' },
+      }));
+      return;
+    }
     const responseHeaders = {};
+    const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+      if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
+    if (deadline.timedOut && !res.destroyed) {
+      console.error('[TeamClaude] Raw relay timed out while waiting for upstream response');
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response timed out.' },
+        }));
+      }
+      return;
+    }
     // Client disconnected → we aborted the relay; nothing to respond to.
-    if (ac.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
+    if (ac.signal.aborted || res.destroyed) {
       if (!res.writableEnded) res.destroy();
       return;
     }
@@ -651,7 +806,83 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
   } finally {
+    deadline.dispose();
     res.removeListener('close', onClose);
+  }
+}
+
+function createUpstreamDeadline(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const abortFromParent = () => controller.abort();
+
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    timer.unref?.();
+  }
+
+  const stopTimeout = () => {
+    if (timer === null) return;
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  return {
+    signal: controller.signal,
+    get timedOut() { return timedOut; },
+    stopTimeout,
+    dispose() {
+      stopTimeout();
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
+}
+
+async function raceTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(message);
+          err.code = 'ETIMEDOUT';
+          reject(err);
+        }, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+async function readBodyBounded(webStream, maxBytes) {
+  if (!webStream) return Buffer.alloc(0);
+  const reader = webStream.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, totalBytes);
+      const chunk = Buffer.from(value);
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -680,12 +911,9 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-// Upstream statuses that are transient and safe to retry instead of surfacing to
-// the client. 529 = "Overloaded" (Anthropic at capacity); 500/502/503/504 =
-// gateway / availability blips. Passing these straight through fails the client's
-// turn — e.g. Claude Code prints "API Error: 529 Overloaded" and stops — so
-// forwardRequest fails them over to another account and, when the whole fleet is
-// overloaded, retries with a bounded exponential backoff before giving up.
+// Candidate transient statuses. A separate method gate permits internal
+// failover/backoff only for replay-safe requests; an ambiguous POST passes
+// through because a 5xx does not prove the upstream skipped its execution.
 const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
@@ -938,9 +1166,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
+  const connectionHeaders = connectionHeaderNames(req.headers.connection);
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (HOP_BY_HOP_HEADERS.has(lk) || connectionHeaders.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     if (lk === 'authorization') continue;
     if (lk === 'chatgpt-account-id') continue;
@@ -961,6 +1190,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
+  const replaySafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
 
   // Build log sections
   const logSections = [];
@@ -985,6 +1215,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
+  const upstreamDeadline = createUpstreamDeadline(
+    ctx.abortSignal,
+    ctx.upstreamResponseTimeoutMs,
+  );
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -997,8 +1231,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // the per-account slot and inFlightProxied never release — repeated stalls
       // would leak the proxy to capacity. Aborting rejects the read and unwinds
       // the finally that frees the slot.
-      signal: ctx.abortSignal,
+      signal: upstreamDeadline.signal,
     });
+    const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
+    if (isStreaming) upstreamDeadline.stopTimeout();
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -1049,7 +1285,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // or it's an API-key account — fail this account out and switch.
       if (account.status !== 'error') {
         account.status = 'error';
+        account._errorFromRefresh = false;
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
+      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+        // A 401 on a still-valid token is account-level rejection evidence.
+        // It must override a refresh-failure label so the sweep cannot revive it.
+        account._errorFromRefresh = false;
       }
       if (logDir) {
         logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -1114,7 +1355,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
           }
         }
-        if (ctx.continuity.enabled && !res.destroyed) {
+        // Continuity polls: each pass sleeps at most continuityMaxSleepMs and
+        // retries. That is right for a 5h window, which really does clear while
+        // we wait. A model-tier window is WEEKLY, so with no fallback configured
+        // (the default `modelFallbacks: {}`) the same pass repeats until the week
+        // rolls over: the client hangs for days and every sleep burns one real
+        // upstream 429. Bound the polling; once the budget is spent the client
+        // gets its 429 and can back off far more cheaply than we can.
+        if (ctx.continuity.enabled && !res.destroyed
+            && (ctx.modelWaitPasses || 0) < MODEL_EXHAUST_WAIT_PASSES) {
+          ctx.modelWaitPasses = (ctx.modelWaitPasses || 0) + 1;
           const wait = computeRetryAfter(
             accountManager.getStatus().accounts,
             accountManager.switchThreshold,
@@ -1206,8 +1456,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
       }
-      if (ctx.continuity.enabled && !res.destroyed) {
-        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally`);
+      const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+      if (ctx.continuity.enabled && !res.destroyed && ctx.overloadRetries < maxOverload) {
+        ctx.overloadRetries += 1;
+        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally (retry ${ctx.overloadRetries}/${maxOverload})`);
         releaseHeld();
         ctx.continuity.defer(retryAfter);
         await ctx.continuity.waitGlobal(ctx.abortSignal);
@@ -1241,12 +1493,38 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     //   (2) once every account has 5xx'd for this request, wait a bounded
     //       exponential backoff and retry the whole fleet — the client transparently
     //       gets the eventual success instead of an error.
-    // Only after the backoff budget is spent is the 5xx surfaced (so the client is
-    // never left hanging indefinitely). No account state is mutated — a 529 is
-    // upstream overload, not a bad account.
+    // Outside continuity mode the configured backoff budget bounds the wait.
+    // In continuity mode the client explicitly chose continuity over fail-fast:
+    // keep the request inside the proxy until upstream recovers or the client
+    // disconnects. No account state is mutated — a 529 is upstream overload,
+    // not a bad account.
     if (RETRYABLE_STATUS.has(upstreamRes.status)) {
       const code = upstreamRes.status;
       await upstreamRes.body?.cancel();
+
+      // A 5xx only proves the response failed, not that the upstream skipped
+      // the request. Replaying a POST here can duplicate inference, tool side
+      // effects, and billing. Leave retries to the client unless the HTTP
+      // method itself is replay-safe.
+      if (!replaySafe) {
+        console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
+        ctx.status = code;
+        if (logDir) {
+          logSections.push(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        if (!res.destroyed && !res.headersSent) {
+          res.writeHead(code, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'overloaded_error',
+              message: `Upstream overloaded (HTTP ${code}). Request was not replayed.`,
+            },
+          }));
+        }
+        return;
+      }
 
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
@@ -1270,7 +1548,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // (2) Every account 5xx'd for this request → upstream overload. Back off and
       // retry the whole fleet so the client transparently rides out the blip.
       if (!res.destroyed && ctx.overloadRetries < maxOverload) {
-        const waitMs = Math.min(backoffBase * 2 ** ctx.overloadRetries, backoffCap);
+        const waitMs = Math.min(
+          backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
+          backoffCap,
+        );
         ctx.overloadRetries += 1;
         console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
         if (logDir) {
@@ -1313,47 +1594,185 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};
+    const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
 
-    res.writeHead(upstreamRes.status, responseHeaders);
-
-    if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
+    // Same predicate the supervisor relay uses (index.js). These two must agree:
+    // the supervisor only frames what the worker framed, so a local copy that
+    // drifts would silently break recovery on whatever the two classify differently.
+    if (isStreaming && upstreamRes.body) {
+      const streamLog = logDir
+        ? { chunks: [], bytes: 0, truncated: false, maxBytes: ctx.maxResponseBytes }
+        : null;
+      // With recovery on, response headers are DEFERRED until the first whole
+      // SSE frame arrives: an upstream that dies before producing anything
+      // leaves the client response untouched and fully replayable on another
+      // account — a transparent failover beats asking the client to retry.
+      const ensureHeaders = () => {
+        if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+      };
+      if (!ctx.streamRecovery) ensureHeaders(); // legacy: headers first, bytes as they come
+      const outcome = await streamResponse(
+        upstreamRes.body,
+        res,
+        account,
+        accountManager,
+        streamLog,
+        ctx.streamRecovery,
+        ctx.streamRecovery && ctx.continuity.enabled,
+        ensureHeaders,
+        ctx.maxResponseBytes,
+        ctx.streamIdleTimeoutMs,
+      );
+      if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: `Upstream stream exceeded the ${ctx.maxResponseBytes}-byte response limit.`,
+          },
+        }));
+        return;
       }
-      res.end();
-      return;
-    }
+      if (outcome.preStreamFailure && !res.headersSent && !res.destroyed) {
+        // Nothing reached the client, but upstream may already have accepted
+        // the request. Only replay-safe methods can move to another account;
+        // an unsafe POST is surfaced as a retryable error for the client to
+        // decide, avoiding a hidden duplicate execution inside the proxy.
+        if (!replaySafe) {
+          console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
+          if (logDir) {
+            logSections.push(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
+            writeRequestLog(logDir, reqId, logSections);
+          }
+          ctx.status = 529;
+          res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'overloaded_error',
+              message: 'Upstream stream failed after dispatch. Request was not replayed; please retry.',
+            },
+          }));
+          return;
+        }
 
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
-
-    if (isStreaming) {
-      const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account, accountManager, streamLog);
+        console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} before any data on "${account.name}" — replaying on another account`);
+        if (logDir) {
+          logSections.push(`=== STREAM ${outcome.preStreamFailure} before any data — replaying ===`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        ctx.tried5xx.add(account);
+        const excludeStream = new Set([...ctx.tried429, ...ctx.tried5xx]);
+        if (retryCount < maxRetries
+            && (accountManager.anyUsable(excludeStream, ctx.model)
+              || accountManager.anyCapped(excludeStream, ctx.model))) {
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+        const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+        if (ctx.continuity.enabled && ctx.overloadRetries < maxOverload) {
+          const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+          const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+          const waitMs = Math.min(
+            backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
+            backoffCap,
+          );
+          ctx.overloadRetries += 1;
+          console.log(`[TeamClaude] Upstream stream failed on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
+          releaseHeld();
+          await sleepOrAbort(waitMs, ctx.abortSignal);
+          if (res.destroyed || ctx.abortSignal?.aborted) return;
+          ctx.tried5xx.clear();
+          return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        }
+        ctx.status = 529;
+        res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: 'Upstream stream failed before any data. Please retry.' },
+        }));
+        return;
+      }
+      if (outcome.injected) {
+        // NOT an account failure: the response was already partially delivered,
+        // so the only recovery that helps is the CLIENT retrying — which the
+        // injected error event triggers. No account state is mutated.
+        console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
+      }
       if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
+        const loggedBody = Buffer.concat(streamLog.chunks, streamLog.bytes).toString();
+        const truncation = streamLog.truncated
+          ? `\n[stream log truncated at ${streamLog.maxBytes} bytes]`
+          : '';
+        logSections.push(`=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===\n${loggedBody}${truncation}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      // Buffer non-SSE bodies before sending headers so replay-safe methods can
+      // recover from body-read failures and oversized upstream responses can be
+      // rejected cleanly without exposing partial attacker-controlled bytes.
+      const buf = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      if (buf === null) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response exceeded the proxy limit.' },
+        }));
+        return;
+      }
       extractUsageFromBody(buf, account, accountManager);
       if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+        if (buf.length === 0) {
+          logSections.push(`=== RESPONSE BODY ===\n(empty)`);
+        } else {
+          try {
+            logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
+          } catch {
+            logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
+          }
         }
         writeRequestLog(logDir, reqId, logSections);
       }
-      res.end(buf);
+      if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+      res.end(buf.length ? buf : undefined);
     }
   } catch (err) {
+    if (upstreamDeadline.timedOut && !res.destroyed) {
+      console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
+      if (logDir) {
+        logSections.push('=== ERROR ===\nUpstream response timed out.');
+        writeRequestLog(logDir, reqId, logSections);
+      }
+
+      ctx.tried5xx.add(account);
+      if (replaySafe && retryCount < maxRetries
+          && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
+            || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
+        console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
+        releaseHeld();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      ctx.status = 502;
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response timed out.' },
+        }));
+      }
+      return;
+    }
+
     // Client disconnected → we aborted the upstream fetch (ctx.abortSignal). This
     // is not the account's fault: don't mark it 'error' or fail over (the client
     // is gone). Just unwind — the outer finally releases the slot / inFlightProxied.
@@ -1369,21 +1788,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       writeRequestLog(logDir, reqId, logSections);
     }
 
+    // Undici surfaces a connection that dies WHILE READING THE BODY differently
+    // from one that dies at dispatch: `TypeError: terminated` with the socket
+    // error as `cause` (code UND_ERR_SOCKET/ECONNRESET), not a top-level code.
+    // Buffered non-SSE bodies also reach this path; the method gate below
+    // decides whether transport recovery is safe without poisoning the account.
+    const TRANSIENT_CODES = new Set([
+      'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
+      'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+    ]);
     const isTransient = err instanceof Error &&
       (err.message.includes('fetch failed') ||
-        err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-        err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT');
+        err.message.includes('terminated') ||
+        TRANSIENT_CODES.has(err.code) ||
+        TRANSIENT_CODES.has(err.cause?.code));
 
-    // Transient network errors. Before any response bytes went out the request
-    // body is still buffered, so fail over to another account exactly like a
-    // 5xx — a per-connection blip (half-dead keep-alive, one flaky route) is
-    // often account-path-local, and destroying the client here surfaces as
-    // "Response stalled mid-stream" in Claude Code for no good reason. The
-    // account is NOT marked 'error' (a network blip is not a bad credential);
-    // exclusion is per-request via tried5xx. Mid-stream (headers already sent,
-    // partial data delivered) is not replayable — close so the client retries.
+    // Transient network errors are ambiguous once dispatch starts: upstream may
+    // have accepted an unsafe request even when no response reached us. Keep
+    // account-local failover for replay-safe methods only. A network blip does
+    // not poison the account; exclusion remains per-request via tried5xx.
     if (isTransient) {
-      if (!res.headersSent && !res.destroyed && retryCount < maxRetries) {
+      if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
         if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
           || accountManager.anyCapped(ctx.tried5xx, ctx.model)) {
@@ -1392,11 +1817,28 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
       }
-      res.destroy();
+      if (!replaySafe && !res.headersSent && !res.destroyed) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: 'Upstream connection failed after dispatch. Request was not replayed.',
+          },
+        }));
+      } else if (!res.writableEnded) {
+        // Legacy/codex mid-stream: only destroy a genuinely unfinished
+        // response; destroying after streamResponse ended it can discard tail.
+        res.destroy();
+      }
       return;
     }
 
-    if (retryCount < maxRetries && !res.headersSent) {
+    if (replaySafe && retryCount < maxRetries && !res.headersSent) {
+      // Preserve a prior refresh-failure label, but label a new request-path
+      // send failure so a later token rotation cannot blindly revive it.
+      if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -1410,62 +1852,289 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
       }));
     }
+  } finally {
+    upstreamDeadline.dispose();
   }
 }
 
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
+ *
+ * With `recover` (anthropic mode, `config.streamRecovery !== false`) the stream
+ * is parsed one WHOLE SSE event at a time (SseFramer). With `transactional`
+ * (continuity mode) no event is exposed until a terminal event arrives; an
+ * abnormal attempt is discarded and returned without leaking partial output.
+ * The caller may replay only a replay-safe method; unsafe requests are surfaced
+ * for the client to decide. Outside continuity mode, an abnormal end keeps the
+ * legacy recovery contract: append a synthetic retryable `overloaded_error`
+ * event and let the client retry.
+ *
+ * With recovery, `ensureHeaders` defers the client's response headers until the
+ * first whole frame is forwarded; a failure BEFORE that point returns
+ * { preStreamFailure } with the response untouched, so the caller can either
+ * replay a safe method or surface an unsafe request without partial output.
+ *
+ * Returns { injected, reason, preStreamFailure }.
  */
-async function streamResponse(webStream, res, account, accountManager, streamLog) {
+async function streamResponse(
+  webStream,
+  res,
+  account,
+  accountManager,
+  streamLog,
+  recover = false,
+  transactional = false,
+  ensureHeaders = null,
+  transactionMaxBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
+  const framer = recover ? new SseFramer() : null;
+  const bufferedFrames = transactional ? [] : null;
+  let bufferedBytes = 0;
+  let spillFile = null;
+  let spillPath = null;
+  let spillUnlinked = false;
+  const outcome = {
+    injected: false,
+    reason: null,
+    preStreamFailure: null,
+    limitExceeded: false,
+  };
+
+  // Append a well-formed retryable error frame and end. Only called when every
+  // byte written so far ended at an event boundary (the framer guarantees it),
+  // so the client's SSE parser sees a clean error event, never half a payload.
+  const endWithRetryableError = (reason) => {
+    outcome.injected = true;
+    outcome.reason = reason;
+    res.end(sseErrorEvent(
+      `TeamClaude: upstream stream ${reason}; the response is incomplete — please retry.`));
+  };
+
+  // Forward bytes + fold their text into logging/usage parsing. Returns
+  // res.write()'s backpressure verdict.
+  const forwardChunk = (bytes) => {
+    ensureHeaders?.(); // first whole frame is ready — commit the deferred headers
+    const ok = res.write(bytes);
+    const text = decoder.decode(bytes, { stream: true });
+    if (streamLog && !streamLog.truncated) {
+      const remaining = streamLog.maxBytes - streamLog.bytes;
+      const logged = bytes.length <= remaining ? bytes : bytes.subarray(0, remaining);
+      if (logged.length > 0) {
+        streamLog.chunks.push(Buffer.from(logged));
+        streamLog.bytes += logged.length;
+      }
+      if (logged.length < bytes.length) streamLog.truncated = true;
+    }
+    sseBuffer += text;
+    const events = sseBuffer.split('\n\n');
+    sseBuffer = events.pop(); // keep incomplete event
+    // Usage parsing is best-effort: a "partial event" that grows this large is
+    // a giant content delta or a CRLF-only stream — nothing parseSSEUsage could
+    // read either way. Drop it instead of buffering without bound.
+    if (sseBuffer.length > 1_048_576) sseBuffer = '';
+    for (const event of events) {
+      parseSSEUsage(event, account, accountManager);
+    }
+    return ok;
+  };
+
+  const waitForDrain = async () => {
+    if (res.destroyed || res.writableEnded) return false;
+    return new Promise(resolve => {
+      let timer = null;
+      const settle = (drained) => {
+        res.removeListener('drain', onDrain);
+        res.removeListener('close', onClose);
+        if (timer !== null) clearTimeout(timer);
+        if (!drained && !res.destroyed) res.destroy();
+        resolve(drained);
+      };
+      const onDrain = () => settle(true);
+      const onClose = () => settle(false);
+      res.once('drain', onDrain);
+      res.once('close', onClose);
+      timer = setTimeout(() => settle(false), streamIdleTimeoutMs);
+      timer.unref?.();
+    });
+  };
+
+  const writeSpill = async (bytes) => {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesWritten } = await spillFile.write(
+        bytes,
+        offset,
+        bytes.length - offset,
+        null,
+      );
+      if (bytesWritten === 0) throw new Error('Unable to buffer upstream stream');
+      offset += bytesWritten;
+    }
+  };
+
+  const stageChunk = async (bytes) => {
+    if (bufferedBytes + bytes.length > transactionMaxBytes) {
+      outcome.limitExceeded = true;
+      return false;
+    }
+    const copy = Buffer.from(bytes);
+    if (!spillFile && bufferedBytes + copy.length > TRANSACTION_MEMORY_BYTES) {
+      spillPath = join(tmpdir(), `teamclaude-stream-${process.pid}-${randomUUID()}.tmp`);
+      spillFile = await open(spillPath, 'wx+', 0o600);
+      try {
+        await unlink(spillPath);
+        spillUnlinked = true;
+      } catch {}
+      for (const frame of bufferedFrames) await writeSpill(frame);
+      bufferedFrames.length = 0;
+    }
+    if (spillFile) await writeSpill(copy);
+    else bufferedFrames.push(copy);
+    bufferedBytes += copy.length;
+    return true;
+  };
+
+  const relayChunk = async (bytes) => {
+    if (transactional) {
+      return stageChunk(bytes);
+    }
+    if (!forwardChunk(bytes) && !await waitForDrain()) return false;
+    return !res.destroyed;
+  };
+
+  const flushTransaction = async () => {
+    if (spillFile) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position < bufferedBytes) {
+        if (res.destroyed || res.writableEnded) return false;
+        const { bytesRead } = await spillFile.read(
+          chunk,
+          0,
+          Math.min(chunk.length, bufferedBytes - position),
+          position,
+        );
+        if (bytesRead === 0) throw new Error('Unable to replay buffered upstream stream');
+        position += bytesRead;
+        if (!forwardChunk(chunk.subarray(0, bytesRead)) && !await waitForDrain()) return false;
+      }
+    } else {
+      for (const bytes of bufferedFrames) {
+        if (res.destroyed || res.writableEnded) return false;
+        if (!forwardChunk(bytes) && !await waitForDrain()) return false;
+      }
+    }
+    return !res.destroyed;
+  };
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      let step;
+      try {
+        step = await raceTimeout(
+          reader.read(),
+          streamIdleTimeoutMs,
+          `Upstream SSE idle timeout after ${streamIdleTimeoutMs}ms`,
+        );
+      } catch (err) {
+        // Upstream died mid-stream.
+        if (framer && !res.destroyed && !res.writableEnded) {
+          const detail = err?.cause?.code || err?.code || err?.name || 'network error';
+          if (transactional && !framer.sawTerminal) {
+            // No semantic bytes from this attempt reached the client. Discard
+            // every staged frame and let the caller apply the method-safety gate.
+            outcome.preStreamFailure = `errored (${detail})`;
+            return outcome;
+          }
+          if (!res.headersSent) {
+            // Nothing was forwarded yet (headers still deferred): hand the
+            // method-aware replay decision back to the caller.
+            outcome.preStreamFailure = `errored (${detail})`;
+            return outcome;
+          }
+          if (!framer.sawTerminal && !framer.passthrough) {
+            // Events are already out, so another account cannot help THIS
+            // response — but a clean retryable error event keeps the client's
+            // automatic retry alive, where a destroyed socket fails the turn.
+            endWithRetryableError(`errored mid-response (${detail})`);
+            return outcome;
+          }
+          // Terminal already delivered — close out normally. Or framing
+          // degraded to passthrough (oversized frame): an injection could land
+          // mid-event and corrupt the parse, so end plainly like legacy.
+          break;
+        }
+        if (framer) break; // client gone — nothing left to salvage
+        throw err; // legacy mode: caller decides (destroys the client socket)
+      }
+      if (step.done) break;
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      // Forward chunk immediately
-      const ok = res.write(value);
-
-      const text = decoder.decode(value, { stream: true });
-
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
-
-      // Parse SSE events for usage tracking
-      sseBuffer += text;
-      const events = sseBuffer.split('\n\n');
-      sseBuffer = events.pop(); // keep incomplete event
-
-      for (const event of events) {
-        parseSSEUsage(event, account, accountManager);
-      }
+      const bytes = framer ? framer.push(step.value) : step.value;
+      if (!bytes || bytes.length === 0) continue; // partial frame still buffering
 
       // Handle backpressure — also bail out if client disconnects,
-      // because 'drain' will never fire on a destroyed socket
-      if (!ok) {
-        await new Promise(resolve => {
-          res.once('drain', resolve);
-          res.once('close', resolve);
-        });
-        if (res.destroyed) break;
-      }
+      // because 'drain' will never fire on a destroyed socket. Both listeners
+      // are removed once either fires, so a long stream with many backpressure
+      // pauses doesn't accumulate dead 'close' listeners.
+      if (!await relayChunk(bytes)) break;
     }
 
-    // Parse any remaining buffer
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, account, accountManager);
+    if (outcome.limitExceeded) return outcome;
+
+    // Parse any remaining (partial / never-forwarded) text for usage tracking
+    const tail = framer && framer.pending.length ? decoder.decode(framer.pending) : '';
+    if ((sseBuffer + tail).trim()) {
+      parseSSEUsage(sseBuffer + tail, account, accountManager);
+    }
+
+    if (framer && !res.destroyed && !res.writableEnded) {
+      if (framer.sawTerminal) {
+        // Complete stream — flush any trailing bytes after the terminal event
+        // (comments / blank lines) for byte fidelity; finally ends normally.
+        if (framer.pending.length) {
+          if (transactional) {
+            if (!await stageChunk(framer.pending)) return outcome;
+          } else {
+            res.write(framer.pending);
+          }
+        }
+        if (transactional) await flushTransaction();
+      } else if (transactional) {
+        // Frames may have been staged, but none were exposed. Treat a clean
+        // socket close without a terminal event exactly like a read error.
+        outcome.preStreamFailure = 'ended without a terminal event';
+        return outcome;
+      } else if (!res.headersSent) {
+        // Ended before a single whole frame: fully replayable by the caller.
+        outcome.preStreamFailure = 'ended without data';
+        return outcome;
+      } else if (!framer.passthrough) {
+        // The upstream ended without message_stop/error: a silently truncated
+        // response. The partial frame (if any) was never forwarded, so the
+        // injected error lands on a clean event boundary.
+        endWithRetryableError('ended mid-response without a terminal event');
+        return outcome;
+      }
+      // else: framing degraded to passthrough — the last relayed bytes may sit
+      // mid-event, where an injected frame would corrupt the parse. End plainly.
     }
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
-    if (!res.writableEnded) res.end();
+    if (spillFile) await spillFile.close().catch(() => {});
+    if (spillPath && !spillUnlinked) await unlink(spillPath).catch(() => {});
+    // Only end a response whose headers went out — a deferred-headers response
+    // being handed back for replay (preStreamFailure) must stay untouched.
+    if (res.headersSent && !res.writableEnded) res.end();
   }
+  return outcome;
 }
 
 // Anthropic usage objects split the prompt into three input families:

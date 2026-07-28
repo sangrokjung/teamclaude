@@ -229,3 +229,39 @@ test('bracket-suffixed model matches its suffix-stripped fallback entry', async 
     upstream.close();
   }
 });
+
+// Model-tier windows are weekly, so "sleep and retry" never clears while we
+// poll. With continuity on and no fallback configured — which is the DEFAULT
+// config (`continuityMode: true`, `modelFallbacks: {}`) — this used to repeat
+// until the week rolled over: the client hung for days and every sleep burned
+// one real upstream 429. The polling must be bounded and end in a 429.
+test('model-tier exhaustion with continuity on and no fallback terminates instead of looping', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJsonBody(req);
+    upstreamHits += 1;
+    modelWeekly429(res);
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    continuityMaxSleepMs: 10, // keep the bounded polling fast in test
+    continuityJitterMs: 0,
+    // modelFallbacks deliberately absent: the default, and the looping case.
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await post(proxyPort, 'claude-fable-5');
+    await res.text();
+    assert.equal(res.status, 429, 'client must receive a terminal 429, not hang');
+    // Bounded by MODEL_EXHAUST_WAIT_PASSES; the exact count depends on how many
+    // accounts are tried per pass, so assert the ceiling rather than equality.
+    assert.ok(upstreamHits <= 40, `upstream 429s must stay bounded, saw ${upstreamHits}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

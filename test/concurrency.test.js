@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
@@ -405,7 +406,7 @@ test('token-refresh callback is not emitted with a stale index for a removed acc
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
   const A = am.accounts[0];
   let emitted = null;
-  am.onTokenRefresh((idx, tokens) => { emitted = { idx, tokens }; });
+  am.onTokenRefresh((idx, tokens, previousTokens) => { emitted = { idx, tokens, previousTokens }; });
 
   // Remove A; B shifts into index 0 while A keeps a stale .index === 0.
   am.removeAccount(A.index);
@@ -417,8 +418,19 @@ test('token-refresh callback is not emitted with a stale index for a removed acc
 
   // Sanity: a live account still emits (with its current index).
   const B = am.accounts[0];
+  const oldAccess = B.credential;
+  const oldRefresh = B.refreshToken;
   am.updateAccountTokens(B, { accessToken: 'x2', refreshToken: 'y2', expiresAt: Date.now() + HOUR });
   assert.ok(emitted && emitted.idx === 0, 'a live account still persists, with its current index');
+  assert.deepEqual(
+    { accessToken: emitted.previousTokens.accessToken, refreshToken: emitted.previousTokens.refreshToken },
+    { accessToken: oldAccess, refreshToken: oldRefresh },
+    'persistence callback receives the credential snapshot needed for disk CAS',
+  );
+
+  emitted = null;
+  am.updateAccountTokens(B, { accessToken: 'disk-new', refreshToken: 'disk-refresh', expiresAt: Date.now() + HOUR }, false);
+  assert.equal(emitted, null, 'installing an authoritative disk credential does not recursively persist');
 });
 
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────
@@ -628,7 +640,7 @@ test('a client disconnect during 5xx overload backoff releases the slot promptly
   process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '1000';
   try {
     const ac = new AbortController();
-    const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', body: '{}', signal: ac.signal })
+    const p = fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'GET', signal: ac.signal })
       .catch(() => 'aborted');
     await new Promise(r => setTimeout(r, 120)); // request has 529'd and is now in backoff sleep
     assert.equal(am.accounts[0].inflight, 1, 'slot held while backing off');
@@ -666,6 +678,296 @@ test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
 
   upstream.close();
   proxy.close();
+});
+
+test('relayRaw removes stale compression headers after upstream gzip decompression', async () => {
+  const payload = {
+    access_token: 'fresh-token-'.repeat(128),
+    token_type: 'bearer',
+  };
+  const compressed = gzipSync(JSON.stringify(payload));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-encoding': 'gzip',
+      'content-length': String(compressed.length),
+      'x-relay-check': 'kept',
+    });
+    res.end(compressed);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-encoding'), null);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(response.headers.get('x-relay-check'), 'kept');
+    assert.deepEqual(await response.json(), payload);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('relayRaw preserves end-to-end request headers for OAuth token exchange', async () => {
+  let receivedHeaders;
+  const upstream = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-test',
+        'x-relay-marker': 'preserved',
+      },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(receivedHeaders['anthropic-version'], '2023-06-01');
+    assert.equal(receivedHeaders['anthropic-beta'], 'oauth-test');
+    assert.equal(receivedHeaders['x-relay-marker'], 'preserved');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('relayRaw strips request headers nominated by Connection', async () => {
+  let receivedHeaders;
+  const upstream = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const request = http.request({
+        host: '127.0.0.1',
+        port,
+        path: '/v1/oauth/token',
+        method: 'POST',
+        headers: {
+          connection: 'x-hop-marker',
+          'content-type': 'application/json',
+          'x-hop-marker': 'must-not-forward',
+        },
+      }, response => {
+        response.resume();
+        response.on('end', () => resolve(response.statusCode));
+      });
+      request.on('error', reject);
+      request.end('{}');
+    });
+
+    assert.equal(status, 200);
+    assert.equal(receivedHeaders['x-hop-marker'], undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('relayRaw strips response headers nominated by Connection', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      connection: 'x-hop-marker',
+      'x-hop-marker': 'must-not-forward',
+    });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-hop-marker'), null);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('proxy strips response headers nominated by Connection', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      connection: 'x-hop-marker',
+      'x-hop-marker': 'must-not-forward',
+    });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-hop-marker'), null);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {
+  let hits = 0;
+  let oversizedClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (hits === 1) {
+      const timer = setInterval(() => res.write('x'.repeat(512)), 5);
+      res.once('close', () => {
+        clearInterval(timer);
+        oversizedClosed = true;
+      });
+      return;
+    }
+    res.end('x'.repeat(1024));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxResponseBytes: 1024,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const oversized = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await oversized.json();
+    assert.equal(oversized.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    for (let i = 0; i < 20 && !oversizedClosed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(oversizedClosed, true, 'the proxy must cancel an endless oversized upstream body');
+
+    const admitted = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(admitted.status, 200, 'the completed rejection must free global admission capacity');
+    assert.equal((await admitted.arrayBuffer()).byteLength, 1024, 'a response exactly at the cap must pass');
+    assert.equal(hits, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('relayRaw times out a stalled upstream response and releases admission capacity', async () => {
+  let hits = 0;
+  let stalledClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (hits === 1) {
+      res.write('{"partial":');
+      res.once('close', () => { stalledClosed = true; });
+      return;
+    }
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    upstreamResponseTimeoutMs: 50,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const stalled = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await stalled.json();
+    assert.equal(stalled.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    for (let i = 0; i < 20 && !stalledClosed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(stalledClosed, true, 'the deadline must cancel the stalled upstream body');
+
+    const admitted = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(admitted.status, 200, 'the timed-out relay must free global admission capacity');
+    assert.deepEqual(await admitted.json(), {});
+    assert.equal(hits, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
 });
 
 test('a client disconnect during a hung /v1/oauth/token relay frees admission capacity', async () => {
@@ -728,6 +1030,193 @@ test('global admission cap rejects past capacity before buffering (upstream unto
 
   upstream.close();
   proxy.close();
+});
+
+test('direct proxy releases admission after a partial request body deadline', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    requestBodyTimeoutMs: 100,
+  });
+  const port = await listen(proxy);
+  let partialRequest = null;
+
+  try {
+    const timeoutResponse = new Promise((resolve, reject) => {
+      let responseStarted = false;
+      partialRequest = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-length': '10' },
+      }, response => {
+        responseStarted = true;
+        response.resume();
+        response.once('end', () => resolve({
+          status: response.statusCode,
+          connection: response.headers.connection,
+        }));
+      });
+      partialRequest.once('error', err => {
+        if (!responseStarted) reject(err);
+      });
+      partialRequest.write('1');
+    });
+    await new Promise(resolve => setTimeout(resolve, 25));
+
+    const blocked = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(blocked.status, 429);
+
+    const timedOut = await Promise.race([
+      timeoutResponse,
+      new Promise(resolve => setTimeout(() => resolve(null), 1000)),
+    ]);
+    assert.deepEqual(timedOut, { status: 408, connection: 'close' });
+
+    const recovered = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal(hits, 1);
+  } finally {
+    partialRequest?.destroy();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('buffer budget caps worker admission below a large account queue capacity', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    if (hits === 1) return;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 8, 8);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1024,
+  });
+  const port = await listen(proxy);
+  const firstAbort = new AbortController();
+  const first = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    body: '{}',
+    signal: firstAbort.signal,
+  }).catch(() => null);
+
+  try {
+    for (let i = 0; i < 20 && hits < 1; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(hits, 1);
+    const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(second.status, 429, 'memory budget must override the larger account/queue capacity');
+    assert.equal(hits, 1, 'budget-rejected request must not reach upstream');
+  } finally {
+    firstAbort.abort();
+    await first;
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('worker rejects before buffering when the budget cannot fit one maximum request', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 8, 8);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1023,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const health = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(health.status, 200);
+    const bodyBearingStatus = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/teamclaude/status',
+        method: 'GET',
+        headers: { 'content-length': '2' },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', reject);
+      request.end('{}');
+    });
+    assert.equal(bodyBearingStatus, 429,
+      'a direct status GET with a body must not bypass the worker buffer budget');
+
+    const slowRejected = await new Promise((resolve, reject) => {
+      let resolved = false;
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, response => {
+        response.resume();
+        response.once('end', () => {
+          resolved = true;
+          resolve({
+            status: response.statusCode,
+            connection: response.headers.connection,
+          });
+        });
+      });
+      request.once('error', err => {
+        if (!resolved) reject(err);
+      });
+      request.write('1');
+    });
+    assert.deepEqual(slowRejected, { status: 429, connection: 'close' });
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(response.status, 429);
+    assert.equal(hits, 0, 'an under-sized budget must reject before reaching upstream');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
 });
 
 // ── disable / enable + priority (account on-off switch + selection order) ──────

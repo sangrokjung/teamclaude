@@ -113,6 +113,72 @@ function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
+function sameAccountIdentity(a, b) {
+  if (a.accountUuid && b.accountUuid) return a.accountUuid === b.accountUuid;
+  return a.name === b.name;
+}
+
+function findAccountByIdentity(accounts, account) {
+  return accounts.find(candidate => sameAccountIdentity(candidate, account));
+}
+
+function persistedAccount(snapshot, accountManager, account) {
+  const configAccount = findAccountByIdentity(snapshot.accounts, account) || account;
+  const liveAccount = findAccountByIdentity(accountManager.accounts, configAccount);
+  if (!liveAccount) return configAccount;
+  return {
+    ...configAccount,
+    accessToken: liveAccount.credential,
+    refreshToken: liveAccount.refreshToken,
+    expiresAt: liveAccount.expiresAt,
+    idToken: liveAccount.idToken,
+    accountId: liveAccount.accountId,
+  };
+}
+
+function patchAccount(accounts, account, fields) {
+  const target = findAccountByIdentity(accounts, account);
+  if (!target) return;
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) delete target[key];
+    else target[key] = value;
+  }
+}
+
+export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation) {
+  if (mutation.type === 'upsert') {
+    const previous = mutation.previous
+      ? findAccountByIdentity(diskConfig.accounts, mutation.previous)
+      : null;
+    if (mutation.previous && !previous) return;
+    const account = persistedAccount(snapshot, accountManager, mutation.account);
+    const current = findAccountByIdentity(diskConfig.accounts, account);
+    const existing = previous || current;
+    if (existing) {
+      diskConfig.accounts[diskConfig.accounts.indexOf(existing)] = { ...existing, ...account };
+    } else {
+      diskConfig.accounts.push(account);
+    }
+    return;
+  }
+  if (mutation.type === 'remove') {
+    const existing = findAccountByIdentity(diskConfig.accounts, mutation.account);
+    if (existing) diskConfig.accounts.splice(diskConfig.accounts.indexOf(existing), 1);
+    return;
+  }
+  if (mutation.type === 'patch') {
+    patchAccount(diskConfig.accounts, mutation.account, mutation.fields);
+    return;
+  }
+  if (mutation.type === 'batchPatch') {
+    for (const patch of mutation.patches) {
+      patchAccount(diskConfig.accounts, patch.account, patch.fields);
+    }
+    return;
+  }
+  throw new Error(`Unknown TUI account mutation: ${mutation.type}`);
+}
+
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
@@ -432,12 +498,14 @@ export class TUI {
         ? this.config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
         : -1;
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+      let previous = null;
 
       if (idx >= 0) {
         // Preserve manual routing settings across a re-import (the new entry
         // omits them, so a re-import would otherwise re-enable a disabled
         // account / clear its priority).
         const prev = this.config.accounts[idx];
+        previous = prev;
         if (prev.enabled !== undefined) entry.enabled = prev.enabled;
         if (prev.priority !== undefined) entry.priority = prev.priority;
         this.config.accounts[idx] = entry;
@@ -454,7 +522,11 @@ export class TUI {
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
-          if (amAcct.status === 'error') amAcct.status = 'active';
+          if (amAcct.status === 'error') {
+            amAcct.status = 'active';
+            delete amAcct._errorFromRefresh;
+          }
+          delete amAcct._refreshRetryAt;
         } else {
           // The matched config entry had no live AccountManager account (it was
           // skipped at load — e.g. previously tokenless). Now that we have fresh
@@ -468,7 +540,7 @@ export class TUI {
         this._addLog(`Imported account "${name}"`);
       }
 
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { type: 'upsert', account: entry, previous });
     } catch (e) {
       this._addLog(`Import failed: ${e.message}`);
     }
@@ -501,8 +573,9 @@ export class TUI {
         a.accountUuid === creds.accountId || a.accountId === creds.accountId);
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
 
+      let previous = null;
       if (idx >= 0) {
-        const previous = this.config.accounts[idx];
+        previous = this.config.accounts[idx];
         if (previous.enabled !== undefined) entry.enabled = previous.enabled;
         if (previous.priority !== undefined) entry.priority = previous.priority;
         this.config.accounts[idx] = entry;
@@ -520,7 +593,7 @@ export class TUI {
         this.am.addAccount(entry);
         this._addLog(`Imported Codex account "${name}"`);
       }
-      await this.saveConfig(this.config);
+      await this.saveConfig(this.config, { type: 'upsert', account: entry, previous });
     } catch (e) {
       this._addLog(`Codex import failed: ${e.message}`);
     }
@@ -532,9 +605,10 @@ export class TUI {
     // the identity key for credential-less API-key accounts, so it must not clash.
     let n = 1, name;
     do { name = `api-${n++}`; } while (this.config.accounts.some(a => a.name === name));
-    this.config.accounts.push({ name, type: 'apikey', apiKey });
-    this.am.addAccount({ name, type: 'apikey', apiKey });
-    await this.saveConfig(this.config);
+    const entry = { name, type: 'apikey', apiKey };
+    this.config.accounts.push(entry);
+    this.am.addAccount(entry);
+    await this.saveConfig(this.config, { type: 'upsert', account: entry });
     this._addLog(`Added API key account "${name}"`);
   }
 
@@ -551,12 +625,15 @@ export class TUI {
     // could match an earlier same-name entry before the real UUID match.
     let cfgIdx = uuid ? this.config.accounts.findIndex(c => c.accountUuid === uuid) : -1;
     if (cfgIdx < 0) cfgIdx = this.config.accounts.findIndex(c => c.name === name);
+    const removed = cfgIdx >= 0
+      ? this.config.accounts[cfgIdx]
+      : { name, accountUuid: uuid };
     if (cfgIdx >= 0) this.config.accounts.splice(cfgIdx, 1);
     // Drop a cursor anchor that pointed at the removed account; _selected()
     // falls back to the remembered position on the next keypress/render.
     if (this.selAcct && !this.am.accounts.includes(this.selAcct)) this.selAcct = null;
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
-    await this.saveConfig(this.config);
+    await this.saveConfig(this.config, { type: 'remove', account: removed });
     this._addLog(`Deleted account "${name}"`);
   }
 
@@ -576,7 +653,11 @@ export class TUI {
     const cfg = (amAcct.accountUuid && this.config.accounts.find(a => a.accountUuid === amAcct.accountUuid))
       || this.config.accounts.find(a => a.name === amAcct.name);
     if (cfg) cfg.enabled = newEnabled;
-    await this.saveConfig(this.config);
+    await this.saveConfig(this.config, {
+      type: 'patch',
+      account: amAcct,
+      fields: { enabled: newEnabled ? undefined : false },
+    });
     this._addLog(`${newEnabled ? 'Enabled' : 'Disabled'} "${amAcct.name}"`);
   }
 
@@ -688,7 +769,11 @@ export class TUI {
     this._saving = (async () => {
       while (this._saveDirty) {
         this._saveDirty = false;
-        try { await this.saveConfig(this.config); }
+        const patches = this.am.accounts.map(account => ({
+          account,
+          fields: { priority: account.priority },
+        }));
+        try { await this.saveConfig(this.config, { type: 'batchPatch', patches }); }
         catch (e) { this._addLog(`Save failed: ${e.message}`); }
       }
       this._saving = null;

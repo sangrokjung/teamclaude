@@ -11,14 +11,15 @@ function makeTUI(names = ['a0', 'a1', 'a2']) {
   const am = new AccountManager(accts.map(a => ({ ...a })), 0.98, 0, 5);
   const config = { accounts: accts.map(a => ({ ...a })) };
   let saves = 0;
+  const mutations = [];
   const tui = new TUI({
     accountManager: am,
     config,
-    saveConfig: async () => { saves++; },
+    saveConfig: async (_snapshot, mutation) => { saves++; mutations.push(mutation); },
     syncAccounts: async () => 0,
     onQuit: () => {},
   });
-  return { tui, am, config, saves: () => saves };
+  return { tui, am, config, saves: () => saves, mutations };
 }
 
 // ── normal-mode cursor: ↑/↓ select, action keys act on the selection ─────────
@@ -72,6 +73,23 @@ test('select-mode (delete) → Enter removes the cursor account, Esc cancels', a
   // Enter path delegates to _doRemove (awaited here to assert its effect deterministically).
   await tui._doRemove(tui._displayList()[1].index);
   assert.deepEqual(config.accounts.map(a => a.name), ['a0', 'a2'], 'a1 removed on confirm');
+});
+
+test('TUI saves scoped account mutations for toggle, order, and delete', async () => {
+  const { tui, am, mutations } = makeTUI(['a0', 'a1']);
+  await tui._doToggleEnabled(0);
+  assert.equal(mutations.at(-1).type, 'patch');
+  assert.equal(mutations.at(-1).account, am.accounts[0]);
+  assert.deepEqual(mutations.at(-1).fields, { enabled: false });
+
+  tui._moveOrder(am.accounts[1], -1);
+  await tui._saving;
+  assert.equal(mutations.at(-1).type, 'batchPatch');
+  assert.equal(mutations.at(-1).patches.length, 2);
+
+  await tui._doRemove(0);
+  assert.equal(mutations.at(-1).type, 'remove');
+  assert.equal(mutations.at(-1).account.name, 'a0');
 });
 
 // ── moving accounts in the order ────────────────────────────────────────────

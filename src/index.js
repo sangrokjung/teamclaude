@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { fork, spawn, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
+import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -16,8 +17,55 @@ import {
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
 } from './codex.js';
-import { TUI } from './tui.js';
+import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
+import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+
+const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
+const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
+const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+]);
+
+function connectionHeaderNames(value) {
+  return new Set(
+    String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
+function publicRequestCapacity(config, accounts = config.accounts || []) {
+  const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
+    ? Math.max(1, config.maxConcurrentPerAccount)
+    : 3;
+  const accountCapacity = accounts.reduce((sum, account) => {
+    if (account.enabled === false) return sum;
+    return sum + (Number.isFinite(account.maxConcurrent)
+      ? Math.max(1, account.maxConcurrent)
+      : defaultConcurrent);
+  }, 0);
+  const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
+    ? Math.max(0, config.overflowQueueMaxDepth)
+    : 256;
+  const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
+    ? config.maxRequestBytes
+    : 32 * 1024 * 1024;
+  const bufferBudget = Number.isFinite(config.maxBufferedRequestBytes)
+      && config.maxBufferedRequestBytes > 0
+    ? config.maxBufferedRequestBytes
+    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
+  const bufferCapacity = Math.floor(bufferBudget / (maxRequestBytes * 2));
+  return Math.min(accountCapacity + queueCapacity, bufferCapacity);
+}
 
 const args = process.argv.slice(2);
 const cliProvider = args[0] === 'codex' ? 'codex' : 'anthropic';
@@ -100,8 +148,694 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  if (process.env[SUPERVISED_WORKER_ENV] === '1') {
+    await proxyWorkerCommand();
+    return;
+  }
+  await superviseServerCommand();
+}
+
+async function superviseServerCommand() {
   const config = await loadOrCreateConfig();
-  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  const port = config?.proxy?.port;
+  const existing = await findRunningServer(config);
+  if (existing && existing.port === port) {
+    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
+    console.error('  See it:      teamcodex status');
+    console.error('  Stop it:     teamcodex stop');
+    console.error('  Restart it:  teamcodex restart');
+    process.exitCode = 1;
+    return;
+  }
+
+  let maxPublicRequests = publicRequestCapacity(config);
+  const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
+    ? config.maxRequestBytes
+    : 32 * 1024 * 1024;
+  const requestBodyTimeoutMs = Number.isFinite(config.requestBodyTimeoutMs)
+      && config.requestBodyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.requestBodyTimeoutMs))
+    : 30_000;
+  // Mirror of the worker's streamRecovery gate (see server.js): SSE relays are
+  // framed to whole events so a worker crash mid-response can be converted into
+  // a clean, client-retryable `overloaded_error` SSE event instead of a
+  // destroyed client socket ("Connection closed mid-response" in Claude Code,
+  // which does NOT auto-retry a raw connection loss).
+  const streamRecovery = !isCodexMode(config) && config.streamRecovery !== false;
+  const streamIdleTimeoutMs = Number.isFinite(config.streamIdleTimeoutMs)
+      && config.streamIdleTimeoutMs > 0
+    ? Math.floor(config.streamIdleTimeoutMs)
+    : DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  const workerHealthIntervalMs = Number.isFinite(config.workerHealthIntervalMs)
+    ? Math.max(50, config.workerHealthIntervalMs)
+    : 5_000;
+  const workerHealthTimeoutMs = Number.isFinite(config.workerHealthTimeoutMs)
+    ? Math.max(10, config.workerHealthTimeoutMs)
+    : 2_000;
+  const workerHealthFailureThreshold = Number.isFinite(config.workerHealthFailureThreshold)
+    ? Math.max(1, Math.floor(config.workerHealthFailureThreshold))
+    : 2;
+  const workerWaiters = new Set();
+  const clientAgents = new WeakMap();
+  const statePath = getServerStatePath();
+  let worker = null;
+  let workerReady = false;
+  let workerPort = null;
+  let hasBeenReady = false;
+  let stopping = false;
+  let activePublicRequests = 0;
+  let restartCount = 0;
+  let restartTimer = null;
+  let stableTimer = null;
+  let healthTimer = null;
+  let healthInFlight = false;
+  let healthFailures = 0;
+  let forceTimer = null;
+  let finish;
+
+  function rejectPublicRequest(req, res, statusCode, headers, payload) {
+    req.pause();
+    res.shouldKeepAlive = false;
+    res.once('finish', () => req.destroy());
+    res.writeHead(statusCode, { ...headers, connection: 'close' });
+    res.end(JSON.stringify(payload));
+  }
+
+  const listener = http.createServer((req, res) => {
+    const clientKey = req.headers['x-api-key'];
+    const authorization = req.headers.authorization;
+    const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
+      ? authorization.slice('Bearer '.length)
+      : null;
+    const remoteAddr = req.socket.remoteAddress;
+    const isLocal = remoteAddr === '127.0.0.1'
+      || remoteAddr === '::1'
+      || remoteAddr === '::ffff:127.0.0.1';
+    if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
+      && bearerKey !== config.proxy.apiKey && !isLocal) {
+      rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+      });
+      return;
+    }
+    const contentLength = req.headers['content-length'];
+    const bypassAdmission = req.method === 'GET'
+      && req.url === '/teamclaude/status'
+      && (contentLength == null || contentLength === '0')
+      && req.headers['transfer-encoding'] == null;
+    if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
+      rejectPublicRequest(
+        req,
+        res,
+        429,
+        { 'content-type': 'application/json', 'retry-after': '1' },
+        { error: { type: 'overloaded_error', message: 'Proxy supervisor queue is full' } },
+      );
+      return;
+    }
+    if (!bypassAdmission) activePublicRequests += 1;
+    let released = bypassAdmission;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activePublicRequests -= 1;
+    };
+    res.once('finish', release);
+    res.once('close', release);
+    handlePublicRequest(req, res).catch(err => {
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'proxy_error', message: err.message } }));
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+    });
+  });
+  // Only the process that actually claimed the state file may remove it. A start
+  // that loses the port race (EADDRINUSE against an already-running server) exits
+  // through this handler too, and deleting the LIVE server's state file there
+  // would strip findRunningServer of its recorded-port leg — the very thing that
+  // keeps a server discoverable after its config port was edited.
+  let ownsStateFile = false;
+  process.once('exit', () => {
+    if (ownsStateFile) {
+      try { unlinkSync(statePath); } catch {}
+    }
+    // `worker?.exitCode == null` is true when worker is null (undefined == null),
+    // so the optional chain alone would send us into kill() on a null worker.
+    if (worker && worker.exitCode == null) {
+      try { worker.kill('SIGKILL'); } catch {}
+    }
+  });
+
+  function bufferRequest(req) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let size = 0;
+      let settled = false;
+      let timer = null;
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+        req.off('aborted', onAborted);
+      };
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      const onData = chunk => {
+        size += chunk.length;
+        if (size > maxRequestBytes) {
+          chunks.length = 0;
+          req.pause();
+          const err = new Error('Request body too large');
+          err.statusCode = 413;
+          err.closeConnection = true;
+          settle(reject, err);
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onEnd = () => settle(resolve, Buffer.concat(chunks));
+      const onError = err => settle(reject, err);
+      const onAborted = () => settle(reject, new Error('Client disconnected'));
+      const onTimeout = () => {
+        chunks.length = 0;
+        req.pause();
+        const err = new Error('Request body timed out');
+        err.statusCode = 408;
+        err.closeConnection = true;
+        settle(reject, err);
+      };
+      req.on('data', onData);
+      req.once('end', onEnd);
+      req.once('error', onError);
+      req.once('aborted', onAborted);
+      timer = setTimeout(onTimeout, requestBodyTimeoutMs);
+      timer.unref();
+    });
+  }
+
+  function waitForWorker(res) {
+    if (workerReady && workerPort && worker) {
+      return Promise.resolve({ worker, port: workerPort });
+    }
+    return new Promise(resolve => {
+      const waiter = { resolve, res };
+      workerWaiters.add(waiter);
+      res.once('close', () => {
+        if (!workerWaiters.delete(waiter)) return;
+        resolve(null);
+      });
+    });
+  }
+
+  function clientAgent(req) {
+    let agent = clientAgents.get(req.socket);
+    if (agent) return agent;
+    agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    clientAgents.set(req.socket, agent);
+    req.socket.once('close', () => agent.destroy());
+    return agent;
+  }
+
+  function resetClientAgent(req) {
+    const agent = clientAgents.get(req.socket);
+    if (agent) agent.destroy();
+    clientAgents.delete(req.socket);
+  }
+
+  function wakeWorkerWaiters() {
+    const target = workerReady && workerPort && worker
+      ? { worker, port: workerPort }
+      : null;
+    for (const waiter of workerWaiters) {
+      workerWaiters.delete(waiter);
+      waiter.resolve(target);
+    }
+  }
+
+  function closePublicListener(force = false) {
+    try { listener.close(); } catch {}
+    workerReady = false;
+    workerPort = null;
+    wakeWorkerWaiters();
+    if (force) listener.closeAllConnections?.();
+  }
+
+  async function handlePublicRequest(req, res) {
+    let body;
+    try {
+      body = await bufferRequest(req);
+    } catch (err) {
+      if (!res.headersSent && !res.destroyed) {
+        const headers = { 'content-type': 'application/json' };
+        if (err.closeConnection) {
+          headers.connection = 'close';
+          res.shouldKeepAlive = false;
+          res.once('finish', () => req.destroy());
+        }
+        res.writeHead(err.statusCode || 400, headers);
+        res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: err.message } }));
+      }
+      return;
+    }
+    await forwardToWorker(req, res, body, 0);
+  }
+
+  async function forwardToWorker(req, res, body, attempt) {
+    const target = await waitForWorker(res);
+    if (!target) {
+      // Woken with no worker (shutdown cleared readiness, or the client left).
+      // Never leave a live client hanging with no response — it would sit
+      // through the whole shutdown grace period.
+      if (!res.destroyed && !res.headersSent) {
+        res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'overloaded_error', message: 'Proxy is restarting; retry shortly.' },
+        }));
+      } else if (!res.destroyed) {
+        res.destroy();
+      }
+      return;
+    }
+    if (res.destroyed) return;
+
+    await new Promise(resolve => {
+      let responseStarted = false;
+      let settled = false;
+      let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
+      let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      let streamIdleTimer = null;
+      let drainCleanup = null;
+      const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+      let workerConnectionEstablished = false;
+      const connectionHeaders = connectionHeaderNames(req.headers.connection);
+      const headers = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        const lowerKey = key.toLowerCase();
+        if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey) || connectionHeaders.has(lowerKey)) continue;
+        headers[key] = value;
+      }
+      headers.host = `127.0.0.1:${target.port}`;
+      headers.connection = 'keep-alive';
+      headers['content-length'] = String(body.length);
+      const upstreamReq = http.request({
+        host: '127.0.0.1',
+        port: target.port,
+        path: req.url,
+        method: req.method,
+        headers,
+        agent: clientAgent(req),
+      });
+
+      const clearRelayTimers = () => {
+        if (streamIdleTimer !== null) {
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        }
+        drainCleanup?.();
+      };
+
+      const armStreamIdle = upstreamRes => {
+        if (streamIdleTimer !== null) clearTimeout(streamIdleTimer);
+        streamIdleTimer = setTimeout(() => {
+          streamIdleTimer = null;
+          const err = new Error(`Proxy worker SSE idle timeout after ${streamIdleTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          upstreamRes.destroy(err);
+        }, streamIdleTimeoutMs);
+        streamIdleTimer.unref?.();
+      };
+
+      const waitForPublicDrain = upstreamRes => {
+        if (drainCleanup) return;
+        if (streamIdleTimer !== null) {
+          clearTimeout(streamIdleTimer);
+          streamIdleTimer = null;
+        }
+        let timer = null;
+        const cleanup = () => {
+          res.removeListener('drain', onDrain);
+          res.removeListener('close', onClose);
+          if (timer !== null) clearTimeout(timer);
+          if (drainCleanup === cleanup) drainCleanup = null;
+        };
+        const onDrain = () => {
+          cleanup();
+          armStreamIdle(upstreamRes);
+          upstreamRes.resume();
+        };
+        const onClose = () => cleanup();
+        drainCleanup = cleanup;
+        res.once('drain', onDrain);
+        res.once('close', onClose);
+        timer = setTimeout(() => {
+          cleanup();
+          const err = new Error(`Public SSE drain timeout after ${streamIdleTimeoutMs}ms`);
+          err.code = 'ETIMEDOUT';
+          upstreamRes.destroy(err);
+          if (!res.destroyed) res.destroy(err);
+        }, streamIdleTimeoutMs);
+        timer.unref?.();
+      };
+
+      const retryOrFail = err => {
+        if (settled) return;
+        clearRelayTimers();
+        settled = true;
+        // The client went away: OUR close handler destroyed the upstream leg,
+        // so this error is self-inflicted. The worker is healthy — recycling
+        // it here would let one aborted terminal (a single Esc during the
+        // seconds-long first-byte wait) SIGKILL the shared worker and cut
+        // every other terminal's in-flight stream.
+        if (clientGone || res.destroyed) {
+          resolve();
+          return;
+        }
+        if (responseStarted) {
+          // The worker died mid-response. A framed SSE relay only ever forwarded
+          // whole events, so the client's response can still be ENDED with a
+          // well-formed retryable `overloaded_error` event — Claude Code retries
+          // that by itself, where a destroyed socket fails the whole turn.
+          // Non-SSE (or terminal already delivered / opt-out) keeps the honest
+          // legacy destroy.
+          if (sseFramer && !sseFramer.passthrough && !res.destroyed && !res.writableEnded) {
+            console.error('[TeamClaude] Proxy worker died mid-stream; ending client response with a retryable error event.');
+            res.end(sseFramer.sawTerminal
+              ? undefined
+              : sseErrorEvent('TeamClaude: proxy worker restarted mid-response; the response is incomplete — please retry.'));
+          } else if (!res.destroyed) {
+            // Non-SSE, opt-out, or framing degraded to passthrough (an
+            // injection could land mid-event): the honest legacy destroy.
+            res.destroy(err);
+          }
+          resolve();
+          return;
+        }
+        if (target.worker === worker) {
+          workerReady = false;
+          workerPort = null;
+          resetClientAgent(req);
+          if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
+        }
+        if (!stopping && !res.destroyed
+            && (replaySafe || !workerConnectionEstablished) && attempt < 3) {
+          // A rejection here (bad forwarded header, synchronous http.request
+          // option error) must still settle the outer promise. Without the
+          // rejection arm the awaiting frame never returns, the client hangs,
+          // and the unhandled rejection takes down the supervisor that owns
+          // the public port and every in-flight stream.
+          forwardToWorker(req, res, body, attempt + 1).then(resolve, retryErr => {
+            if (!res.headersSent && !res.destroyed) {
+              res.writeHead(502, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                error: { type: 'proxy_error', message: retryErr?.message || 'Proxy worker unavailable' },
+              }));
+            } else if (!res.destroyed) {
+              res.destroy(retryErr);
+            }
+            resolve();
+          });
+          return;
+        }
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            error: {
+              type: 'proxy_error',
+              message: !replaySafe && workerConnectionEstablished
+                ? 'Proxy worker failed after dispatch; request was not replayed'
+                : 'Proxy worker unavailable',
+            },
+          }));
+        }
+        resolve();
+      };
+
+      upstreamReq.once('socket', socket => {
+        if (!socket.connecting) {
+          workerConnectionEstablished = true;
+          return;
+        }
+        socket.once('connect', () => { workerConnectionEstablished = true; });
+      });
+      upstreamReq.once('response', upstreamRes => {
+        responseStarted = true;
+        if (res.destroyed) {
+          upstreamRes.destroy();
+          resolve();
+          return;
+        }
+        const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.connection);
+        const responseHeaders = {};
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          const lowerKey = key.toLowerCase();
+          if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey)
+              || responseConnectionHeaders.has(lowerKey)) continue;
+          responseHeaders[key] = value;
+        }
+        res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
+        if (isEventStream(upstreamRes.headers['content-type'])) {
+          const framer = streamRecovery ? new SseFramer() : null;
+          sseFramer = framer;
+          armStreamIdle(upstreamRes);
+          upstreamRes.on('data', chunk => {
+            armStreamIdle(upstreamRes);
+            const bytes = framer ? framer.push(chunk) : chunk;
+            // writableEnded guard: retryOrFail may have already ENDED this
+            // response (graceful injection); a straggler chunk must not
+            // write-after-end (uncaught ERR_STREAM_WRITE_AFTER_END).
+            if (!bytes || bytes.length === 0 || res.destroyed || res.writableEnded) return;
+            if (!res.write(bytes)) {
+              upstreamRes.pause();
+              waitForPublicDrain(upstreamRes);
+            }
+          });
+          upstreamRes.once('end', () => {
+            if (settled) return;
+            clearRelayTimers();
+            settled = true;
+            if (!res.destroyed && !res.writableEnded) {
+              // Clean worker end. The worker's own recovery already injects on
+              // truncation, so relay as-is; flush any un-framed tail (possible
+              // only when the worker ran with recovery off) for byte fidelity.
+              res.end(framer?.pending.length ? framer.pending : undefined);
+            }
+            resolve();
+          });
+        } else {
+          upstreamRes.pipe(res);
+          upstreamRes.once('end', () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          });
+        }
+        upstreamRes.once('error', retryOrFail);
+        upstreamRes.once('aborted', () => retryOrFail(new Error('Proxy worker response aborted')));
+      });
+      upstreamReq.once('error', retryOrFail);
+      res.once('close', () => {
+        clearRelayTimers();
+        if (!res.writableEnded) {
+          clientGone = true; // must be set BEFORE the destroy surfaces as an 'error'
+          upstreamReq.destroy();
+        }
+      });
+      upstreamReq.end(body);
+    });
+  }
+
+  function launchWorker() {
+    if (stopping) return;
+    workerReady = false;
+    workerPort = null;
+    const childEnv = {
+      ...process.env,
+      [SUPERVISED_WORKER_ENV]: '1',
+      [SUPERVISOR_PID_ENV]: String(process.pid),
+    };
+    const child = fork(process.argv[1], ['server'], {
+      env: childEnv,
+      stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    });
+    worker = child;
+    let becameReady = false;
+
+    child.on('message', message => {
+      if (child !== worker) return;
+      if (message?.type === 'teamcodex:shutdown') {
+        requestShutdown({ workerWillExit: true });
+        return;
+      }
+      if (message?.type === 'teamcodex:capacity'
+          && Number.isFinite(message.maxPublicRequests)) {
+        maxPublicRequests = Math.max(0, Math.floor(message.maxPublicRequests));
+        return;
+      }
+      if (message?.type !== 'teamcodex:ready' || !message.internalPort) return;
+      if (Number.isFinite(message.maxPublicRequests)) {
+        maxPublicRequests = Math.max(0, Math.floor(message.maxPublicRequests));
+      }
+      becameReady = true;
+      workerReady = true;
+      workerPort = message.internalPort;
+      hasBeenReady = true;
+      healthFailures = 0;
+      writeServerState({
+        pid: process.pid,
+        workerPid: child.pid,
+        port,
+        startedAt: new Date().toISOString(),
+        config: getConfigPath(),
+      }).then(() => { ownsStateFile = true; }, () => {});
+      clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
+      stableTimer.unref?.();
+      wakeWorkerWaiters();
+    });
+
+    child.once('error', err => {
+      console.error(`[TeamClaude] Failed to start proxy worker: ${err.message}`);
+    });
+
+    child.once('exit', (code, signal) => {
+      if (child === worker) {
+        worker = null;
+        workerReady = false;
+        workerPort = null;
+      }
+      clearTimeout(stableTimer);
+      if (stopping) {
+        // Give in-flight SSE relays a beat to finish their graceful
+        // mid-stream error injection (retryOrFail ends those responses off the
+        // worker socket's error event), then force-close any lingering idle
+        // keep-alive client connections — otherwise a gracefully ENDED (not
+        // destroyed) response leaves its socket idling and holds the
+        // supervisor's event loop open well past the shutdown grace period.
+        // unref'd: if nothing lingers, the process exits without waiting.
+        const lingerSweep = setTimeout(() => closePublicListener(true), 150);
+        lingerSweep.unref?.();
+        finish(0);
+        return;
+      }
+      if (!hasBeenReady && !becameReady) {
+        closePublicListener(true);
+        finish(code ?? 1);
+        return;
+      }
+
+      restartCount += 1;
+      const backoffMs = Math.min(100 * (2 ** (restartCount - 1)), 2_000);
+      console.error(
+        `[TeamClaude] Proxy worker stopped (${signal || `exit ${code}`}); restarting in ${backoffMs}ms.`,
+      );
+      restartTimer = setTimeout(launchWorker, backoffMs);
+    });
+  }
+
+  function checkWorkerHealth() {
+    if (stopping || healthInFlight || !workerReady || !workerPort || !worker) return;
+    const checkedWorker = worker;
+    const checkedPort = workerPort;
+    healthInFlight = true;
+    let settled = false;
+    const finishCheck = healthy => {
+      if (settled) return;
+      settled = true;
+      healthInFlight = false;
+      if (checkedWorker !== worker || stopping) return;
+      if (healthy) {
+        healthFailures = 0;
+        return;
+      }
+      healthFailures += 1;
+      if (healthFailures < workerHealthFailureThreshold) return;
+      console.error(`[TeamClaude] Proxy worker failed ${healthFailures} health checks; restarting it.`);
+      healthFailures = 0;
+      workerReady = false;
+      workerPort = null;
+      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+    };
+    const healthReq = http.get({
+      host: '127.0.0.1',
+      port: checkedPort,
+      path: '/teamclaude/status',
+      agent: false,
+    }, healthRes => {
+      healthRes.resume();
+      healthRes.once('end', () => finishCheck(healthRes.statusCode === 200));
+      healthRes.once('error', () => finishCheck(false));
+      healthRes.once('aborted', () => finishCheck(false));
+    });
+    healthReq.setTimeout(workerHealthTimeoutMs, () => {
+      healthReq.destroy(new Error('Proxy worker health check timed out'));
+    });
+    healthReq.once('error', () => finishCheck(false));
+  }
+
+  function requestShutdown({ workerWillExit = false } = {}) {
+    if (stopping) return;
+    stopping = true;
+    workerReady = false;
+    workerPort = null;
+    clearTimeout(restartTimer);
+    clearTimeout(stableTimer);
+    clearInterval(healthTimer);
+    closePublicListener();
+    if (!worker) {
+      finish(0);
+      return;
+    }
+    if (!workerWillExit) worker.kill('SIGTERM');
+    forceTimer = setTimeout(() => {
+      if (worker) worker.kill('SIGKILL');
+    }, 6_000);
+    forceTimer.unref?.();
+  }
+
+  const exitCode = await new Promise(resolve => {
+    finish = code => {
+      clearTimeout(restartTimer);
+      clearTimeout(stableTimer);
+      clearInterval(healthTimer);
+      clearTimeout(forceTimer);
+      resolve(code);
+    };
+    // Drop the bind-time diagnosis once we own the port. Left attached, any
+    // later server error (EMFILE, ENOBUFS under load) would be reported as
+    // "port already in use" and exit the supervisor mid-stream.
+    const onListenError = err => {
+      handleServerListenError(err, port);
+    };
+    listener.once('error', onListenError);
+    listener.listen(port, () => {
+      listener.removeListener('error', onListenError);
+      launchWorker();
+      healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
+      healthTimer.unref?.();
+    });
+    process.once('SIGINT', () => requestShutdown());
+    process.once('SIGTERM', () => requestShutdown());
+  });
+
+  await clearServerState();
+  process.exitCode = exitCode;
+}
+
+async function proxyWorkerCommand() {
+  const config = await loadOrCreateConfig();
+  // Normalize by the FULL codex-mode signal (subcommand OR inherited env, see
+  // isCodexMode): createProxyServer keys on config.provider, and a supervised
+  // worker only carries the env var.
+  if (!config.provider && isCodexMode(config)) config.provider = 'codex';
   const codexMode = isCodexMode(config);
 
   // --log-to <dir>
@@ -112,12 +846,12 @@ async function serverCommand() {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     if (codexMode) {
-      console.error('  teamclaude codex login      Isolated Codex OAuth login');
-      console.error('  teamclaude codex import     Import the current Codex login');
+      console.error('  teamcodex codex login      Isolated Codex OAuth login');
+      console.error('  teamcodex codex import     Import the current Codex login');
     } else {
-      console.error('  teamclaude import           Import from Claude Code');
-      console.error('  teamclaude login            OAuth login via browser');
-      console.error('  teamclaude login --api      Add an API key');
+      console.error('  teamcodex import           Import from Claude Code');
+      console.error('  teamcodex login            OAuth login via browser');
+      console.error('  teamcodex login --api      Add an API key');
     }
     process.exit(1);
   }
@@ -176,26 +910,12 @@ async function serverCommand() {
   });
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
-  // accounts added externally, e.g. by `teamclaude import` while server is running)
-  accountManager.onTokenRefresh((idx, newTokens) => {
+  // accounts added externally, e.g. by `teamcodex import` while server is running)
+  accountManager.onTokenRefresh((idx, newTokens, previousTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep the in-memory config.accounts in sync so a TUI saveConfig doesn't
-    // clobber fresh tokens. Match by IDENTITY (UUID first, then name) — not by the
-    // AccountManager index `idx`, which can point at a different config entry when
-    // a tokenless config account was skipped at load.
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx >= 0) {
-      config.accounts[memIdx].accessToken = newTokens.accessToken;
-      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-      if (newTokens.idToken) config.accounts[memIdx].idToken = newTokens.idToken;
-      if (newTokens.accountId) {
-        config.accounts[memIdx].accountId = newTokens.accountId;
-        config.accounts[memIdx].accountUuid = newTokens.accountId;
-      }
-    }
-    atomicConfigUpdate(diskConfig => {
+    let conflict = false;
+    return atomicConfigUpdate(diskConfig => {
       // Persist ONLY the refreshed account's tokens. We deliberately do NOT ingest
       // disk-only accounts here: that loop existed to keep the old INDEX-based
       // matching aligned, but matching is identity-based now (findConfigAccount),
@@ -205,14 +925,28 @@ async function serverCommand() {
       // Match by UUID first, then by name — index may have shifted.
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
-        diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
-        diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
-        diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
-        if (newTokens.idToken) diskConfig.accounts[cfgIdx].idToken = newTokens.idToken;
-        if (newTokens.accountId) {
-          diskConfig.accounts[cfgIdx].accountId = newTokens.accountId;
-          diskConfig.accounts[cfgIdx].accountUuid = newTokens.accountId;
+        const diskAccount = diskConfig.accounts[cfgIdx];
+        // OAuth refresh tokens rotate. If another process already replaced the
+        // credential we started from, this late refresh result is stale and must
+        // not overwrite the newer disk state.
+        if (!storedCredentialMatches(diskAccount, previousTokens)) {
+          conflict = true;
+          return;
         }
+        applyOAuthTokens(diskAccount, newTokens);
+      }
+    }).then(diskConfig => {
+      const diskIdx = findConfigAccount(diskConfig, account);
+      if (diskIdx < 0) return;
+      const diskAccount = diskConfig.accounts[diskIdx];
+
+      // The just-serialized disk value is authoritative for both the long-lived
+      // config copy and, on a CAS conflict, the live account manager.
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx >= 0) applyOAuthTokens(config.accounts[memIdx], diskAccount);
+      if (conflict && diskAccount.accessToken) {
+        accountManager.updateAccountTokens(account, diskAccount, false);
+        console.log(`[TeamClaude] Kept newer disk credential for account "${account.name}"`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
@@ -225,38 +959,8 @@ async function serverCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config,
-      saveConfig: () => atomicConfigUpdate(async diskConfig => {
-        // Write in-memory accounts as the authoritative state, preserving
-        // extra disk-only fields (e.g. importFrom) where the account still exists.
-        // Use live tokens from AccountManager (not the stale config.accounts copy).
-        const mapped = config.accounts.map(a => {
-          // Match the live account by IDENTITY — never by array index:
-          // resolveAccounts() can skip a tokenless/bad config entry, so
-          // config.accounts and accountManager.accounts are not index-aligned, and
-          // an index map would overlay the wrong account's credentials. Two-phase
-          // (UUID first, then name): a single `uuid===x || name===x` find could
-          // return an earlier same-name account before reaching the real UUID match.
-          const am = (a.accountUuid && accountManager.accounts.find(x => x.accountUuid === a.accountUuid))
-            || accountManager.accounts.find(x => x.name === a.name);
-          const live = am ? {
-            ...a,
-            accessToken: am.credential,
-            refreshToken: am.refreshToken,
-            expiresAt: am.expiresAt,
-            idToken: am.idToken,
-            accountId: am.accountId,
-          } : a;
-          const diskAcct = (a.accountUuid && diskConfig.accounts.find(d => d.accountUuid === a.accountUuid))
-            || diskConfig.accounts.find(d => d.name === a.name);
-          return diskAcct ? { ...diskAcct, ...live } : live;
-        });
-        // The TUI's in-memory config is authoritative for the account SET (an
-        // account it deleted must stay deleted, not be resurrected from the disk
-        // copy this atomic update re-read). An account added to disk by an external
-        // `teamclaude import/login` while the TUI runs is reconciled on the next
-        // reload (R) / restart via syncAccountsFromDisk — not merged here, since we
-        // can't distinguish "added externally" from "deleted locally" at save time.
-        diskConfig.accounts = mapped;
+      saveConfig: (snapshot, mutation) => atomicConfigUpdate(diskConfig => {
+        applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation);
       }),
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
@@ -267,7 +971,18 @@ async function serverCommand() {
       // (before listen), and the TUI only starts inside the listen callback, so
       // this closure never runs before the binding is initialized.
       refreshQuota: () => server.refreshQuotaAll(),
-      onQuit: () => { server.close(() => process.exit(0)); },
+      onQuit: () => {
+        const closeWorker = () => server.close(() => process.exit(0));
+        if (!process.connected) {
+          closeWorker();
+          return;
+        }
+        try {
+          process.send({ type: 'teamcodex:shutdown' }, closeWorker);
+        } catch {
+          closeWorker();
+        }
+      },
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
@@ -276,21 +991,30 @@ async function serverCommand() {
     };
   }
 
-  // If a TeamClaude server is already running on this config's port, don't try to
-  // bind on top of it — point the user at stop/restart instead of a raw EADDRINUSE.
-  const existing = await findRunningServer(config);
-  if (existing && existing.port === port) {
-    console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
-    console.error('  See it:      teamclaude status');
-    console.error('  Stop it:     teamclaude stop');
-    console.error('  Restart it:  teamclaude restart');
-    process.exit(1);
-  }
-
   // Existing configs predate continuityMode; treat it as enabled unless the
   // operator explicitly opts out.
   config.continuityMode = config.continuityMode !== false;
   const server = createProxyServer(accountManager, config, hooks);
+  let liveSyncChain = Promise.resolve();
+  process.on('SIGHUP', () => {
+    // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
+    // and every in-flight response alive. Serializing signals avoids overlapping
+    // remove/add passes when several CLI changes land together.
+    liveSyncChain = liveSyncChain.then(async () => {
+      const diskConfig = await loadConfig();
+      if (!diskConfig) return;
+      await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (process.connected) {
+        process.send({
+          type: 'teamcodex:capacity',
+          maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
+        });
+      }
+      console.log('[TeamClaude] Applied account config without restarting the worker');
+    }).catch(err => {
+      console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
+    });
+  });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
   // freshly restarted idle proxy — without this the template is memory-only
@@ -304,22 +1028,33 @@ async function serverCommand() {
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(0, '127.0.0.1', () => {
     server.removeListener('error', onListenError);
-    // Record runtime state so `teamclaude status/stop/restart` can find us, and
-    // remove it on process exit (covers SIGINT/SIGTERM/TUI quit/normal exit). A
-    // SIGKILL leaves a stale file, which stop/server detect as dead and clean up.
-    writeServerState({ pid: process.pid, port, startedAt: new Date().toISOString(), config: getConfigPath() }).catch(() => {});
-    const stateP = getServerStatePath();
-    process.on('exit', () => { try { unlinkSync(stateP); } catch { /* already gone */ } });
+    const address = server.address();
+    if (process.connected && typeof address === 'object') {
+      process.send({
+        type: 'teamcodex:ready',
+        port,
+        internalPort: address.port,
+        maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
+      });
+    }
     // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
     // → server.close → process.exit) and every minute as a crash backstop
     // (a SIGKILL loses at most the last interval). The 'exit' write is sync.
     process.on('exit', saveQuotaSnapshot);
     setInterval(saveQuotaSnapshot, 60_000).unref();
+    // Keep idle OAuth refresh chains rotating and retry refresh-caused errors.
+    // A numeric 0 disables the sweep; malformed values use the 5-minute default.
+    const tokenRefreshIntervalMs = normalizeTokenRefreshIntervalMs(config.tokenRefreshIntervalMs);
+    if (tokenRefreshIntervalMs > 0) {
+      setImmediate(() => accountManager.refreshLapsedTokens());
+      setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
+      console.log(`[TeamClaude] Continuity mode: ${config.continuityMode ? 'on' : 'OFF — fleet-wide exhaustion surfaces 429s to clients'}`);
     } else {
       const sep = '='.repeat(60);
       console.log('');
@@ -329,6 +1064,7 @@ async function serverCommand() {
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
+      console.log(`  Continuity: ${config.continuityMode ? 'on' : 'OFF — fleet-wide exhaustion surfaces 429s to clients'}`);
       console.log(`  Upstream:   ${config.upstream || (codexMode ? 'https://chatgpt.com/backend-api/codex' : 'https://api.anthropic.com')}`);
       console.log('');
       accounts.forEach((a, i) => {
@@ -336,11 +1072,11 @@ async function serverCommand() {
       });
       console.log('');
       console.log(codexMode
-        ? '  Run Codex through proxy:   teamclaude codex run'
-        : '  Run Claude through proxy:  teamclaude run');
+        ? '  Run Codex through proxy:   teamcodex codex run'
+        : '  Run Claude through proxy:  teamcodex run');
       console.log(codexMode
-        ? '  Show env vars:             teamclaude codex env'
-        : '  Show env vars:             teamclaude env');
+        ? '  Show env vars:             teamcodex codex env'
+        : '  Show env vars:             teamcodex env');
       console.log(sep);
       console.log('');
     }
@@ -366,6 +1102,7 @@ async function serverCommand() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   }
+  process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
 }
 
 // ── server lifecycle: discover / stop / restart ─────────────
@@ -457,6 +1194,36 @@ async function findRunningServer(config) {
   // a server that's merely unreachable for a moment.
   if (state && !(state.pid && isPidAlive(state.pid))) await clearServerState();
   return null;
+}
+
+async function ensureProxyRunning(config) {
+  const running = await findRunningServer(config);
+  if (running) return running;
+
+  console.error('[TeamClaude] Proxy is not running; starting it automatically.');
+  const daemonEnv = { ...process.env };
+  delete daemonEnv[SUPERVISED_WORKER_ENV];
+  delete daemonEnv[SUPERVISOR_PID_ENV];
+  let launchError = null;
+  const daemon = spawn(process.execPath, [process.argv[1], 'server'], {
+    detached: true,
+    env: daemonEnv,
+    stdio: 'ignore',
+  });
+  daemon.once('error', err => { launchError = err; });
+  daemon.unref();
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (launchError) break;
+    const started = await findRunningServer(config);
+    if (started) return started;
+    if (daemon.exitCode != null) break;
+    await delay(100);
+  }
+
+  const detail = launchError ? `: ${launchError.message}` : '';
+  throw new Error(`Proxy failed to start${detail}. Run "teamcodex server" to inspect the startup error.`);
 }
 
 /**
@@ -581,9 +1348,9 @@ async function importCommand() {
   }
 
   if (codexMode) {
-    await upsertCodexAccount(config, name, creds, 'import');
+    await upsertCodexAccount(name, creds, 'import');
   } else {
-    await upsertOAuthAccount(config, name, creds, 'import');
+    await upsertOAuthAccount(name, creds, 'import');
   }
 }
 
@@ -597,7 +1364,7 @@ async function loginCommand() {
       console.error('Codex subscription pooling supports ChatGPT OAuth accounts only.');
       process.exit(1);
     }
-    await loginCodexCommand(config);
+    await loginCodexCommand();
     return;
   }
 
@@ -634,7 +1401,7 @@ async function loginCommand() {
   }
 }
 
-async function loginCodexCommand(config) {
+async function loginCodexCommand() {
   const codexHome = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
   const loginArgs = ['login', '-c', 'cli_auth_credentials_store="file"'];
   if (args.includes('--device-auth')) loginArgs.push('--device-auth');
@@ -656,14 +1423,14 @@ async function loginCodexCommand(config) {
     if (result.status !== 0) process.exit(result.status ?? 1);
 
     const creds = await importCodexCredentials(join(codexHome, 'auth.json'));
-    await upsertCodexAccount(config, argValue('--name'), creds, 'login');
+    await upsertCodexAccount(argValue('--name'), creds, 'login');
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -675,21 +1442,24 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    // First FREE api-N (not `count + 1`, which collides after a delete) — a unique
-    // name is the identity key for credential-less API-key accounts.
-    let n = 1;
-    do { name = `api-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      // Generate against the fresh locked config: another login may have added
+      // the apparent next slot while this prompt was open.
+      let n = 1;
+      do { name = `api-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    if (cfg.accounts.some(a => a.name === name)) {
+      throw new Error(`Account "${name}" already exists`);
+    }
+    cfg.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
 async function loginOAuthCommand() {
-  const config = await loadOrCreateConfig();
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
@@ -700,12 +1470,12 @@ async function loginOAuthCommand() {
     console.error(`OAuth login failed: ${err.message}`);
     console.error('');
     console.error('Alternatives:');
-    console.error('  teamclaude import        Import from existing Claude Code credentials');
-    console.error('  teamclaude login --api   Add an API key instead');
+    console.error('  teamcodex import        Import from existing Claude Code credentials');
+    console.error('  teamcodex login --api   Add an API key instead');
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login');
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -713,7 +1483,7 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   if (isCodexMode(config)) {
-    console.log('teamclaude codex run');
+    console.log('teamcodex codex run');
     return;
   }
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
@@ -835,6 +1605,14 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
 
 async function runCommand() {
   const config = await loadOrCreateConfig();
+  if (!isCodexMode(config)) {
+    try {
+      await ensureProxyRunning(config);
+    } catch (err) {
+      console.error(`[TeamClaude] ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   // Everything after 'run' (skip -- separator if present)
   const clientArgs = args.slice(1);
@@ -897,7 +1675,7 @@ async function statusCommand() {
   const running = await findRunningServer(config);
   if (!running) {
     console.log(`Server:         not running (no proxy on port ${config.proxy.port})`);
-    console.log('Start it with:  teamclaude server');
+    console.log('Start it with:  teamcodex server');
     process.exit(1);
   }
   const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
@@ -966,38 +1744,33 @@ async function statusCommand() {
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
-  const config = await loadOrCreateConfig();
+  let config = await loadOrCreateConfig();
   const verbose = args.includes('-v') || args.includes('--verbose');
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: teamclaude import, teamclaude login, or teamclaude login --api');
+    console.log('Add one with: teamcodex import, teamcodex login, or teamcodex login --api');
     return;
   }
 
-  // Refresh expired tokens before fetching profiles
-  let configDirty = false;
-  await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
-    if (!isTokenExpiringSoon(a.expiresAt)) return;
-    try {
-      const newTokens = a.provider === 'codex'
-        ? await refreshCodexAccessToken(a.refreshToken)
-        : await refreshAccessToken(a.refreshToken);
-      a.accessToken = newTokens.accessToken;
-      a.refreshToken = newTokens.refreshToken;
-      a.expiresAt = newTokens.expiresAt;
-      if (newTokens.idToken) a.idToken = newTokens.idToken;
-      if (newTokens.accountId) {
-        a.accountId = newTokens.accountId;
-        a.accountUuid = newTokens.accountId;
-      }
-      if (newTokens.email) a.email = newTokens.email;
-      if (newTokens.planType) a.planType = newTokens.planType;
-      configDirty = true;
-    } catch {}
-  }));
-  if (configDirty) await saveConfig(config);
+  const running = await findRunningServer(config).catch(() => null);
+  if (!running) {
+    // With no live proxy there is a single refresh owner: hold the cross-process
+    // config lock for the read→refresh→write cycle so two CLI commands cannot
+    // rotate the same refresh token concurrently.
+    config = await atomicConfigUpdate(async cfg => {
+      await Promise.all(cfg.accounts.map(async account => {
+        if (account.type !== 'oauth' || !account.refreshToken
+          || !isTokenExpiringSoon(account.expiresAt)) return;
+        try {
+          const newTokens = account.provider === 'codex'
+            ? await refreshCodexAccessToken(account.refreshToken)
+            : await refreshAccessToken(account.refreshToken);
+          applyOAuthTokens(account, newTokens);
+        } catch {}
+      }));
+    });
+  }
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
@@ -1011,9 +1784,27 @@ async function accountsCommand() {
           provider: 'codex',
         };
       }
+      // The running worker owns token rotation. Sending an already-expired token
+      // directly here is both useless and misleading; status remains visible via
+      // `teamcodex status` while the worker refreshes on real traffic.
+      if (running && isTokenExpiringSoon(a.expiresAt)) {
+        return { error: 'token refresh managed by running proxy' };
+      }
       return fetchProfile(a.accessToken);
     })
   );
+  const profileUpdates = config.accounts.flatMap((account, i) => {
+    const profile = profiles[i];
+    if (!profile || profile.error || !profile.accountUuid) return [];
+    return [{
+      previousUuid: account.accountUuid || null,
+      previousName: account.name,
+      accessToken: account.accessToken,
+      refreshToken: account.refreshToken,
+      accountUuid: profile.accountUuid,
+      name: account.provider !== 'codex' && profile.email ? profile.email : account.name,
+    }];
+  });
 
   // Deduplicate by accountUuid — keep the last (most recently added) entry
   const seen = new Map();
@@ -1036,8 +1827,32 @@ async function accountsCommand() {
       }
     }
   }
+  if (profileUpdates.length > 0 || removed > 0) {
+    const updatedConfig = await atomicConfigUpdate(cfg => {
+      for (const update of profileUpdates) {
+        const account = (update.previousUuid
+          && cfg.accounts.find(a => a.accountUuid === update.previousUuid))
+          || cfg.accounts.find(a => a.name === update.previousName);
+        // The profile request ran without holding the config lock. A concurrent
+        // import may have installed a different credential under the same name;
+        // never attach the old token's UUID/email to that replacement account.
+        if (!account || !storedCredentialMatches(account, update)) continue;
+        account.accountUuid = update.accountUuid;
+        account.name = update.name;
+      }
+      const deduped = [];
+      const uuids = new Set();
+      for (let i = cfg.accounts.length - 1; i >= 0; i--) {
+        const account = cfg.accounts[i];
+        if (account.accountUuid && uuids.has(account.accountUuid)) continue;
+        if (account.accountUuid) uuids.add(account.accountUuid);
+        deduped.push(account);
+      }
+      cfg.accounts = deduped.reverse();
+    });
+    if (running) await noteRunningServerReload(updatedConfig);
+  }
   if (removed > 0) {
-    await saveConfig(config);
     console.log(`Removed ${removed} duplicate account(s)\n`);
   }
 
@@ -1084,12 +1899,12 @@ function printTokenExpiry(expiresAt) {
 // ── api ─────────────────────────────────────────────────────
 
 async function apiCommand() {
-  const config = await loadOrCreateConfig();
+  let config = await loadOrCreateConfig();
   const path = args[1];
 
   if (!path) {
-    console.error('Usage: teamclaude api <path> [--account NAME] [--method POST] [--data JSON]');
-    console.error('Example: teamclaude api /api/oauth/claude_cli/roles');
+    console.error('Usage: teamcodex api <path> [--account NAME] [--method POST] [--data JSON]');
+    console.error('Example: teamcodex api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
 
@@ -1097,30 +1912,62 @@ async function apiCommand() {
   const accountName = argValue('--account');
   const method = (argValue('--method') || 'GET').toUpperCase();
   const data = argValue('--data');
+  const running = await findRunningServer(config).catch(() => null);
+  const useRunningProxy = !accountName && !path.startsWith('http') && running;
 
-  const accounts = await resolveAccounts(config);
-  let account;
-  if (accountName) {
-    account = accounts.find(a => a.name === accountName);
-    if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
+  let url;
+  let headers;
+  if (useRunningProxy) {
+    url = `http://127.0.0.1:${running.port}${path}`;
+    headers = { 'x-api-key': config.proxy.apiKey };
   } else {
-    account = accounts.find(a => a.type === 'oauth') || accounts[0];
-    if (!account) { console.error('No accounts configured'); process.exit(1); }
-  }
+    const accounts = await resolveAccounts(config);
+    let account;
+    if (accountName) {
+      account = accounts.find(a => a.name === accountName);
+      if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
+    } else {
+      account = accounts.find(a => a.type === 'oauth') || accounts[0];
+      if (!account) { console.error('No accounts configured'); process.exit(1); }
+    }
 
-  const credential = account.accessToken || account.apiKey;
-  const isOAuth = account.type === 'oauth';
-  const codexMode = isCodexMode(config);
-  const upstream = config.upstream || (codexMode
-    ? 'https://chatgpt.com/backend-api/codex'
-    : 'https://api.anthropic.com');
-  const url = path.startsWith('http') ? path : `${upstream}${path}`;
+    if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) {
+      if (running) {
+        console.error('The running proxy owns OAuth token refresh for this config.');
+        console.error('Use a relative path without --account, or stop the proxy before a direct account call.');
+        process.exit(1);
+      }
 
-  const headers = isOAuth
-    ? { 'Authorization': `Bearer ${credential}` }
-    : { 'x-api-key': credential };
-  if (codexMode && account.accountId) {
-    headers['ChatGPT-Account-ID'] = account.accountId;
+      let refreshed = null;
+      config = await atomicConfigUpdate(async cfg => {
+        const stored = (account.accountUuid
+          && cfg.accounts.find(a => a.accountUuid === account.accountUuid))
+          || cfg.accounts.find(a => a.name === account.name);
+        if (!stored) throw new Error(`Account "${account.name}" was removed during refresh`);
+        const refreshToken = stored.refreshToken || account.refreshToken;
+        if (!refreshToken) throw new Error(`Account "${account.name}" has no refresh token`);
+        const newTokens = (stored.provider || account.provider) === 'codex'
+          ? await refreshCodexAccessToken(refreshToken)
+          : await refreshAccessToken(refreshToken);
+        applyOAuthTokens(stored, newTokens);
+        refreshed = { ...account, ...stored };
+      });
+      account = refreshed;
+    }
+
+    const credential = account.accessToken || account.apiKey;
+    const isOAuth = account.type === 'oauth';
+    const codexMode = isCodexMode(config);
+    const upstream = config.upstream || (codexMode
+      ? 'https://chatgpt.com/backend-api/codex'
+      : 'https://api.anthropic.com');
+    url = path.startsWith('http') ? path : `${upstream}${path}`;
+    headers = isOAuth
+      ? { 'Authorization': `Bearer ${credential}` }
+      : { 'x-api-key': credential };
+    if (codexMode && account.accountId) {
+      headers['ChatGPT-Account-ID'] = account.accountId;
+    }
   }
 
   const fetchOpts = { method, headers };
@@ -1150,41 +1997,56 @@ async function apiCommand() {
 // ── remove ──────────────────────────────────────────────────
 
 async function removeCommand() {
-  const config = await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
-    console.error('Usage: teamclaude remove <account-name>');
+    console.error('Usage: teamcodex remove <account-name>');
     process.exit(1);
   }
 
-  const idx = config.accounts.findIndex(a => a.name === name);
-  if (idx < 0) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  config.accounts.splice(idx, 1);
-  await saveConfig(config);
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx < 0) return;
+    cfg.accounts.splice(idx, 1);
+    found = true;
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
   console.log(`Removed account "${name}"`);
+  await noteRunningServerReload(config);
 }
 
 // ── enable / disable / priority ─────────────────────────────
 
-/** Note that changes apply to a running server only after a reload/restart. */
-function noteRunningServerReload(config) {
-  return findRunningServer(config).then(running => {
-    if (running) {
-      console.log('A server is running — apply now with: teamclaude restart');
-      console.log('  (or press "R" in the TUI to reload from config).');
+/** Ask the supervised worker to live-sync account changes without a restart. */
+async function noteRunningServerReload(config) {
+  try {
+    const running = await findRunningServer(config);
+    if (!running) return false;
+    const state = await readServerState();
+    const workerPid = state?.pid === running.pid && state.port === running.port
+      && isPidAlive(state.workerPid)
+      ? state.workerPid
+      : null;
+    if (!workerPid) {
+      console.error('The running server does not support account-only live reload.');
+      console.error('Apply the change with: teamcodex restart');
+      return false;
     }
-  }).catch(() => {});
+    process.kill(workerPid, 'SIGHUP');
+    console.log('Applied to the running server without restarting active connections.');
+    return true;
+  } catch (err) {
+    console.error(`Could not reload the running server automatically: ${err.message}`);
+    console.error('Apply the change with: teamcodex restart');
+    return false;
+  }
 }
 
 async function setEnabledCommand(enabled) {
   const name = args[1];
   if (!name) {
-    console.error(`Usage: teamclaude ${enabled ? 'enable' : 'disable'} <account-name>`);
+    console.error(`Usage: teamcodex ${enabled ? 'enable' : 'disable'} <account-name>`);
     process.exit(1);
   }
   // atomicConfigUpdate re-reads disk before writing, so a concurrent token
@@ -1205,7 +2067,7 @@ async function setPriorityCommand() {
   const name = args[1];
   const raw = args[2];
   if (!name || raw === undefined) {
-    console.error('Usage: teamclaude priority <account-name> <number|auto>');
+    console.error('Usage: teamcodex priority <account-name> <number|auto>');
     console.error('  Lower number = preferred first. Use "auto" (or "clear") to return the');
     console.error('  account to automatic ordering: weekly reset soonest is drained first.');
     process.exit(1);
@@ -1235,7 +2097,7 @@ function showHelp() {
   if (cliProvider === 'codex') {
     console.log(`TeamCodex - Multi-account Codex subscription proxy
 
-Usage: teamclaude codex [command] [options]
+Usage: teamcodex codex [command] [options]
 
 Commands:
   server              Start the Codex proxy server
@@ -1264,9 +2126,9 @@ Config: ${getConfigPath()}
 `);
     return;
   }
-  console.log(`TeamClaude - Multi-account Claude proxy
+  console.log(`TeamCodex - one local proxy for Claude Code and Codex accounts
 
-Usage: teamclaude [command] [options]
+Usage: teamcodex [command] [options]
 
 Commands:
   server              Start the proxy server (default)
@@ -1300,7 +2162,7 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
+async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account UUID
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
@@ -1313,100 +2175,117 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    // First FREE account-N (not `count + 1`, which collides after a delete) so the
-    // generated name stays a unique identity key.
-    let n = 1;
-    do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-    : -1;
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    // Re-credentialing an existing account must not wipe its manual routing
-    // settings — carry enabled/priority over from the entry being replaced.
-    const prev = config.accounts[idx];
-    if (prev.enabled !== undefined) account.enabled = prev.enabled;
-    if (prev.priority !== undefined) account.priority = prev.priority;
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${name}"`);
-  }
-
-  await saveConfig(config);
+  let action = 'Added';
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      // First FREE account-N (not `count + 1`, which collides after a delete)
+      // against the fresh locked config, not the pre-login snapshot.
+      let n = 1;
+      do { name = `account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    const account = {
+      name,
+      type: 'oauth',
+      source,
+      accountUuid: profile?.accountUuid || null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+    let idx = profile?.accountUuid
+      ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+      : -1;
+    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx >= 0) {
+      action = 'Updated';
+      const previous = cfg.accounts[idx];
+      if (previous.enabled !== undefined) account.enabled = previous.enabled;
+      if (previous.priority !== undefined) account.priority = previous.priority;
+      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      cfg.accounts[idx] = account;
+    } else {
+      cfg.accounts.push(account);
+    }
+  });
+  console.log(`${action} account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
-async function upsertCodexAccount(config, name, creds, source = 'unknown') {
+async function upsertCodexAccount(name, creds, source = 'unknown') {
   if (!name) name = creds.email;
-  if (!name) {
-    let n = 1;
-    do { name = `codex-account-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  const account = {
-    name,
-    provider: 'codex',
-    type: 'oauth',
-    source,
-    accountUuid: creds.accountId,
-    accountId: creds.accountId,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    idToken: creds.idToken,
-    expiresAt: creds.expiresAt,
-    email: creds.email,
-    planType: creds.planType,
-  };
-
-  let idx = config.accounts.findIndex(a =>
-    a.accountUuid === creds.accountId || a.accountId === creds.accountId);
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    const previous = config.accounts[idx];
-    if (previous.enabled !== undefined) account.enabled = previous.enabled;
-    if (previous.priority !== undefined) account.priority = previous.priority;
-    if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
-    config.accounts[idx] = account;
-    console.log(`Updated Codex account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added Codex account "${name}"`);
-  }
-
-  config.provider = 'codex';
-  await saveConfig(config);
+  let action = 'Added';
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      let n = 1;
+      do { name = `codex-account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    const account = {
+      name,
+      provider: 'codex',
+      type: 'oauth',
+      source,
+      accountUuid: creds.accountId,
+      accountId: creds.accountId,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      idToken: creds.idToken,
+      expiresAt: creds.expiresAt,
+      email: creds.email,
+      planType: creds.planType,
+    };
+    let idx = cfg.accounts.findIndex(a =>
+      a.accountUuid === creds.accountId || a.accountId === creds.accountId);
+    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx >= 0) {
+      action = 'Updated';
+      const previous = cfg.accounts[idx];
+      if (previous.enabled !== undefined) account.enabled = previous.enabled;
+      if (previous.priority !== undefined) account.priority = previous.priority;
+      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      cfg.accounts[idx] = account;
+    } else {
+      cfg.accounts.push(account);
+    }
+    cfg.provider = 'codex';
+  });
+  console.log(`${action} Codex account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by UUID, then name).
+ * Accounts with two different UUIDs are replacements, even when names match.
+ * Name remains the fallback when either side has no stable UUID.
  */
+function sameAccountIdentity(a, b) {
+  if (a.accountUuid && b.accountUuid) return a.accountUuid === b.accountUuid;
+  return a.name === b.name;
+}
+
 function findConfigAccount(diskConfig, account) {
-  if (account.accountUuid) {
-    const idx = diskConfig.accounts.findIndex(a => a.accountUuid === account.accountUuid);
-    if (idx >= 0) return idx;
+  return diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
+}
+
+function storedCredentialMatches(account, previousTokens) {
+  if (!previousTokens) return true;
+  return (account.accessToken ?? null) === (previousTokens.accessToken ?? null)
+    && (account.refreshToken ?? null) === (previousTokens.refreshToken ?? null);
+}
+
+function applyOAuthTokens(account, tokens) {
+  account.accessToken = tokens.accessToken;
+  account.refreshToken = tokens.refreshToken;
+  account.expiresAt = tokens.expiresAt;
+  if (tokens.idToken) account.idToken = tokens.idToken;
+  if (tokens.accountId) {
+    account.accountId = tokens.accountId;
+    account.accountUuid = tokens.accountId;
   }
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
+  if (tokens.email) account.email = tokens.email;
+  if (tokens.planType) account.planType = tokens.planType;
 }
 
 /**
@@ -1416,11 +2295,23 @@ function findConfigAccount(diskConfig, account) {
  */
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
+
+  // Disk is authoritative for the account set. Without this removal pass, a CLI
+  // `remove` changed only the file while the running worker kept routing traffic
+  // through the deleted live credential until a full restart.
+  for (let i = memConfig.accounts.length - 1; i >= 0; i--) {
+    const memAcct = memConfig.accounts[i];
+    const stillOnDisk = diskConfig.accounts.some(a => sameAccountIdentity(a, memAcct));
+    if (stillOnDisk) continue;
+
+    const mgr = accountManager.accounts.find(a => sameAccountIdentity(a, memAcct));
+    if (mgr) accountManager.removeAccount(mgr.index);
+    memConfig.accounts.splice(i, 1);
+    console.log(`[TeamClaude] Removed account "${memAcct.name}" from live config`);
+  }
+
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid &&
-      memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
+    const memIdx = memConfig.accounts.findIndex(a => sameAccountIdentity(a, diskAcct));
 
     if (memIdx < 0) {
       // New account discovered on disk — add to running server
@@ -1431,15 +2322,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       continue;
     }
 
-    // Find the corresponding AccountManager entry — UUID first, then name, so a
-    // disk entry whose UUID and name resolve to *different* live accounts can't
-    // misattribute the update to the name-match when a UUID-match exists.
-    const mgr = (diskAcct.accountUuid && accountManager.accounts.find(a => a.accountUuid === diskAcct.accountUuid))
-      || accountManager.accounts.find(a => a.name === diskAcct.name);
+    const mgr = accountManager.accounts.find(a => sameAccountIdentity(a, diskAcct));
 
     // Apply enable/disable + priority from disk FIRST — independent of credential
     // re-resolution below. A failed re-import (freshCred null) must NOT strand a
-    // `teamclaude disable`/`priority` set while the server runs. setEnabled drains
+    // `teamcodex disable`/`priority` set while the server runs. setEnabled drains
     // the overflow queue when re-enabling so a freed-up account is used at once.
     if (mgr) {
       const wantEnabled = diskAcct.enabled !== false;
@@ -1511,7 +2398,13 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
 // ── helpers ─────────────────────────────────────────────────
 
 function isCodexMode(config) {
-  return config?.provider === 'codex' || cliProvider === 'codex';
+  // The env leg matters for the SUPERVISED WORKER: it is forked with plain
+  // ['server'] args (cliProvider = 'anthropic') and only inherits
+  // TEAMCLAUDE_PROVIDER. getConfigPath() already picked teamcodex.json off the
+  // same env var, so a provider-less config file must not flip the worker into
+  // anthropic semantics (stream recovery, auth headers, default upstream).
+  return config?.provider === 'codex' || cliProvider === 'codex'
+    || process.env.TEAMCLAUDE_PROVIDER === 'codex';
 }
 
 async function resolveAccounts(config) {
@@ -1560,9 +2453,9 @@ function handleServerListenError(err, port) {
   if (err.code === 'EADDRINUSE') {
     console.error(`[TeamClaude] Port ${port} is already in use.`);
     console.error('Another TeamClaude proxy may already be running.');
-    console.error('  See it:     teamclaude status');
-    console.error('  Stop it:    teamclaude stop');
-    console.error('  Restart it: teamclaude restart');
+    console.error('  See it:     teamcodex status');
+    console.error('  Stop it:    teamcodex stop');
+    console.error('  Restart it: teamcodex restart');
   } else if (err.code === 'EACCES') {
     console.error(`[TeamClaude] Permission denied while listening on port ${port}.`);
     console.error('Choose a non-privileged port in the TeamClaude config.');

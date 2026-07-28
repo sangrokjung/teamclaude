@@ -1,14 +1,18 @@
 {
-  "name": "@karpeleslab/teamclaude",
-  "version": "1.2.3-qjc.1",
-  "description": "Multi-account Claude Code and Codex proxy with quota-based rotation",
+  "name": "teamcodex",
+  "version": "1.1.0",
+  "description": "One local proxy for both Claude Code and Codex. Quota-aware account rotation, zero dependencies.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "teamclaude": "src/index.js"
+    "teamcodex": "src/index.js"
   },
   "files": [
-    "src/"
+    "src/",
+    "README.ko.md",
+    "README.zh-CN.md",
+    "config.example.json",
+    "config.codex.example.json"
   ],
   "scripts": {
     "start": "node src/index.js",
@@ -17,13 +21,27 @@
   },
   "keywords": [
     "claude",
+    "claude-code",
     "anthropic",
     "codex",
     "openai",
+    "chatgpt",
     "proxy",
     "load-balancer",
-    "multi-account"
+    "multi-account",
+    "rate-limit",
+    "quota",
+    "cli"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sangrokjung/teamclaude.git"
+  },
+  "homepage": "https://github.com/sangrokjung/teamclaude#readme",
+  "bugs": {
+    "url": "https://github.com/sangrokjung/teamclaude/issues"
+  },
+  "author": "Sangrok Jung",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"

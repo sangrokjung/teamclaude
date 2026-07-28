@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/teamcodex-hero.png" alt="여러 AI 코딩 계정이 하나의 안정적인 로컬 프록시로 연결되는 모습" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-hero.png" alt="여러 AI 코딩 계정이 하나의 안정적인 로컬 프록시로 연결되는 모습" width="100%">
 </p>
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
@@ -36,10 +36,59 @@
 > [!NOTE]
 > Claude와 Codex는 설정 파일, 포트, 계정 풀을 각각 따로 사용합니다. 두 프록시를 동시에 실행할 수 있으며 Codex CLI와 Hermes Agent는 항상 같은 로컬 주소로 접속합니다.
 
+## 설치
+
+```bash
+npm i -g teamcodex
+
+teamcodex import          # 기존 클로드 코드 로그인 가져오기
+teamcodex codex import    # 기존 ~/.codex/auth.json 가져오기
+teamcodex server          # 프록시 시작 후 `teamcodex run`
+```
+
+명령은 `teamcodex` 하나입니다. `teamclaude` 바이너리는 일부러 설치하지 않습니다. 같은
+이름을 쓰는 원본 패키지와 충돌하지 않기 위해서입니다.
+
+저장소에서 바로 받고 싶다면 `npm i -g github:sangrokjung/teamclaude`도 동작합니다.
+이쪽은 항상 기본 브랜치를 따라갑니다.
+
+## 이용약관에 문제가 없나요?
+
+없습니다. 이 도구는 계정을 여러 사람이 나눠 쓰거나, 재판매하거나, 남에게 중계하지 않습니다.
+
+**본인이 가진 계정**을 **본인 머신에서** 순환시킬 뿐입니다. 손으로 로그인을 갈아끼우는
+동작에서 수동 재로그인만 없앤 것이고, 요청마다 그 계정의 OAuth 토큰이 그대로 실립니다.
+크리덴셜은 로컬에 보관되고, CLI가 원래 보내던 곳인 벤더 API로만 전송됩니다. 제3자는
+크리덴셜을 보지 못합니다.
+
+쿼터를 늘려주지도, 한도를 우회하지도 않습니다. 이미 결제한 쿼터가 그냥 소멸하는 것을
+막아줄 뿐입니다.
+
+참고로 클로드 코드 자체의 `/extra-usage` 기능이 한도에 걸렸을 때 **본인이 가진 다른 계정**으로
+로그인하라고 제안합니다. "내 다른 계정으로 바꿔서 계속 작업하기"는 공식 클라이언트가 먼저
+안내하는 동작입니다. 이 도구는 그 전환을 손으로 클릭하는 대신 자동으로 할 뿐입니다.
+
+팀이라면 각자 자기 구독으로 인증합니다. 여러 사람이 한 좌석을 나눠 쓰는 용도는 지원하지
+않으며, 벤더가 이런 유형의 도구를 금지한다고 밝히면 그에 맞춰 기능을 조정하거나 프로젝트를
+정리합니다.
+
+## 원본 프로젝트와의 관계
+
+포크 계보는 [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) →
+[jung-wan-kim/teamclaude](https://github.com/jung-wan-kim/teamclaude) → 이 저장소입니다.
+페이지 상단의 포크 뱃지는 바로 위 부모만 표시하기 때문에 원저자가 아니라 jung-wan-kim으로
+보입니다.
+
+[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)에서 갈라져 나왔습니다.
+원본은 클로드 쪽 구현이 탄탄하고 그것만으로도 충분히 좋은 프로젝트입니다. 이 포크는 원본이
+다루지 않는 **Codex(ChatGPT OAuth) 계정 풀링**이 필요해서 다른 방향으로 갔고, 모델 폴백
+체인과 네트워크 단위 페일오버를 추가했습니다. 반대로 원본에만 있는 기능도 있으니 환경에
+맞는 쪽을 고르시면 됩니다.
+
 ## 실시간 대시보드
 
 <p align="center">
-  <img src="docs/assets/teamcodex-dashboard.png" alt="데모 계정 3개가 표시된 TeamCodex 터미널 대시보드" width="100%">
+  <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="데모 계정 3개가 표시된 TeamCodex 터미널 대시보드" width="100%">
 </p>
 
 <p align="center"><sub>민감한 계정 정보를 제거한 데모 데이터로 렌더링한 실제 TeamCodex TUI 구성입니다.</sub></p>
@@ -87,7 +136,9 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **계정 수동 제어** — enable, disable, switch, priority 순서를 CLI와 TUI에서 변경할 수 있습니다.
 - **재시작 후 상태 복원** — 사용량과 throttle 상태를 별도 quota 파일에 저장합니다.
 - **Active warm-up** — 실제 요청 형식을 재사용한 최소 요청으로 계정별 사용량을 빠르게 측정합니다.
-- **OAuth 자동 갱신** — 만료가 가까운 인증 정보를 갱신하고 안전하게 저장합니다.
+- **OAuth 자동 갱신** — 만료가 가까운 인증 정보를 갱신하고, 유휴·비활성 계정도 주기 스윕으로 갱신해 refresh 체인이 끊기지 않게 합니다.
+- **안전한 내부 재시도 경계** — 재전송해도 안전한 요청만 프록시 안에서 재시도하고, 결과가 불확실한 POST는 숨은 재전송 없이 재시도 가능한 오류로 돌려줍니다.
+- **자원 상한** — 요청·응답 버퍼 크기와 대기 시간에 상한을 두어 과부하 상황에서도 프록시가 멈추지 않습니다.
 - **런타임 의존성 없음** — Node.js 내장 모듈만 사용합니다.
 
 ## 빠른 시작
@@ -96,7 +147,7 @@ Node.js 18 이상이 필요합니다.
 
 ```bash
 # 설치
-npm install -g github:sangrokjung/teamclaude
+npm install -g teamcodex
 
 # Claude 계정 추가 — 브라우저 OAuth가 열립니다
 teamclaude login
@@ -111,6 +162,7 @@ teamclaude run
 
 > [!IMPORTANT]
 > 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamclaude run`으로 시작하세요.
+> `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 
@@ -258,6 +310,10 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
 | `modelFallbacks` | 모델별 대체 모델 체인 |
+| `streamRecovery` | SSE를 이벤트 단위로 중계하고 끊긴 스트림을 재시도 가능한 오류로 마무리 |
+| `tokenRefreshIntervalMs` | 유휴 계정 OAuth 갱신 스윕 간격 (`0`=비활성) |
+
+버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
 
 ## 작동 방식
 
@@ -288,7 +344,7 @@ flowchart LR
 5. 새로 시작한 서버는 아직 측정되지 않은 계정을 먼저 순회합니다.
 6. 사용량 429는 해당 계정을 제외하고 다른 계정으로 즉시 전환합니다.
 7. 요청 속도나 동시성 429는 계정을 오염시키지 않고 제한된 횟수만큼 분산합니다.
-8. 응답 전 네트워크 오류는 다른 계정으로 재시도합니다.
+8. 네트워크 오류나 불완전한 SSE 스트림은 재전송해도 안전한 요청만 내부에서 다른 계정으로 재시도하고, 결과가 불확실한 POST는 숨은 재전송 없이 재시도 가능한 오류로 돌려줍니다.
 9. 모든 계정이 제한되면 연속성 모드가 가장 가까운 초기화 시점까지 기다립니다.
 10. 일반 사용량 상태는 재시작 후 복원되며 모델별 사용량은 실제 트래픽으로 다시 측정합니다.
 

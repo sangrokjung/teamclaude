@@ -8,11 +8,12 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-function startProxy(am, upstreamPort) {
+function startProxy(am, upstreamPort, overrides = {}) {
   return createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false, // isolate 529 failover from background warm-up probes
+    ...overrides,
   });
 }
 
@@ -21,12 +22,10 @@ function overloaded529(res) {
   res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } }));
 }
 
-// A 529 on one account must NOT be surfaced to the client (which would fail the
-// turn, e.g. Claude Code "API Error: 529 Overloaded"). The request fails over to
-// a healthy account and returns 200 — immediately, with no backoff sleep, and
-// without poisoning either account (a 529 is upstream overload, not a bad account).
-test('529 on one account fails over to a healthy account, no backoff, no poison', async () => {
+test('529 after an unsafe POST is not replayed on another account', async () => {
+  let upstreamHits = 0;
   const upstream = http.createServer((req, res) => {
+    upstreamHits += 1;
     const auth = req.headers['authorization'] || '';
     if (auth.includes('tok-a')) overloaded529(res);
     else {
@@ -52,8 +51,9 @@ test('529 on one account fails over to a healthy account, no backoff, no poison'
     });
     await res.text();
     const elapsed = Date.now() - started;
-    assert.equal(res.status, 200);                                       // served by healthy account, not 529'd to client
-    assert.ok(elapsed < 2000, `expected immediate failover, took ${elapsed}ms`); // no backoff on the failover path
+    assert.equal(res.status, 529);
+    assert.equal(upstreamHits, 1, 'an upstream-accepted POST must not be replayed internally');
+    assert.ok(elapsed < 2000, `expected immediate passthrough, took ${elapsed}ms`);
     assert.ok(am.accounts.every(a => a.status !== 'throttled' && a.status !== 'error'),
       `expected no account poisoned, got ${am.accounts.map(a => a.status).join(',')}`);
   } finally {
@@ -86,11 +86,7 @@ test('all accounts 529 → bounded backoff retries, then passes 529 through (no 
   const proxyPort = await listen(proxy);
 
   try {
-    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [] }),
-    });
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, { method: 'GET' });
     await res.text();
     assert.equal(res.status, 529);                                  // surfaced only after backoff budget spent
     // 2 accounts × (1 initial fleet sweep + 2 backoff-retry sweeps) = 6 hits; allow slack.
@@ -103,6 +99,88 @@ test('all accounts 529 → bounded backoff retries, then passes 529 through (no 
     delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
     delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
     delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  }
+});
+
+test('continuity mode retries within the finite 529 budget and returns eventual success', async () => {
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    if (upstreamHits <= 2) {
+      overloaded529(res);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(res.status, 200, 'recovery within the retry budget must stay transparent');
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(upstreamHits, 3, 'the request must remain inside the proxy until upstream recovers');
+    assert.equal(am.accounts[0].status, 'active');
+  } finally {
+    proxy.close();
+    upstream.close();
+    delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  }
+});
+
+test('continuity mode bounds persistent 529 retries and releases the request', async () => {
+  const previousRetries = process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+  const previousBase = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+  const previousCap = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    overloaded529(res);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'api', credential: 'test-credential' },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(1000),
+    });
+    await res.text();
+    assert.equal(res.status, 529);
+    assert.equal(upstreamHits, 3, 'one initial attempt plus two continuity retries');
+    assert.equal(am.accounts[0].inflight, 0, 'the bounded request must release its account slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+    if (previousRetries === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = previousRetries;
+    if (previousBase === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = previousBase;
+    if (previousCap === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = previousCap;
   }
 });
 
@@ -131,11 +209,7 @@ test('TEAMCLAUDE_OVERLOAD_RETRIES=0 disables backoff — failover sweep then imm
 
   try {
     const started = Date.now();
-    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [] }),
-    });
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, { method: 'GET' });
     await res.text();
     const elapsed = Date.now() - started;
     assert.equal(res.status, 529);                                  // surfaced — retries disabled
