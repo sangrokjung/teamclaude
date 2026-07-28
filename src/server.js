@@ -740,13 +740,20 @@ async function relayRaw(
   res.on('close', onClose);
   const deadline = createUpstreamDeadline(ac.signal, upstreamResponseTimeoutMs);
   try {
+    const requestHeaders = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      const lowerKey = key.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lowerKey)) continue;
+      if (lowerKey === 'x-api-key' || lowerKey === 'accept-encoding') continue;
+      requestHeaders[key] = value;
+    }
+    if (!requestHeaders['content-type']) requestHeaders['content-type'] = 'application/json';
+    if (!requestHeaders.accept) requestHeaders.accept = 'application/json';
+    if (!requestHeaders['user-agent']) requestHeaders['user-agent'] = 'node';
+
     const upstreamRes = await fetch(`${upstream}${req.url}`, {
       method: req.method,
-      headers: {
-        'content-type': req.headers['content-type'] || 'application/json',
-        'accept': req.headers['accept'] || 'application/json',
-        'user-agent': req.headers['user-agent'] || 'node',
-      },
+      headers: requestHeaders,
       body: body.length > 0 ? body : undefined,
       signal: deadline.signal,
     });

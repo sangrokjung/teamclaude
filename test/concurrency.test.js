@@ -721,6 +721,43 @@ test('relayRaw removes stale compression headers after upstream gzip decompressi
   }
 });
 
+test('relayRaw preserves end-to-end request headers for OAuth token exchange', async () => {
+  let receivedHeaders;
+  const upstream = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-test',
+        'x-relay-marker': 'preserved',
+      },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(receivedHeaders['anthropic-version'], '2023-06-01');
+    assert.equal(receivedHeaders['anthropic-beta'], 'oauth-test');
+    assert.equal(receivedHeaders['x-relay-marker'], 'preserved');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {
   let hits = 0;
   let oversizedClosed = false;
