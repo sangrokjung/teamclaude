@@ -1038,6 +1038,13 @@ export class AccountManager {
           account.accountId = newTokens.accountId;
           account.accountUuid = newTokens.accountId;
         }
+        // A token endpoint success only proves a prior refresh failure healed.
+        // Request-path errors (fresh-token 401 or non-transient send failure)
+        // stay parked until new external credentials arrive or the proxy restarts.
+        if (account.status === 'error' && account._errorFromRefresh) {
+          account.status = 'active';
+          delete account._errorFromRefresh;
+        }
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         // Only persist if the account is still live at its claimed index. If it was
         // removed during the (awaited) network refresh, its `.index` is stale and
@@ -1047,9 +1054,14 @@ export class AccountManager {
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Only mark as error if the access token is actually expired;
-        // a failed proactive refresh shouldn't kill a still-valid token
+        // a failed proactive refresh shouldn't kill a still-valid token.
+        // Tag the cause only on the transition: a failed sweep must not relabel
+        // an account already parked by the request path as refresh-caused.
         if (!account.expiresAt || Date.now() >= account.expiresAt) {
-          account.status = 'error';
+          if (account.status !== 'error') {
+            account.status = 'error';
+            account._errorFromRefresh = true;
+          }
         }
       } finally {
         account._refreshPromise = null;
@@ -1057,6 +1069,31 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * Keep idle OAuth refresh chains alive and retry refresh-caused failures.
+   * Disabled accounts are included because disable only removes them from
+   * routing; refreshes are sequential and overlapping sweeps are skipped so a
+   * fleet-wide lapse cannot burst the token endpoint.
+   */
+  async refreshLapsedTokens() {
+    if (this._sweepInFlight) return 0;
+    this._sweepInFlight = true;
+    try {
+      const targets = this.accounts.filter(a =>
+        a.type === 'oauth' && a.refreshToken
+        && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
+      for (const account of targets) {
+        // A still-valid error account is a no-op unless expiry is unknown.
+        // This avoids rotating a request-rejected account every sweep.
+        await this.ensureTokenFresh(account, account.status === 'error' && !account.expiresAt)
+          .catch(() => { /* keep the account parked until a later sweep succeeds */ });
+      }
+      return targets.length;
+    } finally {
+      this._sweepInFlight = false;
+    }
   }
 
   /**
@@ -1087,7 +1124,10 @@ export class AccountManager {
       account.accountId = accountId;
       account.accountUuid = accountId;
     }
-    if (account.status === 'error') account.status = 'active';
+    if (account.status === 'error') {
+      account.status = 'active';
+      delete account._errorFromRefresh;
+    }
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).

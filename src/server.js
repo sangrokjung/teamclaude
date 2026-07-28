@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isTokenExpiringSoon } from './oauth.js';
+import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
@@ -1064,7 +1064,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // or it's an API-key account — fail this account out and switch.
       if (account.status !== 'error') {
         account.status = 'error';
+        account._errorFromRefresh = false;
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
+      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+        // A 401 on a still-valid token is account-level rejection evidence.
+        // It must override a refresh-failure label so the sweep cannot revive it.
+        account._errorFromRefresh = false;
       }
       if (logDir) {
         logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
@@ -1483,6 +1488,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     if (retryCount < maxRetries && !res.headersSent) {
+      // Preserve a prior refresh-failure label, but label a new request-path
+      // send failure so a later token rotation cannot blindly revive it.
+      if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);

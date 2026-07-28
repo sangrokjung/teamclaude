@@ -886,6 +886,15 @@ async function proxyWorkerCommand() {
     // (a SIGKILL loses at most the last interval). The 'exit' write is sync.
     process.on('exit', saveQuotaSnapshot);
     setInterval(saveQuotaSnapshot, 60_000).unref();
+    // Keep idle OAuth refresh chains rotating and retry refresh-caused errors.
+    // A numeric 0 disables the sweep; malformed values use the 5-minute default.
+    const tokenRefreshIntervalMs = Number.isFinite(config.tokenRefreshIntervalMs)
+      ? Math.max(0, config.tokenRefreshIntervalMs)
+      : 300_000;
+    if (tokenRefreshIntervalMs > 0) {
+      setImmediate(() => accountManager.refreshLapsedTokens());
+      setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();
+    }
     if (tui) {
       tui.start();
       console.log(`Listening on port ${port} with ${accounts.length} account(s)`);
