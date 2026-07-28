@@ -741,9 +741,12 @@ async function relayRaw(
   const deadline = createUpstreamDeadline(ac.signal, upstreamResponseTimeoutMs);
   try {
     const requestHeaders = {};
+    const connectionHeaders = new Set(
+      String(req.headers.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean),
+    );
     for (const [key, value] of Object.entries(req.headers)) {
       const lowerKey = key.toLowerCase();
-      if (HOP_BY_HOP_HEADERS.has(lowerKey)) continue;
+      if (HOP_BY_HOP_HEADERS.has(lowerKey) || connectionHeaders.has(lowerKey)) continue;
       if (lowerKey === 'x-api-key' || lowerKey === 'accept-encoding') continue;
       requestHeaders[key] = value;
     }
@@ -1158,9 +1161,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
+  const connectionHeaders = new Set(
+    String(req.headers.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean),
+  );
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+    if (HOP_BY_HOP_HEADERS.has(lk) || connectionHeaders.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     if (lk === 'authorization') continue;
     if (lk === 'chatgpt-account-id') continue;

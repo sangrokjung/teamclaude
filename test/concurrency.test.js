@@ -758,6 +758,50 @@ test('relayRaw preserves end-to-end request headers for OAuth token exchange', a
   }
 });
 
+test('relayRaw strips request headers nominated by Connection', async () => {
+  let receivedHeaders;
+  const upstream = http.createServer((req, res) => {
+    receivedHeaders = req.headers;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const request = http.request({
+        host: '127.0.0.1',
+        port,
+        path: '/v1/oauth/token',
+        method: 'POST',
+        headers: {
+          connection: 'x-hop-marker',
+          'content-type': 'application/json',
+          'x-hop-marker': 'must-not-forward',
+        },
+      }, response => {
+        response.resume();
+        response.on('end', () => resolve(response.statusCode));
+      });
+      request.on('error', reject);
+      request.end('{}');
+    });
+
+    assert.equal(status, 200);
+    assert.equal(receivedHeaders['x-hop-marker'], undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {
   let hits = 0;
   let oversizedClosed = false;
