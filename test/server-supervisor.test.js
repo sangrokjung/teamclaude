@@ -291,6 +291,54 @@ test('unresponsive proxy worker is replaced while the public listener stays avai
   }
 });
 
+test('supervisor strips request headers nominated by Connection before worker forwarding', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-hop-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  let receivedHeaders;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      receivedHeaders = req.headers;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: '' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    accounts: [{ name: 'primary', type: 'apikey', apiKey: 'placeholder' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const response = await request({
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        connection: 'x-hop-marker',
+        'content-type': 'application/json',
+        'x-hop-marker': 'must-not-forward',
+      },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(receivedHeaders['x-hop-marker'], undefined);
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor preserves proxy API-key authentication for remote clients', { timeout: 15000 }, async t => {
   const host = externalIPv4();
   if (!host) {

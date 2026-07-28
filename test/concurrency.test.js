@@ -802,6 +802,69 @@ test('relayRaw strips request headers nominated by Connection', async () => {
   }
 });
 
+test('relayRaw strips response headers nominated by Connection', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      connection: 'x-hop-marker',
+      'x-hop-marker': 'must-not-forward',
+    });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-hop-marker'), null);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('proxy strips response headers nominated by Connection', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      connection: 'x-hop-marker',
+      'x-hop-marker': 'must-not-forward',
+    });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    apiKey: '',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-hop-marker'), null);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {
   let hits = 0;
   let oversizedClosed = false;

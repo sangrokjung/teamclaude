@@ -14,6 +14,12 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+function connectionHeaderNames(value) {
+  return new Set(
+    String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
+  );
+}
+
 // How many continuity sleeps a single request may spend waiting on a model-tier
 // window before we surface the 429. Weekly windows do not clear while we poll,
 // so this is a ceiling on a wait that would otherwise be unbounded. At the
@@ -741,9 +747,7 @@ async function relayRaw(
   const deadline = createUpstreamDeadline(ac.signal, upstreamResponseTimeoutMs);
   try {
     const requestHeaders = {};
-    const connectionHeaders = new Set(
-      String(req.headers.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean),
-    );
+    const connectionHeaders = connectionHeaderNames(req.headers.connection);
     for (const [key, value] of Object.entries(req.headers)) {
       const lowerKey = key.toLowerCase();
       if (HOP_BY_HOP_HEADERS.has(lowerKey) || connectionHeaders.has(lowerKey)) continue;
@@ -771,9 +775,10 @@ async function relayRaw(
       return;
     }
     const responseHeaders = {};
+    const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection'
-          || key === 'content-encoding' || key === 'content-length') continue;
+      if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+      if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
@@ -1161,9 +1166,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
   const headers = {};
-  const connectionHeaders = new Set(
-    String(req.headers.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean),
-  );
+  const connectionHeaders = connectionHeaderNames(req.headers.connection);
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk) || connectionHeaders.has(lk)) continue;
@@ -1591,8 +1594,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     // Build response headers (skip hop-by-hop and encoding headers)
     const responseHeaders = {};
+    const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
       // Strip content-encoding/content-length since fetch may auto-decompress
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;

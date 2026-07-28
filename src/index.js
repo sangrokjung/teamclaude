@@ -25,6 +25,23 @@ const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+]);
+
+function connectionHeaderNames(value) {
+  return new Set(
+    String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
+  );
+}
 
 function publicRequestCapacity(config, accounts = config.accounts || []) {
   const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
@@ -419,8 +436,15 @@ async function superviseServerCommand() {
       let drainCleanup = null;
       const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
       let workerConnectionEstablished = false;
-      const headers = { ...req.headers, host: `127.0.0.1:${target.port}`, connection: 'keep-alive' };
-      delete headers['transfer-encoding'];
+      const connectionHeaders = connectionHeaderNames(req.headers.connection);
+      const headers = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        const lowerKey = key.toLowerCase();
+        if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey) || connectionHeaders.has(lowerKey)) continue;
+        headers[key] = value;
+      }
+      headers.host = `127.0.0.1:${target.port}`;
+      headers.connection = 'keep-alive';
       headers['content-length'] = String(body.length);
       const upstreamReq = http.request({
         host: '127.0.0.1',
@@ -569,10 +593,14 @@ async function superviseServerCommand() {
           resolve();
           return;
         }
-        const responseHeaders = { ...upstreamRes.headers };
-        delete responseHeaders.connection;
-        delete responseHeaders['keep-alive'];
-        delete responseHeaders['transfer-encoding'];
+        const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.connection);
+        const responseHeaders = {};
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          const lowerKey = key.toLowerCase();
+          if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey)
+              || responseConnectionHeaders.has(lowerKey)) continue;
+          responseHeaders[key] = value;
+        }
         res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
         if (isEventStream(upstreamRes.headers['content-type'])) {
           const framer = streamRecovery ? new SseFramer() : null;
