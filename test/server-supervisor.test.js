@@ -492,6 +492,157 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
   }
 });
 
+test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-identity-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  const reset = String(Math.floor((Date.now() + 3600_000) / 1000));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '0.73',
+      'anthropic-ratelimit-unified-5h-reset': reset,
+    });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    accounts: [{
+      name: 'same-name',
+      type: 'oauth',
+      accountUuid: 'old-uuid',
+      accessToken: 'old-placeholder',
+      refreshToken: 'old-placeholder',
+      expiresAt: Date.now() + 3600_000,
+    }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  let errors = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { errors += chunk; });
+
+  try {
+    try {
+      await waitUntil(() => status(port), 'proxy did not start');
+    } catch (err) {
+      throw new Error(`${err.message}: ${errors}`);
+    }
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    const measured = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+    });
+    assert.equal(measured.status, 200);
+    const before = await status(port).then(response => response.json());
+    assert.equal(before.accounts[0].quota.unified5h, 0.73);
+
+    const disk = JSON.parse(await readFile(configPath, 'utf8'));
+    disk.accounts[0] = {
+      ...disk.accounts[0],
+      accountUuid: 'new-uuid',
+      accessToken: 'new-placeholder',
+      refreshToken: 'new-placeholder',
+    };
+    await writeFile(configPath, JSON.stringify(disk));
+    process.kill(initial.workerPid, 'SIGHUP');
+    try {
+      await waitUntil(
+        () => output.includes('Applied account config without restarting the worker'),
+        'worker did not finish the account reload',
+        8000,
+      );
+    } catch (err) {
+      throw new Error(`${err.message}\nstdout: ${output}\nstderr: ${errors}`);
+    }
+
+    const after = await status(port).then(response => response.json());
+    assert.equal(after.accounts.length, 1);
+    assert.equal(after.accounts[0].status, 'active');
+    assert.equal(after.accounts[0].quota.unified5h, null,
+      'a replacement identity must start with fresh quota instead of inheriting the old account state');
+    assert.equal((await readState(statePath)).workerPid, initial.workerPid,
+      'identity replacement should not restart the worker');
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('supervisor buffer budget limits the double-buffered public request count', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    if (upstreamHits === 1) return;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxConcurrentPerAccount: 8,
+    overflowQueueMaxDepth: 8,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 2048,
+    accounts: [{
+      name: 'budget-account',
+      type: 'oauth',
+      accountUuid: 'budget-uuid',
+      accessToken: 'budget-placeholder',
+      refreshToken: 'budget-placeholder',
+      expiresAt: Date.now() + 3600_000,
+    }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const firstAbort = new AbortController();
+  let first = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    first = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: firstAbort.signal,
+    }).catch(() => null);
+    await waitUntil(() => upstreamHits === 1, 'first request did not reach upstream');
+
+    const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(second.status, 429);
+    assert.equal(upstreamHits, 1, 'supervisor must reject before a second buffered worker request');
+  } finally {
+    firstAbort.abort();
+    if (first) await first;
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('live account removal lowers the supervisor admission cap', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-capacity-'));
   const configPath = join(dir, 'config.json');

@@ -23,6 +23,7 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
+const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 
 function publicRequestCapacity(config, accounts = config.accounts || []) {
   const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
@@ -37,7 +38,15 @@ function publicRequestCapacity(config, accounts = config.accounts || []) {
   const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
     ? Math.max(0, config.overflowQueueMaxDepth)
     : 256;
-  return Math.max(1, accountCapacity + queueCapacity);
+  const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
+    ? config.maxRequestBytes
+    : 32 * 1024 * 1024;
+  const bufferBudget = Number.isFinite(config.maxBufferedRequestBytes)
+      && config.maxBufferedRequestBytes > 0
+    ? config.maxBufferedRequestBytes
+    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
+  const bufferCapacity = Math.max(1, Math.floor(bufferBudget / (maxRequestBytes * 2)));
+  return Math.max(1, Math.min(accountCapacity + queueCapacity, bufferCapacity));
 }
 
 const args = process.argv.slice(2);
@@ -2136,14 +2145,16 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
 // ── config sync helpers ─────────────────────────────────────
 
 /**
- * Find a config account entry matching an in-memory account (by UUID, then name).
+ * Accounts with two different UUIDs are replacements, even when names match.
+ * Name remains the fallback when either side has no stable UUID.
  */
+function sameAccountIdentity(a, b) {
+  if (a.accountUuid && b.accountUuid) return a.accountUuid === b.accountUuid;
+  return a.name === b.name;
+}
+
 function findConfigAccount(diskConfig, account) {
-  if (account.accountUuid) {
-    const idx = diskConfig.accounts.findIndex(a => a.accountUuid === account.accountUuid);
-    if (idx >= 0) return idx;
-  }
-  return diskConfig.accounts.findIndex(a => a.name === account.name);
+  return diskConfig.accounts.findIndex(a => sameAccountIdentity(a, account));
 }
 
 function storedCredentialMatches(account, previousTokens) {
@@ -2178,24 +2189,17 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   // through the deleted live credential until a full restart.
   for (let i = memConfig.accounts.length - 1; i >= 0; i--) {
     const memAcct = memConfig.accounts[i];
-    const stillOnDisk = (memAcct.accountUuid
-      && diskConfig.accounts.some(a => a.accountUuid === memAcct.accountUuid))
-      || diskConfig.accounts.some(a => a.name === memAcct.name);
+    const stillOnDisk = diskConfig.accounts.some(a => sameAccountIdentity(a, memAcct));
     if (stillOnDisk) continue;
 
-    const mgr = (memAcct.accountUuid
-      && accountManager.accounts.find(a => a.accountUuid === memAcct.accountUuid))
-      || accountManager.accounts.find(a => a.name === memAcct.name);
+    const mgr = accountManager.accounts.find(a => sameAccountIdentity(a, memAcct));
     if (mgr) accountManager.removeAccount(mgr.index);
     memConfig.accounts.splice(i, 1);
     console.log(`[TeamClaude] Removed account "${memAcct.name}" from live config`);
   }
 
   for (const diskAcct of diskConfig.accounts) {
-    const matchByUuid = diskAcct.accountUuid &&
-      memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);
-    const matchByName = memConfig.accounts.findIndex(a => a.name === diskAcct.name);
-    const memIdx = (matchByUuid >= 0 ? matchByUuid : null) ?? (matchByName >= 0 ? matchByName : -1);
+    const memIdx = memConfig.accounts.findIndex(a => sameAccountIdentity(a, diskAcct));
 
     if (memIdx < 0) {
       // New account discovered on disk — add to running server
@@ -2206,11 +2210,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       continue;
     }
 
-    // Find the corresponding AccountManager entry — UUID first, then name, so a
-    // disk entry whose UUID and name resolve to *different* live accounts can't
-    // misattribute the update to the name-match when a UUID-match exists.
-    const mgr = (diskAcct.accountUuid && accountManager.accounts.find(a => a.accountUuid === diskAcct.accountUuid))
-      || accountManager.accounts.find(a => a.name === diskAcct.name);
+    const mgr = accountManager.accounts.find(a => sameAccountIdentity(a, diskAcct));
 
     // Apply enable/disable + priority from disk FIRST — independent of credential
     // re-resolution below. A failed re-import (freshCred null) must NOT strand a

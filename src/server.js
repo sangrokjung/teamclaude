@@ -22,6 +22,7 @@ const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -42,6 +43,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxBodyBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  const maxBufferedRequestBytes = Number.isFinite(config.maxBufferedRequestBytes)
+      && config.maxBufferedRequestBytes > 0
+    ? config.maxBufferedRequestBytes
+    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
+  const maxBufferedRequests = Math.max(1, Math.floor(maxBufferedRequestBytes / maxBodyBytes));
   // Connection affinity: keep one client connection's sequential requests on the
   // same account for prompt-cache locality (HTTP/1.1 keep-alive reuses the socket
   // for a session's sequential turns). Soft — overflow still spreads. Set
@@ -456,13 +462,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Everything below buffers a request body (the OAuth relay AND the proxied
       // path) → global admission control to bound proxy memory: inFlightProxied
-      // may not exceed the fleet's useful capacity (sum of per-account caps +
-      // overflow queue depth), and we reject BEFORE buffering. Without this, body
+      // may not exceed the smaller of fleet capacity and the request-buffer
+      // memory budget, and we reject BEFORE buffering. Without this, body
       // buffering happens before any queue admission, so N concurrent uploads each
       // buffer up to maxBodyBytes regardless of queue depth — memory would grow
       // with connection count (localhost auth is skipped, so any local process
-      // could flood, including via /v1/oauth/token). Bound: totalCapacity × maxBodyBytes.
-      if (inFlightProxied >= accountManager.totalCapacity()) {
+      // could flood, including via /v1/oauth/token).
+      const admissionCapacity = Math.min(accountManager.totalCapacity(), maxBufferedRequests);
+      if (inFlightProxied >= admissionCapacity) {
         req.resume(); // drain & discard the body so the socket isn't leaked
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
         res.end(JSON.stringify({

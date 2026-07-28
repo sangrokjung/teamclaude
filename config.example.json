@@ -14,6 +14,7 @@
   "streamRecovery": true,
   "maxResponseBytes": 67108864,
   "upstreamResponseTimeoutMs": 300000,
+  "maxBufferedRequestBytes": 268435456,
   "modelFallbacks": {
     "claude-fable-5": [
       "claude-opus-4-8",

@@ -846,6 +846,49 @@ test('global admission cap rejects past capacity before buffering (upstream unto
   proxy.close();
 });
 
+test('buffer budget caps worker admission below a large account queue capacity', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    if (hits === 1) return;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 8, 8);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1024,
+  });
+  const port = await listen(proxy);
+  const firstAbort = new AbortController();
+  const first = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    body: '{}',
+    signal: firstAbort.signal,
+  }).catch(() => null);
+
+  try {
+    for (let i = 0; i < 20 && hits < 1; i++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(hits, 1);
+    const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(second.status, 429, 'memory budget must override the larger account/queue capacity');
+    assert.equal(hits, 1, 'budget-rejected request must not reach upstream');
+  } finally {
+    firstAbort.abort();
+    await first;
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // ── disable / enable + priority (account on-off switch + selection order) ──────
 
 test('a disabled account is excluded from acquire selection', async () => {
