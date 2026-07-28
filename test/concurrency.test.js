@@ -733,6 +733,57 @@ test('relayRaw bounds an oversized upstream response and releases admission capa
   }
 });
 
+test('relayRaw times out a stalled upstream response and releases admission capacity', async () => {
+  let hits = 0;
+  let stalledClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (hits === 1) {
+      res.write('{"partial":');
+      res.once('close', () => { stalledClosed = true; });
+      return;
+    }
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    upstreamResponseTimeoutMs: 50,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const stalled = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await stalled.json();
+    assert.equal(stalled.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    for (let i = 0; i < 20 && !stalledClosed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(stalledClosed, true, 'the deadline must cancel the stalled upstream body');
+
+    const admitted = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(admitted.status, 200, 'the timed-out relay must free global admission capacity');
+    assert.deepEqual(await admitted.json(), {});
+    assert.equal(hits, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a client disconnect during a hung /v1/oauth/token relay frees admission capacity', async () => {
   const upstream = http.createServer(() => { /* hang forever — never respond */ });
   const upstreamPort = await listen(upstream);

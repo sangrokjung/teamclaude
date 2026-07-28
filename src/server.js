@@ -21,6 +21,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -70,6 +71,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxResponseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes > 0
     ? Math.floor(config.maxResponseBytes)
     : DEFAULT_MAX_RESPONSE_BYTES;
+  const upstreamResponseTimeoutMs = Number.isFinite(config.upstreamResponseTimeoutMs)
+      && config.upstreamResponseTimeoutMs > 0
+    ? Math.floor(config.upstreamResponseTimeoutMs)
+    : DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -473,7 +478,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // or rewriting client refreshes would cause token rotation conflicts.
         if (provider === 'anthropic'
             && req.method === 'POST' && req.url === '/v1/oauth/token') {
-          await relayRaw(req, res, upstream, maxBodyBytes, maxResponseBytes);
+          await relayRaw(
+            req,
+            res,
+            upstream,
+            maxBodyBytes,
+            maxResponseBytes,
+            upstreamResponseTimeoutMs,
+          );
           return; // outer finally decrements inFlightProxied
         }
 
@@ -484,7 +496,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -622,6 +634,7 @@ async function relayRaw(
   upstream,
   maxBodyBytes = Infinity,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
+  upstreamResponseTimeoutMs = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
 ) {
   const bodyChunks = [];
   let bodyLen = 0;
@@ -647,6 +660,7 @@ async function relayRaw(
   const ac = new AbortController();
   const onClose = () => ac.abort();
   res.on('close', onClose);
+  const deadline = createUpstreamDeadline(ac.signal, upstreamResponseTimeoutMs);
   try {
     const upstreamRes = await fetch(`${upstream}${req.url}`, {
       method: req.method,
@@ -656,7 +670,7 @@ async function relayRaw(
         'user-agent': req.headers['user-agent'] || 'node',
       },
       body: body.length > 0 ? body : undefined,
-      signal: ac.signal,
+      signal: deadline.signal,
     });
 
     const responseBody = await readBodyBounded(upstreamRes.body, maxResponseBytes);
@@ -676,8 +690,19 @@ async function relayRaw(
     res.writeHead(upstreamRes.status, responseHeaders);
     res.end(responseBody);
   } catch (err) {
+    if (deadline.timedOut && !res.destroyed) {
+      console.error('[TeamClaude] Raw relay timed out while waiting for upstream response');
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response timed out.' },
+        }));
+      }
+      return;
+    }
     // Client disconnected → we aborted the relay; nothing to respond to.
-    if (ac.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || res.destroyed) {
+    if (ac.signal.aborted || res.destroyed) {
       if (!res.writableEnded) res.destroy();
       return;
     }
@@ -687,8 +712,43 @@ async function relayRaw(
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
     }
   } finally {
+    deadline.dispose();
     res.removeListener('close', onClose);
   }
+}
+
+function createUpstreamDeadline(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const abortFromParent = () => controller.abort();
+
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    timer.unref?.();
+  }
+
+  const stopTimeout = () => {
+    if (timer === null) return;
+    clearTimeout(timer);
+    timer = null;
+  };
+
+  return {
+    signal: controller.signal,
+    get timedOut() { return timedOut; },
+    stopTimeout,
+    dispose() {
+      stopTimeout();
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
 }
 
 async function readBodyBounded(webStream, maxBytes) {
@@ -1043,6 +1103,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
+  const upstreamDeadline = createUpstreamDeadline(
+    ctx.abortSignal,
+    ctx.upstreamResponseTimeoutMs,
+  );
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method,
@@ -1055,8 +1119,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // the per-account slot and inFlightProxied never release — repeated stalls
       // would leak the proxy to capacity. Aborting rejects the read and unwinds
       // the finally that frees the slot.
-      signal: ctx.abortSignal,
+      signal: upstreamDeadline.signal,
     });
+    const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
+    if (isStreaming) upstreamDeadline.stopTimeout();
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -1402,8 +1468,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // Same predicate the supervisor relay uses (index.js). These two must agree:
     // the supervisor only frames what the worker framed, so a local copy that
     // drifts would silently break recovery on whatever the two classify differently.
-    const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
-
     if (isStreaming && upstreamRes.body) {
       const streamLog = logDir
         ? { chunks: [], bytes: 0, truncated: false, maxBytes: ctx.maxResponseBytes }
@@ -1526,6 +1590,33 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       res.end(buf.length ? buf : undefined);
     }
   } catch (err) {
+    if (upstreamDeadline.timedOut && !res.destroyed) {
+      console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
+      if (logDir) {
+        logSections.push('=== ERROR ===\nUpstream response timed out.');
+        writeRequestLog(logDir, reqId, logSections);
+      }
+
+      ctx.tried5xx.add(account);
+      if (retryCount < maxRetries
+          && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
+            || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
+        console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
+        releaseHeld();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+
+      ctx.status = 502;
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response timed out.' },
+        }));
+      }
+      return;
+    }
+
     // Client disconnected → we aborted the upstream fetch (ctx.abortSignal). This
     // is not the account's fault: don't mark it 'error' or fail over (the client
     // is gone). Just unwind — the outer finally releases the slot / inFlightProxied.
@@ -1602,6 +1693,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
       }));
     }
+  } finally {
+    upstreamDeadline.dispose();
   }
 }
 

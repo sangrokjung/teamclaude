@@ -564,6 +564,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `continuityMode` | Hold requests in the proxy while quota, global rate limits, HTTP 529/5xx, or an incomplete SSE attempt recover instead of ending the Claude Code turn (optional, default `true`) |
 | `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt so partial output can be discarded and replayed transparently (optional, default `true`) |
 | `maxResponseBytes` | Maximum bytes buffered per upstream response before returning 502; covers transactional SSE, non-SSE, and OAuth relay responses (optional, default `67108864` = 64 MiB) |
+| `upstreamResponseTimeoutMs` | Total deadline for upstream response headers and buffered response bodies; long-lived SSE bodies are exempt after headers arrive (optional, default `300000` = 5 minutes) |
 | `continuityMaxSleepMs` | Maximum interval between continuity probes (optional, default `30000`) |
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |

@@ -497,6 +497,98 @@ test('non-SSE response above maxResponseBytes returns 502 without poisoning the 
   }
 });
 
+test('stalled non-SSE response returns 502 without poisoning the account or retaining its slot', async () => {
+  let upstreamClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"partial":');
+    res.once('close', () => { upstreamClosed = true; });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { upstreamResponseTimeoutMs: 50 });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    for (let i = 0; i < 20 && !upstreamClosed; i++) await delay(10);
+    assert.equal(upstreamClosed, true, 'the deadline must cancel the stalled upstream body');
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.accounts[0].inflight, 0, 'the timed-out response must release its account slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('stalled non-SSE response fails over to an alternate account', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, { upstreamResponseTimeoutMs: 50 });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(hits, 2);
+    assert.ok(am.accounts.every(a => a.status === 'active'));
+    assert.ok(am.accounts.every(a => a.inflight === 0));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('upstream response deadline stops after SSE headers and does not truncate a long stream', async () => {
+  const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    await delay(100);
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { upstreamResponseTimeoutMs: 40 });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const result = await streamPost(proxyPort);
+    assert.equal(result.status, 200);
+    assert.equal(result.cleanEnd, true);
+    assert.equal(result.body, full);
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('client disconnect mid-stream: upstream reader cancelled, slot released, no injection crash', async () => {
   let firstRes = null;
   let upstreamClosed = false;

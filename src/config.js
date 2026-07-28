@@ -223,6 +223,9 @@ export function createDefaultConfig() {
     // Maximum buffered upstream response per request. Transactional SSE spills
     // to disk after 1 MiB; non-SSE and OAuth responses remain memory-bounded.
     maxResponseBytes: 64 * 1024 * 1024,
+    // Total deadline for upstream response headers and buffered response bodies.
+    // Long-lived SSE bodies are exempt after their response headers arrive.
+    upstreamResponseTimeoutMs: 300000,
     // One alternate account distinguishes a per-account rate cap from a global
     // limit without multiplying one request across the whole fleet.
     rateLimitFailovers: 1,

@@ -13,6 +13,7 @@
   "tokenRefreshIntervalMs": 300000,
   "streamRecovery": true,
   "maxResponseBytes": 67108864,
+  "upstreamResponseTimeoutMs": 300000,
   "modelFallbacks": {
     "claude-fable-5": [
       "claude-opus-4-8",
