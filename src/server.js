@@ -20,7 +20,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 // default continuityMaxSleepMs (30s) this is ~5 minutes.
 const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
-const DEFAULT_STREAM_TRANSACTION_MAX_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -67,9 +67,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Anthropic-only: the Codex backend's in-stream error contract differs, so
   // codex mode keeps the legacy passthrough. `streamRecovery: false` opts out.
   const streamRecovery = provider === 'anthropic' && config.streamRecovery !== false;
-  const streamTransactionMaxBytes = Number.isFinite(config.streamTransactionMaxBytes)
-    ? Math.max(1, Math.floor(config.streamTransactionMaxBytes))
-    : DEFAULT_STREAM_TRANSACTION_MAX_BYTES;
+  const maxResponseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes > 0
+    ? Math.floor(config.maxResponseBytes)
+    : DEFAULT_MAX_RESPONSE_BYTES;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -473,7 +473,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // or rewriting client refreshes would cause token rotation conflicts.
         if (provider === 'anthropic'
             && req.method === 'POST' && req.url === '/v1/oauth/token') {
-          await relayRaw(req, res, upstream, maxBodyBytes);
+          await relayRaw(req, res, upstream, maxBodyBytes, maxResponseBytes);
           return; // outer finally decrements inFlightProxied
         }
 
@@ -484,7 +484,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, streamTransactionMaxBytes };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -616,7 +616,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
  * Buffers the body bounded by maxBodyBytes (else 413) so the untouched
  * `/v1/oauth/token` path can't be used to exhaust proxy memory.
  */
-async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
+async function relayRaw(
+  req,
+  res,
+  upstream,
+  maxBodyBytes = Infinity,
+  maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
+) {
   const bodyChunks = [];
   let bodyLen = 0;
   let tooLarge = false;
@@ -653,7 +659,15 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
       signal: ac.signal,
     });
 
-    const responseBody = await upstreamRes.text();
+    const responseBody = await readBodyBounded(upstreamRes.body, maxResponseBytes);
+    if (responseBody === null) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: 'Upstream response exceeded the proxy limit.' },
+      }));
+      return;
+    }
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (key === 'transfer-encoding' || key === 'connection') continue;
@@ -674,6 +688,28 @@ async function relayRaw(req, res, upstream, maxBodyBytes = Infinity) {
     }
   } finally {
     res.removeListener('close', onClose);
+  }
+}
+
+async function readBodyBounded(webStream, maxBytes) {
+  if (!webStream) return Buffer.alloc(0);
+  const reader = webStream.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, totalBytes);
+      const chunk = Buffer.from(value);
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -1385,7 +1421,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.streamRecovery,
         ctx.streamRecovery && ctx.continuity.enabled,
         ensureHeaders,
-        ctx.streamTransactionMaxBytes,
+        ctx.maxResponseBytes,
       );
       if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
         ctx.status = 502;
@@ -1394,7 +1430,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           type: 'error',
           error: {
             type: 'proxy_error',
-            message: `Upstream stream exceeded the ${ctx.streamTransactionMaxBytes}-byte transaction limit.`,
+            message: `Upstream stream exceeded the ${ctx.maxResponseBytes}-byte response limit.`,
           },
         }));
         return;
@@ -1452,14 +1488,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
-      // Non-SSE. With recovery on, buffer the whole body BEFORE sending
-      // headers: if the upstream connection dies while reading, headers are
-      // not yet sent, so the error unwinds into the transient-failover path
-      // below and retries on another account. The legacy path (codex /
-      // streamRecovery:false) keeps the original order — headers first — so
-      // its wire behavior stays as before (no replay, no reordering).
-      if (!ctx.streamRecovery) res.writeHead(upstreamRes.status, responseHeaders);
-      const buf = upstreamRes.body ? Buffer.from(await upstreamRes.arrayBuffer()) : Buffer.alloc(0);
+      // Buffer non-SSE bodies before sending headers so body-read failures remain
+      // replayable and oversized upstream responses can be rejected as a clean
+      // 502 without exposing partial or attacker-controlled bytes to the client.
+      const buf = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      if (buf === null) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'proxy_error', message: 'Upstream response exceeded the proxy limit.' },
+        }));
+        return;
+      }
       extractUsageFromBody(buf, account, accountManager);
       if (logDir) {
         if (buf.length === 0) {
@@ -1583,7 +1624,7 @@ async function streamResponse(
   recover = false,
   transactional = false,
   ensureHeaders = null,
-  transactionMaxBytes = DEFAULT_STREAM_TRANSACTION_MAX_BYTES,
+  transactionMaxBytes = DEFAULT_MAX_RESPONSE_BYTES,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();

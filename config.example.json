@@ -12,7 +12,7 @@
   "warmupIntervalMs": 300000,
   "tokenRefreshIntervalMs": 300000,
   "streamRecovery": true,
-  "streamTransactionMaxBytes": 67108864,
+  "maxResponseBytes": 67108864,
   "modelFallbacks": {
     "claude-fable-5": [
       "claude-opus-4-8",

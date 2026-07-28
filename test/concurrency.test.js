@@ -679,6 +679,60 @@ test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
   proxy.close();
 });
 
+test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {
+  let hits = 0;
+  let oversizedClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (hits === 1) {
+      const timer = setInterval(() => res.write('x'.repeat(512)), 5);
+      res.once('close', () => {
+        clearInterval(timer);
+        oversizedClosed = true;
+      });
+      return;
+    }
+    res.end('x'.repeat(1024));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxResponseBytes: 1024,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const oversized = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await oversized.json();
+    assert.equal(oversized.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    for (let i = 0; i < 20 && !oversizedClosed; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(oversizedClosed, true, 'the proxy must cancel an endless oversized upstream body');
+
+    const admitted = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(admitted.status, 200, 'the completed rejection must free global admission capacity');
+    assert.equal((await admitted.arrayBuffer()).byteLength, 1024, 'a response exactly at the cap must pass');
+    assert.equal(hits, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('a client disconnect during a hung /v1/oauth/token relay frees admission capacity', async () => {
   const upstream = http.createServer(() => { /* hang forever — never respond */ });
   const upstreamPort = await listen(upstream);

@@ -220,9 +220,9 @@ export function createDefaultConfig() {
     continuityMode: true,
     continuityMaxSleepMs: 30000,
     continuityJitterMs: 500,
-    // Transactional SSE responses spill to disk after 1 MiB, but never buffer
-    // more than this per request. This bounds disk usage for a non-terminal stream.
-    streamTransactionMaxBytes: 64 * 1024 * 1024,
+    // Maximum buffered upstream response per request. Transactional SSE spills
+    // to disk after 1 MiB; non-SSE and OAuth responses remain memory-bounded.
+    maxResponseBytes: 64 * 1024 * 1024,
     // One alternate account distinguishes a per-account rate cap from a global
     // limit without multiplying one request across the whole fleet.
     rateLimitFailovers: 1,

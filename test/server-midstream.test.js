@@ -336,7 +336,7 @@ test('transactional SSE rejects a response above the configured spool ceiling', 
   const am = new AccountManager(makeAccounts(1), 0.98);
   const proxy = startProxy(am, upstreamPort, {
     continuityMode: true,
-    streamTransactionMaxBytes: 1024,
+    maxResponseBytes: 1024,
   });
   const proxyPort = await listen(proxy);
 
@@ -461,6 +461,33 @@ test('non-SSE body death mid-read now fails over to another account (headers not
     assert.equal(JSON.parse(r.body).ok, true, 'the second account must serve the response');
     assert.equal(hits.length, 2);
     assert.ok(am.accounts.every(a => a.status === 'active'), 'a body-read blip must not poison the account');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('non-SSE response above maxResponseBytes returns 502 without poisoning the account', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: 'x'.repeat(4096) }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { maxResponseBytes: 1024 });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.accounts[0].inflight, 0, 'the rejected response must release its account slot');
   } finally {
     proxy.close();
     upstream.close();
