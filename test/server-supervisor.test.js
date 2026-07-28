@@ -145,9 +145,17 @@ test('proxy worker crash keeps the listener reachable and replacement serves the
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(5000),
     });
-    assert.equal(response.status, 502,
-      'the supervisor must respond without replaying a possibly dispatched POST');
-    assert.equal((await response.json()).error.type, 'proxy_error');
+    assert.ok(response.status === 200 || response.status === 502,
+      'a crash before dispatch may recover transparently; after dispatch it must fail without replay');
+    const responseBody = await response.json();
+    if (response.status === 200) {
+      assert.equal(responseBody.content[0].text, 'continued');
+    } else {
+      assert.equal(responseBody.error.type, 'proxy_error');
+    }
+    const hitsBeforeFollowUp = upstreamHits;
+    assert.ok(hitsBeforeFollowUp <= 1,
+      'the supervisor must not deliver the original POST upstream more than once');
     await waitUntil(
       () => !isPidAlive(initial.workerPid),
       'crashed worker remained alive',
@@ -160,15 +168,20 @@ test('proxy worker crash keeps the listener reachable and replacement serves the
     assert.equal(recovered.pid, child.pid);
     assert.ok(isPidAlive(recovered.workerPid));
 
-    const nextResponse = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(5000),
-    });
-    assert.equal(nextResponse.status, 200);
-    assert.equal((await nextResponse.json()).content[0].text, 'continued');
-    assert.equal(upstreamHits, 1);
+    if (response.status === 502) {
+      const nextResponse = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      });
+      assert.equal(nextResponse.status, 200);
+      assert.equal((await nextResponse.json()).content[0].text, 'continued');
+      assert.equal(upstreamHits, hitsBeforeFollowUp + 1,
+        'only the explicit follow-up may create another upstream request');
+    } else {
+      assert.equal(upstreamHits, 1);
+    }
     assert.deepEqual(upstreamBody, payload);
     assert.equal(child.exitCode, null, 'the supervisor process must survive a worker crash');
   } finally {

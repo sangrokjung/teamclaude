@@ -204,6 +204,73 @@ test('config/quota writes are atomic: valid content, 0600, no temp leftovers', a
   }
 });
 
+test('atomic config and quota renames fsync their parent directory', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-durability-'));
+  const cfgPath = join(dir, 'teamclaude.json');
+  const moduleUrl = new URL('../src/config.js', import.meta.url).href;
+  try {
+    await writeFile(cfgPath, JSON.stringify({ accounts: [] }) + '\n', { mode: 0o600 });
+    const source = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const directory = ${JSON.stringify(dir)};
+      let asyncDirectorySyncs = 0;
+      let syncDirectorySyncs = 0;
+      const directoryFds = new Set();
+      const originalOpen = fs.promises.open.bind(fs.promises);
+      fs.promises.open = async (path, ...args) => {
+        const handle = await originalOpen(path, ...args);
+        if (path === directory) {
+          const originalSync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            asyncDirectorySyncs += 1;
+            return originalSync();
+          };
+        }
+        return handle;
+      };
+      const originalOpenSync = fs.openSync.bind(fs);
+      const originalFsyncSync = fs.fsyncSync.bind(fs);
+      fs.openSync = (path, ...args) => {
+        const fd = originalOpenSync(path, ...args);
+        if (path === directory) directoryFds.add(fd);
+        return fd;
+      };
+      fs.fsyncSync = fd => {
+        if (directoryFds.has(fd)) syncDirectorySyncs += 1;
+        return originalFsyncSync(fd);
+      };
+      syncBuiltinESMExports();
+      const { saveConfig, writeQuotaCacheSync } = await import(${JSON.stringify(moduleUrl)});
+      await saveConfig({ accounts: [{ name: 'A', type: 'apikey', apiKey: 'masked' }] });
+      writeQuotaCacheSync({ savedAt: 1, accounts: [] });
+      process.stdout.write(JSON.stringify({ asyncDirectorySyncs, syncDirectorySyncs }));
+    `;
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+        env: { ...process.env, TEAMCLAUDE_CONFIG: cfgPath },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const stdout = [];
+      const stderr = [];
+      child.stdout.on('data', chunk => stdout.push(chunk));
+      child.stderr.on('data', chunk => stderr.push(chunk));
+      child.once('error', reject);
+      child.once('exit', code => {
+        if (code === 0) {
+          resolve(JSON.parse(Buffer.concat(stdout).toString()));
+        } else {
+          reject(new Error(`durability probe exited ${code}: ${Buffer.concat(stderr).toString()}`));
+        }
+      });
+    });
+    assert.ok(result.asyncDirectorySyncs > 0, 'async rename must fsync its directory');
+    assert.ok(result.syncDirectorySyncs > 0, 'sync rename must fsync its directory');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('atomicConfigUpdate serializes independent processes without losing accounts', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-process-'));
   const cfgPath = join(dir, 'teamclaude.json');

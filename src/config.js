@@ -13,6 +13,16 @@ export function normalizeTokenRefreshIntervalMs(value) {
   return Math.max(MIN_TOKEN_REFRESH_INTERVAL_MS, value);
 }
 
+async function syncParentDirectory(path) {
+  if (process.platform === 'win32') return;
+  const directory = await open(dirname(path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 // Every persistent file here is written via write-to-temp → fsync → rename.
 // A plain in-place write truncates first, so a process death mid-write (OOM
 // kill, crash, power loss) leaves a 0-byte file — which is exactly how the
@@ -30,6 +40,7 @@ async function writeFileAtomic(path, data, mode = 0o600) {
       await fh.close();
     }
     await rename(tmp, path);
+    await syncParentDirectory(path);
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => {});
     throw err;
@@ -202,6 +213,16 @@ async function withConfigLock(operation) {
 }
 
 // Sync twin for the process-'exit' handler, where async I/O never completes.
+function syncParentDirectorySync(path) {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function writeFileAtomicSync(path, data, mode = 0o600) {
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   try {
@@ -213,6 +234,7 @@ function writeFileAtomicSync(path, data, mode = 0o600) {
       closeSync(fd);
     }
     renameSync(tmp, path);
+    syncParentDirectorySync(path);
   } catch (err) {
     try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
     throw err;
