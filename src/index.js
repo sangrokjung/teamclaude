@@ -410,6 +410,8 @@ async function superviseServerCommand() {
       let settled = false;
       let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
       let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+      let workerConnectionEstablished = false;
       const headers = { ...req.headers, host: `127.0.0.1:${target.port}`, connection: 'keep-alive' };
       delete headers['transfer-encoding'];
       headers['content-length'] = String(body.length);
@@ -460,7 +462,8 @@ async function superviseServerCommand() {
           resetClientAgent(req);
           if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
         }
-        if (!stopping && !res.destroyed && attempt < 3) {
+        if (!stopping && !res.destroyed
+            && (replaySafe || !workerConnectionEstablished) && attempt < 3) {
           // A rejection here (bad forwarded header, synchronous http.request
           // option error) must still settle the outer promise. Without the
           // rejection arm the awaiting frame never returns, the client hangs,
@@ -481,11 +484,25 @@ async function superviseServerCommand() {
         }
         if (!res.headersSent && !res.destroyed) {
           res.writeHead(502, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: { type: 'proxy_error', message: 'Proxy worker unavailable' } }));
+          res.end(JSON.stringify({
+            error: {
+              type: 'proxy_error',
+              message: !replaySafe && workerConnectionEstablished
+                ? 'Proxy worker failed after dispatch; request was not replayed'
+                : 'Proxy worker unavailable',
+            },
+          }));
         }
         resolve();
       };
 
+      upstreamReq.once('socket', socket => {
+        if (!socket.connecting) {
+          workerConnectionEstablished = true;
+          return;
+        }
+        socket.once('connect', () => { workerConnectionEstablished = true; });
+      });
       upstreamReq.once('response', upstreamRes => {
         responseStarted = true;
         if (res.destroyed) {

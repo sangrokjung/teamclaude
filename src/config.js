@@ -1,4 +1,4 @@
-import { readFile, mkdir, rm, open, rename, link } from 'node:fs/promises';
+import { readFile, readdir, mkdir, rmdir, rm, open, rename, link } from 'node:fs/promises';
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -48,6 +48,99 @@ function isProcessAlive(pid) {
   }
 }
 
+async function readConfigLockClaims(queuePath) {
+  let names;
+  try {
+    names = await readdir(queuePath);
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const claims = [];
+  for (const name of names) {
+    if (!name.startsWith('claim-') || !name.endsWith('.json')) continue;
+    const claimPath = join(queuePath, name);
+    try {
+      claims.push({
+        ...JSON.parse(await readFile(claimPath, 'utf8')),
+        name,
+        path: claimPath,
+      });
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+  return claims;
+}
+
+/**
+ * A filesystem bakery queue serializes stale-lock recovery before any writer
+ * inspects or unlinks the shared lock pathname. Claims are uniquely named, so
+ * reclaiming a dead process removes only that process's claim — never a live
+ * writer that replaced a shared path between a read and an unlink.
+ */
+async function acquireConfigLockQueue(path, deadline) {
+  const queuePath = `${path}.lock-queue`;
+  const nonce = randomBytes(12).toString('hex');
+  const name = `claim-${process.pid}-${nonce}.json`;
+  const claimPath = join(queuePath, name);
+  const cleanup = async () => {
+    await rm(claimPath, { force: true }).catch(() => {});
+    await rmdir(queuePath).catch(() => {});
+  };
+
+  while (true) {
+    await mkdir(queuePath, { recursive: true });
+    try {
+      await writeFileAtomic(claimPath, JSON.stringify({
+        pid: process.pid,
+        nonce,
+        ticket: null,
+      }));
+      break;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+
+  try {
+    let ticket = 1;
+    for (const claim of await readConfigLockClaims(queuePath)) {
+      if (claim.name === name) continue;
+      if (!isProcessAlive(claim.pid)) {
+        await rm(claim.path, { force: true }).catch(() => {});
+      } else if (Number.isInteger(claim.ticket) && claim.ticket >= ticket) {
+        ticket = claim.ticket + 1;
+      }
+    }
+    await writeFileAtomic(claimPath, JSON.stringify({ pid: process.pid, nonce, ticket }));
+
+    while (true) {
+      let blocked = false;
+      for (const claim of await readConfigLockClaims(queuePath)) {
+        if (claim.name === name) continue;
+        if (!isProcessAlive(claim.pid)) {
+          await rm(claim.path, { force: true }).catch(() => {});
+          continue;
+        }
+        if (!Number.isInteger(claim.ticket)
+            || claim.ticket < ticket
+            || (claim.ticket === ticket && claim.name < name)) {
+          blocked = true;
+        }
+      }
+      if (!blocked) return cleanup;
+      if (Date.now() >= deadline) {
+        throw new Error('Timed out waiting for config lock recovery queue');
+      }
+      await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 30)));
+    }
+  } catch (err) {
+    await cleanup();
+    throw err;
+  }
+}
+
 /**
  * Serialize config read-modify-write cycles across processes.
  *
@@ -62,51 +155,49 @@ async function withConfigLock(operation) {
   const owner = JSON.stringify({ pid: process.pid, nonce });
   const deadline = Date.now() + CONFIG_LOCK_TIMEOUT_MS;
   await mkdir(dirname(path), { recursive: true });
-
-  while (true) {
-    const candidate = `${lockPath}.candidate-${process.pid}-${randomBytes(4).toString('hex')}`;
-    await writeFileAtomic(candidate, owner);
-    try {
-      await link(candidate, lockPath);
-      await rm(candidate, { force: true }).catch(() => {});
-      break;
-    } catch (err) {
-      await rm(candidate, { force: true }).catch(() => {});
-      if (err.code !== 'EEXIST') throw err;
-
-      let current = null;
-      try {
-        current = JSON.parse(await readFile(lockPath, 'utf8'));
-      } catch (readErr) {
-        if (readErr.code === 'ENOENT') continue;
-      }
-      if (current?.pid && !isProcessAlive(current.pid)) {
-        // Re-read immediately before unlinking so a concurrently-recovered lock
-        // is not mistaken for the dead owner we observed above.
-        try {
-          const latest = JSON.parse(await readFile(lockPath, 'utf8'));
-          if (latest.pid === current.pid && latest.nonce === current.nonce) {
-            await rm(lockPath, { force: true });
-          }
-        } catch {}
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for config lock held by pid ${current?.pid || 'unknown'}`);
-      }
-      await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 30)));
-    }
-  }
+  const releaseQueue = await acquireConfigLockQueue(path, deadline);
 
   try {
-    return await operation();
-  } finally {
-    try {
-      const current = JSON.parse(await readFile(lockPath, 'utf8'));
-      if (current.pid === process.pid && current.nonce === nonce) {
-        await rm(lockPath, { force: true });
+    while (true) {
+      const candidate = `${lockPath}.candidate-${process.pid}-${randomBytes(4).toString('hex')}`;
+      await writeFileAtomic(candidate, owner);
+      try {
+        await link(candidate, lockPath);
+        await rm(candidate, { force: true }).catch(() => {});
+        break;
+      } catch (err) {
+        await rm(candidate, { force: true }).catch(() => {});
+        if (err.code !== 'EEXIST') throw err;
+
+        let current = null;
+        try {
+          current = JSON.parse(await readFile(lockPath, 'utf8'));
+        } catch (readErr) {
+          if (readErr.code === 'ENOENT') continue;
+        }
+        if (current?.pid && !isProcessAlive(current.pid)) {
+          await rm(lockPath, { force: true });
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting for config lock held by pid ${current?.pid || 'unknown'}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 30)));
       }
-    } catch {}
+    }
+
+    try {
+      return await operation();
+    } finally {
+      try {
+        const current = JSON.parse(await readFile(lockPath, 'utf8'));
+        if (current.pid === process.pid && current.nonce === nonce) {
+          await rm(lockPath, { force: true });
+        }
+      } catch {}
+    }
+  } finally {
+    await releaseQueue();
   }
 }
 

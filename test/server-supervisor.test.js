@@ -97,7 +97,7 @@ async function stopChild(child) {
   }
 }
 
-test('proxy worker crash keeps the listener alive and restarts without ConnectionRefused', { timeout: 15000 }, async () => {
+test('proxy worker crash keeps the listener reachable and replacement serves the next request', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-'));
   const configPath = join(dir, 'config.json');
   const statePath = join(dir, 'config.server.json');
@@ -145,10 +145,9 @@ test('proxy worker crash keeps the listener alive and restarts without Connectio
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(5000),
     });
-    assert.equal(response.status, 200, 'the supervisor listener must hold the request until a replacement worker is ready');
-    assert.equal((await response.json()).content[0].text, 'continued');
-    assert.equal(upstreamHits, 1);
-    assert.deepEqual(upstreamBody, payload);
+    assert.equal(response.status, 502,
+      'the supervisor must respond without replaying a possibly dispatched POST');
+    assert.equal((await response.json()).error.type, 'proxy_error');
     await waitUntil(
       () => !isPidAlive(initial.workerPid),
       'crashed worker remained alive',
@@ -160,6 +159,17 @@ test('proxy worker crash keeps the listener alive and restarts without Connectio
     }, 'replacement worker was not recorded');
     assert.equal(recovered.pid, child.pid);
     assert.ok(isPidAlive(recovered.workerPid));
+
+    const nextResponse = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(nextResponse.status, 200);
+    assert.equal((await nextResponse.json()).content[0].text, 'continued');
+    assert.equal(upstreamHits, 1);
+    assert.deepEqual(upstreamBody, payload);
     assert.equal(child.exitCode, null, 'the supervisor process must survive a worker crash');
   } finally {
     await stopChild(child);

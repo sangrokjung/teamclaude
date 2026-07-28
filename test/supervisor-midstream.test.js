@@ -200,7 +200,7 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
   }
 });
 
-test('worker SIGKILL mid-SSE → supervisor replays the same request and client gets final success', { timeout: 20000 }, async () => {
+test('worker SIGKILL after upstream accepts POST does not replay the uncertain request', { timeout: 20000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-sse-'));
   const configPath = join(dir, 'config.json');
   const statePath = join(dir, 'config.server.json');
@@ -264,17 +264,25 @@ test('worker SIGKILL mid-SSE → supervisor replays the same request and client 
     process.kill(initial.workerPid, 'SIGKILL');
     const result = await resultPromise;
 
-    assert.equal(result.status, 200);
-    assert.equal(result.cleanEnd, true, 'the client response must END cleanly, not die with the worker');
-    assert.deepEqual(JSON.parse(result.body), { ok: true },
-      'the original client request must complete on the replacement worker');
-    assert.ok(!result.body.includes('overloaded_error'), 'no retryable error may leak to Claude Code');
-    assert.equal(requests, 2, 'one broken attempt plus one transparent replay');
+    assert.equal(result.status, 502);
+    assert.equal(result.cleanEnd, true, 'the uncertain request must fail with a complete response');
+    assert.equal(JSON.parse(result.body).error.type, 'proxy_error');
+    assert.equal(requests, 1, 'an upstream-accepted POST must never be replayed internally');
 
     await waitUntil(async () => {
       const next = await readState(statePath);
       return next?.workerPid && next.workerPid !== initial.workerPid ? next : null;
     }, 'replacement worker was not recorded');
+
+    const followUp = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'next' }] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(followUp.status, 200);
+    assert.deepEqual(await followUp.json(), { ok: true });
+    assert.equal(requests, 2, 'only an explicit follow-up may create the second upstream request');
     assert.equal(child.exitCode, null, 'the supervisor must survive the worker crash');
   } finally {
     await stopChild(child);

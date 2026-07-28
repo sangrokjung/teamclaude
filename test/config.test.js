@@ -242,6 +242,115 @@ test('atomicConfigUpdate serializes independent processes without losing account
   }
 });
 
+test('stale-lock recovery never removes a concurrently acquired live lock', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-stale-race-'));
+  const cfgPath = join(dir, 'teamclaude.json');
+  const lockPath = `${cfgPath}.lock`;
+  const moduleUrl = new URL('../src/config.js', import.meta.url).href;
+  const children = [];
+  const pendingMessages = [];
+  const waitForMessage = (child, type) => {
+    const pending = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`timed out waiting for ${type}`));
+      }, 3_000);
+      const onMessage = message => {
+        if (message?.type !== type) return;
+        cleanup();
+        resolve(message);
+      };
+      const onExit = code => {
+        cleanup();
+        reject(new Error(`writer exited ${code} before ${type}`));
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        child.removeListener('message', onMessage);
+        child.removeListener('exit', onExit);
+      };
+      child.on('message', onMessage);
+      child.once('exit', onExit);
+    });
+    pendingMessages.push(pending);
+    return pending;
+  };
+  const spawnWriter = (name, pauseBeforeStaleRemove) => {
+    const source = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      const lockPath = ${JSON.stringify(lockPath)};
+      if (${pauseBeforeStaleRemove}) {
+        const originalRm = fs.promises.rm.bind(fs.promises);
+        let paused = false;
+        fs.promises.rm = async (target, options) => {
+          if (!paused && target === lockPath) {
+            paused = true;
+            process.send({ type: 'before-stale-remove' });
+            await new Promise(resolve => process.once('message', resolve));
+          }
+          return originalRm(target, options);
+        };
+        syncBuiltinESMExports();
+      }
+      const { atomicConfigUpdate } = await import(${JSON.stringify(moduleUrl)});
+      await atomicConfigUpdate(async config => {
+        process.send({ type: 'entered' });
+        await new Promise(resolve => process.once('message', resolve));
+        config.accounts.push({ name: ${JSON.stringify(name)}, type: 'apikey', apiKey: 'test' });
+      });
+      process.send({ type: 'done' });
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+      env: { ...process.env, TEAMCLAUDE_CONFIG: cfgPath },
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    return child;
+  };
+
+  try {
+    await writeFile(cfgPath, JSON.stringify({ proxy: { port: 1 }, accounts: [] }) + '\n',
+      { mode: 0o600 });
+    await writeFile(lockPath, JSON.stringify({ pid: 2_147_483_647, nonce: 'dead' }),
+      { mode: 0o600 });
+
+    const writerA = spawnWriter('A', true);
+    const aBeforeRemove = waitForMessage(writerA, 'before-stale-remove');
+    const aEntered = waitForMessage(writerA, 'entered');
+    const aDone = waitForMessage(writerA, 'done');
+    await aBeforeRemove;
+
+    const writerB = spawnWriter('B', false);
+    const bEntered = waitForMessage(writerB, 'entered');
+    const bDone = waitForMessage(writerB, 'done');
+    const bWasBlocked = await Promise.race([
+      bEntered.then(() => false),
+      new Promise(resolve => setTimeout(() => resolve(true), 150)),
+    ]);
+    assert.equal(bWasBlocked, true,
+      'a competing recovery must wait before it can replace the stale lock');
+
+    writerA.send('remove-stale-lock');
+    await aEntered;
+    writerA.send('write');
+    await aDone;
+
+    await bEntered;
+    writerB.send('write');
+    await bDone;
+
+    const final = JSON.parse(await readFile(cfgPath, 'utf8'));
+    assert.deepEqual(final.accounts.map(account => account.name).sort(), ['A', 'B']);
+  } finally {
+    for (const child of children) {
+      if (child.exitCode == null) child.kill('SIGKILL');
+    }
+    await Promise.allSettled(pendingMessages);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('atomicConfigUpdate recovers a lock whose owner process is dead', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-stale-lock-'));
   const cfgPath = join(dir, 'teamclaude.json');
