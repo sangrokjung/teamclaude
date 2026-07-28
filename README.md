@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-200%20passing-58e3a2?style=flat-square" alt="200 tests passing">
+  <img src="https://img.shields.io/badge/tests-291%20passing-58e3a2?style=flat-square" alt="291 tests passing">
   <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18+">
   <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="Zero runtime dependencies">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT License"></a>
