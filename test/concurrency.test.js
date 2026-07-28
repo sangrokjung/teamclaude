@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
@@ -677,6 +678,47 @@ test('relayRaw enforces the body-size cap on /v1/oauth/token', async () => {
 
   upstream.close();
   proxy.close();
+});
+
+test('relayRaw removes stale compression headers after upstream gzip decompression', async () => {
+  const payload = {
+    access_token: 'fresh-token-'.repeat(128),
+    token_type: 'bearer',
+  };
+  const compressed = gzipSync(JSON.stringify(payload));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-encoding': 'gzip',
+      'content-length': String(compressed.length),
+      'x-relay-check': 'kept',
+    });
+    res.end(compressed);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/oauth/token`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-encoding'), null);
+    assert.equal(response.headers.get('content-length'), null);
+    assert.equal(response.headers.get('x-relay-check'), 'kept');
+    assert.deepEqual(await response.json(), payload);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
 });
 
 test('relayRaw bounds an oversized upstream response and releases admission capacity', async () => {

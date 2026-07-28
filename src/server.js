@@ -757,7 +757,8 @@ async function relayRaw(
     }
     const responseHeaders = {};
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key === 'transfer-encoding' || key === 'connection') continue;
+      if (key === 'transfer-encoding' || key === 'connection'
+          || key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.status, responseHeaders);
