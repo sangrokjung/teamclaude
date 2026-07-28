@@ -4,6 +4,15 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
+const DEFAULT_TOKEN_REFRESH_INTERVAL_MS = 300_000;
+const MIN_TOKEN_REFRESH_INTERVAL_MS = 60_000;
+
+export function normalizeTokenRefreshIntervalMs(value) {
+  if (!Number.isFinite(value)) return DEFAULT_TOKEN_REFRESH_INTERVAL_MS;
+  if (value <= 0) return 0;
+  return Math.max(MIN_TOKEN_REFRESH_INTERVAL_MS, value);
+}
+
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
@@ -78,6 +87,7 @@ export function createDefaultConfig() {
       ? 'https://chatgpt.com/backend-api/codex'
       : 'https://api.anthropic.com',
     switchThreshold: 0.98,
+    tokenRefreshIntervalMs: DEFAULT_TOKEN_REFRESH_INTERVAL_MS,
     // Max simultaneous in-flight requests per account before load spreads to the
     // next account (per-account `maxConcurrent` overrides this). Tune to just
     // below where one account starts returning rate/concurrency 429s.

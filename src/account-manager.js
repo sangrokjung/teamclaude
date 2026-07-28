@@ -1,5 +1,7 @@
-import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
+
+const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
@@ -1045,6 +1047,7 @@ export class AccountManager {
           account.status = 'active';
           delete account._errorFromRefresh;
         }
+        delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         // Only persist if the account is still live at its claimed index. If it was
         // removed during the (awaited) network refresh, its `.index` is stale and
@@ -1053,11 +1056,12 @@ export class AccountManager {
         if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        account._refreshRetryAt = Date.now() + REFRESH_SWEEP_RETRY_MS;
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token.
         // Tag the cause only on the transition: a failed sweep must not relabel
         // an account already parked by the request path as refresh-caused.
-        if (!account.expiresAt || Date.now() >= account.expiresAt) {
+        if (!account.expiresAt || Date.now() >= normalizeExpiresAt(account.expiresAt)) {
           if (account.status !== 'error') {
             account.status = 'error';
             account._errorFromRefresh = true;
@@ -1081,8 +1085,10 @@ export class AccountManager {
     if (this._sweepInFlight) return 0;
     this._sweepInFlight = true;
     try {
+      const now = Date.now();
       const targets = this.accounts.filter(a =>
         a.type === 'oauth' && a.refreshToken
+        && (!a._refreshRetryAt || now >= a._refreshRetryAt)
         && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
       for (const account of targets) {
         // A still-valid error account is a no-op unless expiry is unknown.
@@ -1128,6 +1134,7 @@ export class AccountManager {
       account.status = 'active';
       delete account._errorFromRefresh;
     }
+    delete account._refreshRetryAt;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).

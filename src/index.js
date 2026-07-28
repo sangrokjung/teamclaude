@@ -7,7 +7,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -888,9 +888,7 @@ async function proxyWorkerCommand() {
     setInterval(saveQuotaSnapshot, 60_000).unref();
     // Keep idle OAuth refresh chains rotating and retry refresh-caused errors.
     // A numeric 0 disables the sweep; malformed values use the 5-minute default.
-    const tokenRefreshIntervalMs = Number.isFinite(config.tokenRefreshIntervalMs)
-      ? Math.max(0, config.tokenRefreshIntervalMs)
-      : 300_000;
+    const tokenRefreshIntervalMs = normalizeTokenRefreshIntervalMs(config.tokenRefreshIntervalMs);
     if (tokenRefreshIntervalMs > 0) {
       setImmediate(() => accountManager.refreshLapsedTokens());
       setInterval(() => accountManager.refreshLapsedTokens(), tokenRefreshIntervalMs).unref();

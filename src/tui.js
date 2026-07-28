@@ -458,6 +458,7 @@ export class TUI {
             amAcct.status = 'active';
             delete amAcct._errorFromRefresh;
           }
+          delete amAcct._refreshRetryAt;
         } else {
           // The matched config entry had no live AccountManager account (it was
           // skipped at load — e.g. previously tokenless). Now that we have fresh

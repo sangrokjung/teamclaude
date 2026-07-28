@@ -560,7 +560,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min). Set to `0` to disable the timer entirely — the active account then only changes when it becomes unavailable or via per-request 429 failover |
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
-| `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; `0` = disabled) |
+| `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled) |
 | `continuityMode` | Hold requests in the proxy while quota or global rate limits recover instead of returning 429 (optional, default `true`) |
 | `continuityMaxSleepMs` | Maximum interval between continuity probes (optional, default `30000`) |
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |

@@ -125,6 +125,8 @@ test('a refresh-caused error heals back to active on the next successful refresh
   let restore = fetchStub(async () => { throw new Error('fetch failed'); });
   try { await am.refreshLapsedTokens(); } finally { restore(); }
   assert.equal(acct.status, 'error', 'failed refresh of an expired token parks the account');
+  assert.ok(acct._refreshRetryAt > Date.now(), 'failed refresh is backed off');
+  acct._refreshRetryAt = Date.now() - 1;
 
   restore = fetchStub(async () => okTokenResponse());
   try { await am.refreshLapsedTokens(); } finally { restore(); }
@@ -255,4 +257,51 @@ test('a 401 on an EXPIRED token keeps the refresh-caused label (expiry explains 
   assert.equal(a.status, 'error');
   assert.equal(a._errorFromRefresh, true,
     'nothing beyond the expiry was proven — the sweep may still heal this account');
+});
+
+test('a failed proactive refresh does not park a seconds-form still-valid token', async () => {
+  const am = new AccountManager([{
+    name: 'seconds-expiry',
+    type: 'oauth',
+    refreshToken: 'renew-seconds',
+    expiresAt: Math.floor(Date.now() / 1000) + 60,
+  }], 0.98, 0, 3);
+  const account = am.accounts[0];
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error('fixture network failure');
+  };
+  try {
+    assert.equal(await am.refreshLapsedTokens(), 1);
+    assert.equal(attempts, 1);
+    assert.equal(account.status, 'active');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a failed expired-token sweep backs off before another endpoint attempt', async () => {
+  const am = new AccountManager([{
+    name: 'revoked',
+    type: 'oauth',
+    refreshToken: 'renew-revoked',
+    expiresAt: Date.now() - 1_000,
+  }], 0.98, 0, 3);
+  const account = am.accounts[0];
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    throw new Error('fixture endpoint rejection');
+  };
+  try {
+    assert.equal(await am.refreshLapsedTokens(), 1);
+    assert.equal(await am.refreshLapsedTokens(), 0);
+    assert.equal(attempts, 1);
+    assert.ok(account._refreshRetryAt > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
