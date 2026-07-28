@@ -154,6 +154,10 @@ async function superviseServerCommand() {
   const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  const requestBodyTimeoutMs = Number.isFinite(config.requestBodyTimeoutMs)
+      && config.requestBodyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.requestBodyTimeoutMs))
+    : 30_000;
   // Mirror of the worker's streamRecovery gate (see server.js): SSE relays are
   // framed to whole events so a worker crash mid-response can be converted into
   // a clean, client-retryable `overloaded_error` SSE event instead of a
@@ -268,7 +272,9 @@ async function superviseServerCommand() {
       const chunks = [];
       let size = 0;
       let settled = false;
+      let timer = null;
       const cleanup = () => {
+        if (timer) clearTimeout(timer);
         req.off('data', onData);
         req.off('end', onEnd);
         req.off('error', onError);
@@ -296,10 +302,20 @@ async function superviseServerCommand() {
       const onEnd = () => settle(resolve, Buffer.concat(chunks));
       const onError = err => settle(reject, err);
       const onAborted = () => settle(reject, new Error('Client disconnected'));
+      const onTimeout = () => {
+        chunks.length = 0;
+        req.pause();
+        const err = new Error('Request body timed out');
+        err.statusCode = 408;
+        err.closeConnection = true;
+        settle(reject, err);
+      };
       req.on('data', onData);
       req.once('end', onEnd);
       req.once('error', onError);
       req.once('aborted', onAborted);
+      timer = setTimeout(onTimeout, requestBodyTimeoutMs);
+      timer.unref();
     });
   }
 

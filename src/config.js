@@ -240,6 +240,7 @@ export function createDefaultConfig() {
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413
+    requestBodyTimeoutMs: 30000,        // total time allowed to receive one request body
     maxBufferedRequestBytes: 268435456, // 256 MiB request-buffer budget
     accounts: [],
   };

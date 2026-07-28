@@ -668,6 +668,89 @@ test('supervisor buffer budget limits the double-buffered public request count',
   }
 });
 
+test('supervisor releases admission after a partial request body deadline', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-body-timeout-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxConcurrentPerAccount: 1,
+    overflowQueueMaxDepth: 0,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 2048,
+    requestBodyTimeoutMs: 100,
+    accounts: [{
+      name: 'body-timeout-account',
+      type: 'apikey',
+      apiKey: 'body-timeout-placeholder',
+    }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let partialRequest = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const timeoutResponse = new Promise((resolve, reject) => {
+      partialRequest = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-length': '10' },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve({
+          status: response.statusCode,
+          connection: response.headers.connection,
+        }));
+      });
+      partialRequest.once('error', reject);
+      partialRequest.write('1');
+    });
+    await delay(25);
+
+    const blocked = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(blocked.status, 429);
+
+    const timedOut = await Promise.race([
+      timeoutResponse,
+      delay(1000).then(() => null),
+    ]);
+    assert.deepEqual(timedOut, { status: 408, connection: 'close' });
+
+    const recovered = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal(upstreamHits, 1);
+  } finally {
+    partialRequest?.destroy();
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor rejects when the budget cannot fit one double-buffered request', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-minimum-'));
   const configPath = join(dir, 'config.json');
