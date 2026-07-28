@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
@@ -659,5 +662,41 @@ test('codex provider keeps the legacy passthrough (no anthropic-shaped injection
   } finally {
     proxy.close();
     upstream.close();
+  }
+});
+
+test('SSE request logging is capped without truncating the client stream', async () => {
+  const frame = `event: content_block_delta\ndata: ${'x'.repeat(256)}\n\n`;
+  const full = frame.repeat(20);
+  const logDir = await mkdtemp(join(tmpdir(), 'teamclaude-stream-log-'));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(full);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    streamRecovery: false,
+    logDir,
+    maxResponseBytes: 1024,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await streamPost(proxyPort);
+    assert.equal(response.body, full, 'logging limits must not truncate the relayed stream');
+    let files = [];
+    for (let i = 0; i < 20 && files.length === 0; i++) {
+      await delay(10);
+      files = await readdir(logDir);
+    }
+    assert.equal(files.length, 1);
+    const log = await readFile(join(logDir, files[0]), 'utf8');
+    assert.match(log, /\[stream log truncated at 1024 bytes\]/);
+    assert.ok(log.length < full.length, 'the on-disk log must not retain the full oversized stream');
+  } finally {
+    proxy.close();
+    upstream.close();
+    await rm(logDir, { recursive: true, force: true });
   }
 });

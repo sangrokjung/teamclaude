@@ -492,6 +492,74 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
   }
 });
 
+test('live account removal lowers the supervisor admission cap', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-capacity-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  let upstreamHits = 0;
+  const upstream = http.createServer(() => {
+    upstreamHits += 1;
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxConcurrentPerAccount: 1,
+    overflowQueueMaxDepth: 0,
+    accounts: [
+      { name: 'keep', type: 'apikey', apiKey: 'key-a' },
+      { name: 'remove-me', type: 'apikey', apiKey: 'key-b' },
+    ],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const firstAbort = new AbortController();
+  let firstRequest = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const removed = spawnSync(process.execPath, [entry, 'remove', 'remove-me'], {
+      encoding: 'utf8',
+      env,
+      timeout: 10_000,
+    });
+    assert.equal(removed.status, 0, removed.stderr);
+    await waitUntil(async () => {
+      const response = await status(port);
+      return response && (await response.json()).accounts.length === 1;
+    }, 'live worker did not apply the removed account', 8000);
+
+    firstRequest = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: firstAbort.signal,
+    }).catch(() => null);
+    await waitUntil(() => upstreamHits === 1, 'first request did not reach upstream');
+
+    const rejected = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    const body = await rejected.json();
+    assert.equal(rejected.status, 429);
+    assert.equal(body.error?.message, 'Proxy supervisor queue is full');
+    assert.equal(upstreamHits, 1, 'the rejected request must not reach the worker or upstream');
+  } finally {
+    firstAbort.abort();
+    await firstRequest;
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('CLI api uses the live proxy for relative paths instead of refreshing an expired token itself', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-api-'));
   const configPath = join(dir, 'config.json');

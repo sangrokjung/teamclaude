@@ -274,6 +274,41 @@ test('continuity mode contains a global 429 burst and recovers without surfacing
   }
 });
 
+test('continuity mode bounds persistent global 429 retries', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(3), 0.98);
+  const proxy = startContinuityProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const previousRetries = process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 429);
+    assert.equal(body.error?.type, 'rate_limit_error');
+    assert.equal(upstreamHits, 6, 'initial + one failover per bounded continuity pass');
+    assert.ok(am.accounts.every(account => account.status === 'active'));
+    assert.ok(am.accounts.every(account => account.inflight === 0));
+  } finally {
+    if (previousRetries === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = previousRetries;
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('continuity mode waits for quota reset instead of returning all-accounts-exhausted', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {

@@ -24,6 +24,22 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 
+function publicRequestCapacity(config, accounts = config.accounts || []) {
+  const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
+    ? Math.max(1, config.maxConcurrentPerAccount)
+    : 3;
+  const accountCapacity = accounts.reduce((sum, account) => {
+    if (account.enabled === false) return sum;
+    return sum + (Number.isFinite(account.maxConcurrent)
+      ? Math.max(1, account.maxConcurrent)
+      : defaultConcurrent);
+  }, 0);
+  const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
+    ? Math.max(0, config.overflowQueueMaxDepth)
+    : 256;
+  return Math.max(1, accountCapacity + queueCapacity);
+}
+
 const args = process.argv.slice(2);
 const cliProvider = args[0] === 'codex' ? 'codex' : 'anthropic';
 if (cliProvider === 'codex') {
@@ -125,19 +141,7 @@ async function superviseServerCommand() {
     return;
   }
 
-  const defaultConcurrent = Number.isFinite(config.maxConcurrentPerAccount)
-    ? Math.max(1, config.maxConcurrentPerAccount)
-    : 3;
-  const accountCapacity = (config.accounts || []).reduce((sum, account) => {
-    if (account.enabled === false) return sum;
-    return sum + (Number.isFinite(account.maxConcurrent)
-      ? Math.max(1, account.maxConcurrent)
-      : defaultConcurrent);
-  }, 0);
-  const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
-    ? Math.max(0, config.overflowQueueMaxDepth)
-    : 256;
-  const maxPublicRequests = Math.max(1, accountCapacity + queueCapacity);
+  let maxPublicRequests = publicRequestCapacity(config);
   const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
@@ -520,7 +524,15 @@ async function superviseServerCommand() {
         requestShutdown({ workerWillExit: true });
         return;
       }
+      if (message?.type === 'teamcodex:capacity'
+          && Number.isFinite(message.maxPublicRequests)) {
+        maxPublicRequests = Math.max(1, Math.floor(message.maxPublicRequests));
+        return;
+      }
       if (message?.type !== 'teamcodex:ready' || !message.internalPort) return;
+      if (Number.isFinite(message.maxPublicRequests)) {
+        maxPublicRequests = Math.max(1, Math.floor(message.maxPublicRequests));
+      }
       becameReady = true;
       workerReady = true;
       workerPort = message.internalPort;
@@ -871,6 +883,12 @@ async function proxyWorkerCommand() {
       const diskConfig = await loadConfig();
       if (!diskConfig) return;
       await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (process.connected) {
+        process.send({
+          type: 'teamcodex:capacity',
+          maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
+        });
+      }
       console.log('[TeamClaude] Applied account config without restarting the worker');
     }).catch(err => {
       console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
@@ -893,7 +911,12 @@ async function proxyWorkerCommand() {
     server.removeListener('error', onListenError);
     const address = server.address();
     if (process.connected && typeof address === 'object') {
-      process.send({ type: 'teamcodex:ready', port, internalPort: address.port });
+      process.send({
+        type: 'teamcodex:ready',
+        port,
+        internalPort: address.port,
+        maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
+      });
     }
     // Persist the quota snapshot on every exit path (TUI quit, SIGINT/SIGTERM
     // → server.close → process.exit) and every minute as a crash backstop

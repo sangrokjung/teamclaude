@@ -1278,8 +1278,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
       }
-      if (ctx.continuity.enabled && !res.destroyed) {
-        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally`);
+      const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+      if (ctx.continuity.enabled && !res.destroyed && ctx.overloadRetries < maxOverload) {
+        ctx.overloadRetries += 1;
+        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally (retry ${ctx.overloadRetries}/${maxOverload})`);
         releaseHeld();
         ctx.continuity.defer(retryAfter);
         await ctx.continuity.waitGlobal(ctx.abortSignal);
@@ -1403,7 +1405,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
 
     if (isStreaming && upstreamRes.body) {
-      const streamLog = logDir ? [] : null;
+      const streamLog = logDir
+        ? { chunks: [], bytes: 0, truncated: false, maxBytes: ctx.maxResponseBytes }
+        : null;
       // With recovery on, response headers are DEFERRED until the first whole
       // SSE frame arrives: an upstream that dies before producing anything
       // leaves the client response untouched and fully replayable on another
@@ -1484,7 +1488,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
       }
       if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===\n${streamLog.join('')}`);
+        const loggedBody = Buffer.concat(streamLog.chunks, streamLog.bytes).toString();
+        const truncation = streamLog.truncated
+          ? `\n[stream log truncated at ${streamLog.maxBytes} bytes]`
+          : '';
+        logSections.push(`=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===\n${loggedBody}${truncation}`);
         writeRequestLog(logDir, reqId, logSections);
       }
     } else {
@@ -1658,7 +1666,15 @@ async function streamResponse(
     ensureHeaders?.(); // first whole frame is ready — commit the deferred headers
     const ok = res.write(bytes);
     const text = decoder.decode(bytes, { stream: true });
-    if (streamLog) streamLog.push(text);
+    if (streamLog && !streamLog.truncated) {
+      const remaining = streamLog.maxBytes - streamLog.bytes;
+      const logged = bytes.length <= remaining ? bytes : bytes.subarray(0, remaining);
+      if (logged.length > 0) {
+        streamLog.chunks.push(Buffer.from(logged));
+        streamLog.bytes += logged.length;
+      }
+      if (logged.length < bytes.length) streamLog.truncated = true;
+    }
     sseBuffer += text;
     const events = sseBuffer.split('\n\n');
     sseBuffer = events.pop(); // keep incomplete event
