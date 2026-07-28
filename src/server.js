@@ -47,7 +47,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       && config.maxBufferedRequestBytes > 0
     ? config.maxBufferedRequestBytes
     : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
-  const maxBufferedRequests = Math.max(1, Math.floor(maxBufferedRequestBytes / maxBodyBytes));
+  const maxBufferedRequests = Math.floor(maxBufferedRequestBytes / maxBodyBytes);
   // Connection affinity: keep one client connection's sequential requests on the
   // same account for prompt-cache locality (HTTP/1.1 keep-alive reuses the socket
   // for a session's sequential turns). Soft — overflow still spreads. Set

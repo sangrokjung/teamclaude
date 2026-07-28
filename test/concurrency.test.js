@@ -889,6 +889,37 @@ test('buffer budget caps worker admission below a large account queue capacity',
   }
 });
 
+test('worker rejects before buffering when the budget cannot fit one maximum request', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 8, 8);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1023,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+    });
+    assert.equal(response.status, 429);
+    assert.equal(hits, 0, 'an under-sized budget must reject before reaching upstream');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // ── disable / enable + priority (account on-off switch + selection order) ──────
 
 test('a disabled account is excluded from acquire selection', async () => {

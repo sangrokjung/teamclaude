@@ -45,8 +45,8 @@ function publicRequestCapacity(config, accounts = config.accounts || []) {
       && config.maxBufferedRequestBytes > 0
     ? config.maxBufferedRequestBytes
     : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
-  const bufferCapacity = Math.max(1, Math.floor(bufferBudget / (maxRequestBytes * 2)));
-  return Math.max(1, Math.min(accountCapacity + queueCapacity, bufferCapacity));
+  const bufferCapacity = Math.floor(bufferBudget / (maxRequestBytes * 2));
+  return Math.min(accountCapacity + queueCapacity, bufferCapacity);
 }
 
 const args = process.argv.slice(2);
@@ -207,14 +207,15 @@ async function superviseServerCommand() {
       }));
       return;
     }
-    if (activePublicRequests >= maxPublicRequests) {
+    const bypassAdmission = req.method === 'GET' && req.url === '/teamclaude/status';
+    if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
       req.resume();
       res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' });
       res.end(JSON.stringify({ error: { type: 'overloaded_error', message: 'Proxy supervisor queue is full' } }));
       return;
     }
-    activePublicRequests += 1;
-    let released = false;
+    if (!bypassAdmission) activePublicRequests += 1;
+    let released = bypassAdmission;
     const release = () => {
       if (released) return;
       released = true;
@@ -535,12 +536,12 @@ async function superviseServerCommand() {
       }
       if (message?.type === 'teamcodex:capacity'
           && Number.isFinite(message.maxPublicRequests)) {
-        maxPublicRequests = Math.max(1, Math.floor(message.maxPublicRequests));
+        maxPublicRequests = Math.max(0, Math.floor(message.maxPublicRequests));
         return;
       }
       if (message?.type !== 'teamcodex:ready' || !message.internalPort) return;
       if (Number.isFinite(message.maxPublicRequests)) {
-        maxPublicRequests = Math.max(1, Math.floor(message.maxPublicRequests));
+        maxPublicRequests = Math.max(0, Math.floor(message.maxPublicRequests));
       }
       becameReady = true;
       workerReady = true;

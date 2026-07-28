@@ -643,6 +643,55 @@ test('supervisor buffer budget limits the double-buffered public request count',
   }
 });
 
+test('supervisor rejects when the budget cannot fit one double-buffered request', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-minimum-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 2047,
+    accounts: [{
+      name: 'budget-account',
+      type: 'oauth',
+      accountUuid: 'budget-uuid',
+      accessToken: 'budget-placeholder',
+      refreshToken: 'budget-placeholder',
+      expiresAt: Date.now() + 3600_000,
+    }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(response.status, 429);
+    assert.equal(upstreamHits, 0, 'an under-sized supervisor budget must reject before the worker');
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('live account removal lowers the supervisor admission cap', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-capacity-'));
   const configPath = join(dir, 'config.json');
