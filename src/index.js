@@ -257,27 +257,39 @@ async function superviseServerCommand() {
     return new Promise((resolve, reject) => {
       const chunks = [];
       let size = 0;
-      let tooLarge = false;
-      req.on('data', chunk => {
+      let settled = false;
+      const cleanup = () => {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+        req.off('aborted', onAborted);
+      };
+      const settle = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      };
+      const onData = chunk => {
         size += chunk.length;
         if (size > maxRequestBytes) {
-          tooLarge = true;
           chunks.length = 0;
-        } else if (!tooLarge) {
-          chunks.push(chunk);
-        }
-      });
-      req.once('end', () => {
-        if (tooLarge) {
+          req.pause();
           const err = new Error('Request body too large');
           err.statusCode = 413;
-          reject(err);
+          err.closeConnection = true;
+          settle(reject, err);
           return;
         }
-        resolve(Buffer.concat(chunks));
-      });
-      req.once('error', reject);
-      req.once('aborted', () => reject(new Error('Client disconnected')));
+        chunks.push(chunk);
+      };
+      const onEnd = () => settle(resolve, Buffer.concat(chunks));
+      const onError = err => settle(reject, err);
+      const onAborted = () => settle(reject, new Error('Client disconnected'));
+      req.on('data', onData);
+      req.once('end', onEnd);
+      req.once('error', onError);
+      req.once('aborted', onAborted);
     });
   }
 
@@ -334,7 +346,13 @@ async function superviseServerCommand() {
       body = await bufferRequest(req);
     } catch (err) {
       if (!res.headersSent && !res.destroyed) {
-        res.writeHead(err.statusCode || 400, { 'content-type': 'application/json' });
+        const headers = { 'content-type': 'application/json' };
+        if (err.closeConnection) {
+          headers.connection = 'close';
+          res.shouldKeepAlive = false;
+          res.once('finish', () => req.destroy());
+        }
+        res.writeHead(err.statusCode || 400, headers);
         res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: err.message } }));
       }
       return;

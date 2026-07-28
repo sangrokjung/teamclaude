@@ -450,8 +450,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      const isStatusRequest = req.method === 'GET' && req.url === '/teamclaude/status';
+      const contentLength = req.headers['content-length'];
+      const bodyFreeStatus = isStatusRequest
+        && (contentLength == null || contentLength === '0')
+        && req.headers['transfer-encoding'] == null;
+
+      if (bodyFreeStatus) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // `host` rides along so `teamcodex status` (a separate process) can show
         // the machine the PROXY runs on — CPU% is measured between status calls
@@ -526,6 +531,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             return;
           }
           const body = Buffer.concat(bodyChunks);
+          if (isStatusRequest) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Status requests must not include a body.' },
+            }));
+            return;
+          }
           ctx.model = extractRequestModel(body);
 
           // Tie an abort signal to client disconnect so a request that's only

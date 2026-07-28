@@ -709,6 +709,65 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
   }
 });
 
+test('supervisor rejects an oversized body before the request ends', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-body-limit-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxRequestBytes: 4,
+    maxBufferedRequestBytes: 8,
+    accounts: [{
+      name: 'body-limit-account',
+      type: 'oauth',
+      accountUuid: 'body-limit-uuid',
+      accessToken: 'body-limit-placeholder',
+      refreshToken: 'body-limit-placeholder',
+      expiresAt: Date.now() + 3600_000,
+    }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let request = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const responseStatus = new Promise((resolve, reject) => {
+      request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', reject);
+      request.write('12345');
+    });
+    const statusCode = await Promise.race([
+      responseStatus,
+      delay(1000).then(() => 'timeout'),
+    ]);
+    assert.equal(statusCode, 413, 'the supervisor must not wait for request end after the size cap');
+  } finally {
+    request?.destroy();
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('live account removal lowers the supervisor admission cap', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-capacity-'));
   const configPath = join(dir, 'config.json');

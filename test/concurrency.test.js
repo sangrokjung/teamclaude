@@ -908,6 +908,25 @@ test('worker rejects before buffering when the budget cannot fit one maximum req
   const port = await listen(proxy);
 
   try {
+    const health = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    assert.equal(health.status, 200);
+    const bodyBearingStatus = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/teamclaude/status',
+        method: 'GET',
+        headers: { 'content-length': '2' },
+      }, response => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', reject);
+      request.end('{}');
+    });
+    assert.equal(bodyBearingStatus, 429,
+      'a direct status GET with a body must not bypass the worker buffer budget');
+
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
       body: '{}',
