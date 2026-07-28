@@ -20,6 +20,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 // default continuityMaxSleepMs (30s) this is ~5 minutes.
 const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
+const DEFAULT_STREAM_TRANSACTION_MAX_BYTES = 64 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -66,6 +67,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Anthropic-only: the Codex backend's in-stream error contract differs, so
   // codex mode keeps the legacy passthrough. `streamRecovery: false` opts out.
   const streamRecovery = provider === 'anthropic' && config.streamRecovery !== false;
+  const streamTransactionMaxBytes = Number.isFinite(config.streamTransactionMaxBytes)
+    ? Math.max(1, Math.floor(config.streamTransactionMaxBytes))
+    : DEFAULT_STREAM_TRANSACTION_MAX_BYTES;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -480,7 +484,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, streamTransactionMaxBytes };
         try {
           // Buffer request body (needed for retry on 429), bounded by maxBodyBytes.
           const bodyChunks = [];
@@ -1303,16 +1307,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // (2) Every account 5xx'd for this request → upstream overload. Back off and
       // retry the whole fleet so the client transparently rides out the blip.
-      if (!res.destroyed && (ctx.continuity.enabled || ctx.overloadRetries < maxOverload)) {
+      if (!res.destroyed && ctx.overloadRetries < maxOverload) {
         const waitMs = Math.min(
           backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
           backoffCap,
         );
         ctx.overloadRetries += 1;
-        const retryLimit = ctx.continuity.enabled ? '∞' : maxOverload;
-        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${retryLimit})`);
+        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${retryLimit}) ===`);
+          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
           writeRequestLog(logDir, reqId, logSections);
         }
         await sleepOrAbort(waitMs, ctx.abortSignal);
@@ -1382,7 +1385,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.streamRecovery,
         ctx.streamRecovery && ctx.continuity.enabled,
         ensureHeaders,
+        ctx.streamTransactionMaxBytes,
       );
+      if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
+        ctx.status = 502;
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'proxy_error',
+            message: `Upstream stream exceeded the ${ctx.streamTransactionMaxBytes}-byte transaction limit.`,
+          },
+        }));
+        return;
+      }
       if (outcome.preStreamFailure && !res.headersSent && !res.destroyed) {
         // Nothing reached the client. Replay on another account exactly like a
         // pre-stream transient error (per-request exclusion, no account
@@ -1401,7 +1417,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
-        if (ctx.continuity.enabled) {
+        const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+        if (ctx.continuity.enabled && ctx.overloadRetries < maxOverload) {
           const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
           const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
           const waitMs = Math.min(
@@ -1409,7 +1426,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             backoffCap,
           );
           ctx.overloadRetries += 1;
-          console.log(`[TeamClaude] Upstream stream failed on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/∞)`);
+          console.log(`[TeamClaude] Upstream stream failed on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
           releaseHeld();
           await sleepOrAbort(waitMs, ctx.abortSignal);
           if (res.destroyed || ctx.abortSignal?.aborted) return;
@@ -1566,6 +1583,7 @@ async function streamResponse(
   recover = false,
   transactional = false,
   ensureHeaders = null,
+  transactionMaxBytes = DEFAULT_STREAM_TRANSACTION_MAX_BYTES,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
@@ -1576,7 +1594,12 @@ async function streamResponse(
   let spillFile = null;
   let spillPath = null;
   let spillUnlinked = false;
-  const outcome = { injected: false, reason: null, preStreamFailure: null };
+  const outcome = {
+    injected: false,
+    reason: null,
+    preStreamFailure: null,
+    limitExceeded: false,
+  };
 
   // Append a well-formed retryable error frame and end. Only called when every
   // byte written so far ended at an event boundary (the framer guarantees it),
@@ -1636,6 +1659,10 @@ async function streamResponse(
   };
 
   const stageChunk = async (bytes) => {
+    if (bufferedBytes + bytes.length > transactionMaxBytes) {
+      outcome.limitExceeded = true;
+      return false;
+    }
     const copy = Buffer.from(bytes);
     if (!spillFile && bufferedBytes + copy.length > TRANSACTION_MEMORY_BYTES) {
       spillPath = join(tmpdir(), `teamclaude-stream-${process.pid}-${randomUUID()}.tmp`);
@@ -1650,12 +1677,12 @@ async function streamResponse(
     if (spillFile) await writeSpill(copy);
     else bufferedFrames.push(copy);
     bufferedBytes += copy.length;
+    return true;
   };
 
   const relayChunk = async (bytes) => {
     if (transactional) {
-      await stageChunk(bytes);
-      return true;
+      return stageChunk(bytes);
     }
     if (!forwardChunk(bytes)) await waitForDrain();
     return !res.destroyed;
@@ -1737,6 +1764,8 @@ async function streamResponse(
       if (!await relayChunk(bytes)) break;
     }
 
+    if (outcome.limitExceeded) return outcome;
+
     // Parse any remaining (partial / never-forwarded) text for usage tracking
     const tail = framer && framer.pending.length ? decoder.decode(framer.pending) : '';
     if ((sseBuffer + tail).trim()) {
@@ -1748,8 +1777,11 @@ async function streamResponse(
         // Complete stream — flush any trailing bytes after the terminal event
         // (comments / blank lines) for byte fidelity; finally ends normally.
         if (framer.pending.length) {
-          if (transactional) await stageChunk(framer.pending);
-          else res.write(framer.pending);
+          if (transactional) {
+            if (!await stageChunk(framer.pending)) return outcome;
+          } else {
+            res.write(framer.pending);
+          }
         }
         if (transactional) await flushTransaction();
       } else if (transactional) {

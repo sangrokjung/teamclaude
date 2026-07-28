@@ -107,7 +107,7 @@ test('all accounts 529 → bounded backoff retries, then passes 529 through (no 
   }
 });
 
-test('continuity mode keeps retrying past the finite 529 budget and returns eventual success', async () => {
+test('continuity mode retries within the finite 529 budget and returns eventual success', async () => {
   process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
   process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
   process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
@@ -115,7 +115,7 @@ test('continuity mode keeps retrying past the finite 529 budget and returns even
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits += 1;
-    if (upstreamHits <= 3) {
+    if (upstreamHits <= 2) {
       overloaded529(res);
       return;
     }
@@ -137,9 +137,9 @@ test('continuity mode keeps retrying past the finite 529 budget and returns even
       body: JSON.stringify({ model: 'x', messages: [] }),
       signal: AbortSignal.timeout(3000),
     });
-    assert.equal(res.status, 200, 'finite retry budget must not leak a 529 in continuity mode');
+    assert.equal(res.status, 200, 'recovery within the retry budget must stay transparent');
     assert.deepEqual(await res.json(), { ok: true });
-    assert.equal(upstreamHits, 4, 'the request must remain inside the proxy until upstream recovers');
+    assert.equal(upstreamHits, 3, 'the request must remain inside the proxy until upstream recovers');
     assert.equal(am.accounts[0].status, 'active');
   } finally {
     proxy.close();
@@ -147,6 +147,49 @@ test('continuity mode keeps retrying past the finite 529 budget and returns even
     delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
     delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
     delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  }
+});
+
+test('continuity mode bounds persistent 529 retries and releases the request', async () => {
+  const previousRetries = process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+  const previousBase = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+  const previousCap = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    overloaded529(res);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'api', credential: 'test-credential' },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    await res.text();
+    assert.equal(res.status, 529);
+    assert.equal(upstreamHits, 3, 'one initial attempt plus two continuity retries');
+    assert.equal(am.accounts[0].inflight, 0, 'the bounded request must release its account slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+    if (previousRetries === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = previousRetries;
+    if (previousBase === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = previousBase;
+    if (previousCap === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = previousCap;
   }
 });
 

@@ -200,6 +200,49 @@ test('continuity mode retries a broken SSE on the same account after fleet backo
   }
 });
 
+test('continuity mode bounds persistent pre-stream SSE failures', async () => {
+  const previousRetries = process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+  const previousBase = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+  const previousCap = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  let requests = 0;
+  const upstream = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    setTimeout(() => res.socket.destroy(), 5);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    await res.text();
+    assert.equal(res.status, 529);
+    assert.equal(requests, 3, 'one initial stream plus two continuity retries');
+    assert.equal(am.accounts[0].inflight, 0, 'the bounded request must release its account slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+    if (previousRetries === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    else process.env.TEAMCLAUDE_OVERLOAD_RETRIES = previousRetries;
+    if (previousBase === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = previousBase;
+    if (previousCap === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = previousCap;
+  }
+});
+
 test('upstream ends cleanly WITHOUT message_stop → truncation detected, error injected', async () => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -274,6 +317,40 @@ test('continuity mode spills a large complete SSE transaction and preserves byte
     assert.equal(r.cleanEnd, true);
     assert.equal(r.body, full);
     assert.ok(!r.body.includes('overloaded_error'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('transactional SSE rejects a response above the configured spool ceiling', async () => {
+  const largeText = 'x'.repeat(4096);
+  const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"${largeText}"}}\n\n`
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(full);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    streamTransactionMaxBytes: 1024,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 502);
+    assert.equal(body.error?.type, 'proxy_error');
+    assert.equal(am.accounts[0].inflight, 0, 'the rejected stream must release its account slot');
   } finally {
     proxy.close();
     upstream.close();
