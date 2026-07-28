@@ -1027,11 +1027,24 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
+      const previousTokens = {
+        accessToken: account.credential,
+        refreshToken: account.refreshToken,
+        expiresAt: account.expiresAt,
+      };
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
         const newTokens = account.provider === 'codex'
           ? await refreshCodexAccessToken(account.refreshToken)
           : await refreshAccessToken(account.refreshToken);
+        // Another live sync may have installed a newer rotated token while this
+        // network request was in flight. Never let the late result from the old
+        // refresh token replace that newer credential.
+        if (account.credential !== previousTokens.accessToken
+          || account.refreshToken !== previousTokens.refreshToken) {
+          console.log(`[TeamClaude] Discarded stale token refresh for account "${account.name}"`);
+          return;
+        }
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
@@ -1053,7 +1066,9 @@ export class AccountManager {
         // removed during the (awaited) network refresh, its `.index` is stale and
         // would misattribute the write to the survivor that shifted into that slot
         // — and a deleted account's tokens don't need persisting anyway.
-        if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, newTokens);
+        if (this.accounts[account.index] === account) {
+          await this._onTokenRefresh?.(account.index, newTokens, previousTokens);
+        }
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         account._refreshRetryAt = Date.now() + REFRESH_SWEEP_RETRY_MS;
@@ -1118,10 +1133,15 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
-  }) {
+  }, persist = true) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
+    const previousTokens = {
+      accessToken: account.credential,
+      refreshToken: account.refreshToken,
+      expiresAt: account.expiresAt,
+    };
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
@@ -1138,13 +1158,13 @@ export class AccountManager {
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).
-    if (this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
+    if (persist && this.accounts[account.index] === account) this._onTokenRefresh?.(account.index, {
       accessToken,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
       idToken: account.idToken,
       accountId: account.accountId,
-    });
+    }, previousTokens);
   }
 
   /**

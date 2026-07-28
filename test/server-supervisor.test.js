@@ -419,3 +419,206 @@ console.log(JSON.stringify({ ok: response.ok, accounts: body.accounts.length }))
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('CLI remove reloads the live worker while preserving the public supervisor', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-remove-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [
+      { name: 'keep', type: 'apikey', apiKey: 'key-a' },
+      { name: 'remove-me', type: 'apikey', apiKey: 'key-b' },
+    ],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+
+    const result = spawnSync(process.execPath, [entry, 'remove', 'remove-me'], {
+      encoding: 'utf8',
+      env,
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const reloaded = await waitUntil(async () => {
+      const response = await status(port);
+      if (!response) return null;
+      const body = await response.json();
+      const state = await readState(statePath);
+      return body.accounts.length === 1
+        ? { body, state }
+        : null;
+    }, 'live worker did not apply the removed account', 8000);
+
+    assert.equal(reloaded.state.pid, initial.pid, 'public supervisor PID must stay stable');
+    assert.equal(reloaded.state.pid, child.pid);
+    assert.equal(reloaded.state.workerPid, initial.workerPid,
+      'account-only reload must preserve the worker and active connections');
+    assert.deepEqual(reloaded.body.accounts.map(account => account.name), ['keep']);
+
+    const removeLast = spawnSync(process.execPath, [entry, 'remove', 'keep'], {
+      encoding: 'utf8',
+      env,
+      timeout: 10_000,
+    });
+    assert.equal(removeLast.status, 0, removeLast.stderr);
+    await waitUntil(async () => {
+      const response = await status(port);
+      if (!response) return false;
+      return (await response.json()).accounts.length === 0;
+    }, 'last account removal was not applied live');
+    const unavailable = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(unavailable.status, 429, 'zero-account proxy must fail promptly, not hang');
+    assert.equal((await readState(statePath)).workerPid, initial.workerPid);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI api uses the live proxy for relative paths instead of refreshing an expired token itself', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-api-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{
+      name: 'expired',
+      type: 'oauth',
+      accessToken: 'expired-access',
+      refreshToken: 'must-not-be-used-by-cli',
+      expiresAt: Date.now() - 60_000,
+    }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const result = spawnSync(process.execPath, [entry, 'api', '/teamclaude/status'], {
+      encoding: 'utf8',
+      env,
+      timeout: 10_000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const body = JSON.parse(result.stdout);
+    assert.equal(body.accounts.length, 1);
+    assert.equal(body.accounts[0].name, 'expired');
+
+    const listed = spawnSync(process.execPath, [entry, 'accounts'], {
+      encoding: 'utf8',
+      env,
+      timeout: 10_000,
+    });
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.match(listed.stdout, /token refresh managed by running proxy/);
+    const persisted = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(persisted.accounts[0].refreshToken, 'must-not-be-used-by-cli',
+      'accounts/api CLI must not rotate the running worker credential');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('accounts does not attach a stale profile identity after a concurrent re-import', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-profile-cas-'));
+  const configPath = join(dir, 'config.json');
+  const preloadPath = join(dir, 'mock-profile.mjs');
+  const startedPath = join(dir, 'profile-started');
+  const releasePath = join(dir, 'profile-release');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    accounts: [{
+      name: 'same-name',
+      type: 'oauth',
+      accessToken: 'old-access',
+      refreshToken: 'old-refresh',
+      expiresAt: Date.now() + 3_600_000,
+    }],
+  }));
+  await writeFile(preloadPath, `
+import { existsSync, writeFileSync } from 'node:fs';
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+  if (String(input).includes('/api/oauth/profile')) {
+    writeFileSync(${JSON.stringify(startedPath)}, '1');
+    while (!existsSync(${JSON.stringify(releasePath)})) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    return new Response(JSON.stringify({
+      account: { uuid: 'old-uuid', email: 'old@example.invalid' },
+      organization: { name: 'old-org' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  return realFetch(input, init);
+};
+`);
+  const env = {
+    ...process.env,
+    TEAMCLAUDE_CONFIG: configPath,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+  };
+  const listing = spawn(process.execPath, [entry, 'accounts'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let listingStderr = '';
+  listing.stderr.on('data', chunk => { listingStderr += chunk; });
+  const listingExit = once(listing, 'exit');
+
+  try {
+    await waitUntil(async () => {
+      try { await readFile(startedPath); return true; } catch { return false; }
+    }, 'profile request did not start');
+
+    const moduleUrl = new URL('../src/config.js', import.meta.url).href;
+    const writer = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+      import { atomicConfigUpdate } from ${JSON.stringify(moduleUrl)};
+      await atomicConfigUpdate(config => {
+        const account = config.accounts.find(item => item.name === 'same-name');
+        account.accessToken = 'new-access';
+        account.refreshToken = 'new-refresh';
+        account.accountUuid = 'new-uuid';
+      });
+    `], {
+      encoding: 'utf8',
+      env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+      timeout: 10_000,
+    });
+    assert.equal(writer.status, 0, writer.stderr);
+    await writeFile(releasePath, '1');
+    const [listingCode] = await listingExit;
+    assert.equal(listingCode, 0, listingStderr);
+
+    const final = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(final.accounts[0].accessToken, 'new-access');
+    assert.equal(final.accounts[0].accountUuid, 'new-uuid',
+      'old profile UUID must not be attached to the replacement credential');
+  } finally {
+    if (listing.exitCode == null) listing.kill('SIGKILL');
+    await rm(dir, { recursive: true, force: true });
+  }
+});

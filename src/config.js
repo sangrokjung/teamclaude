@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { readFile, mkdir, rm, open, rename, link } from 'node:fs/promises';
+import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -11,6 +11,121 @@ export function normalizeTokenRefreshIntervalMs(value) {
   if (!Number.isFinite(value)) return DEFAULT_TOKEN_REFRESH_INTERVAL_MS;
   if (value <= 0) return 0;
   return Math.max(MIN_TOKEN_REFRESH_INTERVAL_MS, value);
+}
+
+// Every persistent file here is written via write-to-temp → fsync → rename.
+// A plain in-place write truncates first, so a process death mid-write (OOM
+// kill, crash, power loss) leaves a 0-byte file — which is exactly how the
+// whole account fleet's credentials were lost on 2026-07-27 under memory
+// pressure. rename() on the same filesystem is atomic: readers (and the next
+// boot) see either the old file or the new one, never a partial.
+async function writeFileAtomic(path, data, mode = 0o600) {
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    const fh = await open(tmp, 'w', mode);
+    try {
+      await fh.writeFile(data);
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
+}
+
+const CONFIG_LOCK_TIMEOUT_MS = 120_000;
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+/**
+ * Serialize config read-modify-write cycles across processes.
+ *
+ * The candidate is fully written before link() publishes it as `<config>.lock`,
+ * so a crash cannot leave a half-written owner record. A dead owner's lock is
+ * recoverable; a live owner is never timed out and stolen.
+ */
+async function withConfigLock(operation) {
+  const path = getConfigPath();
+  const lockPath = `${path}.lock`;
+  const nonce = randomBytes(12).toString('hex');
+  const owner = JSON.stringify({ pid: process.pid, nonce });
+  const deadline = Date.now() + CONFIG_LOCK_TIMEOUT_MS;
+  await mkdir(dirname(path), { recursive: true });
+
+  while (true) {
+    const candidate = `${lockPath}.candidate-${process.pid}-${randomBytes(4).toString('hex')}`;
+    await writeFileAtomic(candidate, owner);
+    try {
+      await link(candidate, lockPath);
+      await rm(candidate, { force: true }).catch(() => {});
+      break;
+    } catch (err) {
+      await rm(candidate, { force: true }).catch(() => {});
+      if (err.code !== 'EEXIST') throw err;
+
+      let current = null;
+      try {
+        current = JSON.parse(await readFile(lockPath, 'utf8'));
+      } catch (readErr) {
+        if (readErr.code === 'ENOENT') continue;
+      }
+      if (current?.pid && !isProcessAlive(current.pid)) {
+        // Re-read immediately before unlinking so a concurrently-recovered lock
+        // is not mistaken for the dead owner we observed above.
+        try {
+          const latest = JSON.parse(await readFile(lockPath, 'utf8'));
+          if (latest.pid === current.pid && latest.nonce === current.nonce) {
+            await rm(lockPath, { force: true });
+          }
+        } catch {}
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for config lock held by pid ${current?.pid || 'unknown'}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 30)));
+    }
+  }
+
+  try {
+    return await operation();
+  } finally {
+    try {
+      const current = JSON.parse(await readFile(lockPath, 'utf8'));
+      if (current.pid === process.pid && current.nonce === nonce) {
+        await rm(lockPath, { force: true });
+      }
+    } catch {}
+  }
+}
+
+// Sync twin for the process-'exit' handler, where async I/O never completes.
+function writeFileAtomicSync(path, data, mode = 0o600) {
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+  try {
+    const fd = openSync(tmp, 'w', mode);
+    try {
+      writeSync(fd, data);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+    throw err;
+  }
 }
 
 export function getConfigPath() {
@@ -33,7 +148,7 @@ export function getServerStatePath() {
 export async function writeServerState(state) {
   const path = getServerStatePath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  await writeFileAtomic(path, JSON.stringify(state, null, 2) + '\n');
 }
 
 export async function readServerState() {
@@ -71,7 +186,7 @@ export function writeQuotaCacheSync(data) {
   try {
     const path = getQuotaCachePath();
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+    writeFileAtomicSync(path, JSON.stringify(data, null, 2) + '\n');
   } catch { /* best-effort — a failed snapshot must never break the proxy */ }
 }
 
@@ -136,17 +251,25 @@ export async function loadConfig() {
 export async function loadOrCreateConfig() {
   let config = await loadConfig();
   if (!config) {
-    config = createDefaultConfig();
-    await saveConfig(config);
-    console.log(`Created config at ${getConfigPath()}`);
+    config = await enqueueConfigWrite(() => withConfigLock(async () => {
+      // Another process may have created (and populated) the file between the
+      // optimistic read above and lock acquisition. Re-read under the lock so a
+      // first-run CLI cannot overwrite those newly-added accounts with defaults.
+      const existing = await loadConfig();
+      if (existing) return existing;
+      const created = createDefaultConfig();
+      await saveConfigUnlocked(created);
+      console.log(`Created config at ${getConfigPath()}`);
+      return created;
+    }));
   }
   return config;
 }
 
-export async function saveConfig(config) {
+async function saveConfigUnlocked(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  await writeFileAtomic(path, JSON.stringify(config, null, 2) + '\n');
 }
 
 /**
@@ -158,24 +281,29 @@ export async function saveConfig(config) {
  * re-reads the whole file, mutates, and writes it all back, so two concurrent callers
  * — e.g. a background token refresh and a TUI save/delete — would each read the same
  * snapshot and the later write would clobber the earlier one's change (resurrecting a
- * just-deleted account, or dropping a freshly-refreshed token). Chaining makes each
- * cycle observe the previous cycle's write. Cross-PROCESS races remain (the
- * single-proxy design assumption); a CLI write while the server runs is reconciled on
- * the next reload.
+ * just-deleted account, or dropping a freshly-refreshed token). The lock above extends
+ * the same guarantee across processes, including a running server and concurrent CLI.
  */
 let _configWriteChain = Promise.resolve();
 
-export function atomicConfigUpdate(updater) {
-  const run = async () => {
-    const config = await loadConfig() || createDefaultConfig();
-    await updater(config);
-    await saveConfig(config);
-    return config;
-  };
+function enqueueConfigWrite(run) {
   // Run after the previous cycle settles (success OR failure) so one failed update
   // can't stall the queue; keep the chain itself non-rejecting and surface the
   // result/error only to this caller.
   const result = _configWriteChain.then(run, run);
   _configWriteChain = result.then(() => {}, () => {});
   return result;
+}
+
+export function saveConfig(config) {
+  return enqueueConfigWrite(() => withConfigLock(() => saveConfigUnlocked(config)));
+}
+
+export function atomicConfigUpdate(updater) {
+  return enqueueConfigWrite(() => withConfigLock(async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await saveConfigUnlocked(config);
+    return config;
+  }));
 }

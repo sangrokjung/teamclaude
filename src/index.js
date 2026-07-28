@@ -7,7 +7,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
+import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -748,25 +748,11 @@ async function proxyWorkerCommand() {
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamcodex import` while server is running)
-  accountManager.onTokenRefresh((idx, newTokens) => {
+  accountManager.onTokenRefresh((idx, newTokens, previousTokens) => {
     const account = accountManager.accounts[idx];
     if (!account) return;
-    // Keep the in-memory config.accounts in sync so a TUI saveConfig doesn't
-    // clobber fresh tokens. Match by IDENTITY (UUID first, then name) — not by the
-    // AccountManager index `idx`, which can point at a different config entry when
-    // a tokenless config account was skipped at load.
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx >= 0) {
-      config.accounts[memIdx].accessToken = newTokens.accessToken;
-      config.accounts[memIdx].refreshToken = newTokens.refreshToken;
-      config.accounts[memIdx].expiresAt = newTokens.expiresAt;
-      if (newTokens.idToken) config.accounts[memIdx].idToken = newTokens.idToken;
-      if (newTokens.accountId) {
-        config.accounts[memIdx].accountId = newTokens.accountId;
-        config.accounts[memIdx].accountUuid = newTokens.accountId;
-      }
-    }
-    atomicConfigUpdate(diskConfig => {
+    let conflict = false;
+    return atomicConfigUpdate(diskConfig => {
       // Persist ONLY the refreshed account's tokens. We deliberately do NOT ingest
       // disk-only accounts here: that loop existed to keep the old INDEX-based
       // matching aligned, but matching is identity-based now (findConfigAccount),
@@ -776,14 +762,28 @@ async function proxyWorkerCommand() {
       // Match by UUID first, then by name — index may have shifted.
       const cfgIdx = findConfigAccount(diskConfig, account);
       if (cfgIdx >= 0) {
-        diskConfig.accounts[cfgIdx].accessToken = newTokens.accessToken;
-        diskConfig.accounts[cfgIdx].refreshToken = newTokens.refreshToken;
-        diskConfig.accounts[cfgIdx].expiresAt = newTokens.expiresAt;
-        if (newTokens.idToken) diskConfig.accounts[cfgIdx].idToken = newTokens.idToken;
-        if (newTokens.accountId) {
-          diskConfig.accounts[cfgIdx].accountId = newTokens.accountId;
-          diskConfig.accounts[cfgIdx].accountUuid = newTokens.accountId;
+        const diskAccount = diskConfig.accounts[cfgIdx];
+        // OAuth refresh tokens rotate. If another process already replaced the
+        // credential we started from, this late refresh result is stale and must
+        // not overwrite the newer disk state.
+        if (!storedCredentialMatches(diskAccount, previousTokens)) {
+          conflict = true;
+          return;
         }
+        applyOAuthTokens(diskAccount, newTokens);
+      }
+    }).then(diskConfig => {
+      const diskIdx = findConfigAccount(diskConfig, account);
+      if (diskIdx < 0) return;
+      const diskAccount = diskConfig.accounts[diskIdx];
+
+      // The just-serialized disk value is authoritative for both the long-lived
+      // config copy and, on a CAS conflict, the live account manager.
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx >= 0) applyOAuthTokens(config.accounts[memIdx], diskAccount);
+      if (conflict && diskAccount.accessToken) {
+        accountManager.updateAccountTokens(account, diskAccount, false);
+        console.log(`[TeamClaude] Kept newer disk credential for account "${account.name}"`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
@@ -862,6 +862,20 @@ async function proxyWorkerCommand() {
   // operator explicitly opts out.
   config.continuityMode = config.continuityMode !== false;
   const server = createProxyServer(accountManager, config, hooks);
+  let liveSyncChain = Promise.resolve();
+  process.on('SIGHUP', () => {
+    // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
+    // and every in-flight response alive. Serializing signals avoids overlapping
+    // remove/add passes when several CLI changes land together.
+    liveSyncChain = liveSyncChain.then(async () => {
+      const diskConfig = await loadConfig();
+      if (!diskConfig) return;
+      await syncAccountsFromDisk(diskConfig, config, accountManager);
+      console.log('[TeamClaude] Applied account config without restarting the worker');
+    }).catch(err => {
+      console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
+    });
+  });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
   // freshly restarted idle proxy — without this the template is memory-only
@@ -1190,9 +1204,9 @@ async function importCommand() {
   }
 
   if (codexMode) {
-    await upsertCodexAccount(config, name, creds, 'import');
+    await upsertCodexAccount(name, creds, 'import');
   } else {
-    await upsertOAuthAccount(config, name, creds, 'import');
+    await upsertOAuthAccount(name, creds, 'import');
   }
 }
 
@@ -1206,7 +1220,7 @@ async function loginCommand() {
       console.error('Codex subscription pooling supports ChatGPT OAuth accounts only.');
       process.exit(1);
     }
-    await loginCodexCommand(config);
+    await loginCodexCommand();
     return;
   }
 
@@ -1243,7 +1257,7 @@ async function loginCommand() {
   }
 }
 
-async function loginCodexCommand(config) {
+async function loginCodexCommand() {
   const codexHome = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
   const loginArgs = ['login', '-c', 'cli_auth_credentials_store="file"'];
   if (args.includes('--device-auth')) loginArgs.push('--device-auth');
@@ -1265,14 +1279,14 @@ async function loginCodexCommand(config) {
     if (result.status !== 0) process.exit(result.status ?? 1);
 
     const creds = await importCodexCredentials(join(codexHome, 'auth.json'));
-    await upsertCodexAccount(config, argValue('--name'), creds, 'login');
+    await upsertCodexAccount(argValue('--name'), creds, 'login');
   } finally {
     await rm(codexHome, { recursive: true, force: true });
   }
 }
 
 async function loginApiCommand() {
-  const config = await loadOrCreateConfig();
+  await loadOrCreateConfig();
   let name = argValue('--name');
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
@@ -1284,21 +1298,24 @@ async function loginApiCommand() {
     process.exit(1);
   }
 
-  if (!name) {
-    // First FREE api-N (not `count + 1`, which collides after a delete) — a unique
-    // name is the identity key for credential-less API-key accounts.
-    let n = 1;
-    do { name = `api-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  config.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
-  await saveConfig(config);
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      // Generate against the fresh locked config: another login may have added
+      // the apparent next slot while this prompt was open.
+      let n = 1;
+      do { name = `api-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    if (cfg.accounts.some(a => a.name === name)) {
+      throw new Error(`Account "${name}" already exists`);
+    }
+    cfg.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+  });
   console.log(`Added API key account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
 async function loginOAuthCommand() {
-  const config = await loadOrCreateConfig();
   let name = argValue('--name');
 
   console.log('Starting OAuth login...');
@@ -1314,7 +1331,7 @@ async function loginOAuthCommand() {
     process.exit(1);
   }
 
-  await upsertOAuthAccount(config, name, creds, 'login');
+  await upsertOAuthAccount(name, creds, 'login');
 }
 
 // ── env ─────────────────────────────────────────────────────
@@ -1583,7 +1600,7 @@ async function statusCommand() {
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
-  const config = await loadOrCreateConfig();
+  let config = await loadOrCreateConfig();
   const verbose = args.includes('-v') || args.includes('--verbose');
 
   if (config.accounts.length === 0) {
@@ -1592,29 +1609,24 @@ async function accountsCommand() {
     return;
   }
 
-  // Refresh expired tokens before fetching profiles
-  let configDirty = false;
-  await Promise.all(config.accounts.map(async (a) => {
-    if (a.type !== 'oauth' || !a.refreshToken) return;
-    if (!isTokenExpiringSoon(a.expiresAt)) return;
-    try {
-      const newTokens = a.provider === 'codex'
-        ? await refreshCodexAccessToken(a.refreshToken)
-        : await refreshAccessToken(a.refreshToken);
-      a.accessToken = newTokens.accessToken;
-      a.refreshToken = newTokens.refreshToken;
-      a.expiresAt = newTokens.expiresAt;
-      if (newTokens.idToken) a.idToken = newTokens.idToken;
-      if (newTokens.accountId) {
-        a.accountId = newTokens.accountId;
-        a.accountUuid = newTokens.accountId;
-      }
-      if (newTokens.email) a.email = newTokens.email;
-      if (newTokens.planType) a.planType = newTokens.planType;
-      configDirty = true;
-    } catch {}
-  }));
-  if (configDirty) await saveConfig(config);
+  const running = await findRunningServer(config).catch(() => null);
+  if (!running) {
+    // With no live proxy there is a single refresh owner: hold the cross-process
+    // config lock for the read→refresh→write cycle so two CLI commands cannot
+    // rotate the same refresh token concurrently.
+    config = await atomicConfigUpdate(async cfg => {
+      await Promise.all(cfg.accounts.map(async account => {
+        if (account.type !== 'oauth' || !account.refreshToken
+          || !isTokenExpiringSoon(account.expiresAt)) return;
+        try {
+          const newTokens = account.provider === 'codex'
+            ? await refreshCodexAccessToken(account.refreshToken)
+            : await refreshAccessToken(account.refreshToken);
+          applyOAuthTokens(account, newTokens);
+        } catch {}
+      }));
+    });
+  }
 
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
@@ -1628,9 +1640,27 @@ async function accountsCommand() {
           provider: 'codex',
         };
       }
+      // The running worker owns token rotation. Sending an already-expired token
+      // directly here is both useless and misleading; status remains visible via
+      // `teamcodex status` while the worker refreshes on real traffic.
+      if (running && isTokenExpiringSoon(a.expiresAt)) {
+        return { error: 'token refresh managed by running proxy' };
+      }
       return fetchProfile(a.accessToken);
     })
   );
+  const profileUpdates = config.accounts.flatMap((account, i) => {
+    const profile = profiles[i];
+    if (!profile || profile.error || !profile.accountUuid) return [];
+    return [{
+      previousUuid: account.accountUuid || null,
+      previousName: account.name,
+      accessToken: account.accessToken,
+      refreshToken: account.refreshToken,
+      accountUuid: profile.accountUuid,
+      name: account.provider !== 'codex' && profile.email ? profile.email : account.name,
+    }];
+  });
 
   // Deduplicate by accountUuid — keep the last (most recently added) entry
   const seen = new Map();
@@ -1653,8 +1683,32 @@ async function accountsCommand() {
       }
     }
   }
+  if (profileUpdates.length > 0 || removed > 0) {
+    const updatedConfig = await atomicConfigUpdate(cfg => {
+      for (const update of profileUpdates) {
+        const account = (update.previousUuid
+          && cfg.accounts.find(a => a.accountUuid === update.previousUuid))
+          || cfg.accounts.find(a => a.name === update.previousName);
+        // The profile request ran without holding the config lock. A concurrent
+        // import may have installed a different credential under the same name;
+        // never attach the old token's UUID/email to that replacement account.
+        if (!account || !storedCredentialMatches(account, update)) continue;
+        account.accountUuid = update.accountUuid;
+        account.name = update.name;
+      }
+      const deduped = [];
+      const uuids = new Set();
+      for (let i = cfg.accounts.length - 1; i >= 0; i--) {
+        const account = cfg.accounts[i];
+        if (account.accountUuid && uuids.has(account.accountUuid)) continue;
+        if (account.accountUuid) uuids.add(account.accountUuid);
+        deduped.push(account);
+      }
+      cfg.accounts = deduped.reverse();
+    });
+    if (running) await noteRunningServerReload(updatedConfig);
+  }
   if (removed > 0) {
-    await saveConfig(config);
     console.log(`Removed ${removed} duplicate account(s)\n`);
   }
 
@@ -1701,7 +1755,7 @@ function printTokenExpiry(expiresAt) {
 // ── api ─────────────────────────────────────────────────────
 
 async function apiCommand() {
-  const config = await loadOrCreateConfig();
+  let config = await loadOrCreateConfig();
   const path = args[1];
 
   if (!path) {
@@ -1714,30 +1768,62 @@ async function apiCommand() {
   const accountName = argValue('--account');
   const method = (argValue('--method') || 'GET').toUpperCase();
   const data = argValue('--data');
+  const running = await findRunningServer(config).catch(() => null);
+  const useRunningProxy = !accountName && !path.startsWith('http') && running;
 
-  const accounts = await resolveAccounts(config);
-  let account;
-  if (accountName) {
-    account = accounts.find(a => a.name === accountName);
-    if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
+  let url;
+  let headers;
+  if (useRunningProxy) {
+    url = `http://127.0.0.1:${running.port}${path}`;
+    headers = { 'x-api-key': config.proxy.apiKey };
   } else {
-    account = accounts.find(a => a.type === 'oauth') || accounts[0];
-    if (!account) { console.error('No accounts configured'); process.exit(1); }
-  }
+    const accounts = await resolveAccounts(config);
+    let account;
+    if (accountName) {
+      account = accounts.find(a => a.name === accountName);
+      if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
+    } else {
+      account = accounts.find(a => a.type === 'oauth') || accounts[0];
+      if (!account) { console.error('No accounts configured'); process.exit(1); }
+    }
 
-  const credential = account.accessToken || account.apiKey;
-  const isOAuth = account.type === 'oauth';
-  const codexMode = isCodexMode(config);
-  const upstream = config.upstream || (codexMode
-    ? 'https://chatgpt.com/backend-api/codex'
-    : 'https://api.anthropic.com');
-  const url = path.startsWith('http') ? path : `${upstream}${path}`;
+    if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) {
+      if (running) {
+        console.error('The running proxy owns OAuth token refresh for this config.');
+        console.error('Use a relative path without --account, or stop the proxy before a direct account call.');
+        process.exit(1);
+      }
 
-  const headers = isOAuth
-    ? { 'Authorization': `Bearer ${credential}` }
-    : { 'x-api-key': credential };
-  if (codexMode && account.accountId) {
-    headers['ChatGPT-Account-ID'] = account.accountId;
+      let refreshed = null;
+      config = await atomicConfigUpdate(async cfg => {
+        const stored = (account.accountUuid
+          && cfg.accounts.find(a => a.accountUuid === account.accountUuid))
+          || cfg.accounts.find(a => a.name === account.name);
+        if (!stored) throw new Error(`Account "${account.name}" was removed during refresh`);
+        const refreshToken = stored.refreshToken || account.refreshToken;
+        if (!refreshToken) throw new Error(`Account "${account.name}" has no refresh token`);
+        const newTokens = (stored.provider || account.provider) === 'codex'
+          ? await refreshCodexAccessToken(refreshToken)
+          : await refreshAccessToken(refreshToken);
+        applyOAuthTokens(stored, newTokens);
+        refreshed = { ...account, ...stored };
+      });
+      account = refreshed;
+    }
+
+    const credential = account.accessToken || account.apiKey;
+    const isOAuth = account.type === 'oauth';
+    const codexMode = isCodexMode(config);
+    const upstream = config.upstream || (codexMode
+      ? 'https://chatgpt.com/backend-api/codex'
+      : 'https://api.anthropic.com');
+    url = path.startsWith('http') ? path : `${upstream}${path}`;
+    headers = isOAuth
+      ? { 'Authorization': `Bearer ${credential}` }
+      : { 'x-api-key': credential };
+    if (codexMode && account.accountId) {
+      headers['ChatGPT-Account-ID'] = account.accountId;
+    }
   }
 
   const fetchOpts = { method, headers };
@@ -1767,7 +1853,6 @@ async function apiCommand() {
 // ── remove ──────────────────────────────────────────────────
 
 async function removeCommand() {
-  const config = await loadOrCreateConfig();
   const name = args[1];
 
   if (!name) {
@@ -1775,27 +1860,43 @@ async function removeCommand() {
     process.exit(1);
   }
 
-  const idx = config.accounts.findIndex(a => a.name === name);
-  if (idx < 0) {
-    console.error(`Account "${name}" not found`);
-    process.exit(1);
-  }
-
-  config.accounts.splice(idx, 1);
-  await saveConfig(config);
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx < 0) return;
+    cfg.accounts.splice(idx, 1);
+    found = true;
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
   console.log(`Removed account "${name}"`);
+  await noteRunningServerReload(config);
 }
 
 // ── enable / disable / priority ─────────────────────────────
 
-/** Note that changes apply to a running server only after a reload/restart. */
-function noteRunningServerReload(config) {
-  return findRunningServer(config).then(running => {
-    if (running) {
-      console.log('A server is running — apply now with: teamcodex restart');
-      console.log('  (or press "R" in the TUI to reload from config).');
+/** Ask the supervised worker to live-sync account changes without a restart. */
+async function noteRunningServerReload(config) {
+  try {
+    const running = await findRunningServer(config);
+    if (!running) return false;
+    const state = await readServerState();
+    const workerPid = state?.pid === running.pid && state.port === running.port
+      && isPidAlive(state.workerPid)
+      ? state.workerPid
+      : null;
+    if (!workerPid) {
+      console.error('The running server does not support account-only live reload.');
+      console.error('Apply the change with: teamcodex restart');
+      return false;
     }
-  }).catch(() => {});
+    process.kill(workerPid, 'SIGHUP');
+    console.log('Applied to the running server without restarting active connections.');
+    return true;
+  } catch (err) {
+    console.error(`Could not reload the running server automatically: ${err.message}`);
+    console.error('Apply the change with: teamcodex restart');
+    return false;
+  }
 }
 
 async function setEnabledCommand(enabled) {
@@ -1917,7 +2018,7 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
+async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account UUID
   const profile = await fetchProfile(creds.accessToken);
   const profileOk = profile && !profile.error;
@@ -1930,87 +2031,83 @@ async function upsertOAuthAccount(config, name, creds, source = 'unknown') {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  if (!name) {
-    // First FREE account-N (not `count + 1`, which collides after a delete) so the
-    // generated name stays a unique identity key.
-    let n = 1;
-    do { name = `account-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  const account = {
-    name,
-    type: 'oauth',
-    source,
-    accountUuid: profile?.accountUuid || null,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Deduplicate: match by UUID first, then by name
-  let idx = profile?.accountUuid
-    ? config.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-    : -1;
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    // Re-credentialing an existing account must not wipe its manual routing
-    // settings — carry enabled/priority over from the entry being replaced.
-    const prev = config.accounts[idx];
-    if (prev.enabled !== undefined) account.enabled = prev.enabled;
-    if (prev.priority !== undefined) account.priority = prev.priority;
-    config.accounts[idx] = account;
-    console.log(`Updated account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${name}"`);
-  }
-
-  await saveConfig(config);
+  let action = 'Added';
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      // First FREE account-N (not `count + 1`, which collides after a delete)
+      // against the fresh locked config, not the pre-login snapshot.
+      let n = 1;
+      do { name = `account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    const account = {
+      name,
+      type: 'oauth',
+      source,
+      accountUuid: profile?.accountUuid || null,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+    let idx = profile?.accountUuid
+      ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+      : -1;
+    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx >= 0) {
+      action = 'Updated';
+      const previous = cfg.accounts[idx];
+      if (previous.enabled !== undefined) account.enabled = previous.enabled;
+      if (previous.priority !== undefined) account.priority = previous.priority;
+      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      cfg.accounts[idx] = account;
+    } else {
+      cfg.accounts.push(account);
+    }
+  });
+  console.log(`${action} account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
-async function upsertCodexAccount(config, name, creds, source = 'unknown') {
+async function upsertCodexAccount(name, creds, source = 'unknown') {
   if (!name) name = creds.email;
-  if (!name) {
-    let n = 1;
-    do { name = `codex-account-${n++}`; } while (config.accounts.some(a => a.name === name));
-  }
-
-  const account = {
-    name,
-    provider: 'codex',
-    type: 'oauth',
-    source,
-    accountUuid: creds.accountId,
-    accountId: creds.accountId,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    idToken: creds.idToken,
-    expiresAt: creds.expiresAt,
-    email: creds.email,
-    planType: creds.planType,
-  };
-
-  let idx = config.accounts.findIndex(a =>
-    a.accountUuid === creds.accountId || a.accountId === creds.accountId);
-  if (idx < 0) idx = config.accounts.findIndex(a => a.name === name);
-
-  if (idx >= 0) {
-    const previous = config.accounts[idx];
-    if (previous.enabled !== undefined) account.enabled = previous.enabled;
-    if (previous.priority !== undefined) account.priority = previous.priority;
-    if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
-    config.accounts[idx] = account;
-    console.log(`Updated Codex account "${name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added Codex account "${name}"`);
-  }
-
-  config.provider = 'codex';
-  await saveConfig(config);
+  let action = 'Added';
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    if (!name) {
+      let n = 1;
+      do { name = `codex-account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    const account = {
+      name,
+      provider: 'codex',
+      type: 'oauth',
+      source,
+      accountUuid: creds.accountId,
+      accountId: creds.accountId,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      idToken: creds.idToken,
+      expiresAt: creds.expiresAt,
+      email: creds.email,
+      planType: creds.planType,
+    };
+    let idx = cfg.accounts.findIndex(a =>
+      a.accountUuid === creds.accountId || a.accountId === creds.accountId);
+    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx >= 0) {
+      action = 'Updated';
+      const previous = cfg.accounts[idx];
+      if (previous.enabled !== undefined) account.enabled = previous.enabled;
+      if (previous.priority !== undefined) account.priority = previous.priority;
+      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      cfg.accounts[idx] = account;
+    } else {
+      cfg.accounts.push(account);
+    }
+    cfg.provider = 'codex';
+  });
+  console.log(`${action} Codex account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
 }
 
 // ── config sync helpers ─────────────────────────────────────
@@ -2026,6 +2123,25 @@ function findConfigAccount(diskConfig, account) {
   return diskConfig.accounts.findIndex(a => a.name === account.name);
 }
 
+function storedCredentialMatches(account, previousTokens) {
+  if (!previousTokens) return true;
+  return (account.accessToken ?? null) === (previousTokens.accessToken ?? null)
+    && (account.refreshToken ?? null) === (previousTokens.refreshToken ?? null);
+}
+
+function applyOAuthTokens(account, tokens) {
+  account.accessToken = tokens.accessToken;
+  account.refreshToken = tokens.refreshToken;
+  account.expiresAt = tokens.expiresAt;
+  if (tokens.idToken) account.idToken = tokens.idToken;
+  if (tokens.accountId) {
+    account.accountId = tokens.accountId;
+    account.accountUuid = tokens.accountId;
+  }
+  if (tokens.email) account.email = tokens.email;
+  if (tokens.planType) account.planType = tokens.planType;
+}
+
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
@@ -2033,6 +2149,25 @@ function findConfigAccount(diskConfig, account) {
  */
 async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
   let added = 0;
+
+  // Disk is authoritative for the account set. Without this removal pass, a CLI
+  // `remove` changed only the file while the running worker kept routing traffic
+  // through the deleted live credential until a full restart.
+  for (let i = memConfig.accounts.length - 1; i >= 0; i--) {
+    const memAcct = memConfig.accounts[i];
+    const stillOnDisk = (memAcct.accountUuid
+      && diskConfig.accounts.some(a => a.accountUuid === memAcct.accountUuid))
+      || diskConfig.accounts.some(a => a.name === memAcct.name);
+    if (stillOnDisk) continue;
+
+    const mgr = (memAcct.accountUuid
+      && accountManager.accounts.find(a => a.accountUuid === memAcct.accountUuid))
+      || accountManager.accounts.find(a => a.name === memAcct.name);
+    if (mgr) accountManager.removeAccount(mgr.index);
+    memConfig.accounts.splice(i, 1);
+    console.log(`[TeamClaude] Removed account "${memAcct.name}" from live config`);
+  }
+
   for (const diskAcct of diskConfig.accounts) {
     const matchByUuid = diskAcct.accountUuid &&
       memConfig.accounts.findIndex(a => a.accountUuid === diskAcct.accountUuid);

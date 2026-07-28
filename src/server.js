@@ -1,6 +1,8 @@
 import http from 'node:http';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
@@ -17,6 +19,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 // so this is a ceiling on a wait that would otherwise be unbounded. At the
 // default continuityMaxSleepMs (30s) this is ~5 minutes.
 const MODEL_EXHAUST_WAIT_PASSES = 10;
+const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
   const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
@@ -1270,9 +1273,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     //   (2) once every account has 5xx'd for this request, wait a bounded
     //       exponential backoff and retry the whole fleet — the client transparently
     //       gets the eventual success instead of an error.
-    // Only after the backoff budget is spent is the 5xx surfaced (so the client is
-    // never left hanging indefinitely). No account state is mutated — a 529 is
-    // upstream overload, not a bad account.
+    // Outside continuity mode the configured backoff budget bounds the wait.
+    // In continuity mode the client explicitly chose continuity over fail-fast:
+    // keep the request inside the proxy until upstream recovers or the client
+    // disconnects. No account state is mutated — a 529 is upstream overload,
+    // not a bad account.
     if (RETRYABLE_STATUS.has(upstreamRes.status)) {
       const code = upstreamRes.status;
       await upstreamRes.body?.cancel();
@@ -1298,12 +1303,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // (2) Every account 5xx'd for this request → upstream overload. Back off and
       // retry the whole fleet so the client transparently rides out the blip.
-      if (!res.destroyed && ctx.overloadRetries < maxOverload) {
-        const waitMs = Math.min(backoffBase * 2 ** ctx.overloadRetries, backoffCap);
+      if (!res.destroyed && (ctx.continuity.enabled || ctx.overloadRetries < maxOverload)) {
+        const waitMs = Math.min(
+          backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
+          backoffCap,
+        );
         ctx.overloadRetries += 1;
-        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
+        const retryLimit = ctx.continuity.enabled ? '∞' : maxOverload;
+        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${retryLimit})`);
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
+          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${retryLimit}) ===`);
           writeRequestLog(logDir, reqId, logSections);
         }
         await sleepOrAbort(waitMs, ctx.abortSignal);
@@ -1365,7 +1374,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       };
       if (!ctx.streamRecovery) ensureHeaders(); // legacy: headers first, bytes as they come
       const outcome = await streamResponse(
-        upstreamRes.body, res, account, accountManager, streamLog, ctx.streamRecovery, ensureHeaders);
+        upstreamRes.body,
+        res,
+        account,
+        accountManager,
+        streamLog,
+        ctx.streamRecovery,
+        ctx.streamRecovery && ctx.continuity.enabled,
+        ensureHeaders,
+      );
       if (outcome.preStreamFailure && !res.headersSent && !res.destroyed) {
         // Nothing reached the client. Replay on another account exactly like a
         // pre-stream transient error (per-request exclusion, no account
@@ -1383,6 +1400,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
               || accountManager.anyCapped(excludeStream, ctx.model))) {
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+        if (ctx.continuity.enabled) {
+          const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+          const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+          const waitMs = Math.min(
+            backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
+            backoffCap,
+          );
+          ctx.overloadRetries += 1;
+          console.log(`[TeamClaude] Upstream stream failed on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/∞)`);
+          releaseHeld();
+          await sleepOrAbort(waitMs, ctx.abortSignal);
+          if (res.destroyed || ctx.abortSignal?.aborted) return;
+          ctx.tried5xx.clear();
+          return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
         ctx.status = 529;
         res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
@@ -1511,13 +1543,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
  * Stream an SSE response to the client, parsing usage data along the way.
  *
  * With `recover` (anthropic mode, `config.streamRecovery !== false`) the stream
- * is relayed one WHOLE SSE event at a time (SseFramer), and an abnormal end —
- * the upstream read failing mid-stream, or the upstream ending without a
- * terminal event (message_stop / error) — appends a synthetic retryable
- * `overloaded_error` event and ends the response cleanly, so the client's own
- * retry logic recovers the turn. Without `recover` (codex mode / opt-out) the
- * legacy behavior is kept: bytes pass through untouched and a read error
- * propagates to the caller (which destroys the client socket).
+ * is parsed one WHOLE SSE event at a time (SseFramer). With `transactional`
+ * (continuity mode) no event is exposed until a terminal event arrives; an
+ * abnormal attempt is discarded and returned as replayable, so the caller can
+ * run the same request again without leaking partial output. Outside continuity
+ * mode, an abnormal end keeps the legacy recovery contract: append a synthetic
+ * retryable `overloaded_error` event and let the client retry.
  *
  * With recovery, `ensureHeaders` defers the client's response headers until the
  * first whole frame is forwarded; a failure BEFORE that point returns
@@ -1526,11 +1557,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
  *
  * Returns { injected, reason, preStreamFailure }.
  */
-async function streamResponse(webStream, res, account, accountManager, streamLog, recover = false, ensureHeaders = null) {
+async function streamResponse(
+  webStream,
+  res,
+  account,
+  accountManager,
+  streamLog,
+  recover = false,
+  transactional = false,
+  ensureHeaders = null,
+) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
   const framer = recover ? new SseFramer() : null;
+  const bufferedFrames = transactional ? [] : null;
+  let bufferedBytes = 0;
+  let spillFile = null;
+  let spillPath = null;
+  let spillUnlinked = false;
   const outcome = { injected: false, reason: null, preStreamFailure: null };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -1563,6 +1608,84 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
     return ok;
   };
 
+  const waitForDrain = async () => {
+    if (res.destroyed || res.writableEnded) return;
+    await new Promise(resolve => {
+      const settle = () => {
+        res.removeListener('drain', settle);
+        res.removeListener('close', settle);
+        resolve();
+      };
+      res.once('drain', settle);
+      res.once('close', settle);
+    });
+  };
+
+  const writeSpill = async (bytes) => {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesWritten } = await spillFile.write(
+        bytes,
+        offset,
+        bytes.length - offset,
+        null,
+      );
+      if (bytesWritten === 0) throw new Error('Unable to buffer upstream stream');
+      offset += bytesWritten;
+    }
+  };
+
+  const stageChunk = async (bytes) => {
+    const copy = Buffer.from(bytes);
+    if (!spillFile && bufferedBytes + copy.length > TRANSACTION_MEMORY_BYTES) {
+      spillPath = join(tmpdir(), `teamclaude-stream-${process.pid}-${randomUUID()}.tmp`);
+      spillFile = await open(spillPath, 'wx+', 0o600);
+      try {
+        await unlink(spillPath);
+        spillUnlinked = true;
+      } catch {}
+      for (const frame of bufferedFrames) await writeSpill(frame);
+      bufferedFrames.length = 0;
+    }
+    if (spillFile) await writeSpill(copy);
+    else bufferedFrames.push(copy);
+    bufferedBytes += copy.length;
+  };
+
+  const relayChunk = async (bytes) => {
+    if (transactional) {
+      await stageChunk(bytes);
+      return true;
+    }
+    if (!forwardChunk(bytes)) await waitForDrain();
+    return !res.destroyed;
+  };
+
+  const flushTransaction = async () => {
+    if (spillFile) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position < bufferedBytes) {
+        if (res.destroyed || res.writableEnded) return false;
+        const { bytesRead } = await spillFile.read(
+          chunk,
+          0,
+          Math.min(chunk.length, bufferedBytes - position),
+          position,
+        );
+        if (bytesRead === 0) throw new Error('Unable to replay buffered upstream stream');
+        position += bytesRead;
+        if (!forwardChunk(chunk.subarray(0, bytesRead))) await waitForDrain();
+      }
+    } else {
+      for (const bytes of bufferedFrames) {
+        if (res.destroyed || res.writableEnded) return false;
+        if (!forwardChunk(bytes)) await waitForDrain();
+      }
+    }
+    return !res.destroyed;
+  };
+
   try {
     while (true) {
       let step;
@@ -1572,6 +1695,12 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
         // Upstream died mid-stream.
         if (framer && !res.destroyed && !res.writableEnded) {
           const detail = err?.cause?.code || err?.code || err?.name || 'network error';
+          if (transactional && !framer.sawTerminal) {
+            // No semantic bytes from this attempt reached the client. Discard
+            // every staged frame and replay the original buffered request.
+            outcome.preStreamFailure = `errored (${detail})`;
+            return outcome;
+          }
           if (!res.headersSent) {
             // Nothing was forwarded yet (headers still deferred): the request
             // is fully replayable — hand the decision back to the caller.
@@ -1605,18 +1734,7 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
       // because 'drain' will never fire on a destroyed socket. Both listeners
       // are removed once either fires, so a long stream with many backpressure
       // pauses doesn't accumulate dead 'close' listeners.
-      if (!forwardChunk(bytes)) {
-        await new Promise(resolve => {
-          const settle = () => {
-            res.removeListener('drain', settle);
-            res.removeListener('close', settle);
-            resolve();
-          };
-          res.once('drain', settle);
-          res.once('close', settle);
-        });
-        if (res.destroyed) break;
-      }
+      if (!await relayChunk(bytes)) break;
     }
 
     // Parse any remaining (partial / never-forwarded) text for usage tracking
@@ -1629,7 +1747,16 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
       if (framer.sawTerminal) {
         // Complete stream — flush any trailing bytes after the terminal event
         // (comments / blank lines) for byte fidelity; finally ends normally.
-        if (framer.pending.length) res.write(framer.pending);
+        if (framer.pending.length) {
+          if (transactional) await stageChunk(framer.pending);
+          else res.write(framer.pending);
+        }
+        if (transactional) await flushTransaction();
+      } else if (transactional) {
+        // Frames may have been staged, but none were exposed. Treat a clean
+        // socket close without a terminal event exactly like a read error.
+        outcome.preStreamFailure = 'ended without a terminal event';
+        return outcome;
       } else if (!res.headersSent) {
         // Ended before a single whole frame: fully replayable by the caller.
         outcome.preStreamFailure = 'ended without data';
@@ -1647,6 +1774,8 @@ async function streamResponse(webStream, res, account, accountManager, streamLog
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
+    if (spillFile) await spillFile.close().catch(() => {});
+    if (spillPath && !spillUnlinked) await unlink(spillPath).catch(() => {});
     // Only end a response whose headers went out — a deferred-headers response
     // being handed back for replay (preStreamFailure) must stay untouched.
     if (res.headersSent && !res.writableEnded) res.end();

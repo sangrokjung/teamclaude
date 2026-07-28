@@ -8,11 +8,12 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-function startProxy(am, upstreamPort) {
+function startProxy(am, upstreamPort, overrides = {}) {
   return createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false, // isolate 529 failover from background warm-up probes
+    ...overrides,
   });
 }
 
@@ -97,6 +98,49 @@ test('all accounts 529 → bounded backoff retries, then passes 529 through (no 
     assert.ok(upstreamHits >= 2 && upstreamHits <= 10, `expected bounded retries, got ${upstreamHits}`);
     assert.ok(am.accounts.every(a => a.status !== 'throttled' && a.status !== 'error'),
       `expected no account poisoned, got ${am.accounts.map(a => a.status).join(',')}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+    delete process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
+    delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  }
+});
+
+test('continuity mode keeps retrying past the finite 529 budget and returns eventual success', async () => {
+  process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    if (upstreamHits <= 3) {
+      overloaded529(res);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'a', type: 'oauth', accessToken: 'tok-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(res.status, 200, 'finite retry budget must not leak a 529 in continuity mode');
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(upstreamHits, 4, 'the request must remain inside the proxy until upstream recovers');
+    assert.equal(am.accounts[0].status, 'active');
   } finally {
     proxy.close();
     upstream.close();

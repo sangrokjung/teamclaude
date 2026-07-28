@@ -405,7 +405,7 @@ test('token-refresh callback is not emitted with a stale index for a removed acc
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 5);
   const A = am.accounts[0];
   let emitted = null;
-  am.onTokenRefresh((idx, tokens) => { emitted = { idx, tokens }; });
+  am.onTokenRefresh((idx, tokens, previousTokens) => { emitted = { idx, tokens, previousTokens }; });
 
   // Remove A; B shifts into index 0 while A keeps a stale .index === 0.
   am.removeAccount(A.index);
@@ -417,8 +417,19 @@ test('token-refresh callback is not emitted with a stale index for a removed acc
 
   // Sanity: a live account still emits (with its current index).
   const B = am.accounts[0];
+  const oldAccess = B.credential;
+  const oldRefresh = B.refreshToken;
   am.updateAccountTokens(B, { accessToken: 'x2', refreshToken: 'y2', expiresAt: Date.now() + HOUR });
   assert.ok(emitted && emitted.idx === 0, 'a live account still persists, with its current index');
+  assert.deepEqual(
+    { accessToken: emitted.previousTokens.accessToken, refreshToken: emitted.previousTokens.refreshToken },
+    { accessToken: oldAccess, refreshToken: oldRefresh },
+    'persistence callback receives the credential snapshot needed for disk CAS',
+  );
+
+  emitted = null;
+  am.updateAccountTokens(B, { accessToken: 'disk-new', refreshToken: 'disk-refresh', expiresAt: Date.now() + HOUR }, false);
+  assert.equal(emitted, null, 'installing an authoritative disk credential does not recursively persist');
 });
 
 // ── integration: proxy enforces the per-account cap end-to-end ─────────────

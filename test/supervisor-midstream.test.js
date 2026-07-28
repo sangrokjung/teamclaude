@@ -200,13 +200,15 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
   }
 });
 
-test('worker SIGKILL mid-SSE → client gets whole events + retryable error event, then recovers', { timeout: 20000 }, async () => {
+test('worker SIGKILL mid-SSE → supervisor replays the same request and client gets final success', { timeout: 20000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-sse-'));
   const configPath = join(dir, 'config.json');
   const statePath = join(dir, 'config.server.json');
   const port = await unusedPort();
 
   let requests = 0;
+  let markFirstRequest;
+  const firstRequest = new Promise(resolve => { markFirstRequest = resolve; });
   const upstream = http.createServer((req, res) => {
     requests += 1;
     if (requests > 1) {
@@ -214,8 +216,7 @@ test('worker SIGKILL mid-SSE → client gets whole events + retryable error even
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    // First request: stream one whole event, then keep the stream open with
-    // pings so the worker is killed unmistakably MID-response.
+    markFirstRequest();
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
     const timer = setInterval(() => {
@@ -240,25 +241,18 @@ test('worker SIGKILL mid-SSE → client gets whole events + retryable error even
     await waitUntil(() => status(port), 'proxy did not start');
     const initial = await waitUntil(() => readState(statePath), 'server state was not written');
 
-    const result = await new Promise((resolve, reject) => {
+    const resultPromise = new Promise((resolve, reject) => {
       const req = http.request({
         host: '127.0.0.1', port, path: '/v1/messages', method: 'POST',
         headers: { 'content-type': 'application/json' },
       }, res => {
         const chunks = [];
-        let killed = false;
         const settle = cleanEnd => () => resolve({
           status: res.statusCode,
           body: Buffer.concat(chunks).toString(),
           cleanEnd,
         });
-        res.on('data', c => {
-          chunks.push(c);
-          if (!killed) {
-            killed = true;
-            process.kill(initial.workerPid, 'SIGKILL'); // die mid-relay
-          }
-        });
+        res.on('data', c => chunks.push(c));
         res.once('end', settle(true));
         res.once('aborted', settle(false));
         res.once('error', settle(false));
@@ -266,30 +260,21 @@ test('worker SIGKILL mid-SSE → client gets whole events + retryable error even
       req.once('error', reject);
       req.end(JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'hi' }] }));
     });
+    await firstRequest;
+    process.kill(initial.workerPid, 'SIGKILL');
+    const result = await resultPromise;
 
     assert.equal(result.status, 200);
     assert.equal(result.cleanEnd, true, 'the client response must END cleanly, not die with the worker');
-    assert.ok(result.body.includes('message_start'), 'whole events delivered before the crash are kept');
-    const blocks = result.body.split('\n\n').filter(Boolean);
-    const last = blocks[blocks.length - 1];
-    assert.ok(last.startsWith('event: error'), `last frame must be the injected error, got: ${last}`);
-    const data = JSON.parse(last.split('\n').find(l => l.startsWith('data: ')).slice(6));
-    assert.equal(data.error.type, 'overloaded_error', 'injected error must be client-retryable');
+    assert.deepEqual(JSON.parse(result.body), { ok: true },
+      'the original client request must complete on the replacement worker');
+    assert.ok(!result.body.includes('overloaded_error'), 'no retryable error may leak to Claude Code');
+    assert.equal(requests, 2, 'one broken attempt plus one transparent replay');
 
-    // The retry (what Claude Code does on overloaded_error) must succeed on the
-    // replacement worker — the supervisor listener never went away.
     await waitUntil(async () => {
       const next = await readState(statePath);
       return next?.workerPid && next.workerPid !== initial.workerPid ? next : null;
     }, 'replacement worker was not recorded');
-    const retry = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'retry' }] }),
-      signal: AbortSignal.timeout(8000),
-    });
-    assert.equal(retry.status, 200);
-    assert.equal((await retry.json()).ok, true);
     assert.equal(child.exitCode, null, 'the supervisor must survive the worker crash');
   } finally {
     await stopChild(child);

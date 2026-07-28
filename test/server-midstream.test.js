@@ -120,6 +120,86 @@ test('mid-event socket kill → complete events + injected retryable error, clea
   }
 });
 
+test('continuity mode discards a broken partial SSE attempt and returns one complete retry', async () => {
+  const complete = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"complete answer"}}\n\n'
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  let requests = 0;
+  const upstream = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (requests === 1) {
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      res.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"broken partial"}}\n\n');
+      setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
+    res.end(complete);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const r = await streamPost(proxyPort);
+    assert.equal(r.status, 200);
+    assert.equal(r.cleanEnd, true);
+    assert.equal(r.body, complete, 'client must receive only the successful transactional attempt');
+    assert.ok(!r.body.includes('broken partial'));
+    assert.ok(!r.body.includes('overloaded_error'));
+    assert.equal(requests, 2);
+    assert.ok(am.accounts.every(a => a.status === 'active'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('continuity mode retries a broken SSE on the same account after fleet backoff', async () => {
+  const previousBase = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+  const previousCap = process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = '10';
+  process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = '10';
+
+  const complete = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"recovered"}}\n\n'
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  let requests = 0;
+  const upstream = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (requests < 3) {
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      res.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"discard me"}}\n\n');
+      setTimeout(() => res.socket.destroy(), 10);
+      return;
+    }
+    res.end(complete);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const r = await streamPost(proxyPort);
+    assert.equal(r.status, 200);
+    assert.equal(r.cleanEnd, true);
+    assert.equal(r.body, complete);
+    assert.ok(!r.body.includes('discard me'));
+    assert.ok(!r.body.includes('overloaded_error'));
+    assert.equal(requests, 3);
+  } finally {
+    proxy.close();
+    upstream.close();
+    if (previousBase === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS = previousBase;
+    if (previousCap === undefined) delete process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS;
+    else process.env.TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS = previousCap;
+  }
+});
+
 test('upstream ends cleanly WITHOUT message_stop → truncation detected, error injected', async () => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -169,6 +249,31 @@ test('complete stream passes through byte-identically (odd chunk boundaries) and
     const usage = am.accounts[0].usage;
     assert.equal(usage.totalInputTokens, 7, 'input + cache tokens folded');
     assert.equal(usage.totalOutputTokens, 7);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('continuity mode spills a large complete SSE transaction and preserves byte fidelity', async () => {
+  const largeText = 'x'.repeat(1_100_000);
+  const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"${largeText}"}}\n\n`
+    + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(full);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const r = await streamPost(proxyPort);
+    assert.equal(r.cleanEnd, true);
+    assert.equal(r.body, full);
+    assert.ok(!r.body.includes('overloaded_error'));
   } finally {
     proxy.close();
     upstream.close();
@@ -323,6 +428,57 @@ test('client disconnect mid-stream: upstream reader cancelled, slot released, no
     assert.equal(JSON.parse(again.body).ok, true);
   } finally {
     if (firstRes && !firstRes.destroyed) firstRes.destroy();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('client disconnect during a buffered continuity stream cancels upstream and releases the slot', async () => {
+  let upstreamStarted = false;
+  let upstreamClosed = false;
+  const upstream = http.createServer((_req, res) => {
+    upstreamStarted = true;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    const timer = setInterval(() => {
+      if (!res.destroyed) {
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"waiting"}}\n\n');
+      }
+    }, 5);
+    res.once('close', () => {
+      upstreamClosed = true;
+      clearInterval(timer);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+  const ac = new AbortController();
+
+  try {
+    const request = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-fable-5', messages: [] }),
+      signal: ac.signal,
+    }).catch(() => null);
+    const startedDeadline = Date.now() + 2000;
+    while ((!upstreamStarted || am.accounts[0].inflight !== 1) && Date.now() < startedDeadline) {
+      await delay(5);
+    }
+    assert.equal(upstreamStarted, true);
+    assert.equal(am.accounts[0].inflight, 1);
+
+    ac.abort();
+    await request;
+    const closedDeadline = Date.now() + 2000;
+    while ((!upstreamClosed || am.accounts[0].inflight !== 0) && Date.now() < closedDeadline) {
+      await delay(5);
+    }
+    assert.equal(upstreamClosed, true);
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
     proxy.close();
     upstream.close();
   }

@@ -561,7 +561,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
 | `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled) |
-| `continuityMode` | Hold requests in the proxy while quota or global rate limits recover instead of returning 429 (optional, default `true`) |
+| `continuityMode` | Hold requests in the proxy while quota, global rate limits, HTTP 529/5xx, or an incomplete SSE attempt recover instead of ending the Claude Code turn (optional, default `true`) |
+| `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt so partial output can be discarded and replayed transparently (optional, default `true`) |
 | `continuityMaxSleepMs` | Maximum interval between continuity probes (optional, default `30000`) |
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
@@ -623,8 +624,8 @@ flowchart LR
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
    - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. If the limit appears global, continuity mode opens a shared cooldown and retries internally instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
    - **Requested-model dead end** (fork) → after live model-quota exhaustion reaches all eligible accounts or the unlabeled-429 failover budget is exhausted, a configured `modelFallbacks` chain rewrites the request to the next model before any 429 is surfaced or continuity sleep starts.
-7. Transient network errors (connection reset, timeout) fail over to another account before any response bytes are sent. Mid-stream errors, or a failure with no alternate account left, close the connection so the client can retry
-8. If all accounts are exhausted, continuity mode holds the request and polls using the computed account/model reset time. Setting `continuityMode: false` restores the legacy 429 response with `retry-after`.
+7. Transient network errors (connection reset, timeout) fail over before response bytes are sent. In continuity mode, Anthropic SSE attempts are buffered until a terminal event; a broken partial attempt is discarded and replayed, while completed streams preserve byte fidelity. Buffers larger than 1 MiB spill to a private temporary file.
+8. If all accounts are exhausted or upstream returns HTTP 529/5xx, continuity mode keeps the request inside the proxy with capped backoff until recovery or client disconnect. Setting `continuityMode: false` restores bounded retry and the legacy error response.
 9. **Quota survives restarts**: the server snapshots general per-account quota/throttle state plus the committed warm-up probe template to `<config>.quota.json` (every minute and on exit), so TUI **R** works before fresh traffic arrives. A restored template is provisional and the first freshly accepted request shape replaces it. Model-scoped weekly values are intentionally discarded on import and re-measured from live traffic so stale Fable data cannot self-lock its refresh path
 10. Client token refresh requests (`/v1/oauth/token`) are relayed to upstream untouched — the proxy and client manage their own token lifecycles independently
 

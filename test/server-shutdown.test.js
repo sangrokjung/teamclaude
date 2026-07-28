@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,7 +44,10 @@ async function waitUntilListening(port, child) {
 }
 
 test('SIGTERM exits after a bounded grace period even with an active SSE response', async () => {
+  let markUpstreamStarted;
+  const upstreamStarted = new Promise(resolve => { markUpstreamStarted = resolve; });
   const upstream = http.createServer((_req, res) => {
+    markUpstreamStarted();
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"type":"ping"}\n\n');
     const heartbeat = setInterval(() => {
@@ -75,21 +77,20 @@ test('SIGTERM exits after a bounded grace period even with an active SSE respons
   child.stdout.on('data', chunk => { stdout += chunk; });
   child.stderr.on('data', chunk => { stderr += chunk; });
 
+  let clientRequest;
   let clientResponse;
   try {
     await waitUntilListening(proxyPort, child);
-    clientResponse = await new Promise((resolve, reject) => {
-      const req = http.request({
-        host: '127.0.0.1',
-        port: proxyPort,
-        path: '/v1/messages',
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-      }, resolve);
-      req.once('error', reject);
-      req.end(JSON.stringify({ model: 'test-model', messages: [] }));
-    });
-    await once(clientResponse, 'data');
+    clientRequest = http.request({
+      host: '127.0.0.1',
+      port: proxyPort,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, response => { clientResponse = response; });
+    clientRequest.once('error', () => {});
+    clientRequest.end(JSON.stringify({ model: 'test-model', messages: [] }));
+    await upstreamStarted;
 
     const exited = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('server remained alive after the shutdown grace period')), 6500);
@@ -105,6 +106,7 @@ test('SIGTERM exits after a bounded grace period even with an active SSE respons
     assert.match(stdout, /Shutting down/);
     assert.match(stderr, /Graceful shutdown timed out; forcing exit/);
   } finally {
+    clientRequest?.destroy();
     clientResponse?.destroy();
     if (child.exitCode == null) child.kill('SIGKILL');
     upstream.closeAllConnections?.();
