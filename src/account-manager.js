@@ -36,9 +36,9 @@ function emptyQuota() {
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
     // anthropic-ratelimit-unified-<window>-* so a renamed/added window keeps
-    // being tracked without a code change. These response-derived values are
-    // used to classify a live model-scoped 429 and compute its retry time, but
-    // never to pre-block selection: the request itself is the refresh path.
+    // being tracked without a code change. A complete, fresh, full window
+    // pre-blocks only the matching model family; unknown/partial/expired values
+    // remain selectable so the request itself can refresh them.
     modelWeekly: {},       // { '7d_oi': { utilization: 0-1, reset: msTimestamp } }
     resetsAt: null,        // soonest standard reset (session-order fallback)
     // Token and request windows can reset at DIFFERENT times; tracked separately
