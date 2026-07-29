@@ -1145,6 +1145,17 @@ function sendSaved429(res, ctx) {
   return true;
 }
 
+function sendUpstreamTimeout(res, ctx) {
+  if (res.destroyed || res.headersSent) return false;
+  ctx.status = 502;
+  res.writeHead(502, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: { type: 'proxy_error', message: 'Upstream response timed out.' },
+  }));
+  return true;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
@@ -1381,6 +1392,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const continuityRemainingMs = ctx.continuityDeadlineAt == null
     ? null
     : Math.max(0, ctx.continuityDeadlineAt - Date.now());
+  if (continuityRemainingMs != null && continuityRemainingMs <= 1) {
+    if (ctx.abortSignal?.aborted || res.destroyed) return;
+    if (sendSaved429(res, ctx)) return;
+    sendUpstreamTimeout(res, ctx);
+    return;
+  }
   const continuityBoundedTimeout = continuityRemainingMs != null
     && continuityRemainingMs <= ctx.upstreamResponseTimeoutMs;
   const upstreamDeadline = createUpstreamDeadline(
@@ -1946,7 +1963,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   } catch (err) {
     if (upstreamDeadline.timedOut && !res.destroyed) {
-      if (continuityBoundedTimeout && sendSaved429(res, ctx)) return;
+      if (continuityBoundedTimeout && replaySafe && sendSaved429(res, ctx)) return;
       console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
       if (logDir) {
         logSections.push('=== ERROR ===\nUpstream response timed out.');
@@ -1954,7 +1971,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       ctx.tried5xx.add(account);
-      if (replaySafe && retryCount < maxRetries
+      if (!continuityBoundedTimeout && replaySafe && retryCount < maxRetries
           && (accountManager.anyUsable(ctx.tried5xx, ctx.model)
             || accountManager.anyCapped(ctx.tried5xx, ctx.model))) {
         console.log(`[TeamClaude] Response timeout on "${account.name}" — switching account for this request`);
@@ -1962,14 +1979,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      ctx.status = 502;
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'proxy_error', message: 'Upstream response timed out.' },
-        }));
-      }
+      sendUpstreamTimeout(res, ctx);
       return;
     }
 
