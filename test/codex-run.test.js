@@ -7,9 +7,28 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
+const forbiddenResumeArgs = new Set(['resume', '--resume', '--last', '--continue']);
 
 function jwt(payload) {
   return `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`;
+}
+
+async function readInvocations(logPath) {
+  return (await readFile(logPath, 'utf8'))
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(line => JSON.parse(line));
+}
+
+function assertSingleInvocationWithoutResume(invocations, expectedTail) {
+  assert.equal(invocations.length, 1, `expected one child invocation, got ${invocations.length}`);
+  assert.deepEqual(invocations[0].slice(-expectedTail.length), expectedTail);
+  assert.deepEqual(
+    invocations[0].filter(arg => forbiddenResumeArgs.has(arg)),
+    [],
+    `launcher added an implicit resume argument: ${JSON.stringify(invocations[0])}`,
+  );
 }
 
 test('teamclaude codex run launches Codex through the HTTP-only first-party auth provider', async () => {
@@ -62,6 +81,97 @@ console.log(JSON.stringify({
     assert.match(child.args[3], /requires_openai_auth = true/);
     assert.match(child.args[3], /supports_websockets = false/);
     assert.equal(child.args[5], 'chatgpt_base_url="http://127.0.0.1:4567"');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('teamclaude codex run uses a single spawn for success, non-429, and 429-style exits without implicit resume', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-exit-'));
+  const fakeCodex = join(dir, 'codex');
+  const configPath = join(dir, 'teamcodex.json');
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.INVOCATION_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+if (process.env.FAKE_EXIT === '429') {
+  console.error('429 Too Many Requests');
+  process.exit(1);
+}
+process.exit(Number(process.env.FAKE_EXIT));
+`);
+  await chmod(fakeCodex, 0o755);
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port: 4567, apiKey: 'proxy-key' },
+  }));
+
+  try {
+    const scenarios = [
+      { name: 'success', fakeExit: '0', expectedStatus: 0 },
+      { name: 'non-429', fakeExit: '23', expectedStatus: 23 },
+      { name: '429-style', fakeExit: '429', expectedStatus: 1 },
+    ];
+
+    for (const scenario of scenarios) {
+      const logPath = join(dir, `${scenario.name}.log`);
+      const result = spawnSync(
+        process.execPath,
+        [entry, 'codex', 'run', '--', 'exec', 'probe'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PATH: `${dir}:${process.env.PATH}`,
+            TEAMCLAUDE_CONFIG: configPath,
+            INVOCATION_LOG: logPath,
+            FAKE_EXIT: scenario.fakeExit,
+          },
+        },
+      );
+
+      assert.equal(result.status, scenario.expectedStatus, `${scenario.name}: ${result.stderr}`);
+      if (scenario.fakeExit === '429') assert.match(result.stderr, /429 Too Many Requests/);
+      assertSingleInvocationWithoutResume(await readInvocations(logPath), ['exec', 'probe']);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('teamclaude codex run propagates SIGINT with a single spawn and no resume flags', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-signal-'));
+  const fakeCodex = join(dir, 'codex');
+  const configPath = join(dir, 'teamcodex.json');
+  const logPath = join(dir, 'invocations.log');
+  await writeFile(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.INVOCATION_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+process.kill(process.pid, 'SIGINT');
+`);
+  await chmod(fakeCodex, 0o755);
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port: 4567, apiKey: 'proxy-key' },
+  }));
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [entry, 'codex', 'run', '--', 'exec', 'probe'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH}`,
+          TEAMCLAUDE_CONFIG: configPath,
+          INVOCATION_LOG: logPath,
+        },
+      },
+    );
+
+    assert.equal(result.status, null, result.stderr);
+    assert.equal(result.signal, 'SIGINT');
+    assertSingleInvocationWithoutResume(await readInvocations(logPath), ['exec', 'probe']);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

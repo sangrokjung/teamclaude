@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
+const forbiddenResumeArgs = new Set(['resume', '--resume', '--last', '--continue']);
 
 async function startStatusServer(dir, status) {
   const payload = { switchThreshold: 0.98, ...status };
@@ -79,6 +80,56 @@ console.log(JSON.stringify({
     assert.equal(child.oauthToken, 'oauth-must-reach-child');
     assert.equal(child.baseUrl, `http://localhost:${server.port}`);
     assert.deepEqual(child.args, ['--model', 'fable']);
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run propagates SIGINT from Claude with a single spawn and no resume flags', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-signal-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    const logPath = join(dir, 'invocations.log');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.INVOCATION_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+process.kill(process.pid, 'SIGINT');
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port, apiKey: 'proxy-key' } }));
+
+    const result = spawnSync(
+      process.execPath,
+      [entry, 'run', '--', '--model', 'sonnet'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH}`,
+          TEAMCLAUDE_CONFIG: configPath,
+          INVOCATION_LOG: logPath,
+        },
+      },
+    );
+
+    assert.equal(result.status, null, result.stderr);
+    assert.equal(result.signal, 'SIGINT');
+    const invocations = (await readFile(logPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    assert.equal(invocations.length, 1, `expected one child invocation, got ${invocations.length}`);
+    assert.deepEqual(invocations[0], ['--model', 'sonnet']);
+    assert.deepEqual(
+      invocations[0].filter(arg => forbiddenResumeArgs.has(arg)),
+      [],
+      `launcher added an implicit resume argument: ${JSON.stringify(invocations[0])}`,
+    );
   } finally {
     if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });

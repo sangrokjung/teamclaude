@@ -1623,6 +1623,14 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+function propagateChildExit(result) {
+  if (result.signal) {
+    process.kill(process.pid, result.signal);
+    return;
+  }
+  process.exit(result.status ?? 1);
+}
+
 async function runCommand() {
   const config = await loadOrCreateConfig();
   if (!isCodexMode(config)) {
@@ -1657,7 +1665,7 @@ async function runCommand() {
       }
       process.exit(1);
     }
-    process.exit(result.status ?? 1);
+    return propagateChildExit(result);
   }
 
   delete childEnv.ANTHROPIC_API_KEY;
@@ -1682,7 +1690,7 @@ async function runCommand() {
     process.exit(1);
   }
 
-  process.exit(result.status ?? 1);
+  return propagateChildExit(result);
 }
 
 // ── status ──────────────────────────────────────────────────
