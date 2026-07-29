@@ -87,11 +87,11 @@ function request({ host = '127.0.0.1', port, path, method = 'GET', headers, body
 }
 
 async function stopChild(child) {
-  if (child.exitCode != null) return;
+  if (child.exitCode != null || child.signalCode != null) return;
   const exited = once(child, 'exit');
   child.kill('SIGTERM');
   await Promise.race([exited, delay(6500)]);
-  if (child.exitCode == null) {
+  if (child.exitCode == null && child.signalCode == null) {
     child.kill('SIGKILL');
     await once(child, 'exit');
   }
@@ -474,7 +474,7 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
   }
 });
 
-test('teamclaude run starts a missing proxy before launching Claude Code', { timeout: 15000 }, async () => {
+test('teamclaude run starts a missing proxy before launching Claude Code', { timeout: 15000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-autostart-'));
   const configPath = join(dir, 'config.json');
   const fakeClaude = join(dir, 'claude');
@@ -498,15 +498,25 @@ console.log(JSON.stringify({ ok: response.ok, accounts: body.accounts.length }))
     TEAMCLAUDE_CONFIG: configPath,
   };
 
+  let runChild;
   try {
-    const result = spawnSync(process.execPath, [entry, 'run'], {
-      encoding: 'utf8',
+    runChild = spawn(process.execPath, [entry, 'run'], {
       env,
-      timeout: 10000,
+      signal: t.signal,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout.trim()), { ok: true, accounts: 1 });
+    runChild.stdout.setEncoding('utf8');
+    runChild.stderr.setEncoding('utf8');
+    let stdout = '';
+    let stderr = '';
+    runChild.stdout.on('data', chunk => { stdout += chunk; });
+    runChild.stderr.on('data', chunk => { stderr += chunk; });
+    const [exitCode, signal] = await once(runChild, 'close');
+    assert.equal(signal, null, stderr);
+    assert.equal(exitCode, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout.trim()), { ok: true, accounts: 1 });
   } finally {
+    if (runChild) await stopChild(runChild);
     spawnSync(process.execPath, [entry, 'stop'], {
       encoding: 'utf8',
       env,
