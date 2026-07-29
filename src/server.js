@@ -1378,9 +1378,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   }
 
+  const continuityRemainingMs = ctx.continuityDeadlineAt == null
+    ? null
+    : Math.max(0, ctx.continuityDeadlineAt - Date.now());
+  const continuityBoundedTimeout = continuityRemainingMs != null
+    && continuityRemainingMs <= ctx.upstreamResponseTimeoutMs;
   const upstreamDeadline = createUpstreamDeadline(
     ctx.abortSignal,
-    ctx.upstreamResponseTimeoutMs,
+    continuityBoundedTimeout ? continuityRemainingMs : ctx.upstreamResponseTimeoutMs,
   );
   try {
     const upstreamRes = await fetch(upstreamUrl, {
@@ -1941,6 +1946,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   } catch (err) {
     if (upstreamDeadline.timedOut && !res.destroyed) {
+      if (continuityBoundedTimeout && sendSaved429(res, ctx)) return;
       console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
       if (logDir) {
         logSections.push('=== ERROR ===\nUpstream response timed out.');

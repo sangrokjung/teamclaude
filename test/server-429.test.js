@@ -364,6 +364,52 @@ test('persistent global 429 returns the last upstream response at the continuity
   }
 });
 
+test('stalled retry returns the last upstream 429 at the continuity deadline', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    if (upstreamHits === 5) return;
+    res.writeHead(429, {
+      'retry-after': '1',
+      'content-type': 'application/json',
+      'x-upstream-attempt': String(upstreamHits),
+    });
+    res.end(JSON.stringify({ type: 'error', upstreamAttempt: upstreamHits }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  const proxy = startContinuityProxy(am, upstreamPort, {
+    continuityMaxWaitMs: 70,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    upstreamResponseTimeoutMs: 120,
+    rateLimitFailovers: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    const responseBody = await res.json();
+    const elapsed = Date.now() - started;
+    assert.equal(res.status, 429,
+      'a stalled retry must return the last complete 429 instead of a timeout 502');
+    assert.deepEqual(responseBody, { type: 'error', upstreamAttempt: 4 });
+    assert.equal(res.headers.get('x-upstream-attempt'), '4');
+    assert.equal(upstreamHits, 5);
+    assert.ok(elapsed < 150, `continuity deadline should bound the stalled retry, took ${elapsed}ms`);
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('normal inference time before the first 429 does not consume the continuity deadline', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
