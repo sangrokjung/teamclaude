@@ -1009,8 +1009,7 @@ export class AccountManager {
     if (!account || !label) return false;
     // Sweep expired windows before reading the model-specific value.
     this._isNearQuota(account);
-    const win = account.quota.modelWeekly[label];
-    return win?.utilization != null && win.utilization >= this.switchThreshold;
+    return this._isModelNearQuota(account, model);
   }
 
   /**

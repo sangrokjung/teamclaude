@@ -369,6 +369,32 @@ test('live 7d_oi data classifies Fable/Mythos 429s while routing to a ready acco
   assert.equal(am.isModelExhausted(am.accounts[0], 'claude-opus-4-8'), false);
 });
 
+test('model-scoped exhaustion requires a finite future complete window', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const now = Date.now();
+  const incompleteOrStale = [
+    ['null reset', { utilization: 1, reset: null }],
+    ['non-finite reset (NaN)', { utilization: 1, reset: Number.NaN }],
+    ['non-finite reset (Infinity)', { utilization: 1, reset: Number.POSITIVE_INFINITY }],
+    ['non-finite utilization (NaN)', { utilization: Number.NaN, reset: now + HOUR }],
+    ['non-finite utilization (Infinity)', { utilization: Number.POSITIVE_INFINITY, reset: now + HOUR }],
+    ['past reset', { utilization: 1, reset: now - 1 }],
+  ];
+
+  for (const [name, window] of incompleteOrStale) {
+    am.accounts[0].quota.modelWeekly['7d_oi'] = window;
+    assert.equal(am.isModelExhausted(0, 'claude-fable-5'), false,
+      `${name} must not classify the model as exhausted`);
+  }
+
+  am.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: now + HOUR,
+  };
+  assert.equal(am.isModelExhausted(0, 'claude-fable-5'), true,
+    'a finite full window with a future reset must classify the model as exhausted');
+});
+
 test('a headerless response clears stale unifiedStatus across models', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const reset = String(Math.floor((Date.now() + HOUR) / 1000));

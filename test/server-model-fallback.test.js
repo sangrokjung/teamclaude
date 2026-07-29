@@ -107,6 +107,47 @@ test('multi-account bare 429 stays on Fable through failover and bounded continu
   }
 });
 
+test('partial reset-less Fable windows plus bare 429 never trigger Opus fallback', async () => {
+  const attempts = [];
+  let opusAttempts = 0;
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJsonBody(req);
+    attempts.push(body.model);
+    if (body.model === 'claude-opus-4-8') opusAttempts += 1;
+    bare429(res);
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  for (const account of am.accounts) {
+    account.quota.modelWeekly['7d_oi'] = { utilization: 1, reset: null };
+  }
+  const proxy = startProxy(am, upstreamPort, {
+    modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: true,
+    continuityMaxWaitMs: 55,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 1,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await post(proxyPort, 'claude-fable-5');
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.ok(attempts.length >= 2, `expected account failover, got ${attempts.length} attempt(s)`);
+    assert.ok(attempts.length < 20, `bare 429 retries must stay bounded, got ${attempts.length}`);
+    assert.equal(opusAttempts, 0, 'a reset-less partial window must not trigger Opus fallback');
+    assert.ok(attempts.every(model => model === 'claude-fable-5'),
+      `every attempt must remain on Fable, got ${attempts.join(', ')}`);
+    assert.ok(am.accounts.every(a => a.status === 'active'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('labeled Fable 7d_oi exhaustion → falls back to Opus and succeeds', async () => {
   const attempts = [];
   const upstream = http.createServer(async (req, res) => {
