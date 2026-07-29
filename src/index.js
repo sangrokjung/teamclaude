@@ -56,15 +56,7 @@ function publicRequestCapacity(config, accounts = config.accounts || []) {
   const queueCapacity = Number.isFinite(config.overflowQueueMaxDepth)
     ? Math.max(0, config.overflowQueueMaxDepth)
     : 256;
-  const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
-    ? config.maxRequestBytes
-    : 32 * 1024 * 1024;
-  const bufferBudget = Number.isFinite(config.maxBufferedRequestBytes)
-      && config.maxBufferedRequestBytes > 0
-    ? config.maxBufferedRequestBytes
-    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
-  const bufferCapacity = Math.floor(bufferBudget / (maxRequestBytes * 2));
-  return Math.min(accountCapacity + queueCapacity, bufferCapacity);
+  return accountCapacity + queueCapacity;
 }
 
 const args = process.argv.slice(2);
@@ -172,6 +164,10 @@ async function superviseServerCommand() {
   const maxRequestBytes = Number.isFinite(config.maxRequestBytes) && config.maxRequestBytes > 0
     ? config.maxRequestBytes
     : 32 * 1024 * 1024;
+  const maxBufferedRequestBytes = Number.isFinite(config.maxBufferedRequestBytes)
+      && config.maxBufferedRequestBytes > 0
+    ? config.maxBufferedRequestBytes
+    : DEFAULT_MAX_BUFFERED_REQUEST_BYTES;
   const requestBodyTimeoutMs = Number.isFinite(config.requestBodyTimeoutMs)
       && config.requestBodyTimeoutMs > 0
     ? Math.max(1, Math.floor(config.requestBodyTimeoutMs))
@@ -204,6 +200,7 @@ async function superviseServerCommand() {
   let hasBeenReady = false;
   let stopping = false;
   let activePublicRequests = 0;
+  let activeBufferedRequestBytes = 0;
   let restartCount = 0;
   let restartTimer = null;
   let stableTimer = null;
@@ -255,15 +252,25 @@ async function superviseServerCommand() {
       return;
     }
     if (!bypassAdmission) activePublicRequests += 1;
+    let requestBufferedBytes = 0;
     let released = bypassAdmission;
+    const reserveRequestBytes = bytes => {
+      const bufferedBytes = bytes * 2;
+      if (bufferedBytes > maxBufferedRequestBytes - activeBufferedRequestBytes) return false;
+      activeBufferedRequestBytes += bufferedBytes;
+      requestBufferedBytes += bufferedBytes;
+      return true;
+    };
     const release = () => {
       if (released) return;
       released = true;
       activePublicRequests -= 1;
+      activeBufferedRequestBytes -= requestBufferedBytes;
+      requestBufferedBytes = 0;
     };
     res.once('finish', release);
     res.once('close', release);
-    handlePublicRequest(req, res).catch(err => {
+    handlePublicRequest(req, res, reserveRequestBytes).catch(err => {
       if (!res.headersSent && !res.destroyed) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { type: 'proxy_error', message: err.message } }));
@@ -289,7 +296,7 @@ async function superviseServerCommand() {
     }
   });
 
-  function bufferRequest(req) {
+  function bufferRequest(req, reserveRequestBytes) {
     return new Promise((resolve, reject) => {
       const chunks = [];
       let size = 0;
@@ -315,6 +322,16 @@ async function superviseServerCommand() {
           req.pause();
           const err = new Error('Request body too large');
           err.statusCode = 413;
+          err.closeConnection = true;
+          settle(reject, err);
+          return;
+        }
+        if (!reserveRequestBytes(chunk.length)) {
+          chunks.length = 0;
+          req.pause();
+          const err = new Error('Proxy supervisor queue is full');
+          err.statusCode = 429;
+          err.errorType = 'overloaded_error';
           err.closeConnection = true;
           settle(reject, err);
           return;
@@ -388,20 +405,23 @@ async function superviseServerCommand() {
     if (force) listener.closeAllConnections?.();
   }
 
-  async function handlePublicRequest(req, res) {
+  async function handlePublicRequest(req, res, reserveRequestBytes) {
     let body;
     try {
-      body = await bufferRequest(req);
+      body = await bufferRequest(req, reserveRequestBytes);
     } catch (err) {
       if (!res.headersSent && !res.destroyed) {
         const headers = { 'content-type': 'application/json' };
+        if (err.statusCode === 429) headers['retry-after'] = '1';
         if (err.closeConnection) {
           headers.connection = 'close';
           res.shouldKeepAlive = false;
           res.once('finish', () => req.destroy());
         }
         res.writeHead(err.statusCode || 400, headers);
-        res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: err.message } }));
+        res.end(JSON.stringify({
+          error: { type: err.errorType || 'invalid_request_error', message: err.message },
+        }));
       }
       return;
     }

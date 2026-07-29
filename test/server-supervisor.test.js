@@ -679,6 +679,13 @@ test('supervisor buffer budget limits the double-buffered public request count',
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-'));
   const configPath = join(dir, 'config.json');
   const port = await unusedPort();
+  const maxRequestBytes = 1024;
+  const maxBufferedRequestBytes = 2048;
+  const heldBody = Buffer.alloc(maxRequestBytes, 'x');
+  const overflowBody = Buffer.from('x');
+  assert.equal(heldBody.length, maxRequestBytes);
+  assert.equal(heldBody.length * 2, maxBufferedRequestBytes);
+  assert.equal(overflowBody.length, 1);
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits += 1;
@@ -693,8 +700,8 @@ test('supervisor buffer budget limits the double-buffered public request count',
     activeWarmup: false,
     maxConcurrentPerAccount: 8,
     overflowQueueMaxDepth: 8,
-    maxRequestBytes: 1024,
-    maxBufferedRequestBytes: 2048,
+    maxRequestBytes,
+    maxBufferedRequestBytes,
     accounts: [{
       name: 'budget-account',
       type: 'oauth',
@@ -716,16 +723,16 @@ test('supervisor buffer budget limits the double-buffered public request count',
     await waitUntil(() => status(port), 'proxy did not start');
     first = fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      headers: { 'content-type': 'application/octet-stream' },
+      body: heldBody,
       signal: firstAbort.signal,
     }).catch(() => null);
     await waitUntil(() => upstreamHits === 1, 'first request did not reach upstream');
 
     const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      headers: { 'content-type': 'application/octet-stream' },
+      body: overflowBody,
       signal: AbortSignal.timeout(2000),
     });
     assert.equal(second.status, 429);
@@ -733,6 +740,85 @@ test('supervisor buffer budget limits the double-buffered public request count',
   } finally {
     firstAbort.abort();
     if (first) await first;
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('supervisor admits five small held POSTs by actual request byte budget', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-actual-budget-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  const heldResponses = [];
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    if (upstreamHits <= 4) {
+      heldResponses.push(res);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    maxConcurrentPerAccount: 8,
+    overflowQueueMaxDepth: 0,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 8192,
+    accounts: [{
+      name: 'actual-budget-account',
+      type: 'oauth',
+      accountUuid: 'actual-budget-uuid',
+      accessToken: 'x',
+      refreshToken: 'x',
+      expiresAt: Date.now() + 3600_000,
+    }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let childStderr = '';
+  child.stderr.on('data', chunk => { childStderr += chunk; });
+  const heldRequests = [];
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start').catch(err => {
+      err.message += `: ${childStderr.trim()}`;
+      throw err;
+    });
+    for (let i = 0; i < 4; i += 1) {
+      heldRequests.push(fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'test-model', messages: [], request: i }),
+      }));
+    }
+    await waitUntil(() => upstreamHits === 4, 'four held requests did not reach upstream');
+
+    const fifth = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [], request: 4 }),
+      signal: AbortSignal.timeout(2000),
+    });
+    assert.equal(
+      fifth.status,
+      200,
+      'five small bodies fit the byte budget and must not hit the static four-request cap',
+    );
+    assert.equal(upstreamHits, 5);
+  } finally {
+    for (const response of heldResponses) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{}');
+    }
+    await Promise.allSettled(heldRequests);
     await stopChild(child);
     await close(upstream);
     await rm(dir, { recursive: true, force: true });
@@ -826,6 +912,11 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-minimum-'));
   const configPath = join(dir, 'config.json');
   const port = await unusedPort();
+  const maxRequestBytes = 1024;
+  const maxBufferedRequestBytes = 2047;
+  const body = Buffer.alloc(maxRequestBytes, 'x');
+  assert.equal(body.length, maxRequestBytes);
+  assert.equal(body.length * 2, 2048);
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits += 1;
@@ -837,8 +928,8 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
     proxy: { port },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
-    maxRequestBytes: 1024,
-    maxBufferedRequestBytes: 2047,
+    maxRequestBytes,
+    maxBufferedRequestBytes,
     accounts: [{
       name: 'budget-account',
       type: 'oauth',
@@ -856,53 +947,12 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
 
   try {
     await waitUntil(() => status(port), 'proxy did not start');
-    const bodyBearingStatus = await new Promise((resolve, reject) => {
-      const request = http.request({
-        hostname: '127.0.0.1',
-        port,
-        path: '/teamclaude/status',
-        method: 'GET',
-        headers: { 'content-length': '2' },
-      }, response => {
-        response.resume();
-        response.once('end', () => resolve(response.statusCode));
-      });
-      request.once('error', reject);
-      request.end('{}');
-    });
-    assert.equal(bodyBearingStatus, 429,
-      'a status GET with a body must not bypass the supervisor buffer budget');
-
-    const slowRejected = await new Promise((resolve, reject) => {
-      let resolved = false;
-      const request = http.request({
-        hostname: '127.0.0.1',
-        port,
-        path: '/v1/messages',
-        method: 'POST',
-        headers: { 'transfer-encoding': 'chunked' },
-      }, response => {
-        response.resume();
-        response.once('end', () => {
-          resolved = true;
-          resolve({
-            status: response.statusCode,
-            connection: response.headers.connection,
-          });
-        });
-      });
-      request.once('error', err => {
-        if (!resolved) reject(err);
-      });
-      request.write('1');
-    });
-    assert.deepEqual(slowRejected, { status: 429, connection: 'close' });
-
-    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'test-model', messages: [] }),
-      signal: AbortSignal.timeout(2000),
+    const response = await request({
+      port,
+      path: '/teamclaude/status',
+      method: 'GET',
+      headers: { 'transfer-encoding': 'chunked' },
+      body,
     });
     assert.equal(response.status, 429);
     assert.equal(upstreamHits, 0, 'an under-sized supervisor budget must reject before the worker');
