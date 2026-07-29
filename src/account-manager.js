@@ -462,7 +462,7 @@ export class AccountManager {
   _selectBest(exclude = null, model = null) {
     const has = a => (exclude ? exclude.has(a) : false);
     const eligible = this.accounts.filter(a => this._isAvailable(a, model) && !has(a));
-    if (eligible.length === 0) return exclude ? null : this._recoverSoonest();
+    if (eligible.length === 0) return exclude ? null : this._recoverSoonest(model);
 
     eligible.sort((a, b) => {
       const pa = this._priority(a);
@@ -757,7 +757,7 @@ export class AccountManager {
     return true;
   }
 
-  _isNearQuota(account) {
+  _isNearQuota(account, model = null) {
     const q = account.quota;
     const now = Date.now();
 
@@ -783,10 +783,9 @@ export class AccountManager {
       account._partialProbes = 0; // fresh rollover → re-probes allowed again
       account._warmupTries = 0;
     }
-    // Clear expired model-scoped weekly windows. They do not pre-block account
-    // selection, but stale values would still mislead the dashboard and 429
-    // retry-time calculation. A cleared window is a fresh reason to top it up
-    // again, so renew the model-weekly probe budget.
+    // Clear expired model-scoped weekly windows. Stale values would mislead
+    // selection, the dashboard, and 429 retry-time calculation. A cleared window
+    // is a fresh reason to top it up again, so renew the model-weekly probe budget.
     for (const [label, win] of Object.entries(q.modelWeekly)) {
       if (win.reset && now >= win.reset) {
         console.log(`[TeamClaude] Account "${account.name}" ${label} quota reset`);
@@ -794,6 +793,8 @@ export class AccountManager {
         account._mwProbes = 0;
       }
     }
+
+    if (this._isModelNearQuota(account, model, now)) return true;
 
     // Clear expired standard quotas — each window INDEPENDENTLY. The token and
     // request windows reset at different times; sweeping both on the collapsed
@@ -840,14 +841,25 @@ export class AccountManager {
     return false;
   }
 
+  _isModelNearQuota(account, model, now = Date.now()) {
+    const label = modelQuotaLabel(model);
+    if (!label) return false;
+    const win = account.quota.modelWeekly[label];
+    return Number.isFinite(win?.utilization)
+      && Number.isFinite(win?.reset)
+      && win.reset > now
+      && win.utilization >= this.switchThreshold;
+  }
+
   /** When all accounts are unavailable, return the soonest to reset (if it has already reset). */
-  _recoverSoonest() {
+  _recoverSoonest(model = null) {
     let soonestAccount = null;
     let soonestTime = Infinity;
 
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset

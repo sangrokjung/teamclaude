@@ -258,7 +258,7 @@ test('updateQuota parses model-scoped weekly windows (7d_oi) generically', () =>
   assert.equal(am.accounts[0].quota.unified7d, 0.86);
 });
 
-test('a model-scoped weekly limit over threshold does NOT make the account unavailable', () => {
+test('a fresh model-scoped weekly limit blocks only the matching model family', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const now = Date.now();
   am.updateQuota(0, {
@@ -271,8 +271,9 @@ test('a model-scoped weekly limit over threshold does NOT make the account unava
     'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
   });
   assert.equal(am._isAvailable(am.accounts[0]), true);
-  assert.equal(am._isAvailable(am.accounts[0], 'claude-fable-5'), true,
-    'response-derived model quota must not pre-block its own refresh request');
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-fable-5'), false);
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-mythos-5'), false);
+  assert.equal(am._isAvailable(am.accounts[0], 'claude-opus-4-8'), true);
   assert.equal(am.getActiveAccount().name, 'acct-0');
 });
 
@@ -291,7 +292,45 @@ test('Opus remains eligible when the Fable/Mythos 7d_oi window is exhausted', as
   am.releaseAccount(opus);
 });
 
-test('model-scoped cache never pre-blocks the request that can refresh it', async () => {
+test('unknown and expired model-scoped cache do not pre-block the request that can refresh it', async () => {
+  const cases = [
+    ['unknown', null],
+    ['missing-utilization', { reset: Date.now() + HOUR }],
+    ['non-finite-utilization', { utilization: Number.NaN, reset: Date.now() + HOUR }],
+    ['missing-reset', { utilization: 1 }],
+    ['expired', { utilization: 1, reset: Date.now() - 1 }],
+  ];
+
+  for (const [name, window] of cases) {
+    const am = new AccountManager([
+      { ...makeAccounts(1)[0], name },
+    ], 0.98);
+    if (window) am.accounts[0].quota.modelWeekly['7d_oi'] = window;
+
+    const fable = await am.acquireAccount(null, 0, null, null, 'claude-fable-5');
+    assert.equal(fable.name, name, `${name} cache must still reach upstream for refresh`);
+    am.releaseAccount(fable);
+    if (name === 'expired') {
+      assert.deepEqual(am.accounts[0].quota.modelWeekly, {}, 'expired cache is swept during selection');
+    }
+  }
+});
+
+test('all fresh Fable-full accounts return null without recovery', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  for (const account of am.accounts) {
+    account.quota.modelWeekly['7d_oi'] = {
+      utilization: 1,
+      reset: Date.now() + HOUR,
+    };
+  }
+  am.accounts[0].rateLimitedUntil = Date.now() - 1;
+
+  const fable = await am.acquireAccount(null, 0, null, null, 'claude-fable-5');
+  assert.equal(fable, null);
+});
+
+test('fresh Fable-full preferred account is skipped for Fable routing', async () => {
   const am = new AccountManager([
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
     { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
@@ -302,11 +341,11 @@ test('model-scoped cache never pre-blocks the request that can refresh it', asyn
   };
 
   const fable = await am.acquireAccount(null, 0, null, null, 'claude-fable-5');
-  assert.equal(fable.name, 'fable-full', 'cached 7d_oi must not self-lock the preferred account');
+  assert.equal(fable.name, 'fable-ready');
   am.releaseAccount(fable);
 });
 
-test('live 7d_oi data classifies Fable/Mythos 429s without pre-blocking selection', async () => {
+test('live 7d_oi data classifies Fable/Mythos 429s while routing to a ready account', async () => {
   const am = new AccountManager([
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
     { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
@@ -324,7 +363,7 @@ test('live 7d_oi data classifies Fable/Mythos 429s without pre-blocking selectio
     assert.equal(am.isModelExhausted(am.accounts[0], model), true,
       `${model} must classify the live 7d_oi window`);
     const acct = await am.acquireAccount(null, 0, null, null, model);
-    assert.equal(acct.name, 'fable-full', `${model} must still reach upstream to refresh the window`);
+    assert.equal(acct.name, 'fable-ready', `${model} must skip the fresh exhausted window`);
     am.releaseAccount(acct);
   }
   assert.equal(am.isModelExhausted(am.accounts[0], 'claude-opus-4-8'), false);
