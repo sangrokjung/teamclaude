@@ -128,10 +128,11 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **Use-or-lose 우선순위** — 주간 한도 초기화가 가장 가까운 계정을 먼저 사용합니다.
 - **Codex 구독 계정 풀** — ChatGPT OAuth 계정을 별도 풀로 관리하고 공식 Codex 사용량 헤더를 추적합니다.
 - **429 즉시 장애 전환** — 사용량이 끝난 계정은 잠시 제외하고 다음 계정으로 요청을 재전송합니다.
-- **연속성 모드** — 모든 계정이 잠시 제한된 경우 즉시 실패시키지 않고 초기화 시점까지 프록시 내부에서 대기합니다.
+- **연속성 모드** — quota 또는 transient/global 429를 기본 15분 deadline 안에서 프록시가 내부 복구하며, probe 간격은 최대 30초입니다.
 - **연결 affinity** — 같은 터미널의 연속 요청을 같은 계정에 유지해 prompt cache를 보존합니다.
 - **동시 요청 분산** — 계정별 동시 요청 한도를 넘는 트래픽은 다른 계정으로 자동 분산합니다.
-- **모델 fallback** — 전체 계정에서 특정 모델의 사용량이 끝나면 설정된 대체 모델로 전환합니다.
+- **Fable/Mythos 계정 우선** — 모델별 window가 유효 기간 내이고, 유한한 값으로 측정됐으며, 한도에 도달한(fresh·finite·full) 계정만 그 요청에서 제외합니다. 미측정·만료·사용 가능 계정은 원래 모델로 먼저 시도하고, Opus/Sonnet/Haiku 자격은 유지합니다.
+- **모델 fallback** — 캐시에 기록된 general-available 계정이 모두 해당 모델에서 fresh-full이거나, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인되거나, label 없는 429가 반복돼 `rateLimitFailovers`를 소진하면 대체 모델로 전환합니다. 단순 local cap·동시성 queue는 모델을 바꾸지 않습니다.
 - **실시간 TUI** — 계정 상태, 세션·주간 사용량, 초기화 시간, CPU·RAM을 표시합니다.
 - **계정 수동 제어** — enable, disable, switch, priority 순서를 CLI와 TUI에서 변경할 수 있습니다.
 - **재시작 후 상태 복원** — 사용량과 throttle 상태를 별도 quota 파일에 저장합니다.
@@ -163,6 +164,7 @@ teamclaude run
 > [!IMPORTANT]
 > 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamclaude run`으로 시작하세요.
 > `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
+> `launchModel` fallback은 일반 한도 기준으로 사용 가능한 계정 전부의 모델별 window가 유효하게 측정된 한도 도달 상태일 때만 적용됩니다. 미측정 또는 만료 window가 하나라도 있으면 조기 downgrade하지 않습니다.
 
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 
@@ -294,6 +296,8 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
   "continuityMode": true,
+  "continuityMaxWaitMs": 900000,
+  "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
   "accounts": []
 }
@@ -305,7 +309,9 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `reevalIntervalMs` | sticky 계정의 우선순위 재평가 간격 |
 | `maxConcurrentPerAccount` | 계정 하나의 동시 upstream 요청 수 |
 | `sessionAffinity` | 같은 연결을 기존 계정에 유지 |
-| `continuityMode` | 전체 제한 시 429 대신 내부 대기 |
+| `continuityMode` | quota 또는 transient/global 429를 deadline 안에서 내부 복구 |
+| `continuityMaxWaitMs` | 연속성 내부 복구의 전체 deadline (기본 `900000` = 15분) |
+| `continuityMaxSleepMs` | 연속성 probe 사이의 최대 간격 (기본 `30000` = 30초) |
 | `activeWarmup` | 최소 요청으로 계정 사용량을 선측정 |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
@@ -340,13 +346,13 @@ flowchart LR
 1. 클라이언트는 공급자 API 대신 로컬 프록시에 연결합니다.
 2. 프록시는 사용 가능한 계정 중 우선순위가 가장 높은 계정을 선택합니다.
 3. 만료 5분 이내의 OAuth token은 요청 전에 자동 갱신됩니다.
-4. 응답 헤더에서 세션·주간·모델별 사용량과 초기화 시점을 학습합니다.
+4. 응답 헤더에서 세션·주간·모델별 사용량과 초기화 시점을 학습합니다. 모델별 window는 재시작 때 복원하지 않아 미측정(unknown)으로 시작하며, runtime에서 유효 기간 내의 유한한 측정값이 한도에 도달한(fresh·finite·full) 경우에만 해당 Fable/Mythos 요청에서 그 계정을 제외합니다. 일반 한도 기준으로 사용 가능한 계정 중 미측정·만료·사용 가능 window가 하나라도 있으면 원래 모델을 유지하고, Opus/Sonnet/Haiku 자격은 바뀌지 않습니다.
 5. 새로 시작한 서버는 아직 측정되지 않은 계정을 먼저 순회합니다.
 6. 사용량 429는 해당 계정을 제외하고 다른 계정으로 즉시 전환합니다.
-7. 요청 속도나 동시성 429는 계정을 오염시키지 않고 제한된 횟수만큼 분산합니다.
+7. 요청 속도나 동시성 429는 계정을 오염시키지 않고 제한된 횟수만큼 분산합니다. label 없는 429가 반복돼 `rateLimitFailovers`를 소진하면 모델 fallback으로 넘어가며, 이후에도 남는 transient/global 429는 `continuityMaxWaitMs` deadline 안에서 내부 복구합니다. local cap·동시성 queue만으로는 fallback하지 않습니다.
 8. 네트워크 오류나 불완전한 SSE 스트림은 재전송해도 안전한 요청만 내부에서 다른 계정으로 재시도하고, 결과가 불확실한 POST는 숨은 재전송 없이 재시도 가능한 오류로 돌려줍니다.
-9. 모든 계정이 제한되면 연속성 모드가 가장 가까운 초기화 시점까지 기다립니다.
-10. 일반 사용량 상태는 재시작 후 복원되며 모델별 사용량은 실제 트래픽으로 다시 측정합니다.
+9. 모델 fallback은 캐시의 general-available 계정 전부가 fresh-full인 경우, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인된 경우, label 없는 429가 반복돼 failover budget이 소진된 경우에 적용됩니다. cached fresh-full 경로는 연속성 sleep 전에 즉시 실행되고, 그 외에 모든 계정이 제한되면 연속성 모드가 기본 15분 deadline 동안 최대 30초 간격으로 복구를 시도합니다.
+10. 일반 사용량 상태는 재시작 후 복원되지만 모델별 사용량은 복원하지 않고 실제 트래픽으로 다시 측정합니다.
 
 ## 보안 참고
 

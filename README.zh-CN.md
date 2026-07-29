@@ -120,10 +120,11 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 - **Use-or-lose 优先级** — 优先使用每周配额最早重置的账户。
 - **Codex 订阅账户池** — 单独管理 ChatGPT OAuth 账户并追踪官方 Codex 用量响应头。
 - **429 即时故障转移** — 暂时排除配额耗尽的账户，并把请求发送到下一个账户。
-- **连续性模式** — 所有账户暂时受限时，在代理内部等待重置，而不是立即让客户端失败。
+- **连续性模式** — quota 或 transient/global 429 会在默认 15 分钟 deadline 内由代理恢复，probe 间隔最多 30 秒。
 - **连接亲和性** — 同一终端的连续请求尽量停留在同一账户，保留 prompt cache。
 - **并发请求分散** — 超出单账户并发上限的流量自动分散到其他账户。
-- **模型 fallback** — 所有账户都无法使用指定模型时，切换到配置的备用模型。
+- **Fable/Mythos 账户优先** — 只有模型级窗口仍在有效期内、数值有限且已达到上限（fresh、finite、full）的账户才会对当前请求被跳过；未测量、已过期或仍可用的账户会先尝试原模型，Opus/Sonnet/Haiku 的资格不受影响。
+- **模型 fallback** — 当缓存中的 general-available 账户对该模型全部 fresh-full、实时 labeled model-tier 429 已覆盖所有 eligible 账户，或无 label 的 429 反复出现并耗尽 `rateLimitFailovers` 时切换到备用模型；仅 local cap 或并发 queue 不会更换模型。
 - **实时 TUI** — 显示账户状态、会话与每周用量、重置时间以及 CPU、内存。
 - **手动账户控制** — 通过 CLI 或 TUI 执行 enable、disable、switch 和 priority。
 - **重启后恢复状态** — 将用量和 throttle 状态保存在独立的 quota 文件中。
@@ -155,6 +156,7 @@ teamclaude run
 > [!IMPORTANT]
 > 即使代理正在运行，普通的 `claude` 命令也不会自动使用代理。若要启用账户自动切换，请始终通过 `teamclaude run` 启动。
 > `teamclaude run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
+> `launchModel` fallback 仅在所有按通用限额仍可用的账户，其模型级窗口都具有有效测量且已达到上限时应用。只要存在未测量或已过期的窗口，就不会提前 downgrade。
 
 也可以导入 Claude Code 当前的登录信息：
 
@@ -284,6 +286,8 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
   "continuityMode": true,
+  "continuityMaxWaitMs": 900000,
+  "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
   "accounts": []
 }
@@ -295,7 +299,9 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
 | `reevalIntervalMs` | 重新评估 sticky 账户优先级的间隔 |
 | `maxConcurrentPerAccount` | 单个账户的最大并发上游请求数 |
 | `sessionAffinity` | 将同一连接保持在原账户 |
-| `continuityMode` | 全部受限时在内部等待，而不是返回 429 |
+| `continuityMode` | 在 deadline 内部恢复 quota 或 transient/global 429 |
+| `continuityMaxWaitMs` | 连续性内部恢复的总 deadline（默认 `900000` = 15 分钟） |
+| `continuityMaxSleepMs` | 连续性 probe 之间的最大间隔（默认 `30000` = 30 秒） |
 | `activeWarmup` | 通过最小请求预先测量账户用量 |
 | `accounts[].enabled` | 设为 `false` 时从轮换中排除账户 |
 | `accounts[].priority` | 数字越小，固定优先级越高 |
@@ -330,13 +336,13 @@ flowchart LR
 1. 客户端连接本地代理，而不是直接连接服务商 API。
 2. 代理从可用账户中选择优先级最高的账户。
 3. 距离过期不足 5 分钟的 OAuth token 会在请求前自动刷新。
-4. 代理从响应头学习会话、每周和模型级用量及其重置时间。
+4. 代理从响应头学习会话、每周和模型级用量及其重置时间。模型级窗口不会在重启时恢复，因此从未测量（unknown）开始；runtime 中只有仍在有效期内、数值有限且已达到上限（fresh、finite、full）的窗口，才会对对应的 Fable/Mythos 请求排除该账户。只要按通用限额仍可用的账户中有一个窗口未测量、已过期或仍可用，就保留原模型，Opus/Sonnet/Haiku 的资格不变。
 5. 新启动的服务器会优先轮询尚未测量的账户。
 6. 配额型 429 会立即排除当前账户并切换到其他账户。
-7. 速率或并发型 429 只进行有限次数的分散，不会污染账户状态。
+7. 速率或并发型 429 只进行有限次数的分散，不会污染账户状态。无 label 的 429 反复出现并耗尽 `rateLimitFailovers` 后会进入模型 fallback；之后仍存在的 transient/global 429 会在 `continuityMaxWaitMs` deadline 内部恢复。仅 local cap 或并发 queue 不会 fallback。
 8. 网络错误或不完整的 SSE 流，只有可安全重发的请求才会在内部换账户重试；结果不确定的 POST 不做隐藏重发，而是返回可重试的错误。
-9. 所有账户受限时，连续性模式会等待最近的重置时间。
-10. 普通用量状态会在重启后恢复，模型级用量则通过真实流量重新测量。
+9. 模型 fallback 有三个入口：缓存中的 general-available 账户全部 fresh-full；实时 labeled model-tier 429 已覆盖所有 eligible 账户；或无 label 的 429 反复出现并耗尽 failover budget。cached fresh-full 路径会在连续性 sleep 前立即执行；其他情况下，当所有账户都受限时，连续性模式会在默认 15 分钟 deadline 内以最多 30 秒的间隔尝试恢复。
+10. 普通用量状态会在重启后恢复，但模型级用量不会恢复，而是通过真实流量重新测量。
 
 ## 安全提示
 
