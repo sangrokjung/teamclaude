@@ -1574,19 +1574,18 @@ function topTierUnavailable(status, threshold) {
   const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
   const candidates = accounts.filter(a =>
     a.enabled !== false && !['disabled', 'error', 'exhausted', 'throttled'].includes(a.status));
-  if (!candidates.length) return true;
+  const available = candidates.filter(a => !isGeneralQuotaBlocked(a, threshold));
+  if (!available.length) return true;
 
-  let measured = 0;
-  for (const account of candidates) {
-    if (isGeneralQuotaBlocked(account, threshold)) continue;
+  const now = Date.now();
+  return available.every(account => {
     const win = account.quota?.modelWeekly?.['7d_oi'];
     const reset = win?.reset == null ? null : new Date(win.reset).getTime();
-    if (!Number.isFinite(win?.utilization) || (reset != null && reset <= Date.now())) continue;
-    measured++;
-    if (win.utilization < threshold) return false;
-  }
-  if (measured > 0) return true;
-  return candidates.every(a => isGeneralQuotaBlocked(a, threshold));
+    return Number.isFinite(win?.utilization)
+      && Number.isFinite(reset)
+      && reset > now
+      && win.utilization >= threshold;
+  });
 }
 
 function displayModel(model) {

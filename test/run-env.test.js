@@ -11,14 +11,21 @@ import { spawn, spawnSync } from 'node:child_process';
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 const forbiddenResumeArgs = new Set(['resume', '--resume', '--last', '--continue']);
 
-async function startStatusServer(dir, status) {
+async function startStatusServer(dir, status, statusCode = 200, closeAfterHealth = false) {
   const payload = { switchThreshold: 0.98, ...status };
   const script = join(dir, 'status-server.mjs');
   await writeFile(script, `import http from 'node:http';
 const status = JSON.parse(Buffer.from(process.env.STATUS_BASE64, 'base64').toString());
+const statusCode = Number(process.env.STATUS_CODE);
+const closeAfterHealth = process.env.CLOSE_AFTER_HEALTH === '1';
+let requestCount = 0;
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'content-type': 'application/json' });
+  requestCount++;
+  res.writeHead(requestCount === 1 ? 200 : statusCode, { 'content-type': 'application/json' });
   res.end(JSON.stringify(status));
+  if (closeAfterHealth && requestCount === 1) {
+    res.once('finish', () => server.close(() => process.exit(0)));
+  }
 });
 server.listen(0, '127.0.0.1', () => console.log(server.address().port));
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
@@ -27,6 +34,8 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
     env: {
       ...process.env,
       STATUS_BASE64: Buffer.from(JSON.stringify(payload)).toString('base64'),
+      STATUS_CODE: String(statusCode),
+      CLOSE_AFTER_HEALTH: closeAfterHealth ? '1' : '0',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -37,8 +46,45 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 
 async function stopStatusServer(server) {
   server.lines.close();
+  if (server.child.exitCode != null || server.child.signalCode != null) return;
   server.child.kill('SIGTERM');
   await once(server.child, 'exit');
+}
+
+async function runModelFixture({
+  status,
+  statusCode = 200,
+  closeAfterHealth = false,
+  args = [],
+}) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
+  let server;
+  try {
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({ args: process.argv.slice(2) }));
+`);
+    await chmod(fakeClaude, 0o755);
+    server = await startStatusServer(dir, status, statusCode, closeAfterHealth);
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port: server.port },
+      switchThreshold: 0.98,
+      launchModel: 'claude-fable-5',
+      modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    }));
+    return spawnSync(process.execPath, [entry, 'run', ...args], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH}`,
+        TEAMCLAUDE_CONFIG: configPath,
+      },
+    });
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 test('run preserves OAuth while clearing higher-precedence API credentials', async () => {
@@ -231,4 +277,126 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
     if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('run keeps Fable when the proxy status request fails or returns non-200', async (t) => {
+  const fullStatus = {
+    accounts: [{
+      enabled: true,
+      status: 'active',
+      quota: {
+        unified5h: 0.2,
+        unified7d: 0.3,
+        modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() + 3600000 } },
+      },
+    }],
+  };
+
+  await t.test('statusFailure=Fable', async () => {
+    const result = await runModelFixture({ status: fullStatus, closeAfterHealth: true });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-fable-5']);
+  });
+
+  await t.test('non200Status=Fable', async () => {
+    const result = await runModelFixture({ status: fullStatus, statusCode: 503 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-fable-5']);
+  });
+});
+
+test('run defers Fable fallback until every general-available account is fresh and full', async (t) => {
+  const fullAccount = {
+    enabled: true,
+    status: 'active',
+    quota: {
+      unified5h: 0.2,
+      unified7d: 0.3,
+      modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() + 3600000 } },
+    },
+  };
+  const scenarios = [
+    {
+      name: 'unknown=Fable',
+      account: {
+        enabled: true,
+        status: 'active',
+        quota: { unified5h: 0.2, unified7d: 0.3 },
+      },
+    },
+    {
+      name: 'expired=Fable',
+      account: {
+        enabled: true,
+        status: 'active',
+        quota: {
+          unified5h: 0.2,
+          unified7d: 0.3,
+          modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() - 1000 } },
+        },
+      },
+    },
+    {
+      name: 'ready=Fable',
+      account: {
+        enabled: true,
+        status: 'active',
+        quota: {
+          unified5h: 0.2,
+          unified7d: 0.3,
+          modelWeekly: { '7d_oi': { utilization: 0.5, reset: Date.now() + 3600000 } },
+        },
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const result = await runModelFixture({
+        status: { accounts: [fullAccount, scenario.account] },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-fable-5']);
+    });
+  }
+});
+
+test('run preserves fallback when no general-available Fable candidate remains', async (t) => {
+  const generallyBlocked = {
+    enabled: true,
+    status: 'active',
+    quota: {
+      unified5h: 1,
+      unified5hReset: Date.now() + 3600000,
+      unified7d: 0.3,
+    },
+  };
+
+  await t.test('noGeneralCandidate=Opus[1m]', async () => {
+    const result = await runModelFixture({ status: { accounts: [generallyBlocked] } });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8[1m]']);
+  });
+
+  await t.test('unusableCandidatesExcluded=Opus[1m]', async () => {
+    const fullAccount = {
+      enabled: true,
+      status: 'active',
+      quota: {
+        unified5h: 0.2,
+        unified7d: 0.3,
+        modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() + 3600000 } },
+      },
+    };
+    const unusable = ['disabled', 'error', 'exhausted', 'throttled'].map(status => ({
+      enabled: true,
+      status,
+      quota: { unified5h: 0.2, unified7d: 0.3 },
+    }));
+    const result = await runModelFixture({
+      status: { accounts: [fullAccount, ...unusable, generallyBlocked] },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8[1m]']);
+  });
 });
