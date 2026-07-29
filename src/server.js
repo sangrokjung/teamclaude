@@ -1158,6 +1158,18 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     const accts = accountManager.accounts;
     const allAuthFailed = accts.length > 0 && accts.every(a => a.status === 'error');
+    const modelDeadEnd = !accountManager.anyUsable(null, ctx.model)
+      && !accountManager.anyCapped(null, ctx.model);
+    if (!allAuthFailed && modelDeadEnd) {
+      const fallback = nextModelFallback(ctx, req, body);
+      if (fallback) {
+        console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
+        ctx.model = fallback.model;
+        ctx.tried429.clear();
+        ctx.tried5xx.clear();
+        return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+      }
+    }
     const canEventuallyRecover = accts.some(a => a.enabled !== false && a.status !== 'error');
     if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
 
@@ -1214,7 +1226,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // usable account (model-tier or full exhaustion — not a mere concurrency
     // queue timeout, which must never silently change the client's model),
     // walk the configured fallback chain before surfacing a 429.
-    if (!res.destroyed && !accountManager.anyUsable(null, ctx.model)) {
+    if (!res.destroyed
+        && !accountManager.anyUsable(null, ctx.model)
+        && !accountManager.anyCapped(null, ctx.model)) {
       const fallback = nextModelFallback(ctx, req, body);
       if (fallback) {
         console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);

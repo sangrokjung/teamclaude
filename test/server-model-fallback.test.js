@@ -38,11 +38,12 @@ async function readJsonBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString());
 }
 
-function post(port, model) {
+function post(port, model, signal = undefined) {
   return fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+    signal,
   });
 }
 
@@ -247,6 +248,7 @@ test('model-tier exhaustion with continuity on and no fallback terminates instea
   const am = new AccountManager(makeAccounts(2), 0.98);
   const proxy = startProxy(am, upstreamPort, {
     continuityMode: true,
+    continuityMaxWaitMs: 100,
     continuityMaxSleepMs: 10, // keep the bounded polling fast in test
     continuityJitterMs: 0,
     // modelFallbacks deliberately absent: the default, and the looping case.
@@ -260,6 +262,134 @@ test('model-tier exhaustion with continuity on and no fallback terminates instea
     // Bounded by MODEL_EXHAUST_WAIT_PASSES; the exact count depends on how many
     // accounts are tried per pass, so assert the ceiling rather than equality.
     assert.ok(upstreamHits <= 40, `upstream 429s must stay bounded, saw ${upstreamHits}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('cached fleet-wide Fable exhaustion falls back before continuity sleep', async () => {
+  let fableAttempts = 0;
+  let opusAttempts = 0;
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJsonBody(req);
+    if (body.model === 'claude-fable-5') fableAttempts += 1;
+    if (body.model === 'claude-opus-4-8') opusAttempts += 1;
+    ok200(res, { ok: true, served: body.model });
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const reset = Date.now() + 86_400_000;
+  for (const account of am.accounts) {
+    account.quota.modelWeekly['7d_oi'] = { utilization: 1, reset };
+  }
+  const proxy = startProxy(am, upstreamPort, {
+    modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: true,
+    continuityMaxWaitMs: 60_000,
+    continuityMaxSleepMs: 60_000,
+    continuityJitterMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+  const abort = new AbortController();
+  let timeout = null;
+
+  try {
+    const startedAt = Date.now();
+    timeout = setTimeout(() => {
+      abort.abort(new Error('fallback entered continuity wait'));
+    }, 250);
+
+    let res;
+    try {
+      res = await post(proxyPort, 'claude-fable-5', abort.signal);
+    } catch (err) {
+      if (abort.signal.aborted) assert.fail('fallback entered continuity wait');
+      throw err;
+    }
+    clearTimeout(timeout);
+    timeout = null;
+
+    const json = await res.json();
+    const elapsed = Date.now() - startedAt;
+    assert.equal(res.status, 200);
+    assert.equal(json.served, 'claude-opus-4-8');
+    assert.equal(fableAttempts, 0);
+    assert.equal(opusAttempts, 1);
+    assert.ok(elapsed < 250, `fallback must precede continuity sleep, elapsed=${elapsed}ms`);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    abort.abort();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('mixed fleet routes Fable directly to the model-ready account', async () => {
+  const accounts = makeAccounts(2);
+  accounts[0].priority = 0;
+  accounts[1].priority = 1;
+  const am = new AccountManager(accounts, 0.98);
+  const reset = Date.now() + 86_400_000;
+  am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 1, reset };
+  am.accounts[1].quota.modelWeekly['7d_oi'] = { utilization: 0.25, reset };
+
+  const ownerByCredential = new Map([
+    [`Bearer ${am.accounts[0].credential}`, 'A'],
+    [`Bearer ${am.accounts[1].credential}`, 'B'],
+  ]);
+  const attempts = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJsonBody(req);
+    const account = ownerByCredential.get(req.headers.authorization);
+    attempts.push({ account, model: body.model });
+    ok200(res, { ok: true, servedBy: account, served: body.model });
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = startProxy(am, upstreamPort, {
+    modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await post(proxyPort, 'claude-fable-5');
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(json.servedBy, 'B');
+    assert.equal(json.served, 'claude-fable-5');
+    assert.deepEqual(attempts, [{ account: 'B', model: 'claude-fable-5' }]);
+    assert.equal(attempts.filter(a => a.model === 'claude-opus-4-8').length, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('capped fleet queue timeout does not trigger model fallback', async () => {
+  const attempts = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJsonBody(req);
+    attempts.push(body.model);
+    ok200(res, { ok: true, served: body.model });
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  for (const account of am.accounts) account.inflight = account.maxConcurrent;
+  const proxy = startProxy(am, upstreamPort, {
+    modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: false,
+    overflowQueueTimeoutMs: 20,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await post(proxyPort, 'claude-fable-5');
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.deepEqual(attempts, []);
+    assert.equal(attempts.filter(model => model === 'claude-opus-4-8').length, 0);
   } finally {
     proxy.close();
     upstream.close();
