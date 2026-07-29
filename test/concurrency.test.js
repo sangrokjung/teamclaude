@@ -1101,7 +1101,225 @@ test('direct proxy releases admission after a partial request body deadline', as
   }
 });
 
-test('buffer budget caps worker admission below a large account queue capacity', async () => {
+test('standalone buffer admission uses aggregate actual bytes instead of maximum-body request count', async () => {
+  let hits = 0;
+  let releaseUpstream;
+  const upstreamGate = new Promise(resolve => { releaseUpstream = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    hits += 1;
+    await upstreamGate;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 8, 0);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 64,
+  });
+  const port = await listen(proxy);
+
+  const requests = Array.from({ length: 6 }, () => (
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: '{}',
+      signal: AbortSignal.timeout(1000),
+    }).then(response => response.status)
+  ));
+
+  try {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    releaseUpstream();
+    const statuses = await Promise.all(requests);
+    assert.deepEqual(statuses, [200, 200, 200, 200, 200, 200],
+      'six 2-byte bodies fit the 64-byte aggregate budget and must all be admitted');
+    assert.equal(hits, 6);
+  } finally {
+    releaseUpstream();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('standalone chunked concat peak is reserved, settled, and released exactly', async () => {
+  const startChunked = (port, body) => {
+    let request;
+    const result = new Promise((resolve, reject) => {
+      let responseStarted = false;
+      request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, response => {
+        responseStarted = true;
+        response.resume();
+        response.once('end', () => resolve(response.statusCode));
+      });
+      request.once('error', err => {
+        if (!responseStarted) reject(err);
+      });
+      request.end(body);
+    });
+    return { request, result };
+  };
+
+  let belowHits = 0;
+  const belowUpstream = http.createServer((_req, res) => {
+    belowHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const belowUpstreamPort = await listen(belowUpstream);
+  const belowManager = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(belowManager);
+  const belowProxy = createProxyServer(belowManager, {
+    upstream: `http://127.0.0.1:${belowUpstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1023,
+  });
+  const belowPort = await listen(belowProxy);
+
+  try {
+    const belowPeak = startChunked(belowPort, 'a'.repeat(512));
+    assert.equal(await belowPeak.result, 429,
+      'a 512-byte chunked body needs the full 1024-byte chunks-plus-concat peak');
+    assert.equal(belowHits, 0, 'concat-peak rejection must happen before upstream dispatch');
+  } finally {
+    belowProxy.close();
+    belowUpstream.close();
+  }
+
+  let exactHits = 0;
+  const exactUpstream = http.createServer((_req, res) => {
+    exactHits += 1;
+    if (exactHits === 1) return;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const exactUpstreamPort = await listen(exactUpstream);
+  const exactManager = new AccountManager(makeAccounts(1), 0.98, 0, 3, 0);
+  measureAll(exactManager);
+  const exactProxy = createProxyServer(exactManager, {
+    upstream: `http://127.0.0.1:${exactUpstreamPort}`,
+    maxRequestBytes: 1024,
+    maxBufferedRequestBytes: 1024,
+  });
+  const exactPort = await listen(exactProxy);
+  const retained = startChunked(exactPort, 'b'.repeat(512));
+  retained.result.catch(() => {});
+
+  try {
+    for (let i = 0; i < 20 && exactHits < 1; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(exactHits, 1, 'the exact peak budget must reach upstream');
+
+    const afterSettle = startChunked(exactPort, 'c'.repeat(256));
+    assert.equal(await afterSettle.result, 200,
+      'concat must settle from two copies to one before the response finishes');
+
+    retained.request.destroy();
+    for (let i = 0; i < 20 && exactManager.accounts[0].inflight !== 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(exactManager.accounts[0].inflight, 0);
+
+    const afterRelease = startChunked(exactPort, 'd'.repeat(512));
+    assert.equal(await afterRelease.result, 200,
+      'abort must release the retained final-body reservation exactly once');
+    assert.equal(exactHits, 3);
+  } finally {
+    retained.request.destroy();
+    exactProxy.close();
+    exactUpstream.close();
+  }
+});
+
+test('supervised worker does not duplicate the parent buffer budget', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(am);
+  const previousSupervisorPid = process.env.TEAMCLAUDE_SUPERVISOR_PID;
+  let proxy;
+  try {
+    process.env.TEAMCLAUDE_SUPERVISOR_PID = String(process.pid);
+    proxy = createProxyServer(am, {
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      maxRequestBytes: 1024,
+      maxBufferedRequestBytes: 1,
+    });
+  } finally {
+    if (previousSupervisorPid === undefined) delete process.env.TEAMCLAUDE_SUPERVISOR_PID;
+    else process.env.TEAMCLAUDE_SUPERVISOR_PID = previousSupervisorPid;
+  }
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'parent-owned-budget',
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+
+    const missingLength = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'transfer-encoding': 'chunked' },
+      }, rawResponse => {
+        rawResponse.resume();
+        rawResponse.once('end', () => resolve(rawResponse.statusCode));
+      });
+      request.once('error', reject);
+      request.end('missing-length');
+    });
+    assert.equal(missingLength, 400,
+      'a supervised worker must reject a body without the parent Content-Length contract');
+
+    const invalidLength = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port,
+        path: '/v1/messages',
+        method: 'POST',
+        headers: { 'content-length': 'invalid' },
+      }, rawResponse => {
+        rawResponse.resume();
+        rawResponse.once('end', () => resolve(rawResponse.statusCode));
+      });
+      request.once('error', reject);
+      request.end('x');
+    });
+    assert.equal(invalidLength, 400);
+
+    const oversized = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'x'.repeat(1025),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(oversized.status, 413);
+    assert.equal(hits, 1, 'invalid and oversized supervised bodies must not reach upstream');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('standalone buffer budget rejects only when aggregate actual bytes overflow', async () => {
   let hits = 0;
   const upstream = http.createServer((_req, res) => {
     hits += 1;
@@ -1122,7 +1340,7 @@ test('buffer budget caps worker admission below a large account queue capacity',
   const firstAbort = new AbortController();
   const first = fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: 'POST',
-    body: '{}',
+    body: 'a'.repeat(768),
     signal: firstAbort.signal,
   }).catch(() => null);
 
@@ -1131,11 +1349,11 @@ test('buffer budget caps worker admission below a large account queue capacity',
     assert.equal(hits, 1);
     const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
-      body: '{}',
+      body: 'b'.repeat(512),
       signal: AbortSignal.timeout(1000),
     });
-    assert.equal(second.status, 429, 'memory budget must override the larger account/queue capacity');
-    assert.equal(hits, 1, 'budget-rejected request must not reach upstream');
+    assert.equal(second.status, 429, 'aggregate actual bytes above the budget must be rejected');
+    assert.equal(hits, 1, 'byte-budget-rejected request must not reach upstream');
   } finally {
     firstAbort.abort();
     await first;
@@ -1144,10 +1362,11 @@ test('buffer budget caps worker admission below a large account queue capacity',
   }
 });
 
-test('worker rejects before buffering when the budget cannot fit one maximum request', async () => {
+test('chunked buffer reservation is bounded and client abort releases it to zero', async () => {
   let hits = 0;
   const upstream = http.createServer((_req, res) => {
     hits += 1;
+    if (hits === 1) return;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{}');
   });
@@ -1158,62 +1377,51 @@ test('worker rejects before buffering when the budget cannot fit one maximum req
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     maxRequestBytes: 1024,
-    maxBufferedRequestBytes: 1023,
+    maxBufferedRequestBytes: 1600,
   });
   const port = await listen(proxy);
+  let chunkedRequest = null;
 
   try {
-    const health = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
-    assert.equal(health.status, 200);
-    const bodyBearingStatus = await new Promise((resolve, reject) => {
-      const request = http.request({
-        hostname: '127.0.0.1',
-        port,
-        path: '/teamclaude/status',
-        method: 'GET',
-        headers: { 'content-length': '2' },
-      }, response => {
-        response.resume();
-        response.once('end', () => resolve(response.statusCode));
-      });
-      request.once('error', reject);
-      request.end('{}');
-    });
-    assert.equal(bodyBearingStatus, 429,
-      'a direct status GET with a body must not bypass the worker buffer budget');
-
-    const slowRejected = await new Promise((resolve, reject) => {
-      let resolved = false;
-      const request = http.request({
-        hostname: '127.0.0.1',
-        port,
-        path: '/v1/messages',
-        method: 'POST',
-        headers: { 'transfer-encoding': 'chunked' },
-      }, response => {
-        response.resume();
-        response.once('end', () => {
-          resolved = true;
-          resolve({
-            status: response.statusCode,
-            connection: response.headers.connection,
-          });
-        });
-      });
-      request.once('error', err => {
-        if (!resolved) reject(err);
-      });
-      request.write('1');
-    });
-    assert.deepEqual(slowRejected, { status: 429, connection: 'close' });
-
-    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    chunkedRequest = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/v1/messages',
       method: 'POST',
-      body: '{}',
+      headers: { 'transfer-encoding': 'chunked' },
+    }, response => response.resume());
+    chunkedRequest.on('error', () => {});
+    chunkedRequest.end('a'.repeat(800));
+
+    for (let i = 0; i < 20 && hits < 1; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(hits, 1, 'the first chunked body must be retained while upstream hangs');
+
+    const overflow = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'b'.repeat(900),
+      signal: AbortSignal.timeout(1000),
     });
-    assert.equal(response.status, 429);
-    assert.equal(hits, 0, 'an under-sized budget must reject before reaching upstream');
+    assert.equal(overflow.status, 429);
+    assert.equal(hits, 1, 'overflow bytes must not reach upstream');
+
+    chunkedRequest.destroy();
+    for (let i = 0; i < 20 && am.accounts[0].inflight !== 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(am.accounts[0].inflight, 0, 'client abort must unwind the retained request');
+
+    const recovered = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'c'.repeat(1023),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(recovered.status, 200,
+      'a full-budget body must be admitted after abort releases all retained bytes');
+    assert.equal(hits, 2);
   } finally {
+    chunkedRequest?.destroy();
     proxy.close();
     upstream.close();
   }
