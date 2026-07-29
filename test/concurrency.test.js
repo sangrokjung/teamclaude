@@ -1239,8 +1239,13 @@ test('standalone chunked concat peak is reserved, settled, and released exactly'
   }
 });
 
-test('supervised worker does not duplicate the parent buffer budget', async () => {
+test('supervised worker accepts one local body copy without duplicating the parent budget', async () => {
   let hits = 0;
+  const body = 'x'.repeat(700);
+  const maxBufferedRequestBytes = 1024;
+  assert.ok(body.length <= maxBufferedRequestBytes);
+  assert.ok(body.length * 2 > maxBufferedRequestBytes,
+    'the body must fit one worker copy while a duplicate parent-style reservation would fail');
   const upstream = http.createServer((_req, res) => {
     hits += 1;
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -1256,7 +1261,7 @@ test('supervised worker does not duplicate the parent buffer budget', async () =
     proxy = createProxyServer(am, {
       upstream: `http://127.0.0.1:${upstreamPort}`,
       maxRequestBytes: 1024,
-      maxBufferedRequestBytes: 1,
+      maxBufferedRequestBytes,
     });
   } finally {
     if (previousSupervisorPid === undefined) delete process.env.TEAMCLAUDE_SUPERVISOR_PID;
@@ -1267,7 +1272,7 @@ test('supervised worker does not duplicate the parent buffer budget', async () =
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
-      body: 'parent-owned-budget',
+      body,
       signal: AbortSignal.timeout(1000),
     });
     assert.equal(response.status, 200);
@@ -1314,6 +1319,142 @@ test('supervised worker does not duplicate the parent buffer budget', async () =
     assert.equal(oversized.status, 413);
     assert.equal(hits, 1, 'invalid and oversized supervised bodies must not reach upstream');
   } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('supervised worker rejects direct fixed-length bodies above its aggregate local budget', async () => {
+  let hits = 0;
+  let releaseUpstream;
+  let markFirstReached;
+  const upstreamGate = new Promise(resolve => { releaseUpstream = resolve; });
+  const firstReached = new Promise(resolve => { markFirstReached = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      markFirstReached();
+      await upstreamGate;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(am);
+  const previousSupervisorPid = process.env.TEAMCLAUDE_SUPERVISOR_PID;
+  let proxy;
+  try {
+    process.env.TEAMCLAUDE_SUPERVISOR_PID = String(process.pid);
+    proxy = createProxyServer(am, {
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      maxRequestBytes: 1024,
+      maxBufferedRequestBytes: 1024,
+    });
+  } finally {
+    if (previousSupervisorPid === undefined) delete process.env.TEAMCLAUDE_SUPERVISOR_PID;
+    else process.env.TEAMCLAUDE_SUPERVISOR_PID = previousSupervisorPid;
+  }
+  const port = await listen(proxy);
+  const held = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    body: 'a'.repeat(700),
+    signal: AbortSignal.timeout(1000),
+  }).then(response => response.status);
+
+  try {
+    await firstReached;
+    const overflow = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'b'.repeat(400),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(overflow.status, 429,
+      'a direct worker request must not exceed the aggregate one-copy byte budget');
+    assert.equal(hits, 1, 'overflow must be rejected before upstream dispatch');
+
+    releaseUpstream();
+    assert.equal(await held, 200);
+  } finally {
+    releaseUpstream();
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('supervised worker releases direct body bytes exactly once after client abort', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(am);
+  const previousSupervisorPid = process.env.TEAMCLAUDE_SUPERVISOR_PID;
+  let proxy;
+  try {
+    process.env.TEAMCLAUDE_SUPERVISOR_PID = String(process.pid);
+    proxy = createProxyServer(am, {
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      maxRequestBytes: 1024,
+      maxBufferedRequestBytes: 1024,
+    });
+  } finally {
+    if (previousSupervisorPid === undefined) delete process.env.TEAMCLAUDE_SUPERVISOR_PID;
+    else process.env.TEAMCLAUDE_SUPERVISOR_PID = previousSupervisorPid;
+  }
+  let markPartialHandled;
+  const partialHandled = new Promise(resolve => { markPartialHandled = resolve; });
+  proxy.on('request', req => {
+    if (req.headers['x-teamclaude-test'] === 'partial') markPartialHandled();
+  });
+  const port = await listen(proxy);
+  let partialRequest;
+
+  try {
+    partialRequest = http.request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'content-length': '1024',
+        'x-teamclaude-test': 'partial',
+      },
+    });
+    partialRequest.on('error', () => {});
+    partialRequest.flushHeaders();
+    partialRequest.write('p'.repeat(512));
+    await partialHandled;
+
+    const whileHeld = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'q'.repeat(1024),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(whileHeld.status, 429,
+      'the partial direct body must hold its worker-local reservation');
+    assert.equal(hits, 0);
+
+    const serverSawAbort = new Promise(resolve => {
+      partialRequest.socket.once('close', resolve);
+    });
+    partialRequest.destroy();
+    await serverSawAbort;
+    await new Promise(resolve => setImmediate(resolve));
+
+    const recovered = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      body: 'r'.repeat(1024),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(recovered.status, 200,
+      'client abort must return the exact worker-local reservation');
+    assert.equal(hits, 1);
+  } finally {
+    partialRequest?.destroy();
     proxy.close();
     upstream.close();
   }

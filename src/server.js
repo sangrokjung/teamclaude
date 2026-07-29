@@ -545,8 +545,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Everything below buffers a request body (the OAuth relay AND the proxied
       // path) → request count stays within fleet/queue capacity before buffering.
-      // Standalone workers separately reserve actual bytes per chunk; supervised
-      // workers rely on the parent process's shared actual-byte admission.
+      // Each process reserves its local body copy; the supervisor separately
+      // accounts for public-path copies before forwarding to a worker.
       const admissionCapacity = accountManager.totalCapacity();
       if (inFlightProxied >= admissionCapacity) {
         rejectEarlyRequest(
@@ -770,7 +770,7 @@ async function readRequestBody(
         error: { status: 413, message: `Request body exceeds ${maxBodyBytes} bytes.` },
       };
     }
-    if (!supervisedWorker && !reserveRequestBytes(expectedLength)) {
+    if (!reserveRequestBytes(expectedLength)) {
       return {
         error: { status: 429, message: 'Proxy request buffer budget exhausted; retry shortly.' },
       };
