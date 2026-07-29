@@ -355,6 +355,62 @@ test('model-tier polling honors continuity deadline when max wait is shorter tha
   }
 });
 
+test('model-tier deadline preserves the saved upstream 429 after multiple sleeps', async () => {
+  let upstreamHits = 0;
+  const reset = String(Math.floor(Date.now() / 1000) + 86400);
+  const upstream = http.createServer(async (req, res) => {
+    await readJsonBody(req);
+    upstreamHits += 1;
+    res.writeHead(429, {
+      'retry-after': '60',
+      'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+      'anthropic-ratelimit-unified-7d_oi-reset': reset,
+      'content-type': 'application/json',
+      'x-upstream-marker': 'saved-model-429',
+      connection: 'x-hop-only',
+      'x-hop-only': 'remove-me',
+    });
+    res.end(JSON.stringify({ type: 'error', marker: 'saved-model-429' }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    continuityMaxWaitMs: 60,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await post(proxyPort, 'claude-fable-5');
+    const body = await res.json();
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(res.status, 429);
+    assert.ok(elapsed < 150, `model-tier deadline must stay bounded: elapsed=${elapsed}ms`);
+    assert.equal(upstreamHits, 1, 'deadline finalization must not replay upstream');
+    assert.deepEqual({
+      body,
+      marker: res.headers.get('x-upstream-marker'),
+      reset: res.headers.get('anthropic-ratelimit-unified-7d_oi-reset'),
+      retryAfter: res.headers.get('retry-after'),
+      hopHeader: res.headers.get('x-hop-only'),
+    }, {
+      body: { type: 'error', marker: 'saved-model-429' },
+      marker: 'saved-model-429',
+      reset,
+      retryAfter: '60',
+      hopHeader: null,
+    }, 'deadline finalization must preserve saved end-to-end response semantics');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('cached fleet-wide Fable exhaustion falls back before continuity sleep', async () => {
   let fableAttempts = 0;
   let opusAttempts = 0;

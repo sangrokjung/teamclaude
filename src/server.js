@@ -1137,6 +1137,14 @@ function startContinuityDeadline(ctx) {
   return ctx.continuityDeadlineAt;
 }
 
+function sendSaved429(res, ctx) {
+  if (!ctx.last429 || res.destroyed || res.headersSent) return false;
+  ctx.status = 429;
+  res.writeHead(429, ctx.last429.headers);
+  res.end(ctx.last429.body.length > 0 ? ctx.last429.body : undefined);
+  return true;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
@@ -1254,6 +1262,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
     }
+    const deadlineExpired = ctx.continuity.maxWaitMs > 0
+      && ctx.continuityDeadlineAt != null
+      && Date.now() >= ctx.continuityDeadlineAt;
+    if (deadlineExpired && sendSaved429(res, ctx)) return;
     ctx.status = 429;
     const status = accountManager.getStatus();
     const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
@@ -1548,11 +1560,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           const waited = await ctx.continuity.waitFor(wait, ctx.abortSignal, deadlineAt);
           if (ctx.abortSignal?.aborted || res.destroyed) return;
           if (!waited) {
-            ctx.status = 429;
-            if (!res.headersSent) {
-              res.writeHead(429, ctx.last429.headers);
-              res.end(ctx.last429.body.length > 0 ? ctx.last429.body : undefined);
-            }
+            sendSaved429(res, ctx);
             return;
           }
           ctx.tried429.clear();
@@ -1659,18 +1667,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         logSections.push(`=== RESPONSE 429 — global, passed through after exhausting failover budget ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
       }
+      if (sendSaved429(res, ctx)) return;
       if (res.destroyed) return;
       if (!res.headersSent) {
-        if (ctx.last429) {
-          res.writeHead(429, ctx.last429.headers);
-          res.end(ctx.last429.body.length > 0 ? ctx.last429.body : undefined);
-        } else {
-          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
-          }));
-        }
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
+        }));
       }
       return;
     }
