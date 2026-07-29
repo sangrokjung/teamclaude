@@ -633,7 +633,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             }));
             return;
           }
-          ctx.model = extractRequestModel(body);
+          const requestModel = extractRequestModel(body);
+          ctx.model = requestModel.model;
+          ctx.advisorToolIndex = requestModel.advisorToolIndex;
 
           // Tie an abort signal to client disconnect so a request that's only
           // WAITING in the overflow queue is cancelled if the client goes away —
@@ -1054,9 +1056,21 @@ const envInt = (name, def) => {
 function extractRequestModel(body) {
   try {
     const json = JSON.parse(body.toString());
-    return typeof json?.model === 'string' ? json.model : null;
+    const advisorToolIndex = Array.isArray(json?.tools)
+      ? json.tools.findIndex(tool =>
+        tool && typeof tool === 'object'
+        && typeof tool.type === 'string' && tool.type.startsWith('advisor_')
+        && typeof tool.model === 'string' && tool.model.length > 0)
+      : -1;
+    if (advisorToolIndex >= 0) {
+      return { model: json.tools[advisorToolIndex].model, advisorToolIndex };
+    }
+    return {
+      model: typeof json?.model === 'string' ? json.model : null,
+      advisorToolIndex: null,
+    };
   } catch {
-    return null;
+    return { model: null, advisorToolIndex: null };
   }
 }
 
@@ -1102,8 +1116,11 @@ function nextModelFallback(ctx, req, body) {
     } catch {
       return null;
     }
-    if (typeof json?.model !== 'string') return null;
-    json.model = next;
+    const target = ctx.advisorToolIndex == null
+      ? json
+      : json?.tools?.[ctx.advisorToolIndex];
+    if (typeof target?.model !== 'string') return null;
+    target.model = next;
     const newBody = Buffer.from(JSON.stringify(json));
     if (req.headers['content-length'] != null) {
       req.headers['content-length'] = String(newBody.length);

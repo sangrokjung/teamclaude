@@ -124,7 +124,7 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 - **连接亲和性** — 同一终端的连续请求尽量停留在同一账户，保留 prompt cache。
 - **并发请求分散** — 超出单账户并发上限的流量自动分散到其他账户。
 - **Fable/Mythos 账户优先** — 只有模型级窗口仍在有效期内、数值有限且已达到上限（fresh、finite、full）的账户才会对当前请求被跳过；未测量、已过期或仍可用的账户会先尝试原模型，Opus/Sonnet/Haiku 的资格不受影响。
-- **模型 fallback** — 当缓存中的 general-available 账户对该模型全部 fresh-full，或实时 labeled model-tier 429 已覆盖所有 eligible 账户时切换到备用模型；无 label 的 global 429、local cap 或并发 queue 都不会更换模型。
+- **模型 fallback** — 当缓存中的 general-available 账户对该模型全部 fresh-full，或实时 labeled model-tier 429 已覆盖所有 eligible 账户时切换到备用模型。Claude Code advisor 请求以 root `tools[]` 中 `advisor_*` 项的嵌套模型作为路由依据，fallback 也只改写该嵌套 `model`，不会改动 top-level executor；无 label 的 global 429、local cap 或并发 queue 都不会更换模型。
 - **实时 TUI** — 显示账户状态、会话与每周用量、重置时间以及 CPU、内存。
 - **手动账户控制** — 通过 CLI 或 TUI 执行 enable、disable、switch 和 priority。
 - **重启后恢复状态** — 将用量和 throttle 状态保存在独立的 quota 文件中。

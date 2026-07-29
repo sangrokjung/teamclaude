@@ -604,6 +604,7 @@ or a live labeled model-tier 429 has reached every eligible account. A cached
 fresh-full fleet falls back before continuity sleeps. Semantics:
 
 - The chain is resolved **once per request from the original model** (fallbacks of fallbacks are not followed) and consumed in order; when it runs dry, the pre-existing 429/continuity behavior applies unchanged.
+- For Claude Code advisor requests, a direct root `tools[]` entry whose `type` starts with `advisor_` supplies the governing model. Routing and 429 classification use that nested model, and fallback rewrites only that tool's `model`, leaving the top-level executor model unchanged.
 - Keys and targets must be **plain API model IDs**. A client-side bracket suffix (`claude-fable-5[1m]` — the API rejects such IDs as `not_found_error`) matches its suffix-stripped entry.
 - `launchModel` keeps those API IDs plain in config. Only the Claude Code launch
   display adds `[1m]` to Opus 4.8; Claude Code strips that suffix before sending
