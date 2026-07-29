@@ -590,6 +590,49 @@ test('the probe template upgrades to the model tier that reports the Fable windo
   }
 });
 
+test('an advisor nested Fable response cannot seed the probe template', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, {
+      ...RL_HEADERS(),
+      'anthropic-ratelimit-unified-7d_oi-utilization': '0.42',
+      'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+    });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{
+          type: 'advisor_20260301',
+          name: 'advisor',
+          model: 'claude-fable-5',
+        }],
+      }),
+    });
+    await res.text();
+
+    assert.equal(res.status, 200);
+    assert.equal(proxy.exportProbeTemplate(), null,
+      'advisor requests must not contaminate the active warm-up template');
+  } finally {
+    await new Promise(resolve => proxy.close(resolve));
+    await new Promise(resolve => upstream.close(resolve));
+  }
+});
+
 // Root cause of "R updates nothing" in production: idle accounts sit past
 // their token lifetime, and warmupAccount's expiring-token guard silently
 // skips them. The FORCED refresh must revive tokens first (an explicit user

@@ -652,8 +652,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // response also tells us whether this request's model tier reports
             // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
             // limit) — the one property worth a one-way template upgrade.
-            if (!probeTemplate || probeTemplate._restored
-                || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly)) {
+            if (ctx.advisorToolIndex == null
+                && (!probeTemplate || probeTemplate._restored
+                  || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly))) {
               const candidate = stageProbeTemplate(req, body);
               if (candidate) commitProbeTemplate(candidate, ctx.status, ctx.sawModelWeekly === true);
             }
