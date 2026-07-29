@@ -1336,7 +1336,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers['x-api-key'] = account.credential;
   }
 
-  const upstreamUrl = `${upstream}${req.url}`;
+  const hasDuplicatedCodexPrefix = ctx.provider === 'codex'
+    && /\/codex\/?$/.test(new URL(upstream).pathname)
+    && req.url.startsWith('/codex/');
+  const upstreamUrl = hasDuplicatedCodexPrefix
+    ? `${upstream.replace(/\/$/, '')}${req.url.slice('/codex'.length)}`
+    : `${upstream}${req.url}`;
   const method = req.method;
   const replaySafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
 

@@ -8,7 +8,53 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-test('Codex proxy replaces client auth, injects account id, and tracks quota headers', async () => {
+function closeServer(server) {
+  if (!server?.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  });
+}
+
+async function observeCodexPath(upstreamPath) {
+  const paths = [];
+  const upstream = http.createServer((req, res) => {
+    paths.push(req.url);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'response-id' }));
+  });
+  let proxy;
+
+  try {
+    const upstreamPort = await listen(upstream);
+    const manager = new AccountManager([{
+      name: 'codex-pro',
+      provider: 'codex',
+      type: 'oauth',
+      accessToken: 'pooled-access-token',
+      accountId: 'workspace-123',
+      expiresAt: Date.now() + 3_600_000,
+    }]);
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}${upstreamPath}`,
+      activeWarmup: false,
+    });
+    const proxyPort = await listen(proxy);
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses?trace=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    await response.text();
+
+    return { status: response.status, paths };
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}
+
+test('Codex proxy with custom-root upstream replaces auth, injects account id, and tracks quota headers', async () => {
   // Given
   let upstreamRequest;
   const upstream = http.createServer(async (req, res) => {
@@ -84,6 +130,27 @@ test('Codex proxy replaces client auth, injects account id, and tracks quota hea
     proxy.close();
     upstream.close();
   }
+});
+
+test('Codex proxy avoids duplicating an exact /backend-api/codex upstream segment', async () => {
+  const result = await observeCodexPath('/backend-api/codex');
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.paths, ['/backend-api/codex/responses?trace=1']);
+});
+
+test('Codex proxy preserves the public prefix for a similar mycodex upstream segment', async () => {
+  const result = await observeCodexPath('/backend-api/mycodex');
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.paths, ['/backend-api/mycodex/codex/responses?trace=1']);
+});
+
+test('Codex proxy avoids a double slash for an exact trailing slash upstream segment', async () => {
+  const result = await observeCodexPath('/backend-api/codex/');
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.paths, ['/backend-api/codex/responses?trace=1']);
 });
 
 test('Codex proxy fails an exhausted account over to the next subscription', async () => {
