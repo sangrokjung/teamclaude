@@ -1570,12 +1570,14 @@ function isGeneralQuotaBlocked(account, threshold) {
   return false;
 }
 
-function topTierUnavailable(status, threshold) {
+function topTierUnavailable(status, threshold, requestedModel) {
   const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
   const candidates = accounts.filter(a =>
     a.enabled !== false && !['disabled', 'error', 'exhausted', 'throttled'].includes(a.status));
   const available = candidates.filter(a => !isGeneralQuotaBlocked(a, threshold));
   if (!available.length) return true;
+  const plainModel = stripContextSuffix(requestedModel);
+  if (!/(^|[-_.])(fable|mythos)($|[-_.\d])/i.test(plainModel)) return false;
 
   const now = Date.now();
   return available.every(account => {
@@ -1613,7 +1615,7 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
     if (response.ok) status = await response.json();
   } catch {}
 
-  if (status && topTierUnavailable(status, config.switchThreshold ?? 0.98)) {
+  if (status && topTierUnavailable(status, config.switchThreshold ?? 0.98, requestedModel)) {
     const fallback = displayModel(chain[0]);
     setModelArg(claudeArgs, fallback);
     console.error(`[TeamClaude] ${requestedModel} quota unavailable; launching Claude Code as ${fallback}.`);

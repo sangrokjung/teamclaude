@@ -56,6 +56,8 @@ async function runModelFixture({
   statusCode = 200,
   closeAfterHealth = false,
   args = [],
+  launchModel = 'claude-fable-5',
+  modelFallbacks = { 'claude-fable-5': ['claude-opus-4-8'] },
 }) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-model-'));
   let server;
@@ -70,8 +72,8 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
     await writeFile(configPath, JSON.stringify({
       proxy: { port: server.port },
       switchThreshold: 0.98,
-      launchModel: 'claude-fable-5',
-      modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+      launchModel,
+      modelFallbacks,
     }));
     return spawnSync(process.execPath, [entry, 'run', ...args], {
       encoding: 'utf8',
@@ -277,6 +279,41 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
     if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('run does not apply Fable-only full quota evidence to an Opus launch model', async (t) => {
+  const status = {
+    accounts: [{
+      enabled: true,
+      status: 'active',
+      quota: {
+        unified5h: 0.2,
+        unified7d: 0.3,
+        modelWeekly: { '7d_oi': { utilization: 1, reset: Date.now() + 3600000 } },
+      },
+    }],
+  };
+  const modelFallbacks = { 'claude-opus-4-8': ['sonnet'] };
+
+  await t.test('configured Opus remains Opus', async () => {
+    const result = await runModelFixture({
+      status,
+      launchModel: 'claude-opus-4-8',
+      modelFallbacks,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8']);
+  });
+
+  await t.test('explicit Opus remains Opus', async () => {
+    const result = await runModelFixture({
+      status,
+      modelFallbacks,
+      args: ['--', '--model', 'claude-opus-4-8'],
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8']);
+  });
 });
 
 test('run keeps Fable when the proxy status request fails or returns non-200', async (t) => {
