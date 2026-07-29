@@ -47,9 +47,6 @@ function post(port, model, signal = undefined) {
   });
 }
 
-// A bare 429 — no quota headers. This is what an account with an unmeasured
-// weekly window returns on a model-tier exhaustion: the proxy can only
-// classify it as "global" and, pre-fallback, passed it through to the client.
 function bare429(res) {
   res.writeHead(429, { 'retry-after': '60', 'content-type': 'application/json' });
   res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
@@ -72,35 +69,37 @@ function ok200(res, body = { ok: true }) {
   res.end(JSON.stringify(body));
 }
 
-// The production shape of 2026-07-13: every account answers a bare 429 for
-// fable (unlabeled model-tier exhaustion → classified "global"), while opus
-// still serves. The fallback must rewrite the request instead of passing the
-// 429 through.
-test('unlabeled fleet-wide 429 → falls back to the configured model and succeeds', async () => {
-  const modelsSeen = [];
+test('multi-account bare 429 stays on Fable through failover and bounded continuity', async () => {
+  const attempts = [];
+  let opusAttempts = 0;
   const upstream = http.createServer(async (req, res) => {
     const body = await readJsonBody(req);
-    modelsSeen.push(body.model);
-    if (body.model === 'claude-fable-5') bare429(res);
-    else ok200(res, { ok: true, served: body.model });
+    attempts.push({ account: req.headers.authorization, model: body.model });
+    if (body.model === 'claude-opus-4-8') opusAttempts += 1;
+    bare429(res);
   });
   const upstreamPort = await listen(upstream);
 
   const am = new AccountManager(makeAccounts(2), 0.98);
   const proxy = startProxy(am, upstreamPort, {
     modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: true,
+    continuityMaxWaitMs: 55,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 1,
   });
   const proxyPort = await listen(proxy);
 
   try {
     const res = await post(proxyPort, 'claude-fable-5');
-    const json = await res.json();
-    assert.equal(res.status, 200);
-    assert.equal(json.served, 'claude-opus-4-8');
-    // Both accounts tried on fable, then the fallback dispatch on opus.
-    assert.deepEqual(modelsSeen.slice(0, 2), ['claude-fable-5', 'claude-fable-5']);
-    assert.equal(modelsSeen[modelsSeen.length - 1], 'claude-opus-4-8');
-    // A bare 429 must not have poisoned any account.
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.ok(attempts.length >= 2, `expected account failover, got ${attempts.length} attempt(s)`);
+    assert.notEqual(attempts[0].account, attempts[1].account);
+    assert.ok(attempts.length < 20, `bare 429 retries must stay bounded, got ${attempts.length}`);
+    assert.ok(attempts.every(a => a.model === 'claude-fable-5'));
+    assert.equal(opusAttempts, 0, 'bare/global 429 must not trigger Opus fallback');
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
     proxy.close();
@@ -144,29 +143,40 @@ test('labeled Fable 7d_oi exhaustion → falls back to Opus and succeeds', async
   }
 });
 
-// When the whole chain is exhausted too, the pre-existing behavior must be
-// preserved: bounded retries, 429 to the client, no account state mutation.
-test('chain exhausted → 429 passes through with bounded upstream hits', async () => {
-  let hits = 0;
+test('single-account bare 429 recovers on Fable without Opus fallback', async () => {
+  let fableAttempts = 0;
+  let opusAttempts = 0;
   const upstream = http.createServer(async (req, res) => {
-    await readJsonBody(req);
-    hits++;
-    bare429(res);
+    const body = await readJsonBody(req);
+    if (body.model === 'claude-fable-5') {
+      fableAttempts += 1;
+      if (fableAttempts < 3) bare429(res);
+      else ok200(res, { ok: true, served: body.model });
+      return;
+    }
+    if (body.model === 'claude-opus-4-8') opusAttempts += 1;
+    ok200(res, { ok: true, served: body.model });
   });
   const upstreamPort = await listen(upstream);
 
-  const am = new AccountManager(makeAccounts(2), 0.98);
+  const am = new AccountManager(makeAccounts(1), 0.98);
   const proxy = startProxy(am, upstreamPort, {
     modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: true,
+    continuityMaxWaitMs: 250,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);
 
   try {
     const res = await post(proxyPort, 'claude-fable-5');
-    await res.text();
-    assert.equal(res.status, 429);
-    // ≤ 2 accounts × 2 models, no unbounded recursion.
-    assert.ok(hits <= 4, `expected bounded retries, got ${hits}`);
+    const json = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(json.served, 'claude-fable-5');
+    assert.equal(fableAttempts, 3);
+    assert.equal(opusAttempts, 0, 'bare/global 429 must not trigger Opus fallback');
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
     proxy.close();
@@ -209,7 +219,7 @@ test('bracket-suffixed model matches its suffix-stripped fallback entry', async 
     const body = await readJsonBody(req);
     modelsSeen.push(body.model);
     if (body.model === 'claude-opus-4-8') ok200(res, { ok: true, served: body.model });
-    else bare429(res);
+    else modelWeekly429(res);
   });
   const upstreamPort = await listen(upstream);
 

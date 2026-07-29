@@ -132,7 +132,7 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **연결 affinity** — 같은 터미널의 연속 요청을 같은 계정에 유지해 prompt cache를 보존합니다.
 - **동시 요청 분산** — 계정별 동시 요청 한도를 넘는 트래픽은 다른 계정으로 자동 분산합니다.
 - **Fable/Mythos 계정 우선** — 모델별 window가 유효 기간 내이고, 유한한 값으로 측정됐으며, 한도에 도달한(fresh·finite·full) 계정만 그 요청에서 제외합니다. 미측정·만료·사용 가능 계정은 원래 모델로 먼저 시도하고, Opus/Sonnet/Haiku 자격은 유지합니다.
-- **모델 fallback** — 캐시에 기록된 general-available 계정이 모두 해당 모델에서 fresh-full이거나, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인되거나, label 없는 429가 반복돼 `rateLimitFailovers`를 소진하면 대체 모델로 전환합니다. 단순 local cap·동시성 queue는 모델을 바꾸지 않습니다.
+- **모델 fallback** — 캐시에 기록된 general-available 계정이 모두 해당 모델에서 fresh-full이거나, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인되면 대체 모델로 전환합니다. label 없는 global 429와 단순 local cap·동시성 queue는 모델을 바꾸지 않습니다.
 - **실시간 TUI** — 계정 상태, 세션·주간 사용량, 초기화 시간, CPU·RAM을 표시합니다.
 - **계정 수동 제어** — enable, disable, switch, priority 순서를 CLI와 TUI에서 변경할 수 있습니다.
 - **재시작 후 상태 복원** — 사용량과 throttle 상태를 별도 quota 파일에 저장합니다.
@@ -349,9 +349,9 @@ flowchart LR
 4. 응답 헤더에서 세션·주간·모델별 사용량과 초기화 시점을 학습합니다. 모델별 window는 재시작 때 복원하지 않아 미측정(unknown)으로 시작하며, runtime에서 유효 기간 내의 유한한 측정값이 한도에 도달한(fresh·finite·full) 경우에만 해당 Fable/Mythos 요청에서 그 계정을 제외합니다. 일반 한도 기준으로 사용 가능한 계정 중 미측정·만료·사용 가능 window가 하나라도 있으면 원래 모델을 유지하고, Opus/Sonnet/Haiku 자격은 바뀌지 않습니다.
 5. 새로 시작한 서버는 아직 측정되지 않은 계정을 먼저 순회합니다.
 6. 사용량 429는 해당 계정을 제외하고 다른 계정으로 즉시 전환합니다.
-7. 요청 속도나 동시성 429는 계정을 오염시키지 않고 제한된 횟수만큼 분산합니다. label 없는 429가 반복돼 `rateLimitFailovers`를 소진하면 모델 fallback으로 넘어가며, 이후에도 남는 transient/global 429는 `continuityMaxWaitMs` deadline 안에서 내부 복구합니다. local cap·동시성 queue만으로는 fallback하지 않습니다.
+7. 요청 속도나 동시성 429는 계정을 오염시키지 않고 제한된 횟수만큼 분산합니다. failover budget 이후에도 남는 label 없는 transient/global 429는 원래 모델을 유지한 채 `continuityMaxWaitMs` deadline 안에서 내부 복구합니다. local cap·동시성 queue도 fallback을 유발하지 않습니다.
 8. 네트워크 오류나 불완전한 SSE 스트림은 재전송해도 안전한 요청만 내부에서 다른 계정으로 재시도하고, 결과가 불확실한 POST는 숨은 재전송 없이 재시도 가능한 오류로 돌려줍니다.
-9. 모델 fallback은 캐시의 general-available 계정 전부가 fresh-full인 경우, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인된 경우, label 없는 429가 반복돼 failover budget이 소진된 경우에 적용됩니다. cached fresh-full 경로는 연속성 sleep 전에 즉시 실행되고, 그 외에 모든 계정이 제한되면 연속성 모드가 기본 15분 deadline 동안 최대 30초 간격으로 복구를 시도합니다.
+9. 모델 fallback은 캐시의 general-available 계정 전부가 fresh-full인 경우 또는 labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인된 경우에만 적용됩니다. label 없는 global 429는 fallback 근거가 아닙니다. cached fresh-full 경로는 연속성 sleep 전에 즉시 실행되고, 그 외에 모든 계정이 제한되면 연속성 모드가 기본 15분 deadline 동안 최대 30초 간격으로 원래 모델의 복구를 시도합니다.
 10. 일반 사용량 상태는 재시작 후 복원되지만 모델별 사용량은 복원하지 않고 실제 트래픽으로 다시 측정합니다.
 
 ## 보안 참고

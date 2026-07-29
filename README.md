@@ -158,7 +158,7 @@ cannot read that path.
 
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
-- **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, repeated unlabeled 429s may enter `modelFallbacks`; any remaining transient/global 429 never throttles the fleet and is retried internally within the bounded continuity deadline
+- **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
 - **Quota survives restarts** — general per-account quota state *and* the warm-up probe template are snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup. Model-scoped usage is deliberately not restored: every Fable/Mythos window starts unknown and is re-measured from runtime traffic
@@ -494,9 +494,9 @@ displayed total reflects real volume (qjc fork).
 > for the matching Fable/Mythos request. If any generally available account has
 > an unknown, expired, or ready window, the original top-tier model remains
 > account-first; a cached-fleet fallback is allowed only when every such account
-> is fresh, measured, and full. Runtime evidence can also trigger fallback after
-> a labeled model-tier 429 reaches every eligible account, or repeated unlabeled
-> 429s exhaust `rateLimitFailovers`. These windows never remove an account's
+> is fresh, measured, and full. Runtime evidence can also trigger fallback only
+> after a labeled model-tier 429 reaches every eligible account. Unlabeled/global
+> 429s keep the original model. These windows never remove an account's
 > Opus/Sonnet/Haiku eligibility. If a global installation carries additional
 > local patches, validate or reapply them in the service startup path because an
 > npm or Node upgrade can replace globally installed source files.
@@ -582,7 +582,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
-| `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full, a live labeled model-tier 429 reaches every eligible account, or repeated unlabeled 429s exhaust `rateLimitFailovers`. Unknown/expired/ready cached windows stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
+| `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 
 ### Model fallbacks (fork)
@@ -598,11 +598,10 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
 
 The proxy rewrites the request body's `model` to the next entry of the chain and
-retries under normal routing through any of three paths: the cached generally
-available fleet is entirely fresh, finite, and full for the model tier (`7d_oi`);
-a live labeled model-tier 429 has reached every eligible account; or repeated
-unlabeled 429s exhaust `rateLimitFailovers`. A cached fresh-full fleet falls back
-before continuity sleeps. Semantics:
+retries under normal routing through either of two paths: the cached generally
+available fleet is entirely fresh, finite, and full for the model tier (`7d_oi`),
+or a live labeled model-tier 429 has reached every eligible account. A cached
+fresh-full fleet falls back before continuity sleeps. Semantics:
 
 - The chain is resolved **once per request from the original model** (fallbacks of fallbacks are not followed) and consumed in order; when it runs dry, the pre-existing 429/continuity behavior applies unchanged.
 - Keys and targets must be **plain API model IDs**. A client-side bracket suffix (`claude-fable-5[1m]` — the API rejects such IDs as `not_found_error`) matches its suffix-stripped entry.
@@ -610,9 +609,9 @@ before continuity sleeps. Semantics:
   display adds `[1m]` to Opus 4.8; Claude Code strips that suffix before sending
   the request to the proxy.
 - In the cached precheck, an account with an unknown, expired, or non-full model window is tried with the original Fable/Mythos model before fallback. A fresh-full window excludes only that account for that request and does not affect its Opus/Sonnet/Haiku eligibility.
-- Independently of that cached precheck, fleet-wide live labeled model-tier 429 evidence or exhaustion of the repeated unlabeled-429 failover budget can trigger fallback.
+- Independently of that cached precheck, fleet-wide live labeled model-tier 429 evidence can trigger fallback.
 - Fallback runs **before** a continuity-mode sleep when the cached fleet is fresh-full: rewriting to a served model beats sleeping until a weekly reset.
-- A fleet that is only locally capped or queued for concurrency keeps the original model. Transient/global 429 recovery enters continuity after the runtime 429 failover/fallback budget is handled, within `continuityMaxWaitMs`; no account state is poisoned.
+- A fleet that is only locally capped or queued for concurrency keeps the original model. Unlabeled transient/global 429 recovery also keeps the original model and enters continuity after the account failover budget is handled, within `continuityMaxWaitMs`; no account state is poisoned.
 - Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
 
 ## How It Works
@@ -644,8 +643,8 @@ flowchart LR
 5. **Cold-start warm-up**: quota is only known after a request flows through an account, so at startup the proxy first routes requests to any unmeasured account until every account has been measured once. An **active warm-up** additionally probes unmeasured accounts directly — a minimal 1-token request reusing the shape of the first real request — so the whole fleet is measured within seconds of the first post-restart request instead of waiting for traffic to reach each account (`activeWarmup: false` disables it). Then account selection becomes **use-or-lose**: among accounts still under the threshold, it prefers the one whose weekly (7d) quota resets soonest (tie-breaks: soonest session reset, then lowest usage), so quota about to renew unused is drained first. Explicitly ranked accounts (`priority` / TUI `o`) are preferred before all of that; disabled accounts are excluded entirely. The active account stays sticky to keep its prompt cache warm; priority is re-evaluated every `reevalIntervalMs` (default 5 min; set `0` to disable timer-based switching), and on reaching the threshold it switches immediately to the next-highest-priority account
 6. On a 429 the proxy classifies it:
    - **Account-quota exhaustion** (upstream reports the account is over its limit) → marks that account rate-limited for its `retry-after` (clamped to 1s–5m) and immediately re-dispatches to the next available account. If every account is throttled it returns 429 with a computed `retry-after`. (This also keeps cold-start warm-up fast: an exhausted account is skipped in one round-trip.)
-   - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. Once that budget is exhausted, the configured runtime fallback path below gets the first opportunity; a remaining global limit opens a shared continuity cooldown and retries internally within `continuityMaxWaitMs` instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
-   - **Requested-model fallback** (fork) → a configured `modelFallbacks` chain rewrites the request when every generally available account's cached model window is fresh-full, when a live labeled model-tier 429 reaches every eligible account, or when repeated unlabeled 429s exhaust `rateLimitFailovers`. Cached unknown/expired/ready accounts remain account-first, and a fleet that is only locally capped or queued for concurrency does not change models. The cached fresh-full path runs before continuity sleep.
+   - **Rate/concurrency or transient 429** → the request tries a bounded number of alternate accounts. Once that budget is exhausted, a remaining global limit keeps the original model, opens a shared continuity cooldown, and retries internally within `continuityMaxWaitMs` instead of multiplying the request across the fleet or surfacing 429 to Claude Code.
+   - **Requested-model fallback** (fork) → a configured `modelFallbacks` chain rewrites the request when every generally available account's cached model window is fresh-full or when a live labeled model-tier 429 reaches every eligible account. Cached unknown/expired/ready accounts and unlabeled/global 429s remain account-first, and a fleet that is only locally capped or queued for concurrency does not change models. The cached fresh-full path runs before continuity sleep.
 7. Transient network errors and incomplete Anthropic SSE attempts fail over internally only for replay-safe methods (`GET`/`HEAD`/`OPTIONS`). An ambiguous POST is never replayed inside the proxy after dispatch: it receives a complete retryable error so the client controls any retry. Completed streams preserve byte fidelity. Buffers larger than 1 MiB spill to a private temporary file; transactional SSE, non-SSE, and OAuth relay responses are capped by `maxResponseBytes`.
 8. If all accounts are exhausted, continuity mode keeps the request inside the proxy for up to `continuityMaxWaitMs` (default `900000` = 15 minutes), probing no less often than the `continuityMaxSleepMs` cap (default `30000` = 30 seconds). Transient/global 429s recover internally within that same deadline. HTTP 529/5xx backoff is likewise internal only for replay-safe methods; an unsafe request passes the upstream error through without replay. Persistent overload is bounded by `TEAMCLAUDE_OVERLOAD_RETRIES` (default `6`) and a client disconnect aborts sooner. Setting `continuityMode: false` restores legacy handling for quota waits and global rate limits.
 9. **Quota survives restarts**: the server snapshots general per-account quota/throttle state plus the committed warm-up probe template to `<config>.quota.json` (every minute and on exit), so TUI **R** works before fresh traffic arrives. A restored template is provisional and the first freshly accepted request shape replaces it. Model-scoped weekly values are intentionally discarded on import and start unknown; runtime traffic re-measures them before a fleet-wide fallback can be justified

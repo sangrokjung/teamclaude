@@ -1575,7 +1575,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // spreads to an idle account instead of failing. Crucially we do NOT
       // throttle the account: throttling on a request-global 429 would poison
       // the fleet for unrelated requests. The configured failover budget bounds
-      // this replay before fallback, continuity handling, or passthrough; no
+      // this replay before continuity handling or passthrough; no
       // account state is mutated either way.
       ctx.tried429.add(account);
       const failoverLimit = ctx.continuity.rateLimitFailovers;
@@ -1591,22 +1591,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      // The configured alternate-account budget is exhausted. A repeated bare
-      // 429 can be a model-tier exhaustion upstream did not label, so before
-      // cooling down or passing it through, walk the configured model fallback
-      // chain. A genuinely global/IP limit also 429s the fallback and falls
-      // through to the existing behavior.
-      {
-        const fallback = nextModelFallback(ctx, req, body);
-        if (fallback && !res.destroyed) {
-          console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (429 failover budget exhausted for ${ctx.model})`);
-          releaseHeld();
-          ctx.model = fallback.model;
-          ctx.tried429.clear();
-          ctx.tried5xx.clear();
-          return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
-        }
-      }
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const deadlineMode = ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0;
       const deadlineAt = deadlineMode ? startContinuityDeadline(ctx) : null;
