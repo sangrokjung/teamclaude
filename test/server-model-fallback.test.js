@@ -319,6 +319,42 @@ test('model-tier exhaustion with continuity on and no fallback terminates instea
   }
 });
 
+test('model-tier polling honors continuity deadline when max wait is shorter than max sleep', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await readJsonBody(req);
+    upstreamHits += 1;
+    modelWeekly429(res);
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    continuityMaxWaitMs: 20,
+    continuityMaxSleepMs: 100,
+    continuityJitterMs: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await post(proxyPort, 'claude-fable-5');
+    const body = await res.json();
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(res.status, 429);
+    assert.ok(elapsed < 80,
+      `model-tier polling exceeded the 20ms continuity deadline: elapsed=${elapsed}ms`);
+    assert.equal(upstreamHits, 1, 'deadline expiry must not retry upstream');
+    assert.deepEqual(body, { type: 'error', error: { type: 'rate_limit_error' } },
+      'deadline expiry must return the saved upstream 429');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('cached fleet-wide Fable exhaustion falls back before continuity sleep', async () => {
   let fableAttempts = 0;
   let opusAttempts = 0;

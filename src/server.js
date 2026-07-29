@@ -21,10 +21,8 @@ function connectionHeaderNames(value) {
   );
 }
 
-// How many continuity sleeps a single request may spend waiting on a model-tier
-// window before we surface the 429. Weekly windows do not clear while we poll,
-// so this is a ceiling on a wait that would otherwise be unbounded. At the
-// default continuityMaxSleepMs (30s) this is ~5 minutes.
+// Legacy ceiling for model-tier polling when continuityMaxWaitMs is 0. Deadline
+// mode uses the request's overall continuity deadline instead.
 const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -1536,15 +1534,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // rolls over: the client hangs for days and every sleep burns one real
         // upstream 429. Bound the polling; once the budget is spent the client
         // gets its 429 and can back off far more cheaply than we can.
-        if (ctx.continuity.enabled && !res.destroyed
-            && (ctx.modelWaitPasses || 0) < MODEL_EXHAUST_WAIT_PASSES) {
-          ctx.modelWaitPasses = (ctx.modelWaitPasses || 0) + 1;
+        const deadlineMode = ctx.continuity.maxWaitMs > 0;
+        const legacyWaitOpen = !deadlineMode
+          && (ctx.modelWaitPasses || 0) < MODEL_EXHAUST_WAIT_PASSES;
+        if (ctx.continuity.enabled && !res.destroyed && (deadlineMode || legacyWaitOpen)) {
+          if (!deadlineMode) ctx.modelWaitPasses = (ctx.modelWaitPasses || 0) + 1;
           const wait = computeRetryAfter(
             accountManager.getStatus().accounts,
             accountManager.switchThreshold,
             ctx.model,
           );
-          await ctx.continuity.waitFor(wait, ctx.abortSignal);
+          const deadlineAt = deadlineMode ? startContinuityDeadline(ctx) : null;
+          const waited = await ctx.continuity.waitFor(wait, ctx.abortSignal, deadlineAt);
+          if (ctx.abortSignal?.aborted || res.destroyed) return;
+          if (!waited) {
+            ctx.status = 429;
+            if (!res.headersSent) {
+              res.writeHead(429, ctx.last429.headers);
+              res.end(ctx.last429.body.length > 0 ? ctx.last429.body : undefined);
+            }
+            return;
+          }
           ctx.tried429.clear();
           return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
