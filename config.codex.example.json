@@ -9,6 +9,9 @@
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
   "overflowQueueTimeoutMs": 15000,
+  "continuityMode": true,
+  "continuityMaxWaitMs": 900000,
+  "continuityMaxSleepMs": 30000,
   "activeWarmup": false,
   "accounts": [
     {

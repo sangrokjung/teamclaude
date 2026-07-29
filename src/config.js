@@ -6,11 +6,18 @@ import { randomBytes } from 'node:crypto';
 
 const DEFAULT_TOKEN_REFRESH_INTERVAL_MS = 300_000;
 const MIN_TOKEN_REFRESH_INTERVAL_MS = 60_000;
+const DEFAULT_CONTINUITY_MAX_WAIT_MS = 15 * 60 * 1000;
 
 export function normalizeTokenRefreshIntervalMs(value) {
   if (!Number.isFinite(value)) return DEFAULT_TOKEN_REFRESH_INTERVAL_MS;
   if (value <= 0) return 0;
   return Math.max(MIN_TOKEN_REFRESH_INTERVAL_MS, value);
+}
+
+export function normalizeContinuityMaxWaitMs(value) {
+  if (!Number.isFinite(value)) return DEFAULT_CONTINUITY_MAX_WAIT_MS;
+  if (value <= 0) return 0;
+  return Math.max(1, Math.floor(value));
 }
 
 async function syncParentDirectory(path) {
@@ -330,7 +337,9 @@ export function createDefaultConfig() {
     overflowQueueTimeoutMs: 15000,
     // Keep client requests inside the proxy while quota/cooldowns recover rather
     // than surfacing a 429 that interrupts an interactive Claude Code session.
+    // A zero max wait retains the legacy fixed retry-count behavior.
     continuityMode: true,
+    continuityMaxWaitMs: DEFAULT_CONTINUITY_MAX_WAIT_MS,
     continuityMaxSleepMs: 30000,
     continuityJitterMs: 500,
     // Maximum buffered upstream response per request. Transactional SSE spills

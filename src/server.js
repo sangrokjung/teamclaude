@@ -7,6 +7,7 @@ import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+import { normalizeContinuityMaxWaitMs } from './config.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -68,6 +69,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // or upstream rate limits recover, instead of surfacing a terminal-stopping
   // 429. Unit tests can leave it off; the CLI server enables it by default.
   const continuityMode = config.continuityMode === true;
+  const continuityMaxWaitMs = normalizeContinuityMaxWaitMs(config.continuityMaxWaitMs);
   const continuityMaxSleepMs = Number.isFinite(config.continuityMaxSleepMs)
     ? Math.max(10, config.continuityMaxSleepMs)
     : 30_000;
@@ -101,21 +103,44 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const continuity = {
     enabled: continuityMode,
     rateLimitFailovers,
+    maxWaitMs: continuityMaxWaitMs,
     maxSleepMs: continuityMaxSleepMs,
-    defer(seconds) {
-      const delay = Math.min(Math.max(1, seconds) * 1000, continuityMaxSleepMs);
+    deferMs(milliseconds) {
+      const delay = Math.min(Math.max(10, milliseconds), continuityMaxSleepMs);
       globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + delay);
     },
-    async waitGlobal(signal) {
-      const remaining = globalCooldownUntil - Date.now();
+    async waitGlobal(signal, requestContext = null) {
+      const cooldownRemaining = globalCooldownUntil - Date.now();
+      if (cooldownRemaining <= 0) return true;
+      const deadlineAt = requestContext == null ? null : startContinuityDeadline(requestContext);
+      const deadlineRemaining = deadlineAt == null ? Infinity : deadlineAt - Date.now();
+      if (deadlineRemaining <= 0) return false;
+      const remaining = Math.min(cooldownRemaining, deadlineRemaining);
       if (remaining > 0) await sleepOrAbort(remaining, signal);
       if (remaining > 0 && !signal?.aborted && continuityJitterMs > 0) {
-        await sleepOrAbort(Math.floor(Math.random() * continuityJitterMs), signal);
+        const jitterRemaining = deadlineAt == null ? Infinity : deadlineAt - Date.now();
+        if (jitterRemaining > 0) {
+          await sleepOrAbort(
+            Math.min(Math.floor(Math.random() * continuityJitterMs), jitterRemaining),
+            signal,
+          );
+        }
       }
+      return !signal?.aborted && (deadlineAt == null || Date.now() < deadlineAt);
     },
-    async waitFor(seconds, signal) {
-      const delay = Math.min(Math.max(1, seconds) * 1000, continuityMaxSleepMs);
+    async waitFor(seconds, signal, deadlineAt = null) {
+      return this.waitForMs(seconds * 1000, signal, deadlineAt);
+    },
+    async waitForMs(milliseconds, signal, deadlineAt = null) {
+      const deadlineRemaining = deadlineAt == null ? Infinity : deadlineAt - Date.now();
+      if (deadlineRemaining <= 0) return false;
+      const delay = Math.min(
+        Math.max(10, milliseconds),
+        continuityMaxSleepMs,
+        deadlineRemaining,
+      );
       await sleepOrAbort(delay, signal);
+      return !signal?.aborted && (deadlineAt == null || Date.now() < deadlineAt);
     },
   };
   let requestCounter = 0;
@@ -598,7 +623,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1088,6 +1113,14 @@ function nextModelFallback(ctx, req, body) {
   return null;
 }
 
+function startContinuityDeadline(ctx) {
+  if (ctx.continuity.maxWaitMs <= 0) return null;
+  if (ctx.continuityDeadlineAt == null) {
+    ctx.continuityDeadlineAt = Date.now() + ctx.continuity.maxWaitMs;
+  }
+  return ctx.continuityDeadlineAt;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
 
@@ -1098,7 +1131,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // before any account-switching retry is the caller's job, via releaseHeld().
   let account;
   while (!account) {
-    if (ctx.continuity.enabled) await ctx.continuity.waitGlobal(ctx.abortSignal);
+    if (ctx.continuity.enabled) {
+      const waited = await ctx.continuity.waitGlobal(ctx.abortSignal, ctx);
+      if (!waited) break;
+    }
     if (ctx.abortSignal?.aborted || res.destroyed) return;
 
     // On a failover retry, skip accounts already tried for this request.
@@ -1130,8 +1166,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const retryAfter = capped
       ? 1
       : computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    const deadlineMode = ctx.continuity.maxWaitMs > 0;
+    const maxCapacityWaits = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+    if (!deadlineMode && ctx.capacityWaits >= maxCapacityWaits) break;
     console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — waiting ${Math.min(retryAfter * 1000, ctx.continuity.maxSleepMs)}ms`);
-    await ctx.continuity.waitFor(retryAfter, ctx.abortSignal);
+    ctx.capacityWaits += 1;
+    const waited = await ctx.continuity.waitFor(
+      retryAfter,
+      ctx.abortSignal,
+      deadlineMode ? startContinuityDeadline(ctx) : null,
+    );
+    if (!waited) break;
     ctx.tried429.clear();
     ctx.tried5xx.clear();
     retryCount = 0;
@@ -1305,7 +1350,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       signal: upstreamDeadline.signal,
     });
     const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
-    if (isStreaming) upstreamDeadline.stopTimeout();
+    if (isStreaming && upstreamRes.status !== 429) upstreamDeadline.stopTimeout();
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -1396,8 +1441,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
       retryAfter = Math.min(Math.max(retryAfter, 1), 300); // clamp [1s, 5m]
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+      const responseBody = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      if (responseBody === null) {
+        ctx.status = 502;
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: 'Upstream 429 response exceeded the proxy limit.' },
+          }));
+        }
+        return;
+      }
+      const responseHeaders = {};
+      const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
+      for (const [key, value] of upstreamRes.headers.entries()) {
+        if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+        if (key === 'content-encoding' || key === 'content-length') continue;
+        responseHeaders[key] = value;
+      }
+      if (responseHeaders['retry-after'] == null) {
+        responseHeaders['retry-after'] = String(retryAfter);
+      }
+      ctx.last429 = { body: responseBody, headers: responseHeaders };
 
       // A model-scoped exhaustion must only exclude this account for that model.
       // Globally throttling it would unnecessarily remove healthy Sonnet/Haiku
@@ -1528,15 +1594,32 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }
       }
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
-      if (ctx.continuity.enabled && !res.destroyed && ctx.overloadRetries < maxOverload) {
+      const deadlineMode = ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0;
+      const deadlineAt = deadlineMode ? startContinuityDeadline(ctx) : null;
+      const deadlineOpen = deadlineMode && Date.now() < deadlineAt;
+      const legacyRetryOpen = !deadlineMode && ctx.overloadRetries < maxOverload;
+      if (ctx.continuity.enabled && !res.destroyed && (deadlineOpen || legacyRetryOpen)) {
+        const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+        const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+        const exponentialBackoff = Math.min(
+          backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
+          backoffCap,
+        );
+        const waitMs = Math.max(retryAfter * 1000, exponentialBackoff);
         ctx.overloadRetries += 1;
-        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down ${retryAfter}s internally (retry ${ctx.overloadRetries}/${maxOverload})`);
+        const retryBudget = deadlineMode
+          ? `${Math.max(0, deadlineAt - Date.now())}ms remaining`
+          : `${ctx.overloadRetries}/${maxOverload}`;
+        console.log(`[TeamClaude] 429 (global) on "${account.name}" — cooling down internally (${retryBudget})`);
         releaseHeld();
-        ctx.continuity.defer(retryAfter);
-        await ctx.continuity.waitGlobal(ctx.abortSignal);
-        ctx.tried429.clear();
-        ctx.tried5xx.clear();
-        return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        ctx.continuity.deferMs(waitMs);
+        const waited = await ctx.continuity.waitGlobal(ctx.abortSignal, ctx);
+        if (ctx.abortSignal?.aborted || res.destroyed) return;
+        if (waited) {
+          ctx.tried429.clear();
+          ctx.tried5xx.clear();
+          return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        }
       }
 
       console.log(`[TeamClaude] 429 (global) on "${account.name}" — failover budget exhausted, passing through`);
@@ -1547,11 +1630,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       if (res.destroyed) return;
       if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
-        }));
+        if (ctx.last429) {
+          res.writeHead(429, ctx.last429.headers);
+          res.end(ctx.last429.body.length > 0 ? ctx.last429.body : undefined);
+        } else {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'rate_limit_error', message: `Upstream rate limited (retry in ${retryAfter}s).` },
+          }));
+        }
       }
       return;
     }
