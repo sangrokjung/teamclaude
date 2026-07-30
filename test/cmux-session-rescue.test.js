@@ -1,9 +1,13 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -15,6 +19,11 @@ import {
   rescueCmuxSessionsOnce,
   resolveRecoveryWindowId,
 } from '../src/cmux-session-rescue.js';
+import {
+  claimSessionOnce,
+  inspectClaudeProcess,
+  sameClaudeProcess,
+} from '../src/cmux-session-guards.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_SESSION_ID = '22222222-2222-4222-8222-222222222222';
@@ -93,7 +102,9 @@ function processInfo(fx, overrides = {}) {
   return {
     alive: true,
     cwd: fx.cwd,
+    environmentValid: true,
     executablePath: fx.executablePath,
+    launchArgv: [fx.executablePath, '--session-id', SESSION_ID],
     processIdentity: '12345:Mon Jul 30 23:00:00 2026',
     processStartedAt: fx.session.startedAt - 3,
     command: `${fx.executablePath} --session-id ${SESSION_ID}`,
@@ -239,6 +250,7 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
       name: 'process selector belongs to another session',
       inspect: fx => processInfo(fx, {
         command: `${fx.executablePath} --resume ${OTHER_SESSION_ID}`,
+        launchArgv: [fx.executablePath, '--resume', OTHER_SESSION_ID],
       }),
     },
     {
@@ -281,6 +293,67 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
       assert.equal(launches, 0);
     });
   }
+});
+
+test('uses exact cmux launch argv and environment fields instead of rendered ps text', async t => {
+  const fx = await fixture(t);
+  const prompt = `CMUX_SURFACE_ID=${SURFACE_ID} --resume ${SESSION_ID}`;
+  const args = ['-e', 'setInterval(() => {}, 60_000)', prompt];
+  const child = spawn(process.execPath, args, {
+    cwd: fx.cwd,
+    env: {
+      ...process.env,
+      CMUX_SURFACE_ID: OTHER_SESSION_ID,
+      CMUX_AGENT_LAUNCH_ARGV_B64: Buffer.from(
+        [process.execPath, ...args].join('\0'),
+      ).toString('base64'),
+    },
+    stdio: 'ignore',
+  });
+  await once(child, 'spawn');
+  t.after(() => {
+    child.kill('SIGTERM');
+  });
+
+  const info = await inspectClaudeProcess(child.pid);
+  const session = {
+    ...fx.session,
+    pid: child.pid,
+    startedAt: info.processStartedAt + 1,
+    cwd: fx.cwd,
+    launchCommand: {
+      ...fx.session.launchCommand,
+      executablePath: process.execPath,
+    },
+  };
+
+  assert.equal(
+    await sameClaudeProcess(session, info, process.execPath),
+    false,
+  );
+});
+
+test('syncs and identity-checks the recovery claim directory before returning', async t => {
+  const fx = await fixture(t);
+  const claimDir = `${fx.storePath}.recovery-claims`;
+  const movedDir = `${claimDir}.moved`;
+  let syncCalls = 0;
+
+  await assert.rejects(
+    claimSessionOnce(fx.storePath, SESSION_ID, {
+      syncDirectory: async handle => {
+        syncCalls += 1;
+        await handle.sync();
+        await rename(claimDir, movedDir);
+        await mkdir(claimDir, { mode: 0o700 });
+      },
+    }),
+    /identity changed/i,
+  );
+  assert.equal(syncCalls, 1);
+
+  const movedClaim = await open(join(movedDir, SESSION_ID), 'r');
+  await movedClaim.close();
 });
 
 test('coalesces concurrent rescue scans and never adopts the same process twice', async t => {

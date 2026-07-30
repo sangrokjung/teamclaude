@@ -1,20 +1,21 @@
-import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, lstat, mkdir, open, realpath } from 'node:fs/promises';
-import { basename, delimiter, join, relative } from 'node:path';
-import { promisify } from 'node:util';
+import { lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { basename, join, relative } from 'node:path';
 
-const execFileAsync = promisify(execFile);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
-const SUPERVISED_MARKER = 'TEAMCLAUDE_SESSION_SUPERVISED=1';
 const LOGIN_EXPIRED = 'Login expired · Please run /login';
 const NOFOLLOW = constants.O_NOFOLLOW || 0;
+const DIRECTORY = constants.O_DIRECTORY || 0;
 
 function ownedPrivate(info, expectedType) {
   if (!info[expectedType]()) return false;
   if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return false;
   return (info.mode & 0o077) === 0;
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 async function openPrivateFile(path) {
@@ -24,9 +25,25 @@ async function openPrivateFile(path) {
   try {
     const info = await handle.stat();
     if (!ownedPrivate(info, 'isFile')
-        || info.dev !== before.dev
-        || info.ino !== before.ino) {
+        || !sameIdentity(info, before)) {
       throw new Error('File identity changed.');
+    }
+    return { handle, info };
+  } catch (err) {
+    await handle.close();
+    throw err;
+  }
+}
+
+async function openPrivateDirectory(path) {
+  const before = await lstat(path);
+  if (!ownedPrivate(before, 'isDirectory')) throw new Error('Untrusted directory.');
+  const handle = await open(path, constants.O_RDONLY | DIRECTORY | NOFOLLOW);
+  try {
+    const info = await handle.stat();
+    if (!ownedPrivate(info, 'isDirectory')
+        || !sameIdentity(info, before)) {
+      throw new Error('Directory identity changed.');
     }
     return { handle, info };
   } catch (err) {
@@ -128,107 +145,21 @@ export function validSession(store, session) {
     && activeSessionId(store, session.surfaceId) === session.sessionId;
 }
 
-export async function inspectClaudeProcess(pid) {
-  try {
-    process.kill(pid, 0);
-    const [
-      { stdout: command },
-      { stdout: environment },
-      { stdout: cwdOutput },
-      { stdout: startedAt },
-    ] = await Promise.all([
-      execFileAsync('ps', ['-p', String(pid), '-o', 'command='], { timeout: 1500 }),
-      execFileAsync('ps', ['eww', '-p', String(pid), '-o', 'command='], { timeout: 1500 }),
-      execFileAsync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { timeout: 1500 }),
-      execFileAsync('ps', ['-p', String(pid), '-o', 'lstart='], { timeout: 1500 }),
-    ]);
-    const processCommand = command.trim();
-    const executablePath = processCommand.split(/\s+/)[0] || '';
-    const cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || '';
-    const surfaceId = environment.match(/(?:^|\s)CMUX_SURFACE_ID=([^\s]+)/)?.[1] || null;
-    return {
-      alive: true,
-      command: processCommand,
-      cwd,
-      executablePath,
-      processIdentity: `${pid}:${startedAt.trim()}`,
-      processStartedAt: new Date(startedAt.trim()).getTime() / 1000,
-      surfaceId,
-      supervised: environment.includes(SUPERVISED_MARKER),
-    };
-  } catch {
-    return { alive: false };
-  }
-}
+export {
+  inspectClaudeProcess,
+  resolveTrustedClaudePath,
+  sameClaudeProcess,
+} from './cmux-process-guard.js';
 
-function selectorMatches(command, sessionId) {
-  const escaped = sessionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(
-    `(?:^|\\s)--(?:resume|session-id)(?:=|\\s+)${escaped}(?=\\s|$)`,
-  ).test(command);
-}
-
-export async function sameClaudeProcess(
-  session,
-  info,
-  trustedClaudePath = null,
-  expectedIdentity = null,
+export async function claimSessionOnce(
+  storePath,
+  sessionId,
+  { syncDirectory = handle => handle.sync() } = {},
 ) {
-  const startDelta = session?.startedAt - info?.processStartedAt;
-  if (!info?.alive
-      || info.supervised
-      || info.surfaceId !== session.surfaceId
-      || typeof info.processIdentity !== 'string'
-      || !info.processIdentity
-      || (expectedIdentity && info.processIdentity !== expectedIdentity)
-      || !selectorMatches(info.command || '', session.sessionId)
-      || !Number.isFinite(startDelta)
-      || startDelta < -2
-      || startDelta > 60) {
-    return false;
-  }
-  try {
-    const [
-      processExecutable,
-      launchExecutable,
-      trustedExecutable,
-      processCwd,
-      sessionCwd,
-    ] = await Promise.all([
-      realpath(info.executablePath),
-      realpath(session.launchCommand.executablePath),
-      realpath(trustedClaudePath || session.launchCommand.executablePath),
-      realpath(info.cwd),
-      realpath(session.cwd),
-    ]);
-    return processExecutable === trustedExecutable
-      && launchExecutable === trustedExecutable
-      && processCwd === sessionCwd;
-  } catch {
-    return false;
-  }
-}
-
-export async function resolveTrustedClaudePath() {
-  for (const directory of (process.env.PATH || '').split(delimiter)) {
-    if (!directory) continue;
-    const candidate = join(directory, 'claude');
-    try {
-      await access(candidate, constants.X_OK);
-      return await realpath(candidate);
-    } catch {}
-  }
-  throw new Error('Unable to resolve the trusted Claude executable.');
-}
-
-export async function claimSessionOnce(storePath, sessionId) {
   const claimDir = `${storePath}.recovery-claims`;
   await mkdir(claimDir, { recursive: true, mode: 0o700 });
-  const dirInfo = await lstat(claimDir);
-  if (!ownedPrivate(dirInfo, 'isDirectory')) {
-    throw new Error('Untrusted recovery claim directory.');
-  }
-
+  const { handle: directoryHandle, info: directoryInfo } =
+    await openPrivateDirectory(claimDir);
   let handle;
   try {
     handle = await open(
@@ -238,12 +169,32 @@ export async function claimSessionOnce(storePath, sessionId) {
     );
     await handle.writeFile(`${Date.now()}\n`);
     await handle.sync();
+    await syncDirectory(directoryHandle);
+    let currentDirectory;
+    let currentClaim;
+    let claimInfo;
+    try {
+      [currentDirectory, currentClaim, claimInfo] = await Promise.all([
+        lstat(claimDir),
+        lstat(join(claimDir, sessionId)),
+        handle.stat(),
+      ]);
+    } catch {
+      throw new Error('Recovery claim identity changed.');
+    }
+    if (!ownedPrivate(currentDirectory, 'isDirectory')
+        || !sameIdentity(currentDirectory, directoryInfo)
+        || !ownedPrivate(currentClaim, 'isFile')
+        || !sameIdentity(currentClaim, claimInfo)) {
+      throw new Error('Recovery claim identity changed.');
+    }
     return true;
   } catch (err) {
     if (err.code === 'EEXIST') return false;
     throw err;
   } finally {
     await handle?.close();
+    await directoryHandle.close();
   }
 }
 
