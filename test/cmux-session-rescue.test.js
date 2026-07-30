@@ -98,7 +98,7 @@ function processInfo(fx, overrides = {}) {
 
 test('adopts active unresolved Login expired session once', async t => {
   const fx = await fixture(t);
-  const respawned = [];
+  const launched = [];
   const result = await rescueCmuxSessionsOnce({
     storePath: fx.storePath,
     transcriptRoot: fx.transcriptRoot,
@@ -106,16 +106,17 @@ test('adopts active unresolved Login expired session once', async t => {
     scriptPath: '/opt/teamclaude/src/index.js',
     configPath: '/tmp/teamclaude config.json',
     inspectProcess: async () => processInfo(fx),
-    respawnSurface: async request => {
-      respawned.push(request);
+    launchRecoveryWorkspace: async request => {
+      launched.push(request);
     },
   });
 
   assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
-  assert.equal(respawned.length, 1);
-  assert.equal(respawned[0].surfaceId, SURFACE_ID);
+  assert.equal(launched.length, 1);
+  assert.equal(launched[0].workspaceId, fx.session.workspaceId);
+  assert.equal(launched[0].cwd, fx.cwd);
   assert.equal(
-    respawned[0].command,
+    launched[0].command,
     `cd -- '${fx.cwd.replaceAll("'", "'\"'\"'")}' && TEAMCLAUDE_CONFIG='/tmp/teamclaude config.json' '/usr/local/bin/node' '/opt/teamclaude/src/index.js' run -- --resume '${SESSION_ID}' continue`,
   );
 });
@@ -146,6 +147,19 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
       },
     },
     {
+      name: 'same-root transcript belongs to another session',
+      mutate: async fx => {
+        const otherTranscript = join(
+          fx.transcriptRoot,
+          'project',
+          `${OTHER_SESSION_ID}.jsonl`,
+        );
+        await writeFile(otherTranscript, `${loginExpiredRecord(fx.cwd)}\n`);
+        fx.session.transcriptPath = otherTranscript;
+        await writeFile(fx.storePath, JSON.stringify(fx.store));
+      },
+    },
+    {
       name: 'process belongs to another surface',
       inspect: fx => processInfo(fx, { surfaceId: OTHER_SESSION_ID }),
     },
@@ -159,25 +173,25 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
     await t.test(scenario.name, async t => {
       const fx = await fixture(t);
       await scenario.mutate?.(fx);
-      let respawns = 0;
+      let launches = 0;
       await rescueCmuxSessionsOnce({
         storePath: fx.storePath,
         transcriptRoot: fx.transcriptRoot,
         nodePath: '/usr/local/bin/node',
         scriptPath: '/opt/teamclaude/src/index.js',
         inspectProcess: async () => scenario.inspect?.(fx) || processInfo(fx),
-        respawnSurface: async () => {
-          respawns += 1;
+        launchRecoveryWorkspace: async () => {
+          launches += 1;
         },
       });
-      assert.equal(respawns, 0);
+      assert.equal(launches, 0);
     });
   }
 });
 
 test('coalesces concurrent rescue scans and never adopts the same process twice', async t => {
   const fx = await fixture(t);
-  let respawns = 0;
+  let launches = 0;
   const rescuer = createCmuxSessionRescuer({
     enabled: true,
     storePath: fx.storePath,
@@ -185,8 +199,8 @@ test('coalesces concurrent rescue scans and never adopts the same process twice'
     nodePath: '/usr/local/bin/node',
     scriptPath: '/opt/teamclaude/src/index.js',
     inspectProcess: async () => processInfo(fx),
-    respawnSurface: async () => {
-      respawns += 1;
+    launchRecoveryWorkspace: async () => {
+      launches += 1;
     },
     log() {},
   });
@@ -198,12 +212,12 @@ test('coalesces concurrent rescue scans and never adopts the same process twice'
   assert.equal(first, second);
   assert.equal(first.rescued, 1);
   assert.equal(third.rescued, 0);
-  assert.equal(respawns, 1);
+  assert.equal(launches, 1);
 });
 
-test('keeps the blocked process intact when atomic cmux respawn fails', async t => {
+test('does not replay an ambiguous recovery workspace launch', async t => {
   const fx = await fixture(t);
-  let respawns = 0;
+  let launches = 0;
   const attempted = new Set();
   const options = {
     storePath: fx.storePath,
@@ -212,24 +226,24 @@ test('keeps the blocked process intact when atomic cmux respawn fails', async t 
     scriptPath: '/opt/teamclaude/src/index.js',
     attempted,
     inspectProcess: async () => processInfo(fx),
-    respawnSurface: async () => {
-      respawns += 1;
+    launchRecoveryWorkspace: async () => {
+      launches += 1;
       throw new Error('cmux unavailable');
     },
   };
   const first = await rescueCmuxSessionsOnce(options);
   const second = await rescueCmuxSessionsOnce(options);
 
-  assert.equal(respawns, 1);
+  assert.equal(launches, 1);
   assert.deepEqual(first, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
   assert.deepEqual(second, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
 });
 
-test('rejects process identity or active mapping changes before atomic respawn', async t => {
+test('rejects process identity or active mapping changes before workspace launch', async t => {
   await t.test('process identity changed', async t => {
     const fx = await fixture(t);
     let inspections = 0;
-    let respawns = 0;
+    let launches = 0;
     await rescueCmuxSessionsOnce({
       storePath: fx.storePath,
       transcriptRoot: fx.transcriptRoot,
@@ -238,17 +252,17 @@ test('rejects process identity or active mapping changes before atomic respawn',
       inspectProcess: async () => processInfo(fx, {
         processIdentity: inspections++ === 0 ? '12345:first' : '12345:reused',
       }),
-      respawnSurface: async () => {
-        respawns += 1;
+      launchRecoveryWorkspace: async () => {
+        launches += 1;
       },
     });
-    assert.equal(respawns, 0);
+    assert.equal(launches, 0);
   });
 
   await t.test('active surface mapping changed', async t => {
     const fx = await fixture(t);
     let reads = 0;
-    let respawns = 0;
+    let launches = 0;
     const changed = structuredClone(fx.store);
     changed.activeSessionsBySurface[SURFACE_ID].sessionId = OTHER_SESSION_ID;
     await rescueCmuxSessionsOnce({
@@ -258,10 +272,10 @@ test('rejects process identity or active mapping changes before atomic respawn',
       scriptPath: '/opt/teamclaude/src/index.js',
       readStore: async () => (++reads >= 3 ? changed : fx.store),
       inspectProcess: async () => processInfo(fx),
-      respawnSurface: async () => {
-        respawns += 1;
+      launchRecoveryWorkspace: async () => {
+        launches += 1;
       },
     });
-    assert.equal(respawns, 0);
+    assert.equal(launches, 0);
   });
 });

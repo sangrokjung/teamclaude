@@ -402,14 +402,15 @@ interactive session does not wait indefinitely at the prompt for a person.
 
 Existing Claude processes cannot acquire a recovery parent retroactively.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
-cmux's session registry for an unresolved `Login expired` event. It relaunches
+cmux's session registry for an unresolved `Login expired` event. It continues
 only an active surface whose session ID, live process, executable, cmux surface,
 process start identity, working directory, and transcript root all still match.
 Stale or already supervised records fail closed. After a final registry and
-process recheck, one `cmux respawn-pane` operation replaces the blocked process
-with a supervised resume. An uncertain respawn result is not replayed again
-during that supervisor run. This option is off by default because it can replace
-an affected Claude process in its existing terminal.
+process recheck, TeamClaude opens one non-focused workspace in the same cmux
+window and resumes the same session there under recovery supervision. The
+blocked legacy pane is left untouched. An uncertain workspace launch is not
+replayed again during that supervisor run. This option is off by default because
+it adds a recovery workspace for each affected legacy session.
 
 `codexFallbackOnExhaustion: true` additionally hands the conversation to TeamCodex
 when an exact expired-login recovery receives a confirmed `no_alternative_account`
@@ -616,7 +617,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
-| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions that are already blocked on `Login expired`; matching PID/executable/surface/cwd/transcript are required (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions that are already blocked on `Login expired`; matching PID/start identity/executable/workspace/surface/cwd/session transcript are required, and recovery continues in a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)

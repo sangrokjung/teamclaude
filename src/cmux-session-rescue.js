@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { open, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -60,9 +60,10 @@ async function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
-async function hasUnresolvedLoginExpired(path, transcriptRoot) {
+async function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId) {
   try {
     if (!await pathInside(path, transcriptRoot)) return false;
+    if (basename(await realpath(path)) !== `${sessionId}.jsonl`) return false;
     const tail = await readTail(path);
     let blocked = false;
     for (const line of tail.split('\n')) {
@@ -95,6 +96,7 @@ function validSession(store, session) {
   return session?.isRestorable === true
     && UUID_RE.test(session.sessionId || '')
     && SURFACE_RE.test(session.surfaceId || '')
+    && UUID_RE.test(session.workspaceId || '')
     && Number.isInteger(session.pid)
     && session.pid > 0
     && typeof session.cwd === 'string'
@@ -163,13 +165,34 @@ function buildResumeCommand({ cwd, sessionId, nodePath, scriptPath, configPath }
   return `cd -- ${shellQuote(cwd)} && ${config}${shellQuote(nodePath)} ${shellQuote(scriptPath)} run -- --resume ${shellQuote(sessionId)} continue`;
 }
 
-async function defaultRespawnSurface({ surfaceId, command }) {
+async function defaultLaunchRecoveryWorkspace({
+  workspaceId,
+  cwd,
+  sessionId,
+  command,
+}) {
+  const { stdout } = await execFileAsync('cmux', ['rpc', 'system.tree', '{}'], {
+    timeout: 3000,
+  });
+  const tree = JSON.parse(stdout);
+  const window = tree?.windows?.find(item => item?.workspaces?.some(
+    workspace => workspace?.id === workspaceId,
+  ));
+  if (typeof window?.id !== 'string') {
+    throw new Error('Unable to resolve the cmux window for the blocked session.');
+  }
   await execFileAsync('cmux', [
-    'respawn-pane',
-    '--surface',
-    surfaceId,
+    'new-workspace',
+    '--window',
+    window.id,
+    '--name',
+    `Recovered Claude ${sessionId.slice(0, 8)}`,
+    '--cwd',
+    cwd,
     '--command',
     command,
+    '--focus',
+    'false',
   ], {
     timeout: 5000,
   });
@@ -188,7 +211,7 @@ export async function rescueCmuxSessionsOnce({
   attempted = new Set(),
   readStore = defaultReadStore,
   inspectProcess = defaultInspectProcess,
-  respawnSurface = defaultRespawnSurface,
+  launchRecoveryWorkspace = defaultLaunchRecoveryWorkspace,
 }) {
   let store;
   try {
@@ -203,7 +226,11 @@ export async function rescueCmuxSessionsOnce({
   const currentSessions = sessions(store);
   for (const session of currentSessions) {
     if (!validSession(store, session)) continue;
-    if (!await hasUnresolvedLoginExpired(session.transcriptPath, transcriptRoot)) continue;
+    if (!await hasUnresolvedLoginExpired(
+      session.transcriptPath,
+      transcriptRoot,
+      session.sessionId,
+    )) continue;
     candidates += 1;
     const key = `${session.sessionId}:${session.pid}`;
     if (attempted.has(key)) continue;
@@ -216,7 +243,11 @@ export async function rescueCmuxSessionsOnce({
     }
     const fresh = sessions(freshStore).find(item => item?.sessionId === session.sessionId);
     if (!fresh || fresh.pid !== session.pid || !validSession(freshStore, fresh)) continue;
-    if (!await hasUnresolvedLoginExpired(fresh.transcriptPath, transcriptRoot)) continue;
+    if (!await hasUnresolvedLoginExpired(
+      fresh.transcriptPath,
+      transcriptRoot,
+      fresh.sessionId,
+    )) continue;
 
     const first = await inspectProcess(fresh.pid);
     if (!await sameProcess(fresh, first)) continue;
@@ -231,7 +262,11 @@ export async function rescueCmuxSessionsOnce({
     }
     const final = sessions(finalStore).find(item => item?.sessionId === fresh.sessionId);
     if (!final || final.pid !== fresh.pid || !validSession(finalStore, final)) continue;
-    if (!await hasUnresolvedLoginExpired(final.transcriptPath, transcriptRoot)) continue;
+    if (!await hasUnresolvedLoginExpired(
+      final.transcriptPath,
+      transcriptRoot,
+      final.sessionId,
+    )) continue;
     const finalInfo = await inspectProcess(final.pid);
     if (!await sameProcess(final, finalInfo, first.processIdentity)) continue;
 
@@ -244,7 +279,12 @@ export async function rescueCmuxSessionsOnce({
     });
     attempted.add(key);
     try {
-      await respawnSurface({ surfaceId: final.surfaceId, command });
+      await launchRecoveryWorkspace({
+        workspaceId: final.workspaceId,
+        cwd: final.cwd,
+        sessionId: final.sessionId,
+        command,
+      });
       rescued += 1;
     } catch {
       failed += 1;
@@ -272,10 +312,10 @@ export function createCmuxSessionRescuer({
     scanPromise = rescueCmuxSessionsOnce({ ...options, attempted })
       .then(result => {
         if (result.rescued > 0) {
-          log(`[TeamClaude] Rescued ${result.rescued} blocked Claude session(s) under recovery supervision.`);
+          log(`[TeamClaude] Continued ${result.rescued} blocked Claude session(s) in new supervised cmux workspaces.`);
         }
         if (result.failed > 0) {
-          log(`[TeamClaude] Cmux respawn was uncertain for ${result.failed} blocked Claude session(s); not replaying in this supervisor run.`);
+          log(`[TeamClaude] Cmux recovery workspace launch was uncertain for ${result.failed} blocked Claude session(s); not replaying in this supervisor run.`);
         }
         return result;
       })

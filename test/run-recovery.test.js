@@ -51,10 +51,13 @@ test('real run Login expired rotates first and resumes the same session with rec
   t.after(() => rm(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
+  const configDir = join(root, '.config');
   const configPath = join(root, 'config.json');
   const claudeCalls = join(root, 'claude-calls.jsonl');
+  const codexCalls = join(root, 'codex-calls.jsonl');
   await mkdir(bin);
   await mkdir(project);
+  await mkdir(configDir);
 
   const fakeClaude = `#!/usr/bin/env node
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -89,9 +92,18 @@ if (sessionFlag >= 0) {
 }
 `;
   await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+  const fakeCodex = `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
+  args: process.argv.slice(2),
+  provider: process.env.TEAMCLAUDE_PROVIDER ?? null,
+}) + '\\n');
+`;
+  await writeFile(join(bin, 'codex'), fakeCodex, { mode: 0o755 });
 
   let currentAccount = 'account-a';
   let rotateCalls = 0;
+  let rotateMode = 'success';
   const controlServer = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/teamclaude/status') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -115,6 +127,18 @@ if (sessionFlag >= 0) {
         return;
       }
       rotateCalls += 1;
+      if (rotateMode !== 'success') {
+        res.writeHead(409, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: rotateMode === 'no-alternative'
+              ? 'no_alternative_account'
+              : 'rotation_conflict',
+          },
+        }));
+        return;
+      }
       currentAccount = 'account-b';
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
@@ -142,12 +166,18 @@ if (sessionFlag >= 0) {
     codexFallbackOnExhaustion: false,
     accounts: [],
   }));
+  await writeFile(join(configDir, 'teamcodex.json'), JSON.stringify({
+    proxy: { port },
+    provider: 'codex',
+  }));
   const env = {
     ...process.env,
     HOME: root,
+    XDG_CONFIG_HOME: configDir,
     PATH: `${bin}:${process.env.PATH}`,
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
+    FAKE_CODEX_CALLS: codexCalls,
     ANTHROPIC_API_KEY: 'must-not-reach-child',
     ANTHROPIC_AUTH_TOKEN: 'must-not-reach-child',
   };
@@ -190,6 +220,40 @@ if (sessionFlag >= 0) {
     ],
   );
   assert.doesNotMatch(result.stdout + result.stderr, /fixture-proxy-key|must-not-reach-child/);
+
+  await writeFile(claudeCalls, '');
+  rotateMode = 'no-alternative';
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'fixture-proxy-key' },
+    autoResumeClaude: true,
+    claudeAutoResumeMaxRetries: 3,
+    claudeAutoResumeBackoffMs: 0,
+    codexFallbackOnExhaustion: true,
+    accounts: [],
+  }));
+  const noAlternative = await runCli(['run'], {
+    cwd: project,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(noAlternative.status, 0, noAlternative.stderr);
+  assert.equal((await jsonLines(claudeCalls)).length, 1);
+  const handedOff = await jsonLines(codexCalls);
+  assert.equal(handedOff.length, 1);
+  assert.equal(handedOff[0].provider, 'codex');
+  assert.ok(handedOff[0].args.some(arg => arg.includes('teamclaude-handoffs')));
+
+  await writeFile(claudeCalls, '');
+  await writeFile(codexCalls, '');
+  rotateMode = 'malformed-conflict';
+  const malformedConflict = await runCli(['run'], {
+    cwd: project,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.equal(malformedConflict.status, 9, malformedConflict.stderr);
+  assert.equal((await jsonLines(claudeCalls)).length, 1);
+  assert.deepEqual(await jsonLines(codexCalls), []);
 });
 
 test('real run command isolates ambiguous sessions, resumes Claude, then hands off once', async () => {
