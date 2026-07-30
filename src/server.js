@@ -523,11 +523,68 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         : null;
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+      const isRotateRequest = req.url === '/teamclaude/rotate';
+      if (isRotateRequest && !isLocal) {
+        rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'permission_error', message: 'Account rotation is local-only.' },
+        });
+        return;
+      }
+      if (isRotateRequest && proxyApiKey
+          && clientKey !== proxyApiKey && bearerKey !== proxyApiKey) {
+        rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'authentication_error', message: 'Invalid proxy API key' },
+        });
+        return;
+      }
       if (proxyApiKey && clientKey !== proxyApiKey && bearerKey !== proxyApiKey && !isLocal) {
         rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },
         });
+        return;
+      }
+
+      if (isRotateRequest) {
+        if (req.method !== 'POST') {
+          rejectEarlyRequest(
+            req,
+            res,
+            405,
+            { 'Content-Type': 'application/json', Allow: 'POST' },
+            {
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Account rotation requires POST.' },
+            },
+          );
+          return;
+        }
+        const contentLength = req.headers['content-length'];
+        const bodyFree = (contentLength == null || contentLength === '0')
+          && req.headers['transfer-encoding'] == null;
+        if (!bodyFree) {
+          rejectEarlyRequest(req, res, 400, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Account rotation does not accept a body.' },
+          });
+          return;
+        }
+        const result = accountManager.rotateActiveAccount();
+        if (!result.rotated) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'no_alternative_account',
+              message: 'No alternate account is available.',
+            },
+          }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
         return;
       }
 

@@ -63,7 +63,14 @@ function classifyTranscriptLine(line) {
     return null;
   }
   if (!record?.isApiErrorMessage) return null;
-  const message = textBlocks(record.message?.content).join('\n');
+  const message = textBlocks(
+    typeof record.message === 'string' ? record.message : record.message?.content,
+  ).join('\n');
+  const normalizedMessage = message.trim().replace(/\s+/g, ' ');
+  if (record.error === 'authentication_failed'
+      && normalizedMessage === 'Login expired · Please run /login') {
+    return { kind: 'login_expired', record };
+  }
   if (record.error === 'server_error' && /request timed out/i.test(message)) {
     return { kind: 'timeout', record };
   }
@@ -372,6 +379,7 @@ export async function runClaudeWithRecovery({
   handoffRoot = join(homedir(), '.config', 'teamclaude-handoffs'),
   pollIntervalMs = 1000,
   fetchStatus,
+  recoverLoginExpired,
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
@@ -395,11 +403,13 @@ export async function runClaudeWithRecovery({
     ? Math.max(0, Math.floor(config.claudeAutoResumeBackoffMs))
     : 2000;
   let retries = 0;
+  let loginRecoveryUsed = false;
+  let nextEnv = childEnv;
 
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
     const offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
-    const child = spawnClaude(nextArgs, childEnv);
+    const child = spawnClaude(nextArgs, nextEnv);
     const outcome = await monitorChild({
       child,
       transcriptRoot,
@@ -413,6 +423,39 @@ export async function runClaudeWithRecovery({
 
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
+    if (outcome.event.kind === 'login_expired') {
+      if (config.autoResumeClaude !== true
+          || !sessionId
+          || maxRetries === 0
+          || loginRecoveryUsed
+          || typeof recoverLoginExpired !== 'function') {
+        log('[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
+        return childExit(child);
+      }
+
+      loginRecoveryUsed = true;
+      let recovery = null;
+      try {
+        recovery = await recoverLoginExpired({ sessionId, childEnv: nextEnv });
+      } catch {}
+      const recovered = recovery?.rotated === true
+        && typeof recovery.previousAccount === 'string'
+        && typeof recovery.currentAccount === 'string'
+        && recovery.previousAccount !== recovery.currentAccount
+        && recovery.childEnv
+        && typeof recovery.childEnv === 'object';
+      if (!recovered) {
+        log('[TeamClaude] Claude login expired; no alternate account is available. Run /login.');
+        return childExit(child);
+      }
+
+      log(`[TeamClaude] Claude login expired; switched account and resuming session ${sessionId}.`);
+      await stopChild(child);
+      nextArgs = ['--resume', sessionId, 'continue'];
+      nextEnv = recovery.childEnv;
+      continue;
+    }
+
     let status = null;
     try {
       status = await fetchStatus();

@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import {
+  appendFile,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -57,6 +65,22 @@ function overloadedRecord(cwd) {
   });
 }
 
+function authenticationRecord(cwd, text, nested = false) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    timestamp: new Date().toISOString(),
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    message: nested
+      ? {
+          role: 'assistant',
+          content: [{ type: 'text', text }],
+        }
+      : text,
+  });
+}
+
 function statusWithQuota(utilization) {
   return {
     switchThreshold: 0.98,
@@ -72,6 +96,278 @@ function statusWithQuota(utilization) {
     }],
   };
 }
+
+test('Login expired rotates first and resumes the same session once', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const sequence = [];
+  const calls = [];
+  let codexCalls = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: { INITIAL_ONLY: 'yes' },
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 3,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.98),
+    recoverLoginExpired: async () => {
+      sequence.push('rotate:start');
+      await Promise.resolve();
+      sequence.push('rotate:done');
+      return {
+        rotated: true,
+        previousAccount: 'account-a',
+        currentAccount: 'account-b',
+        childEnv: { RECOVERY_ONLY: 'yes' },
+      };
+    },
+    spawnClaude(args, env) {
+      const child = fakeChild(signal => sequence.push(`kill:${signal}`));
+      calls.push({ args: [...args], env: { ...env } });
+      sequence.push(`spawn:${calls.length}`);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        setTimeout(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          await writeFile(
+            join(dir, `${sessionId}.jsonl`),
+            `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+          );
+        }, 10);
+        setTimeout(() => child.finish(9), 80);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      codexCalls += 1;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0].args[calls[0].args.indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], {
+    args: ['--resume', sessionId, 'continue'],
+    env: { RECOVERY_ONLY: 'yes' },
+  });
+  assert.deepEqual(sequence, [
+    'spawn:1',
+    'rotate:start',
+    'rotate:done',
+    'kill:SIGTERM',
+    'spawn:2',
+  ]);
+  assert.equal(codexCalls, 0);
+});
+
+test('Login expired nested message is recovered but generic authentication_failed is ignored', async t => {
+  const cases = [
+    {
+      name: 'exact nested message',
+      message: 'Login expired · Please run /login',
+      nested: true,
+      expectedRecoveries: 1,
+      expectedSpawns: 2,
+    },
+    {
+      name: 'proxy fleet authentication failure',
+      message: 'All accounts failed authentication',
+      nested: true,
+      expectedRecoveries: 0,
+      expectedSpawns: 1,
+    },
+    {
+      name: 'generic re-login request',
+      message: 'Re-login required',
+      nested: false,
+      expectedRecoveries: 0,
+      expectedSpawns: 1,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-auth-kind-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      await mkdir(cwd);
+      let recoveries = 0;
+      let spawns = 0;
+      let kills = 0;
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs: [],
+        childEnv: {},
+        config: {
+          autoResumeClaude: true,
+          claudeAutoResumeMaxRetries: 1,
+          claudeAutoResumeBackoffMs: 0,
+        },
+        cwd,
+        transcriptRoot,
+        pollIntervalMs: 5,
+        fetchStatus: async () => statusWithQuota(0.5),
+        recoverLoginExpired: async () => {
+          recoveries += 1;
+          return {
+            rotated: true,
+            previousAccount: 'account-a',
+            currentAccount: 'account-b',
+            childEnv: { RECOVERY_ONLY: 'yes' },
+          };
+        },
+        spawnClaude(args) {
+          spawns += 1;
+          const child = fakeChild(() => {
+            kills += 1;
+          });
+          if (spawns === 1) {
+            const sessionId = args[args.indexOf('--session-id') + 1];
+            setTimeout(async () => {
+              const dir = join(transcriptRoot, 'project');
+              await mkdir(dir, { recursive: true });
+              await writeFile(
+                join(dir, `${sessionId}.jsonl`),
+                `${authenticationRecord(cwd, scenario.message, scenario.nested)}\n`,
+              );
+            }, 10);
+            setTimeout(() => child.finish(0), 60);
+          } else {
+            setTimeout(() => child.finish(0), 10);
+          }
+          return child;
+        },
+        launchCodex: async () => {
+          throw new Error('Authentication failures must not launch Codex');
+        },
+        log() {},
+      });
+
+      assert.equal(result.status, 0);
+      assert.equal(recoveries, scenario.expectedRecoveries);
+      assert.equal(spawns, scenario.expectedSpawns);
+      assert.equal(kills, scenario.expectedRecoveries);
+    });
+  }
+});
+
+test('Login expired recovery rejects repeated failures and disabled retry gates', async t => {
+  const cases = [
+    {
+      name: 'second Login expired',
+      config: {
+        autoResumeClaude: true,
+        claudeAutoResumeMaxRetries: 3,
+        claudeAutoResumeBackoffMs: 0,
+      },
+      emitOnSpawns: 2,
+      expectedRecoveries: 1,
+      expectedSpawns: 2,
+    },
+    {
+      name: 'auto resume disabled',
+      config: {
+        autoResumeClaude: false,
+        claudeAutoResumeMaxRetries: 3,
+        claudeAutoResumeBackoffMs: 0,
+      },
+      emitOnSpawns: 1,
+      expectedRecoveries: 0,
+      expectedSpawns: 1,
+    },
+    {
+      name: 'zero retry budget',
+      config: {
+        autoResumeClaude: true,
+        claudeAutoResumeMaxRetries: 0,
+        claudeAutoResumeBackoffMs: 0,
+      },
+      emitOnSpawns: 1,
+      expectedRecoveries: 0,
+      expectedSpawns: 1,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-bound-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      await mkdir(cwd);
+      let recoveries = 0;
+      let spawns = 0;
+      let kills = 0;
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs: [],
+        childEnv: {},
+        config: scenario.config,
+        cwd,
+        transcriptRoot,
+        pollIntervalMs: 5,
+        fetchStatus: async () => statusWithQuota(0.5),
+        recoverLoginExpired: async () => {
+          recoveries += 1;
+          return {
+            rotated: true,
+            previousAccount: 'account-a',
+            currentAccount: 'account-b',
+            childEnv: { RECOVERY_ONLY: 'yes' },
+          };
+        },
+        spawnClaude(args) {
+          spawns += 1;
+          const child = fakeChild(() => {
+            kills += 1;
+          });
+          const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+          const sessionId = args[args.indexOf(selector) + 1];
+          if (spawns <= scenario.emitOnSpawns) {
+            setTimeout(async () => {
+              const dir = join(transcriptRoot, 'project');
+              await mkdir(dir, { recursive: true });
+              await appendFile(
+                join(dir, `${sessionId}.jsonl`),
+                `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+              );
+            }, 10);
+          }
+          setTimeout(() => child.finish(spawns === 1 ? 9 : 17), 60);
+          return child;
+        },
+        launchCodex: async () => {
+          throw new Error('Login expired must not launch Codex');
+        },
+        log() {},
+      });
+
+      assert.equal(
+        result.status,
+        scenario.expectedSpawns === 2 ? 17 : 9,
+      );
+      assert.equal(recoveries, scenario.expectedRecoveries);
+      assert.equal(spawns, scenario.expectedSpawns);
+      assert.equal(kills, scenario.expectedRecoveries);
+    });
+  }
+});
 
 test('timeout with general Claude quota remaining resumes the same session once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-resume-'));

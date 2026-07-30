@@ -410,6 +410,66 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
   }
 });
 
+test('supervisor rejects remote account rotation even with a valid proxy API key', {
+  timeout: 15000,
+}, async t => {
+  const host = externalIPv4();
+  if (!host) {
+    t.skip('no non-loopback IPv4 interface is available');
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-rotate-auth-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-remote-rotate' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [
+      { name: 'account-a', type: 'apikey', apiKey: 'fixture-a' },
+      { name: 'account-b', type: 'apikey', apiKey: 'fixture-b' },
+    ],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const before = await request({
+      host,
+      port,
+      path: '/teamclaude/status',
+      headers: { 'x-api-key': 'tc-remote-rotate' },
+    });
+    const beforeAccount = JSON.parse(before.body).currentAccount;
+
+    const blocked = await request({
+      host,
+      port,
+      path: '/teamclaude/rotate',
+      method: 'POST',
+      headers: { 'x-api-key': 'tc-remote-rotate' },
+    });
+
+    const after = await request({
+      host,
+      port,
+      path: '/teamclaude/status',
+      headers: { 'x-api-key': 'tc-remote-rotate' },
+    });
+    assert.equal(blocked.status, 403);
+    assert.equal(JSON.parse(blocked.body).error.type, 'permission_error');
+    assert.equal(JSON.parse(after.body).currentAccount, beforeAccount);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor preserves worker session affinity for a public keep-alive connection', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-affinity-'));
   const configPath = join(dir, 'config.json');

@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdtemp } from 'node:fs/promises';
 
 const entry = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.js');
 
@@ -39,6 +45,139 @@ async function jsonLines(path) {
   const raw = await readFile(path, 'utf8').catch(() => '');
   return raw.split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
+
+test('real run Login expired rotates first and resumes the same session with recovery auth', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-login-recovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, 'bin');
+  const project = join(root, 'project');
+  const configPath = join(root, 'config.json');
+  const claudeCalls = join(root, 'claude-calls.jsonl');
+  await mkdir(bin);
+  await mkdir(project);
+
+  const fakeClaude = `#!/usr/bin/env node
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
+  args,
+  oauthPresent: typeof process.env.CLAUDE_CODE_OAUTH_TOKEN === 'string',
+  apiKeyPresent: typeof process.env.ANTHROPIC_API_KEY === 'string',
+  authTokenPresent: typeof process.env.ANTHROPIC_AUTH_TOKEN === 'string',
+}) + '\\n');
+const sessionFlag = args.indexOf('--session-id');
+if (sessionFlag >= 0) {
+  const sessionId = args[sessionFlag + 1];
+  const dir = join(process.env.HOME, '.claude', 'projects', 'fake');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, sessionId + '.jsonl'), JSON.stringify({
+    type: 'assistant',
+    cwd: process.cwd(),
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    message: 'Login expired · Please run /login',
+  }) + '\\n');
+  process.on('SIGTERM', () => process.exit(0));
+  setTimeout(() => process.exit(9), 3000);
+  setInterval(() => {}, 1000);
+} else {
+  setTimeout(() => process.exit(
+    process.env.CLAUDE_CODE_OAUTH_TOKEN ? 0 : 42
+  ), 20);
+}
+`;
+  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+
+  let currentAccount = 'account-a';
+  let rotateCalls = 0;
+  const controlServer = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        switchThreshold: 0.98,
+        currentAccount,
+        accounts: [
+          { name: 'account-a', enabled: true, status: 'active', quota: {} },
+          { name: 'account-b', enabled: true, status: 'active', quota: {} },
+        ],
+      }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/teamclaude/rotate') {
+      if (req.headers['x-api-key'] !== 'fixture-proxy-key') {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error' },
+        }));
+        return;
+      }
+      rotateCalls += 1;
+      currentAccount = 'account-b';
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        rotated: true,
+        previousAccount: 'account-a',
+        currentAccount,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const port = await listen(controlServer);
+  t.after(() => {
+    controlServer.closeAllConnections();
+    return new Promise(resolve => controlServer.close(resolve));
+  });
+
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'fixture-proxy-key' },
+    autoResumeClaude: true,
+    claudeAutoResumeMaxRetries: 3,
+    claudeAutoResumeBackoffMs: 0,
+    codexFallbackOnExhaustion: false,
+    accounts: [],
+  }));
+  const env = {
+    ...process.env,
+    HOME: root,
+    PATH: `${bin}:${process.env.PATH}`,
+    TEAMCLAUDE_CONFIG: configPath,
+    FAKE_CLAUDE_CALLS: claudeCalls,
+    ANTHROPIC_API_KEY: 'must-not-reach-child',
+    ANTHROPIC_AUTH_TOKEN: 'must-not-reach-child',
+  };
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.CLAUDE_CONFIG_DIR;
+
+  const result = await runCli(['run'], {
+    cwd: project,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const calls = await jsonLines(claudeCalls);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(rotateCalls, 1);
+  assert.equal(currentAccount, 'account-b');
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0].args[calls[0].args.indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1].args, ['--resume', sessionId, 'continue']);
+  assert.deepEqual(
+    calls.map(call => ({
+      oauthPresent: call.oauthPresent,
+      apiKeyPresent: call.apiKeyPresent,
+      authTokenPresent: call.authTokenPresent,
+    })),
+    [
+      { oauthPresent: false, apiKeyPresent: false, authTokenPresent: false },
+      { oauthPresent: true, apiKeyPresent: false, authTokenPresent: false },
+    ],
+  );
+  assert.doesNotMatch(result.stdout + result.stderr, /fixture-proxy-key|must-not-reach-child/);
+});
 
 test('real run command isolates ambiguous sessions, resumes Claude, then hands off once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-recovery-'));

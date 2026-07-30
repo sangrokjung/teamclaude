@@ -155,6 +155,60 @@ test('returns null when every account is exhausted (not yet reset)', () => {
   assert.equal(am.getActiveAccount(), null);
 });
 
+test('rotateActiveAccount switches to another available account without exposing credentials', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.currentIndex = 0;
+
+  const result = am.rotateActiveAccount();
+
+  assert.deepEqual(result, {
+    rotated: true,
+    previousAccount: 'acct-0',
+    currentAccount: 'acct-1',
+  });
+  assert.equal(am.currentIndex, 1);
+  assert.deepEqual(Object.keys(result).sort(), [
+    'currentAccount',
+    'previousAccount',
+    'rotated',
+  ]);
+});
+
+test('rotateActiveAccount skips disabled, errored, and quota-blocked alternatives', () => {
+  const accounts = makeAccounts(5);
+  accounts[1].enabled = false;
+  const am = new AccountManager(accounts, 0.98, 0);
+  am.currentIndex = 0;
+  am.accounts[2].status = 'error';
+  setSession(am, 3, 0.99, 30 * MIN);
+  setSession(am, 4, 0.2, 30 * MIN);
+
+  const result = am.rotateActiveAccount();
+
+  assert.equal(result.rotated, true);
+  assert.equal(result.currentAccount, 'acct-4');
+  assert.equal(am.currentIndex, 4);
+});
+
+test('rotateActiveAccount leaves state unchanged when no alternative is usable', () => {
+  const accounts = makeAccounts(2);
+  accounts[1].enabled = false;
+  const inputBefore = structuredClone(accounts);
+  const am = new AccountManager(accounts, 0.98, 0);
+  am.currentIndex = 0;
+  am.lastEvalAt = 12345;
+
+  const result = am.rotateActiveAccount();
+
+  assert.deepEqual(result, {
+    rotated: false,
+    reason: 'no-alternative-account',
+  });
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.lastEvalAt, 12345);
+  assert.deepEqual(accounts, inputBefore);
+});
+
 // Measure an account the way a real upstream response would (populates quota + totalRequests).
 function measure(am, idx, util5h, resetInMs, now = Date.now()) {
   am.updateQuota(idx, {

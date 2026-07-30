@@ -21,6 +21,7 @@ import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
+import { buildClaudeRecoveryEnv } from './claude-auth.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -229,6 +230,13 @@ async function superviseServerCommand() {
     const isLocal = remoteAddr === '127.0.0.1'
       || remoteAddr === '::1'
       || remoteAddr === '::ffff:127.0.0.1';
+    if (req.url === '/teamclaude/rotate' && !isLocal) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Account rotation is local-only.' },
+      });
+      return;
+    }
     if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
       && bearerKey !== config.proxy.apiKey && !isLocal) {
       rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
@@ -1625,6 +1633,33 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+async function recoverExpiredClaudeLogin(config, childEnv) {
+  const response = await fetch(
+    `http://127.0.0.1:${config.proxy.port}/teamclaude/rotate`,
+    {
+      method: 'POST',
+      headers: config.proxy.apiKey
+        ? { 'x-api-key': config.proxy.apiKey }
+        : undefined,
+      signal: AbortSignal.timeout(1500),
+    },
+  );
+  if (!response.ok) return null;
+  const result = await response.json().catch(() => null);
+  if (result?.rotated !== true
+      || typeof result.previousAccount !== 'string'
+      || typeof result.currentAccount !== 'string'
+      || result.previousAccount === result.currentAccount) {
+    return null;
+  }
+  return {
+    rotated: true,
+    previousAccount: result.previousAccount,
+    currentAccount: result.currentAccount,
+    childEnv: buildClaudeRecoveryEnv(childEnv),
+  };
+}
+
 function propagateChildExit(result) {
   if (result.signal) {
     process.kill(process.pid, result.signal);
@@ -1689,6 +1724,8 @@ async function runCommand() {
         if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
         return response.json();
       },
+      recoverLoginExpired: ({ childEnv: recoveryEnv }) =>
+        recoverExpiredClaudeLogin(config, recoveryEnv),
       spawnClaude: (recoveryArgs, recoveryEnv) => spawn('claude', recoveryArgs, {
         stdio: 'inherit',
         env: recoveryEnv,

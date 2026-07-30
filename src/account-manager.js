@@ -208,6 +208,27 @@ export class AccountManager {
     return current;
   }
 
+  /**
+   * Move the sticky primary to a different currently-available account without
+   * changing persisted priority/enabled settings. Used by local recovery
+   * control paths that must abandon the current account before retrying.
+   */
+  rotateActiveAccount(model = null) {
+    const current = this.accounts[this.currentIndex] || null;
+    const exclude = current ? new Set([current]) : null;
+    const next = this._selectBest(exclude, model);
+    if (!next || next === current) {
+      return { rotated: false, reason: 'no-alternative-account' };
+    }
+    this.currentIndex = next.index;
+    this.lastEvalAt = Date.now();
+    return {
+      rotated: true,
+      previousAccount: current?.name || null,
+      currentAccount: next.name,
+    };
+  }
+
   // ── Concurrency layer: per-account in-flight cap + overflow queue ──────────
   //
   // getActiveAccount() above picks ONE account (sticky, use-or-lose). On its own
