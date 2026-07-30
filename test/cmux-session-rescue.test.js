@@ -239,6 +239,33 @@ test('does not replay an ambiguous recovery workspace launch', async t => {
   assert.deepEqual(second, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
 });
 
+test('does not resume the same session again after its PID changes', async t => {
+  const fx = await fixture(t);
+  let launches = 0;
+  const attempted = new Set();
+  const options = {
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
+    inspectProcess: async pid => processInfo(fx, {
+      processIdentity: `${pid}:Mon Jul 30 23:00:00 2026`,
+    }),
+    launchRecoveryWorkspace: async () => {
+      launches += 1;
+      throw new Error('cmux result lost');
+    },
+  };
+
+  await rescueCmuxSessionsOnce(options);
+  fx.session.pid = 23456;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await rescueCmuxSessionsOnce(options);
+
+  assert.equal(launches, 1);
+});
+
 test('rejects process identity or active mapping changes before workspace launch', async t => {
   await t.test('process identity changed', async t => {
     const fx = await fixture(t);
@@ -265,6 +292,26 @@ test('rejects process identity or active mapping changes before workspace launch
     let launches = 0;
     const changed = structuredClone(fx.store);
     changed.activeSessionsBySurface[SURFACE_ID].sessionId = OTHER_SESSION_ID;
+    await rescueCmuxSessionsOnce({
+      storePath: fx.storePath,
+      transcriptRoot: fx.transcriptRoot,
+      nodePath: '/usr/local/bin/node',
+      scriptPath: '/opt/teamclaude/src/index.js',
+      readStore: async () => (++reads >= 3 ? changed : fx.store),
+      inspectProcess: async () => processInfo(fx),
+      launchRecoveryWorkspace: async () => {
+        launches += 1;
+      },
+    });
+    assert.equal(launches, 0);
+  });
+
+  await t.test('workspace changed', async t => {
+    const fx = await fixture(t);
+    let reads = 0;
+    let launches = 0;
+    const changed = structuredClone(fx.store);
+    changed.sessions[SESSION_ID].workspaceId = '55555555-5555-4555-8555-555555555555';
     await rescueCmuxSessionsOnce({
       storePath: fx.storePath,
       transcriptRoot: fx.transcriptRoot,

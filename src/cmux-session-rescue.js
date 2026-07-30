@@ -232,7 +232,7 @@ export async function rescueCmuxSessionsOnce({
       session.sessionId,
     )) continue;
     candidates += 1;
-    const key = `${session.sessionId}:${session.pid}`;
+    const key = session.sessionId;
     if (attempted.has(key)) continue;
 
     let freshStore;
@@ -242,7 +242,10 @@ export async function rescueCmuxSessionsOnce({
       continue;
     }
     const fresh = sessions(freshStore).find(item => item?.sessionId === session.sessionId);
-    if (!fresh || fresh.pid !== session.pid || !validSession(freshStore, fresh)) continue;
+    if (!fresh
+        || fresh.pid !== session.pid
+        || fresh.workspaceId !== session.workspaceId
+        || !validSession(freshStore, fresh)) continue;
     if (!await hasUnresolvedLoginExpired(
       fresh.transcriptPath,
       transcriptRoot,
@@ -261,7 +264,10 @@ export async function rescueCmuxSessionsOnce({
       continue;
     }
     const final = sessions(finalStore).find(item => item?.sessionId === fresh.sessionId);
-    if (!final || final.pid !== fresh.pid || !validSession(finalStore, final)) continue;
+    if (!final
+        || final.pid !== fresh.pid
+        || final.workspaceId !== fresh.workspaceId
+        || !validSession(finalStore, final)) continue;
     if (!await hasUnresolvedLoginExpired(
       final.transcriptPath,
       transcriptRoot,
