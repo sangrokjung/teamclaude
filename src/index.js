@@ -26,6 +26,10 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
+import {
+  createCmuxSessionRescuer,
+  defaultCmuxRescuePaths,
+} from './cmux-session-rescue.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -214,6 +218,7 @@ async function superviseServerCommand() {
   let healthInFlight = false;
   let healthFailures = 0;
   let forceTimer = null;
+  let sessionRescuer = null;
   let finish;
 
   function rejectPublicRequest(req, res, statusCode, headers, payload) {
@@ -748,6 +753,18 @@ async function superviseServerCommand() {
       clearTimeout(stableTimer);
       stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
       stableTimer.unref?.();
+      if (!sessionRescuer && !isCodexMode(config) && config.cmuxSessionRescue === true) {
+        sessionRescuer = createCmuxSessionRescuer({
+          enabled: true,
+          ready: () => workerReady && !stopping,
+          intervalMs: config.cmuxSessionRescueIntervalMs,
+          ...defaultCmuxRescuePaths(),
+          nodePath: process.execPath,
+          scriptPath: process.argv[1],
+          configPath: getConfigPath(),
+        });
+        sessionRescuer.start();
+      }
       wakeWorkerWaiters();
     });
 
@@ -838,6 +855,7 @@ async function superviseServerCommand() {
     clearTimeout(restartTimer);
     clearTimeout(stableTimer);
     clearInterval(healthTimer);
+    sessionRescuer?.stop();
     closePublicListener();
     if (!worker) {
       finish(0);
@@ -856,6 +874,7 @@ async function superviseServerCommand() {
       clearTimeout(stableTimer);
       clearInterval(healthTimer);
       clearTimeout(forceTimer);
+      sessionRescuer?.stop();
       resolve(code);
     };
     // Drop the bind-time diagnosis once we own the port. Left attached, any
@@ -1729,6 +1748,7 @@ async function runCommand() {
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
+  childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
   await syncLaunchModel(config, clientArgs, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth

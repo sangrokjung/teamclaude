@@ -65,6 +65,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   oauthPresent: typeof process.env.CLAUDE_CODE_OAUTH_TOKEN === 'string',
   apiKeyPresent: typeof process.env.ANTHROPIC_API_KEY === 'string',
   authTokenPresent: typeof process.env.ANTHROPIC_AUTH_TOKEN === 'string',
+  supervised: process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1',
 }) + '\\n');
 const sessionFlag = args.indexOf('--session-id');
 if (sessionFlag >= 0) {
@@ -171,10 +172,21 @@ if (sessionFlag >= 0) {
       oauthPresent: call.oauthPresent,
       apiKeyPresent: call.apiKeyPresent,
       authTokenPresent: call.authTokenPresent,
+      supervised: call.supervised,
     })),
     [
-      { oauthPresent: false, apiKeyPresent: false, authTokenPresent: false },
-      { oauthPresent: true, apiKeyPresent: false, authTokenPresent: false },
+      {
+        oauthPresent: false,
+        apiKeyPresent: false,
+        authTokenPresent: false,
+        supervised: true,
+      },
+      {
+        oauthPresent: true,
+        apiKeyPresent: false,
+        authTokenPresent: false,
+        supervised: true,
+      },
     ],
   );
   assert.doesNotMatch(result.stdout + result.stderr, /fixture-proxy-key|must-not-reach-child/);

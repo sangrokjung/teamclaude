@@ -31,6 +31,8 @@
   "claudeAutoResumeMaxRetries": 3,
   "claudeAutoResumeBackoffMs": 2000,
   "codexFallbackOnExhaustion": false,
+  "cmuxSessionRescue": false,
+  "cmuxSessionRescueIntervalMs": 1000,
   "accounts": [
     {
       "name": "primary-max",

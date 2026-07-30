@@ -367,6 +367,8 @@ export function createDefaultConfig() {
     claudeAutoResumeMaxRetries: 3,
     claudeAutoResumeBackoffMs: 2000,
     codexFallbackOnExhaustion: false,
+    cmuxSessionRescue: false,
+    cmuxSessionRescueIntervalMs: 1000,
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

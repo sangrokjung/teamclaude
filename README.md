@@ -400,6 +400,14 @@ an explicit session ID and watches only that transcript for terminal API errors.
 as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
 interactive session does not wait indefinitely at the prompt for a person.
 
+Existing Claude processes cannot acquire a recovery parent retroactively.
+On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
+cmux's session registry for an unresolved `Login expired` event. It relaunches
+only an active surface whose session ID, live process, executable, cmux surface,
+working directory, and transcript root all still match. Stale or already
+supervised records fail closed. This option is off by default because it can
+terminate and replace an affected Claude process in its existing terminal.
+
 `codexFallbackOnExhaustion: true` additionally hands the conversation to TeamCodex
 only when every enabled Claude account has a fresh, finite general quota window
 at or above `switchThreshold`. A Fable-only `7d_oi` exhaustion, a transient queue,
@@ -603,6 +611,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when every enabled Claude account has fresh general-quota exhaustion evidence (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions that are already blocked on `Login expired`; matching PID/executable/surface/cwd/transcript are required (optional, default `false`) |
+| `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)
 
