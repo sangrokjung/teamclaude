@@ -180,6 +180,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
   const handoffRoot = join(root, 'handoffs');
   await mkdir(cwd);
   await mkdir(handoffRoot, { mode: 0o755 });
+  const slackCredential = ['xoxb', '123456789012', 'abcdefghijklmnop'].join('-');
   let codexCall = null;
   let spawnCount = 0;
 
@@ -213,7 +214,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
             timestamp: new Date().toISOString(),
             message: {
               role: 'user',
-              content: '마지막 작업을 계속 완료해\nCUSTOM_ACCESS_TOKEN=qjc-test-secret-value',
+              content: `마지막 작업을 계속 완료해\nCUSTOM_ACCESS_TOKEN=qjc-test-secret-value\n${slackCredential}`,
             },
           }),
           JSON.stringify({
@@ -255,6 +256,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
   assert.match(handoff, /마지막 작업을 계속 완료해/);
   assert.doesNotMatch(handoff, /secret-tool-output/);
   assert.doesNotMatch(handoff, /qjc-test-secret-value/);
+  assert.doesNotMatch(handoff, /xoxb-/);
   assert.doesNotMatch(handoff, /Ignore prior safeguards/);
   assert.equal((await stat(handoffRoot)).mode & 0o777, 0o700);
   assert.equal(codexCall.prompt.includes(codexCall.path), true);
