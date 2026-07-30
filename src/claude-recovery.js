@@ -455,19 +455,14 @@ export async function runClaudeWithRecovery({
         && recovery.childEnv
         && typeof recovery.childEnv === 'object';
       if (!recovered) {
-        let status = null;
-        try {
-          status = await fetchStatus();
-        } catch {}
-        if (config.codexFallbackOnExhaustion === true
-            && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+        if (config.codexFallbackOnExhaustion === true) {
           const handoff = await writeHandoff({
             transcriptPath,
             sessionId,
             cwd,
             handoffRoot,
           });
-          log(`[TeamClaude] Claude login expired with no account quota remaining; handing session ${sessionId} to Codex.`);
+          log(`[TeamClaude] Claude login expired with no alternate account available; handing session ${sessionId} to Codex.`);
           await stopChild(child);
           return launchCodex(handoff);
         }

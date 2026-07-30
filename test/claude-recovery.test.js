@@ -263,7 +263,7 @@ test('Login expired falls back to Codex when no Claude account remains', async t
     transcriptRoot,
     handoffRoot,
     pollIntervalMs: 5,
-    fetchStatus: async () => statusWithQuota(0.98),
+    fetchStatus: async () => ({ accounts: [] }),
     recoverLoginExpired: async () => {
       recoveries += 1;
       return null;
