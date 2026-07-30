@@ -266,7 +266,7 @@ test('Login expired falls back to Codex when no Claude account remains', async t
     fetchStatus: async () => ({ accounts: [] }),
     recoverLoginExpired: async () => {
       recoveries += 1;
-      return null;
+      return { rotated: false, reason: 'no-alternative-account' };
     },
     spawnClaude(args) {
       spawns += 1;
@@ -433,6 +433,20 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
       expectedRecoveries: 0,
       expectedSpawns: 1,
     },
+    {
+      name: 'transient account rotation failure',
+      config: {
+        autoResumeClaude: true,
+        claudeAutoResumeMaxRetries: 3,
+        claudeAutoResumeBackoffMs: 0,
+        codexFallbackOnExhaustion: true,
+      },
+      emitOnSpawns: 1,
+      expectedRecoveries: 1,
+      expectedSpawns: 1,
+      expectedKills: 0,
+      recoverThrows: true,
+    },
   ];
 
   for (const scenario of cases) {
@@ -441,6 +455,7 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
       t.after(() => rm(root, { recursive: true, force: true }));
       const cwd = join(root, 'project');
       const transcriptRoot = join(root, 'transcripts');
+      const handoffRoot = join(root, 'handoffs');
       await mkdir(cwd);
       let recoveries = 0;
       let spawns = 0;
@@ -452,10 +467,12 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
         config: scenario.config,
         cwd,
         transcriptRoot,
+        handoffRoot,
         pollIntervalMs: 5,
         fetchStatus: async () => statusWithQuota(0.5),
         recoverLoginExpired: async () => {
           recoveries += 1;
+          if (scenario.recoverThrows) throw new Error('rotation request timed out');
           return {
             rotated: true,
             previousAccount: 'account-a',
@@ -495,7 +512,7 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
       );
       assert.equal(recoveries, scenario.expectedRecoveries);
       assert.equal(spawns, scenario.expectedSpawns);
-      assert.equal(kills, scenario.expectedRecoveries);
+      assert.equal(kills, scenario.expectedKills ?? scenario.expectedRecoveries);
     });
   }
 });

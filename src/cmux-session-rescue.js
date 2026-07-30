@@ -242,9 +242,9 @@ export async function rescueCmuxSessionsOnce({
       scriptPath,
       configPath,
     });
+    attempted.add(key);
     try {
       await respawnSurface({ surfaceId: final.surfaceId, command });
-      attempted.add(key);
       rescued += 1;
     } catch {
       failed += 1;
@@ -275,7 +275,7 @@ export function createCmuxSessionRescuer({
           log(`[TeamClaude] Rescued ${result.rescued} blocked Claude session(s) under recovery supervision.`);
         }
         if (result.failed > 0) {
-          log(`[TeamClaude] Failed to relaunch ${result.failed} blocked Claude session(s) in cmux.`);
+          log(`[TeamClaude] Cmux respawn was uncertain for ${result.failed} blocked Claude session(s); not replaying in this supervisor run.`);
         }
         return result;
       })

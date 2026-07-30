@@ -404,15 +404,20 @@ Existing Claude processes cannot acquire a recovery parent retroactively.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
 cmux's session registry for an unresolved `Login expired` event. It relaunches
 only an active surface whose session ID, live process, executable, cmux surface,
-working directory, and transcript root all still match. Stale or already
-supervised records fail closed. This option is off by default because it can
-terminate and replace an affected Claude process in its existing terminal.
+process start identity, working directory, and transcript root all still match.
+Stale or already supervised records fail closed. After a final registry and
+process recheck, one `cmux respawn-pane` operation replaces the blocked process
+with a supervised resume. An uncertain respawn result is not replayed again
+during that supervisor run. This option is off by default because it can replace
+an affected Claude process in its existing terminal.
 
 `codexFallbackOnExhaustion: true` additionally hands the conversation to TeamCodex
-only when every enabled Claude account has a fresh, finite general quota window
-at or above `switchThreshold`. A Fable-only `7d_oi` exhaustion, a transient queue,
-or unknown/partial quota evidence cannot trigger the provider switch. The launcher
-writes a credential-protected, provider-neutral transcript summary under
+when an exact expired-login recovery receives a confirmed `no_alternative_account`
+response, or when every enabled Claude account has a fresh, finite general quota
+window at or above `switchThreshold`. A transient rotation failure, Fable-only
+`7d_oi` exhaustion, transient queue, or unknown/partial quota evidence cannot
+trigger the provider switch. The launcher writes a credential-protected,
+provider-neutral transcript summary under
 `~/.config/teamclaude-handoffs/`, stops the Claude child, and starts one Codex CLI
 with that handoff. Tool inputs and tool results are excluded from the handoff.
 When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
@@ -610,7 +615,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload errors (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
-| `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when every enabled Claude account has fresh general-quota exhaustion evidence (optional, default `false`) |
+| `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
 | `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions that are already blocked on `Login expired`; matching PID/executable/surface/cwd/transcript are required (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 

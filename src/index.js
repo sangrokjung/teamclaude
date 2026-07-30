@@ -1683,14 +1683,18 @@ async function recoverExpiredClaudeLogin(config, childEnv) {
       signal: AbortSignal.timeout(1500),
     },
   );
-  if (!response.ok) return null;
   const result = await response.json().catch(() => null);
+  if (response.status === 409
+      && result?.error?.type === 'no_alternative_account') {
+    return { rotated: false, reason: 'no-alternative-account' };
+  }
+  if (!response.ok) return { rotated: false, reason: 'rotation-unavailable' };
   if (result?.rotated !== true
       || typeof result.previousAccount !== 'string'
       || typeof result.currentAccount !== 'string'
       || typeof result.currentAccountUuid !== 'string'
       || result.previousAccount === result.currentAccount) {
-    return null;
+    return { rotated: false, reason: 'rotation-unavailable' };
   }
   return {
     rotated: true,

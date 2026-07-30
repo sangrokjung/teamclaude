@@ -455,20 +455,41 @@ export async function runClaudeWithRecovery({
         && recovery.childEnv
         && typeof recovery.childEnv === 'object';
       if (!recovered) {
-        if (config.codexFallbackOnExhaustion === true) {
+        const noAlternate = recovery?.rotated === false
+          && recovery?.reason === 'no-alternative-account';
+        let fleetExhausted = false;
+        if (!noAlternate) {
+          let status = null;
+          try {
+            status = await fetchStatus();
+          } catch {}
+          fleetExhausted = isClaudeFleetExhausted(
+            status,
+            config.switchThreshold ?? 0.98,
+          );
+        }
+        if (config.codexFallbackOnExhaustion === true
+            && (noAlternate || fleetExhausted)) {
           const handoff = await writeHandoff({
             transcriptPath,
             sessionId,
             cwd,
             handoffRoot,
           });
-          log(`[TeamClaude] Claude login expired with no alternate account available; handing session ${sessionId} to Codex.`);
+          const reason = noAlternate
+            ? 'no alternate account is available'
+            : 'the Claude account fleet is quota exhausted';
+          log(`[TeamClaude] Claude login expired and ${reason}; handing session ${sessionId} to Codex.`);
           await stopChild(child);
           return launchCodex(handoff);
         }
-        log(canRecover
-          ? '[TeamClaude] Claude login expired; no alternate account is available. Run /login.'
-          : '[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
+        if (noAlternate) {
+          log('[TeamClaude] Claude login expired; no alternate account is available. Run /login.');
+        } else if (canRecover) {
+          log('[TeamClaude] Claude login expired; account rotation could not be confirmed, so the provider was not switched.');
+        } else {
+          log('[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
+        }
         return childExit(child);
       }
 

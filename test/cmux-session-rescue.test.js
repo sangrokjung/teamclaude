@@ -204,30 +204,31 @@ test('coalesces concurrent rescue scans and never adopts the same process twice'
 test('keeps the blocked process intact when atomic cmux respawn fails', async t => {
   const fx = await fixture(t);
   let respawns = 0;
-  const result = await rescueCmuxSessionsOnce({
+  const attempted = new Set();
+  const options = {
     storePath: fx.storePath,
     transcriptRoot: fx.transcriptRoot,
     nodePath: '/usr/local/bin/node',
     scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
     inspectProcess: async () => processInfo(fx),
-    terminateProcess: async () => {
-      throw new Error('must not terminate separately');
-    },
     respawnSurface: async () => {
       respawns += 1;
       throw new Error('cmux unavailable');
     },
-  });
+  };
+  const first = await rescueCmuxSessionsOnce(options);
+  const second = await rescueCmuxSessionsOnce(options);
 
   assert.equal(respawns, 1);
-  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.deepEqual(first, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.deepEqual(second, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
 });
 
 test('rejects process identity or active mapping changes before atomic respawn', async t => {
   await t.test('process identity changed', async t => {
     const fx = await fixture(t);
     let inspections = 0;
-    let legacyTerminations = 0;
     let respawns = 0;
     await rescueCmuxSessionsOnce({
       storePath: fx.storePath,
@@ -237,22 +238,16 @@ test('rejects process identity or active mapping changes before atomic respawn',
       inspectProcess: async () => processInfo(fx, {
         processIdentity: inspections++ === 0 ? '12345:first' : '12345:reused',
       }),
-      terminateProcess: async () => {
-        legacyTerminations += 1;
-        return true;
-      },
       respawnSurface: async () => {
         respawns += 1;
       },
     });
-    assert.equal(legacyTerminations, 0);
     assert.equal(respawns, 0);
   });
 
   await t.test('active surface mapping changed', async t => {
     const fx = await fixture(t);
     let reads = 0;
-    let legacyTerminations = 0;
     let respawns = 0;
     const changed = structuredClone(fx.store);
     changed.activeSessionsBySurface[SURFACE_ID].sessionId = OTHER_SESSION_ID;
@@ -263,15 +258,10 @@ test('rejects process identity or active mapping changes before atomic respawn',
       scriptPath: '/opt/teamclaude/src/index.js',
       readStore: async () => (++reads >= 3 ? changed : fx.store),
       inspectProcess: async () => processInfo(fx),
-      terminateProcess: async () => {
-        legacyTerminations += 1;
-        return true;
-      },
       respawnSurface: async () => {
         respawns += 1;
       },
     });
-    assert.equal(legacyTerminations, 0);
     assert.equal(respawns, 0);
   });
 });
