@@ -209,6 +209,40 @@ test('rotateActiveAccount leaves state unchanged when no alternative is usable',
   assert.deepEqual(accounts, inputBefore);
 });
 
+test('a preferred recovery account survives concurrent global rotations and warm-up', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.currentIndex = 0;
+
+  const firstRecovery = am.rotateActiveAccount();
+  const secondRecovery = am.rotateActiveAccount();
+
+  assert.equal(firstRecovery.currentAccount, 'acct-1');
+  assert.equal(secondRecovery.currentAccount, 'acct-0');
+  assert.equal(am.currentIndex, 0);
+
+  const first = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    firstRecovery.currentAccount,
+  );
+  assert.equal(first?.name, 'acct-1');
+  am.releaseAccount(first);
+
+  const second = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    secondRecovery.currentAccount,
+  );
+  assert.equal(second?.name, 'acct-0');
+  am.releaseAccount(second);
+});
+
 // Measure an account the way a real upstream response would (populates quota + totalRequests).
 function measure(am, idx, util5h, resetInMs, now = Date.now()) {
   am.updateQuota(idx, {

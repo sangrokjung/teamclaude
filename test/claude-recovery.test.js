@@ -175,6 +175,68 @@ test('Login expired rotates first and resumes the same session once', async t =>
   assert.equal(codexCalls, 0);
 });
 
+test('Login expired written immediately before child exit is still recovered', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-exit-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  let recoveries = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 100,
+    fetchStatus: async () => statusWithQuota(0.5),
+    recoverLoginExpired: async () => {
+      recoveries += 1;
+      return {
+        rotated: true,
+        previousAccount: 'account-a',
+        currentAccount: 'account-b',
+        childEnv: { RECOVERY_ONLY: 'yes' },
+      };
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        setImmediate(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          await writeFile(
+            join(dir, `${sessionId}.jsonl`),
+            `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+          );
+          child.finish(9);
+        });
+      } else {
+        setImmediate(() => child.finish(0));
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('Login expired must not launch Codex');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(recoveries, 1);
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
+});
+
 test('Login expired nested message is recovered but generic authentication_failed is ignored', async t => {
   const cases = [
     {

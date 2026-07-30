@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
@@ -454,6 +455,21 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
       method: 'POST',
       headers: { 'x-api-key': 'tc-remote-rotate' },
     });
+    const recoveryEnv = buildClaudeRecoveryEnv({
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+    }, 'account-b');
+    const blockedRecoveryRoute = await request({
+      host,
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': 'tc-remote-rotate',
+        authorization: `Bearer ${recoveryEnv.CLAUDE_CODE_OAUTH_TOKEN}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+    });
 
     const after = await request({
       host,
@@ -463,6 +479,7 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
     });
     assert.equal(blocked.status, 403);
     assert.equal(JSON.parse(blocked.body).error.type, 'permission_error');
+    assert.equal(blockedRecoveryRoute.status, 403);
     assert.equal(JSON.parse(after.body).currentAccount, beforeAccount);
   } finally {
     await stopChild(child);

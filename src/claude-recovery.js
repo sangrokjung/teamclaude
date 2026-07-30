@@ -319,54 +319,66 @@ async function monitorChild({
   let currentOffset = offset;
   let pending = '';
 
-  while (true) {
-    const winner = await Promise.race([
-      exited,
-      delay(pollIntervalMs).then(() => ({ type: 'poll' })),
-    ]);
-    if (winner.type === 'exit') return winner;
-
+  async function scanTranscript(final = false) {
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
       currentOffset = 0;
     }
-    if (!currentPath) continue;
+    if (!currentPath) return null;
 
     const info = await stat(currentPath).catch(() => null);
     if (!info) {
       currentPath = null;
-      continue;
+      return null;
     }
     if (info.size < currentOffset) {
       currentOffset = 0;
       pending = '';
     }
-    if (info.size === currentOffset) continue;
+    if (info.size === currentOffset && (!final || !pending)) return null;
 
-    const handle = await open(currentPath, 'r');
-    let chunk;
-    try {
-      chunk = Buffer.alloc(info.size - currentOffset);
-      await handle.read(chunk, 0, chunk.length, currentOffset);
-    } finally {
-      await handle.close();
+    let chunk = Buffer.alloc(0);
+    if (info.size > currentOffset) {
+      const handle = await open(currentPath, 'r');
+      try {
+        chunk = Buffer.alloc(info.size - currentOffset);
+        await handle.read(chunk, 0, chunk.length, currentOffset);
+      } finally {
+        await handle.close();
+      }
     }
     currentOffset = info.size;
     const lines = (pending + chunk.toString('utf8')).split('\n');
-    pending = lines.pop();
+    pending = final ? '' : lines.pop();
     for (const line of lines) {
       const event = classifyTranscriptLine(line);
-      if (event) {
-        return {
-          type: 'failure',
-          event,
-          transcriptPath: currentPath,
-          sessionId: currentSessionId,
-          offset: currentOffset,
-        };
-      }
+      if (event) return event;
     }
+    return null;
+  }
+
+  function failure(event) {
+    return {
+      type: 'failure',
+      event,
+      transcriptPath: currentPath,
+      sessionId: currentSessionId,
+      offset: currentOffset,
+    };
+  }
+
+  while (true) {
+    const winner = await Promise.race([
+      exited,
+      delay(pollIntervalMs).then(() => ({ type: 'poll' })),
+    ]);
+    if (winner.type === 'exit') {
+      const event = await scanTranscript(true);
+      return event ? failure(event) : winner;
+    }
+    const event = await scanTranscript();
+    if (event) return failure(event);
   }
 }
 

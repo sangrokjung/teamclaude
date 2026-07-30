@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
+import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
 import { createProxyServer } from '../src/server.js';
 
 async function listen(server) {
@@ -113,4 +115,70 @@ test('rotate endpoint rejects unsafe requests and unavailable fleets', async t =
   assert.deepEqual(Object.keys(body.error).sort(), ['message', 'type']);
   assert.equal(body.error.type, 'no_alternative_account');
   assert.equal(manager.currentIndex, 0);
+});
+
+test('recovery auth pins each session to its rotated account across concurrent rotations', async t => {
+  let selectedSecondAccount = false;
+  const upstream = http.createServer((req, res) => {
+    selectedSecondAccount = req.headers.authorization === 'Bearer fixture-b';
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  t.after(() => close(upstream));
+  const upstreamPort = await listen(upstream);
+
+  const manager = new AccountManager([
+    {
+      name: 'account-a',
+      type: 'oauth',
+      accessToken: 'fixture-a',
+      expiresAt: Date.now() + 60_000,
+    },
+    {
+      name: 'account-b',
+      type: 'oauth',
+      accessToken: 'fixture-b',
+      expiresAt: Date.now() + 60_000,
+    },
+  ], 0.98, 0);
+  manager.currentIndex = 0;
+  const server = createProxyServer(manager, {
+    proxy: { apiKey: 'fixture-proxy-key' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  t.after(() => close(server));
+  const port = await listen(server);
+  const controlHeaders = { 'x-api-key': 'fixture-proxy-key' };
+
+  const firstRotate = await fetch(`http://127.0.0.1:${port}/teamclaude/rotate`, {
+    method: 'POST',
+    headers: controlHeaders,
+  });
+  const firstResult = await firstRotate.json();
+  const recoveryEnv = buildClaudeRecoveryEnv({
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+  }, firstResult.currentAccount);
+
+  const secondRotate = await fetch(`http://127.0.0.1:${port}/teamclaude/rotate`, {
+    method: 'POST',
+    headers: controlHeaders,
+  });
+  const secondResult = await secondRotate.json();
+  assert.equal(firstResult.currentAccount, 'account-b');
+  assert.equal(secondResult.currentAccount, 'account-a');
+  assert.equal(manager.currentIndex, 0);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${recoveryEnv.CLAUDE_CODE_OAUTH_TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: 'test-model', messages: [] }),
+  });
+  await response.text();
+
+  assert.equal(response.status, 200);
+  assert.equal(selectedSecondAccount, true);
 });

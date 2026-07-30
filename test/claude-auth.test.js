@@ -6,7 +6,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
+import {
+  buildClaudeRecoveryEnv,
+  parseClaudeRecoveryAccount,
+} from '../src/claude-auth.js';
 
 test('buildClaudeRecoveryEnv replaces higher-precedence auth only for loopback URLs', () => {
   for (const baseUrl of [
@@ -23,7 +26,7 @@ test('buildClaudeRecoveryEnv replaces higher-precedence auth only for loopback U
     };
     const before = structuredClone(input);
 
-    const result = buildClaudeRecoveryEnv(input);
+    const result = buildClaudeRecoveryEnv(input, 'account-b');
 
     assert.deepEqual(input, before);
     assert.equal(result.ANTHROPIC_BASE_URL, baseUrl);
@@ -62,10 +65,31 @@ test('buildClaudeRecoveryEnv rejects non-loopback and malformed recovery base UR
     const before = structuredClone(input);
 
     assert.throws(
-      () => buildClaudeRecoveryEnv(input),
+      () => buildClaudeRecoveryEnv(input, 'account-b'),
       /loopback TeamClaude URL/,
     );
     assert.deepEqual(input, before);
+  }
+});
+
+test('recovery auth carries only the selected account routing hint', () => {
+  const result = buildClaudeRecoveryEnv({
+    ANTHROPIC_BASE_URL: 'http://127.0.0.1:3456',
+  }, '계정/b');
+
+  assert.equal(
+    parseClaudeRecoveryAccount(`Bearer ${result.CLAUDE_CODE_OAUTH_TOKEN}`),
+    '계정/b',
+  );
+  for (const authorization of [
+    undefined,
+    '',
+    'Bearer unrelated-token',
+    'Basic unrelated-token',
+    'Bearer teamclaude-local-recovery:',
+    'Bearer teamclaude-local-recovery:not_base64url!',
+  ]) {
+    assert.equal(parseClaudeRecoveryAccount(authorization), null);
   }
 });
 
@@ -77,7 +101,7 @@ if (process.env.TEAMCLAUDE_REAL_CLAUDE_QA === '1') {
       ...process.env,
       HOME: root,
       ANTHROPIC_BASE_URL: 'http://127.0.0.1:3456',
-    });
+    }, 'account-b');
     delete env.CLAUDE_CONFIG_DIR;
 
     const version = spawnSync('claude', ['--version'], {
@@ -142,7 +166,7 @@ if (process.env.TEAMCLAUDE_REAL_CLAUDE_QA === '1') {
       ...process.env,
       HOME: root,
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.address().port}`,
-    });
+    }, 'account-b');
     delete env.CLAUDE_CONFIG_DIR;
     expectedAuthorization = `Bearer ${env.CLAUDE_CODE_OAUTH_TOKEN}`;
     child = spawn('claude', ['-p', 'reply with ok', '--output-format', 'json'], {

@@ -295,11 +295,27 @@ export class AccountManager {
    * Single-threaded JS keeps this race-free: there is no await between selecting
    * the account and the inflight++ that reserves its slot.
    */
-  _tryAcquire(exclude = null, affinityKey = null, model = null) {
+  _tryAcquire(
+    exclude = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountName = null,
+  ) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
     const affOk = affinityKey != null
       && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
+
+    const preferred = typeof preferredAccountName === 'string'
+      ? this.accounts.find(account => account.name === preferredAccountName)
+      : null;
+    if (preferred && this._isAvailable(preferred, model)
+        && !(exclude && exclude.has(preferred))) {
+      if (!this._hasCapacity(preferred)) return null;
+      preferred.inflight++;
+      if (affOk) this._affinity.set(affinityKey, preferred);
+      return preferred;
+    }
 
     // Connection affinity (cache locality): prefer the account this connection
     // already used — but only as a *soft* hint, and DEFER to cold-start warm-up.
@@ -368,16 +384,35 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
-  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null, model = null) {
+  async acquireAccount(
+    exclude = null,
+    timeoutMs = 0,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountName = null,
+  ) {
     if (signal?.aborted) return null;
-    const account = this._tryAcquire(exclude, affinityKey, model);
+    const account = this._tryAcquire(
+      exclude,
+      affinityKey,
+      model,
+      preferredAccountName,
+    );
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
     if (timeoutMs <= 0 || !this.anyCapped(exclude, model) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs, signal, affinityKey, model);
+    return this._enqueue(
+      exclude,
+      timeoutMs,
+      signal,
+      affinityKey,
+      model,
+      preferredAccountName,
+    );
   }
 
   /** Is the overflow queue at its depth cap? */
@@ -405,9 +440,26 @@ export class AccountManager {
     return caps + this.maxQueueDepth;
   }
 
-  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null, model = null) {
+  _enqueue(
+    exclude,
+    timeoutMs,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountName = null,
+  ) {
     return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey, model };
+      const waiter = {
+        exclude,
+        resolve,
+        done: false,
+        timer: null,
+        signal,
+        onAbort: null,
+        affinityKey,
+        model,
+        preferredAccountName,
+      };
       waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
       // Cancel the wait if the client disconnects — otherwise an aborted request
       // would still acquire a slot later and be dispatched upstream, burning quota.
@@ -450,7 +502,12 @@ export class AccountManager {
   _drainWaiters() {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.model);
+      const account = this._tryAcquire(
+        waiter.exclude,
+        waiter.affinityKey,
+        waiter.model,
+        waiter.preferredAccountName,
+      );
       if (account) {
         // _settleWaiter splices the waiter out, so don't advance i. If it was
         // already settled (shouldn't happen — settled waiters aren't in the list),
