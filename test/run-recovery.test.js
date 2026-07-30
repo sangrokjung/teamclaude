@@ -40,7 +40,7 @@ async function jsonLines(path) {
   return raw.split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
 
-test('real run command resumes Claude then hands an exhausted fleet to Codex exactly once', async () => {
+test('real run command isolates ambiguous sessions, resumes Claude, then hands off once', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-recovery-'));
   const bin = join(root, 'bin');
   const project = join(root, 'project');
@@ -69,10 +69,27 @@ if (flag >= 0) {
   process.on('SIGTERM', () => process.exit(0));
   setInterval(() => {}, 1000);
 }
+if (args.includes('--continue')) {
+  setTimeout(() => {
+    const record = {
+      type: 'assistant',
+      cwd: process.cwd(),
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Request timed out' }] },
+    };
+    appendFileSync(process.env.FAKE_COMPETING_TRANSCRIPT, JSON.stringify(record) + '\\n');
+  }, 10);
+  setTimeout(() => process.exit(0), 50);
+}
 `;
   const fakeCodex = `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
-appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify(process.argv.slice(2)) + '\\n');
+appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
+  args: process.argv.slice(2),
+  config: process.env.TEAMCLAUDE_CONFIG ?? null,
+  provider: process.env.TEAMCLAUDE_PROVIDER ?? null,
+}) + '\\n');
 `;
   await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
   await writeFile(join(bin, 'codex'), fakeCodex, { mode: 0o755 });
@@ -109,7 +126,8 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify(process.argv.slice(2
     codexFallbackOnExhaustion: true,
     accounts: [],
   };
-  await writeFile(join(configDir, 'teamclaude.json'), JSON.stringify(baseConfig));
+  const claudeConfigPath = join(root, 'custom-claude.json');
+  await writeFile(claudeConfigPath, JSON.stringify(baseConfig));
   await writeFile(join(configDir, 'teamcodex.json'), JSON.stringify({
     ...baseConfig,
     provider: 'codex',
@@ -123,11 +141,35 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify(process.argv.slice(2
     PATH: `${bin}:${process.env.PATH}`,
     FAKE_CLAUDE_CALLS: claudeCalls,
     FAKE_CODEX_CALLS: codexCalls,
+    FAKE_COMPETING_TRANSCRIPT: join(
+      root,
+      '.claude',
+      'projects',
+      'fake',
+      '11111111-1111-4111-8111-111111111111.jsonl',
+    ),
+    TEAMCLAUDE_CONFIG: claudeConfigPath,
   };
-  delete env.TEAMCLAUDE_CONFIG;
   delete env.TEAMCLAUDE_PROVIDER;
+  await mkdir(dirname(env.FAKE_COMPETING_TRANSCRIPT), { recursive: true });
+  await writeFile(
+    env.FAKE_COMPETING_TRANSCRIPT,
+    `${JSON.stringify({ type: 'user', cwd: project })}\n`,
+  );
 
   try {
+    utilization = 0.98;
+    const ambiguous = await runCli(['run', '--', '--continue'], {
+      cwd: project,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    assert.equal(ambiguous.status, 0, ambiguous.stderr);
+    assert.deepEqual(await jsonLines(claudeCalls), [['--continue']]);
+    assert.deepEqual(await jsonLines(codexCalls), []);
+
+    await writeFile(claudeCalls, '');
+    utilization = 0.5;
     const resumed = await runCli(['run'], {
       cwd: project,
       env,
@@ -151,7 +193,9 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify(process.argv.slice(2
     assert.equal((await jsonLines(claudeCalls)).length, 1);
     const codex = await jsonLines(codexCalls);
     assert.equal(codex.length, 1);
-    assert.ok(codex[0].some(arg => arg.includes('teamclaude-handoffs')));
+    assert.ok(codex[0].args.some(arg => arg.includes('teamclaude-handoffs')));
+    assert.equal(codex[0].config, null);
+    assert.equal(codex[0].provider, 'codex');
     const handoffs = await readdir(join(configDir, 'teamclaude-handoffs'));
     assert.equal(handoffs.length, 1);
   } finally {

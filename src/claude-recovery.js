@@ -134,26 +134,35 @@ async function findLatestSession(root, cwd) {
 
 function sessionSelector(args) {
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--session-id' && UUID_RE.test(args[i + 1] || '')) {
-      return { sessionId: args[i + 1], selected: true };
+    if (args[i] === '--session-id') {
+      const value = args[i + 1] || '';
+      return UUID_RE.test(value)
+        ? { kind: 'exact', sessionId: value }
+        : { kind: 'ambiguous', sessionId: null };
     }
     if (args[i].startsWith('--session-id=')) {
       const value = args[i].slice('--session-id='.length);
-      return { sessionId: UUID_RE.test(value) ? value : null, selected: true };
+      return UUID_RE.test(value)
+        ? { kind: 'exact', sessionId: value }
+        : { kind: 'ambiguous', sessionId: null };
     }
-    if ((args[i] === '--resume' || args[i] === '-r') && UUID_RE.test(args[i + 1] || '')) {
-      return { sessionId: args[i + 1], selected: true };
+    if (args[i] === '--resume' || args[i] === '-r') {
+      const value = args[i + 1] || '';
+      return UUID_RE.test(value)
+        ? { kind: 'exact', sessionId: value }
+        : { kind: 'ambiguous', sessionId: null };
     }
     if (args[i].startsWith('--resume=')) {
       const value = args[i].slice('--resume='.length);
-      return { sessionId: UUID_RE.test(value) ? value : null, selected: true };
+      return UUID_RE.test(value)
+        ? { kind: 'exact', sessionId: value }
+        : { kind: 'ambiguous', sessionId: null };
     }
-    if (args[i] === '--continue' || args[i] === '-c'
-        || args[i] === '--resume' || args[i] === '-r') {
-      return { sessionId: null, selected: true };
+    if (args[i] === '--continue' || args[i] === '-c') {
+      return { kind: 'ambiguous', sessionId: null };
     }
   }
-  return { sessionId: null, selected: false };
+  return { kind: 'new', sessionId: null };
 }
 
 function redactSecrets(text) {
@@ -358,12 +367,13 @@ export async function runClaudeWithRecovery({
   log = message => console.error(message),
 }) {
   const selector = sessionSelector(claudeArgs);
-  let sessionId = selector.sessionId;
-  if (!sessionId && selector.selected) {
-    sessionId = await findLatestSession(transcriptRoot, cwd);
+  if (selector.kind === 'ambiguous') {
+    return childExit(spawnClaude(claudeArgs, childEnv));
   }
+
+  let sessionId = selector.sessionId;
   let nextArgs = [...claudeArgs];
-  if (!selector.selected) {
+  if (selector.kind === 'new') {
     sessionId = randomUUID();
     nextArgs = ['--session-id', sessionId, ...nextArgs];
   }

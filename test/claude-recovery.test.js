@@ -192,3 +192,74 @@ test('unknown or partial quota never triggers a Codex handoff', async () => {
     } }],
   }, 0.98), false);
 });
+
+test('ambiguous Claude session selectors never monitor or recover another session', async t => {
+  const selectors = [
+    ['--resume', 'named-session'],
+    ['--resume'],
+    ['--continue'],
+    ['--session-id', 'not-a-uuid'],
+  ];
+
+  for (const claudeArgs of selectors) {
+    await t.test(claudeArgs.join(' '), async () => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-ambiguous-'));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      const transcriptDir = join(transcriptRoot, 'project');
+      const competingSessionId = '11111111-1111-4111-8111-111111111111';
+      const transcriptPath = join(transcriptDir, `${competingSessionId}.jsonl`);
+      await mkdir(cwd);
+      await mkdir(transcriptDir, { recursive: true });
+      await writeFile(transcriptPath, `${JSON.stringify({ type: 'user', cwd })}\n`);
+
+      const spawnCalls = [];
+      const killSignals = [];
+      let codexCalls = 0;
+      let statusCalls = 0;
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs,
+        childEnv: {},
+        config: {
+          autoResumeClaude: true,
+          claudeAutoResumeMaxRetries: 1,
+          claudeAutoResumeBackoffMs: 0,
+          codexFallbackOnExhaustion: true,
+          switchThreshold: 0.98,
+        },
+        cwd,
+        transcriptRoot,
+        handoffRoot: join(root, 'handoffs'),
+        pollIntervalMs: 5,
+        fetchStatus: async () => {
+          statusCalls += 1;
+          return statusWithQuota(0.98);
+        },
+        spawnClaude(args) {
+          spawnCalls.push([...args]);
+          const child = fakeChild(signal => killSignals.push(signal));
+          setTimeout(async () => {
+            await writeFile(
+              transcriptPath,
+              `${JSON.stringify({ type: 'user', cwd })}\n${timeoutRecord(cwd)}\n`,
+            );
+          }, 10);
+          setTimeout(() => child.finish(0), 40);
+          return child;
+        },
+        launchCodex: async () => {
+          codexCalls += 1;
+          return { status: 0, signal: null };
+        },
+        log() {},
+      });
+
+      assert.equal(result.status, 0);
+      assert.deepEqual(spawnCalls, [claudeArgs]);
+      assert.deepEqual(killSignals, []);
+      assert.equal(statusCalls, 0);
+      assert.equal(codexCalls, 0);
+    });
+  }
+});

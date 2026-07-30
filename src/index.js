@@ -1693,11 +1693,15 @@ async function runCommand() {
         stdio: 'inherit',
         env: recoveryEnv,
       }),
-      launchCodex: handoff => spawnSync(
-        process.execPath,
-        [process.argv[1], 'codex', 'run', '--', handoff.prompt],
-        { stdio: 'inherit', env: childEnv },
-      ),
+      launchCodex: handoff => {
+        const codexEnv = { ...childEnv, TEAMCLAUDE_PROVIDER: 'codex' };
+        delete codexEnv.TEAMCLAUDE_CONFIG;
+        return spawnSync(
+          process.execPath,
+          [process.argv[1], 'codex', 'run', '--', handoff.prompt],
+          { stdio: 'inherit', env: codexEnv },
+        );
+      },
     });
     if (result?.error) {
       if (result.error.code === 'ENOENT') {
