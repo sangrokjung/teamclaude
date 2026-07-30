@@ -24,6 +24,7 @@ import { runClaudeWithRecovery } from './claude-recovery.js';
 import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
+  parseClaudeRecoveryAccount,
 } from './claude-auth.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
@@ -227,6 +228,7 @@ async function superviseServerCommand() {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
     const hasRecoveryMarker = hasClaudeRecoveryMarker(authorization);
+    const recoveryAccountUuid = parseClaudeRecoveryAccount(authorization);
     const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
       ? authorization.slice('Bearer '.length)
       : null;
@@ -234,6 +236,13 @@ async function superviseServerCommand() {
     const isLocal = remoteAddr === '127.0.0.1'
       || remoteAddr === '::1'
       || remoteAddr === '::ffff:127.0.0.1';
+    if (hasRecoveryMarker && recoveryAccountUuid == null) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Invalid Claude recovery routing marker.' },
+      });
+      return;
+    }
     if (hasRecoveryMarker && !isLocal) {
       rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
         type: 'error',

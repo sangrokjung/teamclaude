@@ -511,6 +511,56 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
   }
 });
 
+test('supervisor rejects malformed loopback recovery markers before worker routing', {
+  timeout: 15000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-local-recovery-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-local-recovery' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [
+      { name: 'account-a', type: 'apikey', apiKey: 'fixture-a' },
+    ],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const malformedRecoveryRoutes = await Promise.all([
+      'Bearer teamclaude-local-recovery:',
+      'Bearer teamclaude-local-recovery:***',
+      'bearer teamclaude-local-recovery:YQ==',
+      'Bearer   teamclaude-local-recovery:bad',
+      'Bearer\tteamclaude-local-recovery:bad',
+      'Basic unrelated, Bearer teamclaude-local-recovery:bad',
+    ].map(authorization => request({
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        authorization,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+    })));
+
+    assert.deepEqual(
+      malformedRecoveryRoutes.map(result => result.status),
+      [403, 403, 403, 403, 403, 403],
+    );
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor preserves worker session affinity for a public keep-alive connection', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-affinity-'));
   const configPath = join(dir, 'config.json');

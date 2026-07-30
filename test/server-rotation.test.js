@@ -189,3 +189,93 @@ test('recovery auth pins each session to its rotated account across concurrent r
   assert.equal(response.status, 200);
   assert.equal(selectedSecondAccount, true);
 });
+
+test('loopback malformed recovery marker is rejected before upstream dispatch', async t => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  t.after(() => close(upstream));
+  const upstreamPort = await listen(upstream);
+
+  const manager = makeManager(1);
+  const server = createProxyServer(manager, {
+    proxy: { apiKey: 'fixture-proxy-key' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  t.after(() => close(server));
+  const port = await listen(server);
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer teamclaude-local-recovery:***',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: 'test-model', messages: [] }),
+  });
+
+  assert.equal(response.status, 403);
+  assert.equal(upstreamHits, 0);
+});
+
+test('recovery UUID fails closed if selected account is removed during token refresh', async t => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  t.after(() => close(upstream));
+  const upstreamPort = await listen(upstream);
+
+  const manager = makeManager(2);
+  let markRefreshStarted;
+  const refreshStarted = new Promise(resolve => {
+    markRefreshStarted = resolve;
+  });
+  let allowRefreshToFinish;
+  const refreshMayFinish = new Promise(resolve => {
+    allowRefreshToFinish = resolve;
+  });
+  const ensureTokenFresh = manager.ensureTokenFresh.bind(manager);
+  manager.ensureTokenFresh = async account => {
+    if (account.accountUuid === 'uuid-1') {
+      markRefreshStarted();
+      await refreshMayFinish;
+    }
+    return ensureTokenFresh(account);
+  };
+
+  const server = createProxyServer(manager, {
+    proxy: { apiKey: 'fixture-proxy-key' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  t.after(() => close(server));
+  const port = await listen(server);
+  const recoveryEnv = buildClaudeRecoveryEnv({
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+  }, 'uuid-1');
+
+  const responsePromise = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${recoveryEnv.CLAUDE_CODE_OAUTH_TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: 'test-model', messages: [] }),
+  });
+  await refreshStarted;
+  const selected = manager.accounts.find(account => account.accountUuid === 'uuid-1');
+  manager.removeAccount(selected.index);
+  allowRefreshToFinish();
+  const response = await responsePromise;
+
+  assert.equal(response.status, 409);
+  assert.equal(upstreamHits, 0);
+});

@@ -533,6 +533,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       const isRotateRequest = req.url === '/teamclaude/rotate';
+      if (hasRecoveryMarker && recoveryAccountUuid == null) {
+        rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'permission_error', message: 'Invalid Claude recovery routing marker.' },
+        });
+        return;
+      }
       if (hasRecoveryMarker && !isLocal) {
         rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
           type: 'error',
@@ -1267,7 +1274,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       );
       if (account) {
         ctx.held = account;
-        ctx.preferredAccountUuid = null;
       }
     }
 
@@ -1386,6 +1392,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   await raceAbort(accountManager.ensureTokenFresh(account), ctx.abortSignal);
   if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone — outer finally frees the slot
 
+  if (typeof ctx.preferredAccountUuid === 'string') {
+    const preferredStillEligible = account.accountUuid === ctx.preferredAccountUuid
+      && accountManager.accounts[account.index] === account
+      && accountManager._isAvailable(account, ctx.model);
+    if (!preferredStillEligible) {
+      releaseHeld();
+      ctx.status = 409;
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'no_alternative_account',
+          message: 'Selected Claude recovery account became unavailable before dispatch.',
+        },
+      }));
+      return;
+    }
+  }
+
   // The account may have been REMOVED (TUI/CLI delete) during the awaited refresh
   // above (or the 401 forced-refresh that recurses back here). A detached account
   // must not be used to dispatch upstream — its slot release is a no-op and we'd
@@ -1487,7 +1512,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     continuityBoundedTimeout ? continuityRemainingMs : ctx.upstreamResponseTimeoutMs,
   );
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
+    const upstreamRequest = fetch(upstreamUrl, {
       method,
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : body,
@@ -1500,6 +1525,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // the finally that frees the slot.
       signal: upstreamDeadline.signal,
     });
+    ctx.preferredAccountUuid = null;
+    const upstreamRes = await upstreamRequest;
     const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
     if (isStreaming && upstreamRes.status !== 429) upstreamDeadline.stopTimeout();
 
