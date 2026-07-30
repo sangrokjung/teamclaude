@@ -299,6 +299,10 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
   "continuityMaxWaitMs": 900000,
   "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
+  "autoResumeClaude": true,
+  "codexFallbackOnExhaustion": false,
+  "cmuxSessionRescue": false,
+  "cmuxSessionRescueIntervalMs": 1000,
   "accounts": []
 }
 ```
@@ -313,11 +317,21 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `continuityMaxWaitMs` | 연속성 내부 복구의 전체 deadline (기본 `900000` = 15분) |
 | `continuityMaxSleepMs` | 연속성 probe 사이의 최대 간격 (기본 `30000` = 30초) |
 | `activeWarmup` | 최소 요청으로 계정 사용량을 선측정 |
+| `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429를 같은 세션으로 자동 재개 |
+| `codexFallbackOnExhaustion` | 대체 Claude 계정이 없거나 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
+| `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
+| `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
 | `modelFallbacks` | 모델별 대체 모델 체인 |
 | `streamRecovery` | SSE를 이벤트 단위로 중계하고 끊긴 스트림을 재시도 가능한 오류로 마무리 |
 | `tokenRefreshIntervalMs` | 유휴 계정 OAuth 갱신 스윕 간격 (`0`=비활성) |
+
+`cmuxSessionRescue`는 소유자 전용 registry/transcript, 정확한 session
+selector와 프로세스 시작 시각, 신뢰된 Claude 실행 파일, 실제 cmux
+surface→workspace topology가 모두 일치할 때만 동작합니다. 세션별 claim을
+디스크에 먼저 기록하므로 supervisor가 재시작되거나 workspace 생성 결과가
+불확실해도 같은 세션을 중복 실행하지 않습니다.
 
 버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
 

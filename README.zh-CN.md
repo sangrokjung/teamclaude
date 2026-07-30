@@ -289,6 +289,10 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
   "continuityMaxWaitMs": 900000,
   "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
+  "autoResumeClaude": true,
+  "codexFallbackOnExhaustion": false,
+  "cmuxSessionRescue": false,
+  "cmuxSessionRescueIntervalMs": 1000,
   "accounts": []
 }
 ```
@@ -303,11 +307,21 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
 | `continuityMaxWaitMs` | 连续性内部恢复的总 deadline（默认 `900000` = 15 分钟） |
 | `continuityMaxSleepMs` | 连续性 probe 之间的最大间隔（默认 `30000` = 30 秒） |
 | `activeWarmup` | 通过最小请求预先测量账户用量 |
+| `autoResumeClaude` | 将 TeamClaude 启动的 Claude 会话在 timeout/429 后自动恢复为同一会话 |
+| `codexFallbackOnExhaustion` | 仅在确认没有备用 Claude 账户或全部通用 quota 耗尽时转交 Codex |
+| `cmuxSessionRescue` | 检测现有 cmux Claude 会话的精确 `Login expired`，保留原 pane，并在同一 window 的新非聚焦 workspace 中恢复 |
+| `cmuxSessionRescueIntervalMs` | 检查现有 cmux 会话恢复的间隔（最小 500ms，默认 1000ms） |
 | `accounts[].enabled` | 设为 `false` 时从轮换中排除账户 |
 | `accounts[].priority` | 数字越小，固定优先级越高 |
 | `modelFallbacks` | 各模型的备用模型链 |
 | `streamRecovery` | 按事件边界转发 SSE，并把中断的流收尾为可重试的错误 |
 | `tokenRefreshIntervalMs` | 闲置账户 OAuth 刷新扫描间隔（`0` = 关闭） |
+
+`cmuxSessionRescue` 仅在仅限所有者访问的 registry/transcript、精确的
+session selector 与进程启动时间、受信任的 Claude 可执行文件以及实时
+cmux surface→workspace 拓扑全部一致时运行。它会先在磁盘上写入每个会话的
+claim，因此 supervisor 重启或 workspace 创建结果不确定时也不会重复启动
+同一会话。
 
 缓冲区、超时上限等完整配置项请参阅[英文 README](README.md#configuration)。
 
