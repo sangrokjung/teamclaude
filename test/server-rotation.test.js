@@ -21,6 +21,7 @@ async function close(server) {
 function makeManager(count) {
   return new AccountManager(Array.from({ length: count }, (_, index) => ({
     name: `account-${index}`,
+    accountUuid: `uuid-${index}`,
     type: 'oauth',
     accessToken: `fixture-${index}`,
     expiresAt: Date.now() + 60_000,
@@ -31,6 +32,7 @@ test('loopback rotate endpoint switches active account without persisting config
   const accountInputs = [
     {
       name: 'account-a',
+      accountUuid: 'uuid-a',
       type: 'oauth',
       accessToken: 'fixture-a',
       expiresAt: Date.now() + 60_000,
@@ -39,6 +41,7 @@ test('loopback rotate endpoint switches active account without persisting config
     },
     {
       name: 'account-b',
+      accountUuid: 'uuid-b',
       type: 'oauth',
       accessToken: 'fixture-b',
       expiresAt: Date.now() + 60_000,
@@ -69,6 +72,7 @@ test('loopback rotate endpoint switches active account without persisting config
   assert.equal(response.status, 200);
   assert.deepEqual(Object.keys(body).sort(), [
     'currentAccount',
+    'currentAccountUuid',
     'previousAccount',
     'rotated',
   ]);
@@ -76,6 +80,7 @@ test('loopback rotate endpoint switches active account without persisting config
     rotated: true,
     previousAccount: 'account-a',
     currentAccount: 'account-b',
+    currentAccountUuid: 'uuid-b',
   });
   assert.equal(beforeStatus.currentAccount, 'account-a');
   assert.equal(afterStatus.currentAccount, 'account-b');
@@ -130,12 +135,14 @@ test('recovery auth pins each session to its rotated account across concurrent r
   const manager = new AccountManager([
     {
       name: 'account-a',
+      accountUuid: 'uuid-a',
       type: 'oauth',
       accessToken: 'fixture-a',
       expiresAt: Date.now() + 60_000,
     },
     {
       name: 'account-b',
+      accountUuid: 'uuid-b',
       type: 'oauth',
       accessToken: 'fixture-b',
       expiresAt: Date.now() + 60_000,
@@ -158,7 +165,7 @@ test('recovery auth pins each session to its rotated account across concurrent r
   const firstResult = await firstRotate.json();
   const recoveryEnv = buildClaudeRecoveryEnv({
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
-  }, firstResult.currentAccount);
+  }, firstResult.currentAccountUuid);
 
   const secondRotate = await fetch(`http://127.0.0.1:${port}/teamclaude/rotate`, {
     method: 'POST',

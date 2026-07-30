@@ -470,6 +470,26 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
       },
       body: JSON.stringify({ model: 'test-model', messages: [] }),
     });
+    const proxyKey = JSON.parse(await readFile(configPath, 'utf8')).proxy.apiKey;
+    const malformedRecoveryRoutes = await Promise.all([
+      'Bearer teamclaude-local-recovery:',
+      'Bearer teamclaude-local-recovery:***',
+      'bearer teamclaude-local-recovery:YQ==',
+      'Bearer   teamclaude-local-recovery:bad',
+      'Bearer\tteamclaude-local-recovery:bad',
+      'Basic unrelated, Bearer teamclaude-local-recovery:bad',
+    ].map(authorization => request({
+      host,
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': proxyKey,
+        authorization,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+    })));
 
     const after = await request({
       host,
@@ -480,6 +500,10 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
     assert.equal(blocked.status, 403);
     assert.equal(JSON.parse(blocked.body).error.type, 'permission_error');
     assert.equal(blockedRecoveryRoute.status, 403);
+    assert.deepEqual(
+      malformedRecoveryRoutes.map(result => result.status),
+      [403, 403, 403, 403, 403, 403],
+    );
     assert.equal(JSON.parse(after.body).currentAccount, beforeAccount);
   } finally {
     await stopChild(child);

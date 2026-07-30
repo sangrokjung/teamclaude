@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildClaudeRecoveryEnv,
+  hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from '../src/claude-auth.js';
 
@@ -75,11 +76,11 @@ test('buildClaudeRecoveryEnv rejects non-loopback and malformed recovery base UR
 test('recovery auth carries only the selected account routing hint', () => {
   const result = buildClaudeRecoveryEnv({
     ANTHROPIC_BASE_URL: 'http://127.0.0.1:3456',
-  }, '계정/b');
+  }, 'uuid-b');
 
   assert.equal(
     parseClaudeRecoveryAccount(`Bearer ${result.CLAUDE_CODE_OAUTH_TOKEN}`),
-    '계정/b',
+    'uuid-b',
   );
   for (const authorization of [
     undefined,
@@ -90,6 +91,27 @@ test('recovery auth carries only the selected account routing hint', () => {
     'Bearer teamclaude-local-recovery:not_base64url!',
   ]) {
     assert.equal(parseClaudeRecoveryAccount(authorization), null);
+  }
+});
+
+test('recovery marker detection rejects malformed remote variants before parsing', () => {
+  for (const value of [
+    'Bearer teamclaude-local-recovery:',
+    'Bearer teamclaude-local-recovery:***',
+    'bearer teamclaude-local-recovery:YQ==',
+    'Bearer   teamclaude-local-recovery:bad',
+    'Bearer\tteamclaude-local-recovery:bad',
+    'Basic unrelated, Bearer teamclaude-local-recovery:bad',
+  ]) {
+    assert.equal(hasClaudeRecoveryMarker(value), true);
+  }
+  for (const value of [
+    undefined,
+    '',
+    'Bearer unrelated-token',
+    'Basic teamclaude-local-recovery:not-a-bearer',
+  ]) {
+    assert.equal(hasClaudeRecoveryMarker(value), false);
   }
 });
 

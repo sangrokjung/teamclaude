@@ -213,9 +213,15 @@ export class AccountManager {
    * changing persisted priority/enabled settings. Used by local recovery
    * control paths that must abandon the current account before retrying.
    */
-  rotateActiveAccount(model = null) {
+  rotateActiveAccount(model = null, requireAccountUuid = false) {
     const current = this.accounts[this.currentIndex] || null;
-    const exclude = current ? new Set([current]) : null;
+    const exclude = new Set();
+    if (current) exclude.add(current);
+    if (requireAccountUuid) {
+      for (const account of this.accounts) {
+        if (!account.accountUuid) exclude.add(account);
+      }
+    }
     const next = this._selectBest(exclude, model);
     if (!next || next === current) {
       return { rotated: false, reason: 'no-alternative-account' };
@@ -226,6 +232,7 @@ export class AccountManager {
       rotated: true,
       previousAccount: current?.name || null,
       currentAccount: next.name,
+      currentAccountUuid: next.accountUuid || null,
     };
   }
 
@@ -299,19 +306,21 @@ export class AccountManager {
     exclude = null,
     affinityKey = null,
     model = null,
-    preferredAccountName = null,
+    preferredAccountUuid = null,
   ) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
     const affOk = affinityKey != null
       && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
 
-    const preferred = typeof preferredAccountName === 'string'
-      ? this.accounts.find(account => account.name === preferredAccountName)
-      : null;
-    if (preferred && this._isAvailable(preferred, model)
-        && !(exclude && exclude.has(preferred))) {
-      if (!this._hasCapacity(preferred)) return null;
+    if (typeof preferredAccountUuid === 'string') {
+      const preferred = this.accounts.find(
+        account => account.accountUuid === preferredAccountUuid,
+      );
+      if (!preferred || !this._isAvailable(preferred, model)
+          || (exclude && exclude.has(preferred)) || !this._hasCapacity(preferred)) {
+        return null;
+      }
       preferred.inflight++;
       if (affOk) this._affinity.set(affinityKey, preferred);
       return preferred;
@@ -390,28 +399,35 @@ export class AccountManager {
     signal = null,
     affinityKey = null,
     model = null,
-    preferredAccountName = null,
+    preferredAccountUuid = null,
   ) {
     if (signal?.aborted) return null;
     const account = this._tryAcquire(
       exclude,
       affinityKey,
       model,
-      preferredAccountName,
+      preferredAccountUuid,
     );
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    if (timeoutMs <= 0 || !this.anyCapped(exclude, model) || this.isQueueFull()) return null;
+    const preferred = typeof preferredAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === preferredAccountUuid)
+      : null;
+    const canQueue = preferredAccountUuid == null
+      ? this.anyCapped(exclude, model)
+      : preferred && this._isAvailable(preferred, model)
+        && !this._hasCapacity(preferred) && !(exclude && exclude.has(preferred));
+    if (timeoutMs <= 0 || !canQueue || this.isQueueFull()) return null;
     return this._enqueue(
       exclude,
       timeoutMs,
       signal,
       affinityKey,
       model,
-      preferredAccountName,
+      preferredAccountUuid,
     );
   }
 
@@ -446,7 +462,7 @@ export class AccountManager {
     signal = null,
     affinityKey = null,
     model = null,
-    preferredAccountName = null,
+    preferredAccountUuid = null,
   ) {
     return new Promise(resolve => {
       const waiter = {
@@ -458,7 +474,7 @@ export class AccountManager {
         onAbort: null,
         affinityKey,
         model,
-        preferredAccountName,
+        preferredAccountUuid,
       };
       waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
       // Cancel the wait if the client disconnects — otherwise an aborted request
@@ -506,7 +522,7 @@ export class AccountManager {
         waiter.exclude,
         waiter.affinityKey,
         waiter.model,
-        waiter.preferredAccountName,
+        waiter.preferredAccountUuid,
       );
       if (account) {
         // _settleWaiter splices the waiter out, so don't advance i. If it was
@@ -521,7 +537,15 @@ export class AccountManager {
       // releases its finite queue slot instead of blocking later, satisfiable
       // overflow requests until its timeout. A waiter that still has a cappable
       // account to hope for is left in place.
-      if (!this.anyCapped(waiter.exclude, waiter.model)) { this._settleWaiter(waiter, null); continue; }
+      const preferred = typeof waiter.preferredAccountUuid === 'string'
+        ? this.accounts.find(account => account.accountUuid === waiter.preferredAccountUuid)
+        : null;
+      const canWait = waiter.preferredAccountUuid == null
+        ? this.anyCapped(waiter.exclude, waiter.model)
+        : preferred && this._isAvailable(preferred, waiter.model)
+          && !this._hasCapacity(preferred)
+          && !(waiter.exclude && waiter.exclude.has(preferred));
+      if (!canWait) { this._settleWaiter(waiter, null); continue; }
       i++;
     }
   }

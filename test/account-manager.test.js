@@ -157,6 +157,8 @@ test('returns null when every account is exhausted (not yet reset)', () => {
 
 test('rotateActiveAccount switches to another available account without exposing credentials', () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
   am.currentIndex = 0;
 
   const result = am.rotateActiveAccount();
@@ -165,10 +167,12 @@ test('rotateActiveAccount switches to another available account without exposing
     rotated: true,
     previousAccount: 'acct-0',
     currentAccount: 'acct-1',
+    currentAccountUuid: 'uuid-1',
   });
   assert.equal(am.currentIndex, 1);
   assert.deepEqual(Object.keys(result).sort(), [
     'currentAccount',
+    'currentAccountUuid',
     'previousAccount',
     'rotated',
   ]);
@@ -211,6 +215,8 @@ test('rotateActiveAccount leaves state unchanged when no alternative is usable',
 
 test('a preferred recovery account survives concurrent global rotations and warm-up', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
   am.currentIndex = 0;
 
   const firstRecovery = am.rotateActiveAccount();
@@ -226,7 +232,7 @@ test('a preferred recovery account survives concurrent global rotations and warm
     null,
     {},
     null,
-    firstRecovery.currentAccount,
+    firstRecovery.currentAccountUuid,
   );
   assert.equal(first?.name, 'acct-1');
   am.releaseAccount(first);
@@ -237,10 +243,62 @@ test('a preferred recovery account survives concurrent global rotations and warm
     null,
     {},
     null,
-    secondRecovery.currentAccount,
+    secondRecovery.currentAccountUuid,
   );
   assert.equal(second?.name, 'acct-0');
   am.releaseAccount(second);
+});
+
+test('a preferred recovery UUID survives rename and fails closed when unavailable or excluded', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
+  am.currentIndex = 0;
+
+  const recovery = am.rotateActiveAccount();
+  const preferred = am.accounts[1];
+  preferred.name = 'renamed-account';
+
+  const renamed = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  );
+  assert.equal(renamed?.accountUuid, 'uuid-1');
+  am.releaseAccount(renamed);
+
+  preferred.enabled = false;
+  assert.equal(await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  ), null);
+
+  preferred.enabled = true;
+  assert.equal(await am.acquireAccount(
+    new Set([preferred]),
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  ), null);
+
+  am.removeAccount(preferred.index);
+  assert.equal(await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  ), null);
 });
 
 // Measure an account the way a real upstream response would (populates quota + totalRequests).

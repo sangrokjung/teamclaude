@@ -120,6 +120,7 @@ if (sessionFlag >= 0) {
         rotated: true,
         previousAccount: 'account-a',
         currentAccount,
+        currentAccountUuid: 'uuid-b',
       }));
       return;
     }

@@ -23,7 +23,7 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import {
   buildClaudeRecoveryEnv,
-  parseClaudeRecoveryAccount,
+  hasClaudeRecoveryMarker,
 } from './claude-auth.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
@@ -226,7 +226,7 @@ async function superviseServerCommand() {
   const listener = http.createServer((req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
-    const recoveryAccountName = parseClaudeRecoveryAccount(authorization);
+    const hasRecoveryMarker = hasClaudeRecoveryMarker(authorization);
     const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
       ? authorization.slice('Bearer '.length)
       : null;
@@ -234,7 +234,7 @@ async function superviseServerCommand() {
     const isLocal = remoteAddr === '127.0.0.1'
       || remoteAddr === '::1'
       || remoteAddr === '::ffff:127.0.0.1';
-    if (recoveryAccountName && !isLocal) {
+    if (hasRecoveryMarker && !isLocal) {
       rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
         type: 'error',
         error: { type: 'permission_error', message: 'Claude recovery routing is local-only.' },
@@ -1660,6 +1660,7 @@ async function recoverExpiredClaudeLogin(config, childEnv) {
   if (result?.rotated !== true
       || typeof result.previousAccount !== 'string'
       || typeof result.currentAccount !== 'string'
+      || typeof result.currentAccountUuid !== 'string'
       || result.previousAccount === result.currentAccount) {
     return null;
   }
@@ -1667,7 +1668,7 @@ async function recoverExpiredClaudeLogin(config, childEnv) {
     rotated: true,
     previousAccount: result.previousAccount,
     currentAccount: result.currentAccount,
-    childEnv: buildClaudeRecoveryEnv(childEnv, result.currentAccount),
+    childEnv: buildClaudeRecoveryEnv(childEnv, result.currentAccountUuid),
   };
 }
 

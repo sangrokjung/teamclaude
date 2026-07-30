@@ -8,7 +8,10 @@ import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { normalizeContinuityMaxWaitMs } from './config.js';
-import { parseClaudeRecoveryAccount } from './claude-auth.js';
+import {
+  hasClaudeRecoveryMarker,
+  parseClaudeRecoveryAccount,
+} from './claude-auth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -519,7 +522,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Auth check — skip for localhost connections
       const clientKey = req.headers['x-api-key'];
       const authorization = req.headers.authorization;
-      const recoveryAccountName = provider === 'anthropic'
+      const hasRecoveryMarker = provider === 'anthropic'
+        && hasClaudeRecoveryMarker(authorization);
+      const recoveryAccountUuid = provider === 'anthropic'
         ? parseClaudeRecoveryAccount(authorization)
         : null;
       const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
@@ -528,7 +533,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       const isRotateRequest = req.url === '/teamclaude/rotate';
-      if (recoveryAccountName && !isLocal) {
+      if (hasRecoveryMarker && !isLocal) {
         rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
           type: 'error',
           error: { type: 'permission_error', message: 'Claude recovery routing is local-only.' },
@@ -582,7 +587,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           return;
         }
-        const result = accountManager.rotateActiveAccount();
+        const result = accountManager.rotateActiveAccount(null, true);
         if (!result.rotated) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -694,7 +699,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountName: recoveryAccountName, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1258,9 +1263,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.abortSignal,
         ctx.affinityKey,
         ctx.model,
-        ctx.preferredAccountName,
+        ctx.preferredAccountUuid,
       );
-      if (account) ctx.held = account;
+      if (account) {
+        ctx.held = account;
+        ctx.preferredAccountUuid = null;
+      }
     }
 
     if (account || ctx.abortSignal?.aborted || res.destroyed) break;
