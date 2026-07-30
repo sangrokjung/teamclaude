@@ -436,20 +436,18 @@ export async function runClaudeWithRecovery({
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
     if (outcome.event.kind === 'login_expired') {
-      if (config.autoResumeClaude !== true
-          || !sessionId
-          || maxRetries === 0
-          || loginRecoveryUsed
-          || typeof recoverLoginExpired !== 'function') {
-        log('[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
-        return childExit(child);
-      }
-
-      loginRecoveryUsed = true;
       let recovery = null;
-      try {
-        recovery = await recoverLoginExpired({ sessionId, childEnv: nextEnv });
-      } catch {}
+      const canRecover = config.autoResumeClaude === true
+        && sessionId
+        && maxRetries > 0
+        && !loginRecoveryUsed
+        && typeof recoverLoginExpired === 'function';
+      if (canRecover) {
+        loginRecoveryUsed = true;
+        try {
+          recovery = await recoverLoginExpired({ sessionId, childEnv: nextEnv });
+        } catch {}
+      }
       const recovered = recovery?.rotated === true
         && typeof recovery.previousAccount === 'string'
         && typeof recovery.currentAccount === 'string'
@@ -457,7 +455,25 @@ export async function runClaudeWithRecovery({
         && recovery.childEnv
         && typeof recovery.childEnv === 'object';
       if (!recovered) {
-        log('[TeamClaude] Claude login expired; no alternate account is available. Run /login.');
+        let status = null;
+        try {
+          status = await fetchStatus();
+        } catch {}
+        if (config.codexFallbackOnExhaustion === true
+            && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
+          const handoff = await writeHandoff({
+            transcriptPath,
+            sessionId,
+            cwd,
+            handoffRoot,
+          });
+          log(`[TeamClaude] Claude login expired with no account quota remaining; handing session ${sessionId} to Codex.`);
+          await stopChild(child);
+          return launchCodex(handoff);
+        }
+        log(canRecover
+          ? '[TeamClaude] Claude login expired; no alternate account is available. Run /login.'
+          : '[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
         return childExit(child);
       }
 

@@ -237,6 +237,75 @@ test('Login expired written immediately before child exit is still recovered', a
   assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
 });
 
+test('Login expired falls back to Codex when no Claude account remains', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-codex-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  let codexCall = null;
+  let recoveries = 0;
+  let spawns = 0;
+  let kills = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+      switchThreshold: 0.98,
+    },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.98),
+    recoverLoginExpired: async () => {
+      recoveries += 1;
+      return null;
+    },
+    spawnClaude(args) {
+      spawns += 1;
+      const child = fakeChild(() => {
+        kills += 1;
+      });
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        const records = [
+          JSON.stringify({
+            type: 'user',
+            cwd,
+            message: { role: 'user', content: 'Codex로 같은 작업을 이어서 완료해' },
+          }),
+          authenticationRecord(cwd, 'Login expired · Please run /login'),
+        ];
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${records.join('\n')}\n`);
+      }, 10);
+      setTimeout(() => child.finish(9), 80);
+      return child;
+    },
+    launchCodex: async handoff => {
+      codexCall = handoff;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(recoveries, 1);
+  assert.equal(spawns, 1);
+  assert.equal(kills, 1);
+  assert.ok(codexCall?.path);
+  const handoff = await readFile(codexCall.path, 'utf8');
+  assert.match(handoff, /Codex로 같은 작업을 이어서 완료해/);
+});
+
 test('Login expired nested message is recovered but generic authentication_failed is ignored', async t => {
   const cases = [
     {
