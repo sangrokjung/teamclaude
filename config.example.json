@@ -18,6 +18,7 @@
   "maxResponseBytes": 67108864,
   "upstreamResponseTimeoutMs": 300000,
   "streamIdleTimeoutMs": 300000,
+  "streamTotalTimeoutMs": 900000,
   "requestBodyTimeoutMs": 30000,
   "maxBufferedRequestBytes": 268435456,
   "modelFallbacks": {
@@ -26,6 +27,10 @@
       "claude-sonnet-5"
     ]
   },
+  "autoResumeClaude": true,
+  "claudeAutoResumeMaxRetries": 3,
+  "claudeAutoResumeBackoffMs": 2000,
+  "codexFallbackOnExhaustion": false,
   "accounts": [
     {
       "name": "primary-max",

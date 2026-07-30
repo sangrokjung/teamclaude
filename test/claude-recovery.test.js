@@ -1,0 +1,194 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  isClaudeFleetExhausted,
+  runClaudeWithRecovery,
+} from '../src/claude-recovery.js';
+
+function fakeChild(onKill = null) {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = signal => {
+    onKill?.(signal);
+    if (child.exitCode == null && child.signalCode == null) {
+      child.signalCode = signal;
+      Promise.resolve().then(() => child.emit('exit', null, signal));
+    }
+    return true;
+  };
+  child.finish = (code = 0) => {
+    if (child.exitCode != null || child.signalCode != null) return;
+    child.exitCode = code;
+    child.emit('exit', code, null);
+  };
+  return child;
+}
+
+function timeoutRecord(cwd) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    timestamp: new Date().toISOString(),
+    isApiErrorMessage: true,
+    error: 'server_error',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Request timed out' }],
+    },
+  });
+}
+
+function statusWithQuota(utilization) {
+  return {
+    switchThreshold: 0.98,
+    accounts: [{
+      enabled: true,
+      status: 'active',
+      quota: {
+        unified5h: 0.1,
+        unified5hReset: new Date(Date.now() + 60_000).toISOString(),
+        unified7d: utilization,
+        unified7dReset: new Date(Date.now() + 60_000).toISOString(),
+      },
+    }],
+  };
+}
+
+test('timeout with general Claude quota remaining resumes the same session once', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-resume-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  let codexCalls = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+      switchThreshold: 0.98,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        setTimeout(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          await writeFile(join(dir, `${sessionId}.jsonl`), `${timeoutRecord(cwd)}\n`);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      codexCalls += 1;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
+  assert.equal(codexCalls, 0);
+});
+
+test('exhausted general Claude fleet creates one sanitized handoff and launches Codex', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-codex-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  let codexCall = null;
+  let spawnCount = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+      switchThreshold: 0.98,
+    },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.98),
+    spawnClaude(args) {
+      spawnCount += 1;
+      const child = fakeChild();
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        const records = [
+          JSON.stringify({
+            type: 'user',
+            cwd,
+            gitBranch: 'feature/recovery',
+            timestamp: new Date().toISOString(),
+            message: { role: 'user', content: '마지막 작업을 계속 완료해' },
+          }),
+          JSON.stringify({
+            type: 'user',
+            cwd,
+            timestamp: new Date().toISOString(),
+            message: {
+              role: 'user',
+              content: [{ type: 'tool_result', content: 'secret-tool-output' }],
+            },
+          }),
+          timeoutRecord(cwd),
+          timeoutRecord(cwd),
+        ];
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${records.join('\n')}\n`);
+      }, 10);
+      return child;
+    },
+    launchCodex: async handoff => {
+      codexCall = handoff;
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(spawnCount, 1);
+  assert.ok(codexCall?.path);
+  const handoff = await readFile(codexCall.path, 'utf8');
+  assert.match(handoff, /마지막 작업을 계속 완료해/);
+  assert.doesNotMatch(handoff, /secret-tool-output/);
+  assert.equal(codexCall.prompt.includes(codexCall.path), true);
+});
+
+test('unknown or partial quota never triggers a Codex handoff', async () => {
+  assert.equal(isClaudeFleetExhausted({
+    accounts: [{ enabled: true, status: 'active', quota: {} }],
+  }, 0.98), false);
+  assert.equal(isClaudeFleetExhausted({
+    accounts: [{ enabled: true, status: 'active', quota: {
+      unified7d: 0.98,
+      unified7dReset: null,
+    } }],
+  }, 0.98), false);
+});

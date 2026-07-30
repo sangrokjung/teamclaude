@@ -28,6 +28,7 @@ const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 
 export function createProxyServer(accountManager, config, hooks = {}) {
@@ -96,6 +97,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       && config.streamIdleTimeoutMs > 0
     ? Math.floor(config.streamIdleTimeoutMs)
     : DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+  const streamTotalTimeoutMs = Number.isFinite(config.streamTotalTimeoutMs)
+      && config.streamTotalTimeoutMs > 0
+    ? Math.floor(config.streamTotalTimeoutMs)
+    : provider === 'anthropic' ? DEFAULT_STREAM_TOTAL_TIMEOUT_MS : null;
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -621,7 +626,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1844,6 +1849,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ensureHeaders,
         ctx.maxResponseBytes,
         ctx.streamIdleTimeoutMs,
+        ctx.streamTotalTimeoutMs,
       );
       if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
         ctx.status = 502;
@@ -2097,6 +2103,7 @@ async function streamResponse(
   ensureHeaders = null,
   transactionMaxBytes = DEFAULT_MAX_RESPONSE_BYTES,
   streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  streamTotalTimeoutMs = null,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
@@ -2107,6 +2114,9 @@ async function streamResponse(
   let spillFile = null;
   let spillPath = null;
   let spillUnlinked = false;
+  const streamDeadlineAt = Number.isFinite(streamTotalTimeoutMs)
+    ? Date.now() + streamTotalTimeoutMs
+    : Infinity;
   const outcome = {
     injected: false,
     reason: null,
@@ -2167,7 +2177,11 @@ async function streamResponse(
       const onClose = () => settle(false);
       res.once('drain', onDrain);
       res.once('close', onClose);
-      timer = setTimeout(() => settle(false), streamIdleTimeoutMs);
+      const remainingTotalMs = Math.max(1, streamDeadlineAt - Date.now());
+      timer = setTimeout(
+        () => settle(false),
+        Math.min(streamIdleTimeoutMs, remainingTotalMs),
+      );
       timer.unref?.();
     });
   };
@@ -2245,10 +2259,14 @@ async function streamResponse(
     while (true) {
       let step;
       try {
+        const remainingTotalMs = streamDeadlineAt - Date.now();
+        const totalDeadlineIsSooner = remainingTotalMs <= streamIdleTimeoutMs;
         step = await raceTimeout(
           reader.read(),
-          streamIdleTimeoutMs,
-          `Upstream SSE idle timeout after ${streamIdleTimeoutMs}ms`,
+          Math.max(1, Math.min(streamIdleTimeoutMs, remainingTotalMs)),
+          totalDeadlineIsSooner
+            ? `Upstream SSE total timeout after ${streamTotalTimeoutMs}ms`
+            : `Upstream SSE idle timeout after ${streamIdleTimeoutMs}ms`,
         );
       } catch (err) {
         // Upstream died mid-stream.

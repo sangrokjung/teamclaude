@@ -20,6 +20,7 @@ import {
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+import { runClaudeWithRecovery } from './claude-recovery.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -1676,7 +1677,39 @@ async function runCommand() {
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
-  // Use spawnSync so the Node process blocks entirely — behaves like execvp.
+  if (config.autoResumeClaude === true || config.codexFallbackOnExhaustion === true) {
+    const result = await runClaudeWithRecovery({
+      claudeArgs: clientArgs,
+      childEnv,
+      config,
+      fetchStatus: async () => {
+        const response = await fetch(`http://127.0.0.1:${config.proxy.port}/teamclaude/status`, {
+          signal: AbortSignal.timeout(1500),
+        });
+        if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
+        return response.json();
+      },
+      spawnClaude: (recoveryArgs, recoveryEnv) => spawn('claude', recoveryArgs, {
+        stdio: 'inherit',
+        env: recoveryEnv,
+      }),
+      launchCodex: handoff => spawnSync(
+        process.execPath,
+        [process.argv[1], 'codex', 'run', '--', handoff.prompt],
+        { stdio: 'inherit', env: childEnv },
+      ),
+    });
+    if (result?.error) {
+      if (result.error.code === 'ENOENT') {
+        console.error('Claude Code or Codex CLI not found in PATH.');
+      } else {
+        console.error(`Failed to recover CLI session: ${result.error.message}`);
+      }
+      process.exit(1);
+    }
+    return propagateChildExit(result);
+  }
+
   const result = spawnSync('claude', clientArgs, {
     stdio: 'inherit',
     env: childEnv,

@@ -348,6 +348,10 @@ export function createDefaultConfig() {
     // Total deadline for upstream response headers and buffered response bodies.
     // Long-lived SSE bodies are exempt after their response headers arrive.
     upstreamResponseTimeoutMs: 300000,
+    // Hard ceiling for one SSE response even when upstream keepalive/ping chunks
+    // keep resetting the idle deadline. This fires before Claude Code's own
+    // request timeout so the client receives a retryable overload response.
+    streamTotalTimeoutMs: provider === 'anthropic' ? 900000 : null,
     // One alternate account distinguishes a per-account rate cap from a global
     // limit without multiplying one request across the whole fleet.
     rateLimitFailovers: 1,
@@ -359,6 +363,10 @@ export function createDefaultConfig() {
     modelFallbacks: {},
     activeWarmup: provider === 'anthropic',
     launchModel: null,
+    autoResumeClaude: true,
+    claudeAutoResumeMaxRetries: 3,
+    claudeAutoResumeBackoffMs: 2000,
+    codexFallbackOnExhaustion: false,
     // Hard caps that bound proxy memory under a request flood.
     overflowQueueMaxDepth: 256,        // max queued requests before 429
     maxRequestBytes: 33554432,         // 32 MiB max buffered request body, else 413

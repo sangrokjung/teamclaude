@@ -632,6 +632,47 @@ test('stalled SSE response hits the idle deadline and releases its slot', async 
   }
 });
 
+test('SSE ping traffic cannot outlive the total stream deadline', async () => {
+  let requests = 0;
+  const upstream = http.createServer((_req, res) => {
+    requests += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    const ping = setInterval(() => res.write(': ping\n\n'), 10);
+    ping.unref();
+    res.once('close', () => clearInterval(ping));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    streamIdleTimeoutMs: 50,
+    streamTotalTimeoutMs: 120,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(750),
+    });
+    const body = await res.json();
+    const elapsed = Date.now() - started;
+    assert.equal(res.status, 529);
+    assert.equal(body.error?.type, 'overloaded_error');
+    assert.equal(requests, 1, 'a timed-out POST must not be replayed internally');
+    assert.ok(elapsed >= 100 && elapsed < 500,
+      `total stream deadline should fire near 120ms, took ${elapsed}ms`);
+    assert.equal(am.accounts[0].inflight, 0, 'the total deadline must release its slot');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('slow SSE reader hits the drain deadline and releases its slot', async () => {
   const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
     + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';

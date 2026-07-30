@@ -393,6 +393,20 @@ If the proxy is not running, `teamclaude run` now starts it in the background
 and waits for the listener before launching Claude Code. The server keeps that
 public listener in a supervisor process, so a crashed proxy worker is replaced
 while new connections wait instead of failing with `ConnectionRefused`.
+
+With `autoResumeClaude: true`, the launcher gives a new Claude Code conversation
+an explicit session ID and watches only that transcript for terminal API errors.
+`Request timed out` and terminal rate/overload errors restart the same conversation
+as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
+interactive session does not wait indefinitely at the prompt for a person.
+
+`codexFallbackOnExhaustion: true` additionally hands the conversation to TeamCodex
+only when every enabled Claude account has a fresh, finite general quota window
+at or above `switchThreshold`. A Fable-only `7d_oi` exhaustion, a transient queue,
+or unknown/partial quota evidence cannot trigger the provider switch. The launcher
+writes a credential-protected, provider-neutral transcript summary under
+`~/.config/teamclaude-handoffs/`, stops the Claude child, and starts one Codex CLI
+with that handoff. Tool inputs and tool results are excluded from the handoff.
 When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
 quota status before launch. It starts Claude Code directly on the first configured
 fallback only when **every generally available account** has a fresh, measured,
@@ -575,6 +589,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `maxResponseBytes` | Maximum bytes buffered per upstream response before returning 502; covers transactional SSE, non-SSE, and OAuth relay responses (optional, default `67108864` = 64 MiB) |
 | `upstreamResponseTimeoutMs` | Total deadline for upstream response headers and buffered non-SSE response bodies (optional, default `300000` = 5 minutes) |
 | `streamIdleTimeoutMs` | Maximum idle time between upstream SSE chunks or while waiting for a downstream client to drain; expiry cancels the stream and releases proxy capacity (optional, default `300000` = 5 minutes) |
+| `streamTotalTimeoutMs` | Hard ceiling for one Anthropic SSE response even when keepalive/ping chunks keep resetting the idle timer; expiry becomes a retryable overload before Claude Code's own request timeout (optional, Claude default `900000` = 15 minutes; Codex default disabled) |
 | `requestBodyTimeoutMs` | Total deadline for receiving a client request body before returning 408 and releasing admission capacity (optional, default `30000` = 30 seconds) |
 | `maxBufferedRequestBytes` | Total request-buffer memory budget used to cap admission before buffering; supervised requests count both supervisor and worker copies (optional, default `268435456` = 256 MiB) |
 | `continuityMaxWaitMs` | Total continuity deadline for internally recovering quota and transient/global 429 responses (optional, default `900000` = 15 minutes) |
@@ -584,6 +599,10 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 | `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
+| `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload errors (optional, default `true`) |
+| `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
+| `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
+| `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when every enabled Claude account has fresh general-quota exhaustion evidence (optional, default `false`) |
 
 ### Model fallbacks (fork)
 
