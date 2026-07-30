@@ -10,10 +10,6 @@ const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
 const SUPERVISED_MARKER = 'TEAMCLAUDE_SESSION_SUPERVISED=1';
 const LOGIN_EXPIRED = 'Login expired · Please run /login';
 
-function delay(ms) {
-  return new Promise(resolveDelay => setTimeout(resolveDelay, ms));
-}
-
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 }
@@ -111,10 +107,16 @@ function validSession(store, session) {
 async function defaultInspectProcess(pid) {
   try {
     process.kill(pid, 0);
-    const [{ stdout: command }, { stdout: environment }, { stdout: cwdOutput }] = await Promise.all([
+    const [
+      { stdout: command },
+      { stdout: environment },
+      { stdout: cwdOutput },
+      { stdout: startedAt },
+    ] = await Promise.all([
       execFileAsync('ps', ['-p', String(pid), '-o', 'command='], { timeout: 1500 }),
       execFileAsync('ps', ['eww', '-p', String(pid), '-o', 'command='], { timeout: 1500 }),
       execFileAsync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { timeout: 1500 }),
+      execFileAsync('ps', ['-p', String(pid), '-o', 'lstart='], { timeout: 1500 }),
     ]);
     const executablePath = command.trim().split(/\s+/)[0] || '';
     const cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || '';
@@ -123,6 +125,7 @@ async function defaultInspectProcess(pid) {
       alive: true,
       cwd,
       executablePath,
+      processIdentity: `${pid}:${startedAt.trim()}`,
       surfaceId,
       supervised: environment.includes(SUPERVISED_MARKER),
     };
@@ -131,8 +134,15 @@ async function defaultInspectProcess(pid) {
   }
 }
 
-async function sameProcess(session, info) {
-  if (!info?.alive || info.supervised || info.surfaceId !== session.surfaceId) return false;
+async function sameProcess(session, info, expectedIdentity = null) {
+  if (!info?.alive
+      || info.supervised
+      || info.surfaceId !== session.surfaceId
+      || typeof info.processIdentity !== 'string'
+      || !info.processIdentity
+      || (expectedIdentity && info.processIdentity !== expectedIdentity)) {
+    return false;
+  }
   try {
     const [processExecutable, launchExecutable, processCwd, sessionCwd] = await Promise.all([
       realpath(info.executablePath),
@@ -146,24 +156,6 @@ async function sameProcess(session, info) {
   }
 }
 
-async function defaultTerminateProcess(pid, timeoutMs = 5000) {
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {
-    return false;
-  }
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
-    await delay(50);
-  }
-  return false;
-}
-
 function buildResumeCommand({ cwd, sessionId, nodePath, scriptPath, configPath }) {
   const config = configPath
     ? `TEAMCLAUDE_CONFIG=${shellQuote(configPath)} `
@@ -171,8 +163,14 @@ function buildResumeCommand({ cwd, sessionId, nodePath, scriptPath, configPath }
   return `cd -- ${shellQuote(cwd)} && ${config}${shellQuote(nodePath)} ${shellQuote(scriptPath)} run -- --resume ${shellQuote(sessionId)} continue`;
 }
 
-async function defaultSendResume({ surfaceId, command }) {
-  await execFileAsync('cmux', ['send', '--surface', surfaceId, `${command}\\n`], {
+async function defaultRespawnSurface({ surfaceId, command }) {
+  await execFileAsync('cmux', [
+    'respawn-pane',
+    '--surface',
+    surfaceId,
+    '--command',
+    command,
+  ], {
     timeout: 5000,
   });
 }
@@ -190,8 +188,7 @@ export async function rescueCmuxSessionsOnce({
   attempted = new Set(),
   readStore = defaultReadStore,
   inspectProcess = defaultInspectProcess,
-  terminateProcess = defaultTerminateProcess,
-  sendResume = defaultSendResume,
+  respawnSurface = defaultRespawnSurface,
 }) {
   let store;
   try {
@@ -224,29 +221,34 @@ export async function rescueCmuxSessionsOnce({
     const first = await inspectProcess(fresh.pid);
     if (!await sameProcess(fresh, first)) continue;
     const second = await inspectProcess(fresh.pid);
-    if (!await sameProcess(fresh, second)) continue;
-    if (!await terminateProcess(fresh.pid)) continue;
+    if (!await sameProcess(fresh, second, first.processIdentity)) continue;
 
-    attempted.add(key);
+    let finalStore;
+    try {
+      finalStore = await readStore(storePath);
+    } catch {
+      continue;
+    }
+    const final = sessions(finalStore).find(item => item?.sessionId === fresh.sessionId);
+    if (!final || final.pid !== fresh.pid || !validSession(finalStore, final)) continue;
+    if (!await hasUnresolvedLoginExpired(final.transcriptPath, transcriptRoot)) continue;
+    const finalInfo = await inspectProcess(final.pid);
+    if (!await sameProcess(final, finalInfo, first.processIdentity)) continue;
+
     const command = buildResumeCommand({
-      cwd: fresh.cwd,
-      sessionId: fresh.sessionId,
+      cwd: final.cwd,
+      sessionId: final.sessionId,
       nodePath,
       scriptPath,
       configPath,
     });
-    let sent = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await sendResume({ surfaceId: fresh.surfaceId, command });
-        sent = true;
-        break;
-      } catch {
-        if (attempt < 2) await delay(200 * 2 ** attempt);
-      }
+    try {
+      await respawnSurface({ surfaceId: final.surfaceId, command });
+      attempted.add(key);
+      rescued += 1;
+    } catch {
+      failed += 1;
     }
-    if (sent) rescued += 1;
-    else failed += 1;
   }
   return { scanned: currentSessions.length, candidates, rescued, failed };
 }

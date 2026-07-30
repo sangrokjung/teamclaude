@@ -89,6 +89,7 @@ function processInfo(fx, overrides = {}) {
     alive: true,
     cwd: fx.cwd,
     executablePath: fx.executablePath,
+    processIdentity: '12345:Mon Jul 30 23:00:00 2026',
     surfaceId: SURFACE_ID,
     supervised: false,
     ...overrides,
@@ -97,8 +98,7 @@ function processInfo(fx, overrides = {}) {
 
 test('adopts active unresolved Login expired session once', async t => {
   const fx = await fixture(t);
-  const terminated = [];
-  const sent = [];
+  const respawned = [];
   const result = await rescueCmuxSessionsOnce({
     storePath: fx.storePath,
     transcriptRoot: fx.transcriptRoot,
@@ -106,21 +106,16 @@ test('adopts active unresolved Login expired session once', async t => {
     scriptPath: '/opt/teamclaude/src/index.js',
     configPath: '/tmp/teamclaude config.json',
     inspectProcess: async () => processInfo(fx),
-    terminateProcess: async pid => {
-      terminated.push(pid);
-      return true;
-    },
-    sendResume: async request => {
-      sent.push(request);
+    respawnSurface: async request => {
+      respawned.push(request);
     },
   });
 
   assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
-  assert.deepEqual(terminated, [12345]);
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].surfaceId, SURFACE_ID);
+  assert.equal(respawned.length, 1);
+  assert.equal(respawned[0].surfaceId, SURFACE_ID);
   assert.equal(
-    sent[0].command,
+    respawned[0].command,
     `cd -- '${fx.cwd.replaceAll("'", "'\"'\"'")}' && TEAMCLAUDE_CONFIG='/tmp/teamclaude config.json' '/usr/local/bin/node' '/opt/teamclaude/src/index.js' run -- --resume '${SESSION_ID}' continue`,
   );
 });
@@ -164,32 +159,25 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
     await t.test(scenario.name, async t => {
       const fx = await fixture(t);
       await scenario.mutate?.(fx);
-      let terminations = 0;
-      let sends = 0;
+      let respawns = 0;
       await rescueCmuxSessionsOnce({
         storePath: fx.storePath,
         transcriptRoot: fx.transcriptRoot,
         nodePath: '/usr/local/bin/node',
         scriptPath: '/opt/teamclaude/src/index.js',
         inspectProcess: async () => scenario.inspect?.(fx) || processInfo(fx),
-        terminateProcess: async () => {
-          terminations += 1;
-          return true;
-        },
-        sendResume: async () => {
-          sends += 1;
+        respawnSurface: async () => {
+          respawns += 1;
         },
       });
-      assert.equal(terminations, 0);
-      assert.equal(sends, 0);
+      assert.equal(respawns, 0);
     });
   }
 });
 
 test('coalesces concurrent rescue scans and never adopts the same process twice', async t => {
   const fx = await fixture(t);
-  let terminations = 0;
-  let sends = 0;
+  let respawns = 0;
   const rescuer = createCmuxSessionRescuer({
     enabled: true,
     storePath: fx.storePath,
@@ -197,12 +185,8 @@ test('coalesces concurrent rescue scans and never adopts the same process twice'
     nodePath: '/usr/local/bin/node',
     scriptPath: '/opt/teamclaude/src/index.js',
     inspectProcess: async () => processInfo(fx),
-    terminateProcess: async () => {
-      terminations += 1;
-      return true;
-    },
-    sendResume: async () => {
-      sends += 1;
+    respawnSurface: async () => {
+      respawns += 1;
     },
     log() {},
   });
@@ -214,26 +198,80 @@ test('coalesces concurrent rescue scans and never adopts the same process twice'
   assert.equal(first, second);
   assert.equal(first.rescued, 1);
   assert.equal(third.rescued, 0);
-  assert.equal(terminations, 1);
-  assert.equal(sends, 1);
+  assert.equal(respawns, 1);
 });
 
-test('bounds cmux relaunch retries after the blocked process exits', async t => {
+test('keeps the blocked process intact when atomic cmux respawn fails', async t => {
   const fx = await fixture(t);
-  let sends = 0;
+  let respawns = 0;
   const result = await rescueCmuxSessionsOnce({
     storePath: fx.storePath,
     transcriptRoot: fx.transcriptRoot,
     nodePath: '/usr/local/bin/node',
     scriptPath: '/opt/teamclaude/src/index.js',
     inspectProcess: async () => processInfo(fx),
-    terminateProcess: async () => true,
-    sendResume: async () => {
-      sends += 1;
+    terminateProcess: async () => {
+      throw new Error('must not terminate separately');
+    },
+    respawnSurface: async () => {
+      respawns += 1;
       throw new Error('cmux unavailable');
     },
   });
 
-  assert.equal(sends, 3);
+  assert.equal(respawns, 1);
   assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+});
+
+test('rejects process identity or active mapping changes before atomic respawn', async t => {
+  await t.test('process identity changed', async t => {
+    const fx = await fixture(t);
+    let inspections = 0;
+    let legacyTerminations = 0;
+    let respawns = 0;
+    await rescueCmuxSessionsOnce({
+      storePath: fx.storePath,
+      transcriptRoot: fx.transcriptRoot,
+      nodePath: '/usr/local/bin/node',
+      scriptPath: '/opt/teamclaude/src/index.js',
+      inspectProcess: async () => processInfo(fx, {
+        processIdentity: inspections++ === 0 ? '12345:first' : '12345:reused',
+      }),
+      terminateProcess: async () => {
+        legacyTerminations += 1;
+        return true;
+      },
+      respawnSurface: async () => {
+        respawns += 1;
+      },
+    });
+    assert.equal(legacyTerminations, 0);
+    assert.equal(respawns, 0);
+  });
+
+  await t.test('active surface mapping changed', async t => {
+    const fx = await fixture(t);
+    let reads = 0;
+    let legacyTerminations = 0;
+    let respawns = 0;
+    const changed = structuredClone(fx.store);
+    changed.activeSessionsBySurface[SURFACE_ID].sessionId = OTHER_SESSION_ID;
+    await rescueCmuxSessionsOnce({
+      storePath: fx.storePath,
+      transcriptRoot: fx.transcriptRoot,
+      nodePath: '/usr/local/bin/node',
+      scriptPath: '/opt/teamclaude/src/index.js',
+      readStore: async () => (++reads >= 3 ? changed : fx.store),
+      inspectProcess: async () => processInfo(fx),
+      terminateProcess: async () => {
+        legacyTerminations += 1;
+        return true;
+      },
+      respawnSurface: async () => {
+        respawns += 1;
+      },
+    });
+    assert.equal(legacyTerminations, 0);
+    assert.equal(respawns, 0);
+  });
 });
