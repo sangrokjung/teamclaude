@@ -24,6 +24,13 @@ writeFileSync(process.env.CODEX_LOG, JSON.stringify({
 `);
   await writeFile(join(dir, 'cmux'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
+const credentials = [
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'CODEX_ACCESS_TOKEN',
+  'TEAMCLAUDE_CODEX_PROXY_TOKEN',
+];
+if (credentials.some((key) => process.env[key])) process.exit(70);
 writeFileSync(process.env.CMUX_LOG, JSON.stringify(process.argv.slice(2)));
 process.stdout.write(process.env.CMUX_BINDING);
 `);
@@ -70,7 +77,7 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     // When
     const result = spawnSync(
       process.execPath,
-      [entry, 'codex', 'resume', SESSION_ID, '--yolo'],
+      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model_provider="openai"'],
       { encoding: 'utf8', env: fx.env },
     );
 
@@ -80,9 +87,9 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     const child = JSON.parse(await readFile(fx.codexLog, 'utf8'));
     const resumeIndex = child.args.indexOf('resume');
     const providerIndex = child.args.indexOf('model_provider="teamcodex_proxy"');
+    const bypassIndex = child.args.indexOf('model_provider="openai"');
     assert.deepEqual(child.args.slice(resumeIndex, resumeIndex + 2), ['resume', SESSION_ID]);
-    assert.ok(providerIndex > resumeIndex);
-    assert.equal(child.args.at(-1), '--yolo');
+    assert.ok(providerIndex > bypassIndex);
     assert.equal(child.openaiApiKey, null);
     assert.equal(child.codexApiKey, null);
     assert.equal(child.codexAccessToken, null);
