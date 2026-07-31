@@ -92,6 +92,9 @@ recovery command.
   not treat the recent-session selector as the source of truth.
 - TeamCodex appends its provider configuration after forwarded resume options,
   so an ad-hoc `-c model_provider=...` cannot silently replace the proxy route.
+- TeamCodex rejects `--remote`, `--remote-auth-token-env`, `--oss`, and
+  `--local-provider` on exact resume because those options bypass provider
+  configuration instead of overriding it.
 - The checkpoint-only cmux lookup runs without direct Codex credential
   environment variables.
 - When provider configuration changes, restart or exact-resume existing TUI

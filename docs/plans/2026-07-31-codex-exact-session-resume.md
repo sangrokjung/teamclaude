@@ -30,9 +30,10 @@
 - Red: `node --test test/codex-resume.test.js` failed because `resume` was an
   unknown command.
 - Targeted: `node --test test/codex-resume.test.js test/codex-run.test.js
-  test/codex-session.test.js test/codex.test.js` passed 12/12 after the
-  resume-argument ordering and cmux credential-boundary fixes.
-- Full: `qgate.py run --slot heavy -- npm test` passed 411/411 on the final
+  test/codex-session.test.js test/codex.test.js` passed 13/13 after the
+  resume-argument ordering, alternate-route, and cmux credential-boundary
+  fixes.
+- Full: `qgate.py run --slot heavy -- npm test` passed 412/412 on the final
   `fork/master`-based branch.
 - Lint: `npx --yes eslint .` exited 0. (`npm run lint` could not locate a local
   ESLint binary; no dependency was added.)
@@ -42,9 +43,16 @@
   wrapper captured `resume SESSION_ID` followed by
   `model_provider="teamcodex_proxy"`. A live agent-hook binding with that same
   ordering preserved the TeamCodex provider in its public restore command.
+- Manual CLI QA: source entrypoint invocations with `--remote` and `--oss`
+  both exited 1 before launching Codex and identified the provider-routing
+  bypass.
 - Independent review at `75b7fb1` found that forwarded options could replace
   the provider and that the cmux lookup inherited direct Codex credentials.
   Both were fixed and locked by CLI/subprocess regression tests before the
   final review SHA.
+- Security review at `33700e5` found that Codex alternate execution flags
+  bypassed `model_provider` despite the final override. Resume now rejects
+  remote/local provider flags, with each accepted spelling covered by the
+  CLI regression test.
 - Housekeeping scan: `info`, 0 sensitive hits. Existing untracked `.omo/`
   remained untouched.

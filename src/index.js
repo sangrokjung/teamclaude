@@ -12,6 +12,7 @@ import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
+  assertSafeCodexResumeArgs,
   buildCodexProxyArgs,
   importCodexCredentials,
   parseCodexCredentialsJson,
@@ -1744,6 +1745,12 @@ async function codexResumeCommand() {
     resumeArgs = args.slice(2);
     if (resumeArgs[0] === '--') resumeArgs.shift();
     sessionId = candidate;
+  }
+  try {
+    assertSafeCodexResumeArgs(resumeArgs);
+  } catch (err) {
+    console.error(`[TeamCodex] ${err.message}`);
+    process.exit(1);
   }
   await runCommand(['resume', sessionId, ...resumeArgs]);
 }

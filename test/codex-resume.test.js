@@ -98,6 +98,38 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
   }
 });
 
+test('codex resume rejects options that bypass TeamCodex provider routing', async () => {
+  // Given
+  const fx = await fixture({});
+  const unsafeArgs = [
+    ['--remote', 'ws://127.0.0.1:9999'],
+    ['--remote=ws://127.0.0.1:9999'],
+    ['--remote-auth-token-env', 'REMOTE_TOKEN'],
+    ['--remote-auth-token-env=REMOTE_TOKEN'],
+    ['--oss'],
+    ['--local-provider', 'ollama'],
+    ['--local-provider=ollama'],
+  ];
+
+  try {
+    for (const args of unsafeArgs) {
+      // When
+      const result = spawnSync(
+        process.execPath,
+        [entry, 'codex', 'resume', SESSION_ID, ...args],
+        { encoding: 'utf8', env: fx.env },
+      );
+
+      // Then
+      assert.notEqual(result.status, 0, args.join(' '));
+      assert.match(result.stderr, /bypasses TeamCodex provider routing/);
+      assert.equal(await exists(fx.codexLog), false);
+    }
+  } finally {
+    await rm(fx.dir, { recursive: true, force: true });
+  }
+});
+
 test('codex resume uses the exact current cmux checkpoint without a selector', async () => {
   // Given
   const fx = await fixture({

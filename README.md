@@ -243,7 +243,9 @@ The no-ID form fails closed when cmux is unavailable or the current surface
 does not have a valid Codex resume binding. It never guesses from working
 directory or recency. Start new sessions with `teamcodex codex run`; cmux then
 records the exact checkpoint together with the TeamCodex provider overrides,
-so later tab restoration keeps the proxy route. See the
+so later tab restoration keeps the proxy route. Resume rejects Codex
+`--remote`, `--remote-auth-token-env`, `--oss`, and `--local-provider` options
+because they would leave that route. See the
 [Codex provider/session recovery runbook](docs/runbooks/codex-provider-session-recovery.md)
 for diagnosis and legacy-session recovery.
 

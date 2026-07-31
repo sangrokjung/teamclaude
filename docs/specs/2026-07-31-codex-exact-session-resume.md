@@ -42,8 +42,11 @@ bound to the current cmux surface and always launches it through TeamCodex.
    environment variables. The cmux checkpoint lookup also receives no direct
    Codex credential variables.
 5. For `resume`, TeamCodex provider overrides follow the exact session selector
-   and forwarded resume arguments, so user flags cannot replace the provider
-   and cmux preserves the enforced route in its next restore binding.
+   and forwarded resume arguments, so configuration flags cannot replace the
+   provider and cmux preserves the enforced route in its next restore binding.
+   Alternate execution paths (`--remote`, `--remote-auth-token-env`, `--oss`,
+   and `--local-provider`) are rejected instead of forwarded because they
+   bypass `model_provider` selection entirely.
 6. Existing `teamcodex codex run` behavior remains a single launch with no
    implicit resume.
 7. Public help, English/Korean setup docs, architecture notes, and an incident
@@ -61,6 +64,8 @@ bound to the current cmux surface and always launches it through TeamCodex.
 - [x] Resume bindings preserve the provider override after the session ID.
 - [x] Forwarded resume configuration cannot override the final TeamCodex
   provider selection.
+- [x] Resume rejects every Codex CLI option that activates a remote or local
+  provider path outside TeamCodex.
 - [x] The cmux lookup subprocess does not inherit direct Codex credentials.
 - [x] Existing Codex run tests, the full Node test suite, and ESLint pass.
 - [x] A real temporary cmux terminal surface shows a TeamCodex-backed resume

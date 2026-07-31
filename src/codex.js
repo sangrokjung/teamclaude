@@ -6,6 +6,12 @@ const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const OPENAI_AUTH_CLAIM = 'https://api.openai.com/auth';
 const OPENAI_PROFILE_CLAIM = 'https://api.openai.com/profile';
 const TOKEN_REFRESH_TIMEOUT_MS = 30_000;
+const UNSAFE_CODEX_RESUME_OPTIONS = new Set([
+  '--local-provider',
+  '--oss',
+  '--remote',
+  '--remote-auth-token-env',
+]);
 
 function decodeJwtPayload(token) {
   if (typeof token !== 'string') return {};
@@ -129,4 +135,16 @@ export function buildCodexProxyArgs(port, userArgs) {
     return [...userArgs, ...overrides];
   }
   return [...overrides, ...userArgs];
+}
+
+export function assertSafeCodexResumeArgs(userArgs) {
+  for (const arg of userArgs) {
+    if (arg === '--') break;
+    const option = arg.split('=', 1)[0];
+    if (UNSAFE_CODEX_RESUME_OPTIONS.has(option)) {
+      throw new Error(
+        `Codex resume option ${option} bypasses TeamCodex provider routing.`,
+      );
+    }
+  }
 }

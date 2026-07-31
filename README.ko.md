@@ -209,6 +209,8 @@ ID를 생략한 명령은 cmux를 사용할 수 없거나 현재 탭에 신뢰�
 resume binding이 없으면 추측하지 않고 실패합니다. 새 세션은
 `teamcodex codex run`으로 시작하세요. cmux가 정확한 checkpoint와 TeamCodex
 provider 인자를 함께 기록하므로 이후 탭 복원도 프록시 경로를 유지합니다.
+`--remote`, `--remote-auth-token-env`, `--oss`, `--local-provider`는 이 경로를
+벗어나므로 resume 명령에서 거부합니다.
 진단과 레거시 세션 복구는
 [Codex provider/session 복구 runbook](docs/runbooks/codex-provider-session-recovery.md)을
 참고하세요.
