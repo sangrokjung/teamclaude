@@ -30,8 +30,9 @@
 - Red: `node --test test/codex-resume.test.js` failed because `resume` was an
   unknown command.
 - Targeted: `node --test test/codex-resume.test.js test/codex-run.test.js
-  test/codex.test.js` passed 11/11 after the resume-argument ordering fix.
-- Full: `qgate.py run --slot heavy -- npm test` passed 412/412.
+  test/codex-session.test.js test/codex.test.js` passed 12/12 after the
+  resume-argument ordering and cmux credential-boundary fixes.
+- Full: `qgate.py run --slot heavy -- npm test` passed 413/413.
 - Lint: `npx --yes eslint .` exited 0. (`npm run lint` could not locate a local
   ESLint binary; no dependency was added.)
 - Package surface: `npm pack --dry-run --json` included
@@ -40,5 +41,9 @@
   wrapper captured `resume SESSION_ID` followed by
   `model_provider="teamcodex_proxy"`. A live agent-hook binding with that same
   ordering preserved the TeamCodex provider in its public restore command.
+- Independent review at `75b7fb1` found that forwarded options could replace
+  the provider and that the cmux lookup inherited direct Codex credentials.
+  Both were fixed and locked by CLI/subprocess regression tests before the
+  final review SHA.
 - Housekeeping scan: `info`, 0 sensitive hits. Existing untracked `.omo/`
   remained untouched.
