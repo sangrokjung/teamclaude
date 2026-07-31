@@ -416,6 +416,7 @@ test('repeated Login expired after account rotation hands the same session to Co
   let spawns = 0;
   let kills = 0;
   const handoffs = [];
+  let sessionId = null;
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
@@ -446,12 +447,14 @@ test('repeated Login expired after account rotation hands the same session to Co
         kills += 1;
       });
       const selector = args.includes('--session-id') ? '--session-id' : '--resume';
-      const sessionId = args[args.indexOf(selector) + 1];
+      const currentSessionId = args[args.indexOf(selector) + 1];
+      if (sessionId == null) sessionId = currentSessionId;
+      else assert.equal(currentSessionId, sessionId);
       setTimeout(async () => {
         const dir = join(transcriptRoot, 'project');
         await mkdir(dir, { recursive: true });
         await appendFile(
-          join(dir, `${sessionId}.jsonl`),
+          join(dir, `${currentSessionId}.jsonl`),
           `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
         );
       }, 10);
@@ -470,7 +473,8 @@ test('repeated Login expired after account rotation hands the same session to Co
   assert.equal(spawns, 2);
   assert.equal(kills, 2);
   assert.equal(handoffs.length, 1);
-  assert.match(handoffs[0].prompt, /Claude Code 작업을 이어받으세요/);
+  assert.equal(handoffs[0].path, join(handoffRoot, `${sessionId}.md`));
+  assert.equal((await stat(handoffs[0].path)).isFile(), true);
 });
 
 test('Login expired recovery respects disabled retry gates', async t => {
