@@ -227,6 +227,26 @@ teamclaude codex run
 teamclaude codex run -- exec "summarize this repository"
 ```
 
+Codex chooses its `model_provider` when the TUI process starts. Reloading the
+shell cannot move an already-running Codex process to TeamCodex. After exiting
+an affected TUI, resume the exact conversation bound to the current cmux tab:
+
+```bash
+# Uses the current surface's trusted Codex checkpoint; no recent-session picker
+teamcodex codex resume
+
+# Or bypass every picker with a known session ID
+teamcodex codex resume SESSION_ID
+```
+
+The no-ID form fails closed when cmux is unavailable or the current surface
+does not have a valid Codex resume binding. It never guesses from working
+directory or recency. Start new sessions with `teamcodex codex run`; cmux then
+records the exact checkpoint together with the TeamCodex provider overrides,
+so later tab restoration keeps the proxy route. See the
+[Codex provider/session recovery runbook](docs/runbooks/codex-provider-session-recovery.md)
+for diagnosis and legacy-session recovery.
+
 You can import the account currently logged into the official Codex CLI instead:
 
 ```bash

@@ -117,13 +117,21 @@ export function buildCodexProxyArgs(port, userArgs) {
     'requires_openai_auth = true',
     'supports_websockets = false',
   ].join(', ');
-  return [
+  const overrides = [
     '-c',
     'model_provider="teamcodex_proxy"',
     '-c',
     `model_providers.teamcodex_proxy={ ${provider} }`,
     '-c',
     `chatgpt_base_url="http://127.0.0.1:${port}"`,
-    ...userArgs,
   ];
+  if (userArgs[0] === 'resume') {
+    const insertAt = userArgs[1] && !userArgs[1].startsWith('-') ? 2 : 1;
+    return [
+      ...userArgs.slice(0, insertAt),
+      ...overrides,
+      ...userArgs.slice(insertAt),
+    ];
+  }
+  return [...overrides, ...userArgs];
 }
