@@ -90,6 +90,10 @@ recovery command.
   checkpoint and the provider arguments used to launch the process.
 - Restore a tab through its recorded binding or `teamcodex codex resume`; do
   not treat the recent-session selector as the source of truth.
+- TeamCodex appends its provider configuration after forwarded resume options,
+  so an ad-hoc `-c model_provider=...` cannot silently replace the proxy route.
+- The checkpoint-only cmux lookup runs without direct Codex credential
+  environment variables.
 - When provider configuration changes, restart or exact-resume existing TUI
   processes. Shell reload is not a migration mechanism.
 

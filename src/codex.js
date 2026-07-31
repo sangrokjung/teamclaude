@@ -126,12 +126,7 @@ export function buildCodexProxyArgs(port, userArgs) {
     `chatgpt_base_url="http://127.0.0.1:${port}"`,
   ];
   if (userArgs[0] === 'resume') {
-    const insertAt = userArgs[1] && !userArgs[1].startsWith('-') ? 2 : 1;
-    return [
-      ...userArgs.slice(0, insertAt),
-      ...overrides,
-      ...userArgs.slice(insertAt),
-    ];
+    return [...userArgs, ...overrides];
   }
   return [...overrides, ...userArgs];
 }

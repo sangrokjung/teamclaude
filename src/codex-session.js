@@ -3,6 +3,12 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const CODEX_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DIRECT_CODEX_CREDENTIALS = [
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'CODEX_ACCESS_TOKEN',
+  'TEAMCLAUDE_CODEX_PROXY_TOKEN',
+];
 
 export function isCodexSessionId(value) {
   return typeof value === 'string' && CODEX_SESSION_ID.test(value);
@@ -15,13 +21,19 @@ export function parseCmuxCodexSessionId(value) {
     : null;
 }
 
+export function buildCmuxEnv(sourceEnv = process.env) {
+  const env = { ...sourceEnv };
+  for (const key of DIRECT_CODEX_CREDENTIALS) delete env[key];
+  return env;
+}
+
 export async function currentCmuxCodexSessionId() {
   let stdout;
   try {
     ({ stdout } = await execFileAsync(
       'cmux',
       ['surface', 'resume', 'get', '--json'],
-      { timeout: 3000 },
+      { timeout: 3000, env: buildCmuxEnv() },
     ));
   } catch {
     throw new Error(

@@ -39,9 +39,11 @@ bound to the current cmux surface and always launches it through TeamCodex.
    launching Codex or opening the recent-session selector.
 4. Explicit and cmux-derived session IDs use the same launch path as
    `teamcodex codex run`, including removal of direct API credential
-   environment variables.
+   environment variables. The cmux checkpoint lookup also receives no direct
+   Codex credential variables.
 5. For `resume`, TeamCodex provider overrides follow the exact session selector
-   so cmux preserves them in its next restore binding.
+   and forwarded resume arguments, so user flags cannot replace the provider
+   and cmux preserves the enforced route in its next restore binding.
 6. Existing `teamcodex codex run` behavior remains a single launch with no
    implicit resume.
 7. Public help, English/Korean setup docs, architecture notes, and an incident
@@ -57,6 +59,9 @@ bound to the current cmux surface and always launches it through TeamCodex.
 - [x] Provider overrides still include `model_provider="teamcodex_proxy"` and the
   configured proxy URL.
 - [x] Resume bindings preserve the provider override after the session ID.
+- [x] Forwarded resume configuration cannot override the final TeamCodex
+  provider selection.
+- [x] The cmux lookup subprocess does not inherit direct Codex credentials.
 - [x] Existing Codex run tests, the full Node test suite, and ESLint pass.
 - [x] A real temporary cmux terminal surface shows a TeamCodex-backed resume
   binding after launch.
