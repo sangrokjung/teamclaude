@@ -43,6 +43,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 - **`src/oauth.js`** — OAuth PKCE login, token refresh, profile fetch, and credential import from Claude Code. No proxy state here — pure functions.
 - **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`; `TEAMCLAUDE_PROVIDER=codex` switches the default file to `~/.config/teamcodex.json`). Written `0o600`.
 - **`src/codex.js`** — Codex-mode helpers, no proxy state: parse/import ChatGPT OAuth credentials (`~/.codex/auth.json` shape), token refresh against `auth.openai.com`, and `buildCodexProxyArgs` (the `-c model_provider` overrides that point the Codex CLI at the proxy).
+- **`src/codex-session.js`** — exact Codex resume boundary: validates UUID session IDs and reads only the current surface's public `cmux surface resume get --json` binding. It fails closed instead of guessing from recent sessions or private state.
 - **`src/system-metrics.js`** — host CPU/RAM/loadavg sampler; `GET /teamclaude/status` rides a `host` object along so `teamclaude status` and the TUI header can show the proxy machine's load.
 - **`src/tui.js`** — full-screen terminal dashboard (alternate screen buffer). Only used when both stdin and stdout are TTYs; otherwise the server logs plainly.
 
@@ -54,6 +55,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 - **Auth headers**: requests are forwarded with the account's `Bearer` token plus `chatgpt-account-id` (client-sent `authorization`/`chatgpt-account-id` are stripped first).
 - **Quota**: `x-codex-primary/secondary-used-percent` (+ `-reset-at`, `x-codex-rate-limit-reached-type`) are normalized into the same unified 5h/7d model in `updateQuota`, so selection, `switchThreshold`, throttling, and the TUI all work unchanged.
 - **`codex run`** launches the Codex CLI with `buildCodexProxyArgs` overrides (`model_provider` base_url → the proxy) — analogous to `run` keeping Claude Code in subscription mode.
+- **`codex resume [SESSION_ID]`** routes the exact ID through a final, non-overridable provider override. Without an ID it consumes the current cmux surface's trusted Codex checkpoint without passing direct Codex credentials to cmux, never the bounded recent-session picker. Remote/local execution flags are rejected because they bypass provider selection entirely.
 - **`activeWarmup` defaults off** in codex mode (no capture-and-replay probe shape for the Codex backend); the `/v1/oauth/token` relay is Anthropic-mode only.
 - Ops note: like Anthropic mode, a running server does **not** see accounts added later via CLI — reload via TUI `R` or restart (`syncAccountsFromDisk`); a headless daemon needs the restart path.
 

@@ -193,6 +193,28 @@ teamclaude codex run
 teamclaude codex run -- exec "summarize this repository"
 ```
 
+Codex는 TUI 프로세스가 시작될 때 `model_provider`를 고정합니다. 따라서 이미
+실행 중인 Codex에서 `source ~/.zshrc`를 실행해도 TeamCodex로 전환되지 않습니다.
+문제가 난 TUI를 종료한 뒤 현재 cmux 탭의 정확한 대화를 복구하세요.
+
+```bash
+# 최근 세션 선택기 없이 현재 탭에 기록된 Codex checkpoint를 직접 사용
+teamcodex codex resume
+
+# SESSION_ID를 알고 있으면 선택기를 완전히 우회
+teamcodex codex resume SESSION_ID
+```
+
+ID를 생략한 명령은 cmux를 사용할 수 없거나 현재 탭에 신뢰할 수 있는 Codex
+resume binding이 없으면 추측하지 않고 실패합니다. 새 세션은
+`teamcodex codex run`으로 시작하세요. cmux가 정확한 checkpoint와 TeamCodex
+provider 인자를 함께 기록하므로 이후 탭 복원도 프록시 경로를 유지합니다.
+`--remote`, `--remote-auth-token-env`, `--oss`, `--local-provider`는 이 경로를
+벗어나므로 resume 명령에서 거부합니다.
+진단과 레거시 세션 복구는
+[Codex provider/session 복구 runbook](docs/runbooks/codex-provider-session-recovery.md)을
+참고하세요.
+
 현재 공식 Codex CLI에 로그인된 계정을 가져올 수도 있습니다.
 
 ```bash
