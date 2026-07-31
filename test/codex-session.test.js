@@ -47,11 +47,20 @@ test('Codex resume rejects options that can bypass the TeamCodex route', () => {
     ], 'model_providers'],
     [['-c"model_provider"="openai"'], 'model_provider'],
     [['-c=model_provider="openai"'], 'model_provider'],
-    [['-c', '"model\\u005fprovider"="openai"'], 'escaped config key'],
+    [['-c', '"model\\u005fprovider"="openai"'], 'model_provider'],
+    [['-c', '"model\\U0000005fprovider"="openai"'], 'model_provider'],
   ];
 
   for (const [args, expected] of cases) {
     assert.equal(findBlockedCodexRouteOption(args), expected);
   }
   assert.equal(findBlockedCodexRouteOption(['--model', 'gpt-5']), null);
+  assert.equal(
+    findBlockedCodexRouteOption(['-c', '"safe\\u005fkey"=true']),
+    null,
+  );
+  assert.equal(
+    findBlockedCodexRouteOption(['-c', "'safe\\u005fkey'=true"]),
+    null,
+  );
 });

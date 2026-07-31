@@ -21,6 +21,35 @@ const BLOCKED_CODEX_CONFIG_ROOTS = [
   'chatgpt_base_url',
 ];
 
+function decodeTomlBasicKeySegments(value) {
+  let invalid = false;
+  const decoded = value.replace(/"(?:\\.|[^"\\])*"/g, segment => {
+    try {
+      const jsonCompatible = segment.replace(
+        /\\U([0-9a-f]{8})/gi,
+        (_, hex) => {
+          const codePoint = Number.parseInt(hex, 16);
+          if (
+            codePoint > 0x10ffff
+            || (codePoint >= 0xd800 && codePoint <= 0xdfff)
+          ) {
+            throw new RangeError('Invalid TOML Unicode escape');
+          }
+          return JSON.stringify(String.fromCodePoint(codePoint)).slice(1, -1);
+        },
+      );
+      if (jsonCompatible.includes('\\/')) {
+        throw new SyntaxError('Invalid TOML escape');
+      }
+      return JSON.parse(jsonCompatible);
+    } catch {
+      invalid = true;
+      return segment;
+    }
+  });
+  return invalid ? null : decoded;
+}
+
 export function isCodexSessionId(value) {
   return typeof value === 'string' && CODEX_SESSION_ID.test(value);
 }
@@ -51,8 +80,9 @@ export function findBlockedCodexRouteOption(args) {
     if (typeof configValue !== 'string') continue;
     if (configValue.startsWith('=')) configValue = configValue.slice(1);
     const rawConfigKey = configValue.split('=', 1)[0];
-    if (rawConfigKey.includes('\\')) return 'escaped config key';
-    const configKey = rawConfigKey.replace(/[\s"'[\]]/g, '');
+    const decodedConfigKey = decodeTomlBasicKeySegments(rawConfigKey);
+    if (decodedConfigKey === null) return 'escaped config key';
+    const configKey = decodedConfigKey.replace(/[\s"'[\]]/g, '');
     const blockedRoot = BLOCKED_CODEX_CONFIG_ROOTS.find(
       root => configKey === root || configKey.startsWith(`${root}.`),
     );
