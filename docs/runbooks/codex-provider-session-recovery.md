@@ -97,8 +97,9 @@ recovery command.
   TeamCodex provider definition, and `chatgpt_base_url`, before launching cmux
   or Codex because those options can replace the TeamCodex route. The common
   guard also covers `teamcodex codex run -- resume ...`, quoted TOML keys, and
-  dotted provider descendants. Escaped config keys fail closed instead of
-  being interpreted by the wrapper.
+  dotted provider descendants. TOML escapes are decoded before route-root
+  matching: escaped protected roots still fail closed, while unrelated valid
+  escaped keys are forwarded to Codex.
 - The checkpoint-only cmux lookup runs without direct Codex credential
   environment variables.
 - When provider configuration changes, restart or exact-resume existing TUI
