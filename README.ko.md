@@ -166,6 +166,24 @@ teamclaude run
 > `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 > `launchModel` fallback은 일반 한도 기준으로 사용 가능한 계정 전부의 모델별 window가 유효하게 측정된 한도 도달 상태일 때만 적용됩니다. 미측정 또는 만료 window가 하나라도 있으면 조기 downgrade하지 않습니다.
 
+Claude Code 로컬 OAuth와 TeamClaude pool 계정 OAuth는 서로 별개입니다.
+`teamclaude login --name <name>`은 pool 계정만 복구하며 Claude Code 로컬
+세션은 갱신하지 못합니다. 로컬 인증은 다음 명령으로 점검·복구하세요.
+
+```bash
+env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude auth status
+env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude auth login
+```
+
+launcher와 cmux rescue는 `Login expired · Please run /login`과
+`Failed to authenticate: OAuth session expired and could not be refreshed`를
+모두 감지합니다. launcher는 먼저 pool 계정을 한 번 전환하고 정확히 같은
+session을 재개합니다. 전환 후에도 같은 인증 만료가 반복되면
+`codexFallbackOnExhaustion: true`일 때 Claude를 종료하고 sanitized handoff로
+Codex가 작업을 이어받습니다. 이는 모델 downgrade가 아니라 provider
+handoff입니다. 계정 소유자의 인증 정보와 승인이 필요한 브라우저 로그인은
+자동화하지 않습니다.
+
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 
 ```bash
@@ -337,9 +355,9 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `continuityMaxWaitMs` | 연속성 내부 복구의 전체 deadline (기본 `900000` = 15분) |
 | `continuityMaxSleepMs` | 연속성 probe 사이의 최대 간격 (기본 `30000` = 30초) |
 | `activeWarmup` | 최소 요청으로 계정 사용량을 선측정 |
-| `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429를 같은 세션으로 자동 재개 |
-| `codexFallbackOnExhaustion` | 대체 Claude 계정이 없거나 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
-| `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
+| `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429/지원되는 인증 만료를 같은 세션으로 자동 재개 |
+| `codexFallbackOnExhaustion` | 한 번의 계정 전환 뒤에도 인증 만료가 반복되거나, 대체 Claude 계정이 없거나, 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
+| `cmuxSessionRescue` | 기존 cmux Claude 세션의 지원되는 인증 만료 문구를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |

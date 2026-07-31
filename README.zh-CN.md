@@ -158,6 +158,22 @@ teamclaude run
 > `teamclaude run` 会在代理缺失时自动启动后台 supervisor。即使 proxy worker 异常退出，public listener 仍会保持，并自动启动新的 worker。
 > `launchModel` fallback 仅在所有按通用限额仍可用的账户，其模型级窗口都具有有效测量且已达到上限时应用。只要存在未测量或已过期的窗口，就不会提前 downgrade。
 
+Claude Code 本地 OAuth 与 TeamClaude 账户池 OAuth 是两个独立的认证层。
+`teamclaude login --name <name>` 只修复账户池中的账户，无法刷新 Claude Code
+本地会话。可用以下命令检查并修复本地认证：
+
+```bash
+env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude auth status
+env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude auth login
+```
+
+launcher 和 cmux rescue 都能识别 `Login expired · Please run /login` 与
+`Failed to authenticate: OAuth session expired and could not be refreshed`。
+launcher 会先切换一次账户池账户，并恢复完全相同的 session。如果确认切换后
+仍重复出现同一认证过期，设置 `codexFallbackOnExhaustion: true` 时会停止
+Claude，并通过 sanitized handoff 交给 Codex 继续。这是 provider handoff，
+不是模型 downgrade。浏览器登录需要账户所有者的凭证和授权，因此不会自动执行。
+
 也可以导入 Claude Code 当前的登录信息：
 
 ```bash
@@ -307,9 +323,9 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
 | `continuityMaxWaitMs` | 连续性内部恢复的总 deadline（默认 `900000` = 15 分钟） |
 | `continuityMaxSleepMs` | 连续性 probe 之间的最大间隔（默认 `30000` = 30 秒） |
 | `activeWarmup` | 通过最小请求预先测量账户用量 |
-| `autoResumeClaude` | 将 TeamClaude 启动的 Claude 会话在 timeout/429 后自动恢复为同一会话 |
-| `codexFallbackOnExhaustion` | 仅在确认没有备用 Claude 账户或全部通用 quota 耗尽时转交 Codex |
-| `cmuxSessionRescue` | 检测现有 cmux Claude 会话的精确 `Login expired`，保留原 pane，并在同一 window 的新非聚焦 workspace 中恢复 |
+| `autoResumeClaude` | 在 timeout/429/受支持的认证过期后，将 TeamClaude 启动的 Claude 会话自动恢复为同一会话 |
+| `codexFallbackOnExhaustion` | 仅在一次账户切换后认证仍过期、确认没有备用 Claude 账户或全部通用 quota 耗尽时转交 Codex |
+| `cmuxSessionRescue` | 检测现有 cmux Claude 会话中受支持的认证过期消息，保留原 pane，并在同一 window 的新非聚焦 workspace 中恢复 |
 | `cmuxSessionRescueIntervalMs` | 检查现有 cmux 会话恢复的间隔（最小 500ms，默认 1000ms） |
 | `accounts[].enabled` | 设为 `false` 时从轮换中排除账户 |
 | `accounts[].priority` | 数字越小，固定优先级越高 |
