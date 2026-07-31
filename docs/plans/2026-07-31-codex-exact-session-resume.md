@@ -32,7 +32,8 @@
 - Targeted: `node --test test/codex-resume.test.js test/codex-run.test.js
   test/codex-session.test.js test/codex.test.js` passed 12/12 after the
   resume-argument ordering and cmux credential-boundary fixes.
-- Full: `qgate.py run --slot heavy -- npm test` passed 413/413.
+- Full: `qgate.py run --slot heavy -- npm test` passed 411/411 on the final
+  `fork/master`-based branch.
 - Lint: `npx --yes eslint .` exited 0. (`npm run lint` could not locate a local
   ESLint binary; no dependency was added.)
 - Package surface: `npm pack --dry-run --json` included
