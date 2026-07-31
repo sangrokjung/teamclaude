@@ -19,6 +19,7 @@ import {
 } from './codex.js';
 import {
   currentCmuxCodexSessionId,
+  findBlockedCodexRouteOption,
   isCodexSessionId,
 } from './codex-session.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
@@ -1725,6 +1726,12 @@ function propagateChildExit(result) {
 }
 
 async function codexResumeCommand() {
+  const blockedOption = findBlockedCodexRouteOption(args.slice(1));
+  if (blockedOption) {
+    console.error(`[TeamCodex] ${blockedOption} cannot be used through TeamCodex resume.`);
+    process.exit(1);
+  }
+
   const candidate = args[1];
   let sessionId;
   let resumeArgs;
@@ -1749,6 +1756,18 @@ async function codexResumeCommand() {
 }
 
 async function runCommand(clientArgsOverride = null) {
+  // Everything after 'run' (skip -- separator if present)
+  const clientArgs = clientArgsOverride == null
+    ? args.slice(1)
+    : [...clientArgsOverride];
+  if (clientArgs[0] === '--') clientArgs.shift();
+
+  const blockedOption = findBlockedCodexRouteOption(clientArgs);
+  if (blockedOption) {
+    console.error(`[TeamCodex] ${blockedOption} cannot be used through TeamCodex.`);
+    process.exit(1);
+  }
+
   const config = await loadOrCreateConfig();
   if (!isCodexMode(config)) {
     try {
@@ -1758,12 +1777,6 @@ async function runCommand(clientArgsOverride = null) {
       process.exit(1);
     }
   }
-
-  // Everything after 'run' (skip -- separator if present)
-  const clientArgs = clientArgsOverride == null
-    ? args.slice(1)
-    : [...clientArgsOverride];
-  if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
   if (isCodexMode(config)) {

@@ -43,7 +43,13 @@ bound to the current cmux surface and always launches it through TeamCodex.
    Codex credential variables.
 5. For `resume`, TeamCodex provider overrides follow the exact session selector
    and forwarded resume arguments, so user flags cannot replace the provider
-   and cmux preserves the enforced route in its next restore binding.
+   and cmux preserves the enforced route in its next restore binding. Options
+   that replace the transport or provider route (`--remote`,
+   `--remote-auth-token-env`, `--oss`, and `--local-provider`) fail closed
+   before either cmux or Codex is launched. The same common launch guard covers
+   the legacy `teamcodex codex run -- resume ...` form and rejects direct
+   overrides of `model_provider`, the TeamCodex provider definition, and
+   `chatgpt_base_url`, including quoted keys and dotted provider descendants.
 6. Existing `teamcodex codex run` behavior remains a single launch with no
    implicit resume.
 7. Public help, English/Korean setup docs, architecture notes, and an incident
@@ -61,6 +67,10 @@ bound to the current cmux surface and always launches it through TeamCodex.
 - [x] Resume bindings preserve the provider override after the session ID.
 - [x] Forwarded resume configuration cannot override the final TeamCodex
   provider selection.
+- [x] Transport/provider-routing options exit non-zero without invoking cmux or
+  Codex through both the dedicated resume command and the legacy run alias.
+- [x] Quoted, dotted, equals-form, and escaped route-configuration keys fail
+  closed before config loading or child launch.
 - [x] The cmux lookup subprocess does not inherit direct Codex credentials.
 - [x] Existing Codex run tests, the full Node test suite, and ESLint pass.
 - [x] A real temporary cmux terminal surface shows a TeamCodex-backed resume

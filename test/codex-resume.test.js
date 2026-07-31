@@ -77,7 +77,7 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     // When
     const result = spawnSync(
       process.execPath,
-      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model_provider="openai"'],
+      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model="gpt-5"'],
       { encoding: 'utf8', env: fx.env },
     );
 
@@ -87,14 +87,66 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     const child = JSON.parse(await readFile(fx.codexLog, 'utf8'));
     const resumeIndex = child.args.indexOf('resume');
     const providerIndex = child.args.indexOf('model_provider="teamcodex_proxy"');
-    const bypassIndex = child.args.indexOf('model_provider="openai"');
+    const forwardedConfigIndex = child.args.indexOf('model="gpt-5"');
     assert.deepEqual(child.args.slice(resumeIndex, resumeIndex + 2), ['resume', SESSION_ID]);
-    assert.ok(providerIndex > bypassIndex);
+    assert.ok(providerIndex > forwardedConfigIndex);
     assert.equal(child.openaiApiKey, null);
     assert.equal(child.codexApiKey, null);
     assert.equal(child.codexAccessToken, null);
   } finally {
     await rm(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex route bypasses fail closed before any wrapper launch path', async t => {
+  const cases = [
+    ['resume command transport', ['codex', 'resume', SESSION_ID, '--remote', 'wss://example.invalid']],
+    ['run alias transport', ['codex', 'run', '--', 'resume', SESSION_ID, '--remote=wss://example.invalid']],
+    ['provider config', ['codex', 'resume', SESSION_ID, '-c', 'model_provider="openai"']],
+    [
+      'run alias provider endpoint',
+      [
+        'codex',
+        'run',
+        '--',
+        '-c',
+        'model_providers.teamcodex_proxy.base_url="https://example.invalid"',
+        'resume',
+        SESSION_ID,
+      ],
+    ],
+    [
+      'run alias quoted provider',
+      ['codex', 'run', '--', '-c', '"model_provider"="openai"', 'resume', SESSION_ID],
+    ],
+    [
+      'run alias short equals provider',
+      ['codex', 'run', '--', '-c=model_provider="openai"', 'resume', SESSION_ID],
+    ],
+  ];
+
+  for (const [name, clientArgs] of cases) {
+    await t.test(name, async () => {
+      // Given
+      const fx = await fixture({});
+
+      try {
+        // When
+        const result = spawnSync(
+          process.execPath,
+          [entry, ...clientArgs],
+          { encoding: 'utf8', env: fx.env },
+        );
+
+        // Then
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, /cannot be used through TeamCodex/);
+        assert.equal(await exists(fx.codexLog), false);
+        assert.equal(await exists(fx.cmuxLog), false);
+      } finally {
+        await rm(fx.dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 

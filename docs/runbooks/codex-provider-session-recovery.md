@@ -92,6 +92,13 @@ recovery command.
   not treat the recent-session selector as the source of truth.
 - TeamCodex appends its provider configuration after forwarded resume options,
   so an ad-hoc `-c model_provider=...` cannot silently replace the proxy route.
+- Resume rejects `--remote`, `--remote-auth-token-env`, `--oss`, and
+  `--local-provider`, plus direct configuration of `model_provider`, the
+  TeamCodex provider definition, and `chatgpt_base_url`, before launching cmux
+  or Codex because those options can replace the TeamCodex route. The common
+  guard also covers `teamcodex codex run -- resume ...`, quoted TOML keys, and
+  dotted provider descendants. Escaped config keys fail closed instead of
+  being interpreted by the wrapper.
 - The checkpoint-only cmux lookup runs without direct Codex credential
   environment variables.
 - When provider configuration changes, restart or exact-resume existing TUI
@@ -125,7 +132,8 @@ direct account's limit while newer terminals work.
 - replay a failed request.
 
 It exits non-zero without launching Codex when the binding is missing,
-malformed, or belongs to another provider.
+malformed, or belongs to another provider, or when a route-changing option is
+present.
 
 ## Rollback
 

@@ -20,18 +20,20 @@
    surface smoke test.
    - Verifier: all commands exit 0 and the surface binding contains the exact
      checkpoint plus TeamCodex provider override.
-6. [ ] Run independent adversarial review, synchronize task documents, then
-   commit, push, open a PR, wait for CI, and merge to `master`.
-   - Verifier: reviewer PASS is bound to the reviewed commit; GitHub reports
-     the PR merged and local `master` matches `origin/master`.
+6. [x] Run independent adversarial review, fix every blocker, and synchronize
+   the recovery documents before the merge gate.
+   - Verifier: final reviewer PASS is bound to the exact merge-ready commit;
+     merge and remote synchronization are recorded by Git rather than this
+     pre-merge plan.
 
 ## Verification log
 
 - Red: `node --test test/codex-resume.test.js` failed because `resume` was an
   unknown command.
 - Targeted: `node --test test/codex-resume.test.js test/codex-run.test.js
-  test/codex-session.test.js test/codex.test.js` passed 12/12 after the
-  resume-argument ordering and cmux credential-boundary fixes.
+  test/codex-session.test.js test/codex.test.js` passed 20/20 after the
+  resume-argument ordering, common route guard, and cmux credential-boundary
+  fixes.
 - Full: `qgate.py run --slot heavy -- npm test` passed 413/413.
 - Lint: `npx --yes eslint .` exited 0. (`npm run lint` could not locate a local
   ESLint binary; no dependency was added.)
@@ -44,6 +46,12 @@
 - Independent review at `75b7fb1` found that forwarded options could replace
   the provider and that the cmux lookup inherited direct Codex credentials.
   Both were fixed and locked by CLI/subprocess regression tests before the
-  final review SHA.
+  final review SHA. A later adversarial security pass found that `--remote`
+  bypassed provider configuration entirely; route-changing options now fail
+  closed before cmux or Codex launch. Re-review then found the same route
+  reachable through `codex run -- resume`; the guard now runs at the common
+  launcher boundary and rejects route configuration keys as well. Final
+  adversarial passes then added quoted, dotted-child, and escaped TOML key
+  variants to the same fail-closed boundary.
 - Housekeeping scan: `info`, 0 sensitive hits. Existing untracked `.omo/`
   remained untouched.

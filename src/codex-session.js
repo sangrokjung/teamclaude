@@ -9,6 +9,17 @@ const DIRECT_CODEX_CREDENTIALS = [
   'CODEX_ACCESS_TOKEN',
   'TEAMCLAUDE_CODEX_PROXY_TOKEN',
 ];
+const BLOCKED_CODEX_RESUME_OPTIONS = new Set([
+  '--remote',
+  '--remote-auth-token-env',
+  '--oss',
+  '--local-provider',
+]);
+const BLOCKED_CODEX_CONFIG_ROOTS = [
+  'model_provider',
+  'model_providers',
+  'chatgpt_base_url',
+];
 
 export function isCodexSessionId(value) {
   return typeof value === 'string' && CODEX_SESSION_ID.test(value);
@@ -19,6 +30,35 @@ export function parseCmuxCodexSessionId(value) {
   return binding?.kind === 'codex' && isCodexSessionId(binding.checkpoint_id)
     ? binding.checkpoint_id
     : null;
+}
+
+export function findBlockedCodexRouteOption(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (typeof arg !== 'string') continue;
+    const option = arg.split('=', 1)[0];
+    if (BLOCKED_CODEX_RESUME_OPTIONS.has(option)) return option;
+
+    let configValue = null;
+    if (arg === '-c' || arg === '--config') {
+      configValue = args[i + 1];
+      i += 1;
+    } else if (arg.startsWith('--config=')) {
+      configValue = arg.slice('--config='.length);
+    } else if (arg.startsWith('-c') && arg.length > 2) {
+      configValue = arg.slice(2);
+    }
+    if (typeof configValue !== 'string') continue;
+    if (configValue.startsWith('=')) configValue = configValue.slice(1);
+    const rawConfigKey = configValue.split('=', 1)[0];
+    if (rawConfigKey.includes('\\')) return 'escaped config key';
+    const configKey = rawConfigKey.replace(/[\s"'[\]]/g, '');
+    const blockedRoot = BLOCKED_CODEX_CONFIG_ROOTS.find(
+      root => configKey === root || configKey.startsWith(`${root}.`),
+    );
+    if (blockedRoot) return blockedRoot;
+  }
+  return null;
 }
 
 export function buildCmuxEnv(sourceEnv = process.env) {
