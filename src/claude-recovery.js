@@ -418,6 +418,7 @@ export async function runClaudeWithRecovery({
     : 2000;
   let retries = 0;
   let loginRecoveryUsed = false;
+  let loginRotationSucceeded = false;
   let nextEnv = childEnv;
 
   while (true) {
@@ -457,10 +458,11 @@ export async function runClaudeWithRecovery({
         && recovery.childEnv
         && typeof recovery.childEnv === 'object';
       if (!recovered) {
+        const persistentAfterRotation = loginRotationSucceeded;
         const noAlternate = recovery?.rotated === false
           && recovery?.reason === 'no-alternative-account';
         let fleetExhausted = false;
-        if (!noAlternate) {
+        if (!persistentAfterRotation && !noAlternate) {
           let status = null;
           try {
             status = await fetchStatus();
@@ -471,14 +473,16 @@ export async function runClaudeWithRecovery({
           );
         }
         if (config.codexFallbackOnExhaustion === true
-            && (noAlternate || fleetExhausted)) {
+            && (persistentAfterRotation || noAlternate || fleetExhausted)) {
           const handoff = await writeHandoff({
             transcriptPath,
             sessionId,
             cwd,
             handoffRoot,
           });
-          const reason = noAlternate
+          const reason = persistentAfterRotation
+            ? 'local Claude authentication remained expired after account rotation'
+            : noAlternate
             ? 'no alternate account is available'
             : 'the Claude account fleet is quota exhausted';
           log(`[TeamClaude] Claude login expired and ${reason}; handing session ${sessionId} to Codex.`);
@@ -496,6 +500,7 @@ export async function runClaudeWithRecovery({
       }
 
       log(`[TeamClaude] Claude login expired; switched account and resuming session ${sessionId}.`);
+      loginRotationSucceeded = true;
       await stopChild(child);
       nextArgs = ['--resume', sessionId, 'continue'];
       nextEnv = recovery.childEnv;

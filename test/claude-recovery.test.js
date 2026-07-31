@@ -405,19 +405,76 @@ test('Login expired nested message is recovered but generic authentication_faile
   }
 });
 
-test('Login expired recovery rejects repeated failures and disabled retry gates', async t => {
-  const cases = [
-    {
-      name: 'second Login expired',
-      config: {
-        autoResumeClaude: true,
-        claudeAutoResumeMaxRetries: 3,
-        claudeAutoResumeBackoffMs: 0,
-      },
-      emitOnSpawns: 2,
-      expectedRecoveries: 1,
-      expectedSpawns: 2,
+test('repeated Login expired after account rotation hands the same session to Codex', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-persistent-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  let recoveries = 0;
+  let spawns = 0;
+  let kills = 0;
+  const handoffs = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
     },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    recoverLoginExpired: async () => {
+      recoveries += 1;
+      return {
+        rotated: true,
+        previousAccount: 'account-a',
+        currentAccount: 'account-b',
+        childEnv: { RECOVERY_ONLY: 'yes' },
+      };
+    },
+    spawnClaude(args) {
+      spawns += 1;
+      const child = fakeChild(() => {
+        kills += 1;
+      });
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+        );
+      }, 10);
+      setTimeout(() => child.finish(spawns === 1 ? 9 : 17), 60);
+      return child;
+    },
+    launchCodex: async handoff => {
+      handoffs.push(handoff);
+      return { status: 0, signal: null };
+    },
+    log() {},
+  });
+
+  assert.deepEqual(result, { status: 0, signal: null });
+  assert.equal(recoveries, 1);
+  assert.equal(spawns, 2);
+  assert.equal(kills, 2);
+  assert.equal(handoffs.length, 1);
+  assert.match(handoffs[0].prompt, /Claude Code 작업을 이어받으세요/);
+});
+
+test('Login expired recovery respects disabled retry gates', async t => {
+  const cases = [
     {
       name: 'auto resume disabled',
       config: {
