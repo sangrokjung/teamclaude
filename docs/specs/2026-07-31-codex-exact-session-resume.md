@@ -1,6 +1,6 @@
 # Codex exact-session resume
 
-Status: Implemented, pending PR merge.
+Status: Implemented.
 
 ## Problem
 
