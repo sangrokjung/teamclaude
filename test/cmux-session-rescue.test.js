@@ -29,13 +29,13 @@ const SESSION_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_SESSION_ID = '22222222-2222-4222-8222-222222222222';
 const SURFACE_ID = '33333333-3333-4333-8333-333333333333';
 
-function loginExpiredRecord(cwd) {
+function loginExpiredRecord(cwd, message = 'Login expired · Please run /login') {
   return JSON.stringify({
     type: 'assistant',
     cwd,
     isApiErrorMessage: true,
     error: 'authentication_failed',
-    message: 'Login expired · Please run /login',
+    message,
   });
 }
 
@@ -138,6 +138,29 @@ test('adopts active unresolved Login expired session once', async t => {
     launched[0].command,
     `cd -- '${fx.cwd.replaceAll("'", "'\"'\"'")}' && TEAMCLAUDE_CONFIG='/tmp/teamclaude config.json' '/usr/local/bin/node' '/opt/teamclaude/src/index.js' run -- --resume '${SESSION_ID}' continue`,
   );
+});
+
+test('adopts active unresolved OAuth session expired message', async t => {
+  const fx = await fixture(t);
+  await writeFile(
+    fx.transcriptPath,
+    `${loginExpiredRecord(
+      fx.cwd,
+      'Failed to authenticate: OAuth session expired and could not be refreshed',
+    )}\n`,
+  );
+  const launched = [];
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    inspectProcess: async () => processInfo(fx),
+    launchRecoveryWorkspace: async request => {
+      launched.push(request);
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launched.length, 1);
 });
 
 test('resolves the recovery window from the verified live surface only', () => {

@@ -68,7 +68,9 @@ function classifyTranscriptLine(line) {
   ).join('\n');
   const normalizedMessage = message.trim().replace(/\s+/g, ' ');
   if (record.error === 'authentication_failed'
-      && normalizedMessage === 'Login expired · Please run /login') {
+      && (normalizedMessage === 'Login expired · Please run /login'
+        || normalizedMessage
+          === 'Failed to authenticate: OAuth session expired and could not be refreshed')) {
     return { kind: 'login_expired', record };
   }
   if (record.error === 'server_error' && /request timed out/i.test(message)) {

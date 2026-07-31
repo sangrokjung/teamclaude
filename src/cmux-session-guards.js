@@ -5,6 +5,8 @@ import { basename, join, relative } from 'node:path';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
 const LOGIN_EXPIRED = 'Login expired · Please run /login';
+const OAUTH_SESSION_EXPIRED =
+  'Failed to authenticate: OAuth session expired and could not be refreshed';
 const NOFOLLOW = constants.O_NOFOLLOW || 0;
 const DIRECTORY = constants.O_DIRECTORY || 0;
 
@@ -74,9 +76,10 @@ function textContent(record) {
 }
 
 function isLoginExpired(record) {
+  const message = textContent(record).trim().replace(/\s+/g, ' ');
   return record?.isApiErrorMessage === true
     && record.error === 'authentication_failed'
-    && textContent(record).trim().replace(/\s+/g, ' ') === LOGIN_EXPIRED;
+    && (message === LOGIN_EXPIRED || message === OAUTH_SESSION_EXPIRED);
 }
 
 function isConversationRecord(record) {

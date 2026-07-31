@@ -316,6 +316,13 @@ test('Login expired nested message is recovered but generic authentication_faile
       expectedSpawns: 2,
     },
     {
+      name: 'current OAuth session expired message',
+      message: 'Failed to authenticate: OAuth session expired and could not be refreshed',
+      nested: true,
+      expectedRecoveries: 1,
+      expectedSpawns: 2,
+    },
+    {
       name: 'proxy fleet authentication failure',
       message: 'All accounts failed authentication',
       nested: true,
