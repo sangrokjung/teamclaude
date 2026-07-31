@@ -481,7 +481,9 @@ test('Login expired recovery respects disabled retry gates', async t => {
         autoResumeClaude: false,
         claudeAutoResumeMaxRetries: 3,
         claudeAutoResumeBackoffMs: 0,
+        codexFallbackOnExhaustion: true,
       },
+      quota: 0.98,
       emitOnSpawns: 1,
       expectedRecoveries: 0,
       expectedSpawns: 1,
@@ -492,7 +494,9 @@ test('Login expired recovery respects disabled retry gates', async t => {
         autoResumeClaude: true,
         claudeAutoResumeMaxRetries: 0,
         claudeAutoResumeBackoffMs: 0,
+        codexFallbackOnExhaustion: true,
       },
+      quota: 0.98,
       emitOnSpawns: 1,
       expectedRecoveries: 0,
       expectedSpawns: 1,
@@ -533,7 +537,7 @@ test('Login expired recovery respects disabled retry gates', async t => {
         transcriptRoot,
         handoffRoot,
         pollIntervalMs: 5,
-        fetchStatus: async () => statusWithQuota(0.5),
+        fetchStatus: async () => statusWithQuota(scenario.quota ?? 0.5),
         recoverLoginExpired: async () => {
           recoveries += 1;
           if (scenario.recoverThrows) throw new Error('rotation request timed out');

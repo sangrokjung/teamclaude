@@ -440,9 +440,10 @@ export async function runClaudeWithRecovery({
     transcriptPath = outcome.transcriptPath;
     if (outcome.event.kind === 'login_expired') {
       let recovery = null;
-      const canRecover = config.autoResumeClaude === true
-        && sessionId
-        && maxRetries > 0
+      const loginRecoveryEnabled = config.autoResumeClaude === true
+        && Boolean(sessionId)
+        && maxRetries > 0;
+      const canRecover = loginRecoveryEnabled
         && !loginRecoveryUsed
         && typeof recoverLoginExpired === 'function';
       if (canRecover) {
@@ -462,7 +463,7 @@ export async function runClaudeWithRecovery({
         const noAlternate = recovery?.rotated === false
           && recovery?.reason === 'no-alternative-account';
         let fleetExhausted = false;
-        if (!persistentAfterRotation && !noAlternate) {
+        if (loginRecoveryEnabled && !persistentAfterRotation && !noAlternate) {
           let status = null;
           try {
             status = await fetchStatus();
@@ -472,7 +473,8 @@ export async function runClaudeWithRecovery({
             config.switchThreshold ?? 0.98,
           );
         }
-        if (config.codexFallbackOnExhaustion === true
+        if (loginRecoveryEnabled
+            && config.codexFallbackOnExhaustion === true
             && (persistentAfterRotation || noAlternate || fleetExhausted)) {
           const handoff = await writeHandoff({
             transcriptPath,
