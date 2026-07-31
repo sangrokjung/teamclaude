@@ -237,7 +237,9 @@ test('Login expired written immediately before child exit is still recovered', a
   assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
 });
 
-test('Login expired falls back to Codex when no Claude account remains', async t => {
+test('Login expired falls back to Codex when no Claude account remains', {
+  timeout: 2000,
+}, async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-codex-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'project');
@@ -287,7 +289,6 @@ test('Login expired falls back to Codex when no Claude account remains', async t
         ];
         await writeFile(join(dir, `${sessionId}.jsonl`), `${records.join('\n')}\n`);
       }, 10);
-      setTimeout(() => child.finish(9), 80);
       return child;
     },
     launchCodex: async handoff => {
@@ -405,7 +406,9 @@ test('Login expired nested message is recovered but generic authentication_faile
   }
 });
 
-test('repeated Login expired after account rotation hands the same session to Codex', async t => {
+test('repeated Login expired after account rotation hands the same session to Codex', {
+  timeout: 2000,
+}, async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-persistent-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const cwd = join(root, 'project');
@@ -458,7 +461,6 @@ test('repeated Login expired after account rotation hands the same session to Co
           `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
         );
       }, 10);
-      setTimeout(() => child.finish(spawns === 1 ? 9 : 17), 60);
       return child;
     },
     launchCodex: async handoff => {
