@@ -17,6 +17,10 @@ import {
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
 } from './codex.js';
+import {
+  currentCmuxCodexSessionId,
+  isCodexSessionId,
+} from './codex-session.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
@@ -90,6 +94,14 @@ switch (command) {
     break;
   case 'run':
     await runCommand();
+    break;
+  case 'resume':
+    if (cliProvider !== 'codex') {
+      console.error('Unknown command: resume\n');
+      showHelp();
+      process.exit(1);
+    }
+    await codexResumeCommand();
     break;
   case 'import':
     await importCommand();
@@ -1712,7 +1724,31 @@ function propagateChildExit(result) {
   process.exit(result.status ?? 1);
 }
 
-async function runCommand() {
+async function codexResumeCommand() {
+  const candidate = args[1];
+  let sessionId;
+  let resumeArgs;
+  if (!candidate || candidate === '--' || candidate.startsWith('-')) {
+    try {
+      sessionId = await currentCmuxCodexSessionId();
+    } catch (err) {
+      console.error(`[TeamCodex] ${err.message}`);
+      process.exit(1);
+    }
+    resumeArgs = candidate === '--' ? args.slice(2) : args.slice(1);
+  } else {
+    if (!isCodexSessionId(candidate)) {
+      console.error('[TeamCodex] Invalid Codex SESSION_ID.');
+      process.exit(1);
+    }
+    resumeArgs = args.slice(2);
+    if (resumeArgs[0] === '--') resumeArgs.shift();
+    sessionId = candidate;
+  }
+  await runCommand(['resume', sessionId, ...resumeArgs]);
+}
+
+async function runCommand(clientArgsOverride = null) {
   const config = await loadOrCreateConfig();
   if (!isCodexMode(config)) {
     try {
@@ -1724,7 +1760,9 @@ async function runCommand() {
   }
 
   // Everything after 'run' (skip -- separator if present)
-  const clientArgs = args.slice(1);
+  const clientArgs = clientArgsOverride == null
+    ? args.slice(1)
+    : [...clientArgsOverride];
   if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
@@ -2254,6 +2292,7 @@ Commands:
   login               Add an account with an isolated official Codex OAuth login
   import              Import the current ~/.codex/auth.json
   run [-- args...]    Run Codex through the multi-account proxy
+  resume [ID]         Resume the exact ID, or the current cmux tab checkpoint
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
   accounts            List configured Codex accounts
