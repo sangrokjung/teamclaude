@@ -24,6 +24,16 @@ inspection showed two populations:
 Forcing the default provider reproduced the usage-limit failure. Launching the
 same request through `teamcodex_proxy` succeeded.
 
+On 2026-08-01, the same route split appeared as:
+
+```text
+exceeded retry limit, last status: 429 Too Many Requests
+```
+
+The proxy and account pool completed a real request successfully. The affected
+TUI had been launched by a shell alias that resolved `codex` directly to the
+official binary, so that process never reached TeamCodex.
+
 ## Root cause
 
 Codex resolves `model_provider` during process startup and keeps it in the TUI
@@ -34,6 +44,11 @@ The ordinary `codex resume --all` view was also an incomplete recovery index.
 During the incident it exposed only a bounded recent set, so older active
 conversations were absent. A title or working directory was not unique enough
 to choose safely across many cmux tabs.
+
+A nested `codex exec` also inherited the parent Codex process's cmux surface
+once and replaced the tab binding with its disposable checkpoint. TeamCodex
+now disables cmux hooks only for a child launched from an existing Codex
+process (`CMUX_CODEX_PID` is present). Top-level launches remain hook-enabled.
 
 ## Exact recovery
 
@@ -86,6 +101,16 @@ recovery command.
 
 - Start Codex with `teamcodex codex run`, not plain `codex`, when account
   pooling is required.
+- If every interactive `codex` command on the machine must use the pool, make
+  that intent explicit in the shell startup file:
+
+  ```zsh
+  alias codex='teamcodex codex run --'
+  ```
+
+  Remove any later alias that points `codex` back to an official binary path.
+  Reloading the shell affects only future processes; exact-resume every TUI
+  that was already running.
 - In cmux, keep Codex hooks installed. The SessionStart hook records the exact
   checkpoint and the provider arguments used to launch the process.
 - Restore a tab through its recorded binding or `teamcodex codex resume`; do
@@ -102,6 +127,9 @@ recovery command.
   escaped keys are forwarded to Codex.
 - The checkpoint-only cmux lookup runs without direct Codex credential
   environment variables.
+- A TeamCodex child launched from inside an existing Codex process receives
+  `CMUX_CODEX_HOOKS_DISABLED=1`, so probes and subcommands cannot replace the
+  parent tab's checkpoint binding.
 - When provider configuration changes, restart or exact-resume existing TUI
   processes. Shell reload is not a migration mechanism.
 
@@ -121,6 +149,16 @@ model_provider="teamcodex_proxy"
 
 Absence of that argument on an older live process explains why it can hit the
 direct account's limit while newer terminals work.
+
+Check shell resolution separately:
+
+```bash
+zsh -ic 'alias codex; whence -a teamcodex'
+```
+
+The alias should expand to `teamcodex codex run --`; a direct binary path is a
+proxy bypass. Also inspect `cmux surface resume get --json` after any nested
+probe. Its `checkpoint_id` and `cwd` must still belong to the parent tab.
 
 ## Failure behavior
 

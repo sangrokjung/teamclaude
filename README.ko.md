@@ -198,17 +198,17 @@ Claude 프록시의 기본 포트는 `3456`이므로 두 서버를 동시에 실
 
 ```bash
 # 공식 Codex OAuth를 각각 격리된 CODEX_HOME에서 실행
-teamclaude codex login --name codex-pro-1
-teamclaude codex login --name codex-pro-2
+teamcodex codex login --name codex-pro-1
+teamcodex codex login --name codex-pro-2
 
 # Codex 프록시와 대시보드 시작
-teamclaude codex server
+teamcodex codex server
 
 # 다른 터미널에서 Codex CLI 실행
-teamclaude codex run
+teamcodex codex run
 
 # 비대화형 실행
-teamclaude codex run -- exec "summarize this repository"
+teamcodex codex run -- exec "summarize this repository"
 ```
 
 Codex는 TUI 프로세스가 시작될 때 `model_provider`를 고정합니다. 따라서 이미
@@ -235,22 +235,22 @@ provider 인자를 함께 기록하므로 이후 탭 복원도 프록시 경로�
 
 ```bash
 codex login
-teamclaude codex import --name codex-pro-1
+teamcodex codex import --name codex-pro-1
 ```
 
-`teamclaude codex login` 방식이 권장됩니다. 이 방식은 임시 `CODEX_HOME`에서
+`teamcodex codex login` 방식이 권장됩니다. 이 방식은 임시 `CODEX_HOME`에서
 로그인을 수행하므로 TeamCodex와 일반 `~/.codex/auth.json`이 동일한 refresh
 token을 서로 갱신하며 충돌하지 않습니다.
 
 ### Codex 계정 제어
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
 
 ## Hermes Agent 연결
@@ -302,7 +302,7 @@ teamclaude stop
 teamclaude restart
 ```
 
-TTY에서 `teamclaude server` 또는 `teamclaude codex server`를 실행하면
+TTY에서 `teamclaude server` 또는 `teamcodex codex server`를 실행하면
 전체 화면 대시보드가 열립니다.
 
 | 키 | 동작 |

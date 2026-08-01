@@ -1784,6 +1784,7 @@ async function runCommand(clientArgsOverride = null) {
     delete childEnv.CODEX_API_KEY;
     delete childEnv.CODEX_ACCESS_TOKEN;
     delete childEnv.TEAMCLAUDE_CODEX_PROXY_TOKEN;
+    if (childEnv.CMUX_CODEX_PID) childEnv.CMUX_CODEX_HOOKS_DISABLED = '1';
     const codexArgs = buildCodexProxyArgs(config.proxy.port, clientArgs);
     const result = spawnSync('codex', codexArgs, {
       stdio: 'inherit',

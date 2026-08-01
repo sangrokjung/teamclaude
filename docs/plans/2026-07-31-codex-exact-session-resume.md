@@ -25,6 +25,10 @@
    - Verifier: final reviewer PASS is bound to the exact merge-ready commit;
      merge and remote synchronization are recorded by Git rather than this
      pre-merge plan.
+7. [x] Prevent a nested TeamCodex launcher from replacing the parent cmux
+   surface binding.
+   - Verifier: the failure-first child-environment assertion passes, and a real
+     nested probe leaves the parent's checkpoint unchanged.
 
 ## Verification log
 
@@ -55,3 +59,13 @@
   variants to the same fail-closed boundary.
 - Housekeeping scan: `info`, 0 sensitive hits. Existing untracked `.omo/`
   remained untouched.
+- 2026-08-01 nested-binding Red: with `CMUX_CODEX_PID` present, the child
+  received no hook-disable flag and replaced the parent surface checkpoint.
+- 2026-08-01 nested-binding Green: `test/codex-run.test.js`, exact-resume, and
+  session tests passed 17/17. A real TeamCodex child returned
+  `NESTED_GUARD_OK`; the parent checkpoint, cwd, and TeamCodex restore command
+  were identical before and after the child.
+- 2026-08-01 full regression: `npm test` ran through the required heavy-work
+  gate with the parent Codex provider environment removed; all 421 tests
+  passed. The inherited `TEAMCLAUDE_PROVIDER=codex` value was the sole cause of
+  the earlier Claude fixture failures and was not treated as a product defect.

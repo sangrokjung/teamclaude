@@ -31,7 +31,7 @@ function assertSingleInvocationWithoutResume(invocations, expectedTail) {
   );
 }
 
-test('teamclaude codex run launches Codex through the HTTP-only first-party auth provider', async () => {
+test('codex run disables cmux hooks only for a nested proxy launch', async () => {
   // Given
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-'));
   const fakeCodex = join(dir, 'codex');
@@ -43,6 +43,7 @@ console.log(JSON.stringify({
   openaiApiKey: process.env.OPENAI_API_KEY ?? null,
   codexApiKey: process.env.CODEX_API_KEY ?? null,
   codexAccessToken: process.env.CODEX_ACCESS_TOKEN ?? null,
+  cmuxHooksDisabled: process.env.CMUX_CODEX_HOOKS_DISABLED ?? null,
 }));
 `);
   await chmod(fakeCodex, 0o755);
@@ -65,6 +66,8 @@ console.log(JSON.stringify({
           OPENAI_API_KEY: 'must-not-reach-child',
           CODEX_API_KEY: 'must-not-reach-child',
           CODEX_ACCESS_TOKEN: 'must-not-reach-child',
+          CMUX_CODEX_PID: 'existing-codex',
+          CMUX_CODEX_HOOKS_DISABLED: '',
         },
       },
     );
@@ -76,11 +79,29 @@ console.log(JSON.stringify({
     assert.equal(child.openaiApiKey, null);
     assert.equal(child.codexApiKey, null);
     assert.equal(child.codexAccessToken, null);
+    assert.equal(child.cmuxHooksDisabled, '1');
     assert.deepEqual(child.args.slice(-3), ['exec', '--json', 'say hello']);
     assert.equal(child.args[1], 'model_provider="teamcodex_proxy"');
     assert.match(child.args[3], /requires_openai_auth = true/);
     assert.match(child.args[3], /supports_websockets = false/);
     assert.equal(child.args[5], 'chatgpt_base_url="http://127.0.0.1:4567"');
+
+    const topLevelResult = spawnSync(
+      process.execPath,
+      [entry, 'codex', 'run', '--', 'exec', '--json', 'say hello'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH}`,
+          TEAMCLAUDE_CONFIG: configPath,
+          CMUX_CODEX_PID: '',
+          CMUX_CODEX_HOOKS_DISABLED: '',
+        },
+      },
+    );
+    assert.equal(topLevelResult.status, 0, topLevelResult.stderr);
+    assert.equal(JSON.parse(topLevelResult.stdout.trim()).cmuxHooksDisabled, '');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

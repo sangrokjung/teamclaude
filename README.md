@@ -157,7 +157,7 @@ cannot read that path.
 ## Features
 
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
-- **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
+- **Codex subscription pooling** — `teamcodex codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
@@ -214,17 +214,17 @@ the Claude and Codex proxies can run at the same time.
 # Add accounts with isolated official Codex OAuth sessions.
 # Each login uses a temporary CODEX_HOME, so its refresh token is owned only by
 # TeamCodex after import and cannot race the normal ~/.codex/auth.json.
-teamclaude codex login --name codex-pro-1
-teamclaude codex login --name codex-pro-2
+teamcodex codex login --name codex-pro-1
+teamcodex codex login --name codex-pro-2
 
 # Start the Codex proxy
-teamclaude codex server
+teamcodex codex server
 
 # In another terminal, run the interactive Codex CLI through the account pool
-teamclaude codex run
+teamcodex codex run
 
 # Non-interactive Codex commands are forwarded after `--`
-teamclaude codex run -- exec "summarize this repository"
+teamcodex codex run -- exec "summarize this repository"
 ```
 
 Codex chooses its `model_provider` when the TUI process starts. Reloading the
@@ -243,7 +243,9 @@ The no-ID form fails closed when cmux is unavailable or the current surface
 does not have a valid Codex resume binding. It never guesses from working
 directory or recency. Start new sessions with `teamcodex codex run`; cmux then
 records the exact checkpoint together with the TeamCodex provider overrides,
-so later tab restoration keeps the proxy route. See the
+so later tab restoration keeps the proxy route. A nested TeamCodex invocation
+from an existing Codex process disables cmux hooks only for that child, so an
+ephemeral probe cannot replace the parent tab's checkpoint. See the
 [Codex provider/session recovery runbook](docs/runbooks/codex-provider-session-recovery.md)
 for diagnosis and legacy-session recovery.
 
@@ -251,15 +253,15 @@ You can import the account currently logged into the official Codex CLI instead:
 
 ```bash
 codex login
-teamclaude codex import --name codex-pro-1
+teamcodex codex import --name codex-pro-1
 ```
 
-The isolated `teamclaude codex login` flow is recommended. A direct import copies
+The isolated `teamcodex codex login` flow is recommended. A direct import copies
 the same rotating refresh token used by `~/.codex/auth.json`; running plain
 `codex` afterward can rotate that token outside the proxy. If that happens,
-re-import the account or log it in again through `teamclaude codex login`.
+re-import the account or log it in again through `teamcodex codex login`.
 
-`teamclaude codex run` starts an HTTP-only Responses provider that still uses
+`teamcodex codex run` starts an HTTP-only Responses provider that still uses
 Codex's first-party ChatGPT auth path (`requires_openai_auth = true`) and
 redirects `chatgpt_base_url` to the local proxy. This preserves the
 subscription-only model catalog while preventing the default Responses
@@ -275,12 +277,12 @@ accounts show unmeasured quota until each account handles a request.
 Common controls mirror the Claude pool:
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
 
 ### Hermes Agent through TeamCodex
@@ -300,10 +302,10 @@ If Hermes has `openai-codex` entries in its credential pool, set each entry's
 changing its configuration. Hermes keeps talking to one stable URL while
 TeamCodex selects, refreshes, and rotates the upstream Codex account.
 
-Run `teamclaude codex server` in a TTY to open the Codex account dashboard.
+Run `teamcodex codex server` in a TTY to open the Codex account dashboard.
 It uses the Codex config and port independently from the Claude dashboard, so
 both proxies can stay online at the same time. For a non-interactive health
-check, use `teamclaude codex status`.
+check, use `teamcodex codex status`.
 
 ## Adding Accounts
 
