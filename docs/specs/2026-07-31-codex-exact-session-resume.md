@@ -55,6 +55,9 @@ bound to the current cmux surface and always launches it through TeamCodex.
 7. Public help, English/Korean setup docs, architecture notes, and an incident
    runbook explain that provider selection is process-scoped and that
    `source ~/.zshrc` cannot repair a live TUI.
+8. When TeamCodex is launched from an existing Codex process, its child does
+   not run cmux hooks against the inherited parent surface. A top-level launch
+   remains hook-enabled and records its own checkpoint normally.
 
 ## Acceptance criteria
 
@@ -75,6 +78,8 @@ bound to the current cmux surface and always launches it through TeamCodex.
 - [x] Existing Codex run tests, the full Node test suite, and ESLint pass.
 - [x] A real temporary cmux terminal surface shows a TeamCodex-backed resume
   binding after launch.
+- [x] A real nested TeamCodex probe leaves the parent surface checkpoint and
+  restore command unchanged.
 
 ## Risks
 
@@ -85,6 +90,46 @@ bound to the current cmux surface and always launches it through TeamCodex.
   wrong conversation.
 - The cmux hook owns binding creation. TeamCodex consumes that public binding
   contract and must not parse cmux's private session JSON for normal recovery.
+- A nested child can inherit `CMUX_SURFACE_ID`; it must opt out through the
+  public `CMUX_CODEX_HOOKS_DISABLED` contract instead of clearing unrelated
+  cmux environment state.
+
+## Alternatives
+
+- Clearing every `CMUX_*` variable from a nested child would also prevent the
+  overwrite, but it discards unrelated terminal integration state.
+- Repairing bindings only after a probe is reactive and can lose the exact
+  checkpoint when the parent ID is no longer known.
+- Disabling Codex hooks globally prevents overwrite but also removes the
+  trusted checkpoint needed for exact resume.
+
+## Decision
+
+Use cmux's public `CMUX_CODEX_HOOKS_DISABLED=1` switch only when the TeamCodex
+launcher inherited `CMUX_CODEX_PID`. Keep top-level launches unchanged. Use the
+package's declared `teamcodex` binary consistently in public Codex docs.
+
+## Migration and rollout
+
+No data or config migration is required. Merge the launcher and docs, install
+the resulting `teamcodex` package, route future `codex` shell invocations
+through `teamcodex codex run --`, then exact-resume each already-running plain
+Codex TUI through its trusted cmux checkpoint.
+
+## Rollback
+
+Remove the conditional child environment assignment to restore the previous
+launcher behavior. Existing sessions and account data remain valid; a cmux
+binding overwritten during rollback must be repaired with a known exact
+checkpoint rather than selected by recency.
+
+## Observability and runbook
+
+The TeamCodex proxy status and process arguments distinguish proxy-backed from
+plain Codex requests. `cmux surface resume get --json` must show the same parent
+checkpoint before and after a nested probe. Operational diagnosis and recovery
+commands are maintained in
+`docs/runbooks/codex-provider-session-recovery.md`.
 
 ## Verification
 
@@ -94,5 +139,7 @@ bound to the current cmux surface and always launches it through TeamCodex.
 - `npm run lint`.
 - Manual CLI QA with fake `codex`/`cmux` binaries.
 - Manual cmux surface QA using `cmux surface resume get --json`.
+- Manual nested Codex QA comparing the parent binding before and after the
+  child exits.
 - Independent adversarial review against this spec, the diff, and execution
   evidence before merge.

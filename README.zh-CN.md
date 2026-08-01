@@ -188,39 +188,39 @@ Claude 代理默认使用端口 `3456`，因此两个服务器可以同时运行
 
 ```bash
 # 在彼此隔离的 CODEX_HOME 中执行官方 Codex OAuth
-teamclaude codex login --name codex-pro-1
-teamclaude codex login --name codex-pro-2
+teamcodex codex login --name codex-pro-1
+teamcodex codex login --name codex-pro-2
 
 # 启动 Codex 代理和仪表盘
-teamclaude codex server
+teamcodex codex server
 
 # 在另一个终端中运行 Codex CLI
-teamclaude codex run
+teamcodex codex run
 
 # 非交互式运行
-teamclaude codex run -- exec "summarize this repository"
+teamcodex codex run -- exec "summarize this repository"
 ```
 
 也可以导入当前登录到官方 Codex CLI 的账户：
 
 ```bash
 codex login
-teamclaude codex import --name codex-pro-1
+teamcodex codex import --name codex-pro-1
 ```
 
-推荐使用 `teamclaude codex login`。该流程在临时 `CODEX_HOME` 中完成登录，
+推荐使用 `teamcodex codex login`。该流程在临时 `CODEX_HOME` 中完成登录，
 可以避免 TeamCodex 与普通 `~/.codex/auth.json` 同时轮换同一个 refresh
 token 而发生冲突。
 
 ### Codex 账户控制
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
 
 ## 连接 Hermes Agent
@@ -270,7 +270,7 @@ teamclaude stop
 teamclaude restart
 ```
 
-在 TTY 中运行 `teamclaude server` 或 `teamclaude codex server` 时，
+在 TTY 中运行 `teamclaude server` 或 `teamcodex codex server` 时，
 会打开全屏仪表盘。
 
 | 按键 | 操作 |

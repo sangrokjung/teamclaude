@@ -49,7 +49,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 
 ### Codex mode (qjc fork)
 
-`teamclaude codex <cmd>` (or config `provider: "codex"`) runs a second, fully isolated pool for **ChatGPT OAuth accounts** in front of `https://chatgpt.com/backend-api/codex` — own config (`~/.config/teamcodex.json`, default port 3457), own quota/server-state files, zero overlap with the Claude pool. Key differences from Anthropic mode:
+`teamcodex codex <cmd>` (or config `provider: "codex"`) runs a second, fully isolated pool for **ChatGPT OAuth accounts** in front of `https://chatgpt.com/backend-api/codex` — own config (`~/.config/teamcodex.json`, default port 3457), own quota/server-state files, zero overlap with the Claude pool. Key differences from Anthropic mode:
 
 - **Accounts are ChatGPT OAuth only.** `codex login` runs the Codex CLI login inside a throwaway `CODEX_HOME` and imports the resulting `auth.json`; `codex import` reads an existing `~/.codex/auth.json`. Refresh routes by `account.provider` to `refreshCodexAccessToken` (auth.openai.com, Codex client id).
 - **Auth headers**: requests are forwarded with the account's `Bearer` token plus `chatgpt-account-id` (client-sent `authorization`/`chatgpt-account-id` are stripped first).
