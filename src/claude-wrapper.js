@@ -347,7 +347,7 @@ function targetKind(stats) {
   return 'unsupported';
 }
 
-async function backupTarget(path) {
+async function planOriginalTarget(path) {
   const stats = await pathInfo(path);
   if (!stats) return { kind: 'none', backupPath: null };
   const kind = targetKind(stats);
@@ -356,7 +356,6 @@ async function backupTarget(path) {
   const integrity = kind === 'file'
     ? { sha256: digest(await readFile(path)), mode: stats.mode & 0o7777 }
     : { linkTarget: await readlink(path) };
-  await rename(path, backupPath);
   return { kind, backupPath, ...integrity };
 }
 
@@ -441,26 +440,6 @@ async function hasManagedSignature(path, signature) {
   return (await readFile(path, 'utf8')).split('\n').includes(`# ${signature}`);
 }
 
-async function rollbackFreshInstall(paths, originals, installedDigests) {
-  for (const [name, path] of [
-    ['wrapper', paths.wrapperPath],
-    ['vendor', paths.vendorShimPath],
-  ]) {
-    const stats = await pathInfo(path);
-    if (stats?.isFile() && !stats.isSymbolicLink()) {
-      const content = await readFile(path, 'utf8').catch(() => null);
-      if (content != null && digest(content) === installedDigests[name]) await unlink(path);
-    }
-    const original = originals[name] ?? { kind: 'none', backupPath: null };
-    if (original.kind !== 'none' && await pathInfo(original.backupPath)) {
-      await rename(original.backupPath, path);
-    }
-  }
-  await unlink(paths.statePath).catch(error => {
-    if (error.code !== 'ENOENT') throw error;
-  });
-}
-
 async function verifyOriginalBackup(original) {
   if (original.kind === 'none') return;
   const stats = await pathInfo(original.backupPath);
@@ -498,9 +477,10 @@ function validateTransaction(journal, paths) {
     || journal.statePath !== paths.statePath) {
     throw new Error(`Refusing to use mismatched wrapper transaction: ${paths.transactionPath}`);
   }
-  if (journal.type === 'install-update') {
+  if (journal.type === 'install-fresh' || journal.type === 'install-update') {
     const state = parseInstallState(journal.stateContent, paths);
-    if (typeof journal.previousStateSha256 !== 'string') {
+    if (journal.type === 'install-update'
+      && typeof journal.previousStateSha256 !== 'string') {
       throw new Error('Refusing to use an invalid previous state digest');
     }
     for (const { name, signature, digestKey } of managedTargets(paths)) {
@@ -573,6 +553,54 @@ async function restoreOriginalTarget(path, original, signature, managedDigest) {
   }
 }
 
+async function freshTargetNeedsBackup(path, original, signature, managedDigest) {
+  const live = await pathInfo(path);
+  if (original.kind === 'none') {
+    if (live) await verifyManagedTarget(path, signature, managedDigest);
+    return false;
+  }
+  if (await pathInfo(original.backupPath)) {
+    await verifyOriginalBackup(original);
+    if (live) await verifyManagedTarget(path, signature, managedDigest);
+    return false;
+  }
+  if (!await originalMatchesPath(path, original)) {
+    throw new Error(`Original target changed during install recovery: ${path}`);
+  }
+  return true;
+}
+
+async function writeInstallGeneration(paths, journal, transactionHook, stepPrefix) {
+  for (const { name, path } of managedTargets(paths)) {
+    await runTransactionHook(transactionHook, `${stepPrefix}:${name}`);
+    await atomicWrite(path, journal.targets[name].content, 0o755);
+  }
+  await runTransactionHook(transactionHook, `${stepPrefix}:state`);
+  await atomicWrite(paths.statePath, journal.stateContent, 0o600);
+  await unlink(paths.transactionPath);
+}
+
+async function resumeFreshInstall(paths, transaction, transactionHook = null) {
+  const { journal, state } = transaction;
+  const stateRecord = await readInstallStateRecord(paths);
+  if (stateRecord && digest(stateRecord.content) !== digest(journal.stateContent)) {
+    throw new Error('Install state changed during fresh install recovery');
+  }
+  const needsBackup = [];
+  for (const target of managedTargets(paths)) {
+    if (await freshTargetNeedsBackup(
+      target.path,
+      state.originals[target.name],
+      target.signature,
+      journal.targets[target.name].sha256,
+    )) needsBackup.push(target);
+  }
+  for (const { name, path } of needsBackup) {
+    await rename(path, state.originals[name].backupPath);
+  }
+  await writeInstallGeneration(paths, journal, transactionHook, 'install:fresh');
+}
+
 async function resumeInstallUpdate(paths, transaction, transactionHook = null) {
   const { journal, state } = transaction;
   const stateRecord = await readInstallStateRecord(paths);
@@ -592,13 +620,7 @@ async function resumeInstallUpdate(paths, transaction, transactionHook = null) {
       throw new Error(`Managed ${name} changed during recovery; refusing to resume`);
     }
   }
-  for (const { name, path } of managedTargets(paths)) {
-    await runTransactionHook(transactionHook, `install:update:${name}`);
-    await atomicWrite(path, journal.targets[name].content, 0o755);
-  }
-  await runTransactionHook(transactionHook, 'install:update:state');
-  await atomicWrite(paths.statePath, journal.stateContent, 0o600);
-  await unlink(paths.transactionPath);
+  await writeInstallGeneration(paths, journal, transactionHook, 'install:update');
 }
 
 async function resumeUninstall(paths, transaction, transactionHook = null) {
@@ -636,6 +658,10 @@ async function resumeUninstall(paths, transaction, transactionHook = null) {
 async function recoverPendingTransaction(paths) {
   const transaction = await readTransaction(paths);
   if (!transaction) return;
+  if (transaction.journal.type === 'install-fresh') {
+    await resumeFreshInstall(paths, transaction);
+    return;
+  }
   if (transaction.journal.type === 'install-update') {
     await resumeInstallUpdate(paths, transaction);
     return;
@@ -714,34 +740,33 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin, transactionH
   }
 
   const originals = {};
-  try {
-    for (const path of [paths.wrapperPath, paths.vendorShimPath]) {
-      const stats = await pathInfo(path);
-      if (stats && targetKind(stats) === 'unsupported') {
-        throw new Error(`Refusing to replace unsupported path: ${path}`);
-      }
-    }
-    originals.wrapper = await backupTarget(paths.wrapperPath);
-    originals.vendor = await backupTarget(paths.vendorShimPath);
-    await atomicWrite(paths.wrapperPath, wrapper, 0o755);
-    await atomicWrite(paths.vendorShimPath, vendor, 0o755);
-    const state = {
-      version: STATE_VERSION,
-      wrapperPath: paths.wrapperPath,
-      vendorShimPath: paths.vendorShimPath,
-      installed: {
-        wrapperSha256: installedDigests.wrapper,
-        vendorSha256: installedDigests.vendor,
-      },
-      originals,
-    };
-    await atomicWrite(paths.statePath, serializeState(state), 0o600);
-  } catch (error) {
-    if (originals.wrapper || originals.vendor) {
-      await rollbackFreshInstall(paths, originals, installedDigests).catch(() => {});
-    }
-    throw error;
+  for (const { name, path } of managedTargets(paths)) {
+    originals[name] = await planOriginalTarget(path);
   }
+  const state = {
+    version: STATE_VERSION,
+    wrapperPath: paths.wrapperPath,
+    vendorShimPath: paths.vendorShimPath,
+    installed: {
+      wrapperSha256: installedDigests.wrapper,
+      vendorSha256: installedDigests.vendor,
+    },
+    originals,
+  };
+  const journal = {
+    version: TRANSACTION_VERSION,
+    type: 'install-fresh',
+    wrapperPath: paths.wrapperPath,
+    vendorShimPath: paths.vendorShimPath,
+    statePath: paths.statePath,
+    stateContent: serializeState(state),
+    targets: {
+      wrapper: { content: wrapper, sha256: installedDigests.wrapper },
+      vendor: { content: vendor, sha256: installedDigests.vendor },
+    },
+  };
+  await atomicWrite(paths.transactionPath, `${JSON.stringify(journal, null, 2)}\n`, 0o600);
+  await resumeFreshInstall(paths, { journal, state }, transactionHook);
 
   return {
     wrapperPath: paths.wrapperPath,

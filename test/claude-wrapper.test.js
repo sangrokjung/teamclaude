@@ -314,6 +314,65 @@ test('same-digest reinstall repairs wrapper and vendor executable modes', async 
   }
 });
 
+test('interrupted first installs converge without losing original targets', async t => {
+  for (const failureStep of [
+    'install:fresh:wrapper',
+    'install:fresh:vendor',
+    'install:fresh:state',
+  ]) {
+    await t.test(failureStep, async () => {
+      const fixture = await makeFixture();
+      try {
+        await writeNative(fixture, '2.1.9');
+        const originalLink = '../share/claude/versions/2.1.9';
+        const originalVendor = Buffer.from('original vendor bytes\n');
+        const transactionPath = join(
+          fixture.binDir,
+          '.teamclaude-claude-wrapper-transaction.json',
+        );
+        await symlink(originalLink, fixture.wrapperPath);
+        await writeFile(fixture.vendorShimPath, originalVendor);
+        await chmod(fixture.vendorShimPath, 0o700);
+
+        await assert.rejects(
+          installClaudeWrapper({
+            homeDir: fixture.homeDir,
+            teamcodexBin: fixture.teamcodexBin,
+            transactionHook: failOnceAt(failureStep),
+          }),
+          /injected transaction failure/,
+        );
+        assert.equal(modeBits(await lstat(transactionPath)), 0o600);
+
+        const installed = await installClaudeWrapper({
+          homeDir: fixture.homeDir,
+          teamcodexBin: fixture.teamcodexBin,
+        });
+        await assertManagedSetMatchesState(installed);
+        await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+
+        await uninstallClaudeWrapper({ homeDir: fixture.homeDir });
+        assert.equal((await lstat(fixture.wrapperPath)).isSymbolicLink(), true);
+        assert.equal(await readlink(fixture.wrapperPath), originalLink);
+        assert.deepEqual(await readFile(fixture.vendorShimPath), originalVendor);
+        assert.equal(modeBits(await lstat(fixture.vendorShimPath)), 0o700);
+        assert.doesNotMatch(
+          await readFile(fixture.wrapperPath, 'utf8'),
+          new RegExp(CLAUDE_WRAPPER_SIGNATURE),
+        );
+        assert.doesNotMatch(
+          await readFile(fixture.vendorShimPath, 'utf8'),
+          new RegExp(CLAUDE_VENDOR_SIGNATURE),
+        );
+        await assert.rejects(readFile(installed.statePath, 'utf8'), { code: 'ENOENT' });
+        await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+      } finally {
+        await cleanup(fixture);
+      }
+    });
+  }
+});
+
 test('interrupted existing install updates converge on the next install', async t => {
   for (const failureStep of ['install:update:vendor', 'install:update:state']) {
     await t.test(failureStep, async () => {
