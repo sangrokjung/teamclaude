@@ -191,7 +191,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
         encoding: 'utf8',
         env: {
           ...process.env,
-          TEAMCODEX_CODEX_BIN: fakeCodex,
+          PATH: `${dir}:${process.env.PATH}`,
           TEAMCLAUDE_CONFIG: configPath,
           TEAMCLAUDE_SESSION_SUPERVISED: '1',
         },
