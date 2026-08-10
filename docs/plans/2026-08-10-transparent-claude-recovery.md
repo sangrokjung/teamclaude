@@ -4,7 +4,7 @@
 
 **Goal:** Make plain `claude` enter TeamClaude recovery automatically and keep the exact Claude session recoverable across usage-credit, timeout, and non-terminal auto-mode classifier failures.
 
-**Architecture:** Add an idempotent installer for a canonical `~/.local/bin/claude` wrapper that resolves the newest native Claude binary and invokes `teamcodex run` with an explicit vendor path. Add a nested-supervision guard in the CLI, retain existing bounded usage/timeout recovery, and pin the safety-classifier tool denial as non-terminal with regression tests.
+**Architecture:** Add an idempotent installer for a canonical `~/.local/bin/claude` wrapper plus a `claude-vendor` shim that resolves the newest native Claude binary at each invocation. The wrapper invokes `teamcodex run` with that explicit shim path. Add a nested-supervision guard in the CLI, exact structured usage/timeout classifiers, UUID-confirmed account rotation, and bounded safety-classifier recovery.
 
 **Tech Stack:** Node.js 18+ built-ins, ES modules, zsh wrapper, Node test runner.
 
@@ -12,11 +12,13 @@
 
 ## File map
 
-- Create `src/claude-wrapper.js`: render, install, inspect, and uninstall the transparent wrapper without runtime dependencies.
+- Create `src/claude-wrapper.js`: render, install, inspect, and uninstall the transparent wrapper and update-safe vendor shim without runtime dependencies.
 - Modify `src/index.js`: expose `install-claude-wrapper`, `uninstall-claude-wrapper`, and reject nested supervised launch recursion.
 - Create `test/claude-wrapper.test.js`: isolated-HOME installer, argv, vendor resolution, idempotency, backup, and rollback tests.
 - Modify `test/run-env.test.js`: nested launcher recursion and explicit vendor regression tests.
-- Modify `test/claude-recovery.test.js`: auto-mode denial remains non-terminal; later timeout still performs UI-only reopen.
+- Modify `test/claude-recovery.test.js`: exact usage/timeout classification, UUID-confirmed rotation, and bounded auto-mode denial recovery.
+- Modify `test/run-recovery.test.js`: exercise real launcher UUID rotation and safe continuation argv.
+- Modify `src/config.js` and `config.example.json`: expose a separate bounded safety-denial recovery budget.
 - Modify `README.md`, `README.ko.md`, and `docs/runbooks/ambiguous-dispatch-502.md`: plain `claude` is normal entry; direct `teamclaude run` is diagnostic only.
 - Create `docs/runbooks/transparent-claude-recovery.md`: worker/main installation, legacy-session adoption, verification, and rollback.
 
@@ -101,14 +103,16 @@ Use a temporary HOME with native binaries under
 ```js
 const result = await installClaudeWrapper({ home: root, teamcodexBin });
 assert.equal(result.installed, true);
-assert.equal(await readlink(join(root, '.local/bin/claude-vendor')), newestVendor);
 assert.match(await readFile(join(root, '.local/bin/claude'), 'utf8'), /TEAMCLAUDE_CLAUDE_BIN/);
+assert.match(await readFile(join(root, '.local/bin/claude-vendor'), 'utf8'), /teamclaude-vendor-shim:v1/);
 assert.equal((await stat(join(root, '.local/bin/claude')).mode & 0o777, 0o755);
 ```
 
 Also execute the wrapper against a fake `teamcodex` and assert the captured argv
-is `['run', '--', ...originalArgs]`, the vendor env points at `2.1.226`, a second
-install is idempotent, and uninstall atomically restores the vendor symlink.
+is `['run', '--', ...originalArgs]`, the vendor env points at `claude-vendor`, a
+second install is idempotent, and uninstall atomically restores the original
+`claude`. Add `2.1.227` after installation and execute `claude-vendor` again;
+the new version must be selected without reinstalling the wrapper.
 
 - [ ] **Step 2: Run installer tests and verify RED**
 
@@ -118,7 +122,9 @@ Expected: FAIL with `ERR_MODULE_NOT_FOUND` for `src/claude-wrapper.js`.
 
 - [ ] **Step 3: Implement native vendor discovery and wrapper rendering**
 
-Create a zero-dependency module with explicit paths and atomic rename:
+Create a zero-dependency module with explicit paths and atomic rename. The module
+validates candidate versions during installation, but the installed vendor shim
+must perform the same semantic-version selection on every invocation:
 
 ```js
 export async function findNewestClaudeVendor(home) {
@@ -137,22 +143,25 @@ export async function findNewestClaudeVendor(home) {
 }
 ```
 
-Render a zsh wrapper with a literal installer signature, explicit vendor and
-teamcodex paths, preserved argv, and no fixed-port pre-probe:
+Render two zsh scripts with literal installer signatures, preserved argv, and no
+fixed-port pre-probe. `claude-vendor` resolves the latest executable native
+version dynamically and rejects its own realpath, non-executable targets, and
+symlink loops before `exec`. The transparent wrapper points
+`TEAMCLAUDE_CLAUDE_BIN` at that shim, never at itself or a pinned version:
 
 ```zsh
 #!/bin/zsh
 set -eu
 # teamclaude-transparent-wrapper:v1
-export TEAMCLAUDE_CLAUDE_BIN="/absolute/native/version"
+export TEAMCLAUDE_CLAUDE_BIN="/absolute/.local/bin/claude-vendor"
 exec "/absolute/teamcodex" run -- "$@"
 ```
 
-Install order: validate newest vendor and teamcodex executable; create/update
-`claude-vendor`; write wrapper to a same-directory temporary file with `0o755`;
-rename it over `claude`. Never overwrite an unknown regular file without first
-renaming it to a timestamped backup. Uninstall only files bearing the exact
-signature and restore `claude-vendor` as `claude` atomically.
+Install order: validate newest vendor and teamcodex executable; write both scripts
+to same-directory temporary files with `0o755`; rename them into place. Never
+overwrite an unknown regular file or symlink without first renaming it to a
+timestamped backup. Uninstall only files bearing the exact signatures, remove
+the managed vendor shim, and atomically restore the original `claude` backup.
 
 - [ ] **Step 4: Expose install and uninstall commands**
 
@@ -187,11 +196,15 @@ git add src/claude-wrapper.js src/index.js test/claude-wrapper.test.js
 git commit -m "feat: install transparent Claude wrapper"
 ```
 
-### Task 3: Pin observed recovery semantics
+### Task 3: Pin exact and bounded recovery semantics
 
 **Files:**
 - Modify: `test/claude-recovery.test.js`
-- Modify only if the tests expose a gap: `src/claude-recovery.js:58-729`
+- Modify: `test/run-recovery.test.js`
+- Modify: `src/claude-recovery.js:58-729`
+- Modify: `src/index.js:1720-1790`
+- Modify: `src/config.js`
+- Modify: `config.example.json`
 
 - [ ] **Step 1: Add the exact observed tool-denial fixture**
 
@@ -211,29 +224,55 @@ function autoModeUnavailableRecord(cwd) {
 }
 ```
 
-- [ ] **Step 2: Add non-terminal and timeout-chain tests**
+- [ ] **Step 2: Add exact classifier and near-miss tests**
+
+Usage-credit must require a structured API-error record and one of the observed
+complete normalized messages. Timeout must require `error=server_error`, the
+observed status when present, and the complete normalized timeout message. Add
+ANSI/CRLF/whitespace positive fixtures plus prompt-injection, embedded phrase,
+wrong type/status/error, and unknown-suffix negatives. No near-miss may trigger
+rotation, resume, or handoff.
+
+- [ ] **Step 3: Require account UUID change for usage recovery**
+
+Record the UUID from `TEAMCLAUDE_RECOVERY_ACCOUNT` before rotation. A rotation is
+successful only when `currentAccountUuid` is valid and differs from the previous
+UUID. Name-only changes, missing UUIDs, malformed responses, exceptions, and the
+same UUID must perform zero resume spawns. A real UUID change resumes the exact
+session with `['--resume', sessionId, 'continue']` within the shared bounded retry
+budget.
+
+- [ ] **Step 4: Add non-terminal and bounded safety-denial tests**
 
 First test writes the denial followed by normal assistant Read activity and exits
 zero. Assert one spawn, no rotation, no Codex handoff, and no resume. Second test
 writes denial then structured timeout and exits nonzero. Assert only timeout
 recovery runs and the next argv is `['--resume', sessionId]`, without `continue`.
 
-- [ ] **Step 3: Run tests and preserve fail-safe behavior**
+Add an unresolved terminal denial case. It may resume once with a constant safe
+continuation that asks Claude to keep working read-only and retry the denied tool
+only after the classifier recovers. It must never approve Bash, change permission
+mode, rotate accounts, or replay the original tool input. Give this class its own
+`claudeSafetyDenialMaxResumes` budget (default `1`, `0` disables it); persistent
+denials stop after the budget while preserving the session/transcript.
+
+- [ ] **Step 5: Run tests and preserve fail-safe behavior**
 
 Run:
 
 ```bash
-node --test --test-name-pattern='auto mode unavailable|tool denial followed by timeout' test/claude-recovery.test.js
+node --test --test-name-pattern='usage credit exact|timeout exact|auto mode unavailable|tool denial followed by timeout|UUID rotation' test/claude-recovery.test.js test/run-recovery.test.js
 ```
 
-Expected: PASS on existing logic. If a test fails, make the minimum monitor change
-that ignores `toolDenialKind=automode-unavailable` as a terminal event. Do not add
-account rotation, Codex handoff, Bash permission changes, or automatic `continue`.
+Expected: all selected tests PASS. Make only the minimum classifier, monitor,
+rotation-verification, and bounded safety-continuation changes. Do not add account
+rotation, Codex handoff, Bash permission changes, or generic `continue` for the
+safety denial.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add test/claude-recovery.test.js src/claude-recovery.js
+git add test/claude-recovery.test.js test/run-recovery.test.js src/claude-recovery.js src/index.js src/config.js config.example.json
 git commit -m "test: pin auto-mode denial recovery boundary"
 ```
 

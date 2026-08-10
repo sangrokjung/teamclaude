@@ -84,9 +84,12 @@ Wrapper는 인자를 byte-for-byte 배열로 전달하고 `exec`로 launcher에 
 특별히 재해석하지 않는다. launcher는 child exit code와 signal을 호출자에게 그대로
 전달한다.
 
-`TEAMCLAUDE_CLAUDE_BIN`은 wrapper 자신이나 PATH의 `claude`가 아니라 검증된 vendor
-binary를 가리킨다. 같은 경로를 가리키거나 실행 불가능하면 fail-closed하고 재귀하지
-않는다. 운영 비상 우회는 별도 `claude-vendor` 이름으로만 제공한다.
+`TEAMCLAUDE_CLAUDE_BIN`은 wrapper 자신이나 PATH의 `claude`가 아니라 관리되는
+`claude-vendor` shim을 가리킨다. shim은 실행할 때마다
+`~/.local/share/claude/versions/*` 중 최신 실행 가능한 native binary를 semantic version
+순서로 고르므로 vendor 업데이트 뒤 wrapper 재설치가 필요 없다. wrapper·shim·native가
+같은 realpath를 가리키거나 대상이 실행 불가능하거나 symlink loop이면 fail-closed하고
+재귀하지 않는다. 운영 비상 우회는 이 shim 이름으로만 제공한다.
 
 ### 2. New sessions and legacy sessions
 
@@ -104,18 +107,21 @@ transparent launcher를 사용한다. qjc-worker가 이미 공용 wrapper를 호
 
 #### Usage credits
 
-구조화된 API-error record에서 `usage limit|usage credits`를 exact recovery class로
-분류한다. launcher는 현재 child를 중지하고 proxy가 준비된 뒤 실제 account 변경이
-확인된 경우에만 같은 session을 `continue`로 재개한다. Fable model-scoped exhaustion은
+구조화된 API-error record와 관찰된 전체 정규화 메시지에서만 usage-credit exact
+recovery class를 분류한다. 사용자 prompt나 부분 문자열은 분류하지 않는다. launcher는
+현재 child를 중지하고 proxy가 준비된 뒤 이전·현재 account UUID가 모두 유효하며 실제로
+달라진 경우에만 같은 session을 `continue`로 재개한다. 계정 이름만 달라진 것은 회전
+성공이 아니다. Fable model-scoped exhaustion은
 proxy의 `modelFallbacks`에서 먼저 같은 request의 완결된 429 계약에 따라 처리하고,
 CLI의 local subscription credit gate는 launcher의 account rotation으로 처리한다.
 같은 account로의 눈속임 재시작은 금지한다.
 
 #### Request timeout
 
-구조화된 `server_error` + `Request timed out`만 timeout으로 분류한다. dispatch 결과가
-불확실하므로 `--resume <id>`로 UI-only reopen하고 `continue`나 원본 prompt를 자동
-전송하지 않는다. 일반 retry budget을 적용한다.
+구조화된 `server_error`와 관찰된 전체 정규화 `Request timed out` record만 timeout으로
+분류한다. 사용자 prompt나 메시지 내부의 부분 문자열은 분류하지 않는다. dispatch
+결과가 불확실하므로 `--resume <id>`로 UI-only reopen하고 `continue`나 원본 prompt를
+자동 전송하지 않는다. 일반 retry budget을 적용한다.
 
 #### Safety classifier unavailable
 
