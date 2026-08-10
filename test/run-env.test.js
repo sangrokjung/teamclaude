@@ -134,6 +134,42 @@ console.log(JSON.stringify({
   }
 });
 
+test('run rejects an inherited supervised marker before spawning Claude', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-nested-supervision-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = join(dir, 'claude-vendor');
+    const configPath = join(dir, 'config.json');
+    const invocationLog = join(dir, 'invocations.log');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.INVOCATION_LOG, 'spawned\\n');
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port } }));
+
+    const result = spawnSync(process.execPath, [entry, 'run'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        TEAMCLAUDE_PROVIDER: 'anthropic',
+        TEAMCLAUDE_CONFIG: configPath,
+        TEAMCLAUDE_CLAUDE_BIN: fakeClaude,
+        TEAMCLAUDE_SESSION_SUPERVISED: '1',
+        INVOCATION_LOG: invocationLog,
+      },
+    });
+
+    assert.equal(result.status, 75, result.stderr);
+    assert.match(result.stderr, /nested supervised Claude launch/i);
+    await assert.rejects(readFile(invocationLog, 'utf8'), { code: 'ENOENT' });
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('run propagates SIGINT from Claude with a single spawn and no resume flags', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-signal-'));
   let server;

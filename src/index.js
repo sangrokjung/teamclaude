@@ -1756,6 +1756,12 @@ async function codexResumeCommand() {
 }
 
 async function runCommand(clientArgsOverride = null) {
+  if (process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1') {
+    console.error(
+      '[TeamClaude] Refusing nested supervised Claude launch: TEAMCLAUDE_CLAUDE_BIN must point to the native Claude vendor binary.',
+    );
+    process.exit(75);
+  }
   const config = await loadOrCreateConfig();
   if (!isCodexMode(config)) {
     try {
