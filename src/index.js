@@ -52,6 +52,20 @@ const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'host',
 ]);
 
+// Korean labels for WHY an account is parked as 'error' (status payload
+// errorReason). Unknown/legacy reasons render as plain `error` with no tag.
+// MUST stay above the top-level command dispatch below: `const` in the module
+// scope is in its temporal dead zone until evaluation reaches this line, and
+// the dispatch `await`s command functions mid-module — a declaration placed
+// after it throws ReferenceError the moment statusCommand touches it.
+const ERROR_REASON_LABELS = {
+  'subscription-disabled': '구독연체',
+  'auth-revoked': '인증무효 — 재로그인 필요',
+  'refresh-failed': 'refresh 실패',
+  'auth-rejected': '인증거부',
+  'send-failed': '송신실패',
+};
+
 function connectionHeaderNames(value) {
   return new Set(
     String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
@@ -1859,6 +1873,7 @@ async function runCommand(clientArgsOverride = null) {
 }
 
 // ── status ──────────────────────────────────────────────────
+// (ERROR_REASON_LABELS lives above the command dispatch — see the note there.)
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
@@ -1889,6 +1904,10 @@ async function statusCommand() {
       console.log(`Host:           CPU ${cpu} (load ${load} / ${h.cpu.cores} cores)   RAM ${formatBytes(m.usedBytes)}/${formatBytes(m.totalBytes)} (${m.usedPct}%)`);
     }
     console.log(`Active account: ${data.currentAccount}`);
+    // Absent from older running servers — only print when the payload has it.
+    if (data.usableCount != null && data.totalCount != null) {
+      console.log(`Usable now:     ${data.usableCount}/${data.totalCount} accounts`);
+    }
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
     for (const acct of data.accounts) {
@@ -1897,7 +1916,9 @@ async function statusCommand() {
 
       const disabledTag = acct.enabled === false ? ' [disabled]' : '';
       console.log(`  ${acct.name} (${acct.type})${current}${disabledTag}`);
-      console.log(`    Status:   ${acct.status}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
+      const reasonTag = acct.status === 'error' && ERROR_REASON_LABELS[acct.errorReason]
+        ? ` [${ERROR_REASON_LABELS[acct.errorReason]}]` : '';
+      console.log(`    Status:   ${acct.status}${reasonTag}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
       if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
       if (acct.maxConcurrent != null) {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
