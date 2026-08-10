@@ -170,6 +170,42 @@ appendFileSync(process.env.INVOCATION_LOG, 'spawned\\n');
   }
 });
 
+test('codex run allows an inherited supervised marker for the internal handoff', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-supervised-handoff-'));
+  const fakeCodex = join(dir, 'codex');
+  const configPath = join(dir, 'teamcodex.json');
+  try {
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+console.log(JSON.stringify({ args: process.argv.slice(2) }));
+`);
+    await chmod(fakeCodex, 0o755);
+    await writeFile(configPath, JSON.stringify({
+      provider: 'codex',
+      proxy: { port: 4567, apiKey: 'proxy-key' },
+    }));
+
+    const result = spawnSync(
+      process.execPath,
+      [entry, 'codex', 'run', '--', 'exec', 'handoff'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
+          TEAMCLAUDE_CONFIG: configPath,
+          TEAMCLAUDE_SESSION_SUPERVISED: '1',
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()).args.slice(-2), ['exec', 'handoff']);
+    assert.doesNotMatch(result.stderr, /nested supervised Claude launch/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('run propagates SIGINT from Claude with a single spawn and no resume flags', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-signal-'));
   let server;
