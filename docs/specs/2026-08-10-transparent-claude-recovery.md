@@ -7,16 +7,18 @@ TeamClaude의 Claude recovery는 `teamclaude run`이 Claude Code의 부모 프�
 `qjc-worker` 세션을 계속 사용하면 벤더 Claude 바이너리가 직접 실행되어 transcript
 감시, account rotation, timeout reopen을 모두 우회한다.
 
-현재 관찰된 증상은 다음 세 종류다.
+현재 관찰된 증상은 다음 네 종류다.
 
 1. `You're out of usage credits ... Fable 5`
 2. `claude-sonnet-5 is temporarily unavailable, so auto mode cannot determine the safety of Bash`
 3. `Request timed out`
+4. `Fable 5's safeguards flagged this message ... Claude Code can't respond`
 
 첫 번째와 세 번째는 launcher recovery 경로가 이미 존재하지만 우회된 세션에는
 적용되지 않는다. 두 번째는 API terminal error가 아니라 transcript의
 `toolDenialKind=automode-unavailable` tool-result이므로 현재 API-error classifier가
-분류하지 않는다.
+분류하지 않는다. 네 번째는 quota가 아니라 provider safeguard refusal이며, 정상
+fallback 여부와 terminal refusal을 구분해야 한다.
 
 ## Goal
 
@@ -138,6 +140,22 @@ Launcher는 해당 record만으로 Claude child를 즉시 죽이지 않는다. C
 뒤 필요한 tool을 다시 판단하라는 지시다. 반복 denial은 전용 budget 소진 후 자동
 재시도를 멈추고 session과 transcript를 보존한다.
 
+#### Fable safeguard refusal
+
+관찰된 정상 fallback record는 `type=system`,
+`subtype=model_refusal_fallback`, `trigger=refusal`, `direction=retry`이며 원래 Fable
+model과 fallback model을 구조화 필드로 가진다. 이 record는 terminal failure가 아니므로
+launcher가 child를 중지하거나 별도 retry하지 않는다. fallback 뒤 정상 assistant/user
+record가 이어지면 해결된 것으로 간주한다.
+
+fallback 없이 `Fable 5's safeguards flagged this message`가 terminal로 남은 경우에도
+quota·auth 장애로 취급하지 않는다. 계정 회전, model 강제 변경, permission 완화, 차단된
+prompt의 재전송·자동 수정은 금지한다. 같은 session을 보존한 채 전용 bounded budget
+안에서 한 번만 안전 continuation을 보내, 차단된 prompt를 재시도·우회하지 말고 남아
+있는 안전한 읽기 전용 작업만 계속하도록 한다. 남은 작업이 없으면 transcript를
+보존하고 사용자 편집을 기다린다. 사용자 prompt 안의 동일 문구나 구조화 refusal 필드가
+없는 near-miss는 복구를 유발하지 않는다.
+
 ### 4. Safety boundaries
 
 - Proxy가 받은 unsafe POST의 ambiguous network/5xx 결과는 내부 replay하지 않는다.
@@ -163,6 +181,9 @@ Launcher는 해당 record만으로 Claude child를 즉시 죽이지 않는다. C
 - timeout은 UI-only reopen하며 원본 prompt와 `continue`를 보내지 않는다.
 - `automode-unavailable` exact tool denial은 terminal unresolved 상태에서만 한 번
   continuation하고, 정상 후속 record·다른 tool error·사용자 문구는 무시한다.
+- `model_refusal_fallback`은 비종료 record로 유지하고, fallback 없는 terminal safeguard
+  refusal만 별도 1회 budget으로 안전 continuation한다. model/account/prompt는 자동
+  변경하거나 재전송하지 않는다.
 - persistent denial과 timeout은 budget을 넘지 않는다.
 - proxy의 unsafe POST upstream hit는 항상 1회다.
 

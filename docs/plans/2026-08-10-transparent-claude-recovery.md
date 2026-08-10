@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make plain `claude` enter TeamClaude recovery automatically and keep the exact Claude session recoverable across usage-credit, timeout, and non-terminal auto-mode classifier failures.
+**Goal:** Make plain `claude` enter TeamClaude recovery automatically and keep the exact Claude session recoverable across usage-credit, timeout, auto-mode classifier failures, and terminal Fable safeguard refusals without replaying blocked prompts.
 
 **Architecture:** Add an idempotent installer for a canonical `~/.local/bin/claude` wrapper plus a `claude-vendor` shim that resolves the newest native Claude binary at each invocation. The wrapper invokes `teamcodex run` with that explicit shim path. Add a nested-supervision guard in the CLI, exact structured usage/timeout classifiers, UUID-confirmed account rotation, and bounded safety-classifier recovery.
 
@@ -16,7 +16,7 @@
 - Modify `src/index.js`: expose `install-claude-wrapper`, `uninstall-claude-wrapper`, and reject nested supervised launch recursion.
 - Create `test/claude-wrapper.test.js`: isolated-HOME installer, argv, vendor resolution, idempotency, backup, and rollback tests.
 - Modify `test/run-env.test.js`: nested launcher recursion and explicit vendor regression tests.
-- Modify `test/claude-recovery.test.js`: exact usage/timeout classification, UUID-confirmed rotation, and bounded auto-mode denial recovery.
+- Modify `test/claude-recovery.test.js`: exact usage/timeout classification, UUID-confirmed rotation, bounded auto-mode denial recovery, and non-bypassing safeguard-refusal continuity.
 - Modify `test/run-recovery.test.js`: exercise real launcher UUID rotation and safe continuation argv.
 - Modify `src/config.js` and `config.example.json`: expose a separate bounded safety-denial recovery budget.
 - Modify `README.md`, `README.ko.md`, and `docs/runbooks/ambiguous-dispatch-502.md`: plain `claude` is normal entry; direct `teamclaude run` is diagnostic only.
@@ -256,12 +256,21 @@ mode, rotate accounts, or replay the original tool input. Give this class its ow
 `claudeSafetyDenialMaxResumes` budget (default `1`, `0` disables it); persistent
 denials stop after the budget while preserving the session/transcript.
 
+Add the observed safeguard fixture with structured
+`type=system/subtype=model_refusal_fallback/trigger=refusal/direction=retry`. When
+normal fallback activity follows, assert one spawn and zero launcher recovery.
+Add a terminal fallback-unavailable safeguard fixture matching the full normalized
+Claude diagnostic. It may use one separate `claudeSafeguardMaxResumes` budget and
+a constant safe continuation, but must perform zero account rotation, model
+override, permission change, blocked-prompt replay, or prompt rewriting. Prompt
+injection and wrong-structure near-misses must remain inert.
+
 - [ ] **Step 5: Run tests and preserve fail-safe behavior**
 
 Run:
 
 ```bash
-node --test --test-name-pattern='usage credit exact|timeout exact|auto mode unavailable|tool denial followed by timeout|UUID rotation' test/claude-recovery.test.js test/run-recovery.test.js
+node --test --test-name-pattern='usage credit exact|timeout exact|auto mode unavailable|tool denial followed by timeout|safeguard|UUID rotation' test/claude-recovery.test.js test/run-recovery.test.js
 ```
 
 Expected: all selected tests PASS. Make only the minimum classifier, monitor,
