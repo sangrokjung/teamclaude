@@ -166,6 +166,7 @@ test('rotateActiveAccount switches to another available account without exposing
   assert.deepEqual(result, {
     rotated: true,
     previousAccount: 'acct-0',
+    previousAccountUuid: 'uuid-0',
     currentAccount: 'acct-1',
     currentAccountUuid: 'uuid-1',
   });
@@ -174,6 +175,7 @@ test('rotateActiveAccount switches to another available account without exposing
     'currentAccount',
     'currentAccountUuid',
     'previousAccount',
+    'previousAccountUuid',
     'rotated',
   ]);
 });
@@ -211,6 +213,55 @@ test('rotateActiveAccount leaves state unchanged when no alternative is usable',
   assert.equal(am.currentIndex, 0);
   assert.equal(am.lastEvalAt, 12345);
   assert.deepEqual(accounts, inputBefore);
+});
+
+test('rotateActiveAccount excludes the failed recovery UUID instead of the global current account', () => {
+  for (const currentIndex of [0, 2]) {
+    const am = new AccountManager(makeAccounts(3), 0.98, 0);
+    am.accounts[0].accountUuid = 'uuid-a';
+    am.accounts[1].accountUuid = 'uuid-b';
+    am.accounts[2].accountUuid = 'uuid-c';
+    am.accounts[0].priority = 0;
+    am.accounts[1].priority = 1;
+    am.accounts[2].priority = 2;
+    am.currentIndex = currentIndex;
+
+    const result = am.rotateActiveAccount(null, true, 'uuid-b');
+
+    assert.deepEqual(result, {
+      rotated: true,
+      previousAccount: 'acct-1',
+      previousAccountUuid: 'uuid-b',
+      currentAccount: 'acct-0',
+      currentAccountUuid: 'uuid-a',
+    });
+    assert.equal(am.currentIndex, 0);
+  }
+});
+
+test('rotateActiveAccount fails closed for an unknown recovery UUID and skips UUID-less targets', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-a';
+  am.accounts[0].priority = 1;
+  am.accounts[1].accountUuid = 'uuid-b';
+  am.accounts[1].priority = 2;
+  am.accounts[2].priority = 0;
+  am.currentIndex = 2;
+
+  assert.deepEqual(
+    am.rotateActiveAccount(null, true, 'uuid-missing'),
+    { rotated: false, reason: 'no-alternative-account' },
+  );
+  assert.equal(am.currentIndex, 2);
+
+  assert.deepEqual(am.rotateActiveAccount(null, true, 'uuid-b'), {
+    rotated: true,
+    previousAccount: 'acct-1',
+    previousAccountUuid: 'uuid-b',
+    currentAccount: 'acct-0',
+    currentAccountUuid: 'uuid-a',
+  });
+  assert.equal(am.currentIndex, 0);
 });
 
 test('a preferred recovery account survives concurrent global rotations and warm-up', async () => {

@@ -213,24 +213,31 @@ export class AccountManager {
    * changing persisted priority/enabled settings. Used by local recovery
    * control paths that must abandon the current account before retrying.
    */
-  rotateActiveAccount(model = null, requireAccountUuid = false) {
+  rotateActiveAccount(model = null, requireAccountUuid = false, failedAccountUuid = null) {
     const current = this.accounts[this.currentIndex] || null;
+    const failed = typeof failedAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === failedAccountUuid) || null
+      : current;
+    if (typeof failedAccountUuid === 'string' && !failed) {
+      return { rotated: false, reason: 'no-alternative-account' };
+    }
     const exclude = new Set();
-    if (current) exclude.add(current);
+    if (failed) exclude.add(failed);
     if (requireAccountUuid) {
       for (const account of this.accounts) {
         if (!account.accountUuid) exclude.add(account);
       }
     }
     const next = this._selectBest(exclude, model);
-    if (!next || next === current) {
+    if (!next || next === failed) {
       return { rotated: false, reason: 'no-alternative-account' };
     }
     this.currentIndex = next.index;
     this.lastEvalAt = Date.now();
     return {
       rotated: true,
-      previousAccount: current?.name || null,
+      previousAccount: failed?.name || null,
+      previousAccountUuid: failed?.accountUuid || null,
       currentAccount: next.name,
       currentAccountUuid: next.accountUuid || null,
     };

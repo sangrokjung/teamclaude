@@ -32,7 +32,12 @@ function confirmedAccountRotation(recovery, childEnv) {
   const previousMarker = parseClaudeRecoveryAccount(
     typeof recoveryToken === 'string' ? `Bearer ${recoveryToken}` : null,
   );
-  return !previousMarker || previousMarker === recovery.previousAccountUuid;
+  const currentRecoveryToken = recovery.childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  const currentMarker = parseClaudeRecoveryAccount(
+    typeof currentRecoveryToken === 'string' ? `Bearer ${currentRecoveryToken}` : null,
+  );
+  return (!previousMarker || previousMarker === recovery.previousAccountUuid)
+    && currentMarker === recovery.currentAccountUuid;
 }
 
 function freshBlocked(utilization, reset, threshold) {

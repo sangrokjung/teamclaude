@@ -594,7 +594,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           return;
         }
-        const result = accountManager.rotateActiveAccount(null, true);
+        const result = accountManager.rotateActiveAccount(null, true, recoveryAccountUuid);
         if (!result.rotated) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({

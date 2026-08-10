@@ -18,6 +18,9 @@ import {
   CLAUDE_SAFEGUARD_RECOVERY_PROMPT,
   CLAUDE_SAFETY_DENIAL_RECOVERY_PROMPT,
 } from '../src/claude-recovery.js';
+import { AccountManager } from '../src/account-manager.js';
+import { parseClaudeRecoveryAccount } from '../src/claude-auth.js';
+import { createProxyServer } from '../src/server.js';
 
 const entry = process.env.TEAMCLAUDE_TEST_ENTRY
   || join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.js');
@@ -452,7 +455,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   assert.deepEqual(await jsonLines(codexCalls), []);
 });
 
-test('real run excludes a pinned failed account and rejects a rotate response that reselects it', async t => {
+test('real run rotates the pinned failed account through the production endpoint and resumes with its replacement marker', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-pinned-usage-recovery-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -466,7 +469,10 @@ test('real run excludes a pinned failed account and rejects a rotate response th
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 const args = process.argv.slice(2);
-appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({ args }) + '\\n');
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
+  args,
+  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+}) + '\\n');
 const resume = args.indexOf('--resume');
 if (resume >= 0 && args.at(-1) !== 'continue') {
   const sessionId = args[resume + 1];
@@ -487,35 +493,43 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
 `;
   await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
-  const failedAccountUuid = 'uuid-b';
-  const recoveryToken = `teamclaude-local-recovery:${Buffer.from(failedAccountUuid).toString('base64url')}`;
-  let rotateAuthorization = null;
-  let returnFailedAccount = false;
-  const controlServer = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/teamclaude/status') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ switchThreshold: 0.98, accounts: [] }));
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/teamclaude/rotate') {
-      rotateAuthorization = req.headers.authorization ?? null;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        rotated: true,
-        previousAccount: 'account-b',
-        previousAccountUuid: failedAccountUuid,
-        currentAccount: 'account-a',
-        currentAccountUuid: returnFailedAccount ? failedAccountUuid : 'uuid-a',
-      }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+  const manager = new AccountManager([
+    {
+      name: 'account-a',
+      accountUuid: 'uuid-a',
+      type: 'oauth',
+      accessToken: 'fixture-a',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      priority: 0,
+    },
+    {
+      name: 'account-b',
+      accountUuid: 'uuid-b',
+      type: 'oauth',
+      accessToken: 'fixture-b',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      priority: 1,
+    },
+    {
+      name: 'account-c',
+      accountUuid: 'uuid-c',
+      type: 'oauth',
+      accessToken: 'fixture-c',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      priority: 2,
+    },
+  ], 0.98, 0);
+  manager.currentIndex = 0;
+  const controlServer = createProxyServer(manager, {
+    provider: 'anthropic',
+    proxy: { apiKey: '' },
+    activeWarmup: false,
+    upstream: 'http://127.0.0.1:1',
   });
   const port = await listen(controlServer);
   t.after(() => {
     controlServer.closeAllConnections();
-    return new Promise(resolve => controlServer.close(resolve));
+    return closeServer(controlServer);
   });
 
   await writeFile(configPath, JSON.stringify({
@@ -526,6 +540,9 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
     codexFallbackOnExhaustion: false,
     accounts: [],
   }));
+  const failedAccountUuid = 'uuid-b';
+  const initialRecoveryToken = `teamclaude-local-recovery:${Buffer.from(failedAccountUuid).toString('base64url')}`;
+  const replacementRecoveryToken = `teamclaude-local-recovery:${Buffer.from('uuid-a').toString('base64url')}`;
   const sessionId = '11111111-1111-4111-8111-111111111111';
   const env = {
     ...process.env,
@@ -534,7 +551,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
     FAKE_CLAUDE_CALLS: claudeCalls,
-    CLAUDE_CODE_OAUTH_TOKEN: recoveryToken,
+    CLAUDE_CODE_OAUTH_TOKEN: initialRecoveryToken,
   };
 
   const recovered = await runCli(['run', '--', '--resume', sessionId], {
@@ -542,21 +559,26 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const calls = await jsonLines(claudeCalls);
+
   assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(rotateAuthorization, `Bearer ${recoveryToken}`);
-  assert.deepEqual((await jsonLines(claudeCalls)).map(call => call.args), [
+  assert.equal(manager.currentIndex, 0, 'global current account starts and remains on A');
+  assert.deepEqual(calls.map(call => call.args), [
     ['--resume', sessionId],
     ['--resume', sessionId, 'continue'],
   ]);
-
-  await writeFile(claudeCalls, '');
-  returnFailedAccount = true;
-  const rejected = await runCli(['run', '--', '--resume', sessionId], {
-    cwd: project,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  assert.equal((await jsonLines(claudeCalls)).length, 1, rejected.stderr);
+  assert.deepEqual(calls.map(call => call.oauthToken), [
+    initialRecoveryToken,
+    replacementRecoveryToken,
+  ]);
+  assert.equal(
+    parseClaudeRecoveryAccount(`Bearer ${calls[0].oauthToken}`),
+    failedAccountUuid,
+  );
+  assert.equal(
+    parseClaudeRecoveryAccount(`Bearer ${calls[1].oauthToken}`),
+    'uuid-a',
+  );
 });
 
 test('real run parks on a tunnel ConnectionRefused and resumes only after the proxy returns', async t => {

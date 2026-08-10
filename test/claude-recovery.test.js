@@ -414,7 +414,10 @@ test('Login expired rotates first and resumes the same session once', async t =>
         previousAccountUuid: 'uuid-a',
         currentAccount: 'account-b',
         currentAccountUuid: 'uuid-b',
-        childEnv: { RECOVERY_ONLY: 'yes' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          RECOVERY_ONLY: 'yes',
+        },
       };
     },
     spawnClaude(args, env) {
@@ -449,7 +452,10 @@ test('Login expired rotates first and resumes the same session once', async t =>
   const sessionId = calls[0].args[calls[0].args.indexOf('--session-id') + 1];
   assert.deepEqual(calls[1], {
     args: ['--resume', sessionId, 'continue'],
-    env: { RECOVERY_ONLY: 'yes' },
+    env: {
+      CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+      RECOVERY_ONLY: 'yes',
+    },
   });
   assert.deepEqual(sequence, [
     'spawn:1',
@@ -489,7 +495,10 @@ test('Login expired written immediately before child exit is still recovered', a
         previousAccountUuid: 'uuid-a',
         currentAccount: 'account-b',
         currentAccountUuid: 'uuid-b',
-        childEnv: { RECOVERY_ONLY: 'yes' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          RECOVERY_ONLY: 'yes',
+        },
       };
     },
     spawnClaude(args) {
@@ -649,7 +658,10 @@ test('Login expired nested message is recovered but generic authentication_faile
             previousAccountUuid: 'uuid-a',
             currentAccount: 'account-b',
             currentAccountUuid: 'uuid-b',
-            childEnv: { RECOVERY_ONLY: 'yes' },
+            childEnv: {
+              CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+              RECOVERY_ONLY: 'yes',
+            },
           };
         },
         spawnClaude(args) {
@@ -768,7 +780,10 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
             previousAccountUuid: 'uuid-a',
             currentAccount: 'account-b',
             currentAccountUuid: 'uuid-b',
-            childEnv: { RECOVERY_ONLY: 'yes' },
+            childEnv: {
+              CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+              RECOVERY_ONLY: 'yes',
+            },
           };
         },
         spawnClaude(args) {
@@ -891,7 +906,11 @@ test('Fable usage-credit limit rotates account before resuming the same session'
         previousAccountUuid: 'uuid-a',
         currentAccount: 'account-b',
         currentAccountUuid: 'uuid-b',
-        childEnv: { ...childEnv, ROUTE: 'account-b' },
+        childEnv: {
+          ...childEnv,
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'account-b',
+        },
       };
     },
     waitForConnectionRecovery: async ({ childEnv }) => {
@@ -985,7 +1004,7 @@ test('Fable usage-credit rotation failure never restarts Claude on the same acco
   assert.deepEqual(callEnvs, [{ ROUTE: 'account-a' }]);
 });
 
-test('UUID rotation requires a different account UUID and matching prior recovery marker', async t => {
+test('UUID rotation requires different UUIDs plus matching prior and current recovery markers', async t => {
   const scenarios = [
     {
       name: 'A to B with unchanged display name',
@@ -995,7 +1014,10 @@ test('UUID rotation requires a different account UUID and matching prior recover
         previousAccountUuid: 'uuid-a',
         currentAccount: 'same-name',
         currentAccountUuid: 'uuid-b',
-        childEnv: { ROUTE: 'uuid-b' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
       },
       expectedSpawns: 2,
     },
@@ -1007,7 +1029,10 @@ test('UUID rotation requires a different account UUID and matching prior recover
         previousAccountUuid: 'uuid-a',
         currentAccount: 'new-name',
         currentAccountUuid: 'uuid-a',
-        childEnv: { ROUTE: 'uuid-a' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a'),
+          ROUTE: 'uuid-a',
+        },
       },
       expectedSpawns: 1,
     },
@@ -1017,7 +1042,10 @@ test('UUID rotation requires a different account UUID and matching prior recover
         rotated: true,
         previousAccount: 'account-a',
         currentAccount: 'account-b',
-        childEnv: { ROUTE: 'uuid-b' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
       },
       expectedSpawns: 1,
     },
@@ -1029,7 +1057,10 @@ test('UUID rotation requires a different account UUID and matching prior recover
         previousAccountUuid: 7,
         currentAccount: 'account-b',
         currentAccountUuid: ['uuid-b'],
-        childEnv: { ROUTE: 'uuid-b' },
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
       },
       expectedSpawns: 1,
     },
@@ -1041,7 +1072,52 @@ test('UUID rotation requires a different account UUID and matching prior recover
         previousAccountUuid: 'uuid-x',
         currentAccount: 'account-b',
         currentAccountUuid: 'uuid-b',
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
+      },
+      expectedSpawns: 1,
+    },
+    {
+      name: 'missing current recovery marker',
+      response: {
+        rotated: true,
+        previousAccount: 'account-a',
+        previousAccountUuid: 'uuid-a',
+        currentAccount: 'account-b',
+        currentAccountUuid: 'uuid-b',
         childEnv: { ROUTE: 'uuid-b' },
+      },
+      expectedSpawns: 1,
+    },
+    {
+      name: 'malformed current recovery marker',
+      response: {
+        rotated: true,
+        previousAccount: 'account-a',
+        previousAccountUuid: 'uuid-a',
+        currentAccount: 'account-b',
+        currentAccountUuid: 'uuid-b',
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: 'teamclaude-local-recovery:***',
+          ROUTE: 'uuid-b',
+        },
+      },
+      expectedSpawns: 1,
+    },
+    {
+      name: 'current recovery marker mismatch',
+      response: {
+        rotated: true,
+        previousAccount: 'account-a',
+        previousAccountUuid: 'uuid-a',
+        currentAccount: 'account-b',
+        currentAccountUuid: 'uuid-b',
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-c'),
+          ROUTE: 'uuid-c',
+        },
       },
       expectedSpawns: 1,
     },
@@ -1109,7 +1185,10 @@ test('UUID rotation requires a different account UUID and matching prior recover
         const sessionId = calls[0].args[calls[0].args.indexOf('--session-id') + 1];
         assert.deepEqual(calls[1], {
           args: ['--resume', sessionId, 'continue'],
-          env: { ROUTE: 'uuid-b' },
+          env: {
+            CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+            ROUTE: 'uuid-b',
+          },
         });
       }
     });
