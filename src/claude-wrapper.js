@@ -440,6 +440,13 @@ async function hasManagedSignature(path, signature) {
   return (await readFile(path, 'utf8')).split('\n').includes(`# ${signature}`);
 }
 
+async function hasManagedTargets(paths) {
+  for (const { path, signature } of managedTargets(paths)) {
+    if (await hasManagedSignature(path, signature)) return true;
+  }
+  return false;
+}
+
 async function verifyOriginalBackup(original) {
   if (original.kind === 'none') return;
   const stats = await pathInfo(original.backupPath);
@@ -686,6 +693,9 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin, transactionH
     vendor: digest(vendor),
   };
   const existingRecord = await readInstallStateRecord(paths);
+  if (!existingRecord && await hasManagedTargets(paths)) {
+    throw new Error(`Wrapper state is missing; refusing to replace managed files: ${paths.statePath}`);
+  }
   if (existingRecord) {
     const existingState = existingRecord.state;
     await verifyManagedTarget(
@@ -780,11 +790,7 @@ export async function uninstallClaudeWrapper({ homeDir, transactionHook } = {}) 
   await recoverPendingTransaction(paths);
   const stateRecord = await readInstallStateRecord(paths);
   if (!stateRecord) {
-    const managedFilesRemain = await hasManagedSignature(
-      paths.wrapperPath,
-      CLAUDE_WRAPPER_SIGNATURE,
-    ) || await hasManagedSignature(paths.vendorShimPath, CLAUDE_VENDOR_SIGNATURE);
-    if (managedFilesRemain) {
+    if (await hasManagedTargets(paths)) {
       throw new Error(`Wrapper state is missing; refusing to uninstall managed files: ${paths.statePath}`);
     }
     return {

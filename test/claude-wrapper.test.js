@@ -576,6 +576,63 @@ test('uninstall fails closed when an original backup changed after installation'
   }
 });
 
+test('reinstall fails closed when managed files remain but state is missing', async () => {
+  const fixture = await makeFixture();
+  try {
+    await writeNative(fixture, '2.1.9');
+    const originalLink = '../share/claude/versions/2.1.9';
+    const originalVendor = Buffer.from('original vendor bytes\n');
+    const transactionPath = join(
+      fixture.binDir,
+      '.teamclaude-claude-wrapper-transaction.json',
+    );
+    await symlink(originalLink, fixture.wrapperPath);
+    await writeFile(fixture.vendorShimPath, originalVendor);
+    await chmod(fixture.vendorShimPath, 0o700);
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    const state = JSON.parse(await readFile(installed.statePath, 'utf8'));
+    await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+    await rm(installed.statePath);
+    const before = {
+      entries: (await readdir(fixture.binDir)).sort(),
+      wrapper: await readFile(installed.wrapperPath),
+      vendor: await readFile(installed.vendorShimPath),
+      wrapperBackupTarget: await readlink(state.originals.wrapper.backupPath),
+      vendorBackup: await readFile(state.originals.vendor.backupPath),
+      vendorBackupMode: modeBits(await lstat(state.originals.vendor.backupPath)),
+    };
+
+    await assert.rejects(
+      installClaudeWrapper({
+        homeDir: fixture.homeDir,
+        teamcodexBin: fixture.teamcodexBin,
+      }),
+      /state.*missing|managed.*refusing/i,
+    );
+    await assert.rejects(
+      uninstallClaudeWrapper({ homeDir: fixture.homeDir }),
+      /state.*missing|refusing to uninstall/i,
+    );
+
+    assert.deepEqual(await readFile(installed.wrapperPath), before.wrapper);
+    assert.deepEqual(await readFile(installed.vendorShimPath), before.vendor);
+    assert.equal(await readlink(state.originals.wrapper.backupPath), before.wrapperBackupTarget);
+    assert.deepEqual(await readFile(state.originals.vendor.backupPath), before.vendorBackup);
+    assert.equal(
+      modeBits(await lstat(state.originals.vendor.backupPath)),
+      before.vendorBackupMode,
+    );
+    assert.deepEqual((await readdir(fixture.binDir)).sort(), before.entries);
+    await assert.rejects(readFile(installed.statePath, 'utf8'), { code: 'ENOENT' });
+    await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
 test('uninstall fails closed when managed files remain but state is missing', async () => {
   const fixture = await makeFixture();
   try {
