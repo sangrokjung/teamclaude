@@ -182,28 +182,16 @@ fail_closed() {
 
 is_semver() {
   local raw="$1"
-  local value="\${raw%%+*}"
-  local build=""
-  local core="\${value%%-*}"
+  local precedence="\${raw%%+*}"
   local prerelease=""
-  local -a parts identifiers
-  if [[ "$raw" == *+* ]]; then
-    build="\${raw#*+}"
-    [[ "$build" =~ "^[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*$" ]] || return 1
-  fi
-  [[ "$value" == *-* ]] && prerelease="\${value#*-}"
-  parts=(\${(s:.:)core})
-  [[ \${#parts} -eq 3 ]] || return 1
-  local part
-  for part in $parts; do
-    [[ "$part" =~ "^(0|[1-9][0-9]*)$" ]] || return 1
-  done
+  local -a identifiers
+  [[ "$raw" =~ "^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-([0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?([+]([0-9A-Za-z-]+([.][0-9A-Za-z-]+)*))?$" ]] || return 1
+  [[ "$precedence" == *-* ]] && prerelease="\${precedence#*-}"
   if [[ -n "$prerelease" ]]; then
     identifiers=(\${(s:.:)prerelease})
-    [[ \${#identifiers} -gt 0 ]] || return 1
-    for part in $identifiers; do
-      [[ "$part" =~ "^[0-9A-Za-z-]+$" ]] || return 1
-      [[ "$part" != <-> || "$part" =~ "^(0|[1-9][0-9]*)$" ]] || return 1
+    local identifier
+    for identifier in $identifiers; do
+      [[ "$identifier" != <-> || "$identifier" =~ "^(0|[1-9][0-9]*)$" ]] || return 1
     done
   fi
   return 0

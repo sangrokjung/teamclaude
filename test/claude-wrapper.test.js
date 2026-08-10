@@ -142,6 +142,92 @@ test('vendor shim ignores malformed SemVer build metadata at runtime', async () 
   }
 });
 
+const invalidRuntimeSemvers = [
+  '999.0.0-alpha..beta',
+  '999.0.0-.alpha',
+  '999.0.0-alpha.',
+  '999.0.0+',
+  '999.0.0+bad..meta',
+  '999.0.0+.meta',
+  '999.0.0+meta.',
+  '999.0.0-alpha_beta',
+  '01.0.0',
+  '1.0.0-01',
+];
+
+test('vendor shim rejects the complete invalid SemVer corpus at runtime', async t => {
+  for (const invalidVersion of invalidRuntimeSemvers) {
+    await t.test(invalidVersion, async () => {
+      const fixture = await makeFixture();
+      try {
+        const normal = await writeNative(fixture, '1.0.0');
+        const installed = await installClaudeWrapper({
+          homeDir: fixture.homeDir,
+          teamcodexBin: fixture.teamcodexBin,
+        });
+        await writeNative(fixture, invalidVersion);
+        const withNormal = spawnSync(installed.vendorShimPath, [], {
+          encoding: 'utf8',
+          env: { ...process.env, TEAMCLAUDE_CALL_LOG: fixture.callLog },
+        });
+
+        assert.equal(withNormal.status, 0, withNormal.stderr);
+        const calls = (await readFile(fixture.callLog, 'utf8'))
+          .trim()
+          .split('\n')
+          .map(line => JSON.parse(line));
+        assert.deepEqual(calls.map(call => call.version), ['1.0.0']);
+
+        await rm(normal);
+        const invalidOnly = spawnSync(installed.vendorShimPath, [], { encoding: 'utf8' });
+        assert.equal(invalidOnly.status, 75, invalidOnly.stderr);
+        assert.match(invalidOnly.stderr, /no semantic-version native candidate/i);
+      } finally {
+        await cleanup(fixture);
+      }
+    });
+  }
+});
+
+test('vendor shim preserves valid prerelease and build metadata precedence', async t => {
+  const scenarios = [
+    {
+      versions: ['2.0.0-alpha.2+build.7', '2.0.0-alpha.10+meta.1'],
+      expected: '2.0.0-alpha.10+meta.1',
+    },
+    {
+      versions: ['3.0.0-rc.9+build.7', '3.0.0+release.1'],
+      expected: '3.0.0+release.1',
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.expected, async () => {
+      const fixture = await makeFixture();
+      try {
+        await writeNative(fixture, '1.0.0');
+        const installed = await installClaudeWrapper({
+          homeDir: fixture.homeDir,
+          teamcodexBin: fixture.teamcodexBin,
+        });
+        for (const version of scenario.versions) await writeNative(fixture, version);
+        const result = spawnSync(installed.vendorShimPath, [], {
+          encoding: 'utf8',
+          env: { ...process.env, TEAMCLAUDE_CALL_LOG: fixture.callLog },
+        });
+
+        assert.equal(result.status, 0, result.stderr);
+        const calls = (await readFile(fixture.callLog, 'utf8'))
+          .trim()
+          .split('\n')
+          .map(line => JSON.parse(line));
+        assert.deepEqual(calls.map(call => call.version), [scenario.expected]);
+      } finally {
+        await cleanup(fixture);
+      }
+    });
+  }
+});
+
 test('install writes signed executable files and 0600 state idempotently', async () => {
   const fixture = await makeFixture();
   try {
