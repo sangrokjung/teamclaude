@@ -4,8 +4,8 @@ import { fork, spawn, spawnSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -35,6 +35,7 @@ import {
   createCmuxSessionRescuer,
   defaultCmuxRescuePaths,
 } from './cmux-session-rescue.js';
+import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
@@ -142,6 +143,14 @@ switch (command) {
     break;
   case 'api':
     await apiCommand();
+    process.exit(0);
+    break;
+  case 'install-claude-wrapper':
+    await installClaudeWrapperCommand();
+    process.exit(0);
+    break;
+  case 'uninstall-claude-wrapper':
+    await uninstallClaudeWrapperCommand();
     process.exit(0);
     break;
   case 'help':
@@ -2290,6 +2299,23 @@ async function setPriorityCommand() {
   await noteRunningServerReload(config);
 }
 
+// ── transparent Claude wrapper ──────────────────────────────
+
+async function installClaudeWrapperCommand() {
+  const installed = await installClaudeWrapper({
+    homeDir: homedir(),
+    teamcodexBin: resolve(process.argv[1]),
+  });
+  console.log(installed.wrapperPath);
+  console.log(installed.vendorShimPath);
+}
+
+async function uninstallClaudeWrapperCommand() {
+  const uninstalled = await uninstallClaudeWrapper({ homeDir: homedir() });
+  console.log(uninstalled.wrapperPath);
+  console.log(uninstalled.vendorShimPath);
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -2314,6 +2340,8 @@ Commands:
   enable <name>       Re-enable an account
   priority <name> <n> Set selection priority ("auto" clears it)
   api <path>          Call a ChatGPT backend endpoint with one account
+  install-claude-wrapper   Install the transparent Claude launcher
+  uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
 
 Options:
@@ -2347,6 +2375,8 @@ Commands:
   priority <name> <n> Set selection priority (lower = preferred; "auto" to return
                       to automatic ordering — weekly reset soonest drained first)
   api <path>          Call an API endpoint with account credentials
+  install-claude-wrapper   Install the transparent Claude launcher
+  uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
 
 Options:
