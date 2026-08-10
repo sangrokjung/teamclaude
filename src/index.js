@@ -1316,6 +1316,45 @@ async function ensureProxyRunning(config) {
   throw new Error(`Proxy failed to start${detail}. Run "teamcodex server" to inspect the startup error.`);
 }
 
+async function waitForClaudeProxyRecovery(config) {
+  const pollMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
+    ? Math.max(250, Math.floor(config.claudeAutoResumeBackoffMs))
+    : 1000;
+  let recoveryConfig = config;
+  let nextLocalStartAt = 0;
+
+  while (true) {
+    const diskConfig = await loadConfig().catch(() => null);
+    if (diskConfig?.proxy?.port) {
+      recoveryConfig = {
+        ...recoveryConfig,
+        ...diskConfig,
+        proxy: { ...recoveryConfig.proxy, ...diskConfig.proxy },
+      };
+    }
+
+    const running = await findRunningServer(recoveryConfig);
+    if (running) return running;
+
+    // A machine with local credentials can recover a dead supervisor itself.
+    // A tunnel-only machine deliberately has no accounts: starting an empty
+    // local proxy there would steal the forwarded port and prevent the SSH
+    // tunnel from returning, so it only waits for the tunnel owner to recover.
+    const canStartLocalProxy = Array.isArray(recoveryConfig.accounts)
+      && recoveryConfig.accounts.length > 0;
+    if (canStartLocalProxy && Date.now() >= nextLocalStartAt) {
+      nextLocalStartAt = Date.now() + 15_000;
+      try {
+        return await ensureProxyRunning(recoveryConfig);
+      } catch {
+        // Keep the CLI parent alive. The next interval retries startup while
+        // the exact Claude session remains parked for a lossless resume.
+      }
+    }
+    await delay(pollMs);
+  }
+}
+
 /**
  * Stop the running server: SIGTERM, wait for graceful exit, escalate to SIGKILL.
  * Returns { stopped, reason?, pid?, port? }.
@@ -1695,13 +1734,18 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
 }
 
 async function recoverExpiredClaudeLogin(config, childEnv) {
+  const recoveryToken = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
+  const failedAccountUuid = parseClaudeRecoveryAccount(
+    typeof recoveryToken === 'string' ? `Bearer ${recoveryToken}` : null,
+  );
+  const headers = {};
+  if (config.proxy.apiKey) headers['x-api-key'] = config.proxy.apiKey;
+  if (failedAccountUuid) headers.authorization = `Bearer ${recoveryToken}`;
   const response = await fetch(
     `http://127.0.0.1:${config.proxy.port}/teamclaude/rotate`,
     {
       method: 'POST',
-      headers: config.proxy.apiKey
-        ? { 'x-api-key': config.proxy.apiKey }
-        : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
       signal: AbortSignal.timeout(1500),
     },
   );
@@ -1712,16 +1756,20 @@ async function recoverExpiredClaudeLogin(config, childEnv) {
   }
   if (!response.ok) return { rotated: false, reason: 'rotation-unavailable' };
   if (result?.rotated !== true
-      || typeof result.previousAccount !== 'string'
-      || typeof result.currentAccount !== 'string'
+      || typeof result.previousAccountUuid !== 'string'
+      || result.previousAccountUuid.length === 0
       || typeof result.currentAccountUuid !== 'string'
-      || result.previousAccount === result.currentAccount) {
+      || result.currentAccountUuid.length === 0
+      || result.previousAccountUuid === result.currentAccountUuid
+      || (failedAccountUuid && result.previousAccountUuid !== failedAccountUuid)) {
     return { rotated: false, reason: 'rotation-unavailable' };
   }
   return {
     rotated: true,
     previousAccount: result.previousAccount,
+    previousAccountUuid: result.previousAccountUuid,
     currentAccount: result.currentAccount,
+    currentAccountUuid: result.currentAccountUuid,
     childEnv: buildClaudeRecoveryEnv(childEnv, result.currentAccountUuid),
   };
 }
@@ -1772,9 +1820,22 @@ async function runCommand(clientArgsOverride = null) {
     process.exit(75);
   }
   const config = await loadOrCreateConfig();
+  let runtimeConfig = isCodexMode(config)
+    ? config
+    : { ...config, proxy: { ...config.proxy } };
   if (!isCodexMode(config)) {
     try {
-      await ensureProxyRunning(config);
+      const canStartLocalProxy = Array.isArray(config.accounts)
+        && config.accounts.length > 0;
+      if (!canStartLocalProxy) {
+        console.error('[TeamClaude] No local accounts; waiting for the configured proxy or SSH tunnel.');
+      }
+      const running = canStartLocalProxy
+        ? await ensureProxyRunning(config)
+        : await waitForClaudeProxyRecovery(config);
+      if (running.port !== config.proxy.port) {
+        runtimeConfig.proxy.port = running.port;
+      }
     } catch (err) {
       console.error(`[TeamClaude] ${err.message}`);
       process.exit(1);
@@ -1788,6 +1849,10 @@ async function runCommand(clientArgsOverride = null) {
   if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
+  const claudeBin = typeof childEnv.TEAMCLAUDE_CLAUDE_BIN === 'string'
+    && childEnv.TEAMCLAUDE_CLAUDE_BIN.length > 0
+    ? childEnv.TEAMCLAUDE_CLAUDE_BIN
+    : 'claude';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
@@ -1809,11 +1874,18 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
+  const preserveProxyApiKey = typeof config.proxy.apiKey === 'string'
+    && config.proxy.apiKey.length > 0
+    && childEnv.ANTHROPIC_API_KEY === config.proxy.apiKey;
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
-  childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
+  childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
+  if (preserveProxyApiKey) childEnv.ANTHROPIC_API_KEY = config.proxy.apiKey;
+  // TeamClaude owns model entitlement across the account pool. Claude Code's
+  // per-login GrowthBook gate can otherwise block Fable before any proxy request.
+  childEnv.DISABLE_GROWTHBOOK = '1';
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
-  await syncLaunchModel(config, clientArgs, childEnv);
+  await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
@@ -1821,17 +1893,29 @@ async function runCommand(clientArgsOverride = null) {
     const result = await runClaudeWithRecovery({
       claudeArgs: clientArgs,
       childEnv,
-      config,
+      config: runtimeConfig,
       fetchStatus: async () => {
-        const response = await fetch(`http://127.0.0.1:${config.proxy.port}/teamclaude/status`, {
+        const response = await fetch(`http://127.0.0.1:${runtimeConfig.proxy.port}/teamclaude/status`, {
           signal: AbortSignal.timeout(1500),
         });
         if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
         return response.json();
       },
       recoverLoginExpired: ({ childEnv: recoveryEnv }) =>
-        recoverExpiredClaudeLogin(config, recoveryEnv),
-      spawnClaude: (recoveryArgs, recoveryEnv) => spawn('claude', recoveryArgs, {
+        recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
+      recoverLimit: ({ childEnv: recoveryEnv }) =>
+        recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
+      waitForConnectionRecovery: async ({ childEnv: recoveryEnv }) => {
+        const recovered = await waitForClaudeProxyRecovery(runtimeConfig);
+        runtimeConfig.proxy.port = recovered.port;
+        return {
+          childEnv: {
+            ...recoveryEnv,
+            ANTHROPIC_BASE_URL: `http://localhost:${recovered.port}`,
+          },
+        };
+      },
+      spawnClaude: (recoveryArgs, recoveryEnv) => spawn(claudeBin, recoveryArgs, {
         stdio: 'inherit',
         env: recoveryEnv,
       }),
@@ -1856,7 +1940,7 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
-  const result = spawnSync('claude', clientArgs, {
+  const result = spawnSync(claudeBin, clientArgs, {
     stdio: 'inherit',
     env: childEnv,
   });
