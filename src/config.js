@@ -369,6 +369,7 @@ export function createDefaultConfig() {
     claudeSafetyDenialMaxResumes: 1,
     claudeSafeguardMaxResumes: 1,
     claudeAmbiguousDispatchMaxResumes: 1,
+    claudeConnectionRecoveryMaxWaitMs: 900000,
     codexFallbackOnExhaustion: false,
     cmuxSessionRescue: false,
     cmuxSessionRescueIntervalMs: 1000,

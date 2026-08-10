@@ -4,11 +4,21 @@ import { mkdtemp, writeFile, readFile, rm, readdir, stat } from 'node:fs/promise
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { atomicConfigUpdate, saveConfig, writeQuotaCacheSync, readQuotaCache } from '../src/config.js';
+import {
+  atomicConfigUpdate,
+  createDefaultConfig,
+  readQuotaCache,
+  saveConfig,
+  writeQuotaCacheSync,
+} from '../src/config.js';
 import { applyTuiAccountMutation } from '../src/tui.js';
 
 // node --test runs each test file in its own process, so setting TEAMCLAUDE_CONFIG
 // (and the module-level write chain) here doesn't leak into other test files.
+
+test('default config bounds Claude connection recovery to fifteen minutes', () => {
+  assert.equal(createDefaultConfig().claudeConnectionRecoveryMaxWaitMs, 900000);
+});
 
 test('atomicConfigUpdate serializes concurrent writers (no lost update / no resurrection)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-cfg-'));

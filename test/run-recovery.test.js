@@ -53,7 +53,7 @@ async function waitForStatus(port, timeoutMs = 5000) {
   throw new Error(`proxy did not become ready on port ${port}`);
 }
 
-function runCli(args, options) {
+function runCli(args, options, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [entry, ...args], options);
     let stdout = '';
@@ -61,7 +61,7 @@ function runCli(args, options) {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
       reject(new Error(`CLI timed out\n${stdout}\n${stderr}`));
-    }, 8000);
+    }, timeoutMs);
     child.stdout.on('data', chunk => { stdout += chunk; });
     child.stderr.on('data', chunk => { stderr += chunk; });
     child.once('error', reject);
@@ -629,7 +629,7 @@ if (sessionFlag >= 0) {
   await writeFile(configPath, JSON.stringify({
     proxy: { port, apiKey: 'fixture-proxy-key' },
     autoResumeClaude: true,
-    claudeAutoResumeMaxRetries: 0,
+    claudeAutoResumeMaxRetries: 1,
     claudeAutoResumeBackoffMs: 0,
     accounts: [],
   }));
@@ -949,6 +949,165 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   assert.equal(calls[0].baseUrl, `http://localhost:${port}`);
 });
 
+test('tunnel-only startup stops at the configured connection recovery deadline', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-tunnel-deadline-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, 'bin');
+  const project = join(root, 'project');
+  const configPath = join(root, 'config.json');
+  const claudeCalls = join(root, 'claude-calls.jsonl');
+  const port = await unusedPort();
+  await mkdir(bin);
+  await mkdir(project);
+
+  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
+  args: process.argv.slice(2),
+}) + '\\n');
+`, { mode: 0o755 });
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'fixture-proxy-key' },
+    autoResumeClaude: true,
+    claudeAutoResumeBackoffMs: 0,
+    claudeConnectionRecoveryMaxWaitMs: 40,
+    accounts: [],
+  }));
+
+  const env = {
+    ...process.env,
+    HOME: root,
+    PATH: `${bin}:${process.env.PATH}`,
+    TEAMCLAUDE_PROVIDER: 'anthropic',
+    TEAMCLAUDE_CONFIG: configPath,
+    TEAMCLAUDE_CLAUDE_BIN: join(bin, 'claude'),
+    FAKE_CLAUDE_CALLS: claudeCalls,
+  };
+  delete env.TEAMCLAUDE_SUPERVISED_WORKER;
+  delete env.TEAMCLAUDE_SUPERVISOR_PID;
+  delete env.TEAMCLAUDE_SESSION_SUPERVISED;
+
+  const startedAt = Date.now();
+  const result = await runCli(['run'], {
+    cwd: project,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }, 1000);
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(elapsedMs < 750, `deadline took ${elapsedMs}ms`);
+  assert.deepEqual(await jsonLines(claudeCalls), []);
+  assert.match(result.stderr, /connection recovery timed out after 40ms/i);
+});
+
+test('active recovery bounds a failed local proxy start by the same deadline', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-local-recovery-deadline-'));
+  const bin = join(root, 'bin');
+  const project = join(root, 'project');
+  const configPath = join(root, 'config.json');
+  const claudeCalls = join(root, 'claude-calls.jsonl');
+  await mkdir(bin);
+  await mkdir(project);
+
+  const statusServer = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ switchThreshold: 0.98, accounts: [] }));
+  });
+  const port = await listen(statusServer);
+  const foreignServer = http.createServer((_req, res) => {
+    res.writeHead(404);
+    res.end('foreign listener');
+  });
+  const controlServer = http.createServer(async (_req, res) => {
+    statusServer.closeAllConnections();
+    await closeServer(statusServer);
+    await new Promise((resolve, reject) => {
+      foreignServer.once('error', reject);
+      foreignServer.listen(port, '127.0.0.1', resolve);
+    });
+    res.writeHead(204);
+    res.end();
+  });
+  const controlPort = await listen(controlServer);
+
+  t.after(async () => {
+    statusServer.closeAllConnections();
+    foreignServer.closeAllConnections();
+    controlServer.closeAllConnections();
+    await Promise.all([
+      statusServer.listening ? closeServer(statusServer) : Promise.resolve(),
+      foreignServer.listening ? closeServer(foreignServer) : Promise.resolve(),
+      controlServer.listening ? closeServer(controlServer) : Promise.resolve(),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await writeFile(join(bin, 'claude'), `#!/usr/bin/env node
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({ args }) + '\\n');
+const sessionFlag = args.indexOf('--session-id');
+if (sessionFlag >= 0) {
+  const sessionId = args[sessionFlag + 1];
+  await fetch(process.env.FAKE_OUTAGE_URL, { method: 'POST' });
+  const dir = join(process.env.HOME, '.claude', 'projects', 'fake');
+  mkdirSync(dir, { recursive: true });
+  appendFileSync(join(dir, sessionId + '.jsonl'), JSON.stringify({
+    type: 'assistant',
+    cwd: process.cwd(),
+    isApiErrorMessage: true,
+    error: 'server_error',
+    message: 'Unable to connect to API (ConnectionRefused)',
+  }) + '\\n');
+  process.exit(9);
+}
+`, { mode: 0o755 });
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'fixture-proxy-key' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    tokenRefreshIntervalMs: 0,
+    autoResumeClaude: true,
+    claudeAutoResumeMaxRetries: 1,
+    claudeAutoResumeBackoffMs: 0,
+    claudeConnectionRecoveryMaxWaitMs: 50,
+    accounts: [{ name: 'fixture', type: 'apikey', apiKey: 'fixture-key' }],
+  }));
+
+  const env = {
+    ...process.env,
+    HOME: root,
+    PATH: `${bin}:${process.env.PATH}`,
+    TEAMCLAUDE_PROVIDER: 'anthropic',
+    TEAMCLAUDE_CONFIG: configPath,
+    TEAMCLAUDE_CLAUDE_BIN: join(bin, 'claude'),
+    FAKE_CLAUDE_CALLS: claudeCalls,
+    FAKE_OUTAGE_URL: `http://127.0.0.1:${controlPort}/outage`,
+  };
+  delete env.TEAMCLAUDE_SUPERVISED_WORKER;
+  delete env.TEAMCLAUDE_SUPERVISOR_PID;
+  delete env.TEAMCLAUDE_SESSION_SUPERVISED;
+
+  const startedAt = Date.now();
+  const result = await runCli(['run'], {
+    cwd: project,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }, 2000);
+  const elapsedMs = Date.now() - startedAt;
+  const calls = await jsonLines(claudeCalls);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.ok(elapsedMs < 1500, `local-start recovery took ${elapsedMs}ms`);
+  assert.equal(calls.length, 1);
+  const sessionId = calls[0].args[calls[0].args.indexOf('--session-id') + 1];
+  assert.match(result.stderr, /connection recovery timed out after 50ms/i);
+  assert.match(result.stderr, new RegExp(sessionId));
+  assert.match(result.stderr, /preserv/i);
+});
+
 test('tunnel-only recovery follows a disk config port move without a local state file', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-tunnel-port-move-'));
   const bin = join(root, 'bin');
@@ -963,7 +1122,7 @@ test('tunnel-only recovery follows a disk config port move without a local state
   const makeConfig = port => ({
     proxy: { port, apiKey: 'fixture-proxy-key' },
     autoResumeClaude: true,
-    claudeAutoResumeMaxRetries: 0,
+    claudeAutoResumeMaxRetries: 1,
     claudeAutoResumeBackoffMs: 0,
     accounts: [],
   });
@@ -1082,7 +1241,7 @@ test('real run follows a replacement supervisor to its new configured port befor
     activeWarmup: false,
     tokenRefreshIntervalMs: 0,
     autoResumeClaude: true,
-    claudeAutoResumeMaxRetries: 0,
+    claudeAutoResumeMaxRetries: 1,
     claudeAutoResumeBackoffMs: 0,
     accounts: [{ name: 'fixture', type: 'apikey', apiKey: 'fixture-upstream-key' }],
   });

@@ -1259,9 +1259,12 @@ function lsofPid(port) {
  * for this same port). Returns { pid, port } (pid may be null if undeterminable),
  * or null when nothing is listening.
  */
-async function findRunningServer(config) {
+async function findRunningServer(config, maxProbeWaitMs = 1500) {
   const configPort = config?.proxy?.port;
   const state = await readServerState();
+  const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
+    ? Math.max(0, Math.floor(maxProbeWaitMs))
+    : 1500);
 
   // Try the port the server ACTUALLY bound (recorded in the state file) first —
   // it may differ from the current config port after the config was edited, and
@@ -1271,7 +1274,9 @@ async function findRunningServer(config) {
   if (configPort && configPort !== state?.port) candidates.push(configPort);
 
   for (const port of candidates) {
-    if (!(await probeServer(port))) continue;
+    const remainingMs = probeDeadline - Date.now();
+    if (remainingMs <= 0) break;
+    if (!(await probeServer(port, Math.min(1500, remainingMs)))) continue;
     const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
     if (ownerPid) return { pid: ownerPid, port };
     // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
@@ -1286,9 +1291,19 @@ async function findRunningServer(config) {
   return null;
 }
 
-async function ensureProxyRunning(config) {
-  const running = await findRunningServer(config);
+async function ensureProxyRunning(config, maxWaitMs = 15_000) {
+  const boundedWaitMs = Number.isFinite(maxWaitMs)
+    ? Math.max(0, Math.floor(maxWaitMs))
+    : 15_000;
+  const deadline = Date.now() + boundedWaitMs;
+  const running = await findRunningServer(
+    config,
+    Math.min(1500, Math.max(0, deadline - Date.now())),
+  );
   if (running) return running;
+  if (Date.now() >= deadline) {
+    throw new Error('Proxy failed to start before its recovery deadline.');
+  }
 
   console.error('[TeamClaude] Proxy is not running; starting it automatically.');
   const daemonEnv = { ...process.env };
@@ -1303,13 +1318,17 @@ async function ensureProxyRunning(config) {
   daemon.once('error', err => { launchError = err; });
   daemon.unref();
 
-  const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (launchError) break;
-    const started = await findRunningServer(config);
+    const remainingMs = deadline - Date.now();
+    const started = await findRunningServer(
+      config,
+      Math.min(1500, Math.max(0, remainingMs)),
+    );
     if (started) return started;
     if (daemon.exitCode != null) break;
-    await delay(100);
+    const sleepMs = Math.min(100, Math.max(0, deadline - Date.now()));
+    if (sleepMs > 0) await delay(sleepMs);
   }
 
   const detail = launchError ? `: ${launchError.message}` : '';
@@ -1320,10 +1339,14 @@ async function waitForClaudeProxyRecovery(config) {
   const pollMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
     ? Math.max(250, Math.floor(config.claudeAutoResumeBackoffMs))
     : 1000;
+  const maxWaitMs = Number.isFinite(config.claudeConnectionRecoveryMaxWaitMs)
+    ? Math.max(0, Math.floor(config.claudeConnectionRecoveryMaxWaitMs))
+    : 900000;
+  const deadline = Date.now() + maxWaitMs;
   let recoveryConfig = config;
   let nextLocalStartAt = 0;
 
-  while (true) {
+  while (Date.now() < deadline) {
     const diskConfig = await loadConfig().catch(() => null);
     if (diskConfig?.proxy?.port) {
       recoveryConfig = {
@@ -1333,7 +1356,12 @@ async function waitForClaudeProxyRecovery(config) {
       };
     }
 
-    const running = await findRunningServer(recoveryConfig);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    const running = await findRunningServer(
+      recoveryConfig,
+      Math.min(1500, remainingMs),
+    );
     if (running) return running;
 
     // A machine with local credentials can recover a dead supervisor itself.
@@ -1345,14 +1373,19 @@ async function waitForClaudeProxyRecovery(config) {
     if (canStartLocalProxy && Date.now() >= nextLocalStartAt) {
       nextLocalStartAt = Date.now() + 15_000;
       try {
-        return await ensureProxyRunning(recoveryConfig);
+        return await ensureProxyRunning(
+          recoveryConfig,
+          Math.max(0, deadline - Date.now()),
+        );
       } catch {
         // Keep the CLI parent alive. The next interval retries startup while
         // the exact Claude session remains parked for a lossless resume.
       }
     }
-    await delay(pollMs);
+    const sleepMs = Math.min(pollMs, Math.max(0, deadline - Date.now()));
+    if (sleepMs > 0) await delay(sleepMs);
   }
+  throw new Error(`Claude proxy connection recovery timed out after ${maxWaitMs}ms.`);
 }
 
 /**

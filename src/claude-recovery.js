@@ -76,7 +76,7 @@ function textBlocks(content) {
 
 const FABLE_USAGE_CREDITS_MESSAGE = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
 const AUTO_MODE_UNAVAILABLE_MESSAGE = 'claude-sonnet-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again. If it keeps failing, continue with other tasks that don\'t require this action and come back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.';
-const SAFEGUARD_REFUSAL_CORE = "API Error: Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't respond to this message with Fable 5. Double press esc to edit your last message, or try a different model with /model. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/15363606";
+const SAFEGUARD_REFUSAL_CORE = "Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't respond to this message with Fable 5. Double press esc to edit your last message, or try a different model with /model. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/15363606";
 const ANSI_ESCAPE_RE = /\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~])/g;
 
 export const CLAUDE_SAFEGUARD_RECOVERY_PROMPT = 'Do not retry or paraphrase the blocked request, switch models, rotate accounts, or bypass safeguards. Work only on any remaining safe read-only tasks; if none remain, wait for the user to revise the request.';
@@ -100,7 +100,10 @@ function isOpusFallbackModel(value) {
 }
 
 function isSafeguardRefusalMessage(value) {
-  const match = value.match(/^(.*) Request ID: (req_[A-Za-z0-9]+)$/);
+  const diagnostic = value.startsWith('API Error: ')
+    ? value.slice('API Error: '.length)
+    : value;
+  const match = diagnostic.match(/^(.*) Request ID: (req_[A-Za-z0-9]+)$/);
   return match?.[1] === SAFEGUARD_REFUSAL_CORE;
 }
 
@@ -166,8 +169,9 @@ export function classifyClaudeApiErrorRecord(record) {
     return { kind: 'usage_limit', record };
   }
   if (isStructuredAssistantError
-      && record.error === 'invalid_request'
-      && record.apiErrorStatus == null
+      && record.isApiErrorMessage === true
+      && (record.error === 'invalid_request' || record.error === 'invalid_request_error')
+      && (record.apiErrorStatus === null || record.apiErrorStatus === 400)
       && record.message.stop_reason === 'refusal'
       && record.toolDenialKind == null
       && isSafeguardRefusalMessage(normalizedMessage)) {
@@ -574,7 +578,7 @@ export async function runClaudeWithRecovery({
     ? Math.max(0, Math.floor(config.claudeSafeguardMaxResumes))
     : 1;
   let retries = 0;
-  let ambiguousDispatchRecoveries = 0;
+  let ambiguousRecoveries = 0;
   let safetyDenialRecoveries = 0;
   let safeguardRecoveries = 0;
   let loginRecoveryUsed = false;
@@ -609,9 +613,30 @@ export async function runClaudeWithRecovery({
 
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
-    if (outcome.event.kind === 'ambiguous_dispatch') {
+    if (outcome.event.kind === 'ambiguous_connection'
+        || outcome.event.kind === 'ambiguous_dispatch') {
       suppressNextContinuationPrompt = true;
     }
+
+    const waitForRecoveredConnection = async () => {
+      await stopChild(child);
+      try {
+        const recovery = await waitForConnectionRecovery({
+          sessionId,
+          childEnv: nextEnv,
+        });
+        if (recovery?.childEnv && typeof recovery.childEnv === 'object') {
+          nextEnv = recovery.childEnv;
+        }
+        return true;
+      } catch (err) {
+        const detail = err instanceof Error && err.message
+          ? err.message
+          : 'unknown recovery error';
+        log(`[TeamClaude] Local proxy recovery failed for Claude session ${sessionId}: ${detail}. Preserving the session transcript for manual continuation.`);
+        return false;
+      }
+    };
     let usageChildStopped = false;
     if (outcome.event.kind === 'login_expired') {
       let recovery = null;
@@ -720,67 +745,54 @@ export async function runClaudeWithRecovery({
       return childExit(child);
     }
 
-    if (outcome.event.kind === 'connection_lost'
-        && config.autoResumeClaude === true
-        && sessionId
-        && typeof waitForConnectionRecovery === 'function') {
-      log(`[TeamClaude] Local proxy connection lost; waiting to resume session ${sessionId}.`);
-      await stopChild(child);
-      const recovery = await waitForConnectionRecovery({
-        sessionId,
-        childEnv: nextEnv,
-      });
-      if (recovery?.childEnv && typeof recovery.childEnv === 'object') {
-        nextEnv = recovery.childEnv;
+    if (outcome.event.kind === 'connection_lost') {
+      if (config.autoResumeClaude === true
+          && sessionId
+          && retries < maxRetries
+          && typeof waitForConnectionRecovery === 'function') {
+        retries += 1;
+        log(`[TeamClaude] Local proxy connection lost; waiting to resume session ${sessionId} (${retries}/${maxRetries}).`);
+        if (!(await waitForRecoveredConnection())) {
+          return { status: 1, signal: null };
+        }
+        log(`[TeamClaude] Local proxy connection restored; resuming session ${sessionId}.`);
+        nextArgs = ['--resume', sessionId, 'continue'];
+        continue;
       }
-      log(`[TeamClaude] Local proxy connection restored; resuming session ${sessionId}.`);
-      nextArgs = ['--resume', sessionId, 'continue'];
-      continue;
+      log(`[TeamClaude] Connection-refused retry budget exhausted (${retries}/${maxRetries}); preserving session ${sessionId} for manual continuation.`);
+      if (child.exitCode == null && child.signalCode == null) {
+        await stopChild(child);
+        return { status: 1, signal: null };
+      }
+      return childExit(child);
     }
 
     if (outcome.event.kind === 'ambiguous_connection'
-        && config.autoResumeClaude === true
-        && sessionId
-        && typeof waitForConnectionRecovery === 'function') {
-      log(`[TeamClaude] Connection reset after a possibly dispatched request; waiting to reopen session ${sessionId} without resending the last prompt.`);
-      await stopChild(child);
-      const recovery = await waitForConnectionRecovery({
-        sessionId,
-        childEnv: nextEnv,
-      });
-      if (recovery?.childEnv && typeof recovery.childEnv === 'object') {
-        nextEnv = recovery.childEnv;
+        || outcome.event.kind === 'ambiguous_dispatch') {
+      if (config.autoResumeClaude === true
+          && sessionId
+          && ambiguousRecoveries < maxAmbiguousDispatchResumes
+          && typeof waitForConnectionRecovery === 'function') {
+        ambiguousRecoveries += 1;
+        const failure = outcome.event.kind === 'ambiguous_connection'
+          ? 'Connection reset after a possibly dispatched request'
+          : 'Upstream connection failed after dispatch; proxy did not replay the request';
+        log(`[TeamClaude] ${failure}. Waiting to reopen session ${sessionId} without resending the last prompt (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}).`);
+        if (!(await waitForRecoveredConnection())) {
+          return { status: 1, signal: null };
+        }
+        if (backoffMs > 0) {
+          await delay(Math.min(backoffMs * 2 ** (ambiguousRecoveries - 1), 30_000));
+        }
+        log(`[TeamClaude] Reopening ambiguous session ${sessionId} without resending the last prompt.`);
+        nextArgs = ['--resume', sessionId];
+        continue;
       }
-      log(`[TeamClaude] Local proxy connection restored; reopening session ${sessionId} without resending the last prompt.`);
-      nextArgs = ['--resume', sessionId];
-      continue;
-    }
-
-    if (outcome.event.kind === 'ambiguous_dispatch'
-        && config.autoResumeClaude === true
-        && sessionId
-        && ambiguousDispatchRecoveries < maxAmbiguousDispatchResumes
-        && typeof waitForConnectionRecovery === 'function') {
-      ambiguousDispatchRecoveries += 1;
-      log(`[TeamClaude] Upstream connection failed after dispatch; proxy did not replay the request. Waiting to reopen session ${sessionId} without resending the last prompt.`);
-      await stopChild(child);
-      const recovery = await waitForConnectionRecovery({
-        sessionId,
-        childEnv: nextEnv,
-      });
-      if (recovery?.childEnv && typeof recovery.childEnv === 'object') {
-        nextEnv = recovery.childEnv;
+      log(`[TeamClaude] Ambiguous-request safe-reopen budget exhausted (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}); preserving session ${sessionId} without resending the last prompt.`);
+      if (child.exitCode == null && child.signalCode == null) {
+        await stopChild(child);
+        return { status: 1, signal: null };
       }
-      if (backoffMs > 0) {
-        await delay(Math.min(backoffMs * 2 ** (ambiguousDispatchRecoveries - 1), 30_000));
-      }
-      log(`[TeamClaude] Reopening ambiguous-dispatch session ${sessionId} without resending the last prompt.`);
-      nextArgs = ['--resume', sessionId];
-      continue;
-    }
-
-    if (outcome.event.kind === 'ambiguous_dispatch') {
-      log(`[TeamClaude] Ambiguous-dispatch safe-reopen budget exhausted (${ambiguousDispatchRecoveries}/${maxAmbiguousDispatchResumes}); the last prompt will not be resent automatically.`);
       return childExit(child);
     }
 

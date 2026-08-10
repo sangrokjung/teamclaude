@@ -1604,6 +1604,21 @@ test('safeguard exact classifier accepts the observed ANSI and CRLF diagnostic o
   const exact = JSON.parse(safeguardRefusalRecord('/tmp/project'));
   const displayVariant = structuredClone(exact);
   displayVariant.message.content[0].text = `\u001b[31m\r\n\t${SAFEGUARD_REFUSAL_MESSAGE.replaceAll(' ', ' \t ')}\r\n\u001b[0m`;
+  const schemaVariants = [];
+  for (const error of ['invalid_request', 'invalid_request_error']) {
+    for (const apiErrorStatus of [null, 400]) {
+      for (const prefix of ['API Error: ', '']) {
+        const record = structuredClone(exact);
+        record.error = error;
+        record.apiErrorStatus = apiErrorStatus;
+        record.message.content[0].text = SAFEGUARD_REFUSAL_MESSAGE.replace(
+          /^API Error: /,
+          prefix,
+        );
+        schemaVariants.push(record);
+      }
+    }
+  }
   const fallback = JSON.parse(modelRefusalFallbackRecord('/tmp/project'));
   const suffixedFallback = {
     ...fallback,
@@ -1611,7 +1626,7 @@ test('safeguard exact classifier accepts the observed ANSI and CRLF diagnostic o
     fallbackModel: 'claude-opus-4-8[1m]',
   };
 
-  for (const record of [exact, displayVariant]) {
+  for (const record of [exact, displayVariant, ...schemaVariants]) {
     assert.equal(classifyClaudeApiErrorRecord(record)?.kind, 'safeguard_refusal');
   }
   for (const record of [fallback, suffixedFallback]) {
@@ -1629,12 +1644,17 @@ test('safeguard exact classifier rejects prompts and structured near-misses', ()
   const cases = [
     mutate(record => { record.type = 'user'; }),
     mutate(record => { record.isApiErrorMessage = false; }),
+    mutate(record => { record.isApiErrorMessage = 'true'; }),
     mutate(record => { record.error = 'server_error'; }),
-    mutate(record => { record.apiErrorStatus = 400; }),
+    mutate(record => { record.apiErrorStatus = 401; }),
+    mutate(record => { delete record.apiErrorStatus; }),
     mutate(record => { record.message.role = 'user'; }),
+    mutate(record => { delete record.message.role; }),
     mutate(record => { record.message.stop_reason = 'end_turn'; }),
     mutate(record => { record.toolDenialKind = 'automode-unavailable'; }),
     mutate(record => { record.message.content[0].text = `User prompt: ${SAFEGUARD_REFUSAL_MESSAGE}`; }),
+    mutate(record => { record.message.content[0].text = SAFEGUARD_REFUSAL_MESSAGE.replace('Request ID:', 'Request identifier:'); }),
+    mutate(record => { record.message.content[0].text = SAFEGUARD_REFUSAL_MESSAGE.replace(/ Request ID:.*$/, ''); }),
     mutate(record => { record.message.content[0].text += ' Unknown suffix.'; }),
     mutate(record => { record.message = SAFEGUARD_REFUSAL_MESSAGE; }),
   ];
@@ -1900,7 +1920,8 @@ test('connection failure retries only refused requests and safely reopens reset 
     childEnv: {},
     config: {
       autoResumeClaude: true,
-      claudeAutoResumeMaxRetries: 0,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAmbiguousDispatchMaxResumes: 1,
       claudeAutoResumeBackoffMs: 0,
     },
     cwd,
@@ -1967,6 +1988,276 @@ test('connection failure retries only refused requests and safely reopens reset 
     'wait:2',
     'spawn:3',
   ]);
+});
+
+test('persistent ConnectionRefused obeys the general 0, 1, and N retry budget', async t => {
+  for (const budget of [0, 1, 3]) {
+    await t.test(`budget ${budget}`, async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-refused-budget-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      await mkdir(cwd);
+      const calls = [];
+      let proxyChecks = 0;
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs: [],
+        childEnv: {},
+        config: {
+          autoResumeClaude: true,
+          claudeAutoResumeMaxRetries: budget,
+          claudeAutoResumeBackoffMs: 0,
+        },
+        cwd,
+        transcriptRoot,
+        pollIntervalMs: 5,
+        fetchStatus: async () => {
+          throw new Error('persistent ConnectionRefused must not inspect quota status');
+        },
+        waitForConnectionRecovery: async ({ childEnv }) => {
+          proxyChecks += 1;
+          return { childEnv };
+        },
+        spawnClaude(args) {
+          const child = fakeChild();
+          calls.push([...args]);
+          const callNumber = calls.length;
+          if (callNumber <= budget + 1) {
+            const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+            const sessionId = args[args.indexOf(selector) + 1];
+            setTimeout(async () => {
+              const dir = join(transcriptRoot, 'project');
+              await mkdir(dir, { recursive: true });
+              await appendFile(
+                join(dir, `${sessionId}.jsonl`),
+                `${connectionRefusedRecord(cwd)}\n`,
+              );
+            }, 10);
+            setTimeout(() => child.finish(9), 60);
+          } else {
+            setTimeout(() => child.finish(0), 10);
+          }
+          return child;
+        },
+        launchCodex: async () => {
+          throw new Error('persistent ConnectionRefused must not switch providers');
+        },
+        log() {},
+      });
+
+      assert.equal(result.status, 9);
+      assert.equal(proxyChecks, budget);
+      assert.equal(calls.length, budget + 1);
+      const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+      for (const args of calls.slice(1)) {
+        assert.deepEqual(args, ['--resume', sessionId, 'continue']);
+      }
+    });
+  }
+});
+
+test('persistent ConnectionReset obeys the shared ambiguous 0, 1, and N reopen budget', async t => {
+  for (const budget of [0, 1, 3]) {
+    await t.test(`budget ${budget}`, async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-reset-budget-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      await mkdir(cwd);
+      const calls = [];
+      let proxyChecks = 0;
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs: [],
+        childEnv: {},
+        config: {
+          autoResumeClaude: true,
+          claudeAutoResumeMaxRetries: 0,
+          claudeAmbiguousDispatchMaxResumes: budget,
+          claudeAutoResumeBackoffMs: 0,
+        },
+        cwd,
+        transcriptRoot,
+        pollIntervalMs: 5,
+        fetchStatus: async () => {
+          throw new Error('persistent ConnectionReset must not inspect quota status');
+        },
+        waitForConnectionRecovery: async ({ childEnv }) => {
+          proxyChecks += 1;
+          return { childEnv };
+        },
+        spawnClaude(args) {
+          const child = fakeChild();
+          calls.push([...args]);
+          const callNumber = calls.length;
+          if (callNumber <= budget + 1) {
+            const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+            const sessionId = args[args.indexOf(selector) + 1];
+            setTimeout(async () => {
+              const dir = join(transcriptRoot, 'project');
+              await mkdir(dir, { recursive: true });
+              await appendFile(
+                join(dir, `${sessionId}.jsonl`),
+                `${connectionRefusedRecord(cwd, 'Unable to connect to API (ConnectionReset)')}\n`,
+              );
+            }, 10);
+            setTimeout(() => child.finish(9), 60);
+          } else {
+            setTimeout(() => child.finish(0), 10);
+          }
+          return child;
+        },
+        launchCodex: async () => {
+          throw new Error('persistent ConnectionReset must not switch providers');
+        },
+        log() {},
+      });
+
+      assert.equal(result.status, 9);
+      assert.equal(proxyChecks, budget);
+      assert.equal(calls.length, budget + 1);
+      const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+      for (const args of calls.slice(1)) {
+        assert.deepEqual(args, ['--resume', sessionId]);
+      }
+    });
+  }
+});
+
+test('ambiguous-dispatch and ConnectionReset consume one shared reopen budget', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-shared-ambiguous-budget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  let proxyChecks = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 0,
+      claudeAmbiguousDispatchMaxResumes: 1,
+      claudeAutoResumeBackoffMs: 0,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => {
+      throw new Error('ambiguous failures must not inspect quota status');
+    },
+    waitForConnectionRecovery: async ({ childEnv }) => {
+      proxyChecks += 1;
+      return { childEnv };
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1];
+      if (calls.length <= 2) {
+        setTimeout(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          const record = calls.length === 1
+            ? ambiguousDispatchRecord(cwd)
+            : connectionRefusedRecord(cwd, 'Unable to connect to API (ConnectionReset)');
+          await appendFile(join(dir, `${sessionId}.jsonl`), `${record}\n`);
+        }, 10);
+        setTimeout(() => child.finish(9), 60);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('ambiguous failures must not switch providers');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(proxyChecks, 1);
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId]);
+});
+
+test('connection recovery rejection preserves the session and does not spawn again', async t => {
+  const scenarios = [
+    {
+      name: 'ConnectionRefused',
+      record: cwd => connectionRefusedRecord(cwd),
+    },
+    {
+      name: 'ConnectionReset',
+      record: cwd => connectionRefusedRecord(cwd, 'Unable to connect to API (ConnectionReset)'),
+    },
+    {
+      name: 'ambiguous-dispatch 502',
+      record: cwd => ambiguousDispatchRecord(cwd),
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-wait-rejection-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      const transcriptRoot = join(root, 'transcripts');
+      await mkdir(cwd);
+      const calls = [];
+      const logs = [];
+
+      const result = await runClaudeWithRecovery({
+        claudeArgs: [],
+        childEnv: {},
+        config: {
+          autoResumeClaude: true,
+          claudeAutoResumeMaxRetries: 1,
+          claudeAmbiguousDispatchMaxResumes: 1,
+          claudeAutoResumeBackoffMs: 0,
+        },
+        cwd,
+        transcriptRoot,
+        pollIntervalMs: 5,
+        fetchStatus: async () => {
+          throw new Error('failed connection recovery must terminate before quota inspection');
+        },
+        waitForConnectionRecovery: async () => {
+          throw new Error('recovery deadline exceeded');
+        },
+        spawnClaude(args) {
+          const child = fakeChild();
+          calls.push([...args]);
+          const sessionId = args[args.indexOf('--session-id') + 1];
+          setTimeout(async () => {
+            const dir = join(transcriptRoot, 'project');
+            await mkdir(dir, { recursive: true });
+            await appendFile(
+              join(dir, `${sessionId}.jsonl`),
+              `${scenario.record(cwd)}\n`,
+            );
+          }, 10);
+          return child;
+        },
+        launchCodex: async () => {
+          throw new Error('failed connection recovery must not switch providers');
+        },
+        log: message => logs.push(message),
+      });
+
+      assert.equal(result.status, 1);
+      assert.equal(calls.length, 1);
+      const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+      assert.match(logs.join('\n'), new RegExp(sessionId));
+      assert.match(logs.join('\n'), /recovery deadline exceeded/i);
+      assert.match(logs.join('\n'), /preserv/i);
+    });
+  }
 });
 
 test('ambiguous post-dispatch 502 reopens the session once without repeating the original POST', async t => {
