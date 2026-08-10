@@ -181,10 +181,16 @@ fail_closed() {
 }
 
 is_semver() {
-  local value="\${1%%+*}"
+  local raw="$1"
+  local value="\${raw%%+*}"
+  local build=""
   local core="\${value%%-*}"
   local prerelease=""
   local -a parts identifiers
+  if [[ "$raw" == *+* ]]; then
+    build="\${raw#*+}"
+    [[ "$build" =~ "^[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*$" ]] || return 1
+  fi
   [[ "$value" == *-* ]] && prerelease="\${value#*-}"
   parts=(\${(s:.:)core})
   [[ \${#parts} -eq 3 ]] || return 1

@@ -117,6 +117,31 @@ test('findNewestClaudeVendor uses semantic version order and ignores non-version
   }
 });
 
+test('vendor shim ignores malformed SemVer build metadata at runtime', async () => {
+  const fixture = await makeFixture();
+  try {
+    await writeNative(fixture, '1.0.0');
+    await writeNative(fixture, '999.0.0+bad..meta');
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    const result = spawnSync(installed.vendorShimPath, [], {
+      encoding: 'utf8',
+      env: { ...process.env, TEAMCLAUDE_CALL_LOG: fixture.callLog },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const calls = (await readFile(fixture.callLog, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    assert.deepEqual(calls.map(call => call.version), ['1.0.0']);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
 test('install writes signed executable files and 0600 state idempotently', async () => {
   const fixture = await makeFixture();
   try {
