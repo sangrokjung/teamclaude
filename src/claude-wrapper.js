@@ -21,6 +21,8 @@ export const CLAUDE_VENDOR_SIGNATURE = 'teamclaude-vendor-shim:v1';
 
 const STATE_VERSION = 1;
 const STATE_FILENAME = '.teamclaude-claude-wrapper-state.json';
+const TRANSACTION_VERSION = 1;
+const TRANSACTION_FILENAME = '.teamclaude-claude-wrapper-transaction.json';
 
 function wrapperPaths(homeDir) {
   if (typeof homeDir !== 'string' || !isAbsolute(homeDir)) {
@@ -33,7 +35,25 @@ function wrapperPaths(homeDir) {
     wrapperPath: join(binDir, 'claude'),
     vendorShimPath: join(binDir, 'claude-vendor'),
     statePath: join(binDir, STATE_FILENAME),
+    transactionPath: join(binDir, TRANSACTION_FILENAME),
   };
+}
+
+function managedTargets(paths) {
+  return [
+    {
+      name: 'wrapper',
+      path: paths.wrapperPath,
+      signature: CLAUDE_WRAPPER_SIGNATURE,
+      digestKey: 'wrapperSha256',
+    },
+    {
+      name: 'vendor',
+      path: paths.vendorShimPath,
+      signature: CLAUDE_VENDOR_SIGNATURE,
+      digestKey: 'vendorSha256',
+    },
+  ];
 }
 
 function parseSemanticVersion(value) {
@@ -340,18 +360,7 @@ async function backupTarget(path) {
   return { kind, backupPath, ...integrity };
 }
 
-async function readInstallState(paths) {
-  const stats = await pathInfo(paths.statePath);
-  if (!stats) return null;
-  if (!stats.isFile() || stats.isSymbolicLink()) {
-    throw new Error(`Refusing to use non-file wrapper state: ${paths.statePath}`);
-  }
-  let state;
-  try {
-    state = JSON.parse(await readFile(paths.statePath, 'utf8'));
-  } catch (error) {
-    throw new Error(`Refusing to overwrite invalid wrapper state: ${error.message}`);
-  }
+function validateInstallState(state, paths) {
   if (state.version !== STATE_VERSION
     || state.wrapperPath !== paths.wrapperPath
     || state.vendorShimPath !== paths.vendorShimPath
@@ -361,10 +370,7 @@ async function readInstallState(paths) {
     || !state.originals?.vendor) {
     throw new Error(`Refusing to use mismatched wrapper state: ${paths.statePath}`);
   }
-  for (const [name, target] of [
-    ['wrapper', paths.wrapperPath],
-    ['vendor', paths.vendorShimPath],
-  ]) {
+  for (const { name, path: target } of managedTargets(paths)) {
     const original = state.originals[name];
     if (!['none', 'file', 'symlink'].includes(original.kind)) {
       throw new Error(`Refusing to use invalid ${name} backup state`);
@@ -387,17 +393,46 @@ async function readInstallState(paths) {
   return state;
 }
 
-async function verifyManagedTarget(path, signature, expectedDigest) {
+function parseInstallState(content, paths) {
+  let state;
+  try {
+    state = JSON.parse(content);
+  } catch (error) {
+    throw new Error(`Refusing to overwrite invalid wrapper state: ${error.message}`);
+  }
+  return validateInstallState(state, paths);
+}
+
+async function readInstallStateRecord(paths) {
+  const stats = await pathInfo(paths.statePath);
+  if (!stats) return null;
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new Error(`Refusing to use non-file wrapper state: ${paths.statePath}`);
+  }
+  const content = await readFile(paths.statePath, 'utf8');
+  return { state: parseInstallState(content, paths), content };
+}
+
+async function inspectManagedTarget(path, signature) {
   const stats = await pathInfo(path);
   if (!stats?.isFile() || stats.isSymbolicLink()) {
-    throw new Error(`Managed file changed after installation; refusing to uninstall: ${path}`);
+    throw new Error(`Managed file changed after installation: ${path}`);
   }
   const content = await readFile(path, 'utf8');
   const signatureLine = `# ${signature}`;
-  if (!content.split('\n').includes(signatureLine) || digest(content) !== expectedDigest) {
+  if (!content.split('\n').includes(signatureLine)) {
+    throw new Error(`Managed file changed after installation: ${path}`);
+  }
+  return { content, sha256: digest(content), mode: stats.mode & 0o7777 };
+}
+
+async function verifyManagedTarget(path, signature, expectedDigest, expectedMode = null) {
+  const inspected = await inspectManagedTarget(path, signature);
+  if (inspected.sha256 !== expectedDigest
+    || (expectedMode != null && inspected.mode !== expectedMode)) {
     throw new Error(`Managed file changed after installation; refusing to uninstall: ${path}`);
   }
-  return content;
+  return inspected;
 }
 
 async function hasManagedSignature(path, signature) {
@@ -443,8 +478,174 @@ async function verifyOriginalBackup(original) {
   }
 }
 
-export async function installClaudeWrapper({ homeDir, teamcodexBin } = {}) {
+function serializeState(state) {
+  return `${JSON.stringify(state, null, 2)}\n`;
+}
+
+function validateJournalTarget(target, signature, label) {
+  if (!target || typeof target.content !== 'string' || typeof target.sha256 !== 'string'
+    || digest(target.content) !== target.sha256
+    || !target.content.split('\n').includes(`# ${signature}`)) {
+    throw new Error(`Refusing to use invalid ${label} transaction target`);
+  }
+  return target;
+}
+
+function validateTransaction(journal, paths) {
+  if (journal.version !== TRANSACTION_VERSION
+    || journal.wrapperPath !== paths.wrapperPath
+    || journal.vendorShimPath !== paths.vendorShimPath
+    || journal.statePath !== paths.statePath) {
+    throw new Error(`Refusing to use mismatched wrapper transaction: ${paths.transactionPath}`);
+  }
+  if (journal.type === 'install-update') {
+    const state = parseInstallState(journal.stateContent, paths);
+    if (typeof journal.previousStateSha256 !== 'string') {
+      throw new Error('Refusing to use an invalid previous state digest');
+    }
+    for (const { name, signature, digestKey } of managedTargets(paths)) {
+      const target = validateJournalTarget(
+        journal.targets?.[name],
+        signature,
+        name,
+      );
+      if (state.installed[digestKey] !== target.sha256) {
+        throw new Error(`Refusing to use inconsistent ${name} transaction digests`);
+      }
+    }
+    return { journal, state };
+  }
+  if (journal.type === 'uninstall') {
+    const state = parseInstallState(journal.stateContent, paths);
+    if (digest(journal.stateContent) !== journal.stateSha256) {
+      throw new Error('Refusing to use an inconsistent uninstall state digest');
+    }
+    return { journal, state };
+  }
+  throw new Error(`Refusing unknown wrapper transaction type: ${journal.type}`);
+}
+
+async function readTransaction(paths) {
+  const stats = await pathInfo(paths.transactionPath);
+  if (!stats) return null;
+  if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o7777) !== 0o600) {
+    throw new Error(`Refusing to use unsafe wrapper transaction: ${paths.transactionPath}`);
+  }
+  let journal;
+  try {
+    journal = JSON.parse(await readFile(paths.transactionPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Refusing to use invalid wrapper transaction: ${error.message}`);
+  }
+  return validateTransaction(journal, paths);
+}
+
+async function runTransactionHook(transactionHook, step) {
+  if (typeof transactionHook === 'function') await transactionHook(step);
+}
+
+async function originalMatchesPath(path, original) {
+  const stats = await pathInfo(path);
+  if (original.kind === 'none') return stats == null;
+  if (!stats || targetKind(stats) !== original.kind) return false;
+  if (original.kind === 'file') {
+    return digest(await readFile(path)) === original.sha256
+      && (stats.mode & 0o7777) === original.mode;
+  }
+  return await readlink(path) === original.linkTarget;
+}
+
+async function restoreOriginalTarget(path, original, signature, managedDigest) {
+  if (original.kind === 'none') {
+    if (!await pathInfo(path)) return;
+    await verifyManagedTarget(path, signature, managedDigest, 0o755);
+    await unlink(path);
+    return;
+  }
+  if (await pathInfo(original.backupPath)) {
+    await verifyOriginalBackup(original);
+    await verifyManagedTarget(path, signature, managedDigest, 0o755);
+    await rename(original.backupPath, path);
+    return;
+  }
+  if (!await originalMatchesPath(path, original)) {
+    throw new Error(`Original restore is incomplete or changed: ${path}`);
+  }
+}
+
+async function resumeInstallUpdate(paths, transaction, transactionHook = null) {
+  const { journal, state } = transaction;
+  const stateRecord = await readInstallStateRecord(paths);
+  if (!stateRecord) throw new Error('Install update state is missing; refusing recovery');
+  const stateDigest = digest(stateRecord.content);
+  const nextStateDigest = digest(journal.stateContent);
+  if (stateDigest !== journal.previousStateSha256 && stateDigest !== nextStateDigest) {
+    throw new Error('Install update state changed during recovery; refusing to resume');
+  }
+  const currentDigests = stateDigest === nextStateDigest
+    ? state.installed
+    : stateRecord.state.installed;
+  for (const { name, path, signature, digestKey } of managedTargets(paths)) {
+    const inspected = await inspectManagedTarget(path, signature);
+    const allowed = [currentDigests[digestKey], journal.targets[name].sha256];
+    if (!allowed.includes(inspected.sha256)) {
+      throw new Error(`Managed ${name} changed during recovery; refusing to resume`);
+    }
+  }
+  for (const { name, path } of managedTargets(paths)) {
+    await runTransactionHook(transactionHook, `install:update:${name}`);
+    await atomicWrite(path, journal.targets[name].content, 0o755);
+  }
+  await runTransactionHook(transactionHook, 'install:update:state');
+  await atomicWrite(paths.statePath, journal.stateContent, 0o600);
+  await unlink(paths.transactionPath);
+}
+
+async function resumeUninstall(paths, transaction, transactionHook = null) {
+  const { journal, state } = transaction;
+  const stateRecord = await readInstallStateRecord(paths);
+  if (!stateRecord) {
+    const restored = await Promise.all([
+      originalMatchesPath(paths.wrapperPath, state.originals.wrapper),
+      originalMatchesPath(paths.vendorShimPath, state.originals.vendor),
+    ]);
+    if (!restored.every(Boolean)) {
+      throw new Error('Uninstall state is missing before all originals were restored');
+    }
+    await unlink(paths.transactionPath);
+    return;
+  }
+  if (digest(stateRecord.content) !== journal.stateSha256) {
+    throw new Error('Install state changed during uninstall; refusing to resume');
+  }
+
+  for (const { name, path, signature, digestKey } of managedTargets(paths)) {
+    await runTransactionHook(transactionHook, `uninstall:${name}`);
+    await restoreOriginalTarget(
+      path,
+      state.originals[name],
+      signature,
+      state.installed[digestKey],
+    );
+  }
+  await runTransactionHook(transactionHook, 'uninstall:state');
+  await unlink(paths.statePath);
+  await unlink(paths.transactionPath);
+}
+
+async function recoverPendingTransaction(paths) {
+  const transaction = await readTransaction(paths);
+  if (!transaction) return;
+  if (transaction.journal.type === 'install-update') {
+    await resumeInstallUpdate(paths, transaction);
+    return;
+  }
+  await resumeUninstall(paths, transaction);
+}
+
+export async function installClaudeWrapper({ homeDir, teamcodexBin, transactionHook } = {}) {
   const paths = wrapperPaths(homeDir);
+  await recoverPendingTransaction(paths);
   const verifiedTeamcodexBin = await executableRealpath(teamcodexBin, 'teamcodexBin');
   await findNewestClaudeVendor({ homeDir, versionsDir: paths.versionsDir });
   await mkdir(paths.binDir, { recursive: true, mode: 0o755 });
@@ -458,8 +659,9 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin } = {}) {
     wrapper: digest(wrapper),
     vendor: digest(vendor),
   };
-  const existingState = await readInstallState(paths);
-  if (existingState) {
+  const existingRecord = await readInstallStateRecord(paths);
+  if (existingRecord) {
+    const existingState = existingRecord.state;
     await verifyManagedTarget(
       paths.wrapperPath,
       CLAUDE_WRAPPER_SIGNATURE,
@@ -472,19 +674,38 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin } = {}) {
     );
     if (existingState.installed.wrapperSha256 === installedDigests.wrapper
       && existingState.installed.vendorSha256 === installedDigests.vendor) {
+      await chmod(paths.wrapperPath, 0o755);
+      await chmod(paths.vendorShimPath, 0o755);
+      await chmod(paths.statePath, 0o600);
       return {
         wrapperPath: paths.wrapperPath,
         vendorShimPath: paths.vendorShimPath,
         statePath: paths.statePath,
       };
     }
-    await atomicWrite(paths.wrapperPath, wrapper, 0o755);
-    await atomicWrite(paths.vendorShimPath, vendor, 0o755);
-    existingState.installed = {
-      wrapperSha256: installedDigests.wrapper,
-      vendorSha256: installedDigests.vendor,
+    const nextState = {
+      ...existingState,
+      installed: {
+        wrapperSha256: installedDigests.wrapper,
+        vendorSha256: installedDigests.vendor,
+      },
     };
-    await atomicWrite(paths.statePath, `${JSON.stringify(existingState, null, 2)}\n`, 0o600);
+    const nextStateContent = serializeState(nextState);
+    const journal = {
+      version: TRANSACTION_VERSION,
+      type: 'install-update',
+      wrapperPath: paths.wrapperPath,
+      vendorShimPath: paths.vendorShimPath,
+      statePath: paths.statePath,
+      previousStateSha256: digest(existingRecord.content),
+      stateContent: nextStateContent,
+      targets: {
+        wrapper: { content: wrapper, sha256: installedDigests.wrapper },
+        vendor: { content: vendor, sha256: installedDigests.vendor },
+      },
+    };
+    await atomicWrite(paths.transactionPath, `${JSON.stringify(journal, null, 2)}\n`, 0o600);
+    await resumeInstallUpdate(paths, { journal, state: nextState }, transactionHook);
     return {
       wrapperPath: paths.wrapperPath,
       vendorShimPath: paths.vendorShimPath,
@@ -514,7 +735,7 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin } = {}) {
       },
       originals,
     };
-    await atomicWrite(paths.statePath, `${JSON.stringify(state, null, 2)}\n`, 0o600);
+    await atomicWrite(paths.statePath, serializeState(state), 0o600);
   } catch (error) {
     if (originals.wrapper || originals.vendor) {
       await rollbackFreshInstall(paths, originals, installedDigests).catch(() => {});
@@ -529,10 +750,11 @@ export async function installClaudeWrapper({ homeDir, teamcodexBin } = {}) {
   };
 }
 
-export async function uninstallClaudeWrapper({ homeDir } = {}) {
+export async function uninstallClaudeWrapper({ homeDir, transactionHook } = {}) {
   const paths = wrapperPaths(homeDir);
-  const state = await readInstallState(paths);
-  if (!state) {
+  await recoverPendingTransaction(paths);
+  const stateRecord = await readInstallStateRecord(paths);
+  if (!stateRecord) {
     const managedFilesRemain = await hasManagedSignature(
       paths.wrapperPath,
       CLAUDE_WRAPPER_SIGNATURE,
@@ -546,27 +768,31 @@ export async function uninstallClaudeWrapper({ homeDir } = {}) {
       statePath: paths.statePath,
     };
   }
+  const { state } = stateRecord;
   await verifyManagedTarget(
     paths.wrapperPath,
     CLAUDE_WRAPPER_SIGNATURE,
     state.installed.wrapperSha256,
+    0o755,
   );
   await verifyManagedTarget(
     paths.vendorShimPath,
     CLAUDE_VENDOR_SIGNATURE,
     state.installed.vendorSha256,
+    0o755,
   );
   for (const original of Object.values(state.originals)) await verifyOriginalBackup(original);
-
-  for (const [name, path] of [
-    ['wrapper', paths.wrapperPath],
-    ['vendor', paths.vendorShimPath],
-  ]) {
-    const original = state.originals[name];
-    if (original.kind === 'none') await unlink(path);
-    else await rename(original.backupPath, path);
-  }
-  await unlink(paths.statePath);
+  const journal = {
+    version: TRANSACTION_VERSION,
+    type: 'uninstall',
+    wrapperPath: paths.wrapperPath,
+    vendorShimPath: paths.vendorShimPath,
+    statePath: paths.statePath,
+    stateContent: stateRecord.content,
+    stateSha256: digest(stateRecord.content),
+  };
+  await atomicWrite(paths.transactionPath, `${JSON.stringify(journal, null, 2)}\n`, 0o600);
+  await resumeUninstall(paths, { journal, state }, transactionHook);
   return {
     wrapperPath: paths.wrapperPath,
     vendorShimPath: paths.vendorShimPath,

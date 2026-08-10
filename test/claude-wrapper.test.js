@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
   chmod,
@@ -86,6 +87,31 @@ async function cleanup(fixture) {
 
 function modeBits(stats) {
   return stats.mode & 0o777;
+}
+
+function sha256(content) {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+function failOnceAt(expectedStep) {
+  let failed = false;
+  return step => {
+    if (!failed && step === expectedStep) {
+      failed = true;
+      throw new Error(`injected transaction failure at ${step}`);
+    }
+  };
+}
+
+async function assertManagedSetMatchesState(installed) {
+  const state = JSON.parse(await readFile(installed.statePath, 'utf8'));
+  const wrapper = await readFile(installed.wrapperPath);
+  const vendor = await readFile(installed.vendorShimPath);
+  assert.equal(state.installed.wrapperSha256, sha256(wrapper));
+  assert.equal(state.installed.vendorSha256, sha256(vendor));
+  assert.equal(modeBits(await lstat(installed.wrapperPath)), 0o755);
+  assert.equal(modeBits(await lstat(installed.vendorShimPath)), 0o755);
+  return state;
 }
 
 async function waitForFile(path, timeoutMs = 5000) {
@@ -266,6 +292,75 @@ test('install writes signed executable files and 0600 state idempotently', async
   }
 });
 
+test('same-digest reinstall repairs wrapper and vendor executable modes', async () => {
+  const fixture = await makeFixture();
+  try {
+    await writeNative(fixture, '2.1.9');
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    await chmod(installed.wrapperPath, 0o644);
+    await chmod(installed.vendorShimPath, 0o644);
+
+    await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+
+    await assertManagedSetMatchesState(installed);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('interrupted existing install updates converge on the next install', async t => {
+  for (const failureStep of ['install:update:vendor', 'install:update:state']) {
+    await t.test(failureStep, async () => {
+      const fixture = await makeFixture();
+      try {
+        await writeNative(fixture, '2.1.9');
+        const installed = await installClaudeWrapper({
+          homeDir: fixture.homeDir,
+          teamcodexBin: fixture.teamcodexBin,
+        });
+        const nextTeamcodexBin = join(fixture.root, 'team codex next');
+        await writeFile(nextTeamcodexBin, await readFile(fixture.teamcodexBin));
+        await chmod(nextTeamcodexBin, 0o755);
+        const transactionPath = join(
+          fixture.binDir,
+          '.teamclaude-claude-wrapper-transaction.json',
+        );
+
+        await assert.rejects(
+          installClaudeWrapper({
+            homeDir: fixture.homeDir,
+            teamcodexBin: nextTeamcodexBin,
+            transactionHook: failOnceAt(failureStep),
+          }),
+          /injected transaction failure/,
+        );
+        assert.equal(modeBits(await lstat(transactionPath)), 0o600);
+        const interruptedState = JSON.parse(await readFile(installed.statePath, 'utf8'));
+        assert.notEqual(
+          interruptedState.installed.wrapperSha256,
+          sha256(await readFile(installed.wrapperPath)),
+        );
+
+        await installClaudeWrapper({
+          homeDir: fixture.homeDir,
+          teamcodexBin: nextTeamcodexBin,
+        });
+        await assertManagedSetMatchesState(installed);
+        assert.ok((await readFile(installed.wrapperPath, 'utf8')).includes(nextTeamcodexBin));
+        await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+      } finally {
+        await cleanup(fixture);
+      }
+    });
+  }
+});
+
 test('installed wrapper dynamically adopts a new vendor and preserves argv and exit status', async () => {
   const fixture = await makeFixture();
   try {
@@ -325,6 +420,49 @@ test('install backs up unknown targets and uninstall atomically restores the ori
     assert.equal(modeBits(await lstat(fixture.vendorShimPath)), 0o700);
     assert.equal((await lstat(native)).isFile(), true);
     await assert.rejects(readFile(installed.statePath, 'utf8'), { code: 'ENOENT' });
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('interrupted uninstall resumes and restores both originals on the next uninstall', async () => {
+  const fixture = await makeFixture();
+  try {
+    await writeNative(fixture, '2.1.9');
+    const originalLink = '../share/claude/versions/2.1.9';
+    const originalVendor = Buffer.from('original vendor bytes\n');
+    await symlink(originalLink, fixture.wrapperPath);
+    await writeFile(fixture.vendorShimPath, originalVendor);
+    await chmod(fixture.vendorShimPath, 0o700);
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    const transactionPath = join(
+      fixture.binDir,
+      '.teamclaude-claude-wrapper-transaction.json',
+    );
+
+    await assert.rejects(
+      uninstallClaudeWrapper({
+        homeDir: fixture.homeDir,
+        transactionHook: failOnceAt('uninstall:vendor'),
+      }),
+      /injected transaction failure/,
+    );
+    assert.equal((await lstat(fixture.wrapperPath)).isSymbolicLink(), true);
+    assert.equal(await readlink(fixture.wrapperPath), originalLink);
+    assert.match(await readFile(fixture.vendorShimPath, 'utf8'), new RegExp(CLAUDE_VENDOR_SIGNATURE));
+    assert.equal(modeBits(await lstat(transactionPath)), 0o600);
+    assert.equal((await lstat(installed.statePath)).isFile(), true);
+
+    await uninstallClaudeWrapper({ homeDir: fixture.homeDir });
+    assert.equal((await lstat(fixture.wrapperPath)).isSymbolicLink(), true);
+    assert.equal(await readlink(fixture.wrapperPath), originalLink);
+    assert.deepEqual(await readFile(fixture.vendorShimPath), originalVendor);
+    assert.equal(modeBits(await lstat(fixture.vendorShimPath)), 0o700);
+    await assert.rejects(readFile(installed.statePath, 'utf8'), { code: 'ENOENT' });
+    await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
   } finally {
     await cleanup(fixture);
   }
