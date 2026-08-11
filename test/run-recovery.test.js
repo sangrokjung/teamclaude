@@ -462,7 +462,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   assert.deepEqual(await jsonLines(codexCalls), []);
 });
 
-test('real run seeds only a missing Claude OAuth marker from proxy status', async t => {
+test('real run seeds only a missing Claude OAuth marker from the production proxy status', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-seed-recovery-marker-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -481,25 +481,30 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 `;
   await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
 
-  let rotateCalls = 0;
-  const controlServer = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/teamclaude/status') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        currentAccountUuid: 'uuid-b',
-        switchThreshold: 0.98,
-        accounts: [],
-      }));
-      return;
-    }
-    if (req.method === 'POST' && req.url === '/teamclaude/rotate') {
-      rotateCalls += 1;
-      res.writeHead(500, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'rotation must not run' }));
-      return;
-    }
-    res.writeHead(404);
-    res.end();
+  const manager = new AccountManager([
+    {
+      name: 'account-a',
+      accountUuid: 'uuid-a',
+      type: 'oauth',
+      accessToken: 'secret-access-a',
+      refreshToken: 'secret-refresh-a',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    },
+    {
+      name: 'account-b',
+      accountUuid: 'uuid-b',
+      type: 'oauth',
+      accessToken: 'secret-access-b',
+      refreshToken: 'secret-refresh-b',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    },
+  ], 0.98, 0);
+  manager.currentIndex = 1;
+  const controlServer = createProxyServer(manager, {
+    provider: 'anthropic',
+    proxy: { apiKey: '' },
+    activeWarmup: false,
+    upstream: 'http://127.0.0.1:1',
   });
   const port = await listen(controlServer);
   t.after(() => {
@@ -515,6 +520,14 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
     codexFallbackOnExhaustion: false,
     accounts: [],
   }));
+
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+  const status = await statusResponse.json();
+  assert.equal(status.currentAccountUuid, 'uuid-b');
+  assert.equal('accessToken' in status.accounts[1], false);
+  assert.equal('refreshToken' in status.accounts[1], false);
+  assert.equal('credential' in status.accounts[1], false);
+  assert.doesNotMatch(JSON.stringify(status), /secret-(?:access|refresh)-[ab]/);
 
   const cases = [
     {
@@ -562,7 +575,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
       assert.equal(calls[0].oauthToken, scenario.expectedToken);
     });
   }
-  assert.equal(rotateCalls, 0);
+  assert.equal(manager.currentIndex, 1);
 });
 
 test('real run keeps failed marker B across a global drift to A and resumes with A', async t => {

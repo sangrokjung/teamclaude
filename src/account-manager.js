@@ -1497,6 +1497,7 @@ export class AccountManager {
   getStatus() {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
+      currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null,
       switchThreshold: this.switchThreshold,
       accounts: this.accounts.map(a => ({
         name: a.name,

@@ -779,3 +779,23 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
   assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
     'mutating the snapshot must not reach live account state');
 });
+
+test('getStatus exposes the current account UUID without credentials', () => {
+  const am = new AccountManager([{
+    name: 'same-name',
+    type: 'oauth',
+    accountUuid: 'uuid-safe',
+    accessToken: 'secret-access',
+    refreshToken: 'secret-refresh',
+    expiresAt: Date.now() + HOUR,
+  }], 0.98, 0, 5);
+
+  const status = am.getStatus();
+  assert.equal(status.currentAccountUuid, 'uuid-safe');
+  assert.equal('accessToken' in status.accounts[0], false);
+  assert.equal('refreshToken' in status.accounts[0], false);
+  assert.equal('credential' in status.accounts[0], false);
+
+  am.currentIndex = -1;
+  assert.equal(am.getStatus().currentAccountUuid, null);
+});
