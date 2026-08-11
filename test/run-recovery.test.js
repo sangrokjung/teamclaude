@@ -80,6 +80,10 @@ async function jsonLines(path) {
   return raw.split('\n').filter(Boolean).map(line => JSON.parse(line));
 }
 
+function recoveryToken(accountUuid) {
+  return `teamclaude-local-recovery:${Buffer.from(accountUuid).toString('base64url')}`;
+}
+
 test('real run keeps timeout UI-only and sends only bounded safety recovery prompts', async t => {
   const safetyMessage = 'claude-sonnet-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again. If it keeps failing, continue with other tasks that don\'t require this action and come back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.';
   const safeguardMessage = "API Error: Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't respond to this message with Fable 5. Double press esc to edit your last message, or try a different model with /model. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/15363606 Request ID: req_011CdtLkC348DZ8Vnk24bJnE";
@@ -298,6 +302,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   await writeFile(join(bin, 'codex'), fakeCodex, { mode: 0o755 });
 
   let currentAccount = 'account-a';
+  let currentAccountUuid = 'uuid-a';
   let rotateCalls = 0;
   let rotateMode = 'success';
   const controlServer = http.createServer((req, res) => {
@@ -306,6 +311,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
       res.end(JSON.stringify({
         switchThreshold: 0.98,
         currentAccount,
+        currentAccountUuid,
         accounts: [
           { name: 'account-a', enabled: true, status: 'active', quota: {} },
           { name: 'account-b', enabled: true, status: 'active', quota: {} },
@@ -336,13 +342,14 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
         return;
       }
       currentAccount = 'account-b';
+      currentAccountUuid = 'uuid-b';
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         rotated: true,
         previousAccount: 'account-a',
         previousAccountUuid: 'uuid-a',
         currentAccount,
-        currentAccountUuid: 'uuid-b',
+        currentAccountUuid,
       }));
       return;
     }
@@ -405,7 +412,7 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
     })),
     [
       {
-        oauthPresent: false,
+        oauthPresent: true,
         apiKeyPresent: false,
         authTokenPresent: false,
         supervised: true,
@@ -455,7 +462,110 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
   assert.deepEqual(await jsonLines(codexCalls), []);
 });
 
-test('real run rotates the pinned failed account through the production endpoint and resumes with its replacement marker', async t => {
+test('real run seeds only a missing Claude OAuth marker from proxy status', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-seed-recovery-marker-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bin = join(root, 'bin');
+  const project = join(root, 'project');
+  const configPath = join(root, 'config.json');
+  const claudeCalls = join(root, 'claude-calls.jsonl');
+  await mkdir(bin);
+  await mkdir(project);
+
+  const fakeClaude = `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
+  args: process.argv.slice(2),
+  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+}) + '\\n');
+`;
+  await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+
+  let rotateCalls = 0;
+  const controlServer = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        currentAccountUuid: 'uuid-b',
+        switchThreshold: 0.98,
+        accounts: [],
+      }));
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/teamclaude/rotate') {
+      rotateCalls += 1;
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'rotation must not run' }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const port = await listen(controlServer);
+  t.after(() => {
+    controlServer.closeAllConnections();
+    return closeServer(controlServer);
+  });
+
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: '' },
+    autoResumeClaude: true,
+    claudeAutoResumeMaxRetries: 1,
+    claudeAutoResumeBackoffMs: 0,
+    codexFallbackOnExhaustion: false,
+    accounts: [],
+  }));
+
+  const cases = [
+    {
+      name: 'unmarked child',
+      expectedToken: recoveryToken('uuid-b'),
+    },
+    {
+      name: 'external OAuth token',
+      initialToken: 'external-oauth-token',
+      expectedToken: 'external-oauth-token',
+    },
+    {
+      name: 'malformed recovery marker',
+      initialToken: 'teamclaude-local-recovery:***',
+      expectedToken: 'teamclaude-local-recovery:***',
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      await writeFile(claudeCalls, '');
+      const env = {
+        ...process.env,
+        HOME: root,
+        PATH: `${bin}:${process.env.PATH}`,
+        TEAMCLAUDE_PROVIDER: 'anthropic',
+        TEAMCLAUDE_CONFIG: configPath,
+        FAKE_CLAUDE_CALLS: claudeCalls,
+      };
+      if (scenario.initialToken !== undefined) {
+        env.CLAUDE_CODE_OAUTH_TOKEN = scenario.initialToken;
+      } else {
+        delete env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
+
+      const result = await runCli(['run'], {
+        cwd: project,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const calls = await jsonLines(claudeCalls);
+
+      assert.equal(result.status, 0, `${scenario.name}: ${result.stderr}`);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].oauthToken, scenario.expectedToken);
+    });
+  }
+  assert.equal(rotateCalls, 0);
+});
+
+test('real run keeps failed marker B across a global drift to A and resumes with A', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-pinned-usage-recovery-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -519,7 +629,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
       priority: 2,
     },
   ], 0.98, 0);
-  manager.currentIndex = 0;
+  manager.currentIndex = 1;
   const controlServer = createProxyServer(manager, {
     provider: 'anthropic',
     proxy: { apiKey: '' },
@@ -541,8 +651,8 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
     accounts: [],
   }));
   const failedAccountUuid = 'uuid-b';
-  const initialRecoveryToken = `teamclaude-local-recovery:${Buffer.from(failedAccountUuid).toString('base64url')}`;
-  const replacementRecoveryToken = `teamclaude-local-recovery:${Buffer.from('uuid-a').toString('base64url')}`;
+  const initialRecoveryToken = recoveryToken(failedAccountUuid);
+  const replacementRecoveryToken = recoveryToken('uuid-a');
   const sessionId = '11111111-1111-4111-8111-111111111111';
   const env = {
     ...process.env,
@@ -554,15 +664,26 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
     CLAUDE_CODE_OAUTH_TOKEN: initialRecoveryToken,
   };
 
-  const recovered = await runCli(['run', '--', '--resume', sessionId], {
+  const runPromise = runCli(['run', '--', '--resume', sessionId], {
     cwd: project,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const driftDeadline = Date.now() + 2000;
+  let firstCalls = [];
+  while (Date.now() < driftDeadline) {
+    firstCalls = await jsonLines(claudeCalls);
+    if (firstCalls.length > 0) break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  if (firstCalls.length === 1) manager.currentIndex = 0;
+  const recovered = await runPromise;
   const calls = await jsonLines(claudeCalls);
 
   assert.equal(recovered.status, 0, recovered.stderr);
-  assert.equal(manager.currentIndex, 0, 'global current account starts and remains on A');
+  assert.equal(firstCalls.length, 1, 'first child must start before the simulated global drift');
+  assert.equal(firstCalls[0].oauthToken, initialRecoveryToken);
+  assert.equal(manager.currentIndex, 0, 'global current drifts to A before B recovers');
   assert.deepEqual(calls.map(call => call.args), [
     ['--resume', sessionId],
     ['--resume', sessionId, 'continue'],

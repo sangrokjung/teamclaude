@@ -393,7 +393,10 @@ test('Login expired rotates first and resumes the same session once', async t =>
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
-    childEnv: { INITIAL_ONLY: 'yes' },
+    childEnv: {
+      CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a'),
+      INITIAL_ONLY: 'yes',
+    },
     config: {
       autoResumeClaude: true,
       claudeAutoResumeMaxRetries: 3,
@@ -477,7 +480,7 @@ test('Login expired written immediately before child exit is still recovered', a
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
-    childEnv: {},
+    childEnv: { CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a') },
     config: {
       autoResumeClaude: true,
       claudeAutoResumeMaxRetries: 1,
@@ -640,7 +643,7 @@ test('Login expired nested message is recovered but generic authentication_faile
 
       const result = await runClaudeWithRecovery({
         claudeArgs: [],
-        childEnv: {},
+        childEnv: { CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a') },
         config: {
           autoResumeClaude: true,
           claudeAutoResumeMaxRetries: 1,
@@ -764,7 +767,7 @@ test('Login expired recovery rejects repeated failures and disabled retry gates'
 
       const result = await runClaudeWithRecovery({
         claudeArgs: [],
-        childEnv: {},
+        childEnv: { CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a') },
         config: scenario.config,
         cwd,
         transcriptRoot,
@@ -886,7 +889,10 @@ test('Fable usage-credit limit rotates account before resuming the same session'
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
-    childEnv: { ROUTE: 'original' },
+    childEnv: {
+      CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a'),
+      ROUTE: 'original',
+    },
     config: {
       autoResumeClaude: true,
       claudeAutoResumeMaxRetries: 1,
@@ -1004,7 +1010,7 @@ test('Fable usage-credit rotation failure never restarts Claude on the same acco
   assert.deepEqual(callEnvs, [{ ROUTE: 'account-a' }]);
 });
 
-test('UUID rotation requires different UUIDs plus matching prior and current recovery markers', async t => {
+test('UUID rotation requires different UUIDs plus exact previous and current recovery markers', async t => {
   const scenarios = [
     {
       name: 'A to B with unchanged display name',
@@ -1080,6 +1086,41 @@ test('UUID rotation requires different UUIDs plus matching prior and current rec
       expectedSpawns: 1,
     },
     {
+      name: 'missing previous recovery marker',
+      initialChildEnv: { ROUTE: 'uuid-a' },
+      response: {
+        rotated: true,
+        previousAccount: 'account-a',
+        previousAccountUuid: 'uuid-a',
+        currentAccount: 'account-b',
+        currentAccountUuid: 'uuid-b',
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
+      },
+      expectedSpawns: 1,
+    },
+    {
+      name: 'malformed previous recovery marker',
+      initialChildEnv: {
+        CLAUDE_CODE_OAUTH_TOKEN: 'teamclaude-local-recovery:***',
+        ROUTE: 'uuid-a',
+      },
+      response: {
+        rotated: true,
+        previousAccount: 'account-a',
+        previousAccountUuid: 'uuid-a',
+        currentAccount: 'account-b',
+        currentAccountUuid: 'uuid-b',
+        childEnv: {
+          CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-b'),
+          ROUTE: 'uuid-b',
+        },
+      },
+      expectedSpawns: 1,
+    },
+    {
       name: 'missing current recovery marker',
       response: {
         rotated: true,
@@ -1140,7 +1181,7 @@ test('UUID rotation requires different UUIDs plus matching prior and current rec
 
       const result = await runClaudeWithRecovery({
         claudeArgs: [],
-        childEnv: {
+        childEnv: scenario.initialChildEnv || {
           CLAUDE_CODE_OAUTH_TOKEN: recoveryToken('uuid-a'),
           ROUTE: 'uuid-a',
         },

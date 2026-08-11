@@ -1766,6 +1766,29 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+async function seedClaudeRecoveryAccount(config, childEnv) {
+  // Never replace an inherited value, even when it looks malformed. It may be
+  // an external OAuth credential, and silently rewriting auth is unsafe.
+  if (Object.hasOwn(childEnv, 'CLAUDE_CODE_OAUTH_TOKEN')) return;
+
+  const port = Number(config.proxy?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok) return;
+    const status = await response.json();
+    if (typeof status?.currentAccountUuid !== 'string'
+        || status.currentAccountUuid.length === 0) return;
+    childEnv.CLAUDE_CODE_OAUTH_TOKEN = buildClaudeRecoveryEnv(
+      childEnv,
+      status.currentAccountUuid,
+    ).CLAUDE_CODE_OAUTH_TOKEN;
+  } catch {}
+}
+
 async function recoverExpiredClaudeLogin(config, childEnv) {
   const recoveryToken = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
   const failedAccountUuid = parseClaudeRecoveryAccount(
@@ -1919,6 +1942,7 @@ async function runCommand(clientArgsOverride = null) {
   childEnv.DISABLE_GROWTHBOOK = '1';
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
   await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
+  await seedClaudeRecoveryAccount(runtimeConfig, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.

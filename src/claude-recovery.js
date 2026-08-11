@@ -36,7 +36,7 @@ function confirmedAccountRotation(recovery, childEnv) {
   const currentMarker = parseClaudeRecoveryAccount(
     typeof currentRecoveryToken === 'string' ? `Bearer ${currentRecoveryToken}` : null,
   );
-  return (!previousMarker || previousMarker === recovery.previousAccountUuid)
+  return previousMarker === recovery.previousAccountUuid
     && currentMarker === recovery.currentAccountUuid;
 }
 
