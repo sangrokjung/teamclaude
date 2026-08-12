@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 const CODEX_REFRESH_ENDPOINT = 'https://auth.openai.com/oauth/token';
 const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -115,12 +117,45 @@ export async function refreshCodexAccessToken(
   };
 }
 
+export function resolveCodexCliBin({
+  env = process.env,
+  execPath = process.execPath,
+  exists = existsSync,
+  platform = process.platform,
+} = {}) {
+  // A bare PATH lookup of `codex` can be shadowed by a shell wrapper/symlink
+  // (e.g. an agent router that ships sessions to a remote host) — that breaks
+  // `login`, whose throwaway CODEX_HOME must be written on THIS machine
+  // (2026-08-04 incident). Prefer the CLI co-installed with the running Node;
+  // TEAMCODEX_CODEX_BIN stays as the explicit escape hatch in both directions.
+  if (env.TEAMCODEX_CODEX_BIN) return env.TEAMCODEX_CODEX_BIN;
+  if (platform !== 'win32') {
+    // win32: the extension-less `codex` next to node.exe is npm's POSIX shim,
+    // which CreateProcess can't run — the bare lookup resolving codex.exe wins.
+    const sibling = join(dirname(execPath), 'codex');
+    if (exists(sibling)) return sibling;
+  }
+  return 'codex';
+}
+
+export function codexCliNotFoundMessage(codexBin, env = process.env) {
+  if (codexBin === 'codex') return 'Codex CLI not found in PATH. Install it first.';
+  return env.TEAMCODEX_CODEX_BIN
+    ? `Codex CLI not found at ${codexBin} — check TEAMCODEX_CODEX_BIN.`
+    : `Codex CLI not found at ${codexBin}. Install it first.`;
+}
+
 export function buildCodexProxyArgs(port, userArgs) {
+  // requires_openai_auth stays false: the proxy strips the client's
+  // authorization/chatgpt-account-id and injects the pool account's, so a
+  // local ~/.codex login adds nothing upstream — but requiring it lets a
+  // revoked local grant block `codex run` with the sign-in screen while the
+  // pool is healthy (2026-08-03 incident).
   const provider = [
     'name = "TeamCodex"',
     `base_url = "http://127.0.0.1:${port}/codex"`,
     'wire_api = "responses"',
-    'requires_openai_auth = true',
+    'requires_openai_auth = false',
     'supports_websockets = false',
   ].join(', ');
   const overrides = [

@@ -836,7 +836,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
   assert.equal(firstCalls[0].oauthToken, initialRecoveryToken);
   assert.equal(manager.currentIndex, 0, 'global current drifts to A before B recovers');
   assert.deepEqual(calls.map(call => call.args), [
-    ['--resume', sessionId],
+    ['--resume', sessionId, '--model', 'claude-sonnet-5'],
     ['--resume', sessionId, 'continue'],
   ]);
   assert.deepEqual(calls.map(call => call.oauthToken), [
@@ -1758,7 +1758,11 @@ appendFileSync(process.env.FAKE_CODEX_CALLS, JSON.stringify({
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.equal(ambiguous.status, 0, ambiguous.stderr);
-    assert.deepEqual(await jsonLines(claudeCalls), [['--continue']]);
+    assert.deepEqual(await jsonLines(claudeCalls), [[
+      '--continue',
+      '--model',
+      'claude-sonnet-5',
+    ]]);
     assert.deepEqual(await jsonLines(codexCalls), []);
 
     await writeFile(claudeCalls, '');

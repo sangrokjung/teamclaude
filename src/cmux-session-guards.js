@@ -1,10 +1,10 @@
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
+import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
-const LOGIN_EXPIRED = 'Login expired · Please run /login';
 const NOFOLLOW = constants.O_NOFOLLOW || 0;
 const DIRECTORY = constants.O_DIRECTORY || 0;
 
@@ -61,24 +61,6 @@ export async function readPrivateJson(path) {
   }
 }
 
-function textContent(record) {
-  const content = typeof record?.message === 'string'
-    ? record.message
-    : record?.message?.content;
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return content
-    .filter(block => block?.type === 'text' && typeof block.text === 'string')
-    .map(block => block.text)
-    .join('\n');
-}
-
-function isLoginExpired(record) {
-  return record?.isApiErrorMessage === true
-    && record.error === 'authentication_failed'
-    && textContent(record).trim().replace(/\s+/g, ' ') === LOGIN_EXPIRED;
-}
-
 function isConversationRecord(record) {
   return record?.type === 'user'
     || (record?.type === 'assistant' && record.isApiErrorMessage !== true);
@@ -89,7 +71,7 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
-export async function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId) {
+async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverableKinds) {
   try {
     const original = await lstat(path);
     if (!original.isFile()) return false;
@@ -106,7 +88,7 @@ export async function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId)
       const start = Math.max(0, info.size - 256 * 1024);
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);
-      let blocked = false;
+      let blocked = null;
       for (const line of buffer.toString('utf8').split('\n')) {
         let record;
         try {
@@ -114,8 +96,9 @@ export async function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId)
         } catch {
           continue;
         }
-        if (isLoginExpired(record)) blocked = true;
-        else if (blocked && isConversationRecord(record)) blocked = false;
+        const event = classifyClaudeApiErrorRecord(record);
+        if (event && recoverableKinds.has(event.kind)) blocked = event.kind;
+        else if (blocked && isConversationRecord(record)) blocked = null;
       }
       return blocked;
     } finally {
@@ -124,6 +107,24 @@ export async function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId)
   } catch {
     return false;
   }
+}
+
+export function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId) {
+  return unresolvedApiErrorKind(path, transcriptRoot, sessionId, new Set(['login_expired']))
+    .then(Boolean);
+}
+
+export function unresolvedRecoverableApiErrorKind(path, transcriptRoot, sessionId) {
+  return unresolvedApiErrorKind(
+    path,
+    transcriptRoot,
+    sessionId,
+    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch']),
+  );
+}
+
+export function hasUnresolvedRecoverableApiError(path, transcriptRoot, sessionId) {
+  return unresolvedRecoverableApiErrorKind(path, transcriptRoot, sessionId).then(Boolean);
 }
 
 function activeSessionId(store, surfaceId) {
@@ -202,9 +203,17 @@ function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
 }
 
-export function buildResumeCommand({ cwd, sessionId, nodePath, scriptPath, configPath }) {
+export function buildResumeCommand({
+  cwd,
+  sessionId,
+  nodePath,
+  scriptPath,
+  configPath,
+  continueLastPrompt = true,
+}) {
   const config = configPath
     ? `TEAMCLAUDE_CONFIG=${shellQuote(configPath)} `
     : '';
-  return `cd -- ${shellQuote(cwd)} && ${config}${shellQuote(nodePath)} ${shellQuote(scriptPath)} run -- --resume ${shellQuote(sessionId)} continue`;
+  const prompt = continueLastPrompt ? ' continue' : '';
+  return `cd -- ${shellQuote(cwd)} && ${config}${shellQuote(nodePath)} ${shellQuote(scriptPath)} run -- --resume ${shellQuote(sessionId)}${prompt}`;
 }

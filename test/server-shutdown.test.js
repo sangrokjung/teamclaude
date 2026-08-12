@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +43,46 @@ async function waitUntilListening(port, child) {
   }
   throw new Error('server did not start listening');
 }
+
+test('a supervised Claude session cannot stop its own proxy', async () => {
+  const proxyPort = await unusedPort();
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-self-stop-'));
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port: proxyPort, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'sk-ant-test' }],
+  }));
+  const child = spawn(process.execPath, [cliPath, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_PROVIDER: 'anthropic', TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+
+  try {
+    await waitUntilListening(proxyPort, child);
+    for (const command of ['stop', 'restart']) {
+      const result = spawnSync(process.execPath, [cliPath, command], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TEAMCLAUDE_PROVIDER: 'anthropic',
+          TEAMCLAUDE_CONFIG: configPath,
+          TEAMCLAUDE_SESSION_SUPERVISED: '1',
+        },
+      });
+      assert.equal(result.status, 1, `${command}: ${result.stderr}`);
+      assert.match(result.stderr, /separate terminal/i);
+    }
+    assert.equal(child.exitCode, null);
+    const status = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`);
+    assert.equal(status.status, 200);
+  } finally {
+    if (child.exitCode == null && child.signalCode == null) child.kill('SIGTERM');
+    if (child.exitCode == null && child.signalCode == null) await once(child, 'exit');
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('SIGTERM exits after a bounded grace period even with an active SSE response', async () => {
   let markUpstreamStarted;

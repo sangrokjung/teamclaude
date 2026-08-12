@@ -261,15 +261,16 @@ the same rotating refresh token used by `~/.codex/auth.json`; running plain
 `codex` afterward can rotate that token outside the proxy. If that happens,
 re-import the account or log it in again through `teamclaude codex login`.
 
-`teamclaude codex run` starts an HTTP-only Responses provider that still uses
-Codex's first-party ChatGPT auth path (`requires_openai_auth = true`) and
-redirects `chatgpt_base_url` to the local proxy. This preserves the
-subscription-only model catalog while preventing the default Responses
-WebSocket from bypassing the HTTP proxy. The proxy discards the client's
-incoming bearer token and account ID before forwarding, then injects the
-selected pool account's credentials. The official Codex CLI must still have a
-normal ChatGPT login to initialize its first-party auth path, but that
-credential is never forwarded upstream by TeamCodex.
+`teamclaude codex run` starts an HTTP-only Responses provider with
+`requires_openai_auth = false` and redirects `chatgpt_base_url` to the local
+proxy, while `supports_websockets = false` keeps the default Responses
+WebSocket from bypassing the HTTP proxy. The proxy discards any client-sent
+bearer token and account ID before forwarding, then injects the selected pool
+account's credentials. The local Codex CLI therefore needs **no ChatGPT login
+of its own** to run through the proxy, and a revoked or expired `~/.codex/auth.json`
+can never block `codex run` with the sign-in screen while the pool is healthy
+(this was the failure mode before 2026-08-03, when the override still set
+`requires_openai_auth = true`).
 
 Codex usage is learned from response headers as traffic flows, so newly added
 accounts show unmeasured quota until each account handles a request.
@@ -385,7 +386,7 @@ teamclaude restart    # stop the running server (if any) and start a fresh one
 
 The running server is discovered via its state file (`<config>.server.json`) with a port-probe fallback, so `stop`/`restart` work from any terminal — even after a config port change. Quota state is restored on restart (see below), so a restart doesn't lose the dashboard.
 
-> **Note:** if a Claude Code session is itself routed through the proxy (`teamclaude run`), running `teamclaude stop` *inside that session* severs its own API connection (`Unable to connect to API (ConnectionRefused)`). Stop or restart the proxy from a separate terminal instead — with `restart`, an in-flight session recovers on its own retries.
+> **Note:** a Claude Code session routed through the proxy (`teamclaude run`) cannot run `teamclaude stop` or `teamclaude restart` against its own supervisor. TeamClaude rejects that self-disruptive command; run it from a separate terminal instead.
 
 ### Account order & manual controls
 
@@ -411,20 +412,46 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
-If the proxy is not running, `teamclaude run` now starts it in the background
-and waits for the listener before launching Claude Code. The server keeps that
-public listener in a supervisor process, so a crashed proxy worker is replaced
-while new connections wait instead of failing with `ConnectionRefused`.
+If the proxy is not running, `teamclaude run` starts it in the background when
+local accounts are configured and waits for the listener before launching
+Claude Code. A tunnel-only machine with no local accounts waits for its external
+listener instead, so an empty local proxy cannot steal the forwarded port. The
+server keeps its public listener in a supervisor process, so a crashed proxy
+worker is replaced while new connections wait instead of failing with
+`ConnectionRefused`.
+
+If Anthropic rejects one OAuth account with the structured
+`oauth_not_allowed_for_organization` 403, TeamClaude parks only that account as
+an auth error and retries the completed rejection on another available account.
+Other permission 403s are passed through unchanged and never poison the pool.
+If every account is rejected, the last original 403 remains visible so an admin
+can enable Claude Code subscription access or the operator can re-import/login
+the account. See [the subscription-disabled runbook](docs/runbooks/claude-subscription-disabled.md).
 
 With `autoResumeClaude: true`, the launcher gives a new Claude Code conversation
 an explicit session ID and watches only that transcript for terminal API errors.
-`Request timed out` and terminal rate/overload errors restart the same conversation
-as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
-interactive session does not wait indefinitely at the prompt for a person.
+Terminal rate/overload rejections restart the same conversation as `--resume
+<session-id> continue`, up to `claudeAutoResumeMaxRetries`. `Request timed out`
+is dispatch-ambiguous, so it reopens the conversation as `--resume <session-id>`
+without resending the last prompt. Exact `ConnectionRefused` / `ECONNREFUSED`
+errors wait for the proxy or SSH tunnel and then safely continue the rejected
+request. `ConnectionReset` / `ECONNRESET` also wait for recovery, but only reopen
+the session because the original request may already have reached upstream.
+
+An exact structured `502 Upstream connection failed after dispatch. Request was
+not replayed.` error has a stricter path. The proxy never hides a replay of the
+ambiguous POST. The launcher verifies the local proxy, waits with backoff, and
+reopens the same session as `--resume <session-id>` without a continuation
+prompt. This dedicated safe-reopen budget is independent of
+`claudeAutoResumeMaxRetries`; launcher recovery therefore issues no second
+inference POST. Claude's optional feedback URL and `Request ID`
+diagnostic suffixes are recognized without treating ordinary prompt text as an
+API error. See [the ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md).
 
 Existing Claude processes cannot acquire a recovery parent retroactively.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
-cmux's session registry for an unresolved `Login expired` event. It continues
+cmux's session registry for an unresolved `Login expired`, connection-loss, or
+ambiguous-dispatch 502 API event. It continues
 only owner-private registry/transcript files whose active session ID, exact
 process selector and start time, trusted Claude executable, cmux surface,
 working directory, and transcript root all still match. The verified live
@@ -459,6 +486,15 @@ Starting or restarting TeamClaude later does **not** reroute an already-open
 direct session, which can still show "out of usage credits" for its single
 logged-in account while the proxy itself is healthy.
 
+For a supervised `teamclaude run` session, the exact Claude Code `out of usage
+credits` / `usage limit` API event is handled separately from transient overload.
+The launcher stops the blocked child, waits for the local proxy, performs an
+authenticated `/teamclaude/rotate`, and sends `--resume <session-id> continue`
+only after the proxy proves that a different account UUID was selected. If that
+rotation cannot be confirmed, the same exhausted account is not restarted.
+`overloaded_error`, temporary overload, and ordinary rate-limit events do not
+invoke this forced account rotation.
+
 Exit that direct session and resume it through TeamClaude from the same working
 directory:
 
@@ -478,23 +514,37 @@ claude
 ### Troubleshoot `ConnectionRefused`
 
 `Unable to connect to API (ConnectionRefused)` means Claude Code could not reach
-the local TeamClaude supervisor. New sessions started with `teamclaude run`
-automatically start a missing supervisor; a worker-only crash keeps the listener
-bound and is recovered automatically. If the supervisor itself was stopped,
-check it from a separate terminal:
+the local TeamClaude supervisor or its SSH tunnel. New sessions started with
+`teamclaude run` automatically start a missing local supervisor. If a supervised
+session later loses the connection, its launcher parks the exact session until
+the listener returns, follows any configured port move, and resumes it
+automatically. A tunnel-only machine waits for the tunnel owner instead of
+starting an empty proxy that would steal the forwarded port.
+
+Check or deliberately restart the supervisor from a separate terminal:
 
 ```bash
 teamclaude status
 lsof -nP -iTCP:3456 -sTCP:LISTEN
 teamclaude restart
 
-# Resume the conversation through the recovered proxy
+# Automatic resume needs no command. For a legacy direct session only:
 teamclaude run -- --continue
 ```
 
 The PID shown by `lsof` is the stable TeamClaude supervisor. Its worker PID may
-change after a crash without creating a no-listener window. Do not run
-`teamclaude stop` from inside the affected proxied Claude Code session.
+change after a crash without creating a no-listener window. Self-stop/restart
+commands from a supervised Claude session are rejected; use another terminal.
+
+### Troubleshoot post-dispatch 502
+
+When Claude Code prints `502 Upstream connection failed after dispatch. Request
+was not replayed`, upstream may have accepted the inference POST before its
+response connection failed. TeamClaude therefore keeps the original proxy POST
+at one hit, then permits one default same-session `continue` with a distinct
+marker. Preserve the displayed `Request ID` for
+upstream log correlation; the feedback/help suffix is diagnostic metadata, not
+a separate failure. See [the runbook](docs/runbooks/ambiguous-dispatch-502.md).
 
 ### Host CPU / RAM line
 
@@ -638,11 +688,12 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 | `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
-| `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload errors (optional, default `true`) |
+| `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
+| `claudeAmbiguousDispatchMaxResumes` | Dedicated same-session continuation budget for an exact structured post-dispatch 502. The proxy never replays the original POST; `0` disables launcher continuation, default `1`, and increasing it explicitly accepts duplicate inference/billing risk |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
-| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions already blocked on `Login expired`; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on exact `Login expired`, connection-loss, or ambiguous-dispatch 502 events; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)

@@ -163,8 +163,48 @@ teamclaude run
 
 > [!IMPORTANT]
 > 프록시가 실행 중이어도 일반 `claude` 명령은 자동으로 프록시를 사용하지 않습니다. 계정 자동 전환을 사용하려면 반드시 `teamclaude run`으로 시작하세요.
-> `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
+> `teamclaude run`은 로컬 계정이 있고 프록시가 없으면 background supervisor를 자동 기동합니다. 로컬 계정이 없는 터널 전용 머신은 외부 listener를 기다립니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 > `launchModel` fallback은 일반 한도 기준으로 사용 가능한 계정 전부의 모델별 window가 유효하게 측정된 한도 도달 상태일 때만 적용됩니다. 미측정 또는 만료 window가 하나라도 있으면 조기 downgrade하지 않습니다.
+
+`autoResumeClaude: true`인 `teamclaude run` 세션에서 정확한
+`ConnectionRefused` / `ECONNREFUSED` API 오류가 발생하면 launcher는 종료하지 않고
+프록시 또는 SSH 터널이 돌아올 때까지 대기한 뒤, 미전송이 확실한 요청만 동일한
+session ID에서 `continue`합니다. `ConnectionReset` / `ECONNRESET`과 `Request timed
+out`은 원본 요청이 upstream에 도착했을 수 있으므로, 연결 복구 뒤 `--resume
+<session-id>`로 세션 UI만 다시 열고 마지막 prompt는 자동 재전송하지 않습니다.
+로컬 계정이 없는 터널 전용 머신은 빈 프록시로 포트를 점유하지 않고 터널 복구를
+기다립니다.
+
+정확한 구조화 오류 `502 Upstream connection failed after dispatch. Request
+was not replayed.`는 별도 안전 경로로 처리합니다. 원본 POST가 upstream에서
+실행됐을 수 있으므로 proxy 내부에서는 절대 재전송하지 않습니다. launcher는
+proxy 상태를 확인한 뒤 같은 session을 `--resume <session-id>`로 다시 열되
+continuation prompt를 보내지 않습니다. 따라서 launcher도 두 번째 inference POST를
+만들지 않습니다. safe-reopen 횟수는 일반 재시도 상한과 분리된 전용 budget으로
+제한됩니다. Claude가 뒤에 붙이는 `/feedback` 링크와 `Request ID`도 인식하지만
+일반 prompt의 유사 문장은 오류로 오탐하지 않습니다. 운영 절차는
+[ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md)을 참고하세요.
+
+`teamclaude run`으로 감독되는 세션에서 Claude Code가 정확한 `out of usage
+credits` 또는 `usage limit` API 오류를 기록하면 transient overload와 분리해
+처리합니다. launcher는 막힌 child를 먼저 종료하고 로컬 proxy 복구를 기다린 뒤,
+인증된 `/teamclaude/rotate`가 **다른 account UUID**를 반환한 경우에만 같은 session을
+`--resume <session-id> continue`로 재개합니다. 회전 성공을 확인하지 못하면 소진된
+같은 계정을 다시 실행하지 않습니다. `overloaded_error`, 일시적 overload, 일반
+rate-limit은 이 강제 계정 회전을 호출하지 않습니다.
+
+프록시를 의도적으로 중지하거나 재시작할 때는 별도 터미널을 사용하세요.
+supervised Claude 세션 안에서 실행한 `teamclaude stop` / `restart`는 자기 연결을
+끊지 않도록 거부됩니다. 이미 직접 `claude`로 시작한 기존 프로세스에는 recovery
+launcher를 소급 적용할 수 없으므로 다음 세션부터 `teamclaude run`을 사용하세요.
+
+Anthropic이 한 OAuth 계정에 구조화된 `oauth_not_allowed_for_organization`
+403을 반환하면 TeamClaude는 해당 계정만 인증 오류로 격리하고, 완결된 거부
+요청을 다른 사용 가능한 계정으로 재전송합니다. 일반 permission 403은 그대로
+전달해 계정 풀을 오염시키지 않습니다. 모든 계정이 거부되면 마지막 원본 403을
+유지하므로 조직 관리자가 Claude Code 구독 접근을 활성화하거나 운영자가 계정을
+다시 import/login할 수 있습니다. 대응 절차는
+[subscription-disabled runbook](docs/runbooks/claude-subscription-disabled.md)을 참고하세요.
 
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 
@@ -225,6 +265,11 @@ teamclaude codex import --name codex-pro-1
 `teamclaude codex login` 방식이 권장됩니다. 이 방식은 임시 `CODEX_HOME`에서
 로그인을 수행하므로 TeamCodex와 일반 `~/.codex/auth.json`이 동일한 refresh
 token을 서로 갱신하며 충돌하지 않습니다.
+
+`teamclaude codex run`이 주입하는 provider는 `requires_openai_auth = false`로
+동작합니다. 프록시가 풀 계정의 자격 증명을 직접 주입하므로 로컬 Codex CLI에
+별도의 ChatGPT 로그인이 없어도 되고, `~/.codex/auth.json`이 만료·폐기되어도
+로그인 화면이 `codex run`을 막지 않습니다.
 
 ### Codex 계정 제어
 
@@ -322,6 +367,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
   "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
   "autoResumeClaude": true,
+  "claudeAmbiguousDispatchMaxResumes": 1,
   "codexFallbackOnExhaustion": false,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,
@@ -339,9 +385,10 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `continuityMaxWaitMs` | 연속성 내부 복구의 전체 deadline (기본 `900000` = 15분) |
 | `continuityMaxSleepMs` | 연속성 probe 사이의 최대 간격 (기본 `30000` = 30초) |
 | `activeWarmup` | 최소 요청으로 계정 사용량을 선측정 |
-| `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429를 같은 세션으로 자동 재개 |
+| `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429/프록시·터널 연결 손실을 같은 세션으로 자동 재개 |
+| `claudeAmbiguousDispatchMaxResumes` | 원본 POST 실행 여부가 불확실한 exact 502의 전용 동일 session continuation 횟수. proxy는 원본 POST를 replay하지 않으며, `0`은 비활성, 기본 `1`; 값을 늘리면 중복 inference·과금 위험을 명시적으로 수용 |
 | `codexFallbackOnExhaustion` | 대체 Claude 계정이 없거나 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
-| `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
+| `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`, 연결 손실, ambiguous-dispatch 502를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |

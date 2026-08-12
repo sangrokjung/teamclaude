@@ -2,10 +2,64 @@ import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './o
 import { refreshCodexAccessToken } from './codex.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
+const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
+const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+function codexWindowKind(windowMinutes) {
+  if (windowMinutes === CODEX_SESSION_WINDOW_MINUTES) return '5h';
+  if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return '7d';
+  return null;
+}
+
+function normalizeResetMs(value) {
+  if (value == null || value === '') return null;
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) return null;
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
+function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritative = true } = {}) {
+  if (!kind) return false;
+  const utilization = Number(usedPercent);
+  const reset = normalizeResetMs(resetAt);
+  const utilKey = kind === '5h' ? 'unified5h' : 'unified7d';
+  const resetKey = kind === '5h' ? 'unified5hReset' : 'unified7dReset';
+  // Per-response x-codex headers are a live incremental signal, NOT an
+  // authoritative meter: the Codex backend reports the rate limit that metered
+  // THAT request, which for a promo/model-scoped meter (e.g. the
+  // GPT-5.3-Codex-Spark additional limit) reads 0% while the account's binding
+  // weekly window (wham/usage base rate_limit) sits at 89% (live incident
+  // 2026-08-05: every forwarded response stamped unified7d back to 0 within
+  // seconds of each wham refresh). Within one live window a same-meter
+  // used-percent never decreases, so a NON-authoritative write that would
+  // LOWER the stored utilization while the stored window is still in the
+  // future is a different meter talking — skip the whole window (its reset is
+  // just as suspect). The authoritative wham path may lower freely (window
+  // rollover, upstream early reset), and an expired stored window may be
+  // overwritten by anyone (legitimate rollover).
+  if (!authoritative
+      && Number.isFinite(utilization)
+      && typeof quota[utilKey] === 'number'
+      && utilization / 100 < quota[utilKey]
+      && typeof quota[resetKey] === 'number'
+      && quota[resetKey] > Date.now()) {
+    return false;
+  }
+  let applied = false;
+  if (Number.isFinite(utilization)) {
+    quota[utilKey] = utilization / 100;
+    applied = true;
+  }
+  if (reset != null) {
+    quota[resetKey] = reset;
+    applied = true;
+  }
+  return applied;
 }
 
 // Anthropic's `7d_oi` window is the top-tier weekly allowance shown as
@@ -32,6 +86,11 @@ function emptyQuota() {
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // Freshness stamp: ms timestamp of the last authoritative codex wham/usage
+    // apply (updateCodexUsage). Per-response x-codex headers never set it —
+    // they are a non-authoritative signal. Drives the active fast-lane refresh
+    // (server.js maybeRefreshCodexUsage) and surfaces data age in status.
+    codexUsageAt: null,
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -997,23 +1056,36 @@ export class AccountManager {
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const codexPrimary = parseFloat(headers['x-codex-primary-used-percent']);
-    const codexSecondary = parseFloat(headers['x-codex-secondary-used-percent']);
-    const u5h = Number.isFinite(codexPrimary)
-      ? codexPrimary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = Number.isFinite(codexSecondary)
-      ? codexSecondary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
-    const r5h = headers['x-codex-primary-reset-at']
-      || headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['x-codex-secondary-reset-at']
-      || headers['anthropic-ratelimit-unified-7d-reset'];
+    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
+    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+
+    // Codex labels windows as primary/secondary, but those positions are not
+    // stable: a weekly-only plan can report its 10080-minute window as primary.
+    // Classify by the advertised duration. Older responses without a duration
+    // retain the legacy primary=5h / secondary=7d fallback.
+    for (const [prefix, fallbackKind] of [['primary', '5h'], ['secondary', '7d']]) {
+      const minutes = Number(headers[`x-codex-${prefix}-window-minutes`]);
+      const kind = Number.isFinite(minutes) && minutes > 0
+        ? codexWindowKind(minutes)
+        : fallbackKind;
+      applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        headers[`x-codex-${prefix}-used-percent`],
+        headers[`x-codex-${prefix}-reset-at`],
+        // Response headers describe whichever meter governed THIS request; only
+        // the wham/usage refresh (updateCodexUsage) is authoritative for the
+        // account's binding windows. See applyCodexQuotaWindow.
+        { authoritative: false },
+      );
+    }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     const codexReached = headers['x-codex-rate-limit-reached-type'];
@@ -1070,6 +1142,59 @@ export class AccountManager {
             : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * Fold the official Codex /wham/usage response into the shared quota model.
+   * The base rate limit wins; additional Codex limits only fill a duration that
+   * the base response did not include. Unrecognized windows are ignored.
+   */
+  updateCodexUsage(accountIndex, payload) {
+    const account = this._resolve(accountIndex);
+    if (!account || !payload || typeof payload !== 'object') return false;
+    // A parsed usage response IS fresh contact with the source, even when it
+    // carries no recognizable 5h/7d window (an upstream contract change must
+    // not turn the active fast lane into an unbounded per-request poll).
+    account.quota.codexUsageAt = Date.now();
+
+    const limits = [];
+    if (payload.rate_limit && typeof payload.rate_limit === 'object') {
+      limits.push(payload.rate_limit);
+    }
+    if (Array.isArray(payload.additional_rate_limits)) {
+      for (const item of payload.additional_rate_limits) {
+        if (item?.limit_name !== 'codex') continue;
+        if (item?.rate_limit && typeof item.rate_limit === 'object') limits.push(item.rate_limit);
+      }
+    }
+
+    const windows = new Map();
+    for (const limit of limits) {
+      for (const window of [limit.primary_window, limit.secondary_window]) {
+        if (!window || typeof window !== 'object') continue;
+        const minutes = window.window_minutes != null && Number.isFinite(Number(window.window_minutes))
+          ? Number(window.window_minutes)
+          : Number(window.limit_window_seconds) / 60;
+        const kind = codexWindowKind(minutes);
+        if (!kind || windows.has(kind)) continue;
+        windows.set(kind, window);
+      }
+    }
+
+    let applied = false;
+    for (const [kind, window] of windows) {
+      const resetAt = window.reset_at ?? (window.reset_after_seconds != null
+        && Number.isFinite(Number(window.reset_after_seconds))
+        ? Date.now() / 1000 + Number(window.reset_after_seconds)
+        : null);
+      applied = applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        window.used_percent,
+        resetAt,
+      ) || applied;
+    }
+    return applied;
   }
 
   /**
@@ -1499,6 +1624,7 @@ export class AccountManager {
       switchThreshold: this.switchThreshold,
       accounts: this.accounts.map(a => ({
         name: a.name,
+        accountUuid: a.accountUuid || null,
         type: a.type,
         provider: a.provider,
         status: a.status,

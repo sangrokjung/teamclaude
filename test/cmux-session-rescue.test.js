@@ -39,6 +39,37 @@ function loginExpiredRecord(cwd) {
   });
 }
 
+function connectionRefusedRecord(cwd) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    isApiErrorMessage: true,
+    error: 'server_error',
+    message: 'Unable to connect to API (ConnectionRefused)',
+  });
+}
+
+function connectionResetRecord(cwd) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    isApiErrorMessage: true,
+    error: 'server_error',
+    message: 'Unable to connect to API (ConnectionReset)',
+  });
+}
+
+function ambiguousDispatchRecord(cwd) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    isApiErrorMessage: true,
+    error: 'server_error',
+    apiErrorStatus: 502,
+    message: 'API Error: 502 Upstream connection failed after dispatch. Request was not replayed. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (localhost:3456).',
+  });
+}
+
 function assistantRecord(cwd) {
   return JSON.stringify({
     type: 'assistant',
@@ -140,6 +171,69 @@ test('adopts active unresolved Login expired session once', async t => {
   );
 });
 
+test('adopts an active unresolved ConnectionRefused session once', async t => {
+  const fx = await fixture(t);
+  await writeFile(fx.transcriptPath, `${connectionRefusedRecord(fx.cwd)}\n`);
+  const launched = [];
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    configPath: '/tmp/teamclaude config.json',
+    inspectProcess: async () => processInfo(fx),
+    launchRecoveryWorkspace: async request => {
+      launched.push(request);
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launched.length, 1);
+  assert.match(launched[0].command, new RegExp(`--resume '${SESSION_ID}' continue$`));
+});
+
+test('reopens an active unresolved ConnectionReset session without resending the last prompt', async t => {
+  const fx = await fixture(t);
+  await writeFile(fx.transcriptPath, `${connectionResetRecord(fx.cwd)}\n`);
+  const launched = [];
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    configPath: '/tmp/teamclaude config.json',
+    inspectProcess: async () => processInfo(fx),
+    launchRecoveryWorkspace: async request => {
+      launched.push(request);
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launched.length, 1);
+  assert.match(launched[0].command, new RegExp(`--resume '${SESSION_ID}'$`));
+});
+
+test('reopens an active unresolved ambiguous-dispatch 502 without resending the last prompt', async t => {
+  const fx = await fixture(t);
+  await writeFile(fx.transcriptPath, `${ambiguousDispatchRecord(fx.cwd)}\n`);
+  const launched = [];
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    configPath: '/tmp/teamclaude config.json',
+    inspectProcess: async () => processInfo(fx),
+    launchRecoveryWorkspace: async request => {
+      launched.push(request);
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launched.length, 1);
+  assert.match(launched[0].command, new RegExp(`--resume '${SESSION_ID}'$`));
+});
+
 test('resolves the recovery window from the verified live surface only', () => {
   const workspaceId = '44444444-4444-4444-8444-444444444444';
   const otherWorkspaceId = '55555555-5555-4555-8555-555555555555';
@@ -194,6 +288,13 @@ test('rejects stale, resolved, escaped, mismatched, or supervised cmux sessions'
       mutate: fx => writeFile(
         fx.transcriptPath,
         `${loginExpiredRecord(fx.cwd)}\n${assistantRecord(fx.cwd)}\n`,
+      ),
+    },
+    {
+      name: 'conversation continued after ConnectionRefused',
+      mutate: fx => writeFile(
+        fx.transcriptPath,
+        `${connectionRefusedRecord(fx.cwd)}\n${assistantRecord(fx.cwd)}\n`,
       ),
     },
     {

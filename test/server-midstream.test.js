@@ -34,6 +34,7 @@ function startProxy(am, upstreamPort, overrides = {}) {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    codexUsageRefresh: false,
     ...overrides,
   });
 }

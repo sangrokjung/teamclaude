@@ -49,6 +49,7 @@ process.stdout.write(process.env.CMUX_BINDING);
     env: {
       ...process.env,
       PATH: `${dir}:${process.env.PATH}`,
+      TEAMCODEX_CODEX_BIN: join(dir, 'codex'),
       TEAMCLAUDE_CONFIG: join(dir, 'teamcodex.json'),
       CODEX_LOG: codexLog,
       CMUX_LOG: cmuxLog,

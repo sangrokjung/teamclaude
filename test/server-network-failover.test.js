@@ -45,10 +45,14 @@ function request(port, method = 'POST', model = 'claude-fable-5') {
 
 test('pre-response network error does not replay an unsafe POST', async () => {
   const authsSeen = [];
-  const upstream = http.createServer((req, res) => {
+  const bodiesSeen = [];
+  const upstream = http.createServer(async (req, res) => {
     const auth = req.headers['authorization'] || '';
     authsSeen.push(auth);
     if (auth.includes('tok-0')) {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      bodiesSeen.push(JSON.parse(Buffer.concat(chunks).toString()));
       req.socket.destroy(); // RST before any response bytes — "fetch failed"/ECONNRESET
       return;
     }
@@ -66,7 +70,15 @@ test('pre-response network error does not replay an unsafe POST', async () => {
     const json = await res.json();
     assert.equal(res.status, 502);
     assert.equal(json.error?.type, 'proxy_error');
+    assert.equal(
+      json.error?.message,
+      'Upstream connection failed after dispatch. Request was not replayed.',
+    );
     assert.equal(authsSeen.length, 1, 'an ambiguous POST must not be replayed internally');
+    assert.deepEqual(bodiesSeen, [{
+      model: 'claude-fable-5',
+      messages: [{ role: 'user', content: 'hi' }],
+    }]);
     // A network blip must not poison the account (per-request exclusion only).
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {

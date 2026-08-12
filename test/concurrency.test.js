@@ -517,6 +517,61 @@ test('proxy caps concurrent in-flight per account and still serves every request
   proxy.close();
 });
 
+test('continuity mode preserves a capped request FIFO position past the short queue timeout', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1);
+  measureAll(am);
+  const held = await am.acquireAccount(null, 0); // saturate the only healthy slot
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: true,
+    continuityMaxWaitMs: 500,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    overflowQueueTimeoutMs: 20,
+  });
+  const port = await listen(proxy);
+
+  let released = false;
+  let pending;
+  try {
+    pending = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    for (let i = 0; i < 20 && am._waiters.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(am._waiters.length, 1, 'the saturated request should enter the FIFO queue');
+    const originalWaiter = am._waiters[0];
+
+    await new Promise(resolve => setTimeout(resolve, 70));
+    assert.equal(
+      am._waiters[0],
+      originalWaiter,
+      'continuity mode must not time out and re-enqueue the request at the back of the queue',
+    );
+
+    am.releaseAccount(held);
+    released = true;
+    const res = await pending;
+    assert.equal(res.status, 200);
+  } finally {
+    if (!released) am.releaseAccount(held);
+    await pending?.catch(() => {});
+    upstream.close();
+    proxy.close();
+  }
+});
+
 test('a keep-alive connection pins its sequential requests to one account (affinity end-to-end)', async () => {
   const served = []; // token (account) that handled each request, in order
   const upstream = http.createServer((req, res) => {

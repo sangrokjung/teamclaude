@@ -14,9 +14,11 @@ import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isToke
 import {
   assertSafeCodexResumeArgs,
   buildCodexProxyArgs,
+  codexCliNotFoundMessage,
   importCodexCredentials,
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
+  resolveCodexCliBin,
 } from './codex.js';
 import {
   currentCmuxCodexSessionId,
@@ -41,6 +43,7 @@ const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_MANAGED_CLAUDE_MODEL = 'claude-sonnet-5';
 const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'keep-alive',
@@ -89,7 +92,7 @@ switch (command) {
     break;
   case 'stop':
     await stopCommand();
-    process.exit(0);
+    process.exit(process.exitCode ?? 0);
     break;
   case 'restart':
     await restartCommand();
@@ -908,6 +911,15 @@ async function superviseServerCommand() {
     listener.once('error', onListenError);
     listener.listen(port, () => {
       listener.removeListener('error', onListenError);
+      listener.on('error', err => {
+        // Runtime accept/resource errors (for example EMFILE/ENOBUFS) must not
+        // become an unhandled EventEmitter error that kills the one process
+        // owning the stable public port. Node can continue accepting once the
+        // transient resource pressure clears; keep the listener and worker up.
+        console.error(
+          `[TeamClaude] Public listener runtime error${err.code ? ` (${err.code})` : ''}: ${err.message}`,
+        );
+      });
       launchWorker();
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
@@ -1094,6 +1106,7 @@ async function proxyWorkerCommand() {
       const diskConfig = await loadConfig();
       if (!diskConfig) return;
       await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (codexMode) await server.refreshQuotaAll();
       if (process.connected) {
         process.send({
           type: 'teamcodex:capacity',
@@ -1238,6 +1251,12 @@ async function probeServer(port, timeoutMs = 1500) {
   finally { clearTimeout(timer); }
 }
 
+function configuredStatusProbeTimeoutMs(fallbackMs = 1500) {
+  const configured = Number(process.env.TEAMCLAUDE_STATUS_PROBE_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return fallbackMs;
+  return Math.min(30_000, Math.max(250, Math.floor(configured)));
+}
+
 /** Best-effort: the pid listening on a TCP port (macOS/Linux via lsof). */
 function lsofPid(port) {
   if (process.platform === 'win32') return null;
@@ -1259,7 +1278,10 @@ function lsofPid(port) {
  * for this same port). Returns { pid, port } (pid may be null if undeterminable),
  * or null when nothing is listening.
  */
-async function findRunningServer(config, maxProbeWaitMs = 1500) {
+async function findRunningServer(
+  config,
+  maxProbeWaitMs = configuredStatusProbeTimeoutMs(),
+) {
   const configPort = config?.proxy?.port;
   const state = await readServerState();
   const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
@@ -1276,7 +1298,10 @@ async function findRunningServer(config, maxProbeWaitMs = 1500) {
   for (const port of candidates) {
     const remainingMs = probeDeadline - Date.now();
     if (remainingMs <= 0) break;
-    if (!(await probeServer(port, Math.min(1500, remainingMs)))) continue;
+    if (!(await probeServer(
+      port,
+      Math.min(configuredStatusProbeTimeoutMs(), remainingMs),
+    ))) continue;
     const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
     if (ownerPid) return { pid: ownerPid, port };
     // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
@@ -1420,7 +1445,17 @@ async function stopRunningServer() {
   return { stopped: true, pid, port };
 }
 
+function refuseSelfDisruptiveLifecycleCommand(command) {
+  if (process.env.TEAMCLAUDE_SESSION_SUPERVISED !== '1') return false;
+  console.error(
+    `[TeamClaude] Refusing to ${command} the proxy from a supervised Claude or Codex session. Use a separate terminal.`,
+  );
+  process.exitCode = 1;
+  return true;
+}
+
 async function stopCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('stop')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped TeamClaude server (pid ${r.pid}, port ${r.port}).`);
@@ -1446,6 +1481,7 @@ async function stopCommand() {
 }
 
 async function restartCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('restart')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped previous server (pid ${r.pid}).`);
@@ -1570,13 +1606,14 @@ async function loginCodexCommand() {
 
   try {
     console.log('Starting isolated Codex OAuth login...');
-    const result = spawnSync('codex', loginArgs, {
+    const codexBin = resolveCodexCliBin();
+    const result = spawnSync(codexBin, loginArgs, {
       stdio: 'inherit',
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     if (result.error) {
       if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
+        console.error(codexCliNotFoundMessage(codexBin));
       } else {
         console.error(`Failed to start Codex login: ${result.error.message}`);
       }
@@ -1648,7 +1685,9 @@ async function envCommand() {
     console.log('teamcodex codex run');
     return;
   }
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
+  const running = await findRunningServer(config);
+  const port = running?.port || config.proxy.port;
+  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${port}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
@@ -1739,10 +1778,14 @@ function displayModel(model) {
 
 async function syncLaunchModel(config, claudeArgs, childEnv) {
   const explicitModel = modelArgValue(claudeArgs) || childEnv.ANTHROPIC_MODEL || null;
-  const requestedModel = explicitModel || config.launchModel;
+  const configuredModel = typeof config.launchModel === 'string'
+      && config.launchModel.length > 0
+    ? config.launchModel
+    : DEFAULT_MANAGED_CLAUDE_MODEL;
+  const requestedModel = explicitModel || configuredModel;
   const chain = fallbackChainFor(config.modelFallbacks, requestedModel);
-  if (!requestedModel || !chain) {
-    if (!explicitModel && config.launchModel) setModelArg(claudeArgs, config.launchModel);
+  if (!chain) {
+    if (!explicitModel) setModelArg(claudeArgs, configuredModel);
     return;
   }
 
@@ -1761,8 +1804,8 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
     const fallback = displayModel(chain[0]);
     setModelArg(claudeArgs, fallback);
     console.error(`[TeamClaude] ${requestedModel} quota unavailable; launching Claude Code as ${fallback}.`);
-  } else if (!modelArgValue(claudeArgs) && !childEnv.ANTHROPIC_MODEL && config.launchModel) {
-    setModelArg(claudeArgs, config.launchModel);
+  } else if (!modelArgValue(claudeArgs) && !childEnv.ANTHROPIC_MODEL) {
+    setModelArg(claudeArgs, configuredModel);
   }
 }
 
@@ -1910,18 +1953,20 @@ async function runCommand(clientArgsOverride = null) {
     ? childEnv.TEAMCLAUDE_CLAUDE_BIN
     : 'claude';
   if (isCodexMode(config)) {
+    childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
     delete childEnv.CODEX_ACCESS_TOKEN;
     delete childEnv.TEAMCLAUDE_CODEX_PROXY_TOKEN;
     const codexArgs = buildCodexProxyArgs(config.proxy.port, clientArgs);
-    const result = spawnSync('codex', codexArgs, {
+    const codexBin = resolveCodexCliBin();
+    const result = spawnSync(codexBin, codexArgs, {
       stdio: 'inherit',
       env: childEnv,
     });
     if (result.error) {
       if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
+        console.error(codexCliNotFoundMessage(codexBin));
       } else {
         console.error(`Failed to start codex: ${result.error.message}`);
       }
@@ -1937,9 +1982,10 @@ async function runCommand(clientArgsOverride = null) {
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
   if (preserveProxyApiKey) childEnv.ANTHROPIC_API_KEY = config.proxy.apiKey;
-  // TeamClaude owns model entitlement across the account pool. Claude Code's
-  // per-login GrowthBook gate can otherwise block Fable before any proxy request.
-  childEnv.DISABLE_GROWTHBOOK = '1';
+  // Model entitlement is owned by Claude Code. In particular, Fable 5 now
+  // requires separately purchased usage credits, so never carry an inherited
+  // experiment-gate bypass into the managed child.
+  delete childEnv.DISABLE_GROWTHBOOK;
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
   await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
   await seedClaudeRecoveryAccount(runtimeConfig, childEnv);

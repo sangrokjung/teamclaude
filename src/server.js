@@ -175,12 +175,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // can't push an account over maxConcurrent, and only learns from a 2xx (or an
   // account-level quota 429). `config.activeWarmup: false` disables it all.
   const activeWarmup = provider === 'anthropic' && config.activeWarmup !== false;
+  const codexUsageRefresh = provider === 'codex' && config.codexUsageRefresh !== false;
   const warmupIntervalMs = Number.isFinite(config.warmupIntervalMs)
     ? Math.max(0, config.warmupIntervalMs)
     : 5 * 60 * 1000;
+  // Active fast lane (codex): max age of an account's authoritative usage data
+  // before a completed request on it triggers a background wham/usage re-fetch.
+  // 0 disables the fast lane (periodic + startup refresh stay on).
+  const codexUsageActiveMs = Number.isFinite(config.codexUsageActiveMs)
+    ? Math.max(0, config.codexUsageActiveMs)
+    : 60_000;
   const WARMUP_PROBE_TIMEOUT_MS = 15_000;
   let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
   let warmupInFlight = false; // guard against overlapping fan-outs
+  let codexRefreshPromise = null;
   let warmupClosed = false;   // set on server close: stop scheduling, abort in-flight probes
   const warmupAbort = new AbortController();
 
@@ -258,6 +266,102 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       warmupAbort.signal.removeEventListener('abort', onClose);
     };
     return { signal: ac.signal, cleanup };
+  }
+
+  function codexUsageEndpoint() {
+    const url = new URL(upstream);
+    url.pathname = `${url.pathname.replace(/\/codex\/?$/, '').replace(/\/$/, '')}/wham/usage`;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  }
+
+  async function refreshCodexAccount(account) {
+    if (warmupClosed || !account.credential) return false;
+    const ok = await fetchCodexUsageOnce(account);
+    // Failure visibility without 60s-cadence spam: log once per failure STREAK
+    // (first failure after a success), and once on recovery. A teardown abort
+    // (warmupClosed) or a removed account is not a data-staleness signal.
+    if (ok) {
+      if (account._usageRefreshFailed) {
+        account._usageRefreshFailed = false;
+        console.log(`[TeamClaude] Codex usage refresh recovered for "${account.name}"`);
+      }
+    } else if (!warmupClosed
+        && accountManager.accounts[account.index] === account
+        && !account._usageRefreshFailed) {
+      account._usageRefreshFailed = true;
+      console.error(`[TeamClaude] Codex usage refresh failed for "${account.name}" — usage data stays stale until a refresh succeeds`);
+    }
+    return ok;
+  }
+
+  async function fetchCodexUsageOnce(account) {
+    const probe = probeSignal();
+    try {
+      const headers = {
+        accept: 'application/json',
+        authorization: `Bearer ${account.credential}`,
+      };
+      if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+      const res = await fetch(codexUsageEndpoint(), { headers, signal: probe.signal });
+      if (!res.ok) {
+        await res.body?.cancel();
+        return false;
+      }
+      const payload = await res.json();
+      if (accountManager.accounts[account.index] !== account) return false;
+      return accountManager.updateCodexUsage(account, payload);
+    } catch {
+      return false;
+    } finally {
+      probe.cleanup();
+    }
+  }
+
+  async function refreshCodexQuotaAll() {
+    if (!codexUsageRefresh || warmupClosed) return -1;
+    if (codexRefreshPromise) return codexRefreshPromise;
+    codexRefreshPromise = (async () => {
+      while (!warmupClosed) {
+        const targets = accountManager.accounts.filter(a => a.provider === 'codex' && a.credential);
+        const outcomes = await Promise.all(targets.map(refreshCodexAccount));
+        const current = accountManager.accounts.filter(a => a.provider === 'codex' && a.credential);
+        if (targets.length === current.length && targets.every((account, i) => account === current[i])) {
+          return {
+            targets: targets.length,
+            measured: outcomes.filter(Boolean).length,
+          };
+        }
+      }
+      return -1;
+    })();
+    try {
+      return await codexRefreshPromise;
+    } finally {
+      codexRefreshPromise = null;
+    }
+  }
+
+  // Active fast lane: called from the request-completion path (the finally that
+  // releases the concurrency slot — runs for SSE and non-SSE alike) with the
+  // account that served the request. When that account's authoritative usage
+  // stamp (quota.codexUsageAt — set only by the wham/usage apply, never by
+  // per-response headers) is older than codexUsageActiveMs, kick a background
+  // refreshCodexAccount. Fire-and-forget: it must never block, delay, or fail
+  // the response path, and _usageRefreshing keeps it single-flight per account
+  // (a failed attempt doesn't stamp freshness, so the next completed request
+  // simply retries).
+  function maybeRefreshCodexUsage(account) {
+    if (!codexUsageRefresh || warmupClosed || codexUsageActiveMs <= 0) return;
+    if (!account || account.provider !== 'codex' || account._usageRefreshing) return;
+    if (accountManager.accounts[account.index] !== account) return;
+    if (Date.now() - (account.quota?.codexUsageAt ?? 0) < codexUsageActiveMs) return;
+    account._usageRefreshing = true;
+    Promise.resolve()
+      .then(() => refreshCodexAccount(account))
+      .catch(() => { /* refreshCodexAccount is already best-effort */ })
+      .finally(() => { account._usageRefreshing = false; });
   }
 
   // Probe one account: send a minimal /v1/messages with its own auth and fold the
@@ -376,6 +480,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // no probe template exists yet (nothing has flowed through the proxy, so there
   // is no known-accepted request shape to replay).
   async function refreshQuotaAll() {
+    if (provider === 'codex') return refreshCodexQuotaAll();
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
       a.status !== 'error' && a.inflight === 0 && !a._warming);
@@ -477,6 +582,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
+  }
+  let codexUsageTimer = null;
+  if (codexUsageRefresh) {
+    setImmediate(() => { refreshCodexQuotaAll(); });
+    if (warmupIntervalMs > 0) {
+      codexUsageTimer = setInterval(() => { refreshCodexQuotaAll(); }, warmupIntervalMs);
+      codexUsageTimer.unref();
+    }
   }
 
   function rejectEarlyRequest(req, res, statusCode, headers, payload) {
@@ -762,10 +875,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // Release the concurrency slot held by this request (if any). A failover
           // releases the previous account before re-acquiring, so at this point only
           // the last-held slot remains; releaseAccount guards against double-release.
+          const servedAccount = ctx.held;
           if (ctx.held != null) {
             accountManager.releaseAccount(ctx.held);
             ctx.held = null;
           }
+          // Codex fast-lane usage refresh for the account that just finished
+          // serving — AFTER the slot release so it can never hold capacity,
+          // and fire-and-forget so it can never delay this response.
+          if (servedAccount != null) maybeRefreshCodexUsage(servedAccount);
           hooks.onRequestEnd?.(reqId, {
             method: req.method, path: req.url,
             account: ctx.account, status: ctx.status,
@@ -798,6 +916,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     warmupClosed = true;
     warmupAbort.abort();
     if (warmupTimer) clearInterval(warmupTimer);
+    if (codexUsageTimer) clearInterval(codexUsageTimer);
   };
   const closeServer = server.close.bind(server);
   server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
@@ -1068,6 +1187,16 @@ async function readBodyBounded(webStream, maxBytes) {
   }
 }
 
+function isClaudeSubscriptionAccessDisabled(body) {
+  try {
+    const payload = JSON.parse(body.toString());
+    return payload?.error?.type === 'permission_error'
+      && payload?.error?.details?.error_code === 'oauth_not_allowed_for_organization';
+  } catch {
+    return false;
+  }
+}
+
 
 function logTimestamp() {
   const d = new Date();
@@ -1264,9 +1393,33 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (ctx.held != null) {
       account = ctx.held;
     } else {
+      // A continuity request must keep its FIFO position while the fleet is
+      // merely concurrency-capped. Re-applying the short overflow timeout on
+      // every loop removes the waiter and appends it at the back again, so a
+      // saturated fleet can starve an older request indefinitely. The overall
+      // continuity deadline already bounds this wait; client abort still
+      // removes it immediately. Preserve an explicit queueTimeoutMs: 0 opt-out.
+      let acquireTimeoutMs = ctx.queueTimeoutMs;
+      const preferred = typeof ctx.preferredAccountUuid === 'string'
+        ? accountManager.accounts.find(a => a.accountUuid === ctx.preferredAccountUuid)
+        : null;
+      const selectionHasUsable = ctx.preferredAccountUuid == null
+        ? accountManager.anyUsable(excludeForSelect, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model)
+          && accountManager._hasCapacity(preferred)
+          && !(excludeForSelect && excludeForSelect.has(preferred));
+      const selectionHasCapped = ctx.preferredAccountUuid == null
+        ? accountManager.anyCapped(excludeForSelect, ctx.model)
+        : preferred && accountManager._isAvailable(preferred, ctx.model)
+          && !accountManager._hasCapacity(preferred)
+          && !(excludeForSelect && excludeForSelect.has(preferred));
+      if (acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
+          && !selectionHasUsable && selectionHasCapped) {
+        acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
+      }
       account = await accountManager.acquireAccount(
         excludeForSelect,
-        ctx.queueTimeoutMs,
+        acquireTimeoutMs,
         ctx.abortSignal,
         ctx.affinityKey,
         ctx.model,
@@ -1613,6 +1766,65 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           error: { type: 'authentication_error', message: 'All accounts failed authentication.' },
         }));
       }
+      return;
+    }
+
+    // Anthropic returns a completed 403 when an OAuth account's organization
+    // has disabled Claude Code subscription access. This is account-scoped and
+    // safe to replay: the upstream explicitly rejected the request before doing
+    // work. Match the product-specific JSON message narrowly; unrelated 403s
+    // remain byte-preserving pass-through responses and do not poison the pool.
+    if (ctx.provider === 'anthropic' && upstreamRes.status === 403 && account.type === 'oauth') {
+      const responseBody = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      if (responseBody === null) {
+        ctx.status = 502;
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: 'Upstream 403 response exceeded the proxy limit.' },
+          }));
+        }
+        return;
+      }
+
+      const subscriptionDisabled = isClaudeSubscriptionAccessDisabled(responseBody);
+      if (subscriptionDisabled) {
+        account.status = 'error';
+        account._errorFromRefresh = false;
+        console.log(`[TeamClaude] 403 subscription access disabled on "${account.name}" — marking account error and switching`);
+        if (logDir) {
+          logSections.push(`=== RESPONSE 403 — subscription access disabled, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
+          writeRequestLog(logDir, reqId, logSections);
+        }
+        if (res.destroyed) return;
+        const hasAlternative = accountManager.anyUsable(null, ctx.model)
+          || accountManager.anyCapped(null, ctx.model);
+        if (retryCount < maxRetries && hasAlternative) {
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+      }
+
+      ctx.status = 403;
+      const responseHeaders = {};
+      const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
+      for (const [key, value] of upstreamRes.headers.entries()) {
+        if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+        if (key === 'content-encoding' || key === 'content-length') continue;
+        responseHeaders[key] = value;
+      }
+      if (logDir && !subscriptionDisabled) {
+        logSections.push(`=== RESPONSE 403 ===\n${formatHeaders(upstreamRes.headers)}`);
+        try {
+          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(responseBody.toString()), null, 2)}`);
+        } catch {
+          logSections.push(`=== RESPONSE BODY (${responseBody.length} bytes) ===\n${responseBody.toString().slice(0, 8192)}`);
+        }
+        writeRequestLog(logDir, reqId, logSections);
+      }
+      if (!res.headersSent) res.writeHead(403, responseHeaders);
+      res.end(responseBody.length > 0 ? responseBody : undefined);
       return;
     }
 

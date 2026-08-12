@@ -589,7 +589,11 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
   }));
 
   const child = spawn(process.execPath, [entry, 'server'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    env: {
+      ...process.env,
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+      TEAMCLAUDE_CONFIG: configPath,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
@@ -646,6 +650,7 @@ console.log(JSON.stringify({ ok: response.ok, accounts: body.accounts.length }))
   const env = {
     ...process.env,
     PATH: `${dir}:${process.env.PATH}`,
+    TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
   };
 

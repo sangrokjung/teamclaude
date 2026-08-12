@@ -1,5 +1,10 @@
 # Codex provider and exact-session recovery runbook
 
+> 메인 cmux surface와 별도 worker tmux 사이에서 `Broken pipe`, 숨은 연결,
+> duplicate client가 함께 발생한 경우에는 단일 tab 복구 절차만 적용하지 말고
+> [main-worker recovery runbook](./main-worker-codex-session-recovery.md)의 전체
+> inventory 및 완료 게이트를 먼저 적용한다.
+
 ## Summary
 
 An existing Codex TUI does not adopt a new provider when shell configuration
