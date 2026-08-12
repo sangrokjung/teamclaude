@@ -273,6 +273,78 @@ test('loopback malformed recovery marker is rejected before upstream dispatch', 
   assert.equal(upstreamHits, 0);
 });
 
+test('a spilled recovery marker tracks the actual account through explicit 429 failover', async t => {
+  const upstreamAuth = [];
+  const upstream = http.createServer((req, res) => {
+    upstreamAuth.push(req.headers.authorization);
+    if (req.headers.authorization === 'Bearer fixture-b') {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': '300',
+        'anthropic-ratelimit-unified-status': 'rejected',
+      });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  t.after(() => close(upstream));
+  const upstreamPort = await listen(upstream);
+
+  const manager = new AccountManager([
+    {
+      name: 'account-a', accountUuid: 'uuid-a', type: 'oauth',
+      accessToken: 'fixture-a', expiresAt: Date.now() + 60_000, priority: 0,
+    },
+    {
+      name: 'account-b', accountUuid: 'uuid-b', type: 'oauth',
+      accessToken: 'fixture-b', expiresAt: Date.now() + 60_000, priority: 1,
+    },
+    {
+      name: 'account-c', accountUuid: 'uuid-c', type: 'oauth',
+      accessToken: 'fixture-c', expiresAt: Date.now() + 60_000, priority: 2,
+    },
+  ], 0.98, 0);
+  const reset = String(Math.floor((Date.now() + 60_000) / 1000));
+  manager.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.99',
+    'anthropic-ratelimit-unified-5h-reset': reset,
+  });
+  for (const index of [1, 2]) {
+    manager.updateQuota(index, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': reset,
+    });
+  }
+  manager.currentIndex = 0;
+
+  const server = createProxyServer(manager, {
+    proxy: { apiKey: '' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  t.after(() => close(server));
+  const port = await listen(server);
+  const recoveryEnv = buildClaudeRecoveryEnv({
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+  }, 'uuid-a');
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${recoveryEnv.CLAUDE_CODE_OAUTH_TOKEN}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ model: 'test-model', messages: [] }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(upstreamAuth, ['Bearer fixture-b', 'Bearer fixture-c']);
+  assert.equal(manager.accounts[1].status, 'throttled');
+});
+
 test('recovery UUID fails closed if selected account is removed during token refresh', async t => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {

@@ -324,13 +324,13 @@ export class AccountManager {
       const preferred = this.accounts.find(
         account => account.accountUuid === preferredAccountUuid,
       );
-      if (!preferred || !this._isAvailable(preferred, model)
-          || (exclude && exclude.has(preferred)) || !this._hasCapacity(preferred)) {
-        return null;
+      if (!preferred) return null;
+      if (this._isAvailable(preferred, model)
+          && !(exclude && exclude.has(preferred)) && this._hasCapacity(preferred)) {
+        preferred.inflight++;
+        if (affOk) this._affinity.set(affinityKey, preferred);
+        return preferred;
       }
-      preferred.inflight++;
-      if (affOk) this._affinity.set(affinityKey, preferred);
-      return preferred;
     }
 
     // Connection affinity (cache locality): prefer the account this connection
@@ -409,6 +409,10 @@ export class AccountManager {
     preferredAccountUuid = null,
   ) {
     if (signal?.aborted) return null;
+    if (typeof preferredAccountUuid === 'string'
+        && !this.accounts.some(account => account.accountUuid === preferredAccountUuid)) {
+      return null;
+    }
     const account = this._tryAcquire(
       exclude,
       affinityKey,
@@ -420,13 +424,7 @@ export class AccountManager {
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    const preferred = typeof preferredAccountUuid === 'string'
-      ? this.accounts.find(account => account.accountUuid === preferredAccountUuid)
-      : null;
-    const canQueue = preferredAccountUuid == null
-      ? this.anyCapped(exclude, model)
-      : preferred && this._isAvailable(preferred, model)
-        && !this._hasCapacity(preferred) && !(exclude && exclude.has(preferred));
+    const canQueue = this.anyCapped(exclude, model);
     if (timeoutMs <= 0 || !canQueue || this.isQueueFull()) return null;
     return this._enqueue(
       exclude,

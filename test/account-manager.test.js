@@ -300,7 +300,7 @@ test('a preferred recovery account survives concurrent global rotations and warm
   am.releaseAccount(second);
 });
 
-test('a preferred recovery UUID survives rename and fails closed when unavailable or excluded', async () => {
+test('a preferred recovery UUID survives rename, spills when unavailable, and fails closed when missing', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0);
   am.accounts[0].accountUuid = 'uuid-0';
   am.accounts[1].accountUuid = 'uuid-1';
@@ -322,24 +322,28 @@ test('a preferred recovery UUID survives rename and fails closed when unavailabl
   am.releaseAccount(renamed);
 
   preferred.enabled = false;
-  assert.equal(await am.acquireAccount(
+  const disabledSpill = await am.acquireAccount(
     null,
     0,
     null,
     {},
     null,
     recovery.currentAccountUuid,
-  ), null);
+  );
+  assert.equal(disabledSpill?.accountUuid, 'uuid-0');
+  am.releaseAccount(disabledSpill);
 
   preferred.enabled = true;
-  assert.equal(await am.acquireAccount(
+  const excludedSpill = await am.acquireAccount(
     new Set([preferred]),
     0,
     null,
     {},
     null,
     recovery.currentAccountUuid,
-  ), null);
+  );
+  assert.equal(excludedSpill?.accountUuid, 'uuid-0');
+  am.releaseAccount(excludedSpill);
 
   am.removeAccount(preferred.index);
   assert.equal(await am.acquireAccount(

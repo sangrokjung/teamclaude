@@ -578,6 +578,144 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   assert.equal(manager.currentIndex, 1);
 });
 
+test('real run spills a seeded marker when its account cannot serve the request', async t => {
+  const scenarios = [
+    { name: 'quota-blocked A to healthy B', quotaBlocked: true },
+    { name: 'capped A to free B', quotaBlocked: false },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async st => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-marker-spill-'));
+      st.after(() => rm(root, { recursive: true, force: true }));
+      const bin = join(root, 'bin');
+      const project = join(root, 'project');
+      const configPath = join(root, 'config.json');
+      const claudeCalls = join(root, 'claude-calls.jsonl');
+      await mkdir(bin);
+      await mkdir(project);
+
+      const fakeClaude = `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+const response = await fetch(process.env.ANTHROPIC_BASE_URL + '/v1/messages', {
+  method: 'POST',
+  headers: {
+    authorization: 'Bearer ' + process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    'content-type': 'application/json',
+  },
+  body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+});
+const body = await response.text();
+appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
+  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+  responseStatus: response.status,
+  body,
+}) + '\\n');
+process.exit(response.status === 200 ? 0 : 9);
+`;
+      await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
+
+      const upstreamAuth = [];
+      const upstream = http.createServer((req, res) => {
+        upstreamAuth.push(req.headers.authorization);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+      });
+      const upstreamPort = await listen(upstream);
+      st.after(() => {
+        upstream.closeAllConnections();
+        return closeServer(upstream);
+      });
+
+      const manager = new AccountManager([
+        {
+          name: 'account-a', accountUuid: 'uuid-a', type: 'oauth',
+          accessToken: 'fixture-a', expiresAt: Date.now() + 60 * 60 * 1000,
+          priority: 0,
+        },
+        {
+          name: 'account-b', accountUuid: 'uuid-b', type: 'oauth',
+          accessToken: 'fixture-b', expiresAt: Date.now() + 60 * 60 * 1000,
+          priority: 1,
+        },
+      ], 0.98, 0, 1);
+      const reset = String(Math.floor((Date.now() + 60 * 60 * 1000) / 1000));
+      for (const index of [0, 1]) {
+        manager.updateQuota(index, {
+          'anthropic-ratelimit-unified-5h-utilization': '0.1',
+          'anthropic-ratelimit-unified-5h-reset': reset,
+        });
+      }
+
+      let held = null;
+      if (scenario.quotaBlocked) {
+        manager.updateQuota(0, {
+          'anthropic-ratelimit-unified-5h-utilization': '0.99',
+          'anthropic-ratelimit-unified-5h-reset': reset,
+        });
+      } else {
+        held = await manager.acquireAccount(
+          null, 0, null, null, 'claude-sonnet-4-6', 'uuid-a',
+        );
+        assert.equal(held.accountUuid, 'uuid-a');
+      }
+      manager.currentIndex = 0;
+      st.after(() => {
+        if (held) manager.releaseAccount(held);
+      });
+
+      const proxy = createProxyServer(manager, {
+        provider: 'anthropic',
+        proxy: { apiKey: '' },
+        upstream: `http://127.0.0.1:${upstreamPort}`,
+        activeWarmup: false,
+        continuityMode: false,
+        overflowQueueTimeoutMs: 50,
+      });
+      const port = await listen(proxy);
+      st.after(() => {
+        proxy.closeAllConnections();
+        return closeServer(proxy);
+      });
+
+      await writeFile(configPath, JSON.stringify({
+        proxy: { port, apiKey: '' },
+        autoResumeClaude: true,
+        claudeAutoResumeMaxRetries: 0,
+        claudeAutoResumeBackoffMs: 0,
+        codexFallbackOnExhaustion: false,
+        accounts: [],
+      }));
+      const env = {
+        ...process.env,
+        HOME: root,
+        PATH: `${bin}:${process.env.PATH}`,
+        TEAMCLAUDE_PROVIDER: 'anthropic',
+        TEAMCLAUDE_CONFIG: configPath,
+        FAKE_CLAUDE_CALLS: claudeCalls,
+      };
+      delete env.CLAUDE_CODE_OAUTH_TOKEN;
+
+      const result = await runCli(['run'], {
+        cwd: project,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const calls = await jsonLines(claudeCalls);
+      if (held) {
+        manager.releaseAccount(held);
+        held = null;
+      }
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].oauthToken, recoveryToken('uuid-a'));
+      assert.equal(calls[0].responseStatus, 200);
+      assert.deepEqual(upstreamAuth, ['Bearer fixture-b']);
+    });
+  }
+});
+
 test('real run keeps failed marker B across a global drift to A and resumes with A', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-run-pinned-usage-recovery-'));
   t.after(() => rm(root, { recursive: true, force: true }));

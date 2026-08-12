@@ -1277,6 +1277,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
     }
 
+    // A recovery UUID is an exact preference only while that account can serve
+    // this request. If normal selection spills to another account, retire the
+    // stale preference before refresh/failover so the actual account owns this
+    // request's tried429/tried5xx state.
+    if (account && typeof ctx.preferredAccountUuid === 'string'
+        && account.accountUuid !== ctx.preferredAccountUuid) {
+      ctx.preferredAccountUuid = null;
+    }
+
     if (account || ctx.abortSignal?.aborted || res.destroyed) break;
 
     const accts = accountManager.accounts;

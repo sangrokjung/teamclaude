@@ -87,6 +87,46 @@ test('all accounts exhausted by quota returns null immediately (does not queue)'
   assert.ok(Date.now() - start < 200, 'must not wait the full timeout when nothing is merely capped');
 });
 
+test('recovery account identity is exact while usable and spills when unavailable', async t => {
+  function manager() {
+    const am = new AccountManager(makeAccounts(2).map((account, index) => ({
+      ...account,
+      accountUuid: `uuid-${index}`,
+    })), 0.98, 0, 1);
+    measureAll(am);
+    am.currentIndex = 0;
+    return am;
+  }
+
+  await t.test('available preferred account', async () => {
+    const am = manager();
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    assert.equal(selected.accountUuid, 'uuid-0');
+  });
+
+  await t.test('quota-blocked preferred account', async () => {
+    const am = manager();
+    am.updateQuota(0, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.99',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+    });
+    am.currentIndex = 0;
+
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    assert.equal(selected.accountUuid, 'uuid-1');
+  });
+
+  await t.test('capped preferred account', async () => {
+    const am = manager();
+    const held = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+
+    assert.equal(held.accountUuid, 'uuid-0');
+    assert.equal(selected.accountUuid, 'uuid-1');
+    assert.equal(am._waiters.length, 0, 'a free spill account must not enter a preferred-only queue');
+  });
+});
+
 test('per-account maxConcurrent overrides the global default', () => {
   const accts = makeAccounts(2);
   accts[1].maxConcurrent = 5;
