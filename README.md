@@ -604,6 +604,50 @@ displayed total reflects real volume (qjc fork).
 > local patches, validate or reapply them in the service startup path because an
 > npm or Node upgrade can replace globally installed source files.
 
+### Check account health and recover authentication
+
+Use the CLI first when reviewing the pool. It keeps listing the remaining
+accounts even when one of them is parked in `error`:
+
+```bash
+teamcodex status       # live proxy snapshot: active account, quota, errors
+teamcodex accounts -v  # configured accounts and OAuth expiry metadata
+```
+
+`status` requires a running proxy. An error row includes a short reason when the
+server provides one, such as `auth-revoked` or `refresh-failed`; it does not make
+the entire server look unreachable. Quota rows are still the proxy's latest
+observations, not a vendor-side on-demand usage query.
+
+Automation on the proxy host can read the same credential-free JSON surface:
+
+```bash
+curl -sS http://127.0.0.1:3456/teamclaude/status
+```
+
+The status payload never contains access tokens, refresh tokens, API keys, or
+authorization headers. It does contain account names and UUIDs, so do not post
+the raw JSON publicly. Remote callers must still authenticate to the proxy with
+`x-api-key`; localhost is the intended operational check.
+
+If an OAuth account is marked as revoked or its refresh grant is invalid, quota
+rotation cannot repair that credential. Log into the same account again and
+reload the server state:
+
+```bash
+teamcodex login
+# Or refresh Claude Code first, then import its current credential:
+claude /login
+teamcodex import
+
+teamcodex restart
+teamcodex status
+```
+
+Re-login/import upserts the matching account instead of creating a second copy.
+Do not copy an OAuth config between machines: rotating refresh-token chains can
+invalidate each other.
+
 ### Other commands
 
 ```bash
@@ -653,8 +697,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
       "name": "user@example.com",
       "type": "oauth",
       "accountUuid": "...",
-      "accessToken": "sk-ant-oat01-...",
-      "refreshToken": "sk-ant-ort01-...",
+      "accessToken": "<access-token>",
+      "refreshToken": "<refresh-token>",
       "expiresAt": 1774384968427,
       "enabled": true,
       "priority": 0
