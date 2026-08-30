@@ -28,6 +28,7 @@ import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
+import { reauthenticateAccount } from './reauth.js';
 import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
@@ -63,7 +64,7 @@ const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
 // the dispatch `await`s command functions mid-module — a declaration placed
 // after it throws ReferenceError the moment statusCommand touches it.
 const ERROR_REASON_LABELS = {
-  'subscription-disabled': '구독연체',
+  'subscription-disabled': '조직의 Claude Code 접근 차단',
   'auth-revoked': '인증무효 — 재로그인 필요',
   'refresh-failed': 'refresh 실패',
   'auth-rejected': '인증거부',
@@ -128,6 +129,10 @@ switch (command) {
     break;
   case 'login':
     await loginCommand();
+    process.exit(0);
+    break;
+  case 'reauth':
+    await reauthenticateCommand();
     process.exit(0);
     break;
   case 'env':
@@ -1066,6 +1071,20 @@ async function proxyWorkerCommand() {
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
+  accountManager.onAccountFlag((account, disabled) => atomicConfigUpdate(diskConfig => {
+    const cfgIdx = findConfigAccount(diskConfig, account);
+    if (cfgIdx < 0) return;
+    if (disabled) diskConfig.accounts[cfgIdx].subscriptionDisabled = true;
+    else delete diskConfig.accounts[cfgIdx].subscriptionDisabled;
+  }).then(() => {
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    if (disabled) config.accounts[memIdx].subscriptionDisabled = true;
+    else delete config.accounts[memIdx].subscriptionDisabled;
+  }).catch(err => {
+    console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
+    throw err;
+  }));
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -1079,7 +1098,7 @@ async function proxyWorkerCommand() {
         applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation);
       }),
       syncAccounts: async () => {
-        const diskConfig = await loadConfig();
+        const diskConfig = await accountManager.readAfterAccountFlagWrites(loadConfig);
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
@@ -1117,7 +1136,7 @@ async function proxyWorkerCommand() {
     // and every in-flight response alive. Serializing signals avoids overlapping
     // remove/add passes when several CLI changes land together.
     liveSyncChain = liveSyncChain.then(async () => {
-      const diskConfig = await loadConfig();
+      const diskConfig = await accountManager.readAfterAccountFlagWrites(loadConfig);
       if (!diskConfig) return;
       await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (codexMode) await server.refreshQuotaAll();
@@ -1691,6 +1710,46 @@ async function loginOAuthCommand() {
   await upsertOAuthAccount(name, creds, 'login');
 }
 
+async function reauthenticateCommand() {
+  const name = args[1];
+  const uuidFlagIndex = args.indexOf('--account-uuid');
+  const uuidEqualsArg = args.find(value => value.startsWith('--account-uuid='));
+  const expectedAccountUuid = uuidEqualsArg
+    ? uuidEqualsArg.slice('--account-uuid='.length) || null
+    : argValue('--account-uuid');
+  if (!name || name.startsWith('--')) {
+    console.error('Usage: teamclaude reauth <account-name> [--account-uuid UUID]');
+    process.exit(1);
+  }
+  if ((uuidFlagIndex >= 0
+      && (!args[uuidFlagIndex + 1] || args[uuidFlagIndex + 1].startsWith('--')))
+      || (uuidEqualsArg && !expectedAccountUuid)) {
+    console.error('--account-uuid requires a value');
+    process.exit(1);
+  }
+
+  console.log(`Starting OAuth re-authentication for "${name}"...`);
+  let result;
+  try {
+    result = await reauthenticateAccount({
+      name,
+      expectedAccountUuid,
+      provider: cliProvider === 'codex' || process.env.TEAMCLAUDE_PROVIDER === 'codex'
+        ? 'codex' : null,
+      loadConfig,
+      login: loginOAuth,
+      fetchProfile,
+      atomicUpdate: atomicConfigUpdate,
+    });
+  } catch (err) {
+    console.error(`OAuth re-authentication rejected: ${err.message}`);
+    process.exit(1);
+  }
+  console.log(`Re-authenticated account "${result.updated.name}"`);
+  console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(result.savedConfig);
+}
+
 // ── env ─────────────────────────────────────────────────────
 
 async function envCommand() {
@@ -1925,6 +1984,12 @@ async function codexResumeCommand() {
   await runCommand(['resume', sessionId, ...resumeArgs]);
 }
 
+function matchesConfiguredProxyApiKey(configuredApiKey, inheritedApiKey) {
+  return typeof configuredApiKey === 'string'
+    && configuredApiKey.length > 0
+    && inheritedApiKey === configuredApiKey;
+}
+
 async function runCommand(clientArgsOverride = null) {
   if (cliProvider !== 'codex' && process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1') {
     console.error(
@@ -1989,9 +2054,10 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
-  const preserveProxyApiKey = typeof config.proxy.apiKey === 'string'
-    && config.proxy.apiKey.length > 0
-    && childEnv.ANTHROPIC_API_KEY === config.proxy.apiKey;
+  const preserveProxyApiKey = matchesConfiguredProxyApiKey(
+    config.proxy.apiKey,
+    childEnv.ANTHROPIC_API_KEY,
+  );
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
@@ -2573,6 +2639,7 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
+  reauth <name>       Re-authenticate one existing OAuth account
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
@@ -2771,6 +2838,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (mgr.enabled !== wantEnabled) accountManager.setEnabled(mgr, wantEnabled);
       const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
       if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
+      const subscriptionDisabled = diskAcct.subscriptionDisabled === true;
+      if ((mgr.subscriptionDisabled === true) !== subscriptionDisabled) {
+        accountManager.setSubscriptionDisabled(mgr, subscriptionDisabled, false);
+      }
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
       // enabled/priority over the disk value and silently revert a CLI change.
@@ -2778,6 +2849,8 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
+        if (subscriptionDisabled) memAcct.subscriptionDisabled = true;
+        else delete memAcct.subscriptionDisabled;
       }
     }
 
@@ -2864,6 +2937,7 @@ async function resolveAccounts(config) {
             maxConcurrent: acct.maxConcurrent,
             enabled: acct.enabled,
             priority: acct.priority,
+            subscriptionDisabled: acct.subscriptionDisabled,
             ...creds,
           });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);

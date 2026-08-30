@@ -34,13 +34,14 @@ node src/index.js codex server     # every subcommand works with the `codex` pre
 
 ## Architecture
 
-Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. Nine files, each a clear layer:
+Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the proxy. The main source files keep clear ownership:
 
 - **`src/index.js`** — CLI dispatcher + all non-server commands (`stop`, `restart`, `import`, `login`, `env`, `status`, `accounts`, `remove`, `api`). Owns the **config-sync wiring** between the running server, the TUI, and external CLI invocations (see below), and the **server lifecycle**: a stable parent HTTP listener buffers requests and forwards them to a replaceable proxy worker, while `findRunningServer`/`stopRunningServer` discover and stop the parent via state file + port probe + `lsof`. `teamclaude run` auto-starts this supervisor when absent.
 - **`src/server.js`** — the HTTP proxy and the request-forwarding loop (`forwardRequest`), including account acquisition (concurrency slot), retry, rate-limit handling, SSE streaming, and optional request logging.
 - **`src/sse.js`** — SSE resilience helpers shared by the worker and the supervisor relay: `SseFramer` (forward only whole SSE events; track whether a terminal event was delivered) and `sseErrorEvent` (the synthetic retryable `overloaded_error` frame injected on an abnormal mid-stream end — see "Mid-stream SSE recovery" below). No proxy state.
 - **`src/account-manager.js`** — `AccountManager` class: in-memory account state, use-or-lose selection, **per-account concurrency cap + overflow queue** (`acquireAccount`/`releaseAccount`), quota tracking from response headers, and token-refresh coalescing. The single source of truth for *live* credentials while the server runs.
 - **`src/oauth.js`** — OAuth PKCE login, token refresh, profile fetch, and credential import from Claude Code. No proxy state here — pure functions.
+- **`src/reauth.js`** — fail-closed account reauthentication: select one existing Anthropic OAuth account, verify the returned profile against its UUID (or legacy email), then replace only that account's credentials through the caller's atomic config writer.
 - **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`; `TEAMCLAUDE_PROVIDER=codex` switches the default file to `~/.config/teamcodex.json`). Written `0o600`.
 - **`src/codex.js`** — Codex-mode helpers, no proxy state: parse/import ChatGPT OAuth credentials (`~/.codex/auth.json` shape), token refresh against `auth.openai.com`, and `buildCodexProxyArgs` (the `-c model_provider` overrides that point the Codex CLI at the proxy).
 - **`src/codex-session.js`** — exact Codex resume boundary: validates UUID session IDs and reads only the current surface's public `cmux surface resume get --json` binding. It fails closed instead of guessing from recent sessions or private state.
@@ -153,12 +154,15 @@ The supervisor writes a **state file** next to the config (`getServerStatePath()
 Most of the commit history is token-rotation/sync bug fixes. There are **three concurrent writers** to the config file:
 1. The running server persisting refreshed OAuth tokens (`onTokenRefresh` callback in `index.js`).
 2. The TUI's `saveConfig` (after import/add/remove).
-3. External `teamclaude import`/`login` run while the server is up (picked up via TUI **R** / `syncAccountsFromDisk`).
+3. External `teamclaude import`/`login`/`reauth` run while the server is up (picked up via TUI **R**, SIGHUP reload, or `syncAccountsFromDisk`).
 
 Rules every config write must follow (see `atomicConfigUpdate`, `findConfigAccount`, `syncAccountsFromDisk`):
 - **Always re-read disk before writing.** `atomicConfigUpdate(updater)` does this; never blind-`saveConfig` from a long-lived in-memory copy, or you clobber accounts added by another process.
 - **Match accounts by `accountUuid` first, then by `name`.** Indexes shift; this matching is the dedup/sync key used everywhere.
 - **Never overwrite fresher tokens with staler ones.** `syncAccountsFromDisk` compares `expiresAt` (`diskIsStaler`) before applying disk credentials over in-memory ones.
+- **Never reload across a pending account quarantine write.** The structured
+  organization-access 403 path awaits `onAccountFlag`; SIGHUP/TUI reads use
+  `readAfterAccountFlagWrites` so stale disk state cannot re-enable that account.
 - Treat `AccountManager.accounts[i].credential/refreshToken/expiresAt` as the authoritative *live* tokens; the `config.accounts` array can lag.
 
 Related gotcha: **`expiresAt` may arrive in seconds or milliseconds.** OAuth endpoints return seconds; Claude Code credentials use milliseconds. Always pass through `normalizeExpiresAt` (oauth.js) — assuming one unit was a recurring bug.

@@ -803,3 +803,39 @@ test('getStatus exposes the current account UUID without credentials', () => {
   am.currentIndex = -1;
   assert.equal(am.getStatus().currentAccountUuid, null);
 });
+
+test('subscription-disabled config restores a parked account and exposes only its safe reason', () => {
+  const accounts = makeAccounts(2);
+  accounts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accounts, 0.98);
+
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].subscriptionDisabled, true);
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+  const status = am.getStatus().accounts[0];
+  assert.equal(status.errorReason, 'subscription-disabled');
+  assert.equal('credential' in status, false);
+  assert.equal('accessToken' in status, false);
+  assert.equal('refreshToken' in status, false);
+});
+
+test('subscription-disabled flag changes are idempotent and fresh credentials clear the park', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const events = [];
+  am.onAccountFlag((account, disabled) => events.push([account.name, disabled]));
+
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  assert.deepEqual(events, [['acct-0', true]]);
+  assert.equal(am.getActiveAccount(), null);
+
+  am.updateAccountTokens(am.accounts[0], {
+    accessToken: 'replacement-access',
+    refreshToken: 'replacement-refresh',
+    expiresAt: Date.now() + HOUR,
+  }, false);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+  assert.equal(am.accounts[0].errorReason, undefined);
+});

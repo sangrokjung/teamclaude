@@ -10,6 +10,10 @@ function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
 }
 
+function normalizeOptionalCredential(value) {
+  return value || null;
+}
+
 function codexWindowKind(windowMinutes) {
   if (windowMinutes === CODEX_SESSION_WINDOW_MINUTES) return '5h';
   if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return '7d';
@@ -123,11 +127,21 @@ export class AccountManager {
       provider: acct.provider || 'anthropic',
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
-      refreshToken: acct.refreshToken || null,
-      idToken: acct.idToken || null,
+      refreshToken: normalizeOptionalCredential(acct.refreshToken),
+      idToken: normalizeOptionalCredential(acct.idToken),
       accountId: acct.accountId || null,
       expiresAt: acct.expiresAt || null,
-      status: 'active',
+      status: acct.subscriptionDisabled === true && (acct.provider || 'anthropic') === 'anthropic'
+        ? 'error' : 'active',
+      subscriptionDisabled: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? true : undefined,
+      errorReason: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? 'subscription-disabled' : undefined,
+      _errorFromRefresh: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? false : undefined,
       // Manual on/off switch. A disabled account is excluded from ALL rotation
       // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
       // in-flight requests still drain, but no new request is routed to it.
@@ -150,6 +164,7 @@ export class AccountManager {
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
+      _subscriptionFlagPromise: Promise.resolve(),
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -164,6 +179,8 @@ export class AccountManager {
     this.probeRetryAfterMs = 15 * 60 * 1000;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
+    this._accountFlagWrites = new Set();
+    this._accountFlagGeneration = 0;
     // Soft connection→account affinity (keyed by the client socket). Keeps one
     // keep-alive connection's *sequential* requests on the same account so
     // Anthropic's per-account prompt cache stays warm. A WeakMap so an entry is
@@ -1025,6 +1042,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      if (account.subscriptionDisabled === true) continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -1367,6 +1385,72 @@ export class AccountManager {
     this._onTokenRefresh = callback;
   }
 
+  onAccountFlag(callback) {
+    this._onAccountFlag = callback;
+  }
+
+  waitForAccountFlag(ref) {
+    const account = this._resolveRef(ref);
+    return account?._subscriptionFlagPromise ?? Promise.resolve();
+  }
+
+  waitForAccountFlagWrites() {
+    return Promise.all([...this._accountFlagWrites]);
+  }
+
+  async readAfterAccountFlagWrites(read) {
+    while (true) {
+      const generation = this._accountFlagGeneration;
+      await this.waitForAccountFlagWrites();
+      const value = await read();
+      await this.waitForAccountFlagWrites();
+      if (generation === this._accountFlagGeneration) return value;
+    }
+  }
+
+  setSubscriptionDisabled(ref, disabled, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account || account.provider !== 'anthropic') return null;
+    const next = disabled === true;
+    const previous = account.subscriptionDisabled === true;
+    if (next) {
+      account.subscriptionDisabled = true;
+      account.status = 'error';
+      account.errorReason = 'subscription-disabled';
+      account._errorFromRefresh = false;
+    } else {
+      delete account.subscriptionDisabled;
+      if (account.status === 'error' && account.errorReason === 'subscription-disabled') {
+        account.status = 'active';
+        delete account.errorReason;
+        delete account._errorFromRefresh;
+        this._drainWaiters();
+      }
+    }
+    if (persist && previous !== next && this.accounts[account.index] === account) {
+      this._accountFlagGeneration++;
+      const previousWrite = account._subscriptionFlagPromise ?? Promise.resolve();
+      let callbackResult;
+      try {
+        callbackResult = this._onAccountFlag?.(account, next);
+      } catch (err) {
+        callbackResult = Promise.reject(err);
+      }
+      const write = Promise.all([
+        previousWrite.catch(() => {}),
+        Promise.resolve(callbackResult),
+      ]).then(() => undefined);
+      write.catch(() => {});
+      this._accountFlagWrites.add(write);
+      write.then(
+        () => this._accountFlagWrites.delete(write),
+        () => this._accountFlagWrites.delete(write),
+      );
+      account._subscriptionFlagPromise = write;
+    }
+    return account;
+  }
+
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1392,6 +1476,9 @@ export class AccountManager {
     if (accountId) {
       account.accountId = accountId;
       account.accountUuid = accountId;
+    }
+    if (account.subscriptionDisabled === true) {
+      this.setSubscriptionDisabled(account, false, persist);
     }
     if (account.status === 'error') {
       account.status = 'active';
@@ -1422,11 +1509,22 @@ export class AccountManager {
       provider: acctData.provider || 'anthropic',
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: acctData.refreshToken || null,
-      idToken: acctData.idToken || null,
+      refreshToken: normalizeOptionalCredential(acctData.refreshToken),
+      idToken: normalizeOptionalCredential(acctData.idToken),
       accountId: acctData.accountId || null,
       expiresAt: acctData.expiresAt || null,
-      status: 'active',
+      status: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? 'error' : 'active',
+      subscriptionDisabled: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? true : undefined,
+      errorReason: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? 'subscription-disabled' : undefined,
+      _errorFromRefresh: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? false : undefined,
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
@@ -1434,6 +1532,7 @@ export class AccountManager {
       rateLimitedUntil: null,
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
+      _subscriptionFlagPromise: Promise.resolve(),
     });
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
@@ -1628,6 +1727,7 @@ export class AccountManager {
         type: a.type,
         provider: a.provider,
         status: a.status,
+        errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
         enabled: a.enabled !== false,
         priority: a.priority ?? null,
         // Deep-copy the nested modelWeekly map — the shallow quota spread would

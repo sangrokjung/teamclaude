@@ -282,6 +282,7 @@ console.log(JSON.stringify({ args: process.argv.slice(2) }));
         env: {
           ...process.env,
           PATH: `${dir}:${process.env.PATH}`,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           TEAMCLAUDE_SESSION_SUPERVISED: '1',
         },
