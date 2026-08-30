@@ -160,6 +160,9 @@ Rules every config write must follow (see `atomicConfigUpdate`, `findConfigAccou
 - **Always re-read disk before writing.** `atomicConfigUpdate(updater)` does this; never blind-`saveConfig` from a long-lived in-memory copy, or you clobber accounts added by another process.
 - **Match accounts by `accountUuid` first, then by `name`.** Indexes shift; this matching is the dedup/sync key used everywhere.
 - **Never overwrite fresher tokens with staler ones.** `syncAccountsFromDisk` compares `expiresAt` (`diskIsStaler`) before applying disk credentials over in-memory ones.
+- **Never reload across a pending account quarantine write.** The structured
+  organization-access 403 path awaits `onAccountFlag`; SIGHUP/TUI reads use
+  `readAfterAccountFlagWrites` so stale disk state cannot re-enable that account.
 - Treat `AccountManager.accounts[i].credential/refreshToken/expiresAt` as the authoritative *live* tokens; the `config.accounts` array can lag.
 
 Related gotcha: **`expiresAt` may arrive in seconds or milliseconds.** OAuth endpoints return seconds; Claude Code credentials use milliseconds. Always pass through `normalizeExpiresAt` (oauth.js) — assuming one unit was a recurring bug.

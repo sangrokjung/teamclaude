@@ -18,8 +18,9 @@ Spec: `docs/specs/2026-08-30-account-reauthentication.md`
 5. [x] README 양쪽에 CLI와 menu-bar app의 `재인증 필요` 사용 절차를 동기화합니다.
 6. [x] targeted test, stale-UUID 수동 CLI QA, ESLint, diff check를 실행합니다.
 7. [x] 독립 검토에서 발견된 provider/importFrom/subscription/missing-UUID blocker를 RED→GREEN으로 수정합니다.
-8. [ ] exact commit SHA에 대해 독립 5-lane review와 runtime audit를 완료합니다.
-9. [ ] fork PR의 CI를 통과시키고 merge한 뒤 기본 브랜치 반영을 확인합니다.
+8. [x] subscription-disabled 저장과 SIGHUP/TUI reload 경합을 재현하고, 저장 완료 대기·stable reread로 수정합니다.
+9. [ ] exact commit SHA에 대해 독립 goal/security review와 runtime audit를 완료합니다.
+10. [ ] fork PR의 CI를 통과시키고 merge한 뒤 기본 브랜치 반영을 확인합니다.
 
 ## Verification
 
@@ -30,7 +31,8 @@ Spec: `docs/specs/2026-08-30-account-reauthentication.md`
 | Manual CLI | stale UUID가 든 격리 config로 `node src/index.js reauth ...` | exit 1, config byte-identical, OAuth 미실행 |
 | Docs/help | README 검토 + `node src/index.js help` | CLI/button/privacy 계약 일치 |
 | Static | `git diff --check` + changed-file ESLint | exit 0 |
-| Regression | qgate `npm test -- --test-concurrency=1` + GitHub CI | exit 0; host hard-limit 중단은 제품 실패와 구분 |
+| Flag persistence race | delayed/failed flag writer + read-during-transition tests | failover 전 저장 완료, stale reload 차단 |
+| Regression | qgate `npm test -- --test-concurrency=1` + GitHub CI | available full suite/CI exits 0; if host admission blocks start, record the qgate ticket/result and use the complete targeted suite plus static checks (this repo has no CI workflow) |
 | Adversarial | goal/QA/code/security/context exact-SHA lanes | 모두 PASS, CRITICAL/HIGH 없음 |
 
 ## Rollout / rollback gate

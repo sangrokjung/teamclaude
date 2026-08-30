@@ -42,6 +42,9 @@ the selected existing account.
    quarantine across reload/restart. Expose only the safe error reason in status.
 8. A successful reauthentication removes `importFrom`; otherwise reload or
    restart would prefer the old credential file over the new embedded tokens.
+9. A structured organization-access 403 must finish persisting its quarantine
+   before failover. A concurrent live reload must not apply a stale disk value
+   while that flag write is pending or failed.
 
 ## Acceptance criteria
 
@@ -51,7 +54,10 @@ the selected existing account.
 - The stale-UUID CLI scenario exits 1 before OAuth and leaves the config bytes unchanged.
 - `node src/index.js help` exposes `reauth <name>` and both READMEs document the
   UUID-pinned command, the app's `재인증 필요` action, and credential-safe status guidance.
-- `git diff --check`, changed-file ESLint, and the full test suite/CI pass.
+- `git diff --check` and changed-file ESLint pass. The full test suite/CI must
+  pass when available; if the host admission gate keeps it from starting, the
+  qgate ticket/result is recorded and the targeted suite covering every changed
+  behavior is the release evidence (this repository currently has no CI workflow).
 - Independent goal, QA, code-quality, security, and context review lanes find no blocker.
 
 ## Risks and security boundaries
@@ -64,6 +70,9 @@ the selected existing account.
 - `subscriptionDisabled: true` contains no credential or user data. It is written
   only from the exact structured organization-access 403 and cleared when fresh
   external credentials are installed.
+- Account-flag persistence is awaited by the 403 path. SIGHUP/TUI reloads wait
+  for a stable post-write config snapshot, and a failed write keeps the live
+  quarantine instead of re-enabling the account from stale disk state.
 
 ## Rollout
 
@@ -81,3 +90,5 @@ existing accounts and credentials remain readable by the previous version.
 - RED: the baseline has no `src/reauth.js`, command dispatch, test, or README action.
 - GREEN: targeted Node tests, CLI help, stale-UUID byte-preservation QA, ESLint,
   full qgate test run or GitHub CI, and exact-SHA independent review.
+- RACE: delayed/failed subscription-flag writes complete before failover, and a
+  flag transition during config read forces a fresh read before live sync.

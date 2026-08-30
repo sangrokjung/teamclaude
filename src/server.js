@@ -1791,6 +1791,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const subscriptionDisabled = isClaudeSubscriptionAccessDisabled(responseBody);
       if (subscriptionDisabled) {
         accountManager.setSubscriptionDisabled(account, true);
+        try {
+          await accountManager.waitForAccountFlag(account);
+        } catch (err) {
+          console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
+        }
         console.log(`[TeamClaude] 403 subscription access disabled on "${account.name}" — marking account error and switching`);
         if (logDir) {
           logSections.push(`=== RESPONSE 403 — subscription access disabled, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);

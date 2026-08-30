@@ -70,6 +70,109 @@ test('a subscription-disabled 403 quarantines the OAuth account and switches', a
   }
 });
 
+test('subscription-disabled persistence completes before failover and graceful close', async () => {
+  const hits = { a: 0, b: 0 };
+  const upstream = http.createServer((req, res) => {
+    const account = (req.headers.authorization || '').includes('tok-a') ? 'a' : 'b';
+    hits[account]++;
+    res.writeHead(account === 'a' ? 403 : 200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(account === 'a'
+      ? { type: 'error', error: SUBSCRIPTION_DISABLED_ERROR }
+      : { ok: true, account }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = accounts();
+  let releasePersistence;
+  let persistenceStartedResolve;
+  const persistenceStarted = new Promise(resolve => { persistenceStartedResolve = resolve; });
+  am.onAccountFlag(() => new Promise(resolve => {
+    releasePersistence = resolve;
+    persistenceStartedResolve();
+  }));
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = postMessage(proxyPort);
+    await persistenceStarted;
+    const closing = close(proxy);
+    assert.deepEqual(hits, { a: 1, b: 0 });
+    releasePersistence();
+    const res = await response;
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, account: 'b' });
+    proxy.closeIdleConnections?.();
+    await closing;
+  } finally {
+    if (proxy.listening) await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('stable config reads repeat when a subscription flag changes during the read', async () => {
+  const am = accounts();
+  let diskDisabled = false;
+  let reads = 0;
+  am.onAccountFlag((_account, disabled) => new Promise(resolve => {
+    setImmediate(() => {
+      diskDisabled = disabled;
+      resolve();
+    });
+  }));
+
+  const snapshot = await am.readAfterAccountFlagWrites(async () => {
+    reads++;
+    const value = diskDisabled;
+    if (reads === 1) am.setSubscriptionDisabled(am.accounts[0], true);
+    return value;
+  });
+
+  assert.equal(snapshot, true);
+  assert.equal(reads, 2);
+});
+
+test('a failed subscription flag write prevents a stale config reload', async () => {
+  const am = accounts();
+  am.onAccountFlag(() => Promise.reject(new Error('disk unavailable')));
+  am.setSubscriptionDisabled(am.accounts[0], true);
+
+  await assert.rejects(
+    am.readAfterAccountFlagWrites(async () => ({ accounts: [] })),
+    /disk unavailable/,
+  );
+  assert.equal(am.accounts[0].subscriptionDisabled, true);
+  assert.equal(am.accounts[0].status, 'error');
+});
+
+test('stable config reads retain a pending flag write after account removal', async () => {
+  const am = accounts();
+  let releasePersistence;
+  let persistenceStartedResolve;
+  const persistenceStarted = new Promise(resolve => { persistenceStartedResolve = resolve; });
+  am.onAccountFlag(() => new Promise(resolve => {
+    releasePersistence = resolve;
+    persistenceStartedResolve();
+  }));
+  const removed = am.accounts[0];
+  am.setSubscriptionDisabled(removed, true);
+  await persistenceStarted;
+  am.removeAccount(removed.index);
+
+  let readStarted = false;
+  const snapshot = am.readAfterAccountFlagWrites(async () => {
+    readStarted = true;
+    return { accounts: [] };
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(readStarted, false);
+  releasePersistence();
+  assert.deepEqual(await snapshot, { accounts: [] });
+});
+
 test('all subscription-disabled accounts return the final original 403', async () => {
   const hits = [];
   const upstream = http.createServer((req, res) => {

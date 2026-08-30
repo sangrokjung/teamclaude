@@ -10,6 +10,10 @@ function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
 }
 
+function normalizeOptionalCredential(value) {
+  return value || null;
+}
+
 function codexWindowKind(windowMinutes) {
   if (windowMinutes === CODEX_SESSION_WINDOW_MINUTES) return '5h';
   if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return '7d';
@@ -123,8 +127,8 @@ export class AccountManager {
       provider: acct.provider || 'anthropic',
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
-      refreshToken: acct.refreshToken || null,
-      idToken: acct.idToken || null,
+      refreshToken: normalizeOptionalCredential(acct.refreshToken),
+      idToken: normalizeOptionalCredential(acct.idToken),
       accountId: acct.accountId || null,
       expiresAt: acct.expiresAt || null,
       status: acct.subscriptionDisabled === true && (acct.provider || 'anthropic') === 'anthropic'
@@ -160,6 +164,7 @@ export class AccountManager {
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
+      _subscriptionFlagPromise: Promise.resolve(),
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
@@ -174,6 +179,8 @@ export class AccountManager {
     this.probeRetryAfterMs = 15 * 60 * 1000;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
+    this._accountFlagWrites = new Set();
+    this._accountFlagGeneration = 0;
     // Soft connection→account affinity (keyed by the client socket). Keeps one
     // keep-alive connection's *sequential* requests on the same account so
     // Anthropic's per-account prompt cache stays warm. A WeakMap so an entry is
@@ -1382,6 +1389,25 @@ export class AccountManager {
     this._onAccountFlag = callback;
   }
 
+  waitForAccountFlag(ref) {
+    const account = this._resolveRef(ref);
+    return account?._subscriptionFlagPromise ?? Promise.resolve();
+  }
+
+  waitForAccountFlagWrites() {
+    return Promise.all([...this._accountFlagWrites]);
+  }
+
+  async readAfterAccountFlagWrites(read) {
+    while (true) {
+      const generation = this._accountFlagGeneration;
+      await this.waitForAccountFlagWrites();
+      const value = await read();
+      await this.waitForAccountFlagWrites();
+      if (generation === this._accountFlagGeneration) return value;
+    }
+  }
+
   setSubscriptionDisabled(ref, disabled, persist = true) {
     const account = this._resolveRef(ref);
     if (!account || account.provider !== 'anthropic') return null;
@@ -1402,7 +1428,25 @@ export class AccountManager {
       }
     }
     if (persist && previous !== next && this.accounts[account.index] === account) {
-      this._onAccountFlag?.(account, next);
+      this._accountFlagGeneration++;
+      const previousWrite = account._subscriptionFlagPromise ?? Promise.resolve();
+      let callbackResult;
+      try {
+        callbackResult = this._onAccountFlag?.(account, next);
+      } catch (err) {
+        callbackResult = Promise.reject(err);
+      }
+      const write = Promise.all([
+        previousWrite.catch(() => {}),
+        Promise.resolve(callbackResult),
+      ]).then(() => undefined);
+      write.catch(() => {});
+      this._accountFlagWrites.add(write);
+      write.then(
+        () => this._accountFlagWrites.delete(write),
+        () => this._accountFlagWrites.delete(write),
+      );
+      account._subscriptionFlagPromise = write;
     }
     return account;
   }
@@ -1465,8 +1509,8 @@ export class AccountManager {
       provider: acctData.provider || 'anthropic',
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: acctData.refreshToken || null,
-      idToken: acctData.idToken || null,
+      refreshToken: normalizeOptionalCredential(acctData.refreshToken),
+      idToken: normalizeOptionalCredential(acctData.idToken),
       accountId: acctData.accountId || null,
       expiresAt: acctData.expiresAt || null,
       status: acctData.subscriptionDisabled === true
@@ -1488,6 +1532,7 @@ export class AccountManager {
       rateLimitedUntil: null,
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
+      _subscriptionFlagPromise: Promise.resolve(),
     });
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable

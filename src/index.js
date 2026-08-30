@@ -1081,9 +1081,10 @@ async function proxyWorkerCommand() {
     if (memIdx < 0) return;
     if (disabled) config.accounts[memIdx].subscriptionDisabled = true;
     else delete config.accounts[memIdx].subscriptionDisabled;
-  }).catch(err => console.error(
-    `[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`,
-  )));
+  }).catch(err => {
+    console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
+    throw err;
+  }));
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -1097,7 +1098,7 @@ async function proxyWorkerCommand() {
         applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation);
       }),
       syncAccounts: async () => {
-        const diskConfig = await loadConfig();
+        const diskConfig = await accountManager.readAfterAccountFlagWrites(loadConfig);
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
@@ -1135,7 +1136,7 @@ async function proxyWorkerCommand() {
     // and every in-flight response alive. Serializing signals avoids overlapping
     // remove/add passes when several CLI changes land together.
     liveSyncChain = liveSyncChain.then(async () => {
-      const diskConfig = await loadConfig();
+      const diskConfig = await accountManager.readAfterAccountFlagWrites(loadConfig);
       if (!diskConfig) return;
       await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (codexMode) await server.refreshQuotaAll();
@@ -1983,6 +1984,12 @@ async function codexResumeCommand() {
   await runCommand(['resume', sessionId, ...resumeArgs]);
 }
 
+function matchesConfiguredProxyApiKey(configuredApiKey, inheritedApiKey) {
+  return typeof configuredApiKey === 'string'
+    && configuredApiKey.length > 0
+    && inheritedApiKey === configuredApiKey;
+}
+
 async function runCommand(clientArgsOverride = null) {
   if (cliProvider !== 'codex' && process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1') {
     console.error(
@@ -2047,9 +2054,10 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
-  const preserveProxyApiKey = typeof config.proxy.apiKey === 'string'
-    && config.proxy.apiKey.length > 0
-    && childEnv.ANTHROPIC_API_KEY === config.proxy.apiKey;
+  const preserveProxyApiKey = matchesConfiguredProxyApiKey(
+    config.proxy.apiKey,
+    childEnv.ANTHROPIC_API_KEY,
+  );
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
