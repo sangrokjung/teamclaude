@@ -45,6 +45,8 @@ test('a subscription-disabled 403 quarantines the OAuth account and switches', a
   });
   const upstreamPort = await listen(upstream);
   const am = accounts();
+  const flagEvents = [];
+  am.onAccountFlag((account, disabled) => flagEvents.push([account.name, disabled]));
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
@@ -59,6 +61,9 @@ test('a subscription-disabled 403 quarantines the OAuth account and switches', a
     assert.deepEqual(hits, { a: 1, b: 1 });
     assert.equal(am.accounts[0].status, 'error');
     assert.equal(am.accounts[0]._errorFromRefresh, false);
+    assert.equal(am.accounts[0].subscriptionDisabled, true);
+    assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+    assert.deepEqual(flagEvents, [['a', true]]);
   } finally {
     await close(proxy);
     await close(upstream);

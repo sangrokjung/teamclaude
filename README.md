@@ -615,7 +615,8 @@ teamcodex accounts -v  # configured accounts and OAuth expiry metadata
 ```
 
 `status` requires a running proxy. An error row includes a short reason when the
-server provides one, such as `auth-revoked` or `refresh-failed`; it does not make
+server provides one, such as `auth-revoked`, `refresh-failed`, or
+`subscription-disabled`; it does not make
 the entire server look unreachable. Quota rows are still the proxy's latest
 observations, not a vendor-side on-demand usage query.
 
@@ -630,23 +631,40 @@ authorization headers. It does contain account names and UUIDs, so do not post
 the raw JSON publicly. Remote callers must still authenticate to the proxy with
 `x-api-key`; localhost is the intended operational check.
 
-If an OAuth account is marked as revoked or its refresh grant is invalid, quota
-rotation cannot repair that credential. Log into the same account again and
-reload the server state:
+If an OAuth account is revoked or its refresh grant is invalid, quota rotation
+cannot repair that credential. Re-authenticate the existing account directly:
 
 ```bash
-teamcodex login
-# Or refresh Claude Code first, then import its current credential:
-claude /login
-teamcodex import
-
-teamcodex restart
+teamcodex reauth user@example.com
+# Pin the identity selected by the TeamClaude app or status JSON:
+teamcodex reauth user@example.com --account-uuid <account-uuid>
 teamcodex status
 ```
 
-Re-login/import upserts the matching account instead of creating a second copy.
-Do not copy an OAuth config between machines: rotating refresh-token chains can
-invalidate each other.
+The command opens Anthropic OAuth, verifies that the returned profile matches
+the selected UUID (or the email on legacy name-only entries), and only then
+replaces that account's tokens. Cancellation, profile mismatch, a disabled
+account, or an account whose organization access is blocked leaves the config
+unchanged. A running proxy is reloaded without interrupting active connections
+when supported; otherwise the CLI tells you to run `teamcodex restart`.
+If the account was originally imported from a credential file, a successful
+reauthentication detaches that stale `importFrom` source so reload/restart keeps
+the newly verified tokens.
+
+In the TeamClaude menu-bar app, an account with a recoverable authentication
+error displays a **`재인증 필요`** button. It invokes the same UUID-pinned flow,
+so another account cannot be written into the selected row by mistake.
+
+You can still refresh Claude Code and import its current credential when needed:
+
+```bash
+claude /login
+teamcodex import
+```
+
+Re-authentication/import updates the matching account instead of creating a
+second copy. Do not copy an OAuth config between machines: rotating
+refresh-token chains can invalidate each other.
 
 ### Other commands
 
@@ -660,6 +678,7 @@ teamclaude remove <name>     # Remove an account
 teamclaude disable <name>    # Disable an account (excluded from rotation)
 teamclaude enable <name>     # Re-enable a disabled account
 teamclaude priority <name> <n|auto>  # Pin selection order (lower = preferred; "auto" clears)
+teamclaude reauth <name> [--account-uuid UUID]  # Re-authenticate one OAuth account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```

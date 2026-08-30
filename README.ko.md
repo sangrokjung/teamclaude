@@ -356,8 +356,8 @@ teamcodex status       # 실행 중인 프록시의 활성 계정·사용량·�
 teamcodex accounts -v  # 설정된 계정과 OAuth 만료 메타데이터
 ```
 
-서버가 오류 사유를 제공하면 `auth-revoked`, `refresh-failed`처럼 짧은 이유도
-함께 표시합니다. 사용량은 벤더를 즉시 조회한 값이 아니라 프록시가 마지막으로
+서버가 오류 사유를 제공하면 `auth-revoked`, `refresh-failed`,
+`subscription-disabled`처럼 짧은 이유도 함께 표시합니다. 사용량은 벤더를 즉시 조회한 값이 아니라 프록시가 마지막으로
 관찰한 응답 헤더 기준입니다.
 
 프록시가 실행되는 머신에서는 자격 증명이 빠진 동일한 JSON 상태를 조회할 수 있습니다.
@@ -372,20 +372,35 @@ curl -sS http://127.0.0.1:3456/teamclaude/status
 운영 점검 경로입니다.
 
 OAuth 계정이 폐기됐거나 refresh grant가 무효라면 계정 회전만으로는 복구할 수
-없습니다. 같은 계정으로 다시 로그인하거나 최신 Claude Code 자격 증명을 가져온 뒤
-상태를 재확인하세요.
+없습니다. 기존 계정을 직접 재인증하세요.
 
 ```bash
-teamcodex login
-# 또는 Claude Code 로그인을 갱신한 뒤 가져오기
-claude /login
-teamcodex import
-
-teamcodex restart
+teamcodex reauth user@example.com
+# TeamClaude 앱이나 status JSON에서 선택한 계정 UUID까지 고정
+teamcodex reauth user@example.com --account-uuid <account-uuid>
 teamcodex status
 ```
 
-재로그인/import는 같은 계정을 중복 생성하지 않고 갱신합니다. Mac 사이에 OAuth
+이 명령은 Anthropic OAuth 로그인 후 반환된 프로필이 선택한 UUID와 일치할 때만
+해당 계정의 토큰을 교체합니다. UUID가 없는 구형 항목은 이메일이 일치해야 합니다.
+로그인 취소, 프로필 불일치, 비활성 계정, 조직 접근이 차단된 계정은 설정을 바꾸지
+않습니다. 실행 중인 프록시는 지원되는 경우 연결을 끊지 않고 다시 읽으며, 지원되지
+않으면 CLI가 `teamcodex restart`를 안내합니다.
+기존 계정이 자격 증명 파일에서 import된 경우, 재인증 성공 시 오래된
+`importFrom` 연결을 제거하므로 reload/restart 뒤에도 새 토큰이 유지됩니다.
+
+TeamClaude 메뉴바 앱에서는 복구할 수 있는 인증 오류 계정 옆에 **`재인증 필요`**
+버튼이 표시됩니다. 이 버튼도 같은 UUID 고정 절차를 사용하므로 다른 계정의 자격
+증명이 선택한 행에 잘못 저장되지 않습니다.
+
+필요하면 Claude Code 로그인을 갱신한 뒤 최신 자격 증명을 가져올 수도 있습니다.
+
+```bash
+claude /login
+teamcodex import
+```
+
+재인증/import는 같은 계정을 중복 생성하지 않고 갱신합니다. Mac 사이에 OAuth
 config를 복사하면 회전형 refresh token chain이 서로를 무효화할 수 있으므로 각
 머신에서 별도로 로그인하세요.
 

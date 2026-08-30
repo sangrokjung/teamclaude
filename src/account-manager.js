@@ -127,7 +127,17 @@ export class AccountManager {
       idToken: acct.idToken || null,
       accountId: acct.accountId || null,
       expiresAt: acct.expiresAt || null,
-      status: 'active',
+      status: acct.subscriptionDisabled === true && (acct.provider || 'anthropic') === 'anthropic'
+        ? 'error' : 'active',
+      subscriptionDisabled: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? true : undefined,
+      errorReason: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? 'subscription-disabled' : undefined,
+      _errorFromRefresh: acct.subscriptionDisabled === true
+          && (acct.provider || 'anthropic') === 'anthropic'
+        ? false : undefined,
       // Manual on/off switch. A disabled account is excluded from ALL rotation
       // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
       // in-flight requests still drain, but no new request is routed to it.
@@ -1025,6 +1035,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      if (account.subscriptionDisabled === true) continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -1367,6 +1378,35 @@ export class AccountManager {
     this._onTokenRefresh = callback;
   }
 
+  onAccountFlag(callback) {
+    this._onAccountFlag = callback;
+  }
+
+  setSubscriptionDisabled(ref, disabled, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account || account.provider !== 'anthropic') return null;
+    const next = disabled === true;
+    const previous = account.subscriptionDisabled === true;
+    if (next) {
+      account.subscriptionDisabled = true;
+      account.status = 'error';
+      account.errorReason = 'subscription-disabled';
+      account._errorFromRefresh = false;
+    } else {
+      delete account.subscriptionDisabled;
+      if (account.status === 'error' && account.errorReason === 'subscription-disabled') {
+        account.status = 'active';
+        delete account.errorReason;
+        delete account._errorFromRefresh;
+        this._drainWaiters();
+      }
+    }
+    if (persist && previous !== next && this.accounts[account.index] === account) {
+      this._onAccountFlag?.(account, next);
+    }
+    return account;
+  }
+
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1392,6 +1432,9 @@ export class AccountManager {
     if (accountId) {
       account.accountId = accountId;
       account.accountUuid = accountId;
+    }
+    if (account.subscriptionDisabled === true) {
+      this.setSubscriptionDisabled(account, false, persist);
     }
     if (account.status === 'error') {
       account.status = 'active';
@@ -1426,7 +1469,18 @@ export class AccountManager {
       idToken: acctData.idToken || null,
       accountId: acctData.accountId || null,
       expiresAt: acctData.expiresAt || null,
-      status: 'active',
+      status: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? 'error' : 'active',
+      subscriptionDisabled: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? true : undefined,
+      errorReason: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? 'subscription-disabled' : undefined,
+      _errorFromRefresh: acctData.subscriptionDisabled === true
+          && (acctData.provider || 'anthropic') === 'anthropic'
+        ? false : undefined,
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
@@ -1628,6 +1682,7 @@ export class AccountManager {
         type: a.type,
         provider: a.provider,
         status: a.status,
+        errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
         enabled: a.enabled !== false,
         priority: a.priority ?? null,
         // Deep-copy the nested modelWeekly map — the shallow quota spread would
