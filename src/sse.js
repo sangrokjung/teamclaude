@@ -72,6 +72,7 @@ export class SseFramer {
     this.maxBufferedBytes = maxBufferedBytes;
     this.pending = EMPTY;
     this.sawTerminal = false;
+    this.sawResponseCompleted = false;
     // Set when a frame exceeded maxBufferedBytes: framing is abandoned and
     // chunks pass straight through (terminal tracking falls back to a rolling
     // substring scan — see _scanRaw).
@@ -137,18 +138,26 @@ export class SseFramer {
       // one wins — and multiple `data:` lines concatenate with newlines.
       const eventLines = [...block.matchAll(/^event:[ \t]?(.*)$/gm)];
       if (eventLines.length) {
-        if (TERMINAL_EVENTS.has(eventLines[eventLines.length - 1][1].trim())) {
+        const eventName = eventLines[eventLines.length - 1][1].trim();
+        if (eventName === 'response.completed') this.sawResponseCompleted = true;
+        if (TERMINAL_EVENTS.has(eventName)) {
           this.sawTerminal = true;
+          return;
         }
         continue;
       }
       const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
       if (!dataLines.length) continue;
       const data = dataLines.join('\n').trim();
-      if (data === '[DONE]') { this.sawTerminal = true; continue; }
+      if (data === '[DONE]') { this.sawTerminal = true; return; }
       if (data.length > MAX_TERMINAL_DATA_PARSE || !data.startsWith('{')) continue;
       try {
-        if (TERMINAL_EVENTS.has(JSON.parse(data)?.type)) this.sawTerminal = true;
+        const type = JSON.parse(data)?.type;
+        if (type === 'response.completed') this.sawResponseCompleted = true;
+        if (TERMINAL_EVENTS.has(type)) {
+          this.sawTerminal = true;
+          return;
+        }
       } catch { /* not JSON — not a terminal marker */ }
     }
   }
@@ -160,6 +169,9 @@ export class SseFramer {
   _scanRaw(text) {
     if (this.sawTerminal) return;
     const hay = this._rawTail + text;
+    if (/\r?\n\r?\nevent:[ \t]?response\.completed[ \t]*\r?\n/.test(hay)) {
+      this.sawResponseCompleted = true;
+    }
     if (/\r?\n\r?\nevent:[ \t]?(message_stop|error|response\.(completed|failed|incomplete))[ \t]*\r?\n/.test(hay)
       || /\r?\ndata:[ \t]?\[DONE\]/.test(hay)) {
       this.sawTerminal = true;

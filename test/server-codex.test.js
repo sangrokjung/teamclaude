@@ -418,6 +418,468 @@ test('Codex usage refresh isolates invalid responses without changing prior quot
   }
 });
 
+test('Codex usage failure cannot end or recover a subscription; a valid usage response can recover it', async () => {
+  let hits = 0;
+  let fail = true;
+  const upstream = http.createServer((req, res) => {
+    if (req.url !== '/backend-api/wham/usage') {
+      res.writeHead(404).end();
+      return;
+    }
+    hits++;
+    if (fail) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'temporary' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      rate_limit: {
+        primary_window: {
+          used_percent: 12,
+          limit_window_seconds: 604800,
+          reset_at: Math.floor(Date.now() / 1000) + 86_400,
+        },
+      },
+    }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'ended-codex', provider: 'codex', type: 'oauth', accessToken: 'access-ended',
+      subscriptionCancellation: {
+        status: 'ended', recordedAt: new Date(now - 7200_000).toISOString(),
+        endsAt: new Date(now - 3600_000).toISOString(), endedAt: new Date(now - 1000).toISOString(),
+        evidence: 'auth-failure-after-cancellation',
+      },
+    }]);
+    const persisted = [];
+    manager.onAccountMetadata((_account, metadata) => persisted.push(metadata));
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}/backend-api/codex`,
+      activeWarmup: false,
+      warmupIntervalMs: 0,
+    });
+    await listen(proxy);
+
+    await waitFor(() => hits === 1 && manager.accounts[0]._usageRefreshFailed === true);
+    assert.equal(manager.accounts[0].errorReason, 'subscription-ended');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'ended');
+    assert.deepEqual(persisted, []);
+
+    fail = false;
+    assert.deepEqual(await proxy.refreshQuotaAll(), { targets: 1, measured: 1 });
+    await manager.waitForAccountFlag(manager.accounts[0]);
+    assert.equal(manager.accounts[0].status, 'active');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'scheduled');
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0].status, 'scheduled');
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
+test('a semantically empty Codex usage 200 cannot recover an inferred subscription end', async () => {
+  const upstream = http.createServer((req, res) => {
+    if (req.url !== '/backend-api/wham/usage') {
+      res.writeHead(404).end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{}');
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'empty-usage', provider: 'codex', type: 'oauth', accessToken: 'empty-usage-access',
+      subscriptionCancellation: {
+        status: 'ended', recordedAt: new Date(now - 7200_000).toISOString(),
+        endsAt: new Date(now - 3600_000).toISOString(), endedAt: new Date(now - 1000).toISOString(),
+        evidence: 'auth-failure-after-cancellation',
+      },
+    }]);
+    const persisted = [];
+    manager.onAccountMetadata((_account, metadata) => persisted.push(metadata));
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}/backend-api/codex`,
+      activeWarmup: false,
+      warmupIntervalMs: 0,
+    });
+    await listen(proxy);
+
+    await waitFor(() => manager.accounts[0].quota.codexUsageAt != null);
+    await manager.waitForAccountFlag(manager.accounts[0]);
+    assert.equal(manager.accounts[0].status, 'error');
+    assert.equal(manager.accounts[0].errorReason, 'subscription-ended');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'ended');
+    assert.deepEqual(persisted, []);
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
+test('a non-inference Codex 2xx endpoint cannot recover an inferred subscription end', async () => {
+  let reportRequest;
+  let releaseResponse;
+  const requestSeen = new Promise(resolve => { reportRequest = resolve; });
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    assert.equal(req.url, '/codex/models');
+    reportRequest();
+    await responseReleased;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [] }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'models-success', provider: 'codex', type: 'oauth', accessToken: 'models-access',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 7200_000).toISOString(),
+        endsAt: new Date(now + 3600_000).toISOString(),
+      },
+    }]);
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const responsePromise = fetch(`http://127.0.0.1:${proxyPort}/codex/models`);
+    await requestSeen;
+    manager.setSubscriptionCancellation(manager.accounts[0], {
+      status: 'ended', recordedAt: new Date(now - 7200_000).toISOString(),
+      endsAt: new Date(now - 3600_000).toISOString(), endedAt: new Date(now - 1000).toISOString(),
+      evidence: 'auth-failure-after-cancellation',
+    }, false);
+    releaseResponse();
+    const response = await responsePromise;
+    await response.text();
+
+    assert.equal(response.status, 200);
+    assert.equal(manager.accounts[0].status, 'error');
+    assert.equal(manager.accounts[0].errorReason, 'subscription-ended');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'ended');
+  } finally {
+    releaseResponse?.();
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
+test('an incomplete Codex 2xx response cannot recover an inferred subscription end', async () => {
+  let reportRequest;
+  let releaseHeaders;
+  const requestSeen = new Promise(resolve => { reportRequest = resolve; });
+  const headersReleased = new Promise(resolve => { releaseHeaders = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    reportRequest();
+    await headersReleased;
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+    res.write('{"id":"partial');
+    setTimeout(() => res.destroy(), 10);
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'in-flight', provider: 'codex', type: 'oauth', accessToken: 'in-flight-access',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3600_000).toISOString(),
+        endsAt: new Date(now + 3600_000).toISOString(),
+      },
+    }]);
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const client = fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    }).then(response => response.text()).catch(() => null);
+
+    await requestSeen;
+    manager.setSubscriptionCancellation(manager.accounts[0], {
+      status: 'ended', recordedAt: new Date(now - 3600_000).toISOString(),
+      endsAt: new Date(now - 1).toISOString(), endedAt: new Date(now).toISOString(),
+      evidence: 'auth-failure-after-cancellation',
+    }, false);
+    releaseHeaders();
+    await client;
+
+    assert.equal(manager.accounts[0].status, 'error');
+    assert.equal(manager.accounts[0].errorReason, 'subscription-ended');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'ended');
+  } finally {
+    releaseHeaders?.();
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
+async function observeCodexSseSubscriptionRecovery(frame) {
+  let reportRequest;
+  let releaseResponse;
+  const requestSeen = new Promise(resolve => { reportRequest = resolve; });
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    reportRequest();
+    await responseReleased;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(frame);
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'sse-terminal', provider: 'codex', type: 'oauth', accessToken: 'sse-access',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3600_000).toISOString(),
+        endsAt: new Date(now + 3600_000).toISOString(),
+      },
+    }]);
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const client = fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+
+    await requestSeen;
+    manager.setSubscriptionCancellation(manager.accounts[0], {
+      status: 'ended', recordedAt: new Date(now - 3600_000).toISOString(),
+      endsAt: new Date(now - 1).toISOString(), endedAt: new Date(now).toISOString(),
+      evidence: 'auth-failure-after-cancellation',
+    }, false);
+    releaseResponse();
+    const response = await client;
+    await response.text();
+    await manager.waitForAccountFlag(manager.accounts[0]);
+
+    return {
+      statusCode: response.status,
+      status: manager.accounts[0].status,
+      errorReason: manager.accounts[0].errorReason || null,
+      subscription: manager.accounts[0].subscriptionCancellation.status,
+    };
+  } finally {
+    releaseResponse?.();
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}
+
+test('Codex SSE recovery requires response.completed rather than any terminal marker', async () => {
+  const terminals = [
+    ['response.failed', 'event: response.failed\ndata: {"type":"response.failed","response":{}}\n\n'],
+    ['response.incomplete', 'event: response.incomplete\ndata: {"type":"response.incomplete","response":{}}\n\n'],
+    ['error', 'event: error\ndata: {"type":"error","error":{"message":"failed"}}\n\n'],
+    ['done', 'data: [DONE]\n\n'],
+    ['response.completed', 'event: response.completed\ndata: {"type":"response.completed","response":{}}\n\n'],
+  ];
+  const observed = [];
+  for (const [terminal, frame] of terminals) {
+    observed.push([terminal, await observeCodexSseSubscriptionRecovery(frame)]);
+  }
+
+  const remainsEnded = {
+    statusCode: 200, status: 'error', errorReason: 'subscription-ended', subscription: 'ended',
+  };
+  assert.deepEqual(observed, [
+    ['response.failed', remainsEnded],
+    ['response.incomplete', remainsEnded],
+    ['error', remainsEnded],
+    ['done', remainsEnded],
+    ['response.completed', {
+      statusCode: 200, status: 'active', errorReason: null, subscription: 'scheduled',
+    }],
+  ]);
+});
+
+async function observeCodexJsonSubscriptionRecovery({ statusCode = 200, body = '' }) {
+  let reportRequest;
+  let releaseResponse;
+  const requestSeen = new Promise(resolve => { reportRequest = resolve; });
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    reportRequest();
+    await responseReleased;
+    res.writeHead(statusCode, { 'content-type': 'application/json' });
+    res.end(body);
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'json-terminal', provider: 'codex', type: 'oauth', accessToken: 'json-access',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3600_000).toISOString(),
+        endsAt: new Date(now + 3600_000).toISOString(),
+      },
+    }]);
+    const persisted = [];
+    manager.onAccountMetadata((_account, metadata) => persisted.push(metadata));
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const client = fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+
+    await requestSeen;
+    manager.setSubscriptionCancellation(manager.accounts[0], {
+      status: 'ended', recordedAt: new Date(now - 3600_000).toISOString(),
+      endsAt: new Date(now - 1).toISOString(), endedAt: new Date(now).toISOString(),
+      evidence: 'auth-failure-after-cancellation',
+    }, false);
+    releaseResponse();
+    const response = await client;
+    await response.text();
+    await manager.waitForAccountFlag(manager.accounts[0]);
+
+    return {
+      statusCode: response.status,
+      status: manager.accounts[0].status,
+      errorReason: manager.accounts[0].errorReason || null,
+      subscription: manager.accounts[0].subscriptionCancellation.status,
+      persisted: persisted.length,
+    };
+  } finally {
+    releaseResponse?.();
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}
+
+test('Codex JSON recovery requires a completed Responses object', async () => {
+  const cases = [
+    ['empty 204', { statusCode: 204, body: '' }, false],
+    ['empty 200', { statusCode: 200, body: '' }, false],
+    ['malformed JSON', { statusCode: 200, body: '{"status":' }, false],
+    ['failed response', {
+      body: JSON.stringify({ id: 'resp_failed', object: 'response', status: 'failed', error: { message: 'failed' } }),
+    }, false],
+    ['incomplete response', {
+      body: JSON.stringify({ id: 'resp_incomplete', object: 'response', status: 'incomplete' }),
+    }, false],
+    ['completed response without id', {
+      body: JSON.stringify({ object: 'response', status: 'completed' }),
+    }, false],
+    ['completed response', {
+      body: JSON.stringify({
+        id: 'resp_completed', object: 'response', status: 'completed', error: null,
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      }),
+    }, true],
+  ];
+  const observed = [];
+  for (const [name, response, recovers] of cases) {
+    observed.push([name, recovers, await observeCodexJsonSubscriptionRecovery(response)]);
+  }
+
+  const remainsEnded = {
+    statusCode: 200, status: 'error', errorReason: 'subscription-ended',
+    subscription: 'ended', persisted: 0,
+  };
+  assert.deepEqual(observed, [
+    ['empty 204', false, { ...remainsEnded, statusCode: 204 }],
+    ['empty 200', false, remainsEnded],
+    ['malformed JSON', false, remainsEnded],
+    ['failed response', false, remainsEnded],
+    ['incomplete response', false, remainsEnded],
+    ['completed response without id', false, remainsEnded],
+    ['completed response', true, {
+      statusCode: 200, status: 'active', errorReason: null,
+      subscription: 'scheduled', persisted: 1,
+    }],
+  ]);
+});
+
+test('a completed in-flight Codex response recovers an inferred subscription end', async () => {
+  let reportRequest;
+  let releaseResponse;
+  const requestSeen = new Promise(resolve => { reportRequest = resolve; });
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const upstream = http.createServer(async (_req, res) => {
+    reportRequest();
+    await responseReleased;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'complete', object: 'response', status: 'completed',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'in-flight-success', provider: 'codex', type: 'oauth', accessToken: 'success-access',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3600_000).toISOString(),
+        endsAt: new Date(now + 3600_000).toISOString(),
+      },
+    }]);
+    const persisted = [];
+    manager.onAccountMetadata((_account, metadata) => persisted.push(metadata));
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const client = fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+
+    await requestSeen;
+    manager.setSubscriptionCancellation(manager.accounts[0], {
+      status: 'ended', recordedAt: new Date(now - 3600_000).toISOString(),
+      endsAt: new Date(now - 1).toISOString(), endedAt: new Date(now).toISOString(),
+      evidence: 'auth-failure-after-cancellation',
+    }, false);
+    releaseResponse();
+    const response = await client;
+    await response.text();
+    await manager.waitForAccountFlag(manager.accounts[0]);
+
+    assert.equal(response.status, 200);
+    assert.equal(manager.accounts[0].status, 'active');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'scheduled');
+    assert.equal(persisted.length, 1);
+  } finally {
+    releaseResponse?.();
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
 // Shared harness for the active fast-lane tests: one upstream that serves both
 // the codex inference path and /wham/usage, with a mutable usage payload and a
 // failure switch, plus a proxy wired for codex usage refresh (periodic timer
@@ -567,6 +1029,43 @@ test('Codex proxy preserves the public prefix for a similar mycodex upstream seg
   assert.deepEqual(result.paths, ['/backend-api/mycodex/codex/responses?trace=1']);
 });
 
+test('a generic Codex 403 does not claim that a declared cancellation ended', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'forbidden for an unrelated reason' } }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const manager = new AccountManager([{
+      name: 'generic-403', provider: 'codex', type: 'oauth', accessToken: 'access-403',
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3600_000).toISOString(),
+        endsAt: new Date(now - 1).toISOString(),
+      },
+    }]);
+    proxy = createProxyServer(manager, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    await response.text();
+
+    assert.equal(response.status, 403);
+    assert.equal(manager.accounts[0].status, 'active');
+    assert.equal(manager.accounts[0].errorReason, undefined);
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'scheduled');
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+});
+
 test('Codex proxy avoids a double slash for an exact trailing slash upstream segment', async () => {
   const result = await observeCodexPath('/backend-api/codex/');
 
@@ -606,6 +1105,10 @@ test('Codex proxy fails an exhausted account over to the next subscription', asy
       accessToken: 'access-a',
       accountId: 'workspace-a',
       expiresAt: Date.now() + 3_600_000,
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(Date.now() - 3600_000).toISOString(),
+        endsAt: new Date(Date.now() - 1).toISOString(),
+      },
     },
     {
       name: 'codex-b',
@@ -643,6 +1146,8 @@ test('Codex proxy fails an exhausted account over to the next subscription', asy
     ]);
     assert.equal(manager.accounts[0].quota.unified5h, 1);
     assert.equal(manager.accounts[0].status, 'throttled');
+    assert.equal(manager.accounts[0].subscriptionCancellation.status, 'scheduled',
+      'quota exhaustion is not subscription termination evidence');
   } finally {
     proxy.close();
     upstream.close();
