@@ -15,7 +15,7 @@ node src/index.js <command>        # run any CLI command locally (server is the 
 node src/index.js stop             # stop the running server (restart = stop + start)
 npm start                          # = node src/index.js (starts the proxy server)
 npm test                           # = node --test  (tests live in test/)
-npx eslint src/                    # lint (flat config in eslint.config.js; no lint npm script)
+npm run lint                       # = eslint . (flat config in eslint.config.js)
 
 # Use a throwaway config instead of ~/.config/teamclaude.json:
 TEAMCLAUDE_CONFIG=./config.json node src/index.js server
@@ -44,6 +44,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 - **`src/reauth.js`** — fail-closed account reauthentication: select one existing Anthropic OAuth account, verify the returned profile against its UUID (or legacy email), then replace only that account's credentials through the caller's atomic config writer.
 - **`src/config.js`** — load/save of `~/.config/teamclaude.json` (override via `TEAMCLAUDE_CONFIG`, or `$XDG_CONFIG_HOME`; `TEAMCLAUDE_PROVIDER=codex` switches the default file to `~/.config/teamcodex.json`). Written `0o600`.
 - **`src/codex.js`** — Codex-mode helpers, no proxy state: parse/import ChatGPT OAuth credentials (`~/.codex/auth.json` shape), token refresh against `auth.openai.com`, and `buildCodexProxyArgs` (the `-c model_provider` overrides that point the Codex CLI at the proxy).
+- **`src/subscription.js`** — pure Codex cancellation metadata validation, exact account targeting, local-date conversion, and credential-free status snapshots.
 - **`src/codex-session.js`** — exact Codex resume boundary: validates UUID session IDs and reads only the current surface's public `cmux surface resume get --json` binding. It fails closed instead of guessing from recent sessions or private state.
 - **`src/system-metrics.js`** — host CPU/RAM/loadavg sampler; `GET /teamclaude/status` rides a `host` object along so `teamclaude status` and the TUI header can show the proxy machine's load.
 - **`src/tui.js`** — full-screen terminal dashboard (alternate screen buffer). Only used when both stdin and stdout are TTYs; otherwise the server logs plainly.
@@ -57,6 +58,7 @@ Single CLI binary (`src/index.js`) dispatches subcommands; `server` boots the pr
 - **Auth headers**: requests are forwarded with the account's `Bearer` token plus `chatgpt-account-id` (client-sent `authorization`/`chatgpt-account-id` are stripped first). Because the proxy injects pool credentials, `buildCodexProxyArgs` sets `requires_openai_auth = false`: the client Codex CLI needs no local ChatGPT login to run through the proxy, so a revoked/expired `~/.codex/auth.json` cannot surface the Codex sign-in screen while the pool is healthy (2026-08-03 incident; previously `true`).
 - **Quota**: `x-codex-primary/secondary-used-percent` (+ `-reset-at`, `x-codex-rate-limit-reached-type`) are normalized into the same unified 5h/7d model in `updateQuota`, so selection, `switchThreshold`, throttling, and the TUI all work unchanged. Authoritative usage comes from per-account `GET /wham/usage` polls (startup + every `warmupIntervalMs`, plus an active per-account refresh right after a forwarded request completes when the data is older than `codexUsageActiveMs`, default 60s; freshness stamp `codexUsageAt` in status).
 - **`codex run`** launches the Codex CLI with `buildCodexProxyArgs` overrides (`model_provider` base_url → the proxy) — analogous to `run` keeping Claude Code in subscription mode.
+- **Cancelled subscriptions stay routable until evidence says otherwise.** `codex subscription cancel|clear` stores operator-declared metadata; `plan_type`, WHAM failure, 429, and generic 403 never prove termination. A terminal auth failure becomes `subscription-ended` only after a known end date or when the end date is unknown, and a completed Codex usage/inference response reverses that inference.
 - **`codex resume [SESSION_ID]`** routes the exact ID through a final, non-overridable provider override. Without an ID it consumes the current cmux surface's trusted Codex checkpoint without passing direct Codex credentials to cmux, never the bounded recent-session picker. Remote/local execution flags are rejected because they bypass provider selection entirely.
 - **`activeWarmup` defaults off** in codex mode (no capture-and-replay probe shape for the Codex backend); the `/v1/oauth/token` relay is Anthropic-mode only.
 - Ops note: like Anthropic mode, a running server does **not** see accounts added later via CLI — reload via TUI `R` or restart (`syncAccountsFromDisk`); a headless daemon needs the restart path.

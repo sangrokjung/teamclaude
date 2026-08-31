@@ -274,13 +274,45 @@ token을 서로 갱신하며 충돌하지 않습니다.
 ### Codex 계정 제어
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
+
+구독을 해지했지만 결제 기간이 남은 계정은 즉시 삭제하거나 비활성화하지 말고
+해지 사실을 기록하세요. 종료일을 아는 경우 `--ends-on`에는 마지막으로 사용할 수
+있는 현지 날짜를 넣습니다.
+
+```bash
+# 종료일을 모르는 해지 계정
+teamcodex codex subscription cancel codex-pro-1
+
+# 2026-09-06까지 사용할 수 있는 해지 계정
+teamcodex codex subscription cancel codex-pro-2 --ends-on 2026-09-06
+
+# 해지 기록이 잘못됐거나 구독을 다시 시작한 경우
+teamcodex codex subscription clear codex-pro-1
+```
+
+계정 선택은 설정된 전체 이름·전체 이메일·정확한 이메일 localpart만 허용합니다.
+비슷한 계정명 prefix는 선택하지 않으며, 자동화에서는 `--account-uuid`로 선택한
+계정의 identity를 함께 고정할 수 있습니다. `status`, `accounts`, TUI와
+`/teamclaude/status`는 `해지 예정`, `종료일 경과`, `구독 종료`를 일반
+`auth-revoked`·`refresh-failed`와 구분해 표시합니다.
+
+`plan_type=free`, 사용량 조회 실패, 429, 일반 403만으로는 구독 종료라고 판정하지
+않습니다. 선언한 종료일이 지났거나 종료일을 모르는 해지 계정에서 terminal 인증
+실패까지 관찰됐을 때만 `subscription-ended`로 격리합니다. 이후 유효한 Codex 사용량
+조회나 inference 성공이 확인되면 종료 추정을 해제하고 해지 예정 기록으로 되돌립니다.
+격리된 계정은 과거 사용량 reset 시각이 지나도 자동으로 rotation에 복귀하지 않습니다.
+비스트리밍 inference는 `id`, `object: "response"`, `status: "completed"`를 갖춘
+Responses 객체여야 하며, 빈 본문·잘못된 JSON·failed/incomplete HTTP 2xx 본문은 성공
+증거가 아닙니다. 스트리밍 inference에서는 `response.completed`만 성공 증거이며,
+`response.failed`·`response.incomplete`·`error`·`[DONE]` 단독으로는 종료 계정을
+다시 활성화하지 않습니다.
 
 ## Hermes Agent 연결
 
@@ -357,7 +389,9 @@ teamcodex accounts -v  # 설정된 계정과 OAuth 만료 메타데이터
 ```
 
 서버가 오류 사유를 제공하면 `auth-revoked`, `refresh-failed`,
-`subscription-disabled`처럼 짧은 이유도 함께 표시합니다. 사용량은 벤더를 즉시 조회한 값이 아니라 프록시가 마지막으로
+`subscription-disabled`, `subscription-ended`처럼 짧은 이유도 함께 표시합니다.
+구독 해지 추적은 위 `teamcodex codex subscription` 명령으로 선언한 로컬
+metadata이며 ChatGPT 결제 페이지를 자동 조회한 값이 아닙니다. 사용량은 벤더를 즉시 조회한 값이 아니라 프록시가 마지막으로
 관찰한 응답 헤더 기준입니다.
 
 프록시가 실행되는 머신에서는 자격 증명이 빠진 동일한 JSON 상태를 조회할 수 있습니다.

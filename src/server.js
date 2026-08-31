@@ -25,6 +25,24 @@ function connectionHeaderNames(value) {
   );
 }
 
+function isCodexInferenceRequest(req) {
+  if (req.method !== 'POST') return false;
+  const path = req.url.split('?')[0];
+  return /^\/(?:codex\/)?responses(?:\/compact)?$/.test(path);
+}
+
+function isCompletedCodexResponse(body) {
+  if (!body?.length) return false;
+  try {
+    const response = JSON.parse(body.toString('utf8'));
+    return typeof response?.id === 'string' && response.id.length > 0
+      && response.object === 'response'
+      && response.status === 'completed';
+  } catch {
+    return false;
+  }
+}
+
 // Legacy ceiling for model-tier polling when continuityMaxWaitMs is 0. Deadline
 // mode uses the request's overall continuity deadline instead.
 const MODEL_EXHAUST_WAIT_PASSES = 10;
@@ -311,7 +329,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       const payload = await res.json();
       if (accountManager.accounts[account.index] !== account) return false;
-      return accountManager.updateCodexUsage(account, payload);
+      const applied = accountManager.updateCodexUsage(account, payload);
+      if (applied) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
+      }
+      return applied;
     } catch {
       return false;
     } finally {
@@ -1708,7 +1733,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       ctx.sawModelWeekly = true;
     }
     accountManager.updateQuota(account, rateLimitHeaders);
-
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
@@ -1740,14 +1764,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Refresh didn't help (failed / already retried / revoked-but-unexpired)
       // or it's an API-key account — fail this account out and switch.
       if (account.status !== 'error') {
-        account.status = 'error';
-        account._errorFromRefresh = false;
+        accountManager.markAuthenticationError(account, 'auth-revoked');
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
       } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
         // A 401 on a still-valid token is account-level rejection evidence.
         // It must override a refresh-failure label so the sweep cannot revive it.
-        account._errorFromRefresh = false;
+        accountManager.markAuthenticationError(account, 'auth-revoked');
       }
+      await accountManager.waitForAccountFlag(account).catch(err => {
+        console.error(`[TeamClaude] Failed to persist subscription state for "${account.name}": ${err.message}`);
+      });
       if (logDir) {
         logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
         writeRequestLog(logDir, reqId, logSections);
@@ -2258,6 +2284,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // injected error event triggers. No account state is mutated.
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
       }
+      if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && outcome.responseCompleted) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
+      }
       if (logDir) {
         const loggedBody = Buffer.concat(streamLog.chunks, streamLog.bytes).toString();
         const truncation = streamLog.truncated
@@ -2281,6 +2315,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return;
       }
       extractUsageFromBody(buf, account, accountManager);
+      if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && isCompletedCodexResponse(buf)) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
+      }
       if (logDir) {
         if (buf.length === 0) {
           logSections.push(`=== RESPONSE BODY ===\n(empty)`);
@@ -2385,6 +2427,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // send failure so a later token rotation cannot blindly revive it.
       if (account.status !== 'error') account._errorFromRefresh = false;
       account.status = 'error';
+      account.errorReason = 'send-failed';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
@@ -2437,12 +2480,14 @@ async function streamResponse(
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
-  const framer = recover ? new SseFramer() : null;
+  const terminalObserver = new SseFramer();
+  const framer = recover ? terminalObserver : null;
   const bufferedFrames = transactional ? [] : null;
   let bufferedBytes = 0;
   let spillFile = null;
   let spillPath = null;
   let spillUnlinked = false;
+  let endedNormally = false;
   const streamDeadlineAt = Number.isFinite(streamTotalTimeoutMs)
     ? Date.now() + streamTotalTimeoutMs
     : Infinity;
@@ -2451,6 +2496,8 @@ async function streamResponse(
     reason: null,
     preStreamFailure: null,
     limitExceeded: false,
+    completed: false,
+    responseCompleted: false,
   };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -2628,12 +2675,16 @@ async function streamResponse(
         if (framer) break; // client gone — nothing left to salvage
         throw err; // legacy mode: caller decides (destroys the client socket)
       }
-      if (step.done) break;
+      if (step.done) {
+        endedNormally = true;
+        break;
+      }
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
       const bytes = framer ? framer.push(step.value) : step.value;
+      if (!framer) terminalObserver.push(step.value);
       if (!bytes || bytes.length === 0) continue; // partial frame still buffering
 
       // Handle backpressure — also bail out if client disconnects,
@@ -2682,6 +2733,8 @@ async function streamResponse(
       // else: framing degraded to passthrough — the last relayed bytes may sit
       // mid-event, where an injected frame would corrupt the parse. End plainly.
     }
+    outcome.completed = endedNormally && (!framer || framer.sawTerminal);
+    outcome.responseCompleted = endedNormally && terminalObserver.sawResponseCompleted;
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});

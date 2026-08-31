@@ -1,6 +1,7 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
+import { subscriptionSnapshot } from './subscription.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -508,6 +509,9 @@ export class TUI {
         previous = prev;
         if (prev.enabled !== undefined) entry.enabled = prev.enabled;
         if (prev.priority !== undefined) entry.priority = prev.priority;
+        if (prev.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = prev.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         // Update the running account manager entry, matched by IDENTITY (the
         // previous entry's UUID first, then name) — NOT the config index `idx`,
@@ -578,6 +582,9 @@ export class TUI {
         previous = this.config.accounts[idx];
         if (previous.enabled !== undefined) entry.enabled = previous.enabled;
         if (previous.priority !== undefined) entry.priority = previous.priority;
+        if (previous.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = previous.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         const live = this.am.accounts.find(a =>
           a.accountUuid === creds.accountId || a.name === previous.name);
@@ -911,12 +918,23 @@ export class TUI {
     if (a.enabled === false) {
       status = gray('disabled');
     } else {
-      switch (a.status) {
-        case 'active':    status = isCur ? green('active') : 'active'; break;
-        case 'throttled': status = yellow('throttled'); break;
-        case 'exhausted': status = red('exhausted'); break;
-        case 'error':     status = red('error'); break;
-        default:          status = a.status || 'ready';
+      const subscription = subscriptionSnapshot(a);
+      if (subscription.state === 'ended') {
+        status = red('sub ended');
+      } else if (a.status === 'error') {
+        status = red('error');
+      } else if (subscription.state === 'end-date-reached') {
+        status = yellow('sub due');
+      } else if (subscription.state === 'cancellation-scheduled') {
+        status = yellow('canceling');
+      } else {
+        switch (a.status) {
+          case 'active':    status = isCur ? green('active') : 'active'; break;
+          case 'throttled': status = yellow('throttled'); break;
+          case 'exhausted': status = red('exhausted'); break;
+          case 'error':     status = red('error'); break;
+          default:          status = a.status || 'ready';
+        }
       }
     }
     status = rpad(status, 10);

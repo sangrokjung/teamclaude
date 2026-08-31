@@ -30,6 +30,14 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
 import {
+  applySubscriptionCancellation,
+  cancellationEndsAt,
+  clearSubscriptionCancellation,
+  findSubscriptionTarget,
+  normalizeSubscriptionCancellation,
+  subscriptionSnapshot,
+} from './subscription.js';
+import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
@@ -65,6 +73,7 @@ const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
 // after it throws ReferenceError the moment statusCommand touches it.
 const ERROR_REASON_LABELS = {
   'subscription-disabled': '조직의 Claude Code 접근 차단',
+  'subscription-ended': '구독 종료',
   'auth-revoked': '인증무효 — 재로그인 필요',
   'refresh-failed': 'refresh 실패',
   'auth-rejected': '인증거부',
@@ -75,6 +84,16 @@ function connectionHeaderNames(value) {
   return new Set(
     String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
   );
+}
+
+function subscriptionDisplay(subscription) {
+  if (!subscription || subscription.state === 'active') return null;
+  if (subscription.state === 'ended') return '구독 종료';
+  if (subscription.state === 'end-date-reached') return '종료일 경과 — 연결 상태 확인 중';
+  if (!subscription.endsAt) return '해지 예정 — 종료일 미확인';
+  const inclusive = new Date(Date.parse(subscription.endsAt) - 1);
+  const date = `${inclusive.getFullYear()}-${String(inclusive.getMonth() + 1).padStart(2, '0')}-${String(inclusive.getDate()).padStart(2, '0')}`;
+  return `해지 예정 — ${date}까지 사용`;
 }
 
 function publicRequestCapacity(config, accounts = config.accounts || []) {
@@ -133,6 +152,10 @@ switch (command) {
     break;
   case 'reauth':
     await reauthenticateCommand();
+    process.exit(0);
+    break;
+  case 'subscription':
+    await subscriptionCommand();
     process.exit(0);
     break;
   case 'env':
@@ -1085,6 +1108,20 @@ async function proxyWorkerCommand() {
     console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
     throw err;
   }));
+  accountManager.onAccountMetadata((account, metadata) => atomicConfigUpdate(diskConfig => {
+    const cfgIdx = findConfigAccount(diskConfig, account);
+    if (cfgIdx < 0) return;
+    if (metadata) diskConfig.accounts[cfgIdx].subscriptionCancellation = metadata;
+    else delete diskConfig.accounts[cfgIdx].subscriptionCancellation;
+  }).then(() => {
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    if (metadata) config.accounts[memIdx].subscriptionCancellation = metadata;
+    else delete config.accounts[memIdx].subscriptionCancellation;
+  }).catch(err => {
+    console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
+    throw err;
+  }));
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -1750,6 +1787,55 @@ async function reauthenticateCommand() {
   await noteRunningServerReload(result.savedConfig);
 }
 
+async function subscriptionCommand() {
+  const action = args[1];
+  const selector = args[2];
+  const uuidFlagIndex = args.indexOf('--account-uuid');
+  const endsFlagIndex = args.indexOf('--ends-on');
+  const uuidEqualsArg = args.find(value => value.startsWith('--account-uuid='));
+  const endsEqualsArg = args.find(value => value.startsWith('--ends-on='));
+  const expectedAccountUuid = uuidEqualsArg
+    ? uuidEqualsArg.slice('--account-uuid='.length) || null
+    : argValue('--account-uuid');
+  const endsOn = endsEqualsArg
+    ? endsEqualsArg.slice('--ends-on='.length) || null
+    : argValue('--ends-on');
+  const missingUuid = uuidFlagIndex >= 0
+    && (!args[uuidFlagIndex + 1] || args[uuidFlagIndex + 1].startsWith('--'))
+    || Boolean(uuidEqualsArg && !expectedAccountUuid);
+  const missingEndsOn = endsFlagIndex >= 0
+    && (!args[endsFlagIndex + 1] || args[endsFlagIndex + 1].startsWith('--'))
+    || Boolean(endsEqualsArg && !endsOn);
+  if (!['cancel', 'clear'].includes(action) || !selector || missingUuid || missingEndsOn
+      || (action === 'clear' && (endsFlagIndex >= 0 || endsEqualsArg))) {
+    console.error('Usage: teamcodex codex subscription cancel <account> [--ends-on YYYY-MM-DD] [--account-uuid UUID]');
+    console.error('       teamcodex codex subscription clear <account> [--account-uuid UUID]');
+    process.exit(1);
+  }
+
+  let selectedName;
+  try {
+    const config = await atomicConfigUpdate(cfg => {
+      const { account } = findSubscriptionTarget(cfg, { selector, expectedAccountUuid });
+      selectedName = account.name;
+      if (action === 'cancel') {
+        applySubscriptionCancellation(account, {
+          endsAt: endsOn ? cancellationEndsAt(endsOn) : null,
+        });
+      } else {
+        clearSubscriptionCancellation(account);
+      }
+    });
+    console.log(action === 'cancel'
+      ? `Tracking cancelled subscription for "${selectedName}"${endsOn ? ` (usable through ${endsOn})` : ''}`
+      : `Cleared subscription cancellation for "${selectedName}"`);
+    await noteRunningServerReload(config);
+  } catch (err) {
+    console.error(`Subscription tracking rejected: ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // ── env ─────────────────────────────────────────────────────
 
 async function envCommand() {
@@ -2187,6 +2273,8 @@ async function statusCommand() {
       const reasonTag = acct.status === 'error' && ERROR_REASON_LABELS[acct.errorReason]
         ? ` [${ERROR_REASON_LABELS[acct.errorReason]}]` : '';
       console.log(`    Status:   ${acct.status}${reasonTag}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
+      const subscriptionTag = subscriptionDisplay(acct.subscription);
+      if (subscriptionTag) console.log(`    Subscription: ${subscriptionTag}`);
       if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
       if (acct.maxConcurrent != null) {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
@@ -2353,6 +2441,10 @@ async function accountsCommand() {
       const src = a.source ? `, ${a.source}` : '';
       console.log(`  [${i + 1}] ${a.name} (Codex ${plan}${src})`);
       if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
+      const subscriptionTag = subscriptionDisplay(subscriptionSnapshot({
+        subscriptionCancellation: normalizeSubscriptionCancellation(a.subscriptionCancellation),
+      }));
+      if (subscriptionTag) console.log(`       Subscription: ${subscriptionTag}`);
       if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
       continue;
     }
@@ -2609,6 +2701,8 @@ Commands:
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
   accounts            List configured Codex accounts
+  subscription cancel Track a cancelled subscription without disabling it
+  subscription clear  Clear cancellation tracking for one account
   remove <name>       Remove an account
   disable <name>      Disable an account
   enable <name>       Re-enable an account
@@ -2622,6 +2716,8 @@ Options:
   --name NAME         Set account name (import/login)
   --from PATH         Codex auth path (default: ~/.codex/auth.json)
   --device-auth       Use the Codex device login flow
+  --ends-on DATE      Last usable local date for subscription cancel (YYYY-MM-DD)
+  --account-uuid UUID Pin a subscription command to the selected account identity
   --log-to DIR        Log full requests/responses to DIR
 
 Config: ${getConfigPath()}
@@ -2707,6 +2803,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      if (previous.subscriptionCancellation !== undefined) {
+        account.subscriptionCancellation = previous.subscriptionCancellation;
+      }
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
@@ -2748,6 +2847,9 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      if (previous.subscriptionCancellation !== undefined) {
+        account.subscriptionCancellation = previous.subscriptionCancellation;
+      }
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
@@ -2842,6 +2944,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if ((mgr.subscriptionDisabled === true) !== subscriptionDisabled) {
         accountManager.setSubscriptionDisabled(mgr, subscriptionDisabled, false);
       }
+      const diskCancellation = normalizeSubscriptionCancellation(diskAcct.subscriptionCancellation);
+      if (JSON.stringify(normalizeSubscriptionCancellation(mgr.subscriptionCancellation))
+          !== JSON.stringify(diskCancellation)) {
+        accountManager.setSubscriptionCancellation(mgr, diskCancellation, false);
+      }
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
       // enabled/priority over the disk value and silently revert a CLI change.
@@ -2851,6 +2958,8 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
         if (subscriptionDisabled) memAcct.subscriptionDisabled = true;
         else delete memAcct.subscriptionDisabled;
+        if (diskCancellation) memAcct.subscriptionCancellation = diskCancellation;
+        else delete memAcct.subscriptionCancellation;
       }
     }
 
@@ -2867,6 +2976,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
           expiresAt: creds.expiresAt,
           idToken: creds.idToken,
           accountId: creds.accountId,
+          planType: creds.planType,
         };
       } catch (err) {
         console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
@@ -2878,6 +2988,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         expiresAt: diskAcct.expiresAt,
         idToken: diskAcct.idToken,
         accountId: diskAcct.accountId,
+        planType: diskAcct.planType,
       };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
@@ -2938,6 +3049,7 @@ async function resolveAccounts(config) {
             enabled: acct.enabled,
             priority: acct.priority,
             subscriptionDisabled: acct.subscriptionDisabled,
+            subscriptionCancellation: acct.subscriptionCancellation,
             ...creds,
           });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);

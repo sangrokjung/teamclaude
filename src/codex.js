@@ -90,8 +90,20 @@ export async function refreshCodexAccessToken(
   });
 
   if (!response.ok) {
-    await response.body?.cancel();
-    throw new Error(`Codex token refresh failed (${response.status})`);
+    let terminalAuthentication = response.status === 401;
+    if (response.status === 400) {
+      const raw = await response.text().catch(() => '');
+      try {
+        terminalAuthentication = JSON.parse(raw)?.error === 'invalid_grant';
+      } catch {
+        terminalAuthentication = false;
+      }
+    } else {
+      await response.body?.cancel();
+    }
+    const error = new Error(`Codex token refresh failed (${response.status})`);
+    error.terminalAuthentication = terminalAuthentication;
+    throw error;
   }
 
   const data = await response.json();

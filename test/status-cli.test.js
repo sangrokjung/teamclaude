@@ -115,3 +115,24 @@ test('status lists healthy accounts with quota lines', async () => {
   assert.match(res.stdout, /Session:\s+10\.0% used\s+Weekly: 20\.0% used/);
   assert.match(res.stdout, /b@example\.com/);
 });
+
+test('status distinguishes scheduled cancellation, ended subscription, auth, and organization policy', async () => {
+  const res = await runStatusAgainst(basePayload([
+    account('scheduled@example.com', {
+      provider: 'codex',
+      subscription: { state: 'cancellation-scheduled', endsAt: '2026-09-06T15:00:00.000Z' },
+    }),
+    account('ended@example.com', {
+      provider: 'codex', status: 'error', errorReason: 'subscription-ended', usable: false,
+      subscription: { state: 'ended', endsAt: null, endedAt: '2026-08-31T00:00:00.000Z' },
+    }),
+    account('auth@example.com', { status: 'error', errorReason: 'auth-revoked', usable: false }),
+    account('policy@example.com', { status: 'error', errorReason: 'subscription-disabled', usable: false }),
+  ]));
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /해지 예정.*2026-09-06/);
+  assert.match(res.stdout, /구독 종료/);
+  assert.match(res.stdout, /인증무효/);
+  assert.match(res.stdout, /조직의 Claude Code 접근 차단/);
+});

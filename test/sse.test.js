@@ -49,14 +49,23 @@ test('terminal detection: event name, error, data-only JSON, [DONE], CRLF', () =
   let f = new SseFramer();
   f.push(b('event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n'));
   assert.equal(f.sawTerminal, true, 'error event');
+  assert.equal(f.sawResponseCompleted, false, 'error is not a successful response');
 
   f = new SseFramer();
   f.push(b('data: {"type":"response.completed","response":{}}\n\n'));
   assert.equal(f.sawTerminal, true, 'data-only response.completed');
+  assert.equal(f.sawResponseCompleted, true, 'response.completed is successful');
 
   f = new SseFramer();
   f.push(b('data: [DONE]\n\n'));
   assert.equal(f.sawTerminal, true, '[DONE] marker');
+  assert.equal(f.sawResponseCompleted, false, '[DONE] alone is not success evidence');
+
+  f = new SseFramer();
+  f.push(b('event: response.failed\ndata: {"type":"response.failed"}\n\n'
+    + 'event: response.completed\ndata: {"type":"response.completed"}\n\n'));
+  assert.equal(f.sawTerminal, true, 'the first response terminal ends the stream');
+  assert.equal(f.sawResponseCompleted, false, 'a later completed marker cannot override failure');
 
   f = new SseFramer();
   f.push(b('event: message_stop\r\ndata: {"type":"message_stop"}\r\n\r\n'));

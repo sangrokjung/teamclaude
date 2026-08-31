@@ -278,13 +278,48 @@ accounts show unmeasured quota until each account handles a request.
 Common controls mirror the Claude pool:
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
+
+When a subscription has been cancelled but its paid period is still usable, track
+the cancellation instead of deleting or disabling the account. `--ends-on` is the
+last usable local calendar date when it is known:
+
+```bash
+# Cancelled subscription with an unknown end date
+teamcodex codex subscription cancel codex-pro-1
+
+# Usable through 2026-09-06
+teamcodex codex subscription cancel codex-pro-2 --ends-on 2026-09-06
+
+# Remove an incorrect declaration or record a resubscription
+teamcodex codex subscription clear codex-pro-1
+```
+
+Selection accepts only an exact configured name, full email, or exact email
+localpart; a similar prefix never selects an account. Automation can also pin the
+selected identity with `--account-uuid`. `status`, `accounts`, the TUI, and
+`/teamclaude/status` distinguish scheduled cancellation, a reached end date, and
+an inferred subscription end from ordinary `auth-revoked` and `refresh-failed`
+errors.
+
+TeamCodex does not infer an ended subscription from `plan_type=free`, a usage
+lookup failure, 429, or an unrelated 403. It parks the account as
+`subscription-ended` only when a terminal authentication failure agrees with a
+declared cancellation whose date is due or unknown. The parked account stays
+out of rotation even when an older quota-reset timestamp passes. A later valid Codex usage
+response or successful inference reopens the account and restores the scheduled
+declaration. A non-streaming inference must return a Responses object with an
+`id`, `object: "response"`, and `status: "completed"`; an empty, malformed,
+failed, or incomplete HTTP 2xx body is not success evidence. For streaming
+inference, only `response.completed` is success evidence; `response.failed`,
+`response.incomplete`, `error`, and `[DONE]` alone do not reopen an ended
+account.
 
 ### Hermes Agent through TeamCodex
 
@@ -616,9 +651,13 @@ teamcodex accounts -v  # configured accounts and OAuth expiry metadata
 
 `status` requires a running proxy. An error row includes a short reason when the
 server provides one, such as `auth-revoked`, `refresh-failed`, or
-`subscription-disabled`; it does not make
+`subscription-disabled` or `subscription-ended`; it does not make
 the entire server look unreachable. Quota rows are still the proxy's latest
 observations, not a vendor-side on-demand usage query.
+
+Codex cancellation tracking is operator-declared local metadata written by
+`teamcodex codex subscription`; it is not an automatic read of the ChatGPT
+billing page.
 
 Automation on the proxy host can read the same credential-free JSON surface:
 

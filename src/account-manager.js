@@ -1,5 +1,10 @@
 import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
+import {
+  cancellationIsDue,
+  normalizeSubscriptionCancellation,
+  subscriptionSnapshot,
+} from './subscription.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
@@ -120,28 +125,32 @@ export class AccountManager {
     // this depth acquireAccount rejects immediately (→ 429) instead of queuing.
     this.maxQueueDepth = Number.isFinite(overflowQueueMaxDepth) && overflowQueueMaxDepth >= 0
       ? Math.floor(overflowQueueMaxDepth) : 256;
-    this.accounts = accounts.map((acct, index) => ({
+    this.accounts = accounts.map((acct, index) => {
+      const provider = acct.provider || 'anthropic';
+      const subscriptionCancellation = provider === 'codex'
+        ? normalizeSubscriptionCancellation(acct.subscriptionCancellation)
+        : null;
+      const subscriptionEnded = subscriptionCancellation?.status === 'ended';
+      const organizationDisabled = acct.subscriptionDisabled === true && provider === 'anthropic';
+      return {
       index,
       name: acct.name,
       type: acct.type,
-      provider: acct.provider || 'anthropic',
+      provider,
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: normalizeOptionalCredential(acct.refreshToken),
       idToken: normalizeOptionalCredential(acct.idToken),
       accountId: acct.accountId || null,
+      planType: acct.planType || null,
       expiresAt: acct.expiresAt || null,
-      status: acct.subscriptionDisabled === true && (acct.provider || 'anthropic') === 'anthropic'
-        ? 'error' : 'active',
-      subscriptionDisabled: acct.subscriptionDisabled === true
-          && (acct.provider || 'anthropic') === 'anthropic'
-        ? true : undefined,
-      errorReason: acct.subscriptionDisabled === true
-          && (acct.provider || 'anthropic') === 'anthropic'
-        ? 'subscription-disabled' : undefined,
-      _errorFromRefresh: acct.subscriptionDisabled === true
-          && (acct.provider || 'anthropic') === 'anthropic'
-        ? false : undefined,
+      status: organizationDisabled || subscriptionEnded ? 'error' : 'active',
+      subscriptionDisabled: organizationDisabled ? true : undefined,
+      subscriptionCancellation: subscriptionCancellation || undefined,
+      errorReason: organizationDisabled
+        ? 'subscription-disabled'
+        : subscriptionEnded ? 'subscription-ended' : undefined,
+      _errorFromRefresh: organizationDisabled || subscriptionEnded ? false : undefined,
       // Manual on/off switch. A disabled account is excluded from ALL rotation
       // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
       // in-flight requests still drain, but no new request is routed to it.
@@ -165,7 +174,9 @@ export class AccountManager {
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
       _subscriptionFlagPromise: Promise.resolve(),
-    }));
+      _accountWritePending: false,
+      };
+    });
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.reevalIntervalMs = reevalIntervalMs;
@@ -1043,6 +1054,7 @@ export class AccountManager {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
       if (account.subscriptionDisabled === true) continue;
+      if (account.errorReason === 'subscription-ended') continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -1310,6 +1322,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         if (newTokens.idToken) account.idToken = newTokens.idToken;
+        if (newTokens.planType) account.planType = newTokens.planType;
         if (newTokens.accountId) {
           account.accountId = newTokens.accountId;
           account.accountUuid = newTokens.accountId;
@@ -1320,6 +1333,7 @@ export class AccountManager {
         if (account.status === 'error' && account._errorFromRefresh) {
           account.status = 'active';
           delete account._errorFromRefresh;
+          delete account.errorReason;
         }
         delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
@@ -1337,10 +1351,20 @@ export class AccountManager {
         // a failed proactive refresh shouldn't kill a still-valid token.
         // Tag the cause only on the transition: a failed sweep must not relabel
         // an account already parked by the request path as refresh-caused.
-        if (!account.expiresAt || Date.now() >= normalizeExpiresAt(account.expiresAt)) {
-          if (account.status !== 'error') {
-            account.status = 'error';
-            account._errorFromRefresh = true;
+        const accessTokenExpired = !account.expiresAt
+          || Date.now() >= normalizeExpiresAt(account.expiresAt);
+        const terminalAuthentication = account.provider === 'codex'
+          ? err?.terminalAuthentication === true
+          : accessTokenExpired;
+        if (terminalAuthentication) {
+          const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+          const cancellationNowDue = account.provider === 'codex'
+            && cancellation?.status === 'scheduled' && cancellationIsDue(account);
+          if (account.status !== 'error' || cancellationNowDue) {
+            this.markAuthenticationError(account, 'refresh-failed');
+            await this.waitForAccountFlag(account).catch(persistErr => {
+              console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${persistErr.message}`);
+            });
           }
         }
       } finally {
@@ -1389,6 +1413,10 @@ export class AccountManager {
     this._onAccountFlag = callback;
   }
 
+  onAccountMetadata(callback) {
+    this._onAccountMetadata = callback;
+  }
+
   waitForAccountFlag(ref) {
     const account = this._resolveRef(ref);
     return account?._subscriptionFlagPromise ?? Promise.resolve();
@@ -1406,6 +1434,36 @@ export class AccountManager {
       await this.waitForAccountFlagWrites();
       if (generation === this._accountFlagGeneration) return value;
     }
+  }
+
+  _queueAccountWrite(account, callback) {
+    this._accountFlagGeneration++;
+    let write;
+    if (account._accountWritePending) {
+      const previousWrite = account._subscriptionFlagPromise ?? Promise.resolve();
+      write = previousWrite.catch(() => {}).then(() => callback?.());
+    } else {
+      account._accountWritePending = true;
+      try {
+        write = Promise.resolve(callback?.());
+      } catch (err) {
+        write = Promise.reject(err);
+      }
+    }
+    write = write.then(() => undefined);
+    write.catch(() => {});
+    this._accountFlagWrites.add(write);
+    write.then(
+      () => {
+        this._accountFlagWrites.delete(write);
+        if (account._subscriptionFlagPromise === write) account._accountWritePending = false;
+      },
+      () => {
+        this._accountFlagWrites.delete(write);
+        if (account._subscriptionFlagPromise === write) account._accountWritePending = false;
+      },
+    );
+    account._subscriptionFlagPromise = write;
   }
 
   setSubscriptionDisabled(ref, disabled, persist = true) {
@@ -1428,26 +1486,76 @@ export class AccountManager {
       }
     }
     if (persist && previous !== next && this.accounts[account.index] === account) {
-      this._accountFlagGeneration++;
-      const previousWrite = account._subscriptionFlagPromise ?? Promise.resolve();
-      let callbackResult;
-      try {
-        callbackResult = this._onAccountFlag?.(account, next);
-      } catch (err) {
-        callbackResult = Promise.reject(err);
-      }
-      const write = Promise.all([
-        previousWrite.catch(() => {}),
-        Promise.resolve(callbackResult),
-      ]).then(() => undefined);
-      write.catch(() => {});
-      this._accountFlagWrites.add(write);
-      write.then(
-        () => this._accountFlagWrites.delete(write),
-        () => this._accountFlagWrites.delete(write),
-      );
-      account._subscriptionFlagPromise = write;
+      this._queueAccountWrite(account, () => this._onAccountFlag?.(account, next));
     }
+    return account;
+  }
+
+  setSubscriptionCancellation(ref, value, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account || account.provider !== 'codex') return null;
+    const next = normalizeSubscriptionCancellation(value);
+    const previous = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    const changed = JSON.stringify(previous) !== JSON.stringify(next);
+    if (next) account.subscriptionCancellation = next;
+    else delete account.subscriptionCancellation;
+
+    if (next?.status === 'ended') {
+      account.status = 'error';
+      account.errorReason = 'subscription-ended';
+      account._errorFromRefresh = false;
+    } else if (account.errorReason === 'subscription-ended') {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+      this._drainWaiters();
+    }
+    if (persist && changed && this.accounts[account.index] === account) {
+      const snapshot = next ? { ...next } : null;
+      this._queueAccountWrite(account, () => this._onAccountMetadata?.(account, snapshot));
+    }
+    return account;
+  }
+
+  markAuthenticationError(ref, reason = 'auth-revoked', now = Date.now(), persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    if (account.provider === 'codex' && cancellation?.status === 'ended') {
+      account.status = 'error';
+      account.errorReason = 'subscription-ended';
+      account._errorFromRefresh = false;
+      return account;
+    }
+    const canInferEnded = account.provider === 'codex' && cancellation?.status === 'scheduled'
+      && cancellationIsDue(account, now);
+    if (canInferEnded) {
+      this.setSubscriptionCancellation(account, {
+        ...account.subscriptionCancellation,
+        status: 'ended',
+        endedAt: new Date(now).toISOString(),
+        evidence: 'auth-failure-after-cancellation',
+      }, persist);
+      return account;
+    }
+    account.status = 'error';
+    account.errorReason = reason;
+    account._errorFromRefresh = reason === 'refresh-failed';
+    return account;
+  }
+
+  markAccountSuccess(ref, now = Date.now(), persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    if (account.provider === 'codex' && cancellation?.status === 'ended') {
+      this.setSubscriptionCancellation(account, {
+        status: 'scheduled',
+        recordedAt: cancellation.recordedAt,
+        endsAt: cancellation.endsAt,
+      }, persist);
+    }
+    account.lastSuccessfulAt = new Date(now).toISOString();
     return account;
   }
 
@@ -1460,6 +1568,7 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
+    planType,
   }, persist = true) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
@@ -1477,11 +1586,15 @@ export class AccountManager {
       account.accountId = accountId;
       account.accountUuid = accountId;
     }
+    if (planType) account.planType = planType;
+    const subscriptionEnded = account.errorReason === 'subscription-ended'
+      && normalizeSubscriptionCancellation(account.subscriptionCancellation)?.status === 'ended';
     if (account.subscriptionDisabled === true) {
       this.setSubscriptionDisabled(account, false, persist);
     }
-    if (account.status === 'error') {
+    if (account.status === 'error' && !subscriptionEnded) {
       account.status = 'active';
+      delete account.errorReason;
       delete account._errorFromRefresh;
     }
     delete account._refreshRetryAt;
@@ -1494,6 +1607,7 @@ export class AccountManager {
       expiresAt: account.expiresAt,
       idToken: account.idToken,
       accountId: account.accountId,
+      planType: account.planType,
     }, previousTokens);
   }
 
@@ -1502,29 +1616,31 @@ export class AccountManager {
    */
   addAccount(acctData) {
     const index = this.accounts.length;
+    const provider = acctData.provider || 'anthropic';
+    const subscriptionCancellation = provider === 'codex'
+      ? normalizeSubscriptionCancellation(acctData.subscriptionCancellation)
+      : null;
+    const subscriptionEnded = subscriptionCancellation?.status === 'ended';
+    const organizationDisabled = acctData.subscriptionDisabled === true && provider === 'anthropic';
     this.accounts.push({
       index,
       name: acctData.name,
       type: acctData.type,
-      provider: acctData.provider || 'anthropic',
+      provider,
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: normalizeOptionalCredential(acctData.refreshToken),
       idToken: normalizeOptionalCredential(acctData.idToken),
       accountId: acctData.accountId || null,
+      planType: acctData.planType || null,
       expiresAt: acctData.expiresAt || null,
-      status: acctData.subscriptionDisabled === true
-          && (acctData.provider || 'anthropic') === 'anthropic'
-        ? 'error' : 'active',
-      subscriptionDisabled: acctData.subscriptionDisabled === true
-          && (acctData.provider || 'anthropic') === 'anthropic'
-        ? true : undefined,
-      errorReason: acctData.subscriptionDisabled === true
-          && (acctData.provider || 'anthropic') === 'anthropic'
-        ? 'subscription-disabled' : undefined,
-      _errorFromRefresh: acctData.subscriptionDisabled === true
-          && (acctData.provider || 'anthropic') === 'anthropic'
-        ? false : undefined,
+      status: organizationDisabled || subscriptionEnded ? 'error' : 'active',
+      subscriptionDisabled: organizationDisabled ? true : undefined,
+      subscriptionCancellation: subscriptionCancellation || undefined,
+      errorReason: organizationDisabled
+        ? 'subscription-disabled'
+        : subscriptionEnded ? 'subscription-ended' : undefined,
+      _errorFromRefresh: organizationDisabled || subscriptionEnded ? false : undefined,
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
@@ -1533,6 +1649,7 @@ export class AccountManager {
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
       _subscriptionFlagPromise: Promise.resolve(),
+      _accountWritePending: false,
     });
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
@@ -1728,6 +1845,8 @@ export class AccountManager {
         provider: a.provider,
         status: a.status,
         errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
+        planType: a.planType || null,
+        subscription: subscriptionSnapshot(a),
         enabled: a.enabled !== false,
         priority: a.priority ?? null,
         // Deep-copy the nested modelWeekly map — the shallow quota spread would
