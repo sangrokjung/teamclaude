@@ -1334,6 +1334,7 @@ export class AccountManager {
           account.status = 'active';
           delete account._errorFromRefresh;
           delete account.errorReason;
+          delete account._errorFromUsagePoll;
         }
         delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
@@ -1508,6 +1509,7 @@ export class AccountManager {
       account.status = 'active';
       delete account.errorReason;
       delete account._errorFromRefresh;
+      delete account._errorFromUsagePoll;
       this._drainWaiters();
     }
     if (persist && changed && this.accounts[account.index] === account) {
@@ -1541,6 +1543,10 @@ export class AccountManager {
     account.status = 'error';
     account.errorReason = reason;
     account._errorFromRefresh = reason === 'refresh-failed';
+    // A park entered here is request/refresh-path evidence. Drop any stale
+    // poll-quarantine tag so a later usage-poll success cannot heal it — the
+    // usage-poll watchdog re-tags its own parks right after calling this.
+    delete account._errorFromUsagePoll;
     return account;
   }
 
@@ -1555,6 +1561,24 @@ export class AccountManager {
         endsAt: cancellation.endsAt,
       }, persist);
     }
+    // Auto-recovery for the usage-poll quarantine: a verified success on the
+    // account (valid usage poll / completed inference) is stronger evidence
+    // than the poll-side auth failures that parked it. Scoped by the cause
+    // tag — a request-path park (no tag) keeps its existing healing rules
+    // (re-import, restart, or a cause-scoped refresh success) untouched.
+    if (account.status === 'error' && account._errorFromUsagePoll === true) {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+      this._drainWaiters();
+    }
+    delete account._errorFromUsagePoll;
+    // Positive auth evidence also resets the usage-poll terminal-failure
+    // streak: a completed inference proves the credential against the SAME
+    // backend, so an actively-serving account can never be escalated into
+    // quarantine by usage-endpoint-only 401/403s (WAF rule, endpoint contract
+    // change, plan/scope policy divergence on /wham/usage).
+    delete account._usageAuthStreak;
     account.lastSuccessfulAt = new Date(now).toISOString();
     return account;
   }
@@ -1596,6 +1620,7 @@ export class AccountManager {
       account.status = 'active';
       delete account.errorReason;
       delete account._errorFromRefresh;
+      delete account._errorFromUsagePoll;
     }
     delete account._refreshRetryAt;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);

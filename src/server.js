@@ -203,6 +203,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const codexUsageActiveMs = Number.isFinite(config.codexUsageActiveMs)
     ? Math.max(0, config.codexUsageActiveMs)
     : 60_000;
+  // Auto-quarantine (codex): consecutive terminal (401/403) auth failures on
+  // the wham/usage poll before the proxy escalates to a forced token refresh
+  // plus a confirm re-poll. In-memory streak; the poll cadence is the pacing.
+  const codexAuthFailureThreshold = Number.isFinite(config.codexAuthFailureThreshold)
+    && config.codexAuthFailureThreshold >= 1
+    ? Math.floor(config.codexAuthFailureThreshold)
+    : 3;
   const WARMUP_PROBE_TIMEOUT_MS = 15_000;
   let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
   let warmupInFlight = false; // guard against overlapping fan-outs
@@ -296,7 +303,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   async function refreshCodexAccount(account) {
     if (warmupClosed || !account.credential) return false;
-    const ok = await fetchCodexUsageOnce(account);
+    const outcome = await fetchCodexUsageOnce(account);
+    await watchCodexAuthOutcome(account, outcome);
+    const ok = outcome.applied;
     // Failure visibility without 60s-cadence spam: log once per failure STREAK
     // (first failure after a success), and once on recovery. A teardown abort
     // (warmupClosed) or a removed account is not a data-staleness signal.
@@ -325,10 +334,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const res = await fetch(codexUsageEndpoint(), { headers, signal: probe.signal });
       if (!res.ok) {
         await res.body?.cancel();
-        return false;
+        // 401/403 are credential verdicts from the backend — the only terminal
+        // auth evidence a poll can carry. 5xx/429/anything else is transient
+        // noise and (as before) never mutates account state.
+        return {
+          applied: false,
+          authOk: false,
+          terminalAuth: res.status === 401 || res.status === 403,
+        };
       }
       const payload = await res.json();
-      if (accountManager.accounts[account.index] !== account) return false;
+      if (accountManager.accounts[account.index] !== account) {
+        return { applied: false, authOk: false, terminalAuth: false };
+      }
       const applied = accountManager.updateCodexUsage(account, payload);
       if (applied) {
         accountManager.markAccountSuccess(account);
@@ -336,12 +354,66 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
         });
       }
-      return applied;
+      return { applied, authOk: true, terminalAuth: false };
     } catch {
-      return false;
+      // Network error / timeout / unparseable 2xx body: non-terminal.
+      return { applied: false, authOk: false, terminalAuth: false };
     } finally {
       probe.cleanup();
     }
+  }
+
+  // Auto subscription-termination detection: usage polls double as credential
+  // health checks. Only a streak of terminal (401/403) poll failures — never a
+  // single one, and never 5xx/network noise — escalates, and even then the
+  // account is parked only after a forced refresh + confirm re-poll agrees.
+  // Accounts parked here are tagged `_errorFromUsagePoll`, which scopes the
+  // automatic poll-success recovery in markAccountSuccess to THIS quarantine
+  // (request-path 401 parks keep their stricter healing rules). Streaks are
+  // in-memory only; a restart starts clean. Any positive auth evidence resets
+  // the streak: a valid poll here, and a completed inference / applied poll via
+  // markAccountSuccess — so an account that is actively serving traffic cannot
+  // be quarantined by usage-endpoint-only 401/403s.
+  async function watchCodexAuthOutcome(account, outcome) {
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (outcome.authOk) {
+      account._usageAuthStreak = 0;
+      return;
+    }
+    if (!outcome.terminalAuth) return; // transient noise: streak neither grows nor resets
+    if (account.status === 'error') return; // already parked — polls continue only for recovery
+    const streak = (account._usageAuthStreak ?? 0) + 1;
+    account._usageAuthStreak = streak;
+    if (streak < codexAuthFailureThreshold) return;
+    // Escalating consumes the streak: whatever the verdict below, the next
+    // escalation needs a fresh streak (the poll interval is the pacing).
+    account._usageAuthStreak = 0;
+    await confirmCodexAuthFailure(account);
+  }
+
+  async function confirmCodexAuthFailure(account) {
+    // Step 1: one forced token refresh. A terminal refresh failure (401 /
+    // invalid_grant) parks the account inside ensureTokenFresh — including the
+    // r7 delegation to subscription-ended when a declared cancellation is due.
+    await accountManager.ensureTokenFresh(account, true)
+      .catch(() => { /* terminal failures are handled inside ensureTokenFresh */ });
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (account.status === 'error') {
+      account._errorFromUsagePoll = true;
+      return;
+    }
+    // Step 2: re-poll once with the (possibly refreshed) credential. Terminal
+    // again = a live token the backend still rejects → quarantine. A healthy
+    // or inconclusive confirm leaves the account alone.
+    const confirm = await fetchCodexUsageOnce(account);
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (confirm.authOk || !confirm.terminalAuth) return;
+    accountManager.markAuthenticationError(account, 'auth-revoked');
+    if (account.status === 'error') account._errorFromUsagePoll = true;
+    console.error(`[TeamClaude] Codex account "${account.name}" quarantined: usage polls and a fresh token both rejected (auto-recovers on a valid usage poll)`);
+    await accountManager.waitForAccountFlag(account).catch(err => {
+      console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
+    });
   }
 
   async function refreshCodexQuotaAll() {
