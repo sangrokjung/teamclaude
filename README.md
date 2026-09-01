@@ -322,10 +322,15 @@ inference, only `response.completed` is success evidence; `response.failed`,
 account.
 
 Even without a declaration, the proxy detects a terminated subscription on its
-own: after `codexAuthFailureThreshold` (default 3) consecutive 401/403 usage-poll
-failures it forces one token refresh plus a confirm re-poll, parks the account
-out of rotation only when both agree, and returns it to rotation automatically
-on the next valid usage poll (5xx, 429, and network errors never count).
+own: after `codexAuthFailureThreshold` (default 3) 401/403 usage-poll failures
+accumulated without an intervening success (a valid poll or a completed
+inference — 5xx, 429, and network errors neither count nor reset) it forces
+one token refresh plus a confirm re-poll, parks the account out of rotation
+only when both agree, and returns it to rotation automatically on the next
+valid usage poll. A circuit breaker withholds this poll-evidence park when it
+would leave zero available accounts, so a usage-endpoint-only outage can never
+empty the pool; real request-path auth failures may still park the last
+account.
 
 ### Hermes Agent through TeamCodex
 
