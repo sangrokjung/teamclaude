@@ -1637,6 +1637,10 @@ export class AccountManager {
       delete account._errorFromUsagePoll;
     }
     delete account._refreshRetryAt;
+    // Fresh external credentials are a fresh evidence baseline: a stale
+    // usage-poll terminal streak must not let the very first poll failure on
+    // the NEW credential re-escalate straight to quarantine.
+    delete account._usageAuthStreak;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).

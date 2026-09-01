@@ -520,6 +520,14 @@ test('markAccountSuccess resets the usage-poll auth streak', () => {
   assert.equal(account._usageAuthStreak ?? 0, 0);
 });
 
+test('updateAccountTokens clears the usage-poll auth streak (fresh credentials = fresh evidence baseline)', () => {
+  const mgr = codexManager();
+  const account = mgr.accounts[0];
+  account._usageAuthStreak = 2;
+  mgr.updateAccountTokens(0, { accessToken: 'new-access', expiresAt: Date.now() + 3_600_000 }, false);
+  assert.equal(account._usageAuthStreak, undefined);
+});
+
 test('a request-path re-park clears a stale poll-quarantine tag', () => {
   const mgr = codexManager();
   const account = mgr.accounts[0];
