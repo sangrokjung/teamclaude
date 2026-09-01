@@ -27,13 +27,19 @@ function closeServer(server) {
 // auth.openai.com token endpoint (mutable outcome + hit counter). The startup
 // usage fan-out is awaited and its counters cleared, so each test drives polls
 // deterministically via proxy.refreshQuotaAll().
-async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
-  const wham = { hits: 0, status: 200, usedPercent: 42 };
-  const token = { hits: 0, status: 200, invalidGrant: true };
+// opts.bystander adds a SECOND account whose usage polls always succeed
+// (routed by its bearer token), so tests can control how many accounts are
+// available while the scripted account fails. `token.onHit` runs synchronously
+// inside the token-endpoint fetch — i.e. DURING an in-flight forced refresh —
+// so tests can inject concurrent request-path events into that await window.
+async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}, opts = {}) {
+  const wham = { hits: 0, bystanderHits: 0, status: 200, usedPercent: 42 };
+  const token = { hits: 0, status: 200, invalidGrant: true, onHit: null };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (input, init) => {
     if (String(input) === 'https://auth.openai.com/oauth/token') {
       token.hits++;
+      token.onHit?.();
       if (token.status === 200) {
         return Promise.resolve(new globalThis.Response(JSON.stringify({
           access_token: `fresh-access-${token.hits}`,
@@ -50,6 +56,23 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
   };
   const upstream = http.createServer((req, res) => {
     if (req.url === '/backend-api/wham/usage') {
+      if (req.headers.authorization === 'Bearer access-b') {
+        // The bystander account is always healthy on the usage endpoint; its
+        // hits are counted separately so the scripted assertions below stay
+        // exact for the account under test.
+        wham.bystanderHits++;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          rate_limit: {
+            primary_window: {
+              used_percent: 5,
+              limit_window_seconds: 604800,
+              reset_at: Math.floor(Date.now() / 1000) + 6 * 24 * 3600,
+            },
+          },
+        }));
+        return;
+      }
       wham.hits++;
       // A per-hit plan wins over the sticky status switch (race-free scripting
       // of "N failures, then healthy" inside a single escalation pass).
@@ -84,7 +107,15 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
     accountId: 'workspace-a',
     expiresAt: Date.now() + 3_600_000,
     ...accountOverrides,
-  }]);
+  }, ...(opts.bystander ? [{
+    name: 'codex-bystander',
+    provider: 'codex',
+    type: 'oauth',
+    accessToken: 'access-b',
+    refreshToken: 'refresh-b',
+    accountId: 'workspace-b',
+    expiresAt: Date.now() + 3_600_000,
+  }] : [])]);
   const persisted = [];
   manager.onAccountMetadata((_account, metadata) => persisted.push(metadata));
   const proxy = createProxyServer(manager, {
@@ -107,6 +138,7 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
     persisted,
     proxyPort,
     account: manager.accounts[0],
+    bystander: manager.accounts[1] ?? null,
     poll: () => proxy.refreshQuotaAll(),
     close: async () => {
       globalThis.fetch = originalFetch;
@@ -171,7 +203,9 @@ test('a terminal streak plus a terminal refresh parks the account, and a valid p
 });
 
 test('refresh success followed by a terminal confirm re-poll parks as auth-revoked', async () => {
-  const h = await startAutoDetectHarness();
+  // A healthy bystander keeps the pool alive: with another available account
+  // in rotation, the circuit breaker lets the confirmed park proceed.
+  const h = await startAutoDetectHarness({}, {}, { bystander: true });
   try {
     h.wham.status = 401;
     await h.poll();
@@ -355,6 +389,96 @@ test('a request-path auth park is NOT healed by a poll success (existing rules p
     await h.poll();
     assert.equal(h.account.status, 'error');
     assert.equal(h.account.errorReason, 'auth-revoked');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a request-path park landing during the forced refresh keeps its stricter healing (no misattribution)', async () => {
+  const h = await startAutoDetectHarness();
+  try {
+    // While the escalation's forced refresh is in flight (awaited), the
+    // request-path 401 handler parks the account ('auth-revoked', not
+    // refresh-caused). The watchdog must NOT claim that park as its own:
+    // tagging it _errorFromUsagePoll would make a later poll success heal a
+    // request-path park, violating the pinned healing contract.
+    h.token.onHit = () => { h.manager.markAuthenticationError(h.account, 'auth-revoked'); };
+    h.wham.status = 401;
+    await h.poll();
+    await h.poll();
+    await h.poll(); // escalation: refresh starts → request path parks mid-await
+    assert.equal(h.token.hits, 1);
+    assert.equal(h.account.status, 'error');
+    assert.equal(h.account.errorReason, 'auth-revoked');
+    assert.equal(h.account._errorFromUsagePoll, undefined); // not the watchdog's park
+    assert.equal(h.wham.hits, 3); // parked during refresh — no confirm re-poll
+
+    // A later valid poll must NOT heal the request-path park.
+    h.wham.status = 200;
+    await h.poll();
+    assert.equal(h.account.status, 'error');
+    assert.equal(h.account.errorReason, 'auth-revoked');
+  } finally {
+    await h.close();
+  }
+});
+
+test('circuit breaker: the watchdog never parks the last available account', async () => {
+  const h = await startAutoDetectHarness({}, {}, { bystander: true });
+  try {
+    // Legitimate request-path park takes the bystander out; the scripted
+    // account is now the only one left in rotation.
+    h.manager.markAuthenticationError(h.bystander, 'auth-revoked');
+    h.wham.status = 401;
+    await h.poll();
+    await h.poll();
+    await h.poll(); // escalation: refresh ok, confirm 401 — but the park is withheld
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.token.hits, 1); // the escalation itself ran
+    assert.equal(h.wham.hits, 4); // 3 streak polls + 1 confirm re-poll
+
+    // The deferral consumed the streak; the next threshold re-judges (and,
+    // with nothing else available, defers again — the pool never empties on
+    // usage-endpoint-only evidence).
+    await h.poll();
+    await h.poll();
+    await h.poll();
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.token.hits, 2);
+
+    // The request path is NOT breaker-gated: real request evidence may still
+    // park the last available account.
+    h.manager.markAuthenticationError(h.account, 'auth-revoked');
+    assert.equal(h.account.status, 'error');
+    assert.equal(h.account.errorReason, 'auth-revoked');
+  } finally {
+    await h.close();
+  }
+});
+
+test('circuit breaker: a deferred account resets its streak on a valid poll', async () => {
+  const h = await startAutoDetectHarness({}, {}, { bystander: true });
+  try {
+    h.manager.markAuthenticationError(h.bystander, 'auth-revoked');
+    h.wham.status = 401;
+    await h.poll();
+    await h.poll();
+    await h.poll(); // escalation → deferred by the breaker
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.token.hits, 1);
+
+    // The usage endpoint recovers: the poll succeeds, usage applies, and the
+    // streak resets — two later terminal failures do not re-escalate.
+    h.wham.status = 200;
+    h.wham.usedPercent = 61;
+    await h.poll();
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.account.quota.unified7d, 0.61);
+    h.wham.status = 401;
+    await h.poll();
+    await h.poll();
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.token.hits, 1); // streak was reset — no new escalation yet
   } finally {
     await h.close();
   }
