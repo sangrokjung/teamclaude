@@ -95,7 +95,7 @@ another session's uncommitted work.
    - After the new runtime is stable, write the new hash to
      `~/.codex/state/teamcodex-runtime-approved.sha256`. When `SOURCE_ROOT`
      is later cleaned to that tree, the deployer converges it as current.
-   - Update `last-good.sha256` **only after several hours of stability** on
+   - Update `~/.codex/state/teamcodex-runtime-last-good.sha256` **only after several hours of stability** on
      the new runtime, because it is the rollback destination and must keep
      pointing at a known-good version until then.
 

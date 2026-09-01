@@ -19,19 +19,26 @@ not exist in the domain, so `kickstart` fails every time with
 performs this bootstrap automatically as a fallback; this runbook covers
 manual diagnosis and recovery, and the guard's remaining blind spot.
 
-## Incident (2026-09-01)
+## Incident (2026-08-31 → 2026-09-01)
 
-- **~00:05**: service healthy; last healthy guard sample.
-- **00:06**: guard observes the 3457 listener missing.
-- **00:08**: guard's `launchctl kickstart` starts failing with
-  `Could not find service`, the signature of a bootout. The actor that ran
-  the bootout was never identified; worktree development sessions were
-  running deploy/server-cycle work at the same time. Afterwards a **dev
-  server intermittently occupied port 3457**, so the guard's listener probe
-  read healthy and the outage stayed hidden.
-- **Morning**: the squatting dev process died; the outage became visible
-  (all accounts offline, Codex CLI reconnect loops).
-- **11:44**: manual `launchctl bootstrap` restored the service.
+Timeline per the guard log (`~/.codex/log/teamcodex-proxy-guard.log`):
+
+- **08-31 22:37–22:39**: first bootout signature: the guard observes the
+  3457 listener missing and its `launchctl kickstart` fails with
+  `Could not find service` (22:39). The actor that ran the bootout was never
+  identified; worktree development sessions were running deploy/server-cycle
+  work at the same time. From here on a **dev server intermittently occupied
+  port 3457**, so the guard's listener probe flapped back to "healthy"
+  (22:40, and repeatedly overnight) and the outage stayed hidden.
+- **08-31 23:59 / 09-01 00:08–00:09 / 01:34**: further short
+  `Could not find service` episodes, each masked again by the squatter
+  within minutes.
+- **09-01 morning (08:33 onward)**: the squatting dev process died for good;
+  the outage became continuously visible (`start-failed` every minute, all
+  accounts offline, Codex CLI reconnect loops).
+- **09-01 ~11:50**: manual `launchctl bootstrap` restored the service (the
+  guard's `start-failed` lines run through 11:49:32 and the first healthy
+  probe is 11:50:32).
 
 ### Why three layers of protection all failed
 
@@ -119,7 +126,7 @@ this repo) gained a **bootstrap fallback**:
 If a foreign process that answers a TeamClaude-shaped `/teamclaude/status`
 squats on port 3457, the guard reads the port as healthy and the absence of
 the real production service stays hidden; there is no identity check or
-alert on the listener's owner (this is exactly what masked the 2026-09-01
-outage for hours). The recovery chain is closed only for the case where the
+alert on the listener's owner (this is exactly what masked the 2026-08-31 → 09-01
+outage overnight). The recovery chain is closed only for the case where the
 squatter dies: if the service is registered, `KeepAlive` restarts it in
 ~3 s; if it is booted out, the guard fallback restores it in ~3–4 minutes.
