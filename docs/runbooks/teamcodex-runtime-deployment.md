@@ -28,11 +28,19 @@ manual staging path used on 2026-09-01 (Path B), verification, and rollback.
    `SOURCE_ROOT=/Users/sangrok/projects/teamclaude`.
 2. If the candidate matches
    `~/.codex/state/teamcodex-runtime-approved.sha256` (the operator's
-   approval token), it decides to restart: drain, stage the artifact,
-   `bootout`/`bootstrap` the service, then verify the new runtime.
+   approval token), it decides to restart, but only once the proxy is idle
+   (`inflight == 0` for consecutive 30 s samples; an approved deploy sits in
+   a wait state under traffic). The artifact is staged first, then the
+   admission fence is applied (a drain when the live runtime exposes a
+   lifecycle id, a SIGSTOP fence otherwise), then `bootout`/`bootstrap`,
+   then verification of the new runtime.
 3. On verification failure it rolls back to `rollback_hash` and records
-   `failed_hash`; that hash is refused for redeploy until approval is
-   re-issued.
+   `failed_hash`. Re-issuing the same approval does NOT clear that block:
+   the deployer must first observe the approval file absent/invalid while
+   `failed_hash` matches the source (setting `failed_approval_removed`),
+   and only a fresh approval after that removal re-enables the hash. To
+   retry a failed hash: delete the approved-hash file, wait one 30 s
+   deployer cycle, then write the approval again.
 4. While the candidate does not match the approved hash, the deployer only
    logs `unapproved` and takes no action.
 
@@ -101,11 +109,19 @@ another session's uncommitted work.
 
 ## Rollback
 
-Restore the plist backup, then `bootout`/`bootstrap` the service. A mismatch
-where the deployer state file
-(`~/.codex/state/teamcodex-runtime-deployer.json`) `active_hash` still points
-at the old version is harmless: the deployer treats the mismatch as
-`unapproved` and only watches.
+Restore the plist backup, then `bootout`/`bootstrap` the service.
+
+CAUTION: before rolling back, check
+`~/.codex/state/teamcodex-runtime-approved.sha256` against the hash of
+`SOURCE_ROOT`'s current `src/*.js`. The deployer's verdict comes from that
+comparison, not from its state file: if `SOURCE_ROOT` still hashes to the
+approved value, the 30 s deployer will decide `restart` and redeploy the
+artifact you just rolled away from. In that case remove (or change) the
+approved-hash file first, then restore the plist. When the hashes already
+differ (the usual case with a dirty checkout), the state-file mismatch
+(`~/.codex/state/teamcodex-runtime-deployer.json` `active_hash` pointing at
+the old version) is harmless: the deployer logs `unapproved` and only
+watches.
 
 ## Deployment record (2026-09-01)
 

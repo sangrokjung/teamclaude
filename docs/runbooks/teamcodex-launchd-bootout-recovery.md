@@ -46,8 +46,9 @@ Timeline per the guard log (`~/.codex/log/teamcodex-proxy-guard.log`):
    `launchctl kickstart`. A booted-out service is not in the domain, so the
    kickstart failed with `Could not find service` every minute: the guard
    detected the outage but could not repair it.
-2. **`teamcodex_runtime_deployer.py`** only logged `unverified-runtime`. By
-   design it takes no action outside an approved deployment.
+2. **`teamcodex_runtime_deployer.py`** only logged watch verdicts (mostly
+   `unapproved`, with `unverified-runtime` runs during the true-outage
+   windows). By design it takes no action outside an approved deployment.
 3. **tunnel-reviver** owns only the tunnel port; port 3457 is out of scope.
 
 ## Diagnosis
@@ -123,10 +124,12 @@ this repo) gained a **bootstrap fallback**:
 
 ## Residual limitation (backlog)
 
-If a foreign process that answers a TeamClaude-shaped `/teamclaude/status`
-squats on port 3457, the guard reads the port as healthy and the absence of
-the real production service stays hidden; there is no identity check or
-alert on the listener's owner (this is exactly what masked the 2026-08-31 → 09-01
-outage overnight). The recovery chain is closed only for the case where the
+If ANY foreign process listens on port 3457, the guard's liveness probe (a
+bare TCP connect in `listener_available()`) resets its missing-listener
+counter and blocks the start path, so the absence of the real production
+service stays hidden; a TeamClaude-shaped `/teamclaude/status` responder is
+only needed for the `healthy` log line, not for the masking itself. There is
+no identity check or alert on the listener's owner (this is exactly what
+masked the 2026-08-31 → 09-01 outage overnight). The recovery chain is closed only for the case where the
 squatter dies: if the service is registered, `KeepAlive` restarts it in
 ~3 s; if it is booted out, the guard fallback restores it in ~3–4 minutes.
