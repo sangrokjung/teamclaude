@@ -399,7 +399,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       .catch(() => { /* terminal failures are handled inside ensureTokenFresh */ });
     if (warmupClosed || accountManager.accounts[account.index] !== account) return;
     if (account.status === 'error') {
-      account._errorFromUsagePoll = true;
+      // Attribute the park precisely: during the awaited refresh the
+      // request-path 401 handler may have parked this account itself
+      // ('auth-revoked', `_errorFromRefresh` false). Only a refresh-caused
+      // park (`_errorFromRefresh` true — set by ensureTokenFresh's terminal
+      // failure, including the r7 subscription-ended delegation's
+      // refresh-failed entry) belongs to THIS escalation; claiming a
+      // request-path park would make it poll-healable, breaking the pinned
+      // "request-path parks keep their stricter healing" contract.
+      if (account._errorFromRefresh === true) account._errorFromUsagePoll = true;
       return;
     }
     // Step 2: re-poll once with the (possibly refreshed) credential. Terminal
@@ -408,7 +416,21 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     const confirm = await fetchCodexUsageOnce(account);
     if (warmupClosed || accountManager.accounts[account.index] !== account) return;
     if (confirm.authOk || !confirm.terminalAuth) return;
+    // Parked by another path while the re-poll was in flight: that park keeps
+    // its own healing rules — never re-mark or re-tag it here.
+    if (account.status === 'error') return;
+    // Circuit breaker: poll-only evidence must never park the LAST available
+    // account. If the whole fleet is truly dead, real request traffic (or a
+    // terminal token refresh) still parks the final account on request-path
+    // evidence; a usage-endpoint-only outage must not empty an idle pool.
+    // The streak stays consumed — the next threshold re-judges availability.
+    if (!accountManager.hasOtherAvailableAccount(account)) {
+      console.error(`[TeamClaude] Codex account "${account.name}" failed the usage-poll auth confirmation, but it is the last available account — quarantine deferred (re-judged on the next failure streak)`);
+      return;
+    }
     accountManager.markAuthenticationError(account, 'auth-revoked');
+    // Tag synchronously with the park (no await in between): a concurrent
+    // request-path park can never be mistaken for this one.
     if (account.status === 'error') account._errorFromUsagePoll = true;
     console.error(`[TeamClaude] Codex account "${account.name}" quarantined: usage polls and a fresh token both rejected (auto-recovers on a valid usage poll)`);
     await accountManager.waitForAccountFlag(account).catch(err => {

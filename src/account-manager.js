@@ -1519,6 +1519,20 @@ export class AccountManager {
     return account;
   }
 
+  /**
+   * True when at least one OTHER account can serve rotation right now (the
+   * same `_isAvailable` notion every selection path funnels through: enabled,
+   * un-parked, un-throttled, under threshold). Used by the usage-poll
+   * watchdog's circuit breaker: poll-only evidence must never park the LAST
+   * available account, or a usage-endpoint-only outage (WAF rule, endpoint
+   * contract change) would empty an idle pool. Read-only w.r.t. selection.
+   */
+  hasOtherAvailableAccount(ref) {
+    const account = this._resolveRef(ref);
+    if (!account) return false;
+    return this.accounts.some(a => a !== account && this._isAvailable(a));
+  }
+
   markAuthenticationError(ref, reason = 'auth-revoked', now = Date.now(), persist = true) {
     const account = this._resolveRef(ref);
     if (!account) return null;
@@ -1623,6 +1637,10 @@ export class AccountManager {
       delete account._errorFromUsagePoll;
     }
     delete account._refreshRetryAt;
+    // Fresh external credentials are a fresh evidence baseline: a stale
+    // usage-poll terminal streak must not let the very first poll failure on
+    // the NEW credential re-escalate straight to quarantine.
+    delete account._usageAuthStreak;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).
