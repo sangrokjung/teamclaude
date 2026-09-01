@@ -35,6 +35,7 @@
   "claudeAmbiguousDispatchMaxResumes": 1,
   "claudeConnectionRecoveryMaxWaitMs": 900000,
   "codexFallbackOnExhaustion": false,
+  "codexAuthFailureThreshold": 3,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,
   "accounts": [
