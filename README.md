@@ -321,6 +321,12 @@ inference, only `response.completed` is success evidence; `response.failed`,
 `response.incomplete`, `error`, and `[DONE]` alone do not reopen an ended
 account.
 
+Even without a declaration, the proxy detects a terminated subscription on its
+own: after `codexAuthFailureThreshold` (default 3) consecutive 401/403 usage-poll
+failures it forces one token refresh plus a confirm re-poll, parks the account
+out of rotation only when both agree, and returns it to rotation automatically
+on the next valid usage poll (5xx, 429, and network errors never count).
+
 ### Hermes Agent through TeamCodex
 
 Keep the Codex proxy running and point Hermes at the stable local endpoint:

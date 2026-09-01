@@ -314,6 +314,11 @@ Responses 객체여야 하며, 빈 본문·잘못된 JSON·failed/incomplete HTT
 `response.failed`·`response.incomplete`·`error`·`[DONE]` 단독으로는 종료 계정을
 다시 활성화하지 않습니다.
 
+선언이 없어도 프록시가 구독 종료를 스스로 감지합니다. 사용량 폴에서 401/403이
+`codexAuthFailureThreshold`(기본 3)회 연속 관측되면 토큰 refresh 1회와 확인
+재폴까지 거친 뒤에만 해당 계정을 rotation에서 제외하고, 이후 유효한 사용량 폴이
+성공하면 자동으로 복귀시킵니다(5xx·429·네트워크 오류는 증거로 세지 않습니다).
+
 ## Hermes Agent 연결
 
 TeamCodex를 실행한 뒤 Hermes의 Codex provider가 로컬 프록시를 사용하도록
