@@ -370,7 +370,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Accounts parked here are tagged `_errorFromUsagePoll`, which scopes the
   // automatic poll-success recovery in markAccountSuccess to THIS quarantine
   // (request-path 401 parks keep their stricter healing rules). Streaks are
-  // in-memory only; a restart starts clean.
+  // in-memory only; a restart starts clean. Any positive auth evidence resets
+  // the streak: a valid poll here, and a completed inference / applied poll via
+  // markAccountSuccess — so an account that is actively serving traffic cannot
+  // be quarantined by usage-endpoint-only 401/403s.
   async function watchCodexAuthOutcome(account, outcome) {
     if (warmupClosed || accountManager.accounts[account.index] !== account) return;
     if (outcome.authOk) {

@@ -1573,6 +1573,12 @@ export class AccountManager {
       this._drainWaiters();
     }
     delete account._errorFromUsagePoll;
+    // Positive auth evidence also resets the usage-poll terminal-failure
+    // streak: a completed inference proves the credential against the SAME
+    // backend, so an actively-serving account can never be escalated into
+    // quarantine by usage-endpoint-only 401/403s (WAF rule, endpoint contract
+    // change, plan/scope policy divergence on /wham/usage).
+    delete account._usageAuthStreak;
     account.lastSuccessfulAt = new Date(now).toISOString();
     return account;
   }

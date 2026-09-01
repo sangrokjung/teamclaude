@@ -28,9 +28,14 @@ classify the failure as `subscription-ended`, this feature delegates to it.
    the r7 delegation to `subscription-ended` when a declared cancellation is
    due) or when the confirm re-poll is terminal again (`auth-revoked`). A
    healthy or inconclusive confirm cancels the escalation without parking.
-   - The streak is in-memory only (restart resets it), resets on any 2xx poll,
-     and is *kept* (neither grown nor reset) across non-terminal noise: only
-     positive auth evidence proves the credential. Escalating consumes the
+   - The streak is in-memory only (restart resets it), resets on any positive
+     auth evidence — a 2xx poll, an applied usage payload, or a **completed
+     inference** on the same backend (`markAccountSuccess`) — and is *kept*
+     (neither grown nor reset) across non-terminal noise: only positive auth
+     evidence proves the credential, and a completed inference IS positive
+     evidence, so an actively-serving account can never be quarantined by
+     usage-endpoint-only 401/403s (WAF rule, endpoint contract change,
+     plan/scope policy divergence on `/wham/usage`). Escalating consumes the
      streak, so the poll cadence itself paces re-escalation; no extra cooldown.
    - No new `errorReason` enum value is introduced (external dashboards keep
      rendering); the quarantine is distinguished by the in-memory cause tag
@@ -48,9 +53,12 @@ classify the failure as `subscription-ended`, this feature delegates to it.
 
 ## Acceptance criteria
 
-Covered by `test/server-codex-auto-detect.test.js` (12 tests):
+Covered by `test/server-codex-auto-detect.test.js` (14 tests):
 
 - Below-threshold terminal failures and any amount of 5xx/429 change nothing.
+- A completed inference through the proxy resets the terminal poll streak
+  (unit + integration), so a serving account never escalates on poll-only
+  401/403s.
 - Streak + terminal refresh parks as `refresh-failed`; streak + refresh success
   + terminal confirm parks as `auth-revoked`; healthy confirm cancels.
 - 403 counts like 401; `codexAuthFailureThreshold: 1` escalates immediately.

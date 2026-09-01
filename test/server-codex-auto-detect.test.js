@@ -72,7 +72,7 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ id: 'response-id' }));
+    res.end(JSON.stringify({ id: 'response-id', object: 'response', status: 'completed' }));
   });
   const upstreamPort = await listen(upstream);
   const manager = new AccountManager([{
@@ -95,7 +95,7 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
     codexUsageActiveMs: 0,
     ...extraConfig,
   });
-  await listen(proxy);
+  const proxyPort = await listen(proxy);
   // Settle the startup fan-out, then reset the counters.
   await proxy.refreshQuotaAll();
   wham.hits = 0;
@@ -105,6 +105,7 @@ async function startAutoDetectHarness(extraConfig = {}, accountOverrides = {}) {
     token,
     manager,
     persisted,
+    proxyPort,
     account: manager.accounts[0],
     poll: () => proxy.refreshQuotaAll(),
     close: async () => {
@@ -256,6 +257,36 @@ test('a successful poll resets the terminal streak', async () => {
   }
 });
 
+test('a completed inference resets the terminal poll streak (serving accounts are never quarantined by poll-only 403s)', async () => {
+  const h = await startAutoDetectHarness();
+  try {
+    // Two terminal polls: one short of the escalation threshold.
+    h.wham.status = 403;
+    await h.poll();
+    await h.poll();
+    // A completed inference on the SAME backend is positive auth evidence —
+    // stronger than usage-endpoint 403s (which may be endpoint-scoped: WAF
+    // rule, contract change, plan/scope policy). It must reset the streak.
+    const response = await fetch(`http://127.0.0.1:${h.proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5', input: 'hello' }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    // Two more terminal polls: only 2 since the success → still no escalation.
+    await h.poll();
+    await h.poll();
+    assert.equal(h.account.status, 'active');
+    assert.equal(h.token.hits, 0); // no forced refresh ever happened
+    // A third consecutive failure with no interleaved success escalates as usual.
+    await h.poll();
+    assert.equal(h.token.hits, 1);
+  } finally {
+    await h.close();
+  }
+});
+
 test('codexAuthFailureThreshold: 1 escalates on the first terminal failure', async () => {
   const h = await startAutoDetectHarness({ codexAuthFailureThreshold: 1 });
   try {
@@ -355,6 +386,14 @@ test('markAccountSuccess heals only a poll-quarantined error', () => {
   mgr.markAccountSuccess(account);
   assert.equal(account.status, 'error');
   assert.equal(account.errorReason, 'auth-revoked');
+});
+
+test('markAccountSuccess resets the usage-poll auth streak', () => {
+  const mgr = codexManager();
+  const account = mgr.accounts[0];
+  account._usageAuthStreak = 2;
+  mgr.markAccountSuccess(account);
+  assert.equal(account._usageAuthStreak ?? 0, 0);
 });
 
 test('a request-path re-park clears a stale poll-quarantine tag', () => {
