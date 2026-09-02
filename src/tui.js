@@ -1060,7 +1060,7 @@ export class TUI {
         const reauth = this._canReauthenticate(selected)
           ? `  ${red('재인증 필요')} [${bold('r')}]`
           : '';
-        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}toggle  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
       }
       case 'select':
         return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;

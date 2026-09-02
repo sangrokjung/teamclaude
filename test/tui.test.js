@@ -23,12 +23,14 @@ test('CJK display width counts Korean as two terminal columns', () => {
 });
 
 test('80-column footer with Korean reauthentication text never wraps quit', () => {
-  const { tui, am } = makeTUI(['a0']);
+  const am = new AccountManager([{ name: 'a0', type: 'oauth', provider: 'codex', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98, 0, 5);
+  const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
   am.accounts[0].status = 'error';
   am.accounts[0].errorReason = 'auth-revoked';
-  const footer = fitLine(tui._renderFooter(), 80);
-  assert.equal(displayWidth(footer), 80);
-  assert.doesNotMatch(footer, /\r|\n/);
+  const footer = tui._renderFooter();
+  assert.ok(displayWidth(footer) <= 80);
+  assert.match(footer, /q.*uit/);
+  assert.match(fitLine(footer, 80), /q.*uit/);
 });
 
 // Build a TUI wired to a real AccountManager + a config copy, without start()
