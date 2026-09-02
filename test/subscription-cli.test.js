@@ -25,8 +25,8 @@ function account(email) {
   };
 }
 
-function runSubscription(configPath, args) {
-  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TZ: 'Asia/Seoul' };
+function runSubscription(configPath, args, timezone = 'Asia/Seoul') {
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TZ: timezone };
   delete env.TEAMCLAUDE_SESSION_SUPERVISED;
   return spawnSync(process.execPath, [entry, 'codex', 'subscription', ...args], {
     encoding: 'utf8',
@@ -86,6 +86,21 @@ test('subscription cancel accepts equals-form identity and end-date flags', asyn
       '--account-uuid=uuid-test981110@example.com',
     ]);
     assert.equal(dated.status, 0, dated.stderr);
+
+    const account = (await fx.read()).accounts.find(a => a.email.startsWith('test981110@'));
+    assert.equal(account.subscriptionCancellation.endsAt, '2026-09-06T15:00:00.000Z');
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test('subscription cancel stores the KST end boundary on a non-KST host', async () => {
+  const fx = await fixture();
+  try {
+    const result = runSubscription(fx.configPath, [
+      'cancel', 'test981110', '--ends-on', '2026-09-06',
+    ], 'America/New_York');
+    assert.equal(result.status, 0, result.stderr);
 
     const account = (await fx.read()).accounts.find(a => a.email.startsWith('test981110@'));
     assert.equal(account.subscriptionCancellation.endsAt, '2026-09-06T15:00:00.000Z');

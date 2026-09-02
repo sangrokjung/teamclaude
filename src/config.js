@@ -20,6 +20,12 @@ export function normalizeContinuityMaxWaitMs(value) {
   return Math.max(1, Math.floor(value));
 }
 
+export function assertSafeProxyConfig(config) {
+  if (typeof config?.proxy?.apiKey !== 'string' || config.proxy.apiKey.trim() === '') {
+    throw new Error('Server startup requires a non-empty proxy.apiKey.');
+  }
+}
+
 async function syncParentDirectory(path) {
   if (process.platform === 'win32') return;
   const directory = await open(dirname(path), 'r');
@@ -335,6 +341,9 @@ export function createDefaultConfig() {
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,
+    // Bound requests accepted by the stable supervisor while its worker is
+    // still starting or being replaced.
+    workerReadyTimeoutMs: 30000,
     // Keep client requests inside the proxy while quota/cooldowns recover rather
     // than surfacing a 429 that interrupts an interactive Claude Code session.
     // A zero max wait retains the legacy fixed retry-count behavior.
@@ -345,6 +354,9 @@ export function createDefaultConfig() {
     // Maximum buffered upstream response per request. Transactional SSE spills
     // to disk after 1 MiB; non-SSE and OAuth responses remain memory-bounded.
     maxResponseBytes: 64 * 1024 * 1024,
+    // Process-wide bytes retained across all buffered responses, including
+    // transactional SSE spill files and non-SSE/OAuth response bodies.
+    maxBufferedResponseBytes: 256 * 1024 * 1024,
     // Total deadline for upstream response headers and buffered response bodies.
     // Long-lived SSE bodies are exempt after their response headers arrive.
     upstreamResponseTimeoutMs: 300000,
@@ -360,16 +372,14 @@ export function createDefaultConfig() {
     // Keys and targets are plain API model IDs (no "[1m]"-style suffixes); a
     // suffixed incoming model falls back to its suffix-stripped entry.
     // e.g. { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
-    modelFallbacks: {},
+    modelFallbacks: provider === 'codex'
+      ? { 'gpt-5.6-sol': ['gpt-5.6-terra'] }
+      : {},
     activeWarmup: provider === 'anthropic',
     launchModel: null,
     autoResumeClaude: true,
     claudeAutoResumeMaxRetries: 3,
     claudeAutoResumeBackoffMs: 2000,
-    claudeSafetyDenialMaxResumes: 1,
-    claudeSafeguardMaxResumes: 1,
-    claudeAmbiguousDispatchMaxResumes: 1,
-    claudeConnectionRecoveryMaxWaitMs: 900000,
     codexFallbackOnExhaustion: false,
     cmuxSessionRescue: false,
     cmuxSessionRescueIntervalMs: 1000,

@@ -476,7 +476,7 @@ test('real run seeds only a missing Claude OAuth marker from the production prox
 import { appendFileSync } from 'node:fs';
 appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   args: process.argv.slice(2),
-  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+  oauthValue: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
 }) + '\\n');
 `;
   await writeFile(join(bin, 'claude'), fakeClaude, { mode: 0o755 });
@@ -502,7 +502,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   manager.currentIndex = 1;
   const controlServer = createProxyServer(manager, {
     provider: 'anthropic',
-    proxy: { apiKey: '' },
+    proxy: { apiKey: 'fixture-proxy-key' },
     activeWarmup: false,
     upstream: 'http://127.0.0.1:1',
   });
@@ -513,7 +513,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   });
 
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: '' },
+    proxy: { port, apiKey: 'fixture-proxy-key' },
     autoResumeClaude: true,
     claudeAutoResumeMaxRetries: 1,
     claudeAutoResumeBackoffMs: 0,
@@ -521,7 +521,12 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
     accounts: [],
   }));
 
-  const statusResponse = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+    headers: {
+      'x-api-key': 'fixture-proxy-key',
+      'x-teamcodex-status-identity': '1',
+    },
+  });
   const status = await statusResponse.json();
   assert.equal(status.currentAccountUuid, 'uuid-b');
   assert.equal('accessToken' in status.accounts[1], false);
@@ -572,13 +577,13 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
 
       assert.equal(result.status, 0, `${scenario.name}: ${result.stderr}`);
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].oauthToken, scenario.expectedToken);
+      assert.equal(calls[0].oauthValue, scenario.expectedToken);
     });
   }
   assert.equal(manager.currentIndex, 1);
 });
 
-test('real run spills a seeded marker when its account cannot serve the request', async t => {
+test('real run fails closed when its seeded recovery account cannot serve the request', async t => {
   const scenarios = [
     { name: 'quota-blocked A to healthy B', quotaBlocked: true },
     { name: 'capped A to free B', quotaBlocked: false },
@@ -607,7 +612,7 @@ const response = await fetch(process.env.ANTHROPIC_BASE_URL + '/v1/messages', {
 });
 const body = await response.text();
 appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
-  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+  oauthValue: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
   responseStatus: response.status,
   body,
 }) + '\\n');
@@ -666,7 +671,7 @@ process.exit(response.status === 200 ? 0 : 9);
 
       const proxy = createProxyServer(manager, {
         provider: 'anthropic',
-        proxy: { apiKey: '' },
+        proxy: { apiKey: 'fixture-proxy-key' },
         upstream: `http://127.0.0.1:${upstreamPort}`,
         activeWarmup: false,
         continuityMode: false,
@@ -679,7 +684,7 @@ process.exit(response.status === 200 ? 0 : 9);
       });
 
       await writeFile(configPath, JSON.stringify({
-        proxy: { port, apiKey: '' },
+        proxy: { port, apiKey: 'fixture-proxy-key' },
         autoResumeClaude: true,
         claudeAutoResumeMaxRetries: 0,
         claudeAutoResumeBackoffMs: 0,
@@ -707,11 +712,11 @@ process.exit(response.status === 200 ? 0 : 9);
         held = null;
       }
 
-      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.status, 9, result.stderr);
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].oauthToken, recoveryToken('uuid-a'));
-      assert.equal(calls[0].responseStatus, 200);
-      assert.deepEqual(upstreamAuth, ['Bearer fixture-b']);
+      assert.equal(calls[0].oauthValue, recoveryToken('uuid-a'));
+      assert.equal(calls[0].responseStatus, 429);
+      assert.deepEqual(upstreamAuth, []);
     });
   }
 });
@@ -732,7 +737,7 @@ import { join } from 'node:path';
 const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
   args,
-  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+  oauthValue: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
 }) + '\\n');
 const resume = args.indexOf('--resume');
 if (resume >= 0 && args.at(-1) !== 'continue') {
@@ -783,7 +788,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
   manager.currentIndex = 1;
   const controlServer = createProxyServer(manager, {
     provider: 'anthropic',
-    proxy: { apiKey: '' },
+    proxy: { apiKey: 'fixture-proxy-key' },
     activeWarmup: false,
     upstream: 'http://127.0.0.1:1',
   });
@@ -794,7 +799,7 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
   });
 
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: '' },
+    proxy: { port, apiKey: 'fixture-proxy-key' },
     autoResumeClaude: true,
     claudeAutoResumeMaxRetries: 3,
     claudeAutoResumeBackoffMs: 0,
@@ -833,22 +838,22 @@ if (resume >= 0 && args.at(-1) !== 'continue') {
 
   assert.equal(recovered.status, 0, recovered.stderr);
   assert.equal(firstCalls.length, 1, 'first child must start before the simulated global drift');
-  assert.equal(firstCalls[0].oauthToken, initialRecoveryToken);
+  assert.equal(firstCalls[0].oauthValue, initialRecoveryToken);
   assert.equal(manager.currentIndex, 0, 'global current drifts to A before B recovers');
   assert.deepEqual(calls.map(call => call.args), [
     ['--resume', sessionId, '--model', 'claude-sonnet-5'],
     ['--resume', sessionId, 'continue'],
   ]);
-  assert.deepEqual(calls.map(call => call.oauthToken), [
+  assert.deepEqual(calls.map(call => call.oauthValue), [
     initialRecoveryToken,
     replacementRecoveryToken,
   ]);
   assert.equal(
-    parseClaudeRecoveryAccount(`Bearer ${calls[0].oauthToken}`),
+    parseClaudeRecoveryAccount(`Bearer ${calls[0].oauthValue}`),
     failedAccountUuid,
   );
   assert.equal(
-    parseClaudeRecoveryAccount(`Bearer ${calls[1].oauthToken}`),
+    parseClaudeRecoveryAccount(`Bearer ${calls[1].oauthValue}`),
     'uuid-a',
   );
 });
@@ -1264,7 +1269,7 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
     proxy: { port, apiKey: 'fixture-proxy-key' },
     autoResumeClaude: true,
     claudeAutoResumeBackoffMs: 0,
-    claudeConnectionRecoveryMaxWaitMs: 40,
+    continuityMaxWaitMs: 40,
     accounts: [],
   }));
 
@@ -1366,7 +1371,7 @@ if (sessionFlag >= 0) {
     autoResumeClaude: true,
     claudeAutoResumeMaxRetries: 1,
     claudeAutoResumeBackoffMs: 0,
-    claudeConnectionRecoveryMaxWaitMs: 50,
+    continuityMaxWaitMs: 50,
     accounts: [{ name: 'fixture', type: 'apikey', apiKey: 'fixture-key' }],
   }));
 

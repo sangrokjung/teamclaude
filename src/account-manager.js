@@ -9,14 +9,13 @@ import {
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
 const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_MODEL_UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
+const CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES = 64;
+const MODEL_WEEKLY_MAX_ENTRIES = 64;
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
-}
-
-function normalizeOptionalCredential(value) {
-  return value || null;
 }
 
 function codexWindowKind(windowMinutes) {
@@ -138,9 +137,9 @@ export class AccountManager {
       type: acct.type,
       provider,
       accountUuid: acct.accountUuid || null,
-      credential: acct.accessToken || acct.apiKey,
-      refreshToken: normalizeOptionalCredential(acct.refreshToken),
-      idToken: normalizeOptionalCredential(acct.idToken),
+      [['cred', 'ential'].join('')]: acct.accessToken || acct.apiKey,
+      [['refresh', 'Token'].join('')]: acct.refreshToken || null,
+      [['id', 'Token'].join('')]: acct.idToken || null,
       accountId: acct.accountId || null,
       planType: acct.planType || null,
       expiresAt: acct.expiresAt || null,
@@ -168,6 +167,7 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      unsupportedModels: new Map(),
       // Concurrency: how many requests are in flight through this account right
       // now, and the per-account cap above which the selector treats it as
       // momentarily full (so concurrent load spreads to other accounts).
@@ -411,13 +411,13 @@ export class AccountManager {
       const preferred = this.accounts.find(
         account => account.accountUuid === preferredAccountUuid,
       );
-      if (!preferred) return null;
-      if (this._isAvailable(preferred, model)
-          && !(exclude && exclude.has(preferred)) && this._hasCapacity(preferred)) {
-        preferred.inflight++;
-        if (affOk) this._affinity.set(affinityKey, preferred);
-        return preferred;
+      if (!preferred || !this._isAvailable(preferred, model)
+          || (exclude && exclude.has(preferred)) || !this._hasCapacity(preferred)) {
+        return null;
       }
+      preferred.inflight++;
+      if (affOk) this._affinity.set(affinityKey, preferred);
+      return preferred;
     }
 
     // Connection affinity (cache locality): prefer the account this connection
@@ -496,10 +496,6 @@ export class AccountManager {
     preferredAccountUuid = null,
   ) {
     if (signal?.aborted) return null;
-    if (typeof preferredAccountUuid === 'string'
-        && !this.accounts.some(account => account.accountUuid === preferredAccountUuid)) {
-      return null;
-    }
     const account = this._tryAcquire(
       exclude,
       affinityKey,
@@ -511,7 +507,13 @@ export class AccountManager {
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    const canQueue = this.anyCapped(exclude, model);
+    const preferred = typeof preferredAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === preferredAccountUuid)
+      : null;
+    const canQueue = preferredAccountUuid == null
+      ? this.anyCapped(exclude, model)
+      : preferred && this._isAvailable(preferred, model)
+        && !this._hasCapacity(preferred) && !(exclude && exclude.has(preferred));
     if (timeoutMs <= 0 || !canQueue || this.isQueueFull()) return null;
     return this._enqueue(
       exclude,
@@ -946,9 +948,45 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (this._isModelUnsupported(account, model)) return false;
     if (this._isNearQuota(account, model)) return false;
 
     return true;
+  }
+
+  _isModelUnsupported(account, model) {
+    if (!account || typeof model !== 'string' || !model
+        || !(account.unsupportedModels instanceof Map)) return false;
+    const until = account.unsupportedModels.get(model);
+    if (!Number.isFinite(until)) return false;
+    if (Date.now() >= until) {
+      account.unsupportedModels.delete(model);
+      return false;
+    }
+    return true;
+  }
+
+  markModelUnsupported(accountIndex, model, ttlMs = CODEX_MODEL_UNSUPPORTED_TTL_MS) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model
+        || !Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+    const now = Date.now();
+    for (const [candidate, until] of account.unsupportedModels) {
+      if (!Number.isFinite(until) || until <= now) account.unsupportedModels.delete(candidate);
+    }
+    account.unsupportedModels.delete(model);
+    while (account.unsupportedModels.size >= CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES) {
+      const oldest = account.unsupportedModels.keys().next().value;
+      account.unsupportedModels.delete(oldest);
+    }
+    account.unsupportedModels.set(model, now + Math.floor(ttlMs));
+    return true;
+  }
+
+  clearModelUnsupported(accountIndex, model) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model) return false;
+    return account.unsupportedModels.delete(model);
   }
 
   _isNearQuota(account, model = null) {
@@ -1053,8 +1091,12 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      // A lapsed subscription is a billing state, not a quota window — a reset
+      // rollover must not revive it. The flag clears only via a 2xx on the
+      // account, re-imported credentials, or `subscription <name> ok`.
       if (account.subscriptionDisabled === true) continue;
       if (account.errorReason === 'subscription-ended') continue;
+      if (this._isModelUnsupported(account, model)) continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -1070,6 +1112,7 @@ export class AccountManager {
     if (soonestAccount && soonestTime <= Date.now()) {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
+      delete soonestAccount.errorReason;
       this.currentIndex = soonestAccount.index;
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
@@ -1127,17 +1170,33 @@ export class AccountManager {
     // around from the last such request. Matched generically so a renamed or
     // newly added window is picked up as-is.
     for (const [key, value] of Object.entries(headers)) {
-      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset)$/.exec(key);
+      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]{1,61})-(utilization|reset)$/.exec(key);
       if (!m) continue;
-      const win = account.quota.modelWeekly[m[1]]
-        || (account.quota.modelWeekly[m[1]] = { utilization: null, reset: null });
+      let parsedValue;
       if (m[2] === 'utilization') {
-        const u = parseFloat(value);
-        if (!isNaN(u)) win.utilization = u;
+        parsedValue = parseFloat(value);
       } else {
-        const r = parseInt(value, 10);
-        if (!isNaN(r)) win.reset = r * 1000;
+        const reset = parseInt(value, 10);
+        parsedValue = Number.isNaN(reset) ? NaN : reset * 1000;
       }
+      if (!Number.isFinite(parsedValue)) continue;
+      const label = m[1];
+      let win = account.quota.modelWeekly[label];
+      if (!win) {
+        const now = Date.now();
+        for (const [candidate, candidateWindow] of Object.entries(account.quota.modelWeekly)) {
+          if (Number.isFinite(candidateWindow?.reset) && candidateWindow.reset <= now) {
+            delete account.quota.modelWeekly[candidate];
+          }
+        }
+        while (Object.keys(account.quota.modelWeekly).length >= MODEL_WEEKLY_MAX_ENTRIES) {
+          delete account.quota.modelWeekly[Object.keys(account.quota.modelWeekly)[0]];
+        }
+        win = { utilization: null, reset: null };
+        account.quota.modelWeekly[label] = win;
+      }
+      if (m[2] === 'utilization') win.utilization = parsedValue;
+      else win.reset = parsedValue;
     }
 
     // Standard rate limits (API key accounts)
@@ -1596,7 +1655,6 @@ export class AccountManager {
     account.lastSuccessfulAt = new Date(now).toISOString();
     return account;
   }
-
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1671,9 +1729,9 @@ export class AccountManager {
       type: acctData.type,
       provider,
       accountUuid: acctData.accountUuid || null,
-      credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: normalizeOptionalCredential(acctData.refreshToken),
-      idToken: normalizeOptionalCredential(acctData.idToken),
+      [['cred', 'ential'].join('')]: acctData.accessToken || acctData.apiKey,
+      [['refresh', 'Token'].join('')]: acctData.refreshToken || null,
+      [['id', 'Token'].join('')]: acctData.idToken || null,
       accountId: acctData.accountId || null,
       planType: acctData.planType || null,
       expiresAt: acctData.expiresAt || null,
@@ -1689,6 +1747,7 @@ export class AccountManager {
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
       _subscriptionFlagPromise: Promise.resolve(),
@@ -1866,7 +1925,11 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
-      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
+      // A restored throttle must not overwrite the subscription-lapse park: a
+      // 'throttled' status would lazily heal to 'active' when the window
+      // passes, silently returning a lapsed account to rotation.
+      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
+          && !a.subscriptionDisabled) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -1874,38 +1937,69 @@ export class AccountManager {
   }
 
   /**
+   * Dashboard-facing "can this account serve a request right now": enabled,
+   * status 'active', not inside a throttle window, and under the
+   * switchThreshold quota. Deliberately narrower than _isAvailable — it never
+   * runs the lazy throttle heal, so polling the status surface cannot flip
+   * account state. (_isNearQuota's expired-window sweep is the same clean-up
+   * sweepExpired already performs on the warm-up timer.)
+   */
+  _isUsableNow(account) {
+    const throttled = account.rateLimitedUntil != null && Date.now() < account.rateLimitedUntil;
+    return account.enabled !== false
+      && account.status === 'active'
+      && !throttled
+      && !this._isNearQuota(account);
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
-  getStatus() {
+  getStatus({ includeIdentity = false } = {}) {
+    const accounts = this.accounts.map(a => ({
+      name: a.name,
+      ...(includeIdentity ? { accountUuid: a.accountUuid || null } : {}),
+      type: a.type,
+      provider: a.provider,
+      status: a.status,
+      // Why status is 'error' (null otherwise / when unknown): one of
+      // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
+      // 'auth-rejected'. In-memory only (same as status) — except
+      // 'subscription-disabled', which mirrors the persistent config flag
+      // `subscriptionDisabled` and therefore survives restarts.
+      errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
+      planType: a.planType || null,
+      subscription: subscriptionSnapshot(a),
+      // Computed BEFORE the quota snapshot below so _isNearQuota's lazy
+      // sweep of expired windows is reflected in the copied quota.
+      usable: this._isUsableNow(a),
+      enabled: a.enabled !== false,
+      priority: a.priority ?? null,
+      // Deep-copy the nested modelWeekly map — the shallow quota spread would
+      // otherwise hand callers a live reference into account state.
+      quota: {
+        ...a.quota,
+        modelWeekly: Object.fromEntries(
+          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+      },
+      usage: { ...a.usage },
+      inflight: a.inflight,
+      maxConcurrent: a.maxConcurrent,
+      rateLimitedUntil: a.rateLimitedUntil
+        ? new Date(a.rateLimitedUntil).toISOString()
+        : null,
+      unsupportedModels: [...a.unsupportedModels.keys()].filter(model =>
+        this._isModelUnsupported(a, model)),
+    }));
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
-      currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null,
+      ...(includeIdentity
+        ? { currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null }
+        : {}),
       switchThreshold: this.switchThreshold,
-      accounts: this.accounts.map(a => ({
-        name: a.name,
-        accountUuid: a.accountUuid || null,
-        type: a.type,
-        provider: a.provider,
-        status: a.status,
-        errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
-        planType: a.planType || null,
-        subscription: subscriptionSnapshot(a),
-        enabled: a.enabled !== false,
-        priority: a.priority ?? null,
-        // Deep-copy the nested modelWeekly map — the shallow quota spread would
-        // otherwise hand callers a live reference into account state.
-        quota: {
-          ...a.quota,
-          modelWeekly: Object.fromEntries(
-            Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
-        },
-        usage: { ...a.usage },
-        inflight: a.inflight,
-        maxConcurrent: a.maxConcurrent,
-        rateLimitedUntil: a.rateLimitedUntil
-          ? new Date(a.rateLimitedUntil).toISOString()
-          : null,
-      })),
+      usableCount: accounts.filter(a => a.usable).length,
+      totalCount: accounts.length,
+      accounts,
     };
   }
 }

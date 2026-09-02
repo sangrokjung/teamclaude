@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-200%20passing-58e3a2?style=flat-square" alt="테스트 200개 통과">
+  <img src="https://img.shields.io/badge/tests-821%20passing-58e3a2?style=flat-square" alt="테스트 821개 통과">
   <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18 이상">
   <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="런타임 의존성 없음">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT 라이선스"></a>
@@ -128,6 +128,8 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **Use-or-lose 우선순위** — 주간 한도 초기화가 가장 가까운 계정을 먼저 사용합니다.
 - **Codex 구독 계정 풀** — ChatGPT OAuth 계정을 별도 풀로 관리하고 공식 Codex 사용량 헤더를 추적합니다.
 - **429 즉시 장애 전환** — 사용량이 끝난 계정은 잠시 제외하고 다음 계정으로 요청을 재전송합니다.
+- **구독 해지·인증 오류 분리** — 해지 계정은 결제 종료일까지 추적하고, terminal 인증 증거를 결합해 `subscription-ended`와 일반 인증 오류를 구분합니다. 복구 가능한 오류는 TUI에 UUID 고정 재인증 동작을 표시합니다.
+- **자격 증명 비노출 복구 상태** — status, CLI, TUI에는 안전한 오류 이유와 복구 동작만 표시하고 token이나 고정 계정 식별자는 노출하지 않습니다.
 - **연속성 모드** — quota 또는 transient/global 429를 기본 15분 deadline 안에서 프록시가 내부 복구하며, probe 간격은 최대 30초입니다.
 - **연결 affinity** — 같은 터미널의 연속 요청을 같은 계정에 유지해 prompt cache를 보존합니다.
 - **동시 요청 분산** — 계정별 동시 요청 한도를 넘는 트래픽은 다른 계정으로 자동 분산합니다.
@@ -284,7 +286,7 @@ teamcodex codex restart
 
 구독을 해지했지만 결제 기간이 남은 계정은 즉시 삭제하거나 비활성화하지 말고
 해지 사실을 기록하세요. 종료일을 아는 경우 `--ends-on`에는 마지막으로 사용할 수
-있는 현지 날짜를 넣습니다.
+있는 한국 표준시(KST) 날짜를 넣습니다.
 
 ```bash
 # 종료일을 모르는 해지 계정
@@ -384,6 +386,7 @@ TTY에서 `teamclaude server` 또는 `teamclaude codex server`를 실행하면
 | `a` | 전체 우선순위를 자동 모드로 초기화 |
 | `c` | 선택 계정의 고정 우선순위 해제 |
 | `d` | 계정 삭제 |
+| `r` | 인증 오류인 선택 계정 재인증 |
 | `R` | 설정 다시 읽기 및 사용량 재측정 |
 | `q` | 종료 |
 
@@ -406,35 +409,40 @@ metadata이며 ChatGPT 결제 페이지를 자동 조회한 값이 아닙니다.
 프록시가 실행되는 머신에서는 자격 증명이 빠진 동일한 JSON 상태를 조회할 수 있습니다.
 
 ```bash
-curl -sS http://127.0.0.1:3456/teamclaude/status
+curl -sS http://127.0.0.1:3457/teamclaude/status  # Codex provider
 ```
 
 응답에는 access token, refresh token, API key, authorization header가 들어가지
-않습니다. 다만 계정 이름과 UUID는 포함되므로 원본 JSON을 공개 채널에 올리지는
-마세요. 원격 호출은 여전히 `x-api-key` 인증이 필요하며, localhost 조회가 기본
-운영 점검 경로입니다.
+않습니다. 공개 status에는 계정 표시 이름만 있고 stable UUID는 빠집니다. UUID가
+필요한 내부 복구 호출은 localhost에서 proxy API key와 전용 identity header를 모두
+제시해야 합니다. 원본 JSON은 공개 채널에 올리지 마세요.
 
 OAuth 계정이 폐기됐거나 refresh grant가 무효라면 계정 회전만으로는 복구할 수
 없습니다. 기존 계정을 직접 재인증하세요.
 
 ```bash
+# Codex 계정 풀: 격리 CODEX_HOME에서 공식 Codex 로그인을 실행
+teamcodex codex reauth user@example.com
+teamcodex codex reauth user@example.com --account-uuid <account-uuid>
+teamcodex codex status
+
+# Anthropic 계정 풀
 teamcodex reauth user@example.com
-# TeamClaude 앱이나 status JSON에서 선택한 계정 UUID까지 고정
-teamcodex reauth user@example.com --account-uuid <account-uuid>
-teamcodex status
 ```
 
-이 명령은 Anthropic OAuth 로그인 후 반환된 프로필이 선택한 UUID와 일치할 때만
-해당 계정의 토큰을 교체합니다. UUID가 없는 구형 항목은 이메일이 일치해야 합니다.
+이 명령은 로그인 후 반환된 identity가 선택한 UUID와 일치할 때만 해당 계정의 토큰을
+교체합니다. Codex는 격리된 `CODEX_HOME`에서 공식 Codex CLI를 실행하고, Anthropic은
+OAuth 흐름을 사용합니다. UUID가 없는 구형 항목은 이메일이 일치해야 합니다.
 로그인 취소, 프로필 불일치, 비활성 계정, 조직 접근이 차단된 계정은 설정을 바꾸지
 않습니다. 실행 중인 프록시는 지원되는 경우 연결을 끊지 않고 다시 읽으며, 지원되지
 않으면 CLI가 `teamcodex restart`를 안내합니다.
 기존 계정이 자격 증명 파일에서 import된 경우, 재인증 성공 시 오래된
 `importFrom` 연결을 제거하므로 reload/restart 뒤에도 새 토큰이 유지됩니다.
 
-TeamClaude 메뉴바 앱에서는 복구할 수 있는 인증 오류 계정 옆에 **`재인증 필요`**
-버튼이 표시됩니다. 이 버튼도 같은 UUID 고정 절차를 사용하므로 다른 계정의 자격
-증명이 선택한 행에 잘못 저장되지 않습니다.
+TeamClaude/TeamCodex TUI에서는 복구할 수 있는 인증 오류 계정 옆에
+**`재인증 필요 [r]`**가 표시됩니다. `r`을 누르면 같은 UUID 고정 절차를 사용하므로
+다른 계정의 자격 증명이 선택한 행에 잘못 저장되지 않습니다. 확정된
+`subscription-ended`와 `subscription-disabled`에는 재인증을 표시하지 않습니다.
 
 필요하면 Claude Code 로그인을 갱신한 뒤 최신 자격 증명을 가져올 수도 있습니다.
 
@@ -493,7 +501,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
-| `modelFallbacks` | 모델별 대체 모델 체인 |
+| `modelFallbacks` | 모델별 대체 모델 체인. Anthropic 기본값은 `{}`, Codex 기본값은 `gpt-5.6-sol → gpt-5.6-terra` |
 | `streamRecovery` | SSE를 이벤트 단위로 중계하고 끊긴 스트림을 재시도 가능한 오류로 마무리 |
 | `tokenRefreshIntervalMs` | 유휴 계정 OAuth 갱신 스윕 간격 (`0`=비활성) |
 
@@ -504,6 +512,17 @@ surface→workspace topology가 모두 일치할 때만 동작합니다. 세션�
 불확실해도 같은 세션을 중복 실행하지 않습니다.
 
 버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
+
+Codex의 Sol→Terra fallback은 일반 400에 반응하지 않습니다. ChatGPT OAuth
+계정이 Sol을 지원하지 않는다는 exact 400을 반환한 경우에만 해당 계정·모델
+조합을 30분 격리하며, 거절된 POST는 재전송하지 않습니다. 모든 eligible
+OAuth 계정이 각자의 독립 요청에서 같은 exact 거절을 기록한 뒤 들어온 새
+요청만 Terra로 전환합니다. 격리 자체는 해당 OAuth 계정·모델 조합에만 적용되지만,
+요청 모델에 유효한 OAuth 격리 기록이 하나라도 생긴 시점부터 이후의 새 Codex 요청도
+계정 선택 전에 OAuth 풀로 고정됩니다. mixed pool의 API-key 계정으로 암묵적
+replay·failover하지 않으며, 사용할 OAuth 후보와 남은 fallback이 모두 없으면 가장 이른
+격리 TTL 만료를 `retry-after`에 담은 429를 즉시 반환합니다. 다른 모델은 계속 사용할 수
+있습니다.
 
 ## 작동 방식
 

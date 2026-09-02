@@ -3,11 +3,26 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { TUI } from '../src/tui.js';
 
+const maxFixture = (name, overrides = {}) => ({
+  name,
+  type: 'oauth',
+  accessToken: 't',
+  refreshToken: 'r',
+  expiresAt: Date.now() + 3600_000,
+  ...overrides,
+});
+const apiFixture = (name, overrides = {}) => ({
+  name,
+  type: 'apikey',
+  apiKey: 'k',
+  ...overrides,
+});
+
 // Build a TUI wired to a real AccountManager + a config copy, without start()
 // (start() is what touches stdin/stdout — the constructor just sets fields). A
 // mock saveConfig records that a persist happened.
 function makeTUI(names = ['a0', 'a1', 'a2']) {
-  const accts = names.map(n => ({ name: n, type: 'apikey', apiKey: `sk-${n}` }));
+  const accts = names.map(n => ({ name: n, type: 'apikey', apiKey: n }));
   const am = new AccountManager(accts.map(a => ({ ...a })), 0.98, 0, 5);
   const config = { accounts: accts.map(a => ({ ...a })) };
   let saves = 0;
@@ -188,9 +203,9 @@ test('order mode: "c" clears ONLY the grabbed account\'s rank', () => {
 
 test('display list sorts unranked accounts by the automatic drain order (weekly reset soonest first)', () => {
   const am = new AccountManager([
-    { name: 'far',  type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-    { name: 'soon', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-    { name: 'pin',  type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000, priority: 0 },
+    maxFixture('far'),
+    maxFixture('soon'),
+    maxFixture('pin', { priority: 0 }),
   ], 0.98, 0, 5);
   const now = Date.now();
   const HOUR = 3600_000;
@@ -206,8 +221,8 @@ test('display list sorts unranked accounts by the automatic drain order (weekly 
 // once, without any settings operation and without waiting for a traffic sweep.
 test('the display order follows a reset rollover without any set operation', () => {
   const am = new AccountManager([
-    { name: 'A', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-    { name: 'B', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    maxFixture('A'),
+    maxFixture('B'),
   ], 0.98, 0, 5);
   const now = Date.now(), DAY = 86400_000;
   am.accounts[0].quota.unified7d = 0.4; am.accounts[0].quota.unified7dReset = now + 1 * DAY;
@@ -228,8 +243,8 @@ test('the display order follows a reset rollover without any set operation', () 
 // The cursor must anchor the account OBJECT, not the row index.
 test('a live display reorder cannot retarget a pending delete (cursor anchors the object)', () => {
   const am = new AccountManager([
-    { name: 'a0', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-    { name: 'a1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    maxFixture('a0'),
+    maxFixture('a1'),
   ], 0.98, 0, 5);
   const now = Date.now(), DAY = 86400_000;
   // a0 drains first (soonest weekly reset) → display order [a0, a1]
@@ -255,9 +270,9 @@ test('a live display reorder cannot retarget a pending delete (cursor anchors th
 
 test('duplicate / legacy priority values render as distinct positions and normalize on a move', async () => {
   const am = new AccountManager([
-    { name: 'a0', type: 'apikey', apiKey: 'k', priority: 1 },
-    { name: 'a1', type: 'apikey', apiKey: 'k', priority: 0 },
-    { name: 'a2', type: 'apikey', apiKey: 'k', priority: 1 }, // duplicate "1"
+    apiFixture('a0', { priority: 1 }),
+    apiFixture('a1', { priority: 0 }),
+    apiFixture('a2', { priority: 1 }), // duplicate "1"
   ], 0.98, 0, 5);
   const config = { accounts: am.accounts.map(a => ({ name: a.name, priority: a.priority })) };
   const tui = new TUI({ accountManager: am, config, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
@@ -275,8 +290,8 @@ test('duplicate / legacy priority values render as distinct positions and normal
 
 test('a config priority of null loads as "unset" (use-or-lose)', () => {
   const am = new AccountManager([
-    { name: 'a0', type: 'apikey', apiKey: 'k', priority: null },
-    { name: 'a1', type: 'apikey', apiKey: 'k' },
+    apiFixture('a0', { priority: null }),
+    apiFixture('a1'),
   ], 0.98, 0, 5);
   assert.equal(am.accounts[0].priority, null, 'null priority loads as unset');
   assert.equal(am._priority(am.accounts[0]), Infinity, 'unset sentinel — no preference');
@@ -303,7 +318,7 @@ const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 
 test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
   const am = new AccountManager([
-    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    maxFixture('max-1'),
   ], 0.98, 0, 5);
   const now = Date.now();
   am.updateQuota(0, {
@@ -320,34 +335,34 @@ test('a wide row renders a third "Fbl" bar for an OAuth account', () => {
   assert.match(wide, /Ses .*Wk .*Fbl .*94%/s, 'third bar labelled Fbl with the 7d_oi utilization');
 
   const mid = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false));
-  assert.doesNotMatch(mid, /Fbl/, 'no third bar on mid widths');
+  assert.doesNotMatch(mid, /Fbl/);
 });
 
 test('the Fbl bar prefers the 7d_oi window when multiple model windows exist', () => {
   const am = new AccountManager([
-    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    maxFixture('max-1'),
   ], 0.98, 0, 5);
   // Insert an unknown window FIRST, then 7d_oi — the bar must still show 7d_oi.
   am.accounts[0].quota.modelWeekly['7d_xx'] = { utilization: 0.11, reset: Date.now() + 86400_000 };
   am.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 0.94, reset: Date.now() + 86400_000 };
   const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
   const row = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.match(row, /Fbl .*94%/s, '7d_oi (94%) shown, not the first-inserted window (11%)');
+  assert.match(row, /Fbl .*94%/s);
 });
 
-test('an unmeasured Fable window renders an empty Fbl bar; API-key rows pad the slot', () => {
+test('unmeasured Fable and API rows keep aligned columns', () => {
   const am = new AccountManager([
-    { name: 'max-1', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
-    { name: 'api-1', type: 'apikey', apiKey: 'sk-1' },
+    maxFixture('max-1'),
+    apiFixture('api-1'),
   ], 0.98, 0, 5);
   const tui = new TUI({ accountManager: am, config: { accounts: [] }, saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {} });
 
-  const oauthRow = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
-  assert.match(oauthRow, /Fbl/, 'OAuth row always shows the Fbl label (with "-" until measured)');
+  const maxRow = stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, true));
+  assert.match(maxRow, /Fbl/, 'OAuth row always shows the Fbl label (with "-" until measured)');
 
   const apiRow = stripAnsi(tui._renderAcct(am.accounts[1], 1, 10, true, true));
   assert.doesNotMatch(apiRow, /Fbl/, 'API-key accounts have no Fable window');
-  assert.equal(oauthRow.length, apiRow.length, 'slot padded so columns stay aligned');
+  assert.equal(maxRow.length, apiRow.length, 'slot padded so columns stay aligned');
 });
 
 // ── Reload (R) re-measures quota, not just accounts ──────────────────────────

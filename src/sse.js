@@ -68,9 +68,18 @@ export function sseErrorEvent(message) {
  * available as `pending`.
  */
 export class SseFramer {
-  constructor({ maxBufferedBytes = SSE_MAX_FRAME_BYTES } = {}) {
+  constructor({
+    maxBufferedBytes = SSE_MAX_FRAME_BYTES,
+    reserveBytes = null,
+    releaseBytes = null,
+  } = {}) {
     this.maxBufferedBytes = maxBufferedBytes;
+    this.reserveBytes = typeof reserveBytes === 'function' ? reserveBytes : null;
+    this.releaseBytes = typeof releaseBytes === 'function' ? releaseBytes : null;
     this.pending = EMPTY;
+    this.reservedBytes = 0;
+    this.forwardedReservationBytes = 0;
+    this.limitExceeded = false;
     this.sawTerminal = false;
     this.sawResponseCompleted = false;
     // Set when a frame exceeded maxBufferedBytes: framing is abandoned and
@@ -91,10 +100,38 @@ export class SseFramer {
       ? input
       : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
     if (this.passthrough) {
+      if (this.reserveBytes && !this.reserveBytes(chunk.length)) {
+        this.limitExceeded = true;
+        return null;
+      }
+      if (this.reserveBytes) this.reservedBytes += chunk.length;
+      this.forwardedReservationBytes = chunk.length;
       this._scanRaw(chunk.toString('utf8'));
       return chunk;
     }
-    this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
+    if (this.reserveBytes && !this.reserveBytes(chunk.length)) {
+      this.limitExceeded = true;
+      return null;
+    }
+    if (this.reserveBytes) this.reservedBytes += chunk.length;
+    if (this.pending.length) {
+      const combinedBytes = this.pending.length + chunk.length;
+      if (this.reserveBytes && !this.reserveBytes(combinedBytes)) {
+        this.releaseBytes?.(chunk.length);
+        this.reservedBytes -= chunk.length;
+        this.limitExceeded = true;
+        return null;
+      }
+      const previousBytes = this.reservedBytes;
+      this.pending = Buffer.concat([this.pending, chunk], combinedBytes);
+      if (this.reserveBytes) {
+        this.reservedBytes += combinedBytes;
+        this.releaseBytes?.(previousBytes);
+        this.reservedBytes -= previousBytes;
+      }
+    } else {
+      this.pending = chunk;
+    }
 
     // Find the LAST complete frame boundary; support both LF and CRLF blank
     // lines (Anthropic emits LF; CRLF-only upstreams still frame correctly).
@@ -111,21 +148,59 @@ export class SseFramer {
         this.passthrough = true;
         const out = this.pending;
         this.pending = EMPTY;
+        this.forwardedReservationBytes = out.length;
         this._scanRaw(out.toString('utf8'));
         return out;
       }
-      // Retaining bytes across push() calls: if pending still aliases the
-      // caller's chunk (or a view over its ArrayBuffer), copy it so caller-side
-      // buffer reuse can't mutate a frame we haven't forwarded yet.
-      if (this.pending === chunk) this.pending = Buffer.from(chunk);
       return null;
     }
 
     const out = this.pending.subarray(0, end);
-    // Copy the (small) remainder so the flushed parent buffer can be GC'd.
-    this.pending = end < this.pending.length ? Buffer.from(this.pending.subarray(end)) : EMPTY;
+    const parentBytes = this.pending.length;
+    const remainderBytes = parentBytes - end;
+    if (remainderBytes > 0) {
+      if (this.reserveBytes && !this.reserveBytes(remainderBytes)) {
+        this.releaseBytes?.(this.reservedBytes);
+        this.reservedBytes = 0;
+        this.pending = EMPTY;
+        this.limitExceeded = true;
+        return null;
+      }
+      this.pending = Buffer.from(this.pending.subarray(end));
+      if (this.reserveBytes) this.reservedBytes += remainderBytes;
+    } else {
+      this.pending = EMPTY;
+    }
+    this.forwardedReservationBytes = parentBytes;
     this._scanFrames(out.toString('utf8'));
     return out;
+  }
+
+  releaseForwarded(bytes, releaseBudget = true) {
+    if (!this.reserveBytes || bytes <= 0) return;
+    if (bytes > this.forwardedReservationBytes
+        || this.forwardedReservationBytes > this.reservedBytes) {
+      throw new Error('SSE frame reservation underflow');
+    }
+    if (releaseBudget) this.releaseBytes?.(this.forwardedReservationBytes);
+    this.reservedBytes -= this.forwardedReservationBytes;
+    this.forwardedReservationBytes = 0;
+  }
+
+  takePending() {
+    const out = this.pending;
+    this.pending = EMPTY;
+    this.forwardedReservationBytes = out.length;
+    return out;
+  }
+
+  dispose() {
+    if (this.reserveBytes && this.reservedBytes > 0) {
+      this.releaseBytes?.(this.reservedBytes);
+      this.reservedBytes = 0;
+    }
+    this.pending = EMPTY;
+    this.forwardedReservationBytes = 0;
   }
 
   // Frame boundaries are ASCII, so flushed bytes never split a UTF-8 character

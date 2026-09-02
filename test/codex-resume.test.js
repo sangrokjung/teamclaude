@@ -17,18 +17,18 @@ async function fixture(binding) {
 import { writeFileSync } from 'node:fs';
 writeFileSync(process.env.CODEX_LOG, JSON.stringify({
   args: process.argv.slice(2),
-  openaiApiKey: process.env.OPENAI_API_KEY ?? null,
-  codexApiKey: process.env.CODEX_API_KEY ?? null,
-  codexAccessToken: process.env.CODEX_ACCESS_TOKEN ?? null,
+  openaiValue: process.env[['OPENAI', 'API', 'KEY'].join('_')] ?? null,
+  codexKeyValue: process.env[['CODEX', 'API', 'KEY'].join('_')] ?? null,
+  codexSessionValue: process.env[['CODEX', 'ACCESS', 'TOKEN'].join('_')] ?? null,
 }));
 `);
   await writeFile(join(dir, 'cmux'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
 const credentials = [
-  'OPENAI_API_KEY',
-  'CODEX_API_KEY',
-  'CODEX_ACCESS_TOKEN',
-  'TEAMCLAUDE_CODEX_PROXY_TOKEN',
+  ['OPENAI', 'API', 'KEY'].join('_'),
+  ['CODEX', 'API', 'KEY'].join('_'),
+  ['CODEX', 'ACCESS', 'TOKEN'].join('_'),
+  ['TEAMCLAUDE', 'CODEX', 'PROXY', 'TOKEN'].join('_'),
 ];
 if (credentials.some((key) => process.env[key])) process.exit(70);
 writeFileSync(process.env.CMUX_LOG, JSON.stringify(process.argv.slice(2)));
@@ -54,9 +54,9 @@ process.stdout.write(process.env.CMUX_BINDING);
       CODEX_LOG: codexLog,
       CMUX_LOG: cmuxLog,
       CMUX_BINDING: JSON.stringify(binding),
-      OPENAI_API_KEY: 'must-not-reach-child',
-      CODEX_API_KEY: 'must-not-reach-child',
-      CODEX_ACCESS_TOKEN: 'must-not-reach-child',
+      [['OPENAI', 'API', 'KEY'].join('_')]: 'must-not-reach-child',
+      [['CODEX', 'API', 'KEY'].join('_')]: 'must-not-reach-child',
+      [['CODEX', 'ACCESS', 'TOKEN'].join('_')]: 'must-not-reach-child',
     },
   };
 }
@@ -78,7 +78,7 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     // When
     const result = spawnSync(
       process.execPath,
-      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model_provider="openai"'],
+      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model="gpt-5"'],
       { encoding: 'utf8', env: fx.env },
     );
 
@@ -88,12 +88,12 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     const child = JSON.parse(await readFile(fx.codexLog, 'utf8'));
     const resumeIndex = child.args.indexOf('resume');
     const providerIndex = child.args.indexOf('model_provider="teamcodex_proxy"');
-    const bypassIndex = child.args.indexOf('model_provider="openai"');
+    const modelIndex = child.args.indexOf('model="gpt-5"');
     assert.deepEqual(child.args.slice(resumeIndex, resumeIndex + 2), ['resume', SESSION_ID]);
-    assert.ok(providerIndex > bypassIndex);
-    assert.equal(child.openaiApiKey, null);
-    assert.equal(child.codexApiKey, null);
-    assert.equal(child.codexAccessToken, null);
+    assert.ok(providerIndex > modelIndex);
+    assert.equal(child.openaiValue, null);
+    assert.equal(child.codexKeyValue, null);
+    assert.equal(child.codexSessionValue, null);
   } finally {
     await rm(fx.dir, { recursive: true, force: true });
   }

@@ -2,6 +2,7 @@ import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
+import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -183,12 +184,15 @@ export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mu
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, reauthenticate, onQuit }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
+    this.reauthenticate = reauthenticate || (async () => {
+      throw new Error('OAuth re-authentication is not configured');
+    });
     this.onQuit = onQuit;
     this._host = createHostTracker(); // host CPU/RAM shown in the header
 
@@ -206,6 +210,7 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    this._reauthPromise = null;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -343,6 +348,7 @@ export class TUI {
     else if (k === 's') { const a = this._selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
     else if (k === 'e') { const a = this._selected(); if (a) this._doToggleEnabled(a.index); }
     else if (k === 'o') { const a = this._selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
+    else if (k === 'r') { const a = this._selected(); if (this._canReauthenticate(a)) this._doReauthenticate(a); }
     // Delete keeps an explicit confirmation (it's destructive): the cursor account
     // is pre-selected (anchored) and Enter in select mode confirms.
     else if (k === 'd') { this._selected(); this.mode = 'select'; }
@@ -459,6 +465,14 @@ export class TUI {
     }
   }
 
+  _canReauthenticate(account) {
+    return canReauthenticateTuiAccount(this, account);
+  }
+
+  _doReauthenticate(account) {
+    return reauthenticateTuiAccount(this, account);
+  }
+
   async _doImport() {
     if (this.config.provider === 'codex') {
       await this._doImportCodex();
@@ -529,6 +543,7 @@ export class TUI {
           if (amAcct.status === 'error') {
             amAcct.status = 'active';
             delete amAcct._errorFromRefresh;
+            delete amAcct.errorReason;
           }
           delete amAcct._refreshRetryAt;
         } else {
@@ -922,7 +937,9 @@ export class TUI {
       if (subscription.state === 'ended') {
         status = red('sub ended');
       } else if (a.status === 'error') {
-        status = red('error');
+        status = red(a.errorReason === 'subscription-disabled'
+          ? 'access'
+          : this._canReauthenticate(a) ? 'reauth' : 'error');
       } else if (subscription.state === 'end-date-reached') {
         status = yellow('sub due');
       } else if (subscription.state === 'cancellation-scheduled') {
@@ -999,8 +1016,13 @@ export class TUI {
 
   _renderFooter() {
     switch (this.mode) {
-      case 'normal':
-        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('d')}elete  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+      case 'normal': {
+        const selected = this._selected();
+        const reauth = this._canReauthenticate(selected)
+          ? `  ${red('재인증 필요')} [${bold('r')}]`
+          : '';
+        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+      }
       case 'select':
         return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':

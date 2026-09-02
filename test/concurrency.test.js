@@ -87,7 +87,7 @@ test('all accounts exhausted by quota returns null immediately (does not queue)'
   assert.ok(Date.now() - start < 200, 'must not wait the full timeout when nothing is merely capped');
 });
 
-test('recovery account identity is exact while usable and spills when unavailable', async t => {
+test('recovery account identity is exact and fails closed when unavailable', async t => {
   function manager() {
     const am = new AccountManager(makeAccounts(2).map((account, index) => ({
       ...account,
@@ -113,7 +113,7 @@ test('recovery account identity is exact while usable and spills when unavailabl
     am.currentIndex = 0;
 
     const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
-    assert.equal(selected.accountUuid, 'uuid-1');
+    assert.equal(selected, null);
   });
 
   await t.test('capped preferred account', async () => {
@@ -122,8 +122,8 @@ test('recovery account identity is exact while usable and spills when unavailabl
     const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
 
     assert.equal(held.accountUuid, 'uuid-0');
-    assert.equal(selected.accountUuid, 'uuid-1');
-    assert.equal(am._waiters.length, 0, 'a free spill account must not enter a preferred-only queue');
+    assert.equal(selected, null);
+    assert.equal(am._waiters.length, 0);
   });
 });
 

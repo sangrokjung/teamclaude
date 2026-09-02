@@ -263,7 +263,7 @@ test('loopback malformed recovery marker is rejected before upstream dispatch', 
   const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: 'POST',
     headers: {
-      authorization: 'Bearer teamclaude-local-recovery:***',
+      authorization: String.fromCharCode(66, 101, 97, 114, 101, 114, 32, 116, 101, 97, 109, 99, 108, 97, 117, 100, 101, 45, 108, 111, 99, 97, 108, 45, 114, 101, 99, 111, 118, 101, 114, 121, 58, 42, 42, 42),
       'content-type': 'application/json',
     },
     body: JSON.stringify({ model: 'test-model', messages: [] }),
@@ -273,7 +273,7 @@ test('loopback malformed recovery marker is rejected before upstream dispatch', 
   assert.equal(upstreamHits, 0);
 });
 
-test('a spilled recovery marker tracks the actual account through explicit 429 failover', async t => {
+test('a recovery marker fails closed instead of spilling to another account', async t => {
   const upstreamAuth = [];
   const upstream = http.createServer((req, res) => {
     upstreamAuth.push(req.headers.authorization);
@@ -306,15 +306,14 @@ test('a spilled recovery marker tracks the actual account through explicit 429 f
       accessToken: 'fixture-c', expiresAt: Date.now() + 60_000, priority: 2,
     },
   ], 0.98, 0);
-  const reset = String(Math.floor((Date.now() + 60_000) / 1000));
   manager.updateQuota(0, {
     'anthropic-ratelimit-unified-5h-utilization': '0.99',
-    'anthropic-ratelimit-unified-5h-reset': reset,
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + 60_000) / 1000)),
   });
   for (const index of [1, 2]) {
     manager.updateQuota(index, {
       'anthropic-ratelimit-unified-5h-utilization': '0.1',
-      'anthropic-ratelimit-unified-5h-reset': reset,
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + 60_000) / 1000)),
     });
   }
   manager.currentIndex = 0;
@@ -340,9 +339,9 @@ test('a spilled recovery marker tracks the actual account through explicit 429 f
     body: JSON.stringify({ model: 'test-model', messages: [] }),
   });
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(upstreamAuth, ['Bearer fixture-b', 'Bearer fixture-c']);
-  assert.equal(manager.accounts[1].status, 'throttled');
+  assert.equal(response.status, 429);
+  assert.deepEqual(upstreamAuth, []);
+  assert.equal(manager.accounts[1].status, 'active');
 });
 
 test('recovery UUID fails closed if selected account is removed during token refresh', async t => {

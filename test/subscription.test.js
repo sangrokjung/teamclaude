@@ -465,6 +465,6 @@ test('TUI keeps a pre-end authentication error visible for reauthentication', ()
   });
 
   const row = tui._renderAcct(am.accounts[0], 0, 5, false);
-  assert.match(row, /error/);
+  assert.match(row, /reauth/);
   assert.doesNotMatch(row, /canceling/);
 });

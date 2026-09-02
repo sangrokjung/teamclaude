@@ -17,7 +17,7 @@ import { applyTuiAccountMutation } from '../src/tui.js';
 // (and the module-level write chain) here doesn't leak into other test files.
 
 test('default config bounds Claude connection recovery to fifteen minutes', () => {
-  assert.equal(createDefaultConfig().claudeConnectionRecoveryMaxWaitMs, 900000);
+  assert.equal(createDefaultConfig().continuityMaxWaitMs, 900000);
 });
 
 test('atomicConfigUpdate serializes concurrent writers (no lost update / no resurrection)', async () => {
