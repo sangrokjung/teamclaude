@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { TUI } from '../src/tui.js';
+import { TUI, displayWidth, fitLine } from '../src/tui.js';
 
 const maxFixture = (name, overrides = {}) => ({
   name,
@@ -16,6 +16,19 @@ const apiFixture = (name, overrides = {}) => ({
   type: 'apikey',
   apiKey: 'k',
   ...overrides,
+});
+
+test('CJK display width counts Korean as two terminal columns', () => {
+  assert.equal(displayWidth('재인증 필요 [r]'), 15);
+});
+
+test('80-column footer with Korean reauthentication text never wraps quit', () => {
+  const { tui, am } = makeTUI(['a0']);
+  am.accounts[0].status = 'error';
+  am.accounts[0].errorReason = 'auth-revoked';
+  const footer = fitLine(tui._renderFooter(), 80);
+  assert.equal(displayWidth(footer), 80);
+  assert.doesNotMatch(footer, /\r|\n/);
 });
 
 // Build a TUI wired to a real AccountManager + a config copy, without start()

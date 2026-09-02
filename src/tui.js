@@ -21,9 +21,44 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+function isWideCodePoint(codePoint) {
+  return (codePoint >= 0x1100 && codePoint <= 0x115f)
+    || (codePoint >= 0x2329 && codePoint <= 0x232a)
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd);
+}
+
+function isCombiningCodePoint(codePoint) {
+  return (codePoint >= 0x300 && codePoint <= 0x36f)
+    || (codePoint >= 0x1ab0 && codePoint <= 0x1aff)
+    || (codePoint >= 0x1dc0 && codePoint <= 0x1dff)
+    || (codePoint >= 0x20d0 && codePoint <= 0x20ff)
+    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)
+    || (codePoint >= 0xe0100 && codePoint <= 0xe01ef);
+}
+
+export function displayWidth(value) {
+  let width = 0;
+  for (let i = 0; i < value.length;) {
+    if (value[i] === '\x1b') {
+      const end = value.indexOf('m', i);
+      if (end >= 0) { i = end + 1; continue; }
+    }
+    const codePoint = value.codePointAt(i);
+    if (codePoint == null) break;
+    if (!isCombiningCodePoint(codePoint)) width += isWideCodePoint(codePoint) ? 2 : 1;
+    i += codePoint > 0xffff ? 2 : 1;
+  }
+  return width;
+}
+
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -40,15 +75,19 @@ function truncate(s, w) {
       const end = s.indexOf('m', i);
       if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
     }
-    out += s[i];
-    visible++;
-    i++;
+    const codePoint = s.codePointAt(i);
+    if (codePoint == null) break;
+    const charWidth = isCombiningCodePoint(codePoint) ? 0 : isWideCodePoint(codePoint) ? 2 : 1;
+    if (visible + charWidth > w) break;
+    out += s.slice(i, i + (codePoint > 0xffff ? 2 : 1));
+    visible += charWidth;
+    i += codePoint > 0xffff ? 2 : 1;
   }
   return out + RESET;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+export function fitLine(s, w) {
   const v = vw(s);
   if (v > w) return truncate(s, w);
   if (v < w) return s + ' '.repeat(w - v);
