@@ -1103,6 +1103,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       };
       const reserveResponseBytes = bytes => {
         if (bytes <= 0) return true;
+        if (responseReleased) return false;
         if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) {
           releaseIdleLogReservation?.();
         }
@@ -1113,12 +1114,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       };
       const releaseResponseBytes = () => {
         if (responseReleased) return;
+        releaseReservedResponseBytes(responseBufferedBytes);
         responseReleased = true;
-        if (responseBufferedBytes > bufferedResponseBytes) {
+      };
+      const releaseReservedResponseBytes = bytes => {
+        if (bytes <= 0) return;
+        if (responseReleased) return;
+        if (bytes > responseBufferedBytes || bytes > bufferedResponseBytes) {
           throw new Error('Response buffer reservation underflow');
         }
-        bufferedResponseBytes -= responseBufferedBytes;
-        responseBufferedBytes = 0;
+        bufferedResponseBytes -= bytes;
+        responseBufferedBytes -= bytes;
       };
       const reserveAuxiliaryResponseBytes = bytes => {
         if (bytes <= 0) return true;
@@ -1193,6 +1199,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             maxResponseBytes,
             upstreamResponseTimeoutMs,
             reserveResponseBytes,
+            releaseReservedResponseBytes,
           );
           return; // outer finally decrements inFlightProxied
         }
@@ -1208,7 +1215,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1438,6 +1445,7 @@ async function relayRaw(
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   upstreamResponseTimeoutMs = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
   reserveResponseBytes = () => true,
+  releaseResponseBytes = () => {},
 ) {
   // Abort the relay if the client disconnects, so a hung upstream OAuth endpoint
   // can't pin this connection (and its admission-control inFlightProxied slot)
@@ -1471,6 +1479,7 @@ async function relayRaw(
       upstreamRes.body,
       maxResponseBytes,
       reserveResponseBytes,
+      releaseResponseBytes,
     );
     if (responseBody === null) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -1571,17 +1580,36 @@ async function raceTimeout(promise, timeoutMs, message) {
   }
 }
 
-async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true) {
+async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true, releaseBytes = () => {}) {
   if (!webStream) return Buffer.alloc(0);
   const reader = webStream.getReader();
   const chunks = [];
   let totalBytes = 0;
+  let reservedChunkBytes = 0;
+  let finalReservedBytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        if (!reserveBytes(totalBytes)) return null;
-        return Buffer.concat(chunks, totalBytes);
+        if (!reserveBytes(totalBytes)) {
+          releaseBytes(reservedChunkBytes);
+          reservedChunkBytes = 0;
+          return null;
+        }
+        finalReservedBytes = totalBytes;
+        let result;
+        try {
+          result = Buffer.concat(chunks, totalBytes);
+        } catch (error) {
+          releaseBytes(finalReservedBytes + reservedChunkBytes);
+          finalReservedBytes = 0;
+          reservedChunkBytes = 0;
+          throw error;
+        }
+        releaseBytes(reservedChunkBytes);
+        reservedChunkBytes = 0;
+        finalReservedBytes = 0;
+        return result;
       }
       const chunk = Buffer.from(value);
       totalBytes += chunk.length;
@@ -1589,9 +1617,11 @@ async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true) {
         await reader.cancel().catch(() => {});
         return null;
       }
+      reservedChunkBytes += chunk.length;
       chunks.push(chunk);
     }
   } finally {
+    if (reservedChunkBytes > 0) releaseBytes(reservedChunkBytes);
     reader.releaseLock();
   }
 }
@@ -2362,6 +2392,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2429,6 +2460,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2497,6 +2529,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2989,6 +3022,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (buf === null) {
         ctx.status = 502;
