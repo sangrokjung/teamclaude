@@ -71,8 +71,9 @@ TeamCodex는 여러 ChatGPT OAuth 계정을 회전하지만, Codex upstream의 �
 8. Codex request log에는 query, request/response/stream body, raw error stack, token, email,
    stable account ID, request ID, 임의 upstream header를 기록하지 않습니다. URL path와
    allowlisted metadata header만 남기며 계정은 `pool-<runtime index>` opaque ref로 표기합니다. 공개 status는
-   stable account ID를 생략하고, 기존 Claude recovery만 `localhost + proxy API key + explicit
-   identity header`를 모두 만족한 내부 호출로 ID 포함 snapshot을 받습니다.
+   stable account ID와 display name을 생략하고, 기존 Claude recovery 및 로컬 status
+   CLI만 `localhost + proxy API key + explicit identity header`를 모두 만족한 내부
+   호출로 identity-bearing snapshot을 받습니다.
 9. watchdog diagnostic log 쓰기가 실패해도 scan과 recovery 판단은 계속합니다. durable
    state/lock 초기화나 저장이 실패하면 recovery는 제출하지 않고 해당 tick을 exit 0으로
    defer합니다. 어느 저장 실패도 launchd watchdog의 nonzero 종료를 만들 수 없습니다.

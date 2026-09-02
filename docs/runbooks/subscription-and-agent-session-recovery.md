@@ -66,17 +66,16 @@ error.details.error_code=oauth_not_allowed_for_organization
 
 ```bash
 curl -fsS http://127.0.0.1:3456/teamclaude/status | jq '{
-  currentAccount,
   switchThreshold,
   accounts: [.accounts[] | {
-    name, status, enabled, quota, inflight, maxConcurrent, rateLimitedUntil
+    status, enabled, quota, inflight, maxConcurrent, rateLimitedUntil
   }]
 }'
 ```
 
 판정 순서는 다음과 같다.
 
-1. `status`가 `error`인지 확인한다.
+1. 각 account row의 `status`가 `error`인지 확인한다.
 2. `enabled:false`인지 확인한다.
 3. 5시간·주간 quota가 `switchThreshold` 이상인지와 reset 시각을 확인한다.
 4. `inflight == maxConcurrent` 또는 `rateLimitedUntil`이 미래인지 확인한다.

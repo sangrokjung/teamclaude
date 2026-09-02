@@ -46,12 +46,30 @@ function account(name, extra = {}) {
   };
 }
 
+function requestWantsIdentity(req) {
+  if (req.headers['x-api-key'] !== 'k') return false;
+  return req.headers['x-teamcodex-status-identity'] === '1';
+}
+
+function publicStatusPayload(payload) {
+  const body = structuredClone(payload);
+  delete body.currentAccount;
+  delete body.currentAccountUuid;
+  for (const account of body.accounts) {
+    delete account.name;
+    delete account.accountUuid;
+  }
+  return body;
+}
+
 /** Serve one fixed /teamclaude/status payload; returns { port, close }. */
-async function startFakeProxy(payload) {
+async function startFakeProxy(payload, onRequest = null) {
   const server = createServer((req, res) => {
+    onRequest?.(req);
     if (!req.url.startsWith('/teamclaude/status')) { res.writeHead(404); res.end(); return; }
+    const body = requestWantsIdentity(req) ? payload : publicStatusPayload(payload);
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(payload));
+    res.end(JSON.stringify(body));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return {
@@ -60,8 +78,8 @@ async function startFakeProxy(payload) {
   };
 }
 
-async function runStatusAgainst(payload) {
-  const proxy = await startFakeProxy(payload);
+async function runStatusAgainst(payload, { onRequest = null } = {}) {
+  const proxy = await startFakeProxy(payload, onRequest);
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-statuscli-'));
   const configPath = join(dir, 'teamclaude.json');
   await writeFile(configPath, JSON.stringify({
@@ -114,6 +132,21 @@ test('status lists healthy accounts with quota lines', async () => {
   assert.match(res.stdout, /Usable now:\s+2\/2 accounts/);
   assert.match(res.stdout, /Session:\s+10\.0% used\s+Weekly: 20\.0% used/);
   assert.match(res.stdout, /b@example\.com/);
+});
+
+test('status CLI requests the trusted local identity payload', async () => {
+  const headers = [];
+  const res = await runStatusAgainst(
+    basePayload([account('operator@example.com')]),
+    { onRequest: req => headers.push(req.headers) },
+  );
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.ok(
+    headers.some(h => h['x-api-key'] === 'k' && h['x-teamcodex-status-identity'] === '1'),
+    'status CLI must present both local capability headers for the name-bearing payload',
+  );
+  assert.match(res.stdout, /operator@example\.com/);
 });
 
 test('status distinguishes scheduled cancellation, ended subscription, auth, and organization policy', async () => {

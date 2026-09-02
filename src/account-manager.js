@@ -1957,7 +1957,7 @@ export class AccountManager {
    */
   getStatus({ includeIdentity = false } = {}) {
     const accounts = this.accounts.map(a => ({
-      name: a.name,
+      ...(includeIdentity ? { name: a.name } : {}),
       ...(includeIdentity ? { accountUuid: a.accountUuid || null } : {}),
       type: a.type,
       provider: a.provider,
@@ -1992,7 +1992,9 @@ export class AccountManager {
         this._isModelUnsupported(a, model)),
     }));
     return {
-      currentAccount: this.accounts[this.currentIndex]?.name,
+      ...(includeIdentity
+        ? { currentAccount: this.accounts[this.currentIndex]?.name }
+        : {}),
       ...(includeIdentity
         ? { currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null }
         : {}),

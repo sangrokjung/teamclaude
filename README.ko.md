@@ -413,8 +413,8 @@ curl -sS http://127.0.0.1:3457/teamclaude/status  # Codex provider
 ```
 
 응답에는 access token, refresh token, API key, authorization header가 들어가지
-않습니다. 공개 status에는 계정 표시 이름만 있고 stable UUID는 빠집니다. UUID가
-필요한 내부 복구 호출은 localhost에서 proxy API key와 전용 identity header를 모두
+않습니다. 공개 status에는 계정 표시 이름과 stable UUID가 모두 빠집니다. identity가
+필요한 내부 호출은 localhost에서 proxy API key와 전용 identity header를 모두
 제시해야 합니다. 원본 JSON은 공개 채널에 올리지 마세요.
 
 OAuth 계정이 폐기됐거나 refresh grant가 무효라면 계정 회전만으로는 복구할 수

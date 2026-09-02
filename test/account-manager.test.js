@@ -793,14 +793,18 @@ test('getStatus hides stable identity by default and exposes it only to internal
   }], 0.98, 0, 5);
 
   const status = am.getStatus();
+  assert.equal('currentAccount' in status, false);
   assert.equal('currentAccountUuid' in status, false);
+  assert.equal('name' in status.accounts[0], false);
   assert.equal('accountUuid' in status.accounts[0], false);
   assert.equal('accessToken' in status.accounts[0], false);
   assert.equal('refreshToken' in status.accounts[0], false);
   assert.equal('credential' in status.accounts[0], false);
 
   const internal = am.getStatus({ includeIdentity: true });
+  assert.equal(internal.currentAccount, 'same-name');
   assert.equal(internal.currentAccountUuid, 'uuid-safe');
+  assert.equal(internal.accounts[0].name, 'same-name');
   assert.equal(internal.accounts[0].accountUuid, 'uuid-safe');
 
   am.currentIndex = -1;

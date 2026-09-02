@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `6b59a700df690c01414fef4f7f5346b62277d7c0c9c4f89cb5b52d4e33a36922`
+- SHA-256: `64ce737d27ff6cfd90960e720f884034b2cbeaa6b475f8d3c07df7a678e9664a`
 - Source: `src/config.js`
 - SHA-256: `9dc6f1ceb8d00af4ebd0995c8efae6451f5a22fd7d27aca7bfbbac26e506a30f`
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`

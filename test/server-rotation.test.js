@@ -59,14 +59,22 @@ test('loopback rotate endpoint switches active account without persisting config
   t.after(() => close(server));
   const port = await listen(server);
 
-  const before = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+  const statusHeaders = {
+    'x-api-key': 'fixture-proxy-key',
+    'x-teamcodex-status-identity': '1',
+  };
+  const before = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+    headers: statusHeaders,
+  });
   const beforeStatus = await before.json();
   const response = await fetch(`http://127.0.0.1:${port}/teamclaude/rotate`, {
     method: 'POST',
     headers: { 'x-api-key': 'fixture-proxy-key' },
   });
   const body = await response.json();
-  const after = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+  const after = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+    headers: statusHeaders,
+  });
   const afterStatus = await after.json();
 
   assert.equal(response.status, 200);

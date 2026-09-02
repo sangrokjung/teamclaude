@@ -679,10 +679,10 @@ curl -sS http://127.0.0.1:3457/teamclaude/status  # Codex provider
 ```
 
 The status payload never contains access tokens, refresh tokens, API keys, or
-authorization headers. Public status includes account display names but omits
-stable account UUIDs. Identity-bearing status is reserved for the localhost
-recovery client and requires both the proxy API key and its explicit internal
-header. Do not post the raw JSON publicly.
+authorization headers. Public status omits account display names and stable
+account UUIDs. Identity-bearing status is reserved for trusted localhost
+clients and requires both the proxy API key and its explicit internal header.
+Do not post the raw JSON publicly.
 
 If an OAuth account is revoked or its refresh grant is invalid, quota rotation
 cannot repair that credential. Re-authenticate the existing account directly:

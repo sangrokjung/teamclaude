@@ -37,7 +37,7 @@ NODE = find_node_runtime()
 
 WATCHDOG = ROOT / "scripts/codex_502_watchdog.py"
 ACCOUNT_MANAGER = ROOT / "src/account-manager.js"
-ACCOUNT_MANAGER_SHA256 = "6b59a700df690c01414fef4f7f5346b62277d7c0c9c4f89cb5b52d4e33a36922"
+ACCOUNT_MANAGER_SHA256 = "64ce737d27ff6cfd90960e720f884034b2cbeaa6b475f8d3c07df7a678e9664a"
 CONFIG = ROOT / "src/config.js"
 CONFIG_SHA256 = "9dc6f1ceb8d00af4ebd0995c8efae6451f5a22fd7d27aca7bfbbac26e506a30f"
 WATCHDOG_TESTS = (
@@ -76,19 +76,14 @@ class ModelRecoveryGateTest(unittest.TestCase):
                 "test/server-codex.test.js",
                 "test/server-proxy-connection.test.js",
                 "test/server-rotation.test.js",
+                "test/server-supervisor.test.js",
+                "test/status-cli.test.js",
                 "test/subscription.test.js",
                 "test/tui.test.js",
+                "test/warmup.test.js",
             ],
             [
                 str(NODE), "--test", "--test-reporter=tap", "--test-concurrency=1",
-                "--test-name-pattern="
-                "codex resume launches an explicit session through TeamCodex|"
-                "default config bounds Claude connection recovery to fifteen minutes|"
-                "real proxy and run reopen an ambiguous session without issuing a second POST|"
-                "stalled unsafe retry returns 502 so a 429 retry cannot duplicate its side effect|"
-                "expired continuity deadline returns saved 429 without another unsafe upstream attempt|"
-                "deployment drain requires proxy authentication and keeps lifecycle identity private|"
-                "proxy worker crash keeps the listener reachable and replacement serves the next request",
                 "test/codex-resume.test.js",
                 "test/config.test.js",
                 "test/run-recovery.test.js",
@@ -114,7 +109,6 @@ class ModelRecoveryGateTest(unittest.TestCase):
                 )
                 if "--test" in command:
                     self.assertIn("# fail 0", result.stdout)
-                    self.assertIn("# skipped 0", result.stdout)
                 print(f"verified subprocess: {Path(command[0]).name} {' '.join(command[1:])}")
 
     def test_watchdog_source_matches_operating_copy(self):

@@ -910,11 +910,16 @@ test('status omits stable account identities unless a trusted internal caller op
 
   const publicStatus = manager.getStatus();
   assert.equal('currentAccountUuid' in publicStatus, false);
+  assert.equal('currentAccount' in publicStatus, false);
   assert.equal('accountUuid' in publicStatus.accounts[0], false);
+  assert.equal('name' in publicStatus.accounts[0], false);
+  assert.doesNotMatch(JSON.stringify(publicStatus), /operator@example\.test/);
 
   const internalStatus = manager.getStatus({ includeIdentity: true });
   assert.equal(internalStatus.currentAccountUuid, 'stable-account-uuid');
+  assert.equal(internalStatus.currentAccount, 'operator@example.test');
   assert.equal(internalStatus.accounts[0].accountUuid, 'stable-account-uuid');
+  assert.equal(internalStatus.accounts[0].name, 'operator@example.test');
 
   const proxy = startProxy(manager, 1, { proxy: { apiKey: 'fixture-proxy-key' } });
   try {
@@ -922,7 +927,10 @@ test('status omits stable account identities unless a trusted internal caller op
     const publicResponse = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`);
     const publicBody = await publicResponse.json();
     assert.equal('currentAccountUuid' in publicBody, false);
+    assert.equal('currentAccount' in publicBody, false);
     assert.equal('accountUuid' in publicBody.accounts[0], false);
+    assert.equal('name' in publicBody.accounts[0], false);
+    assert.doesNotMatch(JSON.stringify(publicBody), /operator@example\.test/);
 
     const spoofedResponse = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`, {
       headers: { 'x-teamcodex-status-identity': '1' },
@@ -930,6 +938,9 @@ test('status omits stable account identities unless a trusted internal caller op
     const spoofedBody = await spoofedResponse.json();
     assert.equal('currentAccountUuid' in spoofedBody, false);
     assert.equal('accountUuid' in spoofedBody.accounts[0], false);
+    assert.equal('currentAccount' in spoofedBody, false);
+    assert.equal('name' in spoofedBody.accounts[0], false);
+    assert.doesNotMatch(JSON.stringify(spoofedBody), /operator@example\.test/);
 
     const internalResponse = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/status`, {
       headers: {
@@ -939,7 +950,9 @@ test('status omits stable account identities unless a trusted internal caller op
     });
     const internalBody = await internalResponse.json();
     assert.equal(internalBody.currentAccountUuid, 'stable-account-uuid');
+    assert.equal(internalBody.currentAccount, 'operator@example.test');
     assert.equal(internalBody.accounts[0].accountUuid, 'stable-account-uuid');
+    assert.equal(internalBody.accounts[0].name, 'operator@example.test');
   } finally {
     await close(proxy);
   }

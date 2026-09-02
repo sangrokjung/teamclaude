@@ -2800,7 +2800,12 @@ async function statusCommand() {
   const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
 
   try {
-    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const res = await fetch(url, {
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        'x-teamcodex-status-identity': '1',
+      },
+    });
     const data = await res.json();
 
     const identity = running.lifecycleVerified
@@ -3057,6 +3062,9 @@ async function apiCommand() {
   if (useRunningProxy) {
     url = `http://127.0.0.1:${running.port}${path}`;
     headers = { 'x-api-key': config.proxy.apiKey };
+    if (path === '/teamclaude/status') {
+      headers['x-teamcodex-status-identity'] = '1';
+    }
   } else {
     const accounts = await resolveAccounts(config);
     let account;

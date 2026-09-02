@@ -1778,7 +1778,7 @@ test('getStatus exposes enabled + priority; setters resolve by name', () => {
   assert.equal(am.setPriority('a1', 7)?.name, 'a1', 'setPriority resolves by name');
   assert.equal(am.setEnabled('nope', false), null, 'unknown name → null');
 
-  const st = am.getStatus();
+  const st = am.getStatus({ includeIdentity: true });
   const s0 = st.accounts.find(a => a.name === 'a0');
   const s1 = st.accounts.find(a => a.name === 'a1');
   assert.equal(s0.enabled, false);

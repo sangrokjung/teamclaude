@@ -418,7 +418,7 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     proxy: { port, apiKey: 'tc-remote-auth' },
     upstream: 'http://127.0.0.1:9',
     activeWarmup: false,
-    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+    accounts: [{ name: 'operator@example.test', type: 'apikey', apiKey: 'test-api-key' }],
   }));
 
   const child = spawn(process.execPath, [entry, 'server'], {
@@ -471,7 +471,11 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
       headers: { 'x-api-key': 'tc-remote-auth' },
     });
     assert.equal(authenticated.status, 200);
-    assert.equal(JSON.parse(authenticated.body).accounts.length, 1);
+    const authenticatedBody = JSON.parse(authenticated.body);
+    assert.equal(authenticatedBody.accounts.length, 1);
+    assert.equal('currentAccount' in authenticatedBody, false);
+    assert.equal('name' in authenticatedBody.accounts[0], false);
+    assert.doesNotMatch(authenticated.body, /operator@example\.test/);
 
     const spoofedIdentity = await request({
       host,
@@ -487,6 +491,9 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     assert.equal('lifecycleId' in spoofedIdentityBody, false);
     assert.equal('currentAccountUuid' in spoofedIdentityBody, false);
     assert.equal('accountUuid' in spoofedIdentityBody.accounts[0], false);
+    assert.equal('currentAccount' in spoofedIdentityBody, false);
+    assert.equal('name' in spoofedIdentityBody.accounts[0], false);
+    assert.doesNotMatch(spoofedIdentity.body, /operator@example\.test/);
 
     const nominatedIdentity = await request({
       host,
@@ -503,6 +510,9 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     assert.equal('lifecycleId' in nominatedIdentityBody, false);
     assert.equal('currentAccountUuid' in nominatedIdentityBody, false);
     assert.equal('accountUuid' in nominatedIdentityBody.accounts[0], false);
+    assert.equal('currentAccount' in nominatedIdentityBody, false);
+    assert.equal('name' in nominatedIdentityBody.accounts[0], false);
+    assert.doesNotMatch(nominatedIdentity.body, /operator@example\.test/);
   } finally {
     await stopChild(child);
     await rm(dir, { recursive: true, force: true });
@@ -539,10 +549,13 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
   try {
     await waitUntil(() => status(port), 'proxy did not start');
     const before = await request({
-      host,
+      host: '127.0.0.1',
       port,
       path: '/teamclaude/status',
-      headers: { 'x-api-key': 'tc-remote-rotate' },
+      headers: {
+        'x-api-key': 'tc-remote-rotate',
+        'x-teamcodex-status-identity': '1',
+      },
     });
     const beforeAccount = JSON.parse(before.body).currentAccount;
 
@@ -583,10 +596,13 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
     })));
 
     const after = await request({
-      host,
+      host: '127.0.0.1',
       port,
       path: '/teamclaude/status',
-      headers: { 'x-api-key': 'tc-remote-rotate' },
+      headers: {
+        'x-api-key': 'tc-remote-rotate',
+        'x-teamcodex-status-identity': '1',
+      },
     });
     assert.equal(blocked.status, 403);
     assert.equal(JSON.parse(blocked.body).error.type, 'permission_error');
@@ -799,7 +815,12 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
     assert.equal(result.status, 0, result.stderr);
 
     const reloaded = await waitUntil(async () => {
-      const response = await status(port);
+      const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+        headers: {
+          'x-api-key': 'tc-test',
+          'x-teamcodex-status-identity': '1',
+        },
+      });
       if (!response) return null;
       const body = await response.json();
       const state = await readState(statePath);
@@ -1374,6 +1395,10 @@ test('CLI api uses the live proxy for relative paths instead of refreshing an ex
     const body = JSON.parse(result.stdout);
     assert.equal(body.accounts.length, 1);
     assert.equal(body.accounts[0].name, 'expired');
+    assert.equal(body.currentAccount, 'expired');
+    assert.equal('accountUuid' in body.accounts[0], true);
+    assert.equal('currentAccountUuid' in body, true);
+    assert.equal(typeof body.lifecycleId, 'string');
 
     const listed = spawnSync(process.execPath, [entry, 'accounts'], {
       encoding: 'utf8',
