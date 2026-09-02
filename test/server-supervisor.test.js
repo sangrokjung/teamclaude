@@ -12,6 +12,18 @@ import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
+function malformedRecoveryHeaders() {
+  const marker = 'teamclaude-local-recovery:';
+  return [
+    `Bearer ${marker}`,
+    `Bearer ${marker}***`,
+    `bearer ${marker}YQ==`,
+    `Bearer   ${marker}bad`,
+    `Bearer\t${marker}bad`,
+    `Basic unrelated, Bearer ${marker}bad`,
+  ];
+}
+
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
@@ -78,6 +90,7 @@ function request({ host = '127.0.0.1', port, path, method = 'GET', headers, body
       res.on('data', chunk => chunks.push(chunk));
       res.once('end', () => resolve({
         status: res.statusCode,
+        headers: res.headers,
         body: Buffer.concat(chunks).toString(),
       }));
       res.once('error', reject);
@@ -97,6 +110,57 @@ async function stopChild(child) {
     await once(child, 'exit');
   }
 }
+
+test('deployment drain requires proxy authentication and keeps lifecycle identity private', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-deployment-drain-auth-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const publicStatus = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+    const publicBody = await publicStatus.json();
+    assert.equal('lifecycleId' in publicBody, false);
+
+    const internalStatus = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: {
+        'x-api-key': 'tc-test',
+        'x-teamcodex-status-identity': '1',
+      },
+    });
+    const internalBody = await internalStatus.json();
+    assert.equal(typeof internalBody.lifecycleId, 'string');
+
+    const lifecycleOnly = await fetch(`http://127.0.0.1:${port}/teamclaude/deployment/drain`, {
+      method: 'POST',
+      headers: { 'x-teamcodex-lifecycle-id': internalBody.lifecycleId },
+    });
+    assert.equal(lifecycleOnly.status, 403);
+
+    const authenticated = await fetch(`http://127.0.0.1:${port}/teamclaude/deployment/drain`, {
+      method: 'POST',
+      headers: {
+        'x-api-key': 'tc-test',
+        'x-teamcodex-lifecycle-id': internalBody.lifecycleId,
+      },
+    });
+    assert.equal(authenticated.status, 200);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test('proxy worker crash keeps the listener reachable and replacement serves the next request', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-'));
@@ -307,7 +371,7 @@ test('supervisor strips request headers nominated by Connection before worker fo
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: '' },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     accounts: [{ name: 'primary', type: 'apikey', apiKey: 'placeholder' }],
@@ -354,7 +418,7 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     proxy: { port, apiKey: 'tc-remote-auth' },
     upstream: 'http://127.0.0.1:9',
     activeWarmup: false,
-    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+    accounts: [{ name: 'operator@example.test', type: 'apikey', apiKey: 'test-api-key' }],
   }));
 
   const child = spawn(process.execPath, [entry, 'server'], {
@@ -371,6 +435,9 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
     });
     assert.equal(unauthenticated.status, 401);
     assert.equal(JSON.parse(unauthenticated.body).error.type, 'authentication_error');
+    assert.equal(unauthenticated.headers['x-teamcodex-active-requests'], undefined);
+    assert.equal(unauthenticated.headers['x-teamcodex-source-hash'], undefined);
+    assert.equal(unauthenticated.headers['x-teamcodex-deployment-draining'], undefined);
 
     const slowUnauthenticated = await new Promise((resolve, reject) => {
       let resolved = false;
@@ -404,7 +471,48 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
       headers: { 'x-api-key': 'tc-remote-auth' },
     });
     assert.equal(authenticated.status, 200);
-    assert.equal(JSON.parse(authenticated.body).accounts.length, 1);
+    const authenticatedBody = JSON.parse(authenticated.body);
+    assert.equal(authenticatedBody.accounts.length, 1);
+    assert.equal('currentAccount' in authenticatedBody, false);
+    assert.equal('name' in authenticatedBody.accounts[0], false);
+    assert.doesNotMatch(authenticated.body, /operator@example\.test/);
+
+    const spoofedIdentity = await request({
+      host,
+      port,
+      path: '/teamclaude/status',
+      headers: {
+        'x-api-key': 'tc-remote-auth',
+        'x-teamcodex-status-identity': '1',
+      },
+    });
+    const spoofedIdentityBody = JSON.parse(spoofedIdentity.body);
+    assert.equal(spoofedIdentity.status, 200);
+    assert.equal('lifecycleId' in spoofedIdentityBody, false);
+    assert.equal('currentAccountUuid' in spoofedIdentityBody, false);
+    assert.equal('accountUuid' in spoofedIdentityBody.accounts[0], false);
+    assert.equal('currentAccount' in spoofedIdentityBody, false);
+    assert.equal('name' in spoofedIdentityBody.accounts[0], false);
+    assert.doesNotMatch(spoofedIdentity.body, /operator@example\.test/);
+
+    const nominatedIdentity = await request({
+      host,
+      port,
+      path: '/teamclaude/status',
+      headers: {
+        connection: 'x-teamcodex-status-identity',
+        'x-api-key': 'tc-remote-auth',
+        'x-teamcodex-status-identity': '1',
+      },
+    });
+    const nominatedIdentityBody = JSON.parse(nominatedIdentity.body);
+    assert.equal(nominatedIdentity.status, 200);
+    assert.equal('lifecycleId' in nominatedIdentityBody, false);
+    assert.equal('currentAccountUuid' in nominatedIdentityBody, false);
+    assert.equal('accountUuid' in nominatedIdentityBody.accounts[0], false);
+    assert.equal('currentAccount' in nominatedIdentityBody, false);
+    assert.equal('name' in nominatedIdentityBody.accounts[0], false);
+    assert.doesNotMatch(nominatedIdentity.body, /operator@example\.test/);
   } finally {
     await stopChild(child);
     await rm(dir, { recursive: true, force: true });
@@ -441,10 +549,13 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
   try {
     await waitUntil(() => status(port), 'proxy did not start');
     const before = await request({
-      host,
+      host: '127.0.0.1',
       port,
       path: '/teamclaude/status',
-      headers: { 'x-api-key': 'tc-remote-rotate' },
+      headers: {
+        'x-api-key': 'tc-remote-rotate',
+        'x-teamcodex-status-identity': '1',
+      },
     });
     const beforeAccount = JSON.parse(before.body).currentAccount;
 
@@ -471,14 +582,7 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
       body: JSON.stringify({ model: 'test-model', messages: [] }),
     });
     const proxyKey = JSON.parse(await readFile(configPath, 'utf8')).proxy.apiKey;
-    const malformedRecoveryRoutes = await Promise.all([
-      'Bearer teamclaude-local-recovery:',
-      'Bearer teamclaude-local-recovery:***',
-      'bearer teamclaude-local-recovery:YQ==',
-      'Bearer   teamclaude-local-recovery:bad',
-      'Bearer\tteamclaude-local-recovery:bad',
-      'Basic unrelated, Bearer teamclaude-local-recovery:bad',
-    ].map(authorization => request({
+    const malformedRecoveryRoutes = await Promise.all(malformedRecoveryHeaders().map(authorization => request({
       host,
       port,
       path: '/v1/messages',
@@ -492,10 +596,13 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
     })));
 
     const after = await request({
-      host,
+      host: '127.0.0.1',
       port,
       path: '/teamclaude/status',
-      headers: { 'x-api-key': 'tc-remote-rotate' },
+      headers: {
+        'x-api-key': 'tc-remote-rotate',
+        'x-teamcodex-status-identity': '1',
+      },
     });
     assert.equal(blocked.status, 403);
     assert.equal(JSON.parse(blocked.body).error.type, 'permission_error');
@@ -533,14 +640,7 @@ test('supervisor rejects malformed loopback recovery markers before worker routi
 
   try {
     await waitUntil(() => status(port), 'proxy did not start');
-    const malformedRecoveryRoutes = await Promise.all([
-      'Bearer teamclaude-local-recovery:',
-      'Bearer teamclaude-local-recovery:***',
-      'bearer teamclaude-local-recovery:YQ==',
-      'Bearer   teamclaude-local-recovery:bad',
-      'Bearer\tteamclaude-local-recovery:bad',
-      'Basic unrelated, Bearer teamclaude-local-recovery:bad',
-    ].map(authorization => request({
+    const malformedRecoveryRoutes = await Promise.all(malformedRecoveryHeaders().map(authorization => request({
       port,
       path: '/v1/messages',
       method: 'POST',
@@ -653,6 +753,7 @@ console.log(JSON.stringify({ ok: response.ok, accounts: body.accounts.length }))
     TEAMCLAUDE_PROVIDER: 'anthropic',
     TEAMCLAUDE_CONFIG: configPath,
   };
+  delete env.TEAMCLAUDE_SESSION_SUPERVISED;
 
   let runChild;
   try {
@@ -714,7 +815,12 @@ test('CLI remove reloads the live worker while preserving the public supervisor'
     assert.equal(result.status, 0, result.stderr);
 
     const reloaded = await waitUntil(async () => {
-      const response = await status(port);
+      const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+        headers: {
+          'x-api-key': 'tc-test',
+          'x-teamcodex-status-identity': '1',
+        },
+      });
       if (!response) return null;
       const body = await response.json();
       const state = await readState(statePath);
@@ -770,7 +876,7 @@ test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 150
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     accounts: [{
@@ -861,7 +967,7 @@ test('supervisor buffer budget limits the double-buffered public request count',
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 8,
@@ -929,7 +1035,7 @@ test('supervisor admits five small held POSTs by actual request byte budget', { 
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 8,
@@ -1003,7 +1109,7 @@ test('supervisor releases admission after a partial request body deadline', { ti
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 1,
@@ -1091,7 +1197,7 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxRequestBytes,
@@ -1139,7 +1245,7 @@ test('supervisor rejects an oversized body before the request ends', { timeout: 
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxRequestBytes: 4,
@@ -1289,6 +1395,10 @@ test('CLI api uses the live proxy for relative paths instead of refreshing an ex
     const body = JSON.parse(result.stdout);
     assert.equal(body.accounts.length, 1);
     assert.equal(body.accounts[0].name, 'expired');
+    assert.equal(body.currentAccount, 'expired');
+    assert.equal('accountUuid' in body.accounts[0], true);
+    assert.equal('currentAccountUuid' in body, true);
+    assert.equal(typeof body.lifecycleId, 'string');
 
     const listed = spawnSync(process.execPath, [entry, 'accounts'], {
       encoding: 'utf8',

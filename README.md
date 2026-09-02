@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-291%20passing-58e3a2?style=flat-square" alt="291 tests passing">
+  <img src="https://img.shields.io/badge/tests-821%20passing-58e3a2?style=flat-square" alt="821 tests passing">
   <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18+">
   <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="Zero runtime dependencies">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT License"></a>
@@ -159,6 +159,8 @@ cannot read that path.
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
+- **Cancellation-aware account health** — locally declared Codex cancellations stay usable through their paid end date, while terminal authentication evidence distinguishes `subscription-ended` from an ordinary credential error. Recoverable errors expose UUID-pinned re-authentication in the TUI
+- **Credential-free recovery status** — status, CLI, and TUI surfaces show the recovery action and safe reason without exposing tokens or stable account IDs
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
 - **Quota survives restarts** — general per-account quota state *and* the warm-up probe template are snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup. Model-scoped usage is deliberately not restored: every Fable/Mythos window starts unknown and is re-measured from runtime traffic
@@ -288,7 +290,7 @@ teamcodex codex restart
 
 When a subscription has been cancelled but its paid period is still usable, track
 the cancellation instead of deleting or disabling the account. `--ends-on` is the
-last usable local calendar date when it is known:
+last usable Korean (KST) calendar date when it is known:
 
 ```bash
 # Cancelled subscription with an unknown end date
@@ -673,27 +675,32 @@ billing page.
 Automation on the proxy host can read the same credential-free JSON surface:
 
 ```bash
-curl -sS http://127.0.0.1:3456/teamclaude/status
+curl -sS http://127.0.0.1:3457/teamclaude/status  # Codex provider
 ```
 
 The status payload never contains access tokens, refresh tokens, API keys, or
-authorization headers. It does contain account names and UUIDs, so do not post
-the raw JSON publicly. Remote callers must still authenticate to the proxy with
-`x-api-key`; localhost is the intended operational check.
+authorization headers. Public status omits account display names and stable
+account UUIDs. Identity-bearing status is reserved for trusted localhost
+clients and requires both the proxy API key and its explicit internal header.
+Do not post the raw JSON publicly.
 
 If an OAuth account is revoked or its refresh grant is invalid, quota rotation
 cannot repair that credential. Re-authenticate the existing account directly:
 
 ```bash
+# Codex pool: runs the official Codex login in an isolated CODEX_HOME
+teamcodex codex reauth user@example.com
+teamcodex codex reauth user@example.com --account-uuid <account-uuid>
+teamcodex codex status
+
+# Anthropic pool
 teamcodex reauth user@example.com
-# Pin the identity selected by the TeamClaude app or status JSON:
-teamcodex reauth user@example.com --account-uuid <account-uuid>
-teamcodex status
 ```
 
-The command opens Anthropic OAuth, verifies that the returned profile matches
-the selected UUID (or the email on legacy name-only entries), and only then
-replaces that account's tokens. Cancellation, profile mismatch, a disabled
+The command verifies that the returned identity matches the selected UUID (or
+the email on legacy name-only entries) and only then replaces that account's
+tokens. Codex uses the official CLI in a throwaway `CODEX_HOME`; Anthropic uses
+its OAuth flow. Cancellation, profile mismatch, a disabled
 account, or an account whose organization access is blocked leaves the config
 unchanged. A running proxy is reloaded without interrupting active connections
 when supported; otherwise the CLI tells you to run `teamcodex restart`.
@@ -701,9 +708,11 @@ If the account was originally imported from a credential file, a successful
 reauthentication detaches that stale `importFrom` source so reload/restart keeps
 the newly verified tokens.
 
-In the TeamClaude menu-bar app, an account with a recoverable authentication
-error displays a **`재인증 필요`** button. It invokes the same UUID-pinned flow,
-so another account cannot be written into the selected row by mistake.
+In the TeamClaude/TeamCodex TUI, an account with a recoverable authentication
+error displays **`재인증 필요 [r]`**. Pressing `r` invokes the same UUID-pinned
+flow, so another account cannot be written into the selected row by mistake.
+Confirmed `subscription-ended` and `subscription-disabled` rows do not offer
+re-authentication because those states are not repaired by rotating credentials.
 
 You can still refresh Claude Code and import its current credential when needed:
 
@@ -799,7 +808,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
-| `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
+| `modelFallbacks` | Fork only — per-model fallback chains. Anthropic defaults to `{}` and applies a chain only for fresh-full cached model windows or fleet-wide labeled model-tier 429s. Codex defaults to `{ "gpt-5.6-sol": ["gpt-5.6-terra"] }` and uses that chain only on a new request after every eligible ChatGPT OAuth account independently rejected Sol as unsupported (see below) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
@@ -810,6 +819,19 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)
+
+Provider defaults differ. Anthropic starts with no fallback chain. Codex starts
+with `gpt-5.6-sol → gpt-5.6-terra`: an exact single-object ChatGPT OAuth 400
+marks only that account/model pair unsupported for 30 minutes. The rejected POST
+is returned unchanged and never replayed. A later, independently initiated
+request uses Terra only after every eligible Codex OAuth account has been
+quarantined for Sol. The quarantine itself affects only that OAuth account/model
+pair. As soon as any live OAuth quarantine exists for the requested model, every
+fresh Codex request for that model is constrained to the OAuth pool before account
+selection. It never falls through to a mixed-pool API-key account; if no OAuth
+candidate can serve and no configured fallback remains, the proxy returns 429
+immediately with `retry-after` derived from the earliest quarantine expiry. Other
+models remain eligible.
 
 ```json
 {

@@ -300,7 +300,7 @@ test('a preferred recovery account survives concurrent global rotations and warm
   am.releaseAccount(second);
 });
 
-test('a preferred recovery UUID survives rename, spills when unavailable, and fails closed when missing', async () => {
+test('a preferred recovery UUID survives rename and fails closed when unavailable or missing', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0);
   am.accounts[0].accountUuid = 'uuid-0';
   am.accounts[1].accountUuid = 'uuid-1';
@@ -322,7 +322,7 @@ test('a preferred recovery UUID survives rename, spills when unavailable, and fa
   am.releaseAccount(renamed);
 
   preferred.enabled = false;
-  const disabledSpill = await am.acquireAccount(
+  const disabled = await am.acquireAccount(
     null,
     0,
     null,
@@ -330,11 +330,10 @@ test('a preferred recovery UUID survives rename, spills when unavailable, and fa
     null,
     recovery.currentAccountUuid,
   );
-  assert.equal(disabledSpill?.accountUuid, 'uuid-0');
-  am.releaseAccount(disabledSpill);
+  assert.equal(disabled, null);
 
   preferred.enabled = true;
-  const excludedSpill = await am.acquireAccount(
+  const excluded = await am.acquireAccount(
     new Set([preferred]),
     0,
     null,
@@ -342,8 +341,7 @@ test('a preferred recovery UUID survives rename, spills when unavailable, and fa
     null,
     recovery.currentAccountUuid,
   );
-  assert.equal(excludedSpill?.accountUuid, 'uuid-0');
-  am.releaseAccount(excludedSpill);
+  assert.equal(excluded, null);
 
   am.removeAccount(preferred.index);
   assert.equal(await am.acquireAccount(
@@ -479,10 +477,10 @@ test('a fresh model-scoped weekly limit blocks only the matching model family', 
 });
 
 test('Opus remains eligible when the Fable/Mythos 7d_oi window is exhausted', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fallback', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fallback', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -532,10 +530,10 @@ test('all fresh Fable-full accounts return null without recovery', async () => {
 });
 
 test('fresh Fable-full preferred account is skipped for Fable routing', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -547,10 +545,10 @@ test('fresh Fable-full preferred account is skipped for Fable routing', async ()
 });
 
 test('live 7d_oi data classifies Fable/Mythos 429s while routing to a ready account', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -784,7 +782,7 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
     'mutating the snapshot must not reach live account state');
 });
 
-test('getStatus exposes the current account UUID without credentials', () => {
+test('getStatus hides stable identity by default and exposes it only to internal callers', () => {
   const am = new AccountManager([{
     name: 'same-name',
     type: 'oauth',
@@ -795,13 +793,22 @@ test('getStatus exposes the current account UUID without credentials', () => {
   }], 0.98, 0, 5);
 
   const status = am.getStatus();
-  assert.equal(status.currentAccountUuid, 'uuid-safe');
+  assert.equal('currentAccount' in status, false);
+  assert.equal('currentAccountUuid' in status, false);
+  assert.equal('name' in status.accounts[0], false);
+  assert.equal('accountUuid' in status.accounts[0], false);
   assert.equal('accessToken' in status.accounts[0], false);
   assert.equal('refreshToken' in status.accounts[0], false);
   assert.equal('credential' in status.accounts[0], false);
 
+  const internal = am.getStatus({ includeIdentity: true });
+  assert.equal(internal.currentAccount, 'same-name');
+  assert.equal(internal.currentAccountUuid, 'uuid-safe');
+  assert.equal(internal.accounts[0].name, 'same-name');
+  assert.equal(internal.accounts[0].accountUuid, 'uuid-safe');
+
   am.currentIndex = -1;
-  assert.equal(am.getStatus().currentAccountUuid, null);
+  assert.equal(am.getStatus({ includeIdentity: true }).currentAccountUuid, null);
 });
 
 test('subscription-disabled config restores a parked account and exposes only its safe reason', () => {

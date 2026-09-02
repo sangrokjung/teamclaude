@@ -99,8 +99,9 @@ test('subscription-disabled persistence completes before failover and graceful c
   try {
     const response = postMessage(proxyPort);
     await persistenceStarted;
-    const closing = close(proxy);
+    await new Promise(resolve => setTimeout(resolve, 25));
     assert.deepEqual(hits, { a: 1, b: 0 });
+    const closing = close(proxy);
     releasePersistence();
     const res = await response;
     assert.equal(res.status, 200);
@@ -109,6 +110,42 @@ test('subscription-disabled persistence completes before failover and graceful c
     await closing;
   } finally {
     if (proxy.listening) await close(proxy);
+    await close(upstream);
+  }
+});
+
+test('a failed subscription-disabled write returns the original 403 without failover', async () => {
+  const hits = { a: 0, b: 0 };
+  const upstream = http.createServer((req, res) => {
+    const account = (req.headers.authorization || '').includes('tok-a') ? 'a' : 'b';
+    hits[account]++;
+    res.writeHead(account === 'a' ? 403 : 200, {
+      'content-type': 'application/json',
+      'x-denied-account': account,
+    });
+    res.end(JSON.stringify(account === 'a'
+      ? { type: 'error', error: SUBSCRIPTION_DISABLED_ERROR }
+      : { ok: true, account }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = accounts();
+  am.onAccountFlag(() => Promise.reject(new Error('disk unavailable')));
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await postMessage(proxyPort);
+    assert.equal(res.status, 403);
+    assert.equal(res.headers.get('x-denied-account'), 'a');
+    assert.deepEqual(hits, { a: 1, b: 0 });
+    assert.equal(am.accounts[0].status, 'error');
+    assert.equal(am.accounts[0].subscriptionDisabled, true);
+  } finally {
+    await close(proxy);
     await close(upstream);
   }
 });

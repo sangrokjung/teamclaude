@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
@@ -714,7 +715,7 @@ test('Codex SSE recovery requires response.completed rather than any terminal ma
   ]);
 });
 
-async function observeCodexJsonSubscriptionRecovery({ statusCode = 200, body = '' }) {
+async function observeCodexJsonSubscriptionRecovery({ statusCode = 200, body = '', headers = {} }) {
   let reportRequest;
   let releaseResponse;
   const requestSeen = new Promise(resolve => { reportRequest = resolve; });
@@ -722,7 +723,7 @@ async function observeCodexJsonSubscriptionRecovery({ statusCode = 200, body = '
   const upstream = http.createServer(async (_req, res) => {
     reportRequest();
     await responseReleased;
-    res.writeHead(statusCode, { 'content-type': 'application/json' });
+    res.writeHead(statusCode, { 'content-type': 'application/json', ...headers });
     res.end(body);
   });
   let proxy;
@@ -795,6 +796,13 @@ test('Codex JSON recovery requires a completed Responses object', async () => {
         usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
       }),
     }, true],
+    ['gzip completed response', {
+      body: gzipSync(JSON.stringify({
+        id: 'resp_gzip_completed', object: 'response', status: 'completed', error: null,
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      })),
+      headers: { 'content-encoding': 'gzip' },
+    }, true],
   ];
   const observed = [];
   for (const [name, response, recovers] of cases) {
@@ -813,6 +821,10 @@ test('Codex JSON recovery requires a completed Responses object', async () => {
     ['incomplete response', false, remainsEnded],
     ['completed response without id', false, remainsEnded],
     ['completed response', true, {
+      statusCode: 200, status: 'active', errorReason: null,
+      subscription: 'scheduled', persisted: 1,
+    }],
+    ['gzip completed response', true, {
       statusCode: 200, status: 'active', errorReason: null,
       subscription: 'scheduled', persisted: 1,
     }],

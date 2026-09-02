@@ -51,7 +51,7 @@ function recordingUpstream(seen) {
 }
 
 function measured(am, name) {
-  return am.getStatus().accounts.find(a => a.name === name)?.quota.unified5h != null;
+  return am.getStatus({ includeIdentity: true }).accounts.find(a => a.name === name)?.quota.unified5h != null;
 }
 
 // ── unit: warmupCandidates() ───────────────────────────────────────────────
@@ -899,7 +899,7 @@ test('a non-exhaustion 429 probe (rate-limit headers but not "rejected") does no
   assert.ok(await waitFor(() => measured(am, 'a0')), 'a0 measured by the real request');
   await new Promise(r => setTimeout(r, 80)); // let the (non-exhaustion 429) probe finish
 
-  const a1 = am.getStatus().accounts.find(a => a.name === 'a1');
+  const a1 = am.getStatus({ includeIdentity: true }).accounts.find(a => a.name === 'a1');
   assert.ok(!measured(am, 'a1'), 'non-exhaustion 429 must NOT mark the probed account measured');
   assert.equal(a1.usage.totalRequests, 0, 'non-exhaustion 429 must not bump usage (no updateQuota)');
   assert.equal(a1.status, 'active', 'non-exhaustion 429 must not change account status');
