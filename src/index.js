@@ -2,7 +2,7 @@
 
 import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -73,7 +73,7 @@ const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_MANAGED_CLAUDE_MODEL = 'claude-sonnet-5';
 function runtimeSourceHash(entryPath) {
-  const sourceDir = dirname(entryPath);
+  const sourceDir = dirname(realpathSync(entryPath));
   const digest = createHash('sha256');
   const files = readdirSync(sourceDir).filter(name => name.endsWith('.js')).sort();
   for (const name of files) {
@@ -86,6 +86,7 @@ function runtimeSourceHash(entryPath) {
 }
 
 const RUNTIME_SOURCE_HASH = runtimeSourceHash(process.argv[1]);
+const RUNTIME_ENTRY_PATH = realpathSync(process.argv[1]);
 const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'keep-alive',
@@ -1683,12 +1684,21 @@ function sameProcessIdentity(recorded, current) {
     && recorded.command === current.command);
 }
 
+function commandReferencesRuntime(command) {
+  if (typeof command !== 'string') return false;
+  return command.split(/\s+/).some(token => {
+    const candidate = token.replace(/^['"]|['"]$/g, '');
+    try { return realpathSync(candidate) === RUNTIME_ENTRY_PATH; }
+    catch { return candidate === process.argv[1] || candidate === RUNTIME_ENTRY_PATH; }
+  });
+}
+
 function isExpectedServerIdentity(identity, { worker = false, supervisorPid = null } = {}) {
   if (!identity || typeof identity.command !== 'string') return false;
-  if (!identity.command.includes(process.argv[1]) || !identity.command.includes('server')) return false;
+  if (!commandReferencesRuntime(identity.command) || !identity.command.includes('server')) return false;
   if (worker) {
     return identity.ppid === supervisorPid
-      && identity.command.includes(process.argv[1]);
+      && commandReferencesRuntime(identity.command);
   }
   return identity.ppid > 0;
 }
@@ -1810,7 +1820,10 @@ async function findRunningServer(
       port,
       Math.min(configuredStatusProbeTimeoutMs(), remainingMs),
     ))) continue;
-    const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
+    const lsofOwnerPid = lsofPid(port);
+    const ownerPid = lsofOwnerPid || (
+      state?.port === port && state.pid && isPidAlive(state.pid) ? state.pid : null
+    );
     if (!ownerPid) return { pid: null, port, lifecycleVerified: false, reason: 'no-pid' };
     const verified = verifyLifecycleState(state, ownerPid, port);
     const lifecycleRemainingMs = probeDeadline - Date.now();
