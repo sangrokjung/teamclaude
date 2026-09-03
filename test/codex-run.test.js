@@ -31,7 +31,7 @@ function assertSingleInvocationWithoutResume(invocations, expectedTail) {
   );
 }
 
-test('teamclaude codex run launches Codex through the HTTP-only first-party auth provider', async () => {
+test('teamclaude codex run launches Codex through the login-free HTTP-only provider', async () => {
   // Given
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-'));
   const fakeCodex = join(dir, 'codex');
@@ -61,6 +61,7 @@ console.log(JSON.stringify({
         env: {
           ...process.env,
           PATH: `${dir}:${process.env.PATH}`,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           OPENAI_API_KEY: 'must-not-reach-child',
           CODEX_API_KEY: 'must-not-reach-child',
@@ -78,7 +79,7 @@ console.log(JSON.stringify({
     assert.equal(child.codexAccessToken, null);
     assert.deepEqual(child.args.slice(-3), ['exec', '--json', 'say hello']);
     assert.equal(child.args[1], 'model_provider="teamcodex_proxy"');
-    assert.match(child.args[3], /requires_openai_auth = true/);
+    assert.match(child.args[3], /requires_openai_auth = false/);
     assert.match(child.args[3], /supports_websockets = false/);
     assert.equal(child.args[5], 'chatgpt_base_url="http://127.0.0.1:4567"');
   } finally {
@@ -122,6 +123,7 @@ process.exit(Number(process.env.FAKE_EXIT));
           env: {
             ...process.env,
             PATH: `${dir}:${process.env.PATH}`,
+            TEAMCODEX_CODEX_BIN: fakeCodex,
             TEAMCLAUDE_CONFIG: configPath,
             INVOCATION_LOG: logPath,
             FAKE_EXIT: scenario.fakeExit,
@@ -163,6 +165,7 @@ process.kill(process.pid, 'SIGINT');
         env: {
           ...process.env,
           PATH: `${dir}:${process.env.PATH}`,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
           TEAMCLAUDE_CONFIG: configPath,
           INVOCATION_LOG: logPath,
         },
@@ -273,6 +276,7 @@ writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), ${JSON.stringify(JSON.s
         env: {
           ...process.env,
           PATH: `${dir}:${process.env.PATH}`,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
           XDG_CONFIG_HOME: dir,
           TEAMCLAUDE_CONFIG: '',
         },

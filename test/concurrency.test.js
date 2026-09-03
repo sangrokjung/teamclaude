@@ -87,6 +87,46 @@ test('all accounts exhausted by quota returns null immediately (does not queue)'
   assert.ok(Date.now() - start < 200, 'must not wait the full timeout when nothing is merely capped');
 });
 
+test('recovery account identity is exact and fails closed when unavailable', async t => {
+  function manager() {
+    const am = new AccountManager(makeAccounts(2).map((account, index) => ({
+      ...account,
+      accountUuid: `uuid-${index}`,
+    })), 0.98, 0, 1);
+    measureAll(am);
+    am.currentIndex = 0;
+    return am;
+  }
+
+  await t.test('available preferred account', async () => {
+    const am = manager();
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    assert.equal(selected.accountUuid, 'uuid-0');
+  });
+
+  await t.test('quota-blocked preferred account', async () => {
+    const am = manager();
+    am.updateQuota(0, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.99',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+    });
+    am.currentIndex = 0;
+
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    assert.equal(selected, null);
+  });
+
+  await t.test('capped preferred account', async () => {
+    const am = manager();
+    const held = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+    const selected = await am.acquireAccount(null, 0, null, null, null, 'uuid-0');
+
+    assert.equal(held.accountUuid, 'uuid-0');
+    assert.equal(selected, null);
+    assert.equal(am._waiters.length, 0);
+  });
+});
+
 test('per-account maxConcurrent overrides the global default', () => {
   const accts = makeAccounts(2);
   accts[1].maxConcurrent = 5;
@@ -475,6 +515,61 @@ test('proxy caps concurrent in-flight per account and still serves every request
 
   upstream.close();
   proxy.close();
+});
+
+test('continuity mode preserves a capped request FIFO position past the short queue timeout', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 1);
+  measureAll(am);
+  const held = await am.acquireAccount(null, 0); // saturate the only healthy slot
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: true,
+    continuityMaxWaitMs: 500,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    overflowQueueTimeoutMs: 20,
+  });
+  const port = await listen(proxy);
+
+  let released = false;
+  let pending;
+  try {
+    pending = fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    for (let i = 0; i < 20 && am._waiters.length === 0; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(am._waiters.length, 1, 'the saturated request should enter the FIFO queue');
+    const originalWaiter = am._waiters[0];
+
+    await new Promise(resolve => setTimeout(resolve, 70));
+    assert.equal(
+      am._waiters[0],
+      originalWaiter,
+      'continuity mode must not time out and re-enqueue the request at the back of the queue',
+    );
+
+    am.releaseAccount(held);
+    released = true;
+    const res = await pending;
+    assert.equal(res.status, 200);
+  } finally {
+    if (!released) am.releaseAccount(held);
+    await pending?.catch(() => {});
+    upstream.close();
+    proxy.close();
+  }
 });
 
 test('a keep-alive connection pins its sequential requests to one account (affinity end-to-end)', async () => {
@@ -1239,6 +1334,215 @@ test('standalone chunked concat peak is reserved, settled, and released exactly'
   }
 });
 
+test('fragmented upstream response enforces concat peak and releases chunks', async () => {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('a'.repeat(256));
+    setTimeout(() => res.end('b'.repeat(256)), 10);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(manager);
+  const proxy = createProxyServer(manager, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxResponseBytes: 512,
+    maxBufferedResponseBytes: 512,
+  });
+  const port = await listen(proxy);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 502);
+    await response.arrayBuffer();
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+
+  const upstream2 = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('a'.repeat(256));
+    setTimeout(() => res.end('b'.repeat(256)), 10);
+  });
+  const upstreamPort2 = await listen(upstream2);
+  const manager2 = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(manager2);
+  const proxy2 = createProxyServer(manager2, {
+    upstream: `http://127.0.0.1:${upstreamPort2}`,
+    maxResponseBytes: 512,
+    maxBufferedResponseBytes: 1024,
+  });
+  const port2 = await listen(proxy2);
+  try {
+    const response = await fetch(`http://127.0.0.1:${port2}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.text()).length, 512);
+  } finally {
+    proxy2.close();
+    upstream2.close();
+  }
+});
+
+test('concat failure releases final response reservation before the next request', async () => {
+  let large = true;
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (large) {
+      res.write('a'.repeat(256));
+      setTimeout(() => res.end('b'.repeat(256)), 10);
+      return;
+    }
+    res.end('{}');
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(manager);
+  const proxy = createProxyServer(manager, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxResponseBytes: 512,
+    maxBufferedResponseBytes: 1024,
+  });
+  const port = await listen(proxy);
+  const originalConcat = Buffer.concat;
+  let threw = false;
+  Buffer.concat = (chunks, totalLength) => {
+    if (!threw && totalLength === 512) {
+      threw = true;
+      throw new Error('synthetic concat failure');
+    }
+    return originalConcat(chunks, totalLength);
+  };
+  try {
+    const failed = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(failed.status, 502);
+    await failed.arrayBuffer();
+  } finally {
+    Buffer.concat = originalConcat;
+  }
+  try {
+    assert.equal(threw, true);
+    large = false;
+    const next = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(next.status, 200);
+    await next.arrayBuffer();
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('client close during a buffered response cannot reserve after lifecycle release', async () => {
+  let requestCount = 0;
+  const upstream = http.createServer((_req, res) => {
+    requestCount += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('a'.repeat(256));
+    setTimeout(() => res.end('b'.repeat(256)), 40);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(manager);
+  const proxy = createProxyServer(manager, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    maxResponseBytes: 512,
+    maxBufferedResponseBytes: 1024,
+  });
+  const port = await listen(proxy);
+  try {
+    await new Promise(resolve => {
+      const request = http.request({ hostname: '127.0.0.1', port, path: '/v1/messages', method: 'POST' });
+      request.on('error', () => resolve());
+      request.end('{}');
+      setTimeout(() => request.destroy(), 10);
+    });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+    assert.equal(requestCount, 2);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('buffered response close race rejects late chunks without poisoning the next request', async () => {
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  let releaseTail;
+  const tailReady = new Promise(resolve => { releaseTail = resolve; });
+  let firstChunkSeen;
+  const firstSeen = new Promise(resolve => { firstChunkSeen = resolve; });
+  let upstreamAborted;
+  const aborted = new Promise(resolve => { upstreamAborted = resolve; });
+  let tailDone;
+  const tailFinished = new Promise(resolve => { tailDone = resolve; });
+  globalThis.fetch = async (url, options = {}) => {
+    if (new URL(String(url)).host !== 'mock.invalid') return originalFetch(url);
+    callCount += 1;
+    const makeStream = (first, second) => new globalThis.ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(first));
+        tailReady.then(() => {
+          try {
+            controller.enqueue(new TextEncoder().encode(second));
+            controller.close();
+            tailDone();
+          } catch {}
+        });
+        options.signal?.addEventListener('abort', upstreamAborted, { once: true });
+      },
+      cancel() {},
+    });
+    if (callCount > 1) {
+      return new globalThis.Response(makeStream('c'.repeat(256), 'd'.repeat(256)), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    const stream = makeStream('a'.repeat(256), 'b'.repeat(256));
+    firstChunkSeen();
+    return new globalThis.Response(stream, { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const manager = new AccountManager(makeAccounts(1), 0.98, 0, 2, 0);
+  measureAll(manager);
+  const proxy = createProxyServer(manager, {
+    upstream: 'http://mock.invalid', maxResponseBytes: 512, maxBufferedResponseBytes: 1024,
+  });
+  const port = await listen(proxy);
+  try {
+    const clientClosed = new Promise(resolve => {
+      const request = http.request({ hostname: '127.0.0.1', port, path: '/v1/messages', method: 'POST' });
+      request.on('error', resolve);
+      request.on('close', resolve);
+      request.end('{}');
+      firstSeen.then(() => setTimeout(() => request.destroy(), 25));
+    });
+    await clientClosed;
+    await aborted;
+    releaseTail();
+    await tailFinished;
+    const next = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST', body: '{}', signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(next.status, 200);
+    await next.arrayBuffer();
+    assert.equal(callCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    proxy.close();
+  }
+});
+
 test('supervised worker accepts one local body copy without duplicating the parent budget', async () => {
   let hits = 0;
   const body = 'x'.repeat(700);
@@ -1683,7 +1987,7 @@ test('getStatus exposes enabled + priority; setters resolve by name', () => {
   assert.equal(am.setPriority('a1', 7)?.name, 'a1', 'setPriority resolves by name');
   assert.equal(am.setEnabled('nope', false), null, 'unknown name → null');
 
-  const st = am.getStatus();
+  const st = am.getStatus({ includeIdentity: true });
   const s0 = st.accounts.find(a => a.name === 'a0');
   const s1 = st.accounts.find(a => a.name === 'a1');
   assert.equal(s0.enabled, false);

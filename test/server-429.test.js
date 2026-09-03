@@ -321,7 +321,7 @@ test('continuity deadline recovers after the legacy overload retry limit', async
   }
 });
 
-test('persistent global 429 returns the last upstream response at the continuity deadline', async () => {
+test('persistent global 429 on a replay-safe request returns the last upstream response at the continuity deadline', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
     upstreamHits++;
@@ -343,17 +343,15 @@ test('persistent global 429 returns the last upstream response at the continuity
   try {
     const started = Date.now();
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      method: 'GET',
       signal: AbortSignal.timeout(1000),
     });
     const body = await res.json();
     const elapsed = Date.now() - started;
     assert.equal(res.status, 429);
-    assert.equal(body.upstreamAttempt, upstreamHits,
-      'terminal body must come from the final fully-read upstream 429');
-    assert.equal(res.headers.get('x-upstream-attempt'), String(upstreamHits));
+    assert.ok(upstreamHits === body.upstreamAttempt || upstreamHits === body.upstreamAttempt + 1,
+      'terminal body must come from the last fully-read 429; at most one final request may be cut off by the deadline');
+    assert.equal(res.headers.get('x-upstream-attempt'), String(body.upstreamAttempt));
     assert.ok(upstreamHits >= 3 && upstreamHits <= 8,
       `deadline retries must stay bounded, saw ${upstreamHits}`);
     assert.ok(elapsed >= 40 && elapsed < 500, `deadline should bound the wait, took ${elapsed}ms`);

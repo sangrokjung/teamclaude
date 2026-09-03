@@ -68,10 +68,20 @@ export function sseErrorEvent(message) {
  * available as `pending`.
  */
 export class SseFramer {
-  constructor({ maxBufferedBytes = SSE_MAX_FRAME_BYTES } = {}) {
+  constructor({
+    maxBufferedBytes = SSE_MAX_FRAME_BYTES,
+    reserveBytes = null,
+    releaseBytes = null,
+  } = {}) {
     this.maxBufferedBytes = maxBufferedBytes;
+    this.reserveBytes = typeof reserveBytes === 'function' ? reserveBytes : null;
+    this.releaseBytes = typeof releaseBytes === 'function' ? releaseBytes : null;
     this.pending = EMPTY;
+    this.reservedBytes = 0;
+    this.forwardedReservationBytes = 0;
+    this.limitExceeded = false;
     this.sawTerminal = false;
+    this.sawResponseCompleted = false;
     // Set when a frame exceeded maxBufferedBytes: framing is abandoned and
     // chunks pass straight through (terminal tracking falls back to a rolling
     // substring scan — see _scanRaw).
@@ -90,10 +100,38 @@ export class SseFramer {
       ? input
       : Buffer.from(input.buffer, input.byteOffset, input.byteLength);
     if (this.passthrough) {
+      if (this.reserveBytes && !this.reserveBytes(chunk.length)) {
+        this.limitExceeded = true;
+        return null;
+      }
+      if (this.reserveBytes) this.reservedBytes += chunk.length;
+      this.forwardedReservationBytes = chunk.length;
       this._scanRaw(chunk.toString('utf8'));
       return chunk;
     }
-    this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
+    if (this.reserveBytes && !this.reserveBytes(chunk.length)) {
+      this.limitExceeded = true;
+      return null;
+    }
+    if (this.reserveBytes) this.reservedBytes += chunk.length;
+    if (this.pending.length) {
+      const combinedBytes = this.pending.length + chunk.length;
+      if (this.reserveBytes && !this.reserveBytes(combinedBytes)) {
+        this.releaseBytes?.(chunk.length);
+        this.reservedBytes -= chunk.length;
+        this.limitExceeded = true;
+        return null;
+      }
+      const previousBytes = this.reservedBytes;
+      this.pending = Buffer.concat([this.pending, chunk], combinedBytes);
+      if (this.reserveBytes) {
+        this.reservedBytes += combinedBytes;
+        this.releaseBytes?.(previousBytes);
+        this.reservedBytes -= previousBytes;
+      }
+    } else {
+      this.pending = chunk;
+    }
 
     // Find the LAST complete frame boundary; support both LF and CRLF blank
     // lines (Anthropic emits LF; CRLF-only upstreams still frame correctly).
@@ -110,21 +148,59 @@ export class SseFramer {
         this.passthrough = true;
         const out = this.pending;
         this.pending = EMPTY;
+        this.forwardedReservationBytes = out.length;
         this._scanRaw(out.toString('utf8'));
         return out;
       }
-      // Retaining bytes across push() calls: if pending still aliases the
-      // caller's chunk (or a view over its ArrayBuffer), copy it so caller-side
-      // buffer reuse can't mutate a frame we haven't forwarded yet.
-      if (this.pending === chunk) this.pending = Buffer.from(chunk);
       return null;
     }
 
     const out = this.pending.subarray(0, end);
-    // Copy the (small) remainder so the flushed parent buffer can be GC'd.
-    this.pending = end < this.pending.length ? Buffer.from(this.pending.subarray(end)) : EMPTY;
+    const parentBytes = this.pending.length;
+    const remainderBytes = parentBytes - end;
+    if (remainderBytes > 0) {
+      if (this.reserveBytes && !this.reserveBytes(remainderBytes)) {
+        this.releaseBytes?.(this.reservedBytes);
+        this.reservedBytes = 0;
+        this.pending = EMPTY;
+        this.limitExceeded = true;
+        return null;
+      }
+      this.pending = Buffer.from(this.pending.subarray(end));
+      if (this.reserveBytes) this.reservedBytes += remainderBytes;
+    } else {
+      this.pending = EMPTY;
+    }
+    this.forwardedReservationBytes = parentBytes;
     this._scanFrames(out.toString('utf8'));
     return out;
+  }
+
+  releaseForwarded(bytes, releaseBudget = true) {
+    if (!this.reserveBytes || bytes <= 0) return;
+    if (bytes > this.forwardedReservationBytes
+        || this.forwardedReservationBytes > this.reservedBytes) {
+      throw new Error('SSE frame reservation underflow');
+    }
+    if (releaseBudget) this.releaseBytes?.(this.forwardedReservationBytes);
+    this.reservedBytes -= this.forwardedReservationBytes;
+    this.forwardedReservationBytes = 0;
+  }
+
+  takePending() {
+    const out = this.pending;
+    this.pending = EMPTY;
+    this.forwardedReservationBytes = out.length;
+    return out;
+  }
+
+  dispose() {
+    if (this.reserveBytes && this.reservedBytes > 0) {
+      this.releaseBytes?.(this.reservedBytes);
+      this.reservedBytes = 0;
+    }
+    this.pending = EMPTY;
+    this.forwardedReservationBytes = 0;
   }
 
   // Frame boundaries are ASCII, so flushed bytes never split a UTF-8 character
@@ -137,18 +213,26 @@ export class SseFramer {
       // one wins — and multiple `data:` lines concatenate with newlines.
       const eventLines = [...block.matchAll(/^event:[ \t]?(.*)$/gm)];
       if (eventLines.length) {
-        if (TERMINAL_EVENTS.has(eventLines[eventLines.length - 1][1].trim())) {
+        const eventName = eventLines[eventLines.length - 1][1].trim();
+        if (eventName === 'response.completed') this.sawResponseCompleted = true;
+        if (TERMINAL_EVENTS.has(eventName)) {
           this.sawTerminal = true;
+          return;
         }
         continue;
       }
       const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
       if (!dataLines.length) continue;
       const data = dataLines.join('\n').trim();
-      if (data === '[DONE]') { this.sawTerminal = true; continue; }
+      if (data === '[DONE]') { this.sawTerminal = true; return; }
       if (data.length > MAX_TERMINAL_DATA_PARSE || !data.startsWith('{')) continue;
       try {
-        if (TERMINAL_EVENTS.has(JSON.parse(data)?.type)) this.sawTerminal = true;
+        const type = JSON.parse(data)?.type;
+        if (type === 'response.completed') this.sawResponseCompleted = true;
+        if (TERMINAL_EVENTS.has(type)) {
+          this.sawTerminal = true;
+          return;
+        }
       } catch { /* not JSON — not a terminal marker */ }
     }
   }
@@ -160,6 +244,9 @@ export class SseFramer {
   _scanRaw(text) {
     if (this.sawTerminal) return;
     const hay = this._rawTail + text;
+    if (/\r?\n\r?\nevent:[ \t]?response\.completed[ \t]*\r?\n/.test(hay)) {
+      this.sawResponseCompleted = true;
+    }
     if (/\r?\n\r?\nevent:[ \t]?(message_stop|error|response\.(completed|failed|incomplete))[ \t]*\r?\n/.test(hay)
       || /\r?\ndata:[ \t]?\[DONE\]/.test(hay)) {
       this.sawTerminal = true;

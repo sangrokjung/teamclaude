@@ -1,6 +1,8 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
+import { subscriptionSnapshot } from './subscription.js';
+import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -19,9 +21,44 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+function isWideCodePoint(codePoint) {
+  return (codePoint >= 0x1100 && codePoint <= 0x115f)
+    || (codePoint >= 0x2329 && codePoint <= 0x232a)
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd);
+}
+
+function isCombiningCodePoint(codePoint) {
+  return (codePoint >= 0x300 && codePoint <= 0x36f)
+    || (codePoint >= 0x1ab0 && codePoint <= 0x1aff)
+    || (codePoint >= 0x1dc0 && codePoint <= 0x1dff)
+    || (codePoint >= 0x20d0 && codePoint <= 0x20ff)
+    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)
+    || (codePoint >= 0xe0100 && codePoint <= 0xe01ef);
+}
+
+export function displayWidth(value) {
+  let width = 0;
+  for (let i = 0; i < value.length;) {
+    if (value[i] === '\x1b') {
+      const end = value.indexOf('m', i);
+      if (end >= 0) { i = end + 1; continue; }
+    }
+    const codePoint = value.codePointAt(i);
+    if (codePoint == null) break;
+    if (!isCombiningCodePoint(codePoint)) width += isWideCodePoint(codePoint) ? 2 : 1;
+    i += codePoint > 0xffff ? 2 : 1;
+  }
+  return width;
+}
+
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -38,15 +75,19 @@ function truncate(s, w) {
       const end = s.indexOf('m', i);
       if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
     }
-    out += s[i];
-    visible++;
-    i++;
+    const codePoint = s.codePointAt(i);
+    if (codePoint == null) break;
+    const charWidth = isCombiningCodePoint(codePoint) ? 0 : isWideCodePoint(codePoint) ? 2 : 1;
+    if (visible + charWidth > w) break;
+    out += s.slice(i, i + (codePoint > 0xffff ? 2 : 1));
+    visible += charWidth;
+    i += codePoint > 0xffff ? 2 : 1;
   }
   return out + RESET;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+export function fitLine(s, w) {
   const v = vw(s);
   if (v > w) return truncate(s, w);
   if (v < w) return s + ' '.repeat(w - v);
@@ -182,12 +223,15 @@ export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mu
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, reauthenticate, onQuit }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
+    this.reauthenticate = reauthenticate || (async () => {
+      throw new Error('OAuth re-authentication is not configured');
+    });
     this.onQuit = onQuit;
     this._host = createHostTracker(); // host CPU/RAM shown in the header
 
@@ -205,6 +249,7 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    this._reauthPromise = null;
   }
 
   // ── lifecycle ──────────────────────────────────────
@@ -342,6 +387,7 @@ export class TUI {
     else if (k === 's') { const a = this._selected(); if (a) { this.am.currentIndex = a.index; this._addLog(`Switched to "${a.name}"`); } }
     else if (k === 'e') { const a = this._selected(); if (a) this._doToggleEnabled(a.index); }
     else if (k === 'o') { const a = this._selected(); if (a) { this.orderAccount = a; this.mode = 'order'; } }
+    else if (k === 'r') { const a = this._selected(); if (this._canReauthenticate(a)) this._doReauthenticate(a); }
     // Delete keeps an explicit confirmation (it's destructive): the cursor account
     // is pre-selected (anchored) and Enter in select mode confirms.
     else if (k === 'd') { this._selected(); this.mode = 'select'; }
@@ -458,6 +504,14 @@ export class TUI {
     }
   }
 
+  _canReauthenticate(account) {
+    return canReauthenticateTuiAccount(this, account);
+  }
+
+  _doReauthenticate(account) {
+    return reauthenticateTuiAccount(this, account);
+  }
+
   async _doImport() {
     if (this.config.provider === 'codex') {
       await this._doImportCodex();
@@ -508,6 +562,9 @@ export class TUI {
         previous = prev;
         if (prev.enabled !== undefined) entry.enabled = prev.enabled;
         if (prev.priority !== undefined) entry.priority = prev.priority;
+        if (prev.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = prev.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         // Update the running account manager entry, matched by IDENTITY (the
         // previous entry's UUID first, then name) — NOT the config index `idx`,
@@ -525,6 +582,7 @@ export class TUI {
           if (amAcct.status === 'error') {
             amAcct.status = 'active';
             delete amAcct._errorFromRefresh;
+            delete amAcct.errorReason;
           }
           delete amAcct._refreshRetryAt;
         } else {
@@ -578,6 +636,9 @@ export class TUI {
         previous = this.config.accounts[idx];
         if (previous.enabled !== undefined) entry.enabled = previous.enabled;
         if (previous.priority !== undefined) entry.priority = previous.priority;
+        if (previous.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = previous.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         const live = this.am.accounts.find(a =>
           a.accountUuid === creds.accountId || a.name === previous.name);
@@ -911,12 +972,25 @@ export class TUI {
     if (a.enabled === false) {
       status = gray('disabled');
     } else {
-      switch (a.status) {
-        case 'active':    status = isCur ? green('active') : 'active'; break;
-        case 'throttled': status = yellow('throttled'); break;
-        case 'exhausted': status = red('exhausted'); break;
-        case 'error':     status = red('error'); break;
-        default:          status = a.status || 'ready';
+      const subscription = subscriptionSnapshot(a);
+      if (subscription.state === 'ended') {
+        status = red('sub ended');
+      } else if (a.status === 'error') {
+        status = red(a.errorReason === 'subscription-disabled'
+          ? 'access'
+          : this._canReauthenticate(a) ? 'reauth' : 'error');
+      } else if (subscription.state === 'end-date-reached') {
+        status = yellow('sub due');
+      } else if (subscription.state === 'cancellation-scheduled') {
+        status = yellow('canceling');
+      } else {
+        switch (a.status) {
+          case 'active':    status = isCur ? green('active') : 'active'; break;
+          case 'throttled': status = yellow('throttled'); break;
+          case 'exhausted': status = red('exhausted'); break;
+          case 'error':     status = red('error'); break;
+          default:          status = a.status || 'ready';
+        }
       }
     }
     status = rpad(status, 10);
@@ -981,8 +1055,13 @@ export class TUI {
 
   _renderFooter() {
     switch (this.mode) {
-      case 'normal':
-        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}nable/disable  ${bold('o')}rder  ${bold('d')}elete  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+      case 'normal': {
+        const selected = this._selected();
+        const reauth = this._canReauthenticate(selected)
+          ? `  ${red('재인증 필요')} [${bold('r')}]`
+          : '';
+        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}toggle  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
+      }
       case 'select':
         return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':

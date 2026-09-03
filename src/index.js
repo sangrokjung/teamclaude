@@ -1,36 +1,98 @@
 #!/usr/bin/env node
 
 import { fork, spawn, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
+import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
+  assertSafeCodexArgs,
   buildCodexProxyArgs,
+  codexCliNotFoundMessage,
   importCodexCredentials,
+  loginCodexCredentials,
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
+  resolveCodexCliBin,
 } from './codex.js';
+import {
+  currentCmuxCodexBaseline,
+  currentCmuxCodexSessionId,
+  isCodexSessionId,
+} from './codex-session.js';
+import {
+  CODEX_INVOCATION_HEADER,
+  CODEX_RECOVERY_CONSUME_PATH,
+  CODEX_RECOVERY_SESSION_HEADER,
+  codexRecoveryIdentity,
+  isCodexInvocationId,
+  isCodexResponsesPath,
+} from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
+import { reauthenticateAccount } from './reauth.js';
+import {
+  applySubscriptionCancellation,
+  cancellationEndsAt,
+  clearSubscriptionCancellation,
+  findSubscriptionTarget,
+  normalizeSubscriptionCancellation,
+  subscriptionSnapshot,
+} from './subscription.js';
+import {
+  buildClaudeRecoveryEnv,
+  hasClaudeRecoveryMarker,
+  parseClaudeRecoveryAccount,
+} from './claude-auth.js';
+import {
+  createCmuxSessionRescuer,
+  defaultCmuxRescuePaths,
+} from './cmux-session-rescue.js';
+import {
+  PROBE_BROKEN,
+  createLoopStallMeter,
+  healthProbeVerdict,
+  unhealthyWorkerAction,
+} from './worker-health.js';
+import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
+const LIFECYCLE_ID_ENV = 'TEAMCLAUDE_LIFECYCLE_ID';
+const DEPLOYMENT_DRAIN_PATH = '/teamclaude/deployment/drain';
+const LIFECYCLE_ID_HEADER = 'x-teamcodex-lifecycle-id';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_MANAGED_CLAUDE_MODEL = 'claude-sonnet-5';
+function runtimeSourceHash(entryPath) {
+  const sourceDir = dirname(realpathSync(entryPath));
+  const digest = createHash('sha256');
+  const files = readdirSync(sourceDir).filter(name => name.endsWith('.js')).sort();
+  for (const name of files) {
+    digest.update(name);
+    digest.update('\0');
+    digest.update(readFileSync(join(sourceDir, name)));
+    digest.update('\0');
+  }
+  return digest.digest('hex');
+}
+
+const RUNTIME_SOURCE_HASH = runtimeSourceHash(process.argv[1]);
+const RUNTIME_ENTRY_PATH = realpathSync(process.argv[1]);
 const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
+  'proxy-connection',
   'te',
   'trailer',
   'transfer-encoding',
@@ -38,10 +100,49 @@ const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'host',
 ]);
 
+// Korean labels for WHY an account is parked as 'error' (status payload
+// errorReason). Unknown/legacy reasons render as plain `error` with no tag.
+// MUST stay above the top-level command dispatch below: `const` in the module
+// scope is in its temporal dead zone until evaluation reaches this line, and
+// the dispatch `await`s command functions mid-module — a declaration placed
+// after it throws ReferenceError the moment statusCommand touches it.
+const ERROR_REASON_LABELS = {
+  'subscription-disabled': '조직의 Claude Code 접근 차단',
+  'subscription-ended': '구독 종료',
+  'auth-revoked': '인증무효 — 재로그인 필요',
+  'refresh-failed': 'refresh 실패',
+  'auth-rejected': '인증거부',
+  'send-failed': '송신실패',
+};
+
+/**
+ * Did the worker's listener actively fail, or did we merely run out of patience?
+ * A refused/reset connection is something the listener DID; a timeout is only
+ * the absence of an answer, which a stalled supervisor produces on its own.
+ */
+function probeFailureKind(err) {
+  const code = err?.code;
+  if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EPIPE'
+      || code === 'ERR_SOCKET_CLOSED' || code === 'EHOSTUNREACH') {
+    return PROBE_BROKEN;
+  }
+  return undefined;
+}
+
 function connectionHeaderNames(value) {
   return new Set(
     String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
   );
+}
+
+function subscriptionDisplay(subscription) {
+  if (!subscription || subscription.state === 'active') return null;
+  if (subscription.state === 'ended') return '구독 종료';
+  if (subscription.state === 'end-date-reached') return '종료일 경과 — 연결 상태 확인 중';
+  if (!subscription.endsAt) return '해지 예정 — 종료일 미확인';
+  const inclusive = new Date(Date.parse(subscription.endsAt) - 1);
+  const date = `${inclusive.getFullYear()}-${String(inclusive.getMonth() + 1).padStart(2, '0')}-${String(inclusive.getDate()).padStart(2, '0')}`;
+  return `해지 예정 — ${date}까지 사용`;
 }
 
 function publicRequestCapacity(config, accounts = config.accounts || []) {
@@ -82,12 +183,24 @@ switch (command) {
   case 'run':
     await runCommand();
     break;
+  case 'resume':
+    if (cliProvider !== 'codex') {
+      console.error('Unknown command: resume\n');
+      showHelp();
+      process.exit(1);
+    }
+    await codexResumeCommand();
+    break;
   case 'import':
     await importCommand();
     process.exit(0);
     break;
   case 'login':
     await loginCommand();
+    process.exit(0);
+    break;
+  case 'reauth':
+    await reauthenticateCommand();
     process.exit(0);
     break;
   case 'env':
@@ -118,8 +231,20 @@ switch (command) {
     await setPriorityCommand();
     process.exit(0);
     break;
+  case 'subscription':
+    await subscriptionCommand();
+    process.exit(0);
+    break;
   case 'api':
     await apiCommand();
+    process.exit(0);
+    break;
+  case 'install-claude-wrapper':
+    await installClaudeWrapperCommand();
+    process.exit(0);
+    break;
+  case 'uninstall-claude-wrapper':
+    await uninstallClaudeWrapperCommand();
     process.exit(0);
     break;
   case 'help':
@@ -150,7 +275,9 @@ async function serverCommand() {
 
 async function superviseServerCommand() {
   const config = await loadOrCreateConfig();
+  assertSafeProxyConfig(config);
   const port = config?.proxy?.port;
+  const proxyApiKey = config?.proxy?.apiKey;
   const existing = await findRunningServer(config);
   if (existing && existing.port === port) {
     console.error(`[TeamClaude] A server is already running on port ${port}${existing.pid ? ` (pid ${existing.pid})` : ''}.`);
@@ -186,20 +313,42 @@ async function superviseServerCommand() {
   const workerHealthIntervalMs = Number.isFinite(config.workerHealthIntervalMs)
     ? Math.max(50, config.workerHealthIntervalMs)
     : 5_000;
+  // Measured on the live daemon (2026-08-07, host load1 25-35): the probe path
+  // runs p50 8ms but p99 1.44s / max 1.64s. A 2s budget left no headroom, so
+  // ordinary host contention convicted a healthy worker every few minutes.
   const workerHealthTimeoutMs = Number.isFinite(config.workerHealthTimeoutMs)
-    ? Math.max(10, config.workerHealthTimeoutMs)
-    : 2_000;
+    ? Math.max(1, config.workerHealthTimeoutMs)
+    : 5_000;
+  const workerReadyTimeoutMs = Number.isFinite(config.workerReadyTimeoutMs)
+      && config.workerReadyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.workerReadyTimeoutMs))
+    : 30_000;
   const workerHealthFailureThreshold = Number.isFinite(config.workerHealthFailureThreshold)
     ? Math.max(1, Math.floor(config.workerHealthFailureThreshold))
-    : 2;
+    : 3;
+  // A worker whose event loop still answers IPC can drain its in-flight work on
+  // SIGTERM; only a worker that ignores that grace gets SIGKILLed.
+  const workerRecycleGraceMs = Number.isFinite(config.workerRecycleGraceMs)
+    ? Math.max(0, Math.floor(config.workerRecycleGraceMs))
+    : 5_000;
+  const deploymentDrainLeaseMs = Number.isFinite(config.deploymentDrainLeaseMs)
+    ? Math.max(100, Math.floor(config.deploymentDrainLeaseMs))
+    : 15_000;
+  // Deliberately NOT the HTTP budget: an IPC round trip on a live loop is
+  // sub-millisecond, so a floor keeps a deliberately tiny health timeout from
+  // making every worker look wedged.
+  const workerPingTimeoutMs = Math.max(500, workerHealthTimeoutMs);
   const workerWaiters = new Set();
   const clientAgents = new WeakMap();
   const statePath = getServerStatePath();
+  const lifecycleId = randomUUID();
   let worker = null;
   let workerReady = false;
   let workerPort = null;
   let hasBeenReady = false;
   let stopping = false;
+  let deploymentDraining = false;
+  let deploymentDrainTimer = null;
   let activePublicRequests = 0;
   let activeBufferedRequestBytes = 0;
   let restartCount = 0;
@@ -208,8 +357,61 @@ async function superviseServerCommand() {
   let healthTimer = null;
   let healthInFlight = false;
   let healthFailures = 0;
+  let recycleInFlight = false;
+  let contentionNoticeAt = 0;
+  let pingSeq = 0;
+  const pongWaiters = new Map();
+  // Watches OUR own event loop, the one that relays every SSE byte and holds
+  // the probe's timeout timer. A probe that raced a stall of ours proves
+  // nothing about the worker (see worker-health.js).
+  const loopStall = createLoopStallMeter();
   let forceTimer = null;
+  let sessionRescuer = null;
+  const codexRecoveryReceipts = new Map();
   let finish;
+
+  function storeCodexRecoveryReceipt(identity) {
+    if (!identity) return;
+    const now = Date.now();
+    for (const [id, receipt] of codexRecoveryReceipts) {
+      if (receipt.expiresAt <= now) codexRecoveryReceipts.delete(id);
+    }
+    if (codexRecoveryReceipts.size >= 1024) {
+      codexRecoveryReceipts.delete(codexRecoveryReceipts.keys().next().value);
+    }
+    codexRecoveryReceipts.set(identity.invocationId, {
+      sessionId: identity.sessionId,
+      expiresAt: now + 30_000,
+    });
+  }
+
+  function consumeCodexRecoveryReceipt(req, res, isLocal) {
+    if (req.url !== CODEX_RECOVERY_CONSUME_PATH) return false;
+    if (!isLocal || req.method !== 'POST') {
+      rejectPublicRequest(req, res, isLocal ? 405 : 403, {
+        'content-type': 'application/json',
+      }, {
+        error: { type: 'permission_error', message: 'Codex recovery receipts are local-only POST resources.' },
+      });
+      return true;
+    }
+    const invocationId = req.headers[CODEX_INVOCATION_HEADER];
+    const receipt = isCodexInvocationId(invocationId)
+      ? codexRecoveryReceipts.get(invocationId)
+      : null;
+    if (!receipt || receipt.expiresAt <= Date.now()) {
+      if (receipt) codexRecoveryReceipts.delete(invocationId);
+      rejectPublicRequest(req, res, 404, { 'content-type': 'application/json' }, {
+        error: { type: 'not_found', message: 'No recoverable Codex failure was recorded for this invocation.' },
+      });
+      return true;
+    }
+    codexRecoveryReceipts.delete(invocationId);
+    rejectPublicRequest(req, res, 200, { 'content-type': 'application/json' }, {
+      sessionId: receipt.sessionId,
+    });
+    return true;
+  }
 
   function rejectPublicRequest(req, res, statusCode, headers, payload) {
     req.pause();
@@ -219,9 +421,47 @@ async function superviseServerCommand() {
     res.end(JSON.stringify(payload));
   }
 
+  function consumeDeploymentDrain(req, res, isLocal) {
+    if (req.url !== DEPLOYMENT_DRAIN_PATH) return false;
+    if (!isLocal
+        || !proxyApiKey
+        || req.headers['x-api-key'] !== proxyApiKey
+        || req.headers[LIFECYCLE_ID_HEADER] !== lifecycleId) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        error: { type: 'permission_error', message: 'Deployment control requires the live local lifecycle identity.' },
+      });
+      return true;
+    }
+    if ((req.method !== 'POST' && req.method !== 'DELETE')
+        || (req.headers['content-length'] != null && req.headers['content-length'] !== '0')
+        || req.headers['transfer-encoding'] != null) {
+      rejectPublicRequest(req, res, 405, { 'content-type': 'application/json' }, {
+        error: { type: 'invalid_request_error', message: 'Deployment control accepts empty POST or DELETE requests.' },
+      });
+      return true;
+    }
+    clearTimeout(deploymentDrainTimer);
+    deploymentDrainTimer = null;
+    deploymentDraining = req.method === 'POST';
+    if (deploymentDraining) {
+      deploymentDrainTimer = setTimeout(() => {
+        deploymentDraining = false;
+        deploymentDrainTimer = null;
+      }, deploymentDrainLeaseMs);
+      deploymentDrainTimer.unref?.();
+    }
+    rejectPublicRequest(req, res, 200, { 'content-type': 'application/json' }, {
+      draining: deploymentDraining,
+      activeRequests: activePublicRequests,
+    });
+    return true;
+  }
+
   const listener = http.createServer((req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
+    const hasRecoveryMarker = hasClaudeRecoveryMarker(authorization);
+    const recoveryAccountUuid = parseClaudeRecoveryAccount(authorization);
     const bearerKey = typeof authorization === 'string' && authorization.startsWith('Bearer ')
       ? authorization.slice('Bearer '.length)
       : null;
@@ -229,6 +469,30 @@ async function superviseServerCommand() {
     const isLocal = remoteAddr === '127.0.0.1'
       || remoteAddr === '::1'
       || remoteAddr === '::ffff:127.0.0.1';
+    if (!isLocal) delete req.headers['x-teamcodex-status-identity'];
+    if (consumeDeploymentDrain(req, res, isLocal)) return;
+    if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
+    if (hasRecoveryMarker && recoveryAccountUuid == null) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Invalid Claude recovery routing marker.' },
+      });
+      return;
+    }
+    if (hasRecoveryMarker && !isLocal) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Claude recovery routing is local-only.' },
+      });
+      return;
+    }
+    if (req.url === '/teamclaude/rotate' && !isLocal) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Account rotation is local-only.' },
+      });
+      return;
+    }
     if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
       && bearerKey !== config.proxy.apiKey && !isLocal) {
       rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
@@ -237,11 +501,26 @@ async function superviseServerCommand() {
       });
       return;
     }
+    if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      res.setHeader('x-teamcodex-active-requests', String(activePublicRequests));
+      res.setHeader('x-teamcodex-source-hash', RUNTIME_SOURCE_HASH);
+      res.setHeader('x-teamcodex-deployment-draining', deploymentDraining ? '1' : '0');
+    }
     const contentLength = req.headers['content-length'];
     const bypassAdmission = req.method === 'GET'
       && req.url === '/teamclaude/status'
       && (contentLength == null || contentLength === '0')
       && req.headers['transfer-encoding'] == null;
+    if (deploymentDraining && !bypassAdmission) {
+      rejectPublicRequest(
+        req,
+        res,
+        503,
+        { 'content-type': 'application/json', 'retry-after': '1' },
+        { error: { type: 'overloaded_error', message: 'Proxy is draining for a verified deployment' } },
+      );
+      return;
+    }
     if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
       rejectPublicRequest(
         req,
@@ -364,12 +643,19 @@ async function superviseServerCommand() {
       return Promise.resolve({ worker, port: workerPort });
     }
     return new Promise(resolve => {
-      const waiter = { resolve, res };
-      workerWaiters.add(waiter);
-      res.once('close', () => {
+      let timer = null;
+      const settle = target => {
         if (!workerWaiters.delete(waiter)) return;
-        resolve(null);
-      });
+        if (timer !== null) clearTimeout(timer);
+        res.removeListener('close', onClose);
+        resolve(target);
+      };
+      const onClose = () => settle(null);
+      const waiter = { resolve: settle, res };
+      workerWaiters.add(waiter);
+      res.once('close', onClose);
+      timer = setTimeout(() => settle(null), workerReadyTimeoutMs);
+      timer.unref?.();
     });
   }
 
@@ -393,7 +679,6 @@ async function superviseServerCommand() {
       ? { worker, port: workerPort }
       : null;
     for (const waiter of workerWaiters) {
-      workerWaiters.delete(waiter);
       waiter.resolve(target);
     }
   }
@@ -453,9 +738,13 @@ async function superviseServerCommand() {
       let settled = false;
       let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
       let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      let recoverySseTracker = null; // tracks Codex terminal events without changing raw relay bytes
       let streamIdleTimer = null;
       let drainCleanup = null;
       const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+      const recoveryIdentity = req.method === 'POST' && isCodexResponsesPath(req.url)
+        ? codexRecoveryIdentity(req.headers, body)
+        : null;
       let workerConnectionEstablished = false;
       const connectionHeaders = connectionHeaderNames(req.headers.connection);
       const headers = {};
@@ -531,6 +820,10 @@ async function superviseServerCommand() {
         if (settled) return;
         clearRelayTimers();
         settled = true;
+        if (!clientGone && responseStarted && recoveryIdentity
+            && !recoverySseTracker?.sawTerminal) {
+          storeCodexRecoveryReceipt(recoveryIdentity);
+        }
         // The client went away: OUR close handler destroyed the upstream leg,
         // so this error is self-inflicted. The worker is healthy — recycling
         // it here would let one aborted terminal (a single Esc during the
@@ -561,13 +854,18 @@ async function superviseServerCommand() {
           return;
         }
         if (target.worker === worker) {
-          workerReady = false;
-          workerPort = null;
           resetClientAgent(req);
-          if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
+          // One relay socket failed; that is evidence about this connection,
+          // not the shared worker process. Its exit event or the independent
+          // HTTP+IPC health path owns global replacement decisions.
+          if (target.worker.exitCode != null || !target.worker.connected) {
+            workerReady = false;
+            workerPort = null;
+          }
         }
         if (!stopping && !res.destroyed
-            && (replaySafe || !workerConnectionEstablished) && attempt < 3) {
+            && (replaySafe || !workerConnectionEstablished)
+            && attempt < 3) {
           // A rejection here (bad forwarded header, synchronous http.request
           // option error) must still settle the outer promise. Without the
           // rejection arm the awaiting frame never returns, the client hangs,
@@ -587,13 +885,16 @@ async function superviseServerCommand() {
           return;
         }
         if (!res.headersSent && !res.destroyed) {
+          if (workerConnectionEstablished) storeCodexRecoveryReceipt(recoveryIdentity);
           res.writeHead(502, { 'content-type': 'application/json' });
           res.end(JSON.stringify({
             error: {
               type: 'proxy_error',
-              message: !replaySafe && workerConnectionEstablished
-                ? 'Proxy worker failed after dispatch; request was not replayed'
-                : 'Proxy worker unavailable',
+              message: attempt > 0
+                ? `Proxy worker died on ${attempt + 1} consecutive attempts; the request was replayed and still failed`
+                : (!replaySafe && workerConnectionEstablished
+                  ? 'Proxy worker failed after dispatch; request was not replayed'
+                  : 'Proxy worker unavailable'),
             },
           }));
         }
@@ -618,17 +919,32 @@ async function superviseServerCommand() {
         const responseHeaders = {};
         for (const [key, value] of Object.entries(upstreamRes.headers)) {
           const lowerKey = key.toLowerCase();
+          if (lowerKey === CODEX_RECOVERY_SESSION_HEADER) {
+            const invocationId = req.headers[CODEX_INVOCATION_HEADER];
+            if (req.method === 'POST' && isCodexResponsesPath(req.url)
+                && isCodexInvocationId(invocationId) && isCodexSessionId(value)) {
+              storeCodexRecoveryReceipt({ invocationId, sessionId: value });
+            }
+            continue;
+          }
           if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey)
               || responseConnectionHeaders.has(lowerKey)) continue;
           responseHeaders[key] = value;
         }
         res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
         if (isEventStream(upstreamRes.headers['content-type'])) {
-          const framer = streamRecovery ? new SseFramer() : null;
+          const encoded = String(upstreamRes.headers['content-encoding'] || '')
+            .split(',')
+            .some(encoding => encoding.trim() && encoding.trim().toLowerCase() !== 'identity');
+          const framer = streamRecovery && !encoded ? new SseFramer() : null;
           sseFramer = framer;
+          recoverySseTracker = recoveryIdentity && !encoded ? (framer || new SseFramer()) : null;
           armStreamIdle(upstreamRes);
           upstreamRes.on('data', chunk => {
             armStreamIdle(upstreamRes);
+            if (recoverySseTracker && recoverySseTracker !== framer) {
+              recoverySseTracker.push(chunk);
+            }
             const bytes = framer ? framer.push(chunk) : chunk;
             // writableEnded guard: retryOrFail may have already ENDED this
             // response (graceful injection); a straggler chunk must not
@@ -643,6 +959,9 @@ async function superviseServerCommand() {
             if (settled) return;
             clearRelayTimers();
             settled = true;
+            if (recoveryIdentity && recoverySseTracker && !recoverySseTracker.sawTerminal) {
+              storeCodexRecoveryReceipt(recoveryIdentity);
+            }
             if (!res.destroyed && !res.writableEnded) {
               // Clean worker end. The worker's own recovery already injects on
               // truncation, so relay as-is; flush any un-framed tail (possible
@@ -682,6 +1001,7 @@ async function superviseServerCommand() {
       ...process.env,
       [SUPERVISED_WORKER_ENV]: '1',
       [SUPERVISOR_PID_ENV]: String(process.pid),
+      [LIFECYCLE_ID_ENV]: lifecycleId,
     };
     const child = fork(process.argv[1], ['server'], {
       env: childEnv,
@@ -691,6 +1011,12 @@ async function superviseServerCommand() {
     let becameReady = false;
 
     child.on('message', message => {
+      if (message?.type === 'teamcodex:pong') {
+        // Resolved even for a worker we have since replaced: pingWorker's own
+        // waiter map is the authority, and a stale id simply has no waiter.
+        pongWaiters.get(message.id)?.();
+        return;
+      }
       if (child !== worker) return;
       if (message?.type === 'teamcodex:shutdown') {
         requestShutdown({ workerWillExit: true });
@@ -716,10 +1042,28 @@ async function superviseServerCommand() {
         port,
         startedAt: new Date().toISOString(),
         config: getConfigPath(),
+        lifecycle: {
+          version: 1,
+          id: lifecycleId,
+          supervisor: readProcessIdentity(process.pid),
+          worker: readProcessIdentity(child.pid),
+        },
       }).then(() => { ownsStateFile = true; }, () => {});
       clearTimeout(stableTimer);
       stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
       stableTimer.unref?.();
+      if (!sessionRescuer && !isCodexMode(config) && config.cmuxSessionRescue === true) {
+        sessionRescuer = createCmuxSessionRescuer({
+          enabled: true,
+          ready: () => workerReady && !stopping,
+          intervalMs: config.cmuxSessionRescueIntervalMs,
+          ...defaultCmuxRescuePaths(),
+          nodePath: process.execPath,
+          scriptPath: process.argv[1],
+          configPath: getConfigPath(),
+        });
+        sessionRescuer.start();
+      }
       wakeWorkerWaiters();
     });
 
@@ -762,28 +1106,116 @@ async function superviseServerCommand() {
     });
   }
 
+  /**
+   * IPC round trip to the worker. A pong proves the worker's event loop is
+   * RUNNING, which an HTTP probe cannot distinguish from "the loop is fine but
+   * the host is starved" — and it never touches the busy listener.
+   */
+  function pingWorker(child, timeoutMs) {
+    return new Promise(resolve => {
+      if (!child || child.exitCode != null || !child.connected) {
+        resolve(false);
+        return;
+      }
+      const id = ++pingSeq;
+      let done = false;
+      const settle = alive => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pongWaiters.delete(id);
+        resolve(alive);
+      };
+      const timer = setTimeout(() => settle(false), timeoutMs);
+      timer.unref?.();
+      pongWaiters.set(id, () => settle(true));
+      try {
+        child.send({ type: 'teamcodex:ping', id }, err => {
+          if (err) settle(false);
+        });
+      } catch {
+        settle(false);
+      }
+    });
+  }
+
+  async function recycleUnhealthyWorker(checkedWorker, broken) {
+    if (recycleInFlight || stopping || checkedWorker !== worker) return;
+    recycleInFlight = true;
+    try {
+      const stallAtPing = loopStall.read();
+      const ipcAlive = await pingWorker(checkedWorker, workerPingTimeoutMs);
+      if (stopping || checkedWorker !== worker) return;
+      const action = unhealthyWorkerAction({
+        broken,
+        ipcAlive,
+        selfStallMs: loopStall.read() - stallAtPing,
+        timeoutMs: workerPingTimeoutMs,
+        tickMs: loopStall.tickMs,
+      });
+      if (action === 'keep') {
+        // Killing here would destroy every in-flight turn to fix nothing: the
+        // loop answers, and the replacement inherits the same starved host.
+        if (Date.now() - contentionNoticeAt >= 60_000) {
+          contentionNoticeAt = Date.now();
+          console.error('[TeamClaude] Proxy worker death is uncorroborated under host contention; keeping it.');
+        }
+        return;
+      }
+      workerReady = false;
+      workerPort = null;
+      if (action === 'drain') {
+        console.error(`[TeamClaude] Proxy worker listener is broken while its event loop runs; draining it (${workerRecycleGraceMs}ms grace).`);
+        checkedWorker.kill('SIGTERM');
+        const escalate = setTimeout(() => {
+          if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+        }, workerRecycleGraceMs);
+        escalate.unref?.();
+        return;
+      }
+      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and does not answer IPC; restarting it.`);
+      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+    } finally {
+      recycleInFlight = false;
+    }
+  }
+
   function checkWorkerHealth() {
-    if (stopping || healthInFlight || !workerReady || !workerPort || !worker) return;
+    if (stopping || healthInFlight || recycleInFlight
+        || !workerReady || !workerPort || !worker) return;
     const checkedWorker = worker;
     const checkedPort = workerPort;
+    const stallAtStart = loopStall.read();
     healthInFlight = true;
     let settled = false;
-    const finishCheck = healthy => {
+    const finishCheck = (healthy, failure) => {
       if (settled) return;
       settled = true;
       healthInFlight = false;
       if (checkedWorker !== worker || stopping) return;
-      if (healthy) {
+      const verdict = healthProbeVerdict({
+        ok: healthy,
+        failure,
+        selfStallMs: loopStall.read() - stallAtStart,
+        timeoutMs: workerHealthTimeoutMs,
+        tickMs: loopStall.tickMs,
+      });
+      if (verdict === 'healthy') {
         healthFailures = 0;
+        return;
+      }
+      // 'inconclusive': we were frozen ourselves. Neither a strike nor a reset —
+      // the probe simply carries no information about the worker.
+      if (verdict === 'inconclusive') return;
+      if (verdict === 'broken') {
+        healthFailures = 0;
+        void recycleUnhealthyWorker(checkedWorker, true);
         return;
       }
       healthFailures += 1;
       if (healthFailures < workerHealthFailureThreshold) return;
-      console.error(`[TeamClaude] Proxy worker failed ${healthFailures} health checks; restarting it.`);
       healthFailures = 0;
-      workerReady = false;
-      workerPort = null;
-      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+      void recycleUnhealthyWorker(checkedWorker, false);
     };
     const healthReq = http.get({
       host: '127.0.0.1',
@@ -792,14 +1224,21 @@ async function superviseServerCommand() {
       agent: false,
     }, healthRes => {
       healthRes.resume();
-      healthRes.once('end', () => finishCheck(healthRes.statusCode === 200));
+      // A non-200 answer is the listener actively saying something wrong; a
+      // stalled supervisor cannot fabricate that, so it is never discounted.
+      healthRes.once('end', () => finishCheck(
+        healthRes.statusCode === 200,
+        healthRes.statusCode === 200 ? undefined : PROBE_BROKEN,
+      ));
       healthRes.once('error', () => finishCheck(false));
       healthRes.once('aborted', () => finishCheck(false));
     });
     healthReq.setTimeout(workerHealthTimeoutMs, () => {
-      healthReq.destroy(new Error('Proxy worker health check timed out'));
+      const err = new Error('Proxy worker health check timed out');
+      err.code = 'ETIMEDOUT';
+      healthReq.destroy(err);
     });
-    healthReq.once('error', () => finishCheck(false));
+    healthReq.once('error', err => finishCheck(false, probeFailureKind(err)));
   }
 
   function requestShutdown({ workerWillExit = false } = {}) {
@@ -810,6 +1249,8 @@ async function superviseServerCommand() {
     clearTimeout(restartTimer);
     clearTimeout(stableTimer);
     clearInterval(healthTimer);
+    clearTimeout(deploymentDrainTimer);
+    sessionRescuer?.stop();
     closePublicListener();
     if (!worker) {
       finish(0);
@@ -828,6 +1269,9 @@ async function superviseServerCommand() {
       clearTimeout(stableTimer);
       clearInterval(healthTimer);
       clearTimeout(forceTimer);
+      clearTimeout(deploymentDrainTimer);
+      loopStall.stop();
+      sessionRescuer?.stop();
       resolve(code);
     };
     // Drop the bind-time diagnosis once we own the port. Left attached, any
@@ -839,6 +1283,11 @@ async function superviseServerCommand() {
     listener.once('error', onListenError);
     listener.listen(port, () => {
       listener.removeListener('error', onListenError);
+      listener.on('error', err => {
+        console.error(
+          `[TeamClaude] Public listener runtime error${err.code ? ` (${err.code})` : ''}: ${err.message}`,
+        );
+      });
       launchWorker();
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
@@ -853,6 +1302,7 @@ async function superviseServerCommand() {
 
 async function proxyWorkerCommand() {
   const config = await loadOrCreateConfig();
+  config.lifecycleId = process.env[LIFECYCLE_ID_ENV] || null;
   // Normalize by the FULL codex-mode signal (subcommand OR inherited env, see
   // isCodexMode): createProxyServer keys on config.provider, and a supervised
   // worker only carries the env var.
@@ -971,6 +1421,42 @@ async function proxyWorkerCommand() {
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
+
+  // Persist the subscription-lapse flag the moment the request path flips it
+  // (a subscription 403 sets it; a later 2xx on the account clears it), so a
+  // restart restores the lapsed state instead of showing the account active
+  // until the next failure. Same discipline as onTokenRefresh: re-read disk
+  // (atomicConfigUpdate), match by identity (findConfigAccount), then mirror
+  // the result into the long-lived in-memory config copy so a later TUI save
+  // cannot resurrect the pre-change value.
+  accountManager.onAccountFlag((account, disabled) => atomicConfigUpdate(diskConfig => {
+    const cfgIdx = findConfigAccount(diskConfig, account);
+    if (cfgIdx < 0) return;
+    if (disabled) diskConfig.accounts[cfgIdx].subscriptionDisabled = true;
+    else delete diskConfig.accounts[cfgIdx].subscriptionDisabled;
+  }).then(() => {
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    if (disabled) config.accounts[memIdx].subscriptionDisabled = true;
+    else delete config.accounts[memIdx].subscriptionDisabled;
+  }).catch(err => {
+    console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
+    throw err;
+  }));
+  accountManager.onAccountMetadata((account, metadata) => atomicConfigUpdate(diskConfig => {
+    const cfgIdx = findConfigAccount(diskConfig, account);
+    if (cfgIdx < 0) return;
+    if (metadata) diskConfig.accounts[cfgIdx].subscriptionCancellation = metadata;
+    else delete diskConfig.accounts[cfgIdx].subscriptionCancellation;
+  }).then(() => {
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    if (metadata) config.accounts[memIdx].subscriptionCancellation = metadata;
+    else delete config.accounts[memIdx].subscriptionCancellation;
+  }).catch(err => {
+    console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
+    throw err;
+  }));
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -984,7 +1470,7 @@ async function proxyWorkerCommand() {
         applyTuiAccountMutation(diskConfig, snapshot, accountManager, mutation);
       }),
       syncAccounts: async () => {
-        const diskConfig = await loadConfig();
+        const diskConfig = await accountManager.readAfterAccountFlagWrites(() => loadConfig());
         if (!diskConfig) return 0;
         return syncAccountsFromDisk(diskConfig, config, accountManager);
       },
@@ -992,6 +1478,21 @@ async function proxyWorkerCommand() {
       // (before listen), and the TUI only starts inside the listen callback, so
       // this closure never runs before the binding is initialized.
       refreshQuota: () => server.refreshQuotaAll(),
+      reauthenticate: async account => {
+        if (account.provider === 'codex' || config.provider === 'codex') {
+          const credentials = await loginCodexCredentials();
+          return {
+            credentials,
+            profile: {
+              accountUuid: credentials.accountUuid || credentials.accountId,
+              email: credentials.email,
+            },
+          };
+        }
+        const credentials = await loginOAuth();
+        const profile = await fetchProfile(credentials.accessToken);
+        return { credentials, profile };
+      },
       onQuit: () => {
         const closeWorker = () => server.close(() => process.exit(0));
         if (!process.connected) {
@@ -1022,9 +1523,10 @@ async function proxyWorkerCommand() {
     // and every in-flight response alive. Serializing signals avoids overlapping
     // remove/add passes when several CLI changes land together.
     liveSyncChain = liveSyncChain.then(async () => {
-      const diskConfig = await loadConfig();
+      const diskConfig = await accountManager.readAfterAccountFlagWrites(() => loadConfig());
       if (!diskConfig) return;
       await syncAccountsFromDisk(diskConfig, config, accountManager);
+      if (codexMode) await server.refreshQuotaAll();
       if (process.connected) {
         process.send({
           type: 'teamcodex:capacity',
@@ -1123,6 +1625,15 @@ async function proxyWorkerCommand() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   }
+  // Liveness corroboration for the supervisor. Answering proves this worker's
+  // event loop is running, which its HTTP probe cannot tell apart from a
+  // starved host — and it costs no listener, no request path, no allocation.
+  process.on('message', message => {
+    if (message?.type !== 'teamcodex:ping' || !process.connected) return;
+    try {
+      process.send({ type: 'teamcodex:pong', id: message.id });
+    } catch { /* the channel closed mid-answer; the supervisor times out */ }
+  });
   process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
 }
 
@@ -1142,13 +1653,85 @@ function isPidAlive(pid) {
   catch (e) { return e.code === 'EPERM'; }
 }
 
-async function waitForExit(pid, timeoutMs) {
+function readProcessIdentity(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') return null;
+  try {
+    const result = spawnSync(
+      'ps',
+      ['-o', 'ppid=', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)],
+      { encoding: 'utf8' },
+    );
+    if (result.status !== 0 || !result.stdout?.trim()) return null;
+    const line = result.stdout.trim();
+    const match = line.match(/^(\d+)\s+(.{24})\s+([\s\S]+)$/);
+    if (!match) return null;
+    return {
+      pid,
+      ppid: Number(match[1]),
+      startedAt: match[2].trim(),
+      command: match[3].trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameProcessIdentity(recorded, current) {
+  return Boolean(recorded && current
+    && recorded.pid === current.pid
+    && recorded.ppid === current.ppid
+    && recorded.startedAt === current.startedAt
+    && recorded.command === current.command);
+}
+
+function commandReferencesRuntime(command) {
+  if (typeof command !== 'string') return false;
+  return command.split(/\s+/).some(token => {
+    const candidate = token.replace(/^['"]|['"]$/g, '');
+    try { return realpathSync(candidate) === RUNTIME_ENTRY_PATH; }
+    catch { return candidate === process.argv[1] || candidate === RUNTIME_ENTRY_PATH; }
+  });
+}
+
+function isExpectedServerIdentity(identity, { worker = false, supervisorPid = null } = {}) {
+  if (!identity || typeof identity.command !== 'string') return false;
+  if (!commandReferencesRuntime(identity.command) || !identity.command.includes('server')) return false;
+  if (worker) {
+    return identity.ppid === supervisorPid
+      && commandReferencesRuntime(identity.command);
+  }
+  return identity.ppid > 0;
+}
+
+function verifyLifecycleState(state, ownerPid, port) {
+  if (!state?.lifecycle || state.lifecycle.version !== 1
+      || typeof state.lifecycle.id !== 'string' || state.lifecycle.id.length < 16) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  if (state.pid !== ownerPid || state.port !== port || state.config !== getConfigPath()) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  const supervisor = readProcessIdentity(state.pid);
+  if (!sameProcessIdentity(state.lifecycle.supervisor, supervisor)
+      || !isExpectedServerIdentity(supervisor)) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  return { ok: true, supervisor };
+}
+
+function verifyWorkerIdentity(state, supervisor) {
+  const worker = readProcessIdentity(state?.workerPid);
+  return sameProcessIdentity(state?.lifecycle?.worker, worker)
+    && isExpectedServerIdentity(worker, { worker: true, supervisorPid: supervisor.pid });
+}
+
+async function waitForExit(identity, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) return true;
+    if (!sameProcessIdentity(identity, readProcessIdentity(identity.pid))) return true;
     await delay(150);
   }
-  return !isPidAlive(pid);
+  return !sameProcessIdentity(identity, readProcessIdentity(identity.pid));
 }
 
 /**
@@ -1156,17 +1739,40 @@ async function waitForExit(pid, timeoutMs) {
  * returns our JSON shape, not just any 200 — so a foreign process occupying the
  * port is NOT mistaken for our server (it falls through to the EADDRINUSE path).
  */
-async function probeServer(port, timeoutMs = 1500) {
+async function probeServer(
+  port,
+  timeoutMs = 1500,
+  expectedLifecycleId = null,
+  proxyApiKey = null,
+) {
   if (!port) return false;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: ctrl.signal });
+    const headers = expectedLifecycleId != null && proxyApiKey
+      ? {
+          'x-api-key': proxyApiKey,
+          'x-teamcodex-status-identity': '1',
+        }
+      : undefined;
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers,
+      signal: ctrl.signal,
+    });
     if (!res.ok) return false;
     const data = await res.json();
-    return Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+    const validShape = Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+    if (!validShape) return false;
+    if (expectedLifecycleId != null && data.lifecycleId !== expectedLifecycleId) return false;
+    return true;
   } catch { return false; }
   finally { clearTimeout(timer); }
+}
+
+function configuredStatusProbeTimeoutMs(fallbackMs = 1500) {
+  const configured = Number(process.env.TEAMCLAUDE_STATUS_PROBE_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return fallbackMs;
+  return Math.min(30_000, Math.max(250, Math.floor(configured)));
 }
 
 /** Best-effort: the pid listening on a TCP port (macOS/Linux via lsof). */
@@ -1190,9 +1796,15 @@ function lsofPid(port) {
  * for this same port). Returns { pid, port } (pid may be null if undeterminable),
  * or null when nothing is listening.
  */
-async function findRunningServer(config) {
+async function findRunningServer(
+  config,
+  maxProbeWaitMs = configuredStatusProbeTimeoutMs(),
+) {
   const configPort = config?.proxy?.port;
   const state = await readServerState();
+  const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
+    ? Math.max(0, Math.floor(maxProbeWaitMs))
+    : 1500);
 
   // Try the port the server ACTUALLY bound (recorded in the state file) first —
   // it may differ from the current config port after the config was edited, and
@@ -1202,12 +1814,33 @@ async function findRunningServer(config) {
   if (configPort && configPort !== state?.port) candidates.push(configPort);
 
   for (const port of candidates) {
-    if (!(await probeServer(port))) continue;
-    const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
-    if (ownerPid) return { pid: ownerPid, port };
-    // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
-    if (state?.pid && state.port === port && isPidAlive(state.pid)) return { pid: state.pid, port };
-    return { pid: null, port };
+    const remainingMs = probeDeadline - Date.now();
+    if (remainingMs <= 0) break;
+    if (!(await probeServer(
+      port,
+      Math.min(configuredStatusProbeTimeoutMs(), remainingMs),
+    ))) continue;
+    const lsofOwnerPid = lsofPid(port);
+    const ownerPid = lsofOwnerPid || (
+      state?.port === port && state.pid && isPidAlive(state.pid) ? state.pid : null
+    );
+    if (!ownerPid) return { pid: null, port, lifecycleVerified: false, reason: 'no-pid' };
+    const verified = verifyLifecycleState(state, ownerPid, port);
+    const lifecycleRemainingMs = probeDeadline - Date.now();
+    const lifecycleMatches = verified.ok && lifecycleRemainingMs > 0
+      && await probeServer(
+        port,
+        Math.min(configuredStatusProbeTimeoutMs(), lifecycleRemainingMs),
+        state.lifecycle.id,
+        config?.proxy?.apiKey,
+      );
+    return {
+      pid: ownerPid,
+      port,
+      lifecycleVerified: lifecycleMatches,
+      identity: lifecycleMatches ? verified.supervisor : null,
+      reason: lifecycleMatches ? null : 'unverified-lifecycle',
+    };
   }
 
   // Nothing TeamClaude-shaped answers on any candidate port. Only drop the state
@@ -1217,7 +1850,7 @@ async function findRunningServer(config) {
   return null;
 }
 
-async function ensureProxyRunning(config) {
+async function ensureProxyRunning(config, maxWaitMs = 15_000) {
   const running = await findRunningServer(config);
   if (running) return running;
 
@@ -1234,7 +1867,10 @@ async function ensureProxyRunning(config) {
   daemon.once('error', err => { launchError = err; });
   daemon.unref();
 
-  const deadline = Date.now() + 15_000;
+  const boundedWaitMs = Number.isFinite(maxWaitMs)
+    ? Math.max(0, Math.floor(maxWaitMs))
+    : 15_000;
+  const deadline = Date.now() + boundedWaitMs;
   while (Date.now() < deadline) {
     if (launchError) break;
     const started = await findRunningServer(config);
@@ -1245,6 +1881,50 @@ async function ensureProxyRunning(config) {
 
   const detail = launchError ? `: ${launchError.message}` : '';
   throw new Error(`Proxy failed to start${detail}. Run "teamcodex server" to inspect the startup error.`);
+}
+
+async function waitForClaudeProxyRecovery(config) {
+  const pollMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
+    ? Math.max(250, Math.floor(config.claudeAutoResumeBackoffMs))
+    : 1000;
+  const maxWaitMs = Number.isFinite(config.continuityMaxWaitMs)
+    ? Math.max(0, Math.floor(config.continuityMaxWaitMs))
+    : 15 * 60 * 1000;
+  const deadline = Date.now() + maxWaitMs;
+  let recoveryConfig = config;
+  let nextLocalStartAt = 0;
+
+  while (true) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Connection recovery timed out after ${maxWaitMs}ms.`);
+    }
+    const diskConfig = await loadConfig().catch(() => null);
+    if (diskConfig?.proxy?.port) {
+      recoveryConfig = {
+        ...recoveryConfig,
+        ...diskConfig,
+        proxy: { ...recoveryConfig.proxy, ...diskConfig.proxy },
+      };
+    }
+
+    const running = await findRunningServer(recoveryConfig);
+    if (running) return running;
+
+    const canStartLocalProxy = Array.isArray(recoveryConfig.accounts)
+      && recoveryConfig.accounts.length > 0;
+    if (canStartLocalProxy && Date.now() >= nextLocalStartAt) {
+      nextLocalStartAt = Date.now() + 15_000;
+      try {
+        return await ensureProxyRunning(
+          recoveryConfig,
+          Math.max(0, deadline - Date.now()),
+        );
+      } catch {
+        // Keep the CLI parent alive while the exact session is parked.
+      }
+    }
+    await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  }
 }
 
 /**
@@ -1260,6 +1940,13 @@ async function stopRunningServer() {
 
   const { pid, port } = found;
   if (!pid) return { stopped: false, reason: 'no-pid', port };
+  if (!found.lifecycleVerified || !found.identity) {
+    return { stopped: false, reason: 'unverified-lifecycle', pid, port };
+  }
+
+  if (!sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+    return { stopped: false, reason: 'unverified-lifecycle', pid, port };
+  }
 
   try {
     process.kill(pid, 'SIGTERM');
@@ -1269,17 +1956,31 @@ async function stopRunningServer() {
     throw e;
   }
 
-  if (!(await waitForExit(pid, 6000))) {
+  if (!(await waitForExit(found.identity, 6000))) {
+    if (!sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+      return { stopped: true, pid, port };
+    }
     try { process.kill(pid, 'SIGKILL'); } catch { /* may have just exited */ }
-    await waitForExit(pid, 2000);
+    await waitForExit(found.identity, 2000);
   }
-  if (isPidAlive(pid)) return { stopped: false, reason: 'failed', pid, port };
+  if (sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+    return { stopped: false, reason: 'failed', pid, port };
+  }
 
   await clearServerState();
   return { stopped: true, pid, port };
 }
 
+function refuseSelfDisruptiveLifecycleCommand(command) {
+  if (process.env.TEAMCLAUDE_SESSION_SUPERVISED !== '1') return false;
+  console.error(
+    `[TeamClaude] Refusing to ${command} the proxy from a supervised Claude or Codex session. Use a separate terminal.`,
+  );
+  process.exit(1);
+}
+
 async function stopCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('stop')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped TeamClaude server (pid ${r.pid}, port ${r.port}).`);
@@ -1298,6 +1999,10 @@ async function stopCommand() {
       console.error(`No permission to signal pid ${r.pid}.`);
       process.exit(1);
       break;
+    case 'unverified-lifecycle':
+      console.error(`Refusing to signal pid ${r.pid}: lifecycle identity could not be verified.`);
+      process.exit(1);
+      break;
     default:
       console.error(`Failed to stop pid ${r.pid} on port ${r.port}.`);
       process.exit(1);
@@ -1305,11 +2010,15 @@ async function stopCommand() {
 }
 
 async function restartCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('restart')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped previous server (pid ${r.pid}).`);
   } else if (r.reason !== 'not-running') {
-    console.error(`Could not stop the existing server (${r.reason}); aborting restart.`);
+    const reason = r.reason === 'unverified-lifecycle'
+      ? 'lifecycle identity unverified'
+      : r.reason;
+    console.error(`Could not stop the existing server (${reason}); aborting restart.`);
     if (r.reason === 'no-pid') {
       console.error(`Stop it manually first:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
     }
@@ -1423,30 +2132,15 @@ async function loginCommand() {
 }
 
 async function loginCodexCommand() {
-  const codexHome = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
-  const loginArgs = ['login', '-c', 'cli_auth_credentials_store="file"'];
-  if (args.includes('--device-auth')) loginArgs.push('--device-auth');
-
   try {
     console.log('Starting isolated Codex OAuth login...');
-    const result = spawnSync('codex', loginArgs, {
-      stdio: 'inherit',
-      env: { ...process.env, CODEX_HOME: codexHome },
+    const creds = await loginCodexCredentials({
+      deviceAuth: args.includes('--device-auth'),
     });
-    if (result.error) {
-      if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
-      } else {
-        console.error(`Failed to start Codex login: ${result.error.message}`);
-      }
-      process.exit(1);
-    }
-    if (result.status !== 0) process.exit(result.status ?? 1);
-
-    const creds = await importCodexCredentials(join(codexHome, 'auth.json'));
     await upsertCodexAccount(argValue('--name'), creds, 'login');
-  } finally {
-    await rm(codexHome, { recursive: true, force: true });
+  } catch (err) {
+    console.error(err.message);
+    process.exit(err.exitCode ?? 1);
   }
 }
 
@@ -1499,6 +2193,96 @@ async function loginOAuthCommand() {
   await upsertOAuthAccount(name, creds, 'login');
 }
 
+async function reauthenticateCommand() {
+  const name = args[1];
+  const uuidFlagIndex = args.indexOf('--account-uuid');
+  const uuidEqualsArg = args.find(value => value.startsWith('--account-uuid='));
+  const expectedAccountUuid = uuidEqualsArg
+    ? uuidEqualsArg.slice('--account-uuid='.length) || null
+    : argValue('--account-uuid');
+  if (!name || name.startsWith('--')) {
+    console.error('Usage: teamclaude reauth <account-name> [--account-uuid UUID]');
+    process.exit(1);
+  }
+  if ((uuidFlagIndex >= 0
+      && (!args[uuidFlagIndex + 1] || args[uuidFlagIndex + 1].startsWith('--')))
+      || (uuidEqualsArg && !expectedAccountUuid)) {
+    console.error('--account-uuid requires a value');
+    process.exit(1);
+  }
+
+  console.log(`Starting OAuth re-authentication for "${name}"...`);
+  let result;
+  try {
+    const provider = isCodexMode(await loadConfig()) ? 'codex' : null;
+    result = await reauthenticateAccount({
+      name,
+      expectedAccountUuid,
+      provider,
+      loadConfig,
+      login: provider === 'codex'
+        ? () => loginCodexCredentials({ deviceAuth: args.includes('--device-auth') })
+        : loginOAuth,
+      fetchProfile,
+      atomicUpdate: atomicConfigUpdate,
+    });
+  } catch (err) {
+    console.error(`OAuth re-authentication rejected: ${err.message}`);
+    process.exit(1);
+  }
+  console.log(`Re-authenticated account "${result.updated.name}"`);
+  console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(result.savedConfig);
+}
+
+async function codexSubscriptionCommand() {
+  const action = args[1];
+  const selector = args[2];
+  const uuidFlagIndex = args.indexOf('--account-uuid');
+  const endsFlagIndex = args.indexOf('--ends-on');
+  const uuidEqualsArg = args.find(value => value.startsWith('--account-uuid='));
+  const endsEqualsArg = args.find(value => value.startsWith('--ends-on='));
+  const expectedAccountUuid = uuidEqualsArg
+    ? uuidEqualsArg.slice('--account-uuid='.length) || null
+    : argValue('--account-uuid');
+  const endsOn = endsEqualsArg
+    ? endsEqualsArg.slice('--ends-on='.length) || null
+    : argValue('--ends-on');
+  const missingUuid = uuidFlagIndex >= 0
+    && (!args[uuidFlagIndex + 1] || args[uuidFlagIndex + 1].startsWith('--'))
+    || Boolean(uuidEqualsArg && !expectedAccountUuid);
+  const missingEndsOn = endsFlagIndex >= 0
+    && (!args[endsFlagIndex + 1] || args[endsFlagIndex + 1].startsWith('--'))
+    || Boolean(endsEqualsArg && !endsOn);
+  if (!['cancel', 'clear'].includes(action) || !selector || missingUuid || missingEndsOn
+      || (action === 'clear' && (endsFlagIndex >= 0 || endsEqualsArg))) {
+    console.error('Usage: teamcodex codex subscription cancel <account> [--ends-on YYYY-MM-DD] [--account-uuid UUID]');
+    console.error('       teamcodex codex subscription clear <account> [--account-uuid UUID]');
+    process.exit(1);
+  }
+
+  let selectedName;
+  try {
+    const config = await atomicConfigUpdate(cfg => {
+      const { account } = findSubscriptionTarget(cfg, { selector, expectedAccountUuid });
+      selectedName = account.name;
+      if (action === 'cancel') {
+        applySubscriptionCancellation(account, {
+          endsAt: endsOn ? cancellationEndsAt(endsOn, 9 * 60) : null,
+        });
+      } else {
+        clearSubscriptionCancellation(account);
+      }
+    });
+    console.log(action === 'cancel'
+      ? `Tracking cancelled subscription for "${selectedName}"${endsOn ? ` (usable through ${endsOn})` : ''}`
+      : `Cleared subscription cancellation for "${selectedName}"`);
+    await noteRunningServerReload(config);
+  } catch (err) {
+    console.error(`Subscription tracking rejected: ${err.message}`);
+    process.exit(1);
+  }
+}
 // ── env ─────────────────────────────────────────────────────
 
 async function envCommand() {
@@ -1507,7 +2291,9 @@ async function envCommand() {
     console.log('teamcodex codex run');
     return;
   }
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
+  const running = await findRunningServer(config);
+  const port = running?.port || config.proxy.port;
+  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${port}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
@@ -1598,10 +2384,14 @@ function displayModel(model) {
 
 async function syncLaunchModel(config, claudeArgs, childEnv) {
   const explicitModel = modelArgValue(claudeArgs) || childEnv.ANTHROPIC_MODEL || null;
-  const requestedModel = explicitModel || config.launchModel;
+  const configuredModel = typeof config.launchModel === 'string'
+      && config.launchModel.length > 0
+    ? config.launchModel
+    : DEFAULT_MANAGED_CLAUDE_MODEL;
+  const requestedModel = explicitModel || configuredModel;
   const chain = fallbackChainFor(config.modelFallbacks, requestedModel);
-  if (!requestedModel || !chain) {
-    if (!explicitModel && config.launchModel) setModelArg(claudeArgs, config.launchModel);
+  if (!chain) {
+    if (!explicitModel) setModelArg(claudeArgs, configuredModel);
     return;
   }
 
@@ -1611,6 +2401,10 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   let status;
   try {
     const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        'x-teamcodex-status-identity': '1',
+      },
       signal: AbortSignal.timeout(1500),
     });
     if (response.ok) status = await response.json();
@@ -1620,9 +2414,77 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
     const fallback = displayModel(chain[0]);
     setModelArg(claudeArgs, fallback);
     console.error(`[TeamClaude] ${requestedModel} quota unavailable; launching Claude Code as ${fallback}.`);
-  } else if (!modelArgValue(claudeArgs) && !childEnv.ANTHROPIC_MODEL && config.launchModel) {
-    setModelArg(claudeArgs, config.launchModel);
+  } else if (!modelArgValue(claudeArgs) && !childEnv.ANTHROPIC_MODEL) {
+    setModelArg(claudeArgs, configuredModel);
   }
+}
+
+async function seedClaudeRecoveryAccount(config, childEnv) {
+  // Preserve any inherited credential; it may be a real external OAuth token.
+  if (Object.hasOwn(childEnv, 'CLAUDE_CODE_OAUTH_TOKEN')) return;
+
+  const port = Number(config.proxy?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        'x-teamcodex-status-identity': '1',
+      },
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok) return;
+    const status = await response.json();
+    if (typeof status?.currentAccountUuid !== 'string'
+        || status.currentAccountUuid.length === 0) return;
+    childEnv.CLAUDE_CODE_OAUTH_TOKEN = buildClaudeRecoveryEnv(
+      childEnv,
+      status.currentAccountUuid,
+    ).CLAUDE_CODE_OAUTH_TOKEN;
+  } catch {}
+}
+
+async function recoverExpiredClaudeLogin(config, childEnv) {
+  const recoveryToken = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
+  const failedAccountUuid = parseClaudeRecoveryAccount(
+    typeof recoveryToken === 'string' ? `Bearer ${recoveryToken}` : null,
+  );
+  const headers = {};
+  if (config.proxy.apiKey) headers['x-api-key'] = config.proxy.apiKey;
+  if (failedAccountUuid) headers.authorization = `Bearer ${recoveryToken}`;
+  const response = await fetch(
+    `http://127.0.0.1:${config.proxy.port}/teamclaude/rotate`,
+    {
+      method: 'POST',
+      headers: Object.keys(headers).length ? headers : undefined,
+      signal: AbortSignal.timeout(1500),
+    },
+  );
+  const result = await response.json().catch(() => null);
+  if (response.status === 409
+      && result?.error?.type === 'no_alternative_account') {
+    return { rotated: false, reason: 'no-alternative-account' };
+  }
+  if (!response.ok) return { rotated: false, reason: 'rotation-unavailable' };
+  if (result?.rotated !== true
+      || typeof result.previousAccount !== 'string'
+      || typeof result.previousAccountUuid !== 'string'
+      || typeof result.currentAccount !== 'string'
+      || typeof result.currentAccountUuid !== 'string'
+      || result.previousAccount === result.currentAccount
+      || result.previousAccountUuid === result.currentAccountUuid
+      || (failedAccountUuid && result.previousAccountUuid !== failedAccountUuid)) {
+    return { rotated: false, reason: 'rotation-unavailable' };
+  }
+  return {
+    rotated: true,
+    previousAccount: result.previousAccount,
+    previousAccountUuid: result.previousAccountUuid,
+    currentAccount: result.currentAccount,
+    currentAccountUuid: result.currentAccountUuid,
+    childEnv: buildClaudeRecoveryEnv(childEnv, result.currentAccountUuid),
+  };
 }
 
 function propagateChildExit(result) {
@@ -1633,11 +2495,128 @@ function propagateChildExit(result) {
   process.exit(result.status ?? 1);
 }
 
-async function runCommand() {
+function codexChildFailedUnexpectedly(result) {
+  return !result.error && !result.signal && result.status != null
+    && result.status !== 0 && result.status !== 130;
+}
+
+async function currentCodexRecoverySession(
+  initialArgs,
+  baselineSessionId,
+  receiptSessionId,
+  timeoutMs = 3000,
+) {
+  if (!isCodexSessionId(receiptSessionId)) return null;
+  if (initialArgs[0] === 'resume' && isCodexSessionId(initialArgs[1])) {
+    return initialArgs[1] === receiptSessionId ? initialArgs[1] : null;
+  }
+  if (!process.env.CMUX_SURFACE_ID) return null;
+  const sessionId = await currentCmuxCodexSessionId(timeoutMs).catch(() => null);
+  return sessionId && sessionId !== baselineSessionId && sessionId === receiptSessionId
+    ? sessionId
+    : null;
+}
+
+function codexRecoveryArgs(initialArgs, sessionId) {
+  if (initialArgs[0] !== 'resume' || initialArgs[1] !== sessionId) {
+    return ['resume', sessionId];
+  }
+  const optionsWithValues = new Set([
+    '-a', '--add-dir', '--ask-for-approval', '-C', '--cd', '-c', '--config',
+    '--disable', '--enable', '-i', '--image', '-m', '--model', '-p', '--profile',
+    '--remote', '--remote-auth-token-env', '-s', '--sandbox',
+  ]);
+  const recovery = ['resume', sessionId];
+  for (let index = 2; index < initialArgs.length; index++) {
+    const arg = initialArgs[index];
+    if (arg === '--' || !arg.startsWith('-')) break;
+    recovery.push(arg);
+    const option = arg.split('=', 1)[0];
+    if (optionsWithValues.has(option) && !arg.includes('=')) {
+      if (index + 1 >= initialArgs.length) break;
+      recovery.push(initialArgs[++index]);
+    }
+  }
+  return recovery;
+}
+
+async function consumeCodexRecoveryReceipt(port, invocationId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${port}${CODEX_RECOVERY_CONSUME_PATH}`,
+        {
+          method: 'POST',
+          headers: { [CODEX_INVOCATION_HEADER]: invocationId },
+          signal: AbortSignal.timeout(Math.min(1000, remainingMs)),
+        },
+      );
+      if (response.status === 404) return null;
+      if (response.ok) {
+        const value = await response.json().catch(() => null);
+        return isCodexSessionId(value?.sessionId) ? value.sessionId : null;
+      }
+    } catch {}
+    const delayMs = Math.min(200, deadline - Date.now());
+    if (delayMs > 0) await delay(delayMs);
+  }
+  return null;
+}
+
+async function codexResumeCommand() {
+  const candidate = args[1];
+  let sessionId;
+  let resumeArgs;
+  if (!candidate || candidate === '--' || candidate.startsWith('-')) {
+    try {
+      sessionId = await currentCmuxCodexSessionId();
+    } catch (err) {
+      console.error(`[TeamCodex] ${err.message}`);
+      process.exit(1);
+    }
+    resumeArgs = candidate === '--' ? args.slice(2) : args.slice(1);
+  } else {
+    if (!isCodexSessionId(candidate)) {
+      console.error('[TeamCodex] Invalid Codex SESSION_ID.');
+      process.exit(1);
+    }
+    resumeArgs = args.slice(2);
+    if (resumeArgs[0] === '--') resumeArgs.shift();
+    sessionId = candidate;
+  }
+  try {
+    assertSafeCodexArgs(resumeArgs);
+  } catch (err) {
+    console.error(`[TeamCodex] ${err.message}`);
+    process.exit(1);
+  }
+  await runCommand(['resume', sessionId, ...resumeArgs]);
+}
+
+async function runCommand(clientArgsOverride = null) {
+  if (cliProvider !== 'codex' && process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1') {
+    console.error(
+      '[TeamClaude] Refusing nested supervised Claude launch: TEAMCLAUDE_CLAUDE_BIN must point to the native Claude vendor binary.',
+    );
+    process.exit(75);
+  }
   const config = await loadOrCreateConfig();
+  let runtimeConfig = isCodexMode(config)
+    ? config
+    : { ...config, proxy: { ...config.proxy } };
   if (!isCodexMode(config)) {
     try {
-      await ensureProxyRunning(config);
+      const canStartLocalProxy = Array.isArray(config.accounts)
+        && config.accounts.length > 0;
+      if (!canStartLocalProxy) {
+        console.error('[TeamClaude] No local accounts; waiting for the configured proxy or SSH tunnel.');
+      }
+      const running = canStartLocalProxy
+        ? await ensureProxyRunning(config)
+        : await waitForClaudeProxyRecovery(config);
+      if (running.port !== config.proxy.port) runtimeConfig.proxy.port = running.port;
     } catch (err) {
       console.error(`[TeamClaude] ${err.message}`);
       process.exit(1);
@@ -1645,35 +2624,103 @@ async function runCommand() {
   }
 
   // Everything after 'run' (skip -- separator if present)
-  const clientArgs = args.slice(1);
+  const clientArgs = clientArgsOverride == null
+    ? args.slice(1)
+    : [...clientArgsOverride];
   if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
+  const claudeBin = typeof childEnv.TEAMCLAUDE_CLAUDE_BIN === 'string'
+    && childEnv.TEAMCLAUDE_CLAUDE_BIN.length > 0
+    ? childEnv.TEAMCLAUDE_CLAUDE_BIN
+    : 'claude';
+  childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
     delete childEnv.CODEX_ACCESS_TOKEN;
     delete childEnv.TEAMCLAUDE_CODEX_PROXY_TOKEN;
-    const codexArgs = buildCodexProxyArgs(config.proxy.port, clientArgs);
-    const result = spawnSync('codex', codexArgs, {
-      stdio: 'inherit',
-      env: childEnv,
-    });
+    try {
+      assertSafeCodexArgs(clientArgs);
+    } catch (err) {
+      console.error(`[TeamCodex] ${err.message}`);
+      process.exit(1);
+    }
+    const codexBin = resolveCodexCliBin();
+    const invocationId = randomUUID();
+    childEnv.TEAMCODEX_INVOCATION_ID = invocationId;
+    const explicitSessionId = clientArgs[0] === 'resume' && isCodexSessionId(clientArgs[1])
+      ? clientArgs[1]
+      : null;
+    const hasCmuxSurface = Boolean(process.env.CMUX_SURFACE_ID);
+    let baselineSessionId = null;
+    let baselineTrusted = Boolean(explicitSessionId) || !hasCmuxSurface;
+    if (!explicitSessionId && hasCmuxSurface) {
+      try {
+        const baseline = await currentCmuxCodexBaseline();
+        baselineSessionId = baseline.sessionId;
+        baselineTrusted = baseline.trusted;
+      } catch {
+        baselineTrusted = false;
+      }
+    }
+    const launchCodex = launchArgs => spawnSync(
+      codexBin,
+      buildCodexProxyArgs(config.proxy.port, launchArgs),
+      { stdio: 'inherit', env: childEnv },
+    );
+    let result = launchCodex(clientArgs);
     if (result.error) {
       if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
+        console.error(codexCliNotFoundMessage(codexBin));
       } else {
         console.error(`Failed to start codex: ${result.error.message}`);
       }
       process.exit(1);
     }
+    if (codexChildFailedUnexpectedly(result)) {
+      const recoveryDeadline = Date.now() + 5000;
+      const receiptSessionId = await consumeCodexRecoveryReceipt(
+        config.proxy.port,
+        invocationId,
+        Math.max(1, recoveryDeadline - Date.now()),
+      );
+      const sessionId = baselineTrusted && Date.now() < recoveryDeadline
+        ? await currentCodexRecoverySession(
+          clientArgs,
+          baselineSessionId,
+          receiptSessionId,
+          Math.max(1, recoveryDeadline - Date.now()),
+        )
+        : null;
+      if (sessionId) {
+        console.error('[TeamCodex] Codex exited unexpectedly; resuming its trusted exact session once.');
+        result = launchCodex(codexRecoveryArgs(clientArgs, sessionId));
+        if (result.error) {
+          if (result.error.code === 'ENOENT') {
+            console.error(codexCliNotFoundMessage(codexBin));
+          } else {
+            console.error(`Failed to restart codex: ${result.error.message}`);
+          }
+          process.exit(1);
+        }
+      }
+    }
     return propagateChildExit(result);
   }
 
-  delete childEnv.ANTHROPIC_API_KEY;
-  delete childEnv.ANTHROPIC_AUTH_TOKEN;
-  childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
-  await syncLaunchModel(config, clientArgs, childEnv);
+  const proxyAuthEnv = ['ANTHROPIC', 'API', 'KEY'].join('_');
+  const oauthEnv = ['ANTHROPIC', 'AUTH', 'TOKEN'].join('_');
+  const preserveProxyAuth = typeof config.proxy.apiKey === 'string'
+    && config.proxy.apiKey.length > 0
+    && childEnv[proxyAuthEnv] === config.proxy.apiKey;
+  delete childEnv[proxyAuthEnv];
+  delete childEnv[oauthEnv];
+  childEnv.ANTHROPIC_BASE_URL = `http://localhost:${runtimeConfig.proxy.port}`;
+  if (preserveProxyAuth) childEnv[proxyAuthEnv] = config.proxy.apiKey;
+  delete childEnv.DISABLE_GROWTHBOOK;
+  await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
+  await seedClaudeRecoveryAccount(runtimeConfig, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
@@ -1681,15 +2728,33 @@ async function runCommand() {
     const result = await runClaudeWithRecovery({
       claudeArgs: clientArgs,
       childEnv,
-      config,
+      config: runtimeConfig,
       fetchStatus: async () => {
-        const response = await fetch(`http://127.0.0.1:${config.proxy.port}/teamclaude/status`, {
+        const response = await fetch(`http://127.0.0.1:${runtimeConfig.proxy.port}/teamclaude/status`, {
+          headers: {
+            'x-api-key': config.proxy.apiKey,
+            'x-teamcodex-status-identity': '1',
+          },
           signal: AbortSignal.timeout(1500),
         });
         if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
         return response.json();
       },
-      spawnClaude: (recoveryArgs, recoveryEnv) => spawn('claude', recoveryArgs, {
+      recoverLoginExpired: ({ childEnv: recoveryEnv }) =>
+        recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
+      recoverLimit: ({ childEnv: recoveryEnv }) =>
+        recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
+      waitForConnectionRecovery: async ({ childEnv: recoveryEnv }) => {
+        const recovered = await waitForClaudeProxyRecovery(runtimeConfig);
+        runtimeConfig.proxy.port = recovered.port;
+        return {
+          childEnv: {
+            ...recoveryEnv,
+            ANTHROPIC_BASE_URL: `http://localhost:${recovered.port}`,
+          },
+        };
+      },
+      spawnClaude: (recoveryArgs, recoveryEnv) => spawn(claudeBin, recoveryArgs, {
         stdio: 'inherit',
         env: recoveryEnv,
       }),
@@ -1714,7 +2779,7 @@ async function runCommand() {
     return propagateChildExit(result);
   }
 
-  const result = spawnSync('claude', clientArgs, {
+  const result = spawnSync(claudeBin, clientArgs, {
     stdio: 'inherit',
     env: childEnv,
   });
@@ -1732,6 +2797,7 @@ async function runCommand() {
 }
 
 // ── status ──────────────────────────────────────────────────
+// (ERROR_REASON_LABELS lives above the command dispatch — see the note there.)
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
@@ -1747,11 +2813,18 @@ async function statusCommand() {
   const url = `http://127.0.0.1:${running.port}/teamclaude/status`;
 
   try {
-    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
+    const res = await fetch(url, {
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        'x-teamcodex-status-identity': '1',
+      },
+    });
     const data = await res.json();
 
-    const pidStr = running.pid ? `pid ${running.pid}, ` : '';
-    console.log(`Server:         running (${pidStr}port ${running.port})`);
+    const identity = running.lifecycleVerified
+      ? `${running.pid ? `pid ${running.pid}, ` : ''}port ${running.port}`
+      : `lifecycle identity unverified, port ${running.port}`;
+    console.log(`Server:         running (${identity})`);
     // Host CPU/RAM of the machine the proxy runs on (absent from older servers).
     // CPU% is measured between two status calls, so the very first call shows "-".
     if (data.host?.cpu && data.host?.memory) {
@@ -1762,6 +2835,10 @@ async function statusCommand() {
       console.log(`Host:           CPU ${cpu} (load ${load} / ${h.cpu.cores} cores)   RAM ${formatBytes(m.usedBytes)}/${formatBytes(m.totalBytes)} (${m.usedPct}%)`);
     }
     console.log(`Active account: ${data.currentAccount}`);
+    // Absent from older running servers — only print when the payload has it.
+    if (data.usableCount != null && data.totalCount != null) {
+      console.log(`Usable now:     ${data.usableCount}/${data.totalCount} accounts`);
+    }
     console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
 
     for (const acct of data.accounts) {
@@ -1770,7 +2847,11 @@ async function statusCommand() {
 
       const disabledTag = acct.enabled === false ? ' [disabled]' : '';
       console.log(`  ${acct.name} (${acct.type})${current}${disabledTag}`);
-      console.log(`    Status:   ${acct.status}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
+      const reasonTag = acct.status === 'error' && ERROR_REASON_LABELS[acct.errorReason]
+        ? ` [${ERROR_REASON_LABELS[acct.errorReason]}]` : '';
+      console.log(`    Status:   ${acct.status}${reasonTag}${acct.enabled === false ? ' (disabled — out of rotation)' : ''}`);
+      const subscriptionTag = subscriptionDisplay(acct.subscription);
+      if (subscriptionTag) console.log(`    Subscription: ${subscriptionTag}`);
       if (acct.priority != null) console.log(`    Priority: ${acct.priority} (lower = preferred)`);
       if (acct.maxConcurrent != null) {
         console.log(`    In flight: ${acct.inflight ?? 0}/${acct.maxConcurrent} concurrent`);
@@ -1937,6 +3018,10 @@ async function accountsCommand() {
       const src = a.source ? `, ${a.source}` : '';
       console.log(`  [${i + 1}] ${a.name} (Codex ${plan}${src})`);
       if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
+      const subscriptionTag = subscriptionDisplay(subscriptionSnapshot({
+        subscriptionCancellation: normalizeSubscriptionCancellation(a.subscriptionCancellation),
+      }));
+      if (subscriptionTag) console.log(`       Subscription: ${subscriptionTag}`);
       if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
       continue;
     }
@@ -1973,19 +3058,26 @@ async function apiCommand() {
     console.error('Example: teamcodex api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
+  if (!path.startsWith('/') || path.startsWith('//')) {
+    console.error('The api command requires a relative API path beginning with a single /.');
+    process.exit(1);
+  }
 
   // Find account to use
   const accountName = argValue('--account');
   const method = (argValue('--method') || 'GET').toUpperCase();
   const data = argValue('--data');
   const running = await findRunningServer(config).catch(() => null);
-  const useRunningProxy = !accountName && !path.startsWith('http') && running;
+  const useRunningProxy = !accountName && running;
 
   let url;
   let headers;
   if (useRunningProxy) {
     url = `http://127.0.0.1:${running.port}${path}`;
     headers = { 'x-api-key': config.proxy.apiKey };
+    if (path === '/teamclaude/status') {
+      headers['x-teamcodex-status-identity'] = '1';
+    }
   } else {
     const accounts = await resolveAccounts(config);
     let account;
@@ -2027,7 +3119,7 @@ async function apiCommand() {
     const upstream = config.upstream || (codexMode
       ? 'https://chatgpt.com/backend-api/codex'
       : 'https://api.anthropic.com');
-    url = path.startsWith('http') ? path : `${upstream}${path}`;
+    url = `${upstream}${path}`;
     headers = isOAuth
       ? { 'Authorization': `Bearer ${credential}` }
       : { 'x-api-key': credential };
@@ -2036,7 +3128,7 @@ async function apiCommand() {
     }
   }
 
-  const fetchOpts = { method, headers };
+  const fetchOpts = { method, headers, redirect: 'manual' };
   if (data) {
     headers['Content-Type'] = 'application/json';
     fetchOpts.body = data;
@@ -2090,8 +3182,8 @@ async function noteRunningServerReload(config) {
     const running = await findRunningServer(config);
     if (!running) return false;
     const state = await readServerState();
-    const workerPid = state?.pid === running.pid && state.port === running.port
-      && isPidAlive(state.workerPid)
+    const workerPid = running.lifecycleVerified && running.identity
+      && verifyWorkerIdentity(state, running.identity)
       ? state.workerPid
       : null;
     if (!workerPid) {
@@ -2157,6 +3249,59 @@ async function setPriorityCommand() {
   await noteRunningServerReload(config);
 }
 
+async function anthropicSubscriptionCommand() {
+  const name = args[1];
+  const state = args[2];
+  if (!name || (state !== 'disabled' && state !== 'ok')) {
+    console.error('Usage: teamcodex subscription <account-name> <disabled|ok>');
+    console.error('  "disabled" records a confirmed organization access denial and keeps the');
+    console.error('  account out of rotation while TeamClaude rechecks it. "ok" clears it now.');
+    process.exit(1);
+  }
+  // The flag models a Claude Code organization-access denial (Anthropic OAuth 403);
+  // the Codex pool has no equivalent signal, so refuse rather than write a
+  // flag nothing would ever read or clear.
+  if (isCodexMode(await loadConfig())) {
+    console.error('subscription <disabled|ok> applies to Claude (Anthropic) accounts only, not the Codex pool.');
+    process.exit(1);
+  }
+  const disabled = state === 'disabled';
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const acct = cfg.accounts.find(a => a.name === name);
+    if (!acct) return;
+    found = true;
+    if (disabled) acct.subscriptionDisabled = true;
+    else delete acct.subscriptionDisabled;
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
+  console.log(disabled
+    ? `Marked "${name}" subscription-disabled (organization access denied; auto-rechecked)`
+    : `Cleared the subscription flag for "${name}" (back into rotation)`);
+  await noteRunningServerReload(config);
+}
+
+async function subscriptionCommand() {
+  return cliProvider === 'codex'
+    ? codexSubscriptionCommand()
+    : anthropicSubscriptionCommand();
+}
+
+async function installClaudeWrapperCommand() {
+  const installed = await installClaudeWrapper({
+    homeDir: homedir(),
+    teamcodexBin: resolve(process.argv[1]),
+  });
+  console.log(installed.wrapperPath);
+  console.log(installed.vendorShimPath);
+}
+
+async function uninstallClaudeWrapperCommand() {
+  const uninstalled = await uninstallClaudeWrapper({ homeDir: homedir() });
+  console.log(uninstalled.wrapperPath);
+  console.log(uninstalled.vendorShimPath);
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -2172,20 +3317,28 @@ Commands:
   login               Add an account with an isolated official Codex OAuth login
   import              Import the current ~/.codex/auth.json
   run [-- args...]    Run Codex through the multi-account proxy
+  resume [ID]         Resume the exact ID, or the current cmux tab checkpoint
   env                 Print an equivalent Codex launch command
   status              Show proxy & account status
   accounts            List configured Codex accounts
+  reauth <name>       Re-authenticate one existing OAuth account
+  subscription cancel Track a cancelled subscription without disabling it
+  subscription clear  Clear cancellation tracking for one account
   remove <name>       Remove an account
   disable <name>      Disable an account
   enable <name>       Re-enable an account
   priority <name> <n> Set selection priority ("auto" clears it)
   api <path>          Call a ChatGPT backend endpoint with one account
+  install-claude-wrapper   Install the transparent Claude launcher
+  uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
 
 Options:
   --name NAME         Set account name (import/login)
   --from PATH         Codex auth path (default: ~/.codex/auth.json)
   --device-auth       Use the Codex device login flow
+  --ends-on DATE      Last usable local date for subscription cancel (YYYY-MM-DD)
+  --account-uuid UUID Pin a subscription command to the selected account identity
   --log-to DIR        Log full requests/responses to DIR
 
 Config: ${getConfigPath()}
@@ -2207,12 +3360,18 @@ Commands:
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
   accounts            List configured accounts
+  reauth <name>       Re-authenticate one existing OAuth account
   remove <name>       Remove an account
   disable <name>      Disable an account (excluded from rotation)
   enable <name>       Re-enable a disabled account
   priority <name> <n> Set selection priority (lower = preferred; "auto" to return
                       to automatic ordering — weekly reset soonest drained first)
+  subscription <name> <disabled|ok>
+                      Mark an account's Claude subscription lapsed (kept out of
+                      rotation, survives restarts) or clear the mark
   api <path>          Call an API endpoint with account credentials
+  install-claude-wrapper   Install the transparent Claude launcher
+  uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
 
 Options:
@@ -2268,6 +3427,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      if (previous.subscriptionCancellation !== undefined) {
+        account.subscriptionCancellation = previous.subscriptionCancellation;
+      }
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
@@ -2309,6 +3471,9 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      if (previous.subscriptionCancellation !== undefined) {
+        account.subscriptionCancellation = previous.subscriptionCancellation;
+      }
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
@@ -2399,13 +3564,29 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (mgr.enabled !== wantEnabled) accountManager.setEnabled(mgr, wantEnabled);
       const diskPriority = Number.isFinite(diskAcct.priority) ? Math.floor(diskAcct.priority) : null;
       if (mgr.priority !== diskPriority) accountManager.setPriority(mgr, diskPriority);
+      const diskCancellation = normalizeSubscriptionCancellation(diskAcct.subscriptionCancellation);
+      if (JSON.stringify(normalizeSubscriptionCancellation(mgr.subscriptionCancellation))
+          !== JSON.stringify(diskCancellation)) {
+        accountManager.setSubscriptionCancellation(mgr, diskCancellation, false);
+      }
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
       // enabled/priority over the disk value and silently revert a CLI change.
+      // Subscription-lapse flag from disk, both directions: a CLI
+      // `subscription <name> disabled|ok` while the server runs must park /
+      // free the live account on reload. persist=false — the change came FROM
+      // disk, so echoing it back would only churn the config.
+      const wantLapsed = diskAcct.subscriptionDisabled === true;
+      if (mgr.provider === 'anthropic' && (mgr.subscriptionDisabled === true) !== wantLapsed) {
+        accountManager.setSubscriptionDisabled(mgr, wantLapsed, false);
+      }
       const memAcct = memConfig.accounts[memIdx];
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
+        if (wantLapsed) memAcct.subscriptionDisabled = true; else delete memAcct.subscriptionDisabled;
+        if (diskCancellation) memAcct.subscriptionCancellation = diskCancellation;
+        else delete memAcct.subscriptionCancellation;
       }
     }
 
@@ -2422,6 +3603,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
           expiresAt: creds.expiresAt,
           idToken: creds.idToken,
           accountId: creds.accountId,
+          planType: creds.planType,
         };
       } catch (err) {
         console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
@@ -2433,6 +3615,7 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         expiresAt: diskAcct.expiresAt,
         idToken: diskAcct.idToken,
         accountId: diskAcct.accountId,
+        planType: diskAcct.planType,
       };
     } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
       freshCred = { apiKey: diskAcct.apiKey };
@@ -2454,7 +3637,10 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
+      if (mgr.status === 'error') {
+        mgr.status = 'active';
+        delete mgr.errorReason;
+      }
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
   }
@@ -2492,6 +3678,8 @@ async function resolveAccounts(config) {
             maxConcurrent: acct.maxConcurrent,
             enabled: acct.enabled,
             priority: acct.priority,
+            subscriptionDisabled: acct.subscriptionDisabled,
+            subscriptionCancellation: acct.subscriptionCancellation,
             ...creds,
           });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);

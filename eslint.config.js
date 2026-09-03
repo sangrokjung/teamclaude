@@ -17,8 +17,10 @@ export default [
         TextDecoder: 'readonly',
         TextEncoder: 'readonly',
         fetch: 'readonly',
+        Headers: 'readonly',
         AbortController: 'readonly',
         AbortSignal: 'readonly',
+        structuredClone: 'readonly',
       },
     },
     rules: {

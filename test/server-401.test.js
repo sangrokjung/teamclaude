@@ -8,6 +8,97 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
+function closeServer(server) {
+  if (!server?.listening) return Promise.resolve();
+  return new Promise(resolve => {
+    server.close(resolve);
+    server.closeAllConnections();
+  });
+}
+
+async function codexCancellation401({ endsAt }) {
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const am = new AccountManager([{
+      name: 'cancelled', provider: 'codex', type: 'oauth', accessToken: 'codex-token',
+      expiresAt: now + 3_600_000,
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3_600_000).toISOString(), endsAt,
+      },
+    }], 0.98);
+    const persisted = [];
+    am.onAccountMetadata((_account, metadata) => persisted.push(metadata));
+    proxy = createProxyServer(am, {
+      provider: 'codex',
+      upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false,
+      codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    await response.text();
+    await am.waitForAccountFlag(am.accounts[0]);
+    return { responseStatus: response.status, account: am.accounts[0], persisted };
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}
+
+async function codexCancellation401WithTerminalRefresh({ refreshStatus }) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => {
+    if (String(input) === 'https://auth.openai.com/oauth/token') {
+      return Promise.resolve(new globalThis.Response(
+        refreshStatus === 400 ? JSON.stringify({ error: 'invalid_grant' }) : '',
+        { status: refreshStatus, headers: { 'content-type': 'application/json' } },
+      ));
+    }
+    return originalFetch(input, init);
+  };
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+  });
+  let proxy;
+  try {
+    const upstreamPort = await listen(upstream);
+    const now = Date.now();
+    const am = new AccountManager([{
+      name: 'cancelled-refresh', provider: 'codex', type: 'oauth',
+      accessToken: 'codex-token', refreshToken: 'codex-refresh', expiresAt: now + 3_600_000,
+      subscriptionCancellation: {
+        status: 'scheduled', recordedAt: new Date(now - 3_600_000).toISOString(),
+        endsAt: new Date(now - 1).toISOString(),
+      },
+    }], 0.98);
+    proxy = createProxyServer(am, {
+      provider: 'codex', upstream: `http://127.0.0.1:${upstreamPort}`,
+      activeWarmup: false, codexUsageRefresh: false,
+    });
+    const proxyPort = await listen(proxy);
+    const response = await originalFetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    await response.text();
+    await am.waitForAccountFlag(am.accounts[0]);
+    return { responseStatus: response.status, account: am.accounts[0] };
+  } finally {
+    globalThis.fetch = originalFetch;
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}
+
 // Regression (adversarial review): a 401 (auth failure / revoked token) must
 // fail the account out and switch — not get retried as a warm-up target,
 // which would route repeated 401s to the client. Account 'a' has no refresh
@@ -92,3 +183,43 @@ test('all accounts failing auth → returns 401 to the client', async () => {
     upstream.close();
   }
 });
+
+test('Codex 401 before a declared subscription end remains an authentication error', async () => {
+  const result = await codexCancellation401({ endsAt: new Date(Date.now() + 3_600_000).toISOString() });
+
+  assert.equal(result.responseStatus, 401);
+  assert.equal(result.account.status, 'error');
+  assert.equal(result.account.errorReason, 'auth-revoked');
+  assert.equal(result.account.subscriptionCancellation.status, 'scheduled');
+  assert.deepEqual(result.persisted, [], 'ordinary auth failures do not rewrite cancellation metadata');
+});
+
+test('Codex 401 after a declared subscription end persists subscription-ended', async () => {
+  const result = await codexCancellation401({ endsAt: new Date(Date.now() - 1).toISOString() });
+
+  assert.equal(result.responseStatus, 401);
+  assert.equal(result.account.status, 'error');
+  assert.equal(result.account.errorReason, 'subscription-ended');
+  assert.equal(result.account.subscriptionCancellation.status, 'ended');
+  assert.equal(result.persisted.length, 1);
+  assert.equal(result.persisted[0].evidence, 'auth-failure-after-cancellation');
+});
+
+test('Codex 401 on a cancellation with no known date persists subscription-ended', async () => {
+  const result = await codexCancellation401({ endsAt: null });
+
+  assert.equal(result.responseStatus, 401);
+  assert.equal(result.account.errorReason, 'subscription-ended');
+  assert.equal(result.account.subscriptionCancellation.status, 'ended');
+});
+
+for (const refreshStatus of [401, 400]) {
+  test(`Codex upstream 401 plus terminal refresh ${refreshStatus} preserves subscription-ended`, async () => {
+    const result = await codexCancellation401WithTerminalRefresh({ refreshStatus });
+
+    assert.equal(result.responseStatus, 401);
+    assert.equal(result.account.status, 'error');
+    assert.equal(result.account.errorReason, 'subscription-ended');
+    assert.equal(result.account.subscriptionCancellation.status, 'ended');
+  });
+}

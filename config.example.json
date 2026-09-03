@@ -30,7 +30,14 @@
   "autoResumeClaude": true,
   "claudeAutoResumeMaxRetries": 3,
   "claudeAutoResumeBackoffMs": 2000,
+  "claudeSafetyDenialMaxResumes": 1,
+  "claudeSafeguardMaxResumes": 1,
+  "claudeAmbiguousDispatchMaxResumes": 1,
+  "claudeConnectionRecoveryMaxWaitMs": 900000,
   "codexFallbackOnExhaustion": false,
+  "codexAuthFailureThreshold": 3,
+  "cmuxSessionRescue": false,
+  "cmuxSessionRescueIntervalMs": 1000,
   "accounts": [
     {
       "name": "primary-max",

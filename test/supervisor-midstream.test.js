@@ -99,6 +99,7 @@ test('supervisor bounds an idle worker SSE relay and releases public admission',
     proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    codexUsageRefresh: false,
     continuityMode: false,
     streamIdleTimeoutMs: 200,
     maxConcurrentPerAccount: 1,
@@ -107,7 +108,11 @@ test('supervisor bounds an idle worker SSE relay and releases public admission',
   }));
 
   const child = spawn(process.execPath, [entry, 'server'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    env: {
+      ...process.env,
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+      TEAMCLAUDE_CONFIG: configPath,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stoppedWorkerPid = null;

@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-291%20passing-58e3a2?style=flat-square" alt="291 tests passing">
+  <img src="https://img.shields.io/badge/tests-821%20passing-58e3a2?style=flat-square" alt="821 tests passing">
   <img src="https://img.shields.io/badge/runtime-Node.js%2018%2B-56d8ff?style=flat-square" alt="Node.js 18+">
   <img src="https://img.shields.io/badge/dependencies-zero-8d6cff?style=flat-square" alt="Zero runtime dependencies">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-ec6c9c?style=flat-square" alt="MIT License"></a>
@@ -159,14 +159,16 @@ cannot read that path.
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
+- **Cancellation-aware account health** — locally declared Codex cancellations stay usable through their paid end date, while terminal authentication evidence distinguishes `subscription-ended` from an ordinary credential error. Recoverable errors expose UUID-pinned re-authentication in the TUI
+- **Credential-free recovery status** — status, CLI, and TUI surfaces show the recovery action and safe reason without exposing tokens or stable account IDs
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
 - **Manual account controls** — enable/disable accounts and pin an explicit account order from the TUI or CLI (`teamclaude disable|enable|priority`); a disabled account is excluded from rotation while its in-flight requests drain, and everything unranked stays on automatic use-or-lose ordering
 - **Quota survives restarts** — general per-account quota state *and* the warm-up probe template are snapshotted to `<config>.quota.json` (every minute and on exit) and restored at startup. Model-scoped usage is deliberately not restored: every Fable/Mythos window starts unknown and is re-measured from runtime traffic
 - **Account-first Fable/Mythos routing** — only an account with a fresh, finite, full model-scoped window is skipped for that top-tier request. Any generally available account (enabled, auth-healthy, and under its general 5h/7d limits) whose model window is unknown, expired, or ready keeps the original model eligible; Opus, Sonnet, and Haiku eligibility is never removed by a Fable/Mythos window
 - **Active warm-up** — after a (re)start the proxy probes eligible unmeasured accounts with a minimal request (reusing the last accepted request shape), so response-derived quota data populates without waiting for normal traffic to reach each account
 - **Server lifecycle** — `teamclaude stop` / `teamclaude restart` cleanly stop or replace the running server from any terminal
-- **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
-- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also best-effort re-measures every idle account, including disabled accounts for display, and reports an honest `M/N`
+- **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched. A periodic keep-alive sweep (default 5 min) also refreshes **idle** accounts' expiring tokens — including parked and disabled accounts — so their refresh-token chains stay alive with zero traffic. A refresh-caused error self-heals on success; an upstream-auth rejection stays parked until re-import/login
+- **Hot-reload accounts** — add accounts via `import` or `login` while the server is running, press **R** to pick them up; **R** also force-re-measures every idle account, including disabled accounts, so the dashboard reflects usage spent outside this proxy and reports an honest `M/N`
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Host CPU / RAM tracking** — live host CPU%, 1/5/15-min load average, and RAM usage in the TUI header, `teamclaude status`, and the `/teamclaude/status` JSON (`host` field); measured with Node built-ins only
@@ -227,6 +229,28 @@ teamclaude codex run
 teamclaude codex run -- exec "summarize this repository"
 ```
 
+Codex chooses its `model_provider` when the TUI process starts. Reloading the
+shell cannot move an already-running Codex process to TeamCodex. After exiting
+an affected TUI, resume the exact conversation bound to the current cmux tab:
+
+```bash
+# Uses the current surface's trusted Codex checkpoint; no recent-session picker
+teamcodex codex resume
+
+# Or bypass every picker with a known session ID
+teamcodex codex resume SESSION_ID
+```
+
+The no-ID form fails closed when cmux is unavailable or the current surface
+does not have a valid Codex resume binding. It never guesses from working
+directory or recency. Start new sessions with `teamcodex codex run`; cmux then
+records the exact checkpoint together with the TeamCodex provider overrides,
+so later tab restoration keeps the proxy route. Resume rejects Codex
+`--remote`, `--remote-auth-token-env`, `--oss`, and `--local-provider` options
+because they would leave that route. See the
+[Codex provider/session recovery runbook](docs/runbooks/codex-provider-session-recovery.md)
+for diagnosis and legacy-session recovery.
+
 You can import the account currently logged into the official Codex CLI instead:
 
 ```bash
@@ -239,15 +263,16 @@ the same rotating refresh token used by `~/.codex/auth.json`; running plain
 `codex` afterward can rotate that token outside the proxy. If that happens,
 re-import the account or log it in again through `teamclaude codex login`.
 
-`teamclaude codex run` starts an HTTP-only Responses provider that still uses
-Codex's first-party ChatGPT auth path (`requires_openai_auth = true`) and
-redirects `chatgpt_base_url` to the local proxy. This preserves the
-subscription-only model catalog while preventing the default Responses
-WebSocket from bypassing the HTTP proxy. The proxy discards the client's
-incoming bearer token and account ID before forwarding, then injects the
-selected pool account's credentials. The official Codex CLI must still have a
-normal ChatGPT login to initialize its first-party auth path, but that
-credential is never forwarded upstream by TeamCodex.
+`teamclaude codex run` starts an HTTP-only Responses provider with
+`requires_openai_auth = false` and redirects `chatgpt_base_url` to the local
+proxy, while `supports_websockets = false` keeps the default Responses
+WebSocket from bypassing the HTTP proxy. The proxy discards any client-sent
+bearer token and account ID before forwarding, then injects the selected pool
+account's credentials. The local Codex CLI therefore needs **no ChatGPT login
+of its own** to run through the proxy, and a revoked or expired `~/.codex/auth.json`
+can never block `codex run` with the sign-in screen while the pool is healthy
+(this was the failure mode before 2026-08-03, when the override still set
+`requires_openai_auth = true`).
 
 Codex usage is learned from response headers as traffic flows, so newly added
 accounts show unmeasured quota until each account handles a request.
@@ -255,13 +280,59 @@ accounts show unmeasured quota until each account handles a request.
 Common controls mirror the Claude pool:
 
 ```bash
-teamclaude codex status
-teamclaude codex accounts
-teamclaude codex disable codex-pro-1
-teamclaude codex enable codex-pro-1
-teamclaude codex priority codex-pro-2 0
-teamclaude codex restart
+teamcodex codex status
+teamcodex codex accounts
+teamcodex codex disable codex-pro-1
+teamcodex codex enable codex-pro-1
+teamcodex codex priority codex-pro-2 0
+teamcodex codex restart
 ```
+
+When a subscription has been cancelled but its paid period is still usable, track
+the cancellation instead of deleting or disabling the account. `--ends-on` is the
+last usable Korean (KST) calendar date when it is known:
+
+```bash
+# Cancelled subscription with an unknown end date
+teamcodex codex subscription cancel codex-pro-1
+
+# Usable through 2026-09-06
+teamcodex codex subscription cancel codex-pro-2 --ends-on 2026-09-06
+
+# Remove an incorrect declaration or record a resubscription
+teamcodex codex subscription clear codex-pro-1
+```
+
+Selection accepts only an exact configured name, full email, or exact email
+localpart; a similar prefix never selects an account. Automation can also pin the
+selected identity with `--account-uuid`. `status`, `accounts`, the TUI, and
+`/teamclaude/status` distinguish scheduled cancellation, a reached end date, and
+an inferred subscription end from ordinary `auth-revoked` and `refresh-failed`
+errors.
+
+TeamCodex does not infer an ended subscription from `plan_type=free`, a usage
+lookup failure, 429, or an unrelated 403. It parks the account as
+`subscription-ended` only when a terminal authentication failure agrees with a
+declared cancellation whose date is due or unknown. The parked account stays
+out of rotation even when an older quota-reset timestamp passes. A later valid Codex usage
+response or successful inference reopens the account and restores the scheduled
+declaration. A non-streaming inference must return a Responses object with an
+`id`, `object: "response"`, and `status: "completed"`; an empty, malformed,
+failed, or incomplete HTTP 2xx body is not success evidence. For streaming
+inference, only `response.completed` is success evidence; `response.failed`,
+`response.incomplete`, `error`, and `[DONE]` alone do not reopen an ended
+account.
+
+Even without a declaration, the proxy detects a terminated subscription on its
+own: after `codexAuthFailureThreshold` (default 3) 401/403 usage-poll failures
+accumulated without an intervening success (a valid poll or a completed
+inference — 5xx, 429, and network errors neither count nor reset) it forces
+one token refresh plus a confirm re-poll, parks the account out of rotation
+only when both agree, and returns it to rotation automatically on the next
+valid usage poll. A circuit breaker withholds this poll-evidence park when it
+would leave zero available accounts, so a usage-endpoint-only outage can never
+empty the pool; real request-path auth failures may still park the last
+account.
 
 ### Hermes Agent through TeamCodex
 
@@ -363,7 +434,7 @@ teamclaude restart    # stop the running server (if any) and start a fresh one
 
 The running server is discovered via its state file (`<config>.server.json`) with a port-probe fallback, so `stop`/`restart` work from any terminal — even after a config port change. Quota state is restored on restart (see below), so a restart doesn't lose the dashboard.
 
-> **Note:** if a Claude Code session is itself routed through the proxy (`teamclaude run`), running `teamclaude stop` *inside that session* severs its own API connection (`Unable to connect to API (ConnectionRefused)`). Stop or restart the proxy from a separate terminal instead — with `restart`, an in-flight session recovers on its own retries.
+> **Note:** a Claude Code session routed through the proxy (`teamclaude run`) cannot run `teamclaude stop` or `teamclaude restart` against its own supervisor. TeamClaude rejects that self-disruptive command; run it from a separate terminal instead.
 
 ### Account order & manual controls
 
@@ -389,22 +460,65 @@ teamclaude run
 removes inherited `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` values so Claude
 Code keeps its Max/Pro OAuth subscription instead of silently preferring API
 credits. A `CLAUDE_CODE_OAUTH_TOKEN`, when intentionally supplied, is preserved.
-If the proxy is not running, `teamclaude run` now starts it in the background
-and waits for the listener before launching Claude Code. The server keeps that
-public listener in a supervisor process, so a crashed proxy worker is replaced
-while new connections wait instead of failing with `ConnectionRefused`.
+If the proxy is not running, `teamclaude run` starts it in the background when
+local accounts are configured and waits for the listener before launching
+Claude Code. A tunnel-only machine with no local accounts waits for its external
+listener instead, so an empty local proxy cannot steal the forwarded port. The
+server keeps its public listener in a supervisor process, so a crashed proxy
+worker is replaced while new connections wait instead of failing with
+`ConnectionRefused`.
+
+If Anthropic rejects one OAuth account with the structured
+`oauth_not_allowed_for_organization` 403, TeamClaude parks only that account as
+an auth error and retries the completed rejection on another available account.
+Other permission 403s are passed through unchanged and never poison the pool.
+If every account is rejected, the last original 403 remains visible so an admin
+can enable Claude Code subscription access or the operator can re-import/login
+the account. See [the subscription-disabled runbook](docs/runbooks/claude-subscription-disabled.md).
 
 With `autoResumeClaude: true`, the launcher gives a new Claude Code conversation
 an explicit session ID and watches only that transcript for terminal API errors.
-`Request timed out` and terminal rate/overload errors restart the same conversation
-as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
-interactive session does not wait indefinitely at the prompt for a person.
+Terminal rate/overload rejections restart the same conversation as `--resume
+<session-id> continue`, up to `claudeAutoResumeMaxRetries`. `Request timed out`
+is dispatch-ambiguous, so it reopens the conversation as `--resume <session-id>`
+without resending the last prompt. Exact `ConnectionRefused` / `ECONNREFUSED`
+errors wait for the proxy or SSH tunnel and then safely continue the rejected
+request. `ConnectionReset` / `ECONNRESET` also wait for recovery, but only reopen
+the session because the original request may already have reached upstream.
+
+An exact structured `502 Upstream connection failed after dispatch. Request was
+not replayed.` error has a stricter path. The proxy never hides a replay of the
+ambiguous POST. The launcher verifies the local proxy, waits with backoff, and
+reopens the same session as `--resume <session-id>` without a continuation
+prompt. This dedicated safe-reopen budget is independent of
+`claudeAutoResumeMaxRetries`; launcher recovery therefore issues no second
+inference POST. Claude's optional feedback URL and `Request ID`
+diagnostic suffixes are recognized without treating ordinary prompt text as an
+API error. See [the ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md).
+
+Existing Claude processes cannot acquire a recovery parent retroactively.
+On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
+cmux's session registry for an unresolved `Login expired`, connection-loss, or
+ambiguous-dispatch 502 API event. It continues
+only owner-private registry/transcript files whose active session ID, exact
+process selector and start time, trusted Claude executable, cmux surface,
+working directory, and transcript root all still match. The verified live
+surface is resolved through cmux's current topology and must still belong to
+the recorded workspace. Stale, redirected, or already supervised records fail
+closed. After a final registry and process recheck, TeamClaude durably claims
+the session and opens one non-focused workspace in the same cmux window. The
+same session is not replayed after a supervisor restart, even when the workspace
+launch result was uncertain. The blocked legacy pane remains untouched. This
+option is off by default because it adds a recovery workspace for each affected
+legacy session.
 
 `codexFallbackOnExhaustion: true` additionally hands the conversation to TeamCodex
-only when every enabled Claude account has a fresh, finite general quota window
-at or above `switchThreshold`. A Fable-only `7d_oi` exhaustion, a transient queue,
-or unknown/partial quota evidence cannot trigger the provider switch. The launcher
-writes a credential-protected, provider-neutral transcript summary under
+when an exact expired-login recovery receives a confirmed `no_alternative_account`
+response, or when every enabled Claude account has a fresh, finite general quota
+window at or above `switchThreshold`. A transient rotation failure, Fable-only
+`7d_oi` exhaustion, transient queue, or unknown/partial quota evidence cannot
+trigger the provider switch. The launcher writes a credential-protected,
+provider-neutral transcript summary under
 `~/.config/teamclaude-handoffs/`, stops the Claude child, and starts one Codex CLI
 with that handoff. Tool inputs and tool results are excluded from the handoff.
 When `launchModel` is configured, `teamclaude run` also checks the proxy's latest
@@ -419,6 +533,15 @@ or `ANTHROPIC_MODEL` remains authoritative.
 Starting or restarting TeamClaude later does **not** reroute an already-open
 direct session, which can still show "out of usage credits" for its single
 logged-in account while the proxy itself is healthy.
+
+For a supervised `teamclaude run` session, the exact Claude Code `out of usage
+credits` / `usage limit` API event is handled separately from transient overload.
+The launcher stops the blocked child, waits for the local proxy, performs an
+authenticated `/teamclaude/rotate`, and sends `--resume <session-id> continue`
+only after the proxy proves that a different account UUID was selected. If that
+rotation cannot be confirmed, the same exhausted account is not restarted.
+`overloaded_error`, temporary overload, and ordinary rate-limit events do not
+invoke this forced account rotation.
 
 Exit that direct session and resume it through TeamClaude from the same working
 directory:
@@ -439,23 +562,37 @@ claude
 ### Troubleshoot `ConnectionRefused`
 
 `Unable to connect to API (ConnectionRefused)` means Claude Code could not reach
-the local TeamClaude supervisor. New sessions started with `teamclaude run`
-automatically start a missing supervisor; a worker-only crash keeps the listener
-bound and is recovered automatically. If the supervisor itself was stopped,
-check it from a separate terminal:
+the local TeamClaude supervisor or its SSH tunnel. New sessions started with
+`teamclaude run` automatically start a missing local supervisor. If a supervised
+session later loses the connection, its launcher parks the exact session until
+the listener returns, follows any configured port move, and resumes it
+automatically. A tunnel-only machine waits for the tunnel owner instead of
+starting an empty proxy that would steal the forwarded port.
+
+Check or deliberately restart the supervisor from a separate terminal:
 
 ```bash
 teamclaude status
 lsof -nP -iTCP:3456 -sTCP:LISTEN
 teamclaude restart
 
-# Resume the conversation through the recovered proxy
+# Automatic resume needs no command. For a legacy direct session only:
 teamclaude run -- --continue
 ```
 
 The PID shown by `lsof` is the stable TeamClaude supervisor. Its worker PID may
-change after a crash without creating a no-listener window. Do not run
-`teamclaude stop` from inside the affected proxied Claude Code session.
+change after a crash without creating a no-listener window. Self-stop/restart
+commands from a supervised Claude session are rejected; use another terminal.
+
+### Troubleshoot post-dispatch 502
+
+When Claude Code prints `502 Upstream connection failed after dispatch. Request
+was not replayed`, upstream may have accepted the inference POST before its
+response connection failed. TeamClaude therefore keeps the original proxy POST
+at one hit, then permits one default same-session `continue` with a distinct
+marker. Preserve the displayed `Request ID` for
+upstream log correlation; the feedback/help suffix is diagnostic metadata, not
+a separate failure. See [the runbook](docs/runbooks/ambiguous-dispatch-502.md).
 
 ### Host CPU / RAM line
 
@@ -515,6 +652,79 @@ displayed total reflects real volume (qjc fork).
 > local patches, validate or reapply them in the service startup path because an
 > npm or Node upgrade can replace globally installed source files.
 
+### Check account health and recover authentication
+
+Use the CLI first when reviewing the pool. It keeps listing the remaining
+accounts even when one of them is parked in `error`:
+
+```bash
+teamcodex status       # live proxy snapshot: active account, quota, errors
+teamcodex accounts -v  # configured accounts and OAuth expiry metadata
+```
+
+`status` requires a running proxy. An error row includes a short reason when the
+server provides one, such as `auth-revoked`, `refresh-failed`, or
+`subscription-disabled` or `subscription-ended`; it does not make
+the entire server look unreachable. Quota rows are still the proxy's latest
+observations, not a vendor-side on-demand usage query.
+
+Codex cancellation tracking is operator-declared local metadata written by
+`teamcodex codex subscription`; it is not an automatic read of the ChatGPT
+billing page.
+
+Automation on the proxy host can read the same credential-free JSON surface:
+
+```bash
+curl -sS http://127.0.0.1:3457/teamclaude/status  # Codex provider
+```
+
+The status payload never contains access tokens, refresh tokens, API keys, or
+authorization headers. Public status omits account display names and stable
+account UUIDs. Identity-bearing status is reserved for trusted localhost
+clients and requires both the proxy API key and its explicit internal header.
+Do not post the raw JSON publicly.
+
+If an OAuth account is revoked or its refresh grant is invalid, quota rotation
+cannot repair that credential. Re-authenticate the existing account directly:
+
+```bash
+# Codex pool: runs the official Codex login in an isolated CODEX_HOME
+teamcodex codex reauth user@example.com
+teamcodex codex reauth user@example.com --account-uuid <account-uuid>
+teamcodex codex status
+
+# Anthropic pool
+teamcodex reauth user@example.com
+```
+
+The command verifies that the returned identity matches the selected UUID (or
+the email on legacy name-only entries) and only then replaces that account's
+tokens. Codex uses the official CLI in a throwaway `CODEX_HOME`; Anthropic uses
+its OAuth flow. Cancellation, profile mismatch, a disabled
+account, or an account whose organization access is blocked leaves the config
+unchanged. A running proxy is reloaded without interrupting active connections
+when supported; otherwise the CLI tells you to run `teamcodex restart`.
+If the account was originally imported from a credential file, a successful
+reauthentication detaches that stale `importFrom` source so reload/restart keeps
+the newly verified tokens.
+
+In the TeamClaude/TeamCodex TUI, an account with a recoverable authentication
+error displays **`재인증 필요 [r]`**. Pressing `r` invokes the same UUID-pinned
+flow, so another account cannot be written into the selected row by mistake.
+Confirmed `subscription-ended` and `subscription-disabled` rows do not offer
+re-authentication because those states are not repaired by rotating credentials.
+
+You can still refresh Claude Code and import its current credential when needed:
+
+```bash
+claude /login
+teamcodex import
+```
+
+Re-authentication/import updates the matching account instead of creating a
+second copy. Do not copy an OAuth config between machines: rotating
+refresh-token chains can invalidate each other.
+
 ### Other commands
 
 ```bash
@@ -527,6 +737,7 @@ teamclaude remove <name>     # Remove an account
 teamclaude disable <name>    # Disable an account (excluded from rotation)
 teamclaude enable <name>     # Re-enable a disabled account
 teamclaude priority <name> <n|auto>  # Pin selection order (lower = preferred; "auto" clears)
+teamclaude reauth <name> [--account-uuid UUID]  # Re-authenticate one OAuth account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```
@@ -564,8 +775,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
       "name": "user@example.com",
       "type": "oauth",
       "accountUuid": "...",
-      "accessToken": "sk-ant-oat01-...",
-      "refreshToken": "sk-ant-ort01-...",
+      "accessToken": "<access-token>",
+      "refreshToken": "<refresh-token>",
       "expiresAt": 1774384968427,
       "enabled": true,
       "priority": 0
@@ -583,7 +794,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min). Set to `0` to disable the timer entirely — the active account then only changes when it becomes unavailable or via per-request 429 failover |
 | `activeWarmup` | Probe unmeasured accounts after a restart to populate quota (optional, default `true`) |
 | `warmupIntervalMs` | How often (ms) the active warm-up re-probes accounts whose quota window reset (optional, default `300000` = 5 min; `0` = startup-only) |
-| `tokenRefreshIntervalMs` | How often (ms) to refresh expiring OAuth tokens across the fleet, including disabled accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled) |
+| `tokenRefreshIntervalMs` | How often (ms) the token keep-alive sweep runs across expiring, expired, parked, and disabled OAuth accounts (optional, default `300000` = 5 min; positive values are clamped to at least `60000`; `0` = disabled). A refresh-caused `error` self-heals on success; an upstream-auth `error` stays parked until re-import/login |
 | `continuityMode` | Hold requests in the proxy while quota or transient/global 429 limits recover within the continuity deadline; HTTP 529/5xx, network errors, and incomplete SSE attempts are retried internally only for replay-safe methods, never for an ambiguous POST (optional, default `true`) |
 | `streamRecovery` | Frame Anthropic SSE responses and, with continuity mode, publish only a terminally complete attempt; broken replay-safe attempts may retry transparently, while an ambiguous POST is returned as a retryable error without hidden replay (optional, default `true`) |
 | `maxResponseBytes` | Maximum bytes buffered per upstream response before returning 502; covers transactional SSE, non-SSE, and OAuth relay responses (optional, default `67108864` = 64 MiB) |
@@ -597,14 +808,30 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
-| `modelFallbacks` | Fork only — per-model fallback chains applied when the cached generally available fleet is fresh-full or a live labeled model-tier 429 reaches every eligible account. Unknown/expired/ready cached windows and unlabeled/global 429s stay account-first; a fleet that is only locally capped or queued for concurrency never changes the model (optional, default `{}`; see below) |
+| `modelFallbacks` | Fork only — per-model fallback chains. Anthropic defaults to `{}` and applies a chain only for fresh-full cached model windows or fleet-wide labeled model-tier 429s. Codex defaults to `{ "gpt-5.6-sol": ["gpt-5.6-terra"] }` and uses that chain only on a new request after every eligible ChatGPT OAuth account independently rejected Sol as unsupported (see below) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
-| `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload errors (optional, default `true`) |
+| `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
-| `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when every enabled Claude account has fresh general-quota exhaustion evidence (optional, default `false`) |
+| `claudeAmbiguousDispatchMaxResumes` | Dedicated same-session continuation budget for an exact structured post-dispatch 502. The proxy never replays the original POST; `0` disables launcher continuation, default `1`, and increasing it explicitly accepts duplicate inference/billing risk |
+| `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on exact `Login expired`, connection-loss, or ambiguous-dispatch 502 events; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
+| `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)
+
+Provider defaults differ. Anthropic starts with no fallback chain. Codex starts
+with `gpt-5.6-sol → gpt-5.6-terra`: an exact single-object ChatGPT OAuth 400
+marks only that account/model pair unsupported for 30 minutes. The rejected POST
+is returned unchanged and never replayed. A later, independently initiated
+request uses Terra only after every eligible Codex OAuth account has been
+quarantined for Sol. The quarantine itself affects only that OAuth account/model
+pair. As soon as any live OAuth quarantine exists for the requested model, every
+fresh Codex request for that model is constrained to the OAuth pool before account
+selection. It never falls through to a mixed-pool API-key account; if no OAuth
+candidate can serve and no configured fallback remains, the proxy returns 429
+immediately with `retry-after` derived from the earliest quarantine expiry. Other
+models remain eligible.
 
 ```json
 {

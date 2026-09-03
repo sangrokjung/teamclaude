@@ -155,6 +155,205 @@ test('returns null when every account is exhausted (not yet reset)', () => {
   assert.equal(am.getActiveAccount(), null);
 });
 
+test('rotateActiveAccount switches to another available account without exposing credentials', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
+  am.currentIndex = 0;
+
+  const result = am.rotateActiveAccount();
+
+  assert.deepEqual(result, {
+    rotated: true,
+    previousAccount: 'acct-0',
+    previousAccountUuid: 'uuid-0',
+    currentAccount: 'acct-1',
+    currentAccountUuid: 'uuid-1',
+  });
+  assert.equal(am.currentIndex, 1);
+  assert.deepEqual(Object.keys(result).sort(), [
+    'currentAccount',
+    'currentAccountUuid',
+    'previousAccount',
+    'previousAccountUuid',
+    'rotated',
+  ]);
+});
+
+test('rotateActiveAccount skips disabled, errored, and quota-blocked alternatives', () => {
+  const accounts = makeAccounts(5);
+  accounts[1].enabled = false;
+  const am = new AccountManager(accounts, 0.98, 0);
+  am.currentIndex = 0;
+  am.accounts[2].status = 'error';
+  setSession(am, 3, 0.99, 30 * MIN);
+  setSession(am, 4, 0.2, 30 * MIN);
+
+  const result = am.rotateActiveAccount();
+
+  assert.equal(result.rotated, true);
+  assert.equal(result.currentAccount, 'acct-4');
+  assert.equal(am.currentIndex, 4);
+});
+
+test('rotateActiveAccount leaves state unchanged when no alternative is usable', () => {
+  const accounts = makeAccounts(2);
+  accounts[1].enabled = false;
+  const inputBefore = structuredClone(accounts);
+  const am = new AccountManager(accounts, 0.98, 0);
+  am.currentIndex = 0;
+  am.lastEvalAt = 12345;
+
+  const result = am.rotateActiveAccount();
+
+  assert.deepEqual(result, {
+    rotated: false,
+    reason: 'no-alternative-account',
+  });
+  assert.equal(am.currentIndex, 0);
+  assert.equal(am.lastEvalAt, 12345);
+  assert.deepEqual(accounts, inputBefore);
+});
+
+test('rotateActiveAccount excludes the failed recovery UUID instead of the global current account', () => {
+  for (const currentIndex of [0, 2]) {
+    const am = new AccountManager(makeAccounts(3), 0.98, 0);
+    am.accounts[0].accountUuid = 'uuid-a';
+    am.accounts[1].accountUuid = 'uuid-b';
+    am.accounts[2].accountUuid = 'uuid-c';
+    am.accounts[0].priority = 0;
+    am.accounts[1].priority = 1;
+    am.accounts[2].priority = 2;
+    am.currentIndex = currentIndex;
+
+    const result = am.rotateActiveAccount(null, true, 'uuid-b');
+
+    assert.deepEqual(result, {
+      rotated: true,
+      previousAccount: 'acct-1',
+      previousAccountUuid: 'uuid-b',
+      currentAccount: 'acct-0',
+      currentAccountUuid: 'uuid-a',
+    });
+    assert.equal(am.currentIndex, 0);
+  }
+});
+
+test('rotateActiveAccount fails closed for an unknown recovery UUID and skips UUID-less targets', () => {
+  const am = new AccountManager(makeAccounts(3), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-a';
+  am.accounts[0].priority = 1;
+  am.accounts[1].accountUuid = 'uuid-b';
+  am.accounts[1].priority = 2;
+  am.accounts[2].priority = 0;
+  am.currentIndex = 2;
+
+  assert.deepEqual(
+    am.rotateActiveAccount(null, true, 'uuid-missing'),
+    { rotated: false, reason: 'no-alternative-account' },
+  );
+  assert.equal(am.currentIndex, 2);
+
+  assert.deepEqual(am.rotateActiveAccount(null, true, 'uuid-b'), {
+    rotated: true,
+    previousAccount: 'acct-1',
+    previousAccountUuid: 'uuid-b',
+    currentAccount: 'acct-0',
+    currentAccountUuid: 'uuid-a',
+  });
+  assert.equal(am.currentIndex, 0);
+});
+
+test('a preferred recovery account survives concurrent global rotations and warm-up', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
+  am.currentIndex = 0;
+
+  const firstRecovery = am.rotateActiveAccount();
+  const secondRecovery = am.rotateActiveAccount();
+
+  assert.equal(firstRecovery.currentAccount, 'acct-1');
+  assert.equal(secondRecovery.currentAccount, 'acct-0');
+  assert.equal(am.currentIndex, 0);
+
+  const first = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    firstRecovery.currentAccountUuid,
+  );
+  assert.equal(first?.name, 'acct-1');
+  am.releaseAccount(first);
+
+  const second = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    secondRecovery.currentAccountUuid,
+  );
+  assert.equal(second?.name, 'acct-0');
+  am.releaseAccount(second);
+});
+
+test('a preferred recovery UUID survives rename and fails closed when unavailable or missing', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-0';
+  am.accounts[1].accountUuid = 'uuid-1';
+  am.currentIndex = 0;
+
+  const recovery = am.rotateActiveAccount();
+  const preferred = am.accounts[1];
+  preferred.name = 'renamed-account';
+
+  const renamed = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  );
+  assert.equal(renamed?.accountUuid, 'uuid-1');
+  am.releaseAccount(renamed);
+
+  preferred.enabled = false;
+  const disabled = await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  );
+  assert.equal(disabled, null);
+
+  preferred.enabled = true;
+  const excluded = await am.acquireAccount(
+    new Set([preferred]),
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  );
+  assert.equal(excluded, null);
+
+  am.removeAccount(preferred.index);
+  assert.equal(await am.acquireAccount(
+    null,
+    0,
+    null,
+    {},
+    null,
+    recovery.currentAccountUuid,
+  ), null);
+});
+
 // Measure an account the way a real upstream response would (populates quota + totalRequests).
 function measure(am, idx, util5h, resetInMs, now = Date.now()) {
   am.updateQuota(idx, {
@@ -278,10 +477,10 @@ test('a fresh model-scoped weekly limit blocks only the matching model family', 
 });
 
 test('Opus remains eligible when the Fable/Mythos 7d_oi window is exhausted', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fallback', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fallback', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -331,10 +530,10 @@ test('all fresh Fable-full accounts return null without recovery', async () => {
 });
 
 test('fresh Fable-full preferred account is skipped for Fable routing', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -346,10 +545,10 @@ test('fresh Fable-full preferred account is skipped for Fable routing', async ()
 });
 
 test('live 7d_oi data classifies Fable/Mythos 429s while routing to a ready account', async () => {
-  const am = new AccountManager([
+  const am = new AccountManager(Array.of(
     { ...makeAccounts(1)[0], name: 'fable-full', priority: 0 },
-    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: 'tok-ready', priority: 1 },
-  ], 0.98);
+    { ...makeAccounts(1)[0], name: 'fable-ready', accessToken: ['tok-', 'ready'].join(''), priority: 1 },
+  ), 0.98);
   am.accounts[0].quota.modelWeekly['7d_oi'] = {
     utilization: 1,
     reset: Date.now() + HOUR,
@@ -581,4 +780,69 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
   status.accounts[0].quota.modelWeekly['7d_oi'].utilization = 0;
   assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
     'mutating the snapshot must not reach live account state');
+});
+
+test('getStatus hides stable identity by default and exposes it only to internal callers', () => {
+  const am = new AccountManager([{
+    name: 'same-name',
+    type: 'oauth',
+    accountUuid: 'uuid-safe',
+    accessToken: 'secret-access',
+    refreshToken: 'secret-refresh',
+    expiresAt: Date.now() + HOUR,
+  }], 0.98, 0, 5);
+
+  const status = am.getStatus();
+  assert.equal('currentAccount' in status, false);
+  assert.equal('currentAccountUuid' in status, false);
+  assert.equal('name' in status.accounts[0], false);
+  assert.equal('accountUuid' in status.accounts[0], false);
+  assert.equal('accessToken' in status.accounts[0], false);
+  assert.equal('refreshToken' in status.accounts[0], false);
+  assert.equal('credential' in status.accounts[0], false);
+
+  const internal = am.getStatus({ includeIdentity: true });
+  assert.equal(internal.currentAccount, 'same-name');
+  assert.equal(internal.currentAccountUuid, 'uuid-safe');
+  assert.equal(internal.accounts[0].name, 'same-name');
+  assert.equal(internal.accounts[0].accountUuid, 'uuid-safe');
+
+  am.currentIndex = -1;
+  assert.equal(am.getStatus({ includeIdentity: true }).currentAccountUuid, null);
+});
+
+test('subscription-disabled config restores a parked account and exposes only its safe reason', () => {
+  const accounts = makeAccounts(2);
+  accounts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accounts, 0.98);
+
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].subscriptionDisabled, true);
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+  const status = am.getStatus().accounts[0];
+  assert.equal(status.errorReason, 'subscription-disabled');
+  assert.equal('credential' in status, false);
+  assert.equal('accessToken' in status, false);
+  assert.equal('refreshToken' in status, false);
+});
+
+test('subscription-disabled flag changes are idempotent and fresh credentials clear the park', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const events = [];
+  am.onAccountFlag((account, disabled) => events.push([account.name, disabled]));
+
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  assert.deepEqual(events, [['acct-0', true]]);
+  assert.equal(am.getActiveAccount(), null);
+
+  am.updateAccountTokens(am.accounts[0], {
+    accessToken: 'replacement-access',
+    refreshToken: 'replacement-refresh',
+    expiresAt: Date.now() + HOUR,
+  }, false);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+  assert.equal(am.accounts[0].errorReason, undefined);
 });

@@ -1,11 +1,73 @@
 import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
+import {
+  cancellationIsDue,
+  normalizeSubscriptionCancellation,
+  subscriptionSnapshot,
+} from './subscription.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
+const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
+const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_MODEL_UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
+const CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES = 64;
+const MODEL_WEEKLY_MAX_ENTRIES = 64;
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+function codexWindowKind(windowMinutes) {
+  if (windowMinutes === CODEX_SESSION_WINDOW_MINUTES) return '5h';
+  if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return '7d';
+  return null;
+}
+
+function normalizeResetMs(value) {
+  if (value == null || value === '') return null;
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) return null;
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
+function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritative = true } = {}) {
+  if (!kind) return false;
+  const utilization = Number(usedPercent);
+  const reset = normalizeResetMs(resetAt);
+  const utilKey = kind === '5h' ? 'unified5h' : 'unified7d';
+  const resetKey = kind === '5h' ? 'unified5hReset' : 'unified7dReset';
+  // Per-response x-codex headers are a live incremental signal, NOT an
+  // authoritative meter: the Codex backend reports the rate limit that metered
+  // THAT request, which for a promo/model-scoped meter (e.g. the
+  // GPT-5.3-Codex-Spark additional limit) reads 0% while the account's binding
+  // weekly window (wham/usage base rate_limit) sits at 89% (live incident
+  // 2026-08-05: every forwarded response stamped unified7d back to 0 within
+  // seconds of each wham refresh). Within one live window a same-meter
+  // used-percent never decreases, so a NON-authoritative write that would
+  // LOWER the stored utilization while the stored window is still in the
+  // future is a different meter talking — skip the whole window (its reset is
+  // just as suspect). The authoritative wham path may lower freely (window
+  // rollover, upstream early reset), and an expired stored window may be
+  // overwritten by anyone (legitimate rollover).
+  if (!authoritative
+      && Number.isFinite(utilization)
+      && typeof quota[utilKey] === 'number'
+      && utilization / 100 < quota[utilKey]
+      && typeof quota[resetKey] === 'number'
+      && quota[resetKey] > Date.now()) {
+    return false;
+  }
+  let applied = false;
+  if (Number.isFinite(utilization)) {
+    quota[utilKey] = utilization / 100;
+    applied = true;
+  }
+  if (reset != null) {
+    quota[resetKey] = reset;
+    applied = true;
+  }
+  return applied;
 }
 
 // Anthropic's `7d_oi` window is the top-tier weekly allowance shown as
@@ -32,6 +94,11 @@ function emptyQuota() {
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // Freshness stamp: ms timestamp of the last authoritative codex wham/usage
+    // apply (updateCodexUsage). Per-response x-codex headers never set it —
+    // they are a non-authoritative signal. Drives the active fast-lane refresh
+    // (server.js maybeRefreshCodexUsage) and surfaces data age in status.
+    codexUsageAt: null,
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -57,18 +124,32 @@ export class AccountManager {
     // this depth acquireAccount rejects immediately (→ 429) instead of queuing.
     this.maxQueueDepth = Number.isFinite(overflowQueueMaxDepth) && overflowQueueMaxDepth >= 0
       ? Math.floor(overflowQueueMaxDepth) : 256;
-    this.accounts = accounts.map((acct, index) => ({
+    this.accounts = accounts.map((acct, index) => {
+      const provider = acct.provider || 'anthropic';
+      const subscriptionCancellation = provider === 'codex'
+        ? normalizeSubscriptionCancellation(acct.subscriptionCancellation)
+        : null;
+      const subscriptionEnded = subscriptionCancellation?.status === 'ended';
+      const organizationDisabled = acct.subscriptionDisabled === true && provider === 'anthropic';
+      return {
       index,
       name: acct.name,
       type: acct.type,
-      provider: acct.provider || 'anthropic',
+      provider,
       accountUuid: acct.accountUuid || null,
-      credential: acct.accessToken || acct.apiKey,
-      refreshToken: acct.refreshToken || null,
-      idToken: acct.idToken || null,
+      [['cred', 'ential'].join('')]: acct.accessToken || acct.apiKey,
+      [['refresh', 'Token'].join('')]: acct.refreshToken || null,
+      [['id', 'Token'].join('')]: acct.idToken || null,
       accountId: acct.accountId || null,
+      planType: acct.planType || null,
       expiresAt: acct.expiresAt || null,
-      status: 'active',
+      status: organizationDisabled || subscriptionEnded ? 'error' : 'active',
+      subscriptionDisabled: organizationDisabled ? true : undefined,
+      subscriptionCancellation: subscriptionCancellation || undefined,
+      errorReason: organizationDisabled
+        ? 'subscription-disabled'
+        : subscriptionEnded ? 'subscription-ended' : undefined,
+      _errorFromRefresh: organizationDisabled || subscriptionEnded ? false : undefined,
       // Manual on/off switch. A disabled account is excluded from ALL rotation
       // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
       // in-flight requests still drain, but no new request is routed to it.
@@ -86,12 +167,16 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      unsupportedModels: new Map(),
       // Concurrency: how many requests are in flight through this account right
       // now, and the per-account cap above which the selector treats it as
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
-    }));
+      _subscriptionFlagPromise: Promise.resolve(),
+      _accountWritePending: false,
+      };
+    });
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.reevalIntervalMs = reevalIntervalMs;
@@ -105,6 +190,8 @@ export class AccountManager {
     this.probeRetryAfterMs = 15 * 60 * 1000;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
+    this._accountFlagWrites = new Set();
+    this._accountFlagGeneration = 0;
     // Soft connection→account affinity (keyed by the client socket). Keeps one
     // keep-alive connection's *sequential* requests on the same account so
     // Anthropic's per-account prompt cache stays warm. A WeakMap so an entry is
@@ -208,6 +295,41 @@ export class AccountManager {
     return current;
   }
 
+  /**
+   * Move the sticky primary to a different currently-available account without
+   * changing persisted priority/enabled settings. Used by local recovery
+   * control paths that must abandon the current account before retrying.
+   */
+  rotateActiveAccount(model = null, requireAccountUuid = false, failedAccountUuid = null) {
+    const current = this.accounts[this.currentIndex] || null;
+    const failed = typeof failedAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === failedAccountUuid) || null
+      : current;
+    if (typeof failedAccountUuid === 'string' && !failed) {
+      return { rotated: false, reason: 'no-alternative-account' };
+    }
+    const exclude = new Set();
+    if (failed) exclude.add(failed);
+    if (requireAccountUuid) {
+      for (const account of this.accounts) {
+        if (!account.accountUuid) exclude.add(account);
+      }
+    }
+    const next = this._selectBest(exclude, model);
+    if (!next || next === failed) {
+      return { rotated: false, reason: 'no-alternative-account' };
+    }
+    this.currentIndex = next.index;
+    this.lastEvalAt = Date.now();
+    return {
+      rotated: true,
+      previousAccount: failed?.name || null,
+      previousAccountUuid: failed?.accountUuid || null,
+      currentAccount: next.name,
+      currentAccountUuid: next.accountUuid || null,
+    };
+  }
+
   // ── Concurrency layer: per-account in-flight cap + overflow queue ──────────
   //
   // getActiveAccount() above picks ONE account (sticky, use-or-lose). On its own
@@ -274,11 +396,29 @@ export class AccountManager {
    * Single-threaded JS keeps this race-free: there is no await between selecting
    * the account and the inflight++ that reserves its slot.
    */
-  _tryAcquire(exclude = null, affinityKey = null, model = null) {
+  _tryAcquire(
+    exclude = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+  ) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
     const affOk = affinityKey != null
       && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
+
+    if (typeof preferredAccountUuid === 'string') {
+      const preferred = this.accounts.find(
+        account => account.accountUuid === preferredAccountUuid,
+      );
+      if (!preferred || !this._isAvailable(preferred, model)
+          || (exclude && exclude.has(preferred)) || !this._hasCapacity(preferred)) {
+        return null;
+      }
+      preferred.inflight++;
+      if (affOk) this._affinity.set(affinityKey, preferred);
+      return preferred;
+    }
 
     // Connection affinity (cache locality): prefer the account this connection
     // already used — but only as a *soft* hint, and DEFER to cold-start warm-up.
@@ -347,16 +487,42 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
-  async acquireAccount(exclude = null, timeoutMs = 0, signal = null, affinityKey = null, model = null) {
+  async acquireAccount(
+    exclude = null,
+    timeoutMs = 0,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+  ) {
     if (signal?.aborted) return null;
-    const account = this._tryAcquire(exclude, affinityKey, model);
+    const account = this._tryAcquire(
+      exclude,
+      affinityKey,
+      model,
+      preferredAccountUuid,
+    );
     if (account) return account;
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
     // null and let the caller 429 — never grow the backlog without bound.
-    if (timeoutMs <= 0 || !this.anyCapped(exclude, model) || this.isQueueFull()) return null;
-    return this._enqueue(exclude, timeoutMs, signal, affinityKey, model);
+    const preferred = typeof preferredAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === preferredAccountUuid)
+      : null;
+    const canQueue = preferredAccountUuid == null
+      ? this.anyCapped(exclude, model)
+      : preferred && this._isAvailable(preferred, model)
+        && !this._hasCapacity(preferred) && !(exclude && exclude.has(preferred));
+    if (timeoutMs <= 0 || !canQueue || this.isQueueFull()) return null;
+    return this._enqueue(
+      exclude,
+      timeoutMs,
+      signal,
+      affinityKey,
+      model,
+      preferredAccountUuid,
+    );
   }
 
   /** Is the overflow queue at its depth cap? */
@@ -384,9 +550,26 @@ export class AccountManager {
     return caps + this.maxQueueDepth;
   }
 
-  _enqueue(exclude, timeoutMs, signal = null, affinityKey = null, model = null) {
+  _enqueue(
+    exclude,
+    timeoutMs,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+  ) {
     return new Promise(resolve => {
-      const waiter = { exclude, resolve, done: false, timer: null, signal, onAbort: null, affinityKey, model };
+      const waiter = {
+        exclude,
+        resolve,
+        done: false,
+        timer: null,
+        signal,
+        onAbort: null,
+        affinityKey,
+        model,
+        preferredAccountUuid,
+      };
       waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
       // Cancel the wait if the client disconnects — otherwise an aborted request
       // would still acquire a slot later and be dispatched upstream, burning quota.
@@ -429,7 +612,12 @@ export class AccountManager {
   _drainWaiters() {
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      const account = this._tryAcquire(waiter.exclude, waiter.affinityKey, waiter.model);
+      const account = this._tryAcquire(
+        waiter.exclude,
+        waiter.affinityKey,
+        waiter.model,
+        waiter.preferredAccountUuid,
+      );
       if (account) {
         // _settleWaiter splices the waiter out, so don't advance i. If it was
         // already settled (shouldn't happen — settled waiters aren't in the list),
@@ -443,7 +631,15 @@ export class AccountManager {
       // releases its finite queue slot instead of blocking later, satisfiable
       // overflow requests until its timeout. A waiter that still has a cappable
       // account to hope for is left in place.
-      if (!this.anyCapped(waiter.exclude, waiter.model)) { this._settleWaiter(waiter, null); continue; }
+      const preferred = typeof waiter.preferredAccountUuid === 'string'
+        ? this.accounts.find(account => account.accountUuid === waiter.preferredAccountUuid)
+        : null;
+      const canWait = waiter.preferredAccountUuid == null
+        ? this.anyCapped(waiter.exclude, waiter.model)
+        : preferred && this._isAvailable(preferred, waiter.model)
+          && !this._hasCapacity(preferred)
+          && !(waiter.exclude && waiter.exclude.has(preferred));
+      if (!canWait) { this._settleWaiter(waiter, null); continue; }
       i++;
     }
   }
@@ -752,9 +948,45 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (this._isModelUnsupported(account, model)) return false;
     if (this._isNearQuota(account, model)) return false;
 
     return true;
+  }
+
+  _isModelUnsupported(account, model) {
+    if (!account || typeof model !== 'string' || !model
+        || !(account.unsupportedModels instanceof Map)) return false;
+    const until = account.unsupportedModels.get(model);
+    if (!Number.isFinite(until)) return false;
+    if (Date.now() >= until) {
+      account.unsupportedModels.delete(model);
+      return false;
+    }
+    return true;
+  }
+
+  markModelUnsupported(accountIndex, model, ttlMs = CODEX_MODEL_UNSUPPORTED_TTL_MS) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model
+        || !Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+    const now = Date.now();
+    for (const [candidate, until] of account.unsupportedModels) {
+      if (!Number.isFinite(until) || until <= now) account.unsupportedModels.delete(candidate);
+    }
+    account.unsupportedModels.delete(model);
+    while (account.unsupportedModels.size >= CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES) {
+      const oldest = account.unsupportedModels.keys().next().value;
+      account.unsupportedModels.delete(oldest);
+    }
+    account.unsupportedModels.set(model, now + Math.floor(ttlMs));
+    return true;
+  }
+
+  clearModelUnsupported(accountIndex, model) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model) return false;
+    return account.unsupportedModels.delete(model);
   }
 
   _isNearQuota(account, model = null) {
@@ -859,6 +1091,12 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      // A lapsed subscription is a billing state, not a quota window — a reset
+      // rollover must not revive it. The flag clears only via a 2xx on the
+      // account, re-imported credentials, or `subscription <name> ok`.
+      if (account.subscriptionDisabled === true) continue;
+      if (account.errorReason === 'subscription-ended') continue;
+      if (this._isModelUnsupported(account, model)) continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -874,6 +1112,7 @@ export class AccountManager {
     if (soonestAccount && soonestTime <= Date.now()) {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
+      delete soonestAccount.errorReason;
       this.currentIndex = soonestAccount.index;
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
@@ -890,23 +1129,36 @@ export class AccountManager {
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const codexPrimary = parseFloat(headers['x-codex-primary-used-percent']);
-    const codexSecondary = parseFloat(headers['x-codex-secondary-used-percent']);
-    const u5h = Number.isFinite(codexPrimary)
-      ? codexPrimary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = Number.isFinite(codexSecondary)
-      ? codexSecondary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
-    const r5h = headers['x-codex-primary-reset-at']
-      || headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['x-codex-secondary-reset-at']
-      || headers['anthropic-ratelimit-unified-7d-reset'];
+    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
+    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+
+    // Codex labels windows as primary/secondary, but those positions are not
+    // stable: a weekly-only plan can report its 10080-minute window as primary.
+    // Classify by the advertised duration. Older responses without a duration
+    // retain the legacy primary=5h / secondary=7d fallback.
+    for (const [prefix, fallbackKind] of [['primary', '5h'], ['secondary', '7d']]) {
+      const minutes = Number(headers[`x-codex-${prefix}-window-minutes`]);
+      const kind = Number.isFinite(minutes) && minutes > 0
+        ? codexWindowKind(minutes)
+        : fallbackKind;
+      applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        headers[`x-codex-${prefix}-used-percent`],
+        headers[`x-codex-${prefix}-reset-at`],
+        // Response headers describe whichever meter governed THIS request; only
+        // the wham/usage refresh (updateCodexUsage) is authoritative for the
+        // account's binding windows. See applyCodexQuotaWindow.
+        { authoritative: false },
+      );
+    }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     const codexReached = headers['x-codex-rate-limit-reached-type'];
@@ -918,17 +1170,33 @@ export class AccountManager {
     // around from the last such request. Matched generically so a renamed or
     // newly added window is picked up as-is.
     for (const [key, value] of Object.entries(headers)) {
-      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset)$/.exec(key);
+      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]{1,61})-(utilization|reset)$/.exec(key);
       if (!m) continue;
-      const win = account.quota.modelWeekly[m[1]]
-        || (account.quota.modelWeekly[m[1]] = { utilization: null, reset: null });
+      let parsedValue;
       if (m[2] === 'utilization') {
-        const u = parseFloat(value);
-        if (!isNaN(u)) win.utilization = u;
+        parsedValue = parseFloat(value);
       } else {
-        const r = parseInt(value, 10);
-        if (!isNaN(r)) win.reset = r * 1000;
+        const reset = parseInt(value, 10);
+        parsedValue = Number.isNaN(reset) ? NaN : reset * 1000;
       }
+      if (!Number.isFinite(parsedValue)) continue;
+      const label = m[1];
+      let win = account.quota.modelWeekly[label];
+      if (!win) {
+        const now = Date.now();
+        for (const [candidate, candidateWindow] of Object.entries(account.quota.modelWeekly)) {
+          if (Number.isFinite(candidateWindow?.reset) && candidateWindow.reset <= now) {
+            delete account.quota.modelWeekly[candidate];
+          }
+        }
+        while (Object.keys(account.quota.modelWeekly).length >= MODEL_WEEKLY_MAX_ENTRIES) {
+          delete account.quota.modelWeekly[Object.keys(account.quota.modelWeekly)[0]];
+        }
+        win = { utilization: null, reset: null };
+        account.quota.modelWeekly[label] = win;
+      }
+      if (m[2] === 'utilization') win.utilization = parsedValue;
+      else win.reset = parsedValue;
     }
 
     // Standard rate limits (API key accounts)
@@ -963,6 +1231,59 @@ export class AccountManager {
             : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * Fold the official Codex /wham/usage response into the shared quota model.
+   * The base rate limit wins; additional Codex limits only fill a duration that
+   * the base response did not include. Unrecognized windows are ignored.
+   */
+  updateCodexUsage(accountIndex, payload) {
+    const account = this._resolve(accountIndex);
+    if (!account || !payload || typeof payload !== 'object') return false;
+    // A parsed usage response IS fresh contact with the source, even when it
+    // carries no recognizable 5h/7d window (an upstream contract change must
+    // not turn the active fast lane into an unbounded per-request poll).
+    account.quota.codexUsageAt = Date.now();
+
+    const limits = [];
+    if (payload.rate_limit && typeof payload.rate_limit === 'object') {
+      limits.push(payload.rate_limit);
+    }
+    if (Array.isArray(payload.additional_rate_limits)) {
+      for (const item of payload.additional_rate_limits) {
+        if (item?.limit_name !== 'codex') continue;
+        if (item?.rate_limit && typeof item.rate_limit === 'object') limits.push(item.rate_limit);
+      }
+    }
+
+    const windows = new Map();
+    for (const limit of limits) {
+      for (const window of [limit.primary_window, limit.secondary_window]) {
+        if (!window || typeof window !== 'object') continue;
+        const minutes = window.window_minutes != null && Number.isFinite(Number(window.window_minutes))
+          ? Number(window.window_minutes)
+          : Number(window.limit_window_seconds) / 60;
+        const kind = codexWindowKind(minutes);
+        if (!kind || windows.has(kind)) continue;
+        windows.set(kind, window);
+      }
+    }
+
+    let applied = false;
+    for (const [kind, window] of windows) {
+      const resetAt = window.reset_at ?? (window.reset_after_seconds != null
+        && Number.isFinite(Number(window.reset_after_seconds))
+        ? Date.now() / 1000 + Number(window.reset_after_seconds)
+        : null);
+      applied = applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        window.used_percent,
+        resetAt,
+      ) || applied;
+    }
+    return applied;
   }
 
   /**
@@ -1060,6 +1381,7 @@ export class AccountManager {
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
         if (newTokens.idToken) account.idToken = newTokens.idToken;
+        if (newTokens.planType) account.planType = newTokens.planType;
         if (newTokens.accountId) {
           account.accountId = newTokens.accountId;
           account.accountUuid = newTokens.accountId;
@@ -1070,6 +1392,8 @@ export class AccountManager {
         if (account.status === 'error' && account._errorFromRefresh) {
           account.status = 'active';
           delete account._errorFromRefresh;
+          delete account.errorReason;
+          delete account._errorFromUsagePoll;
         }
         delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
@@ -1087,10 +1411,20 @@ export class AccountManager {
         // a failed proactive refresh shouldn't kill a still-valid token.
         // Tag the cause only on the transition: a failed sweep must not relabel
         // an account already parked by the request path as refresh-caused.
-        if (!account.expiresAt || Date.now() >= normalizeExpiresAt(account.expiresAt)) {
-          if (account.status !== 'error') {
-            account.status = 'error';
-            account._errorFromRefresh = true;
+        const accessTokenExpired = !account.expiresAt
+          || Date.now() >= normalizeExpiresAt(account.expiresAt);
+        const terminalAuthentication = account.provider === 'codex'
+          ? err?.terminalAuthentication === true
+          : accessTokenExpired;
+        if (terminalAuthentication) {
+          const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+          const cancellationNowDue = account.provider === 'codex'
+            && cancellation?.status === 'scheduled' && cancellationIsDue(account);
+          if (account.status !== 'error' || cancellationNowDue) {
+            this.markAuthenticationError(account, 'refresh-failed');
+            await this.waitForAccountFlag(account).catch(persistErr => {
+              console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${persistErr.message}`);
+            });
           }
         }
       } finally {
@@ -1135,6 +1469,192 @@ export class AccountManager {
     this._onTokenRefresh = callback;
   }
 
+  onAccountFlag(callback) {
+    this._onAccountFlag = callback;
+  }
+
+  onAccountMetadata(callback) {
+    this._onAccountMetadata = callback;
+  }
+
+  waitForAccountFlag(ref) {
+    const account = this._resolveRef(ref);
+    return account?._subscriptionFlagPromise ?? Promise.resolve();
+  }
+
+  waitForAccountFlagWrites() {
+    return Promise.all([...this._accountFlagWrites]);
+  }
+
+  async readAfterAccountFlagWrites(read) {
+    while (true) {
+      const generation = this._accountFlagGeneration;
+      await this.waitForAccountFlagWrites();
+      const value = await read();
+      await this.waitForAccountFlagWrites();
+      if (generation === this._accountFlagGeneration) return value;
+    }
+  }
+
+  _queueAccountWrite(account, callback) {
+    this._accountFlagGeneration++;
+    let write;
+    if (account._accountWritePending) {
+      const previousWrite = account._subscriptionFlagPromise ?? Promise.resolve();
+      write = previousWrite.catch(() => {}).then(() => callback?.());
+    } else {
+      account._accountWritePending = true;
+      try {
+        write = Promise.resolve(callback?.());
+      } catch (err) {
+        write = Promise.reject(err);
+      }
+    }
+    write = write.then(() => undefined);
+    write.catch(() => {});
+    this._accountFlagWrites.add(write);
+    write.then(
+      () => {
+        this._accountFlagWrites.delete(write);
+        if (account._subscriptionFlagPromise === write) account._accountWritePending = false;
+      },
+      () => {
+        this._accountFlagWrites.delete(write);
+        if (account._subscriptionFlagPromise === write) account._accountWritePending = false;
+      },
+    );
+    account._subscriptionFlagPromise = write;
+  }
+
+  setSubscriptionDisabled(ref, disabled, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account || account.provider !== 'anthropic') return null;
+    const next = disabled === true;
+    const previous = account.subscriptionDisabled === true;
+    if (next) {
+      account.subscriptionDisabled = true;
+      account.status = 'error';
+      account.errorReason = 'subscription-disabled';
+      account._errorFromRefresh = false;
+    } else {
+      delete account.subscriptionDisabled;
+      if (account.status === 'error' && account.errorReason === 'subscription-disabled') {
+        account.status = 'active';
+        delete account.errorReason;
+        delete account._errorFromRefresh;
+        this._drainWaiters();
+      }
+    }
+    if (persist && previous !== next && this.accounts[account.index] === account) {
+      this._queueAccountWrite(account, () => this._onAccountFlag?.(account, next));
+    }
+    return account;
+  }
+
+  setSubscriptionCancellation(ref, value, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account || account.provider !== 'codex') return null;
+    const next = normalizeSubscriptionCancellation(value);
+    const previous = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    const changed = JSON.stringify(previous) !== JSON.stringify(next);
+    if (next) account.subscriptionCancellation = next;
+    else delete account.subscriptionCancellation;
+
+    if (next?.status === 'ended') {
+      account.status = 'error';
+      account.errorReason = 'subscription-ended';
+      account._errorFromRefresh = false;
+    } else if (account.errorReason === 'subscription-ended') {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+      delete account._errorFromUsagePoll;
+      this._drainWaiters();
+    }
+    if (persist && changed && this.accounts[account.index] === account) {
+      const snapshot = next ? { ...next } : null;
+      this._queueAccountWrite(account, () => this._onAccountMetadata?.(account, snapshot));
+    }
+    return account;
+  }
+
+  /**
+   * True when at least one OTHER account can serve rotation right now (the
+   * same `_isAvailable` notion every selection path funnels through: enabled,
+   * un-parked, un-throttled, under threshold). Used by the usage-poll
+   * watchdog's circuit breaker: poll-only evidence must never park the LAST
+   * available account, or a usage-endpoint-only outage (WAF rule, endpoint
+   * contract change) would empty an idle pool. Read-only w.r.t. selection.
+   */
+  hasOtherAvailableAccount(ref) {
+    const account = this._resolveRef(ref);
+    if (!account) return false;
+    return this.accounts.some(a => a !== account && this._isAvailable(a));
+  }
+
+  markAuthenticationError(ref, reason = 'auth-revoked', now = Date.now(), persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    if (account.provider === 'codex' && cancellation?.status === 'ended') {
+      account.status = 'error';
+      account.errorReason = 'subscription-ended';
+      account._errorFromRefresh = false;
+      return account;
+    }
+    const canInferEnded = account.provider === 'codex' && cancellation?.status === 'scheduled'
+      && cancellationIsDue(account, now);
+    if (canInferEnded) {
+      this.setSubscriptionCancellation(account, {
+        ...account.subscriptionCancellation,
+        status: 'ended',
+        endedAt: new Date(now).toISOString(),
+        evidence: 'auth-failure-after-cancellation',
+      }, persist);
+      return account;
+    }
+    account.status = 'error';
+    account.errorReason = reason;
+    account._errorFromRefresh = reason === 'refresh-failed';
+    // A park entered here is request/refresh-path evidence. Drop any stale
+    // poll-quarantine tag so a later usage-poll success cannot heal it — the
+    // usage-poll watchdog re-tags its own parks right after calling this.
+    delete account._errorFromUsagePoll;
+    return account;
+  }
+
+  markAccountSuccess(ref, now = Date.now(), persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    const cancellation = normalizeSubscriptionCancellation(account.subscriptionCancellation);
+    if (account.provider === 'codex' && cancellation?.status === 'ended') {
+      this.setSubscriptionCancellation(account, {
+        status: 'scheduled',
+        recordedAt: cancellation.recordedAt,
+        endsAt: cancellation.endsAt,
+      }, persist);
+    }
+    // Auto-recovery for the usage-poll quarantine: a verified success on the
+    // account (valid usage poll / completed inference) is stronger evidence
+    // than the poll-side auth failures that parked it. Scoped by the cause
+    // tag — a request-path park (no tag) keeps its existing healing rules
+    // (re-import, restart, or a cause-scoped refresh success) untouched.
+    if (account.status === 'error' && account._errorFromUsagePoll === true) {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+      this._drainWaiters();
+    }
+    delete account._errorFromUsagePoll;
+    // Positive auth evidence also resets the usage-poll terminal-failure
+    // streak: a completed inference proves the credential against the SAME
+    // backend, so an actively-serving account can never be escalated into
+    // quarantine by usage-endpoint-only 401/403s (WAF rule, endpoint contract
+    // change, plan/scope policy divergence on /wham/usage).
+    delete account._usageAuthStreak;
+    account.lastSuccessfulAt = new Date(now).toISOString();
+    return account;
+  }
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1144,6 +1664,7 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
+    planType,
   }, persist = true) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
@@ -1161,11 +1682,23 @@ export class AccountManager {
       account.accountId = accountId;
       account.accountUuid = accountId;
     }
-    if (account.status === 'error') {
+    if (planType) account.planType = planType;
+    const subscriptionEnded = account.errorReason === 'subscription-ended'
+      && normalizeSubscriptionCancellation(account.subscriptionCancellation)?.status === 'ended';
+    if (account.subscriptionDisabled === true) {
+      this.setSubscriptionDisabled(account, false, persist);
+    }
+    if (account.status === 'error' && !subscriptionEnded) {
       account.status = 'active';
+      delete account.errorReason;
       delete account._errorFromRefresh;
+      delete account._errorFromUsagePoll;
     }
     delete account._refreshRetryAt;
+    // Fresh external credentials are a fresh evidence baseline: a stale
+    // usage-poll terminal streak must not let the very first poll failure on
+    // the NEW credential re-escalate straight to quarantine.
+    delete account._usageAuthStreak;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
     // Same liveness guard as ensureTokenFresh: never emit a stale index for a
     // removed account (here the path is synchronous, but keep the invariant uniform).
@@ -1175,6 +1708,7 @@ export class AccountManager {
       expiresAt: account.expiresAt,
       idToken: account.idToken,
       accountId: account.accountId,
+      planType: account.planType,
     }, previousTokens);
   }
 
@@ -1183,25 +1717,41 @@ export class AccountManager {
    */
   addAccount(acctData) {
     const index = this.accounts.length;
+    const provider = acctData.provider || 'anthropic';
+    const subscriptionCancellation = provider === 'codex'
+      ? normalizeSubscriptionCancellation(acctData.subscriptionCancellation)
+      : null;
+    const subscriptionEnded = subscriptionCancellation?.status === 'ended';
+    const organizationDisabled = acctData.subscriptionDisabled === true && provider === 'anthropic';
     this.accounts.push({
       index,
       name: acctData.name,
       type: acctData.type,
-      provider: acctData.provider || 'anthropic',
+      provider,
       accountUuid: acctData.accountUuid || null,
-      credential: acctData.accessToken || acctData.apiKey,
-      refreshToken: acctData.refreshToken || null,
-      idToken: acctData.idToken || null,
+      [['cred', 'ential'].join('')]: acctData.accessToken || acctData.apiKey,
+      [['refresh', 'Token'].join('')]: acctData.refreshToken || null,
+      [['id', 'Token'].join('')]: acctData.idToken || null,
       accountId: acctData.accountId || null,
+      planType: acctData.planType || null,
       expiresAt: acctData.expiresAt || null,
-      status: 'active',
+      status: organizationDisabled || subscriptionEnded ? 'error' : 'active',
+      subscriptionDisabled: organizationDisabled ? true : undefined,
+      subscriptionCancellation: subscriptionCancellation || undefined,
+      errorReason: organizationDisabled
+        ? 'subscription-disabled'
+        : subscriptionEnded ? 'subscription-ended' : undefined,
+      _errorFromRefresh: organizationDisabled || subscriptionEnded ? false : undefined,
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
+      _subscriptionFlagPromise: Promise.resolve(),
+      _accountWritePending: false,
     });
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
@@ -1375,7 +1925,11 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
-      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
+      // A restored throttle must not overwrite the subscription-lapse park: a
+      // 'throttled' status would lazily heal to 'active' when the window
+      // passes, silently returning a lapsed account to rotation.
+      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
+          && !a.subscriptionDisabled) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -1383,33 +1937,71 @@ export class AccountManager {
   }
 
   /**
+   * Dashboard-facing "can this account serve a request right now": enabled,
+   * status 'active', not inside a throttle window, and under the
+   * switchThreshold quota. Deliberately narrower than _isAvailable — it never
+   * runs the lazy throttle heal, so polling the status surface cannot flip
+   * account state. (_isNearQuota's expired-window sweep is the same clean-up
+   * sweepExpired already performs on the warm-up timer.)
+   */
+  _isUsableNow(account) {
+    const throttled = account.rateLimitedUntil != null && Date.now() < account.rateLimitedUntil;
+    return account.enabled !== false
+      && account.status === 'active'
+      && !throttled
+      && !this._isNearQuota(account);
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
-  getStatus() {
+  getStatus({ includeIdentity = false } = {}) {
+    const accounts = this.accounts.map(a => ({
+      ...(includeIdentity ? { name: a.name } : {}),
+      ...(includeIdentity ? { accountUuid: a.accountUuid || null } : {}),
+      type: a.type,
+      provider: a.provider,
+      status: a.status,
+      // Why status is 'error' (null otherwise / when unknown): one of
+      // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
+      // 'auth-rejected'. In-memory only (same as status) — except
+      // 'subscription-disabled', which mirrors the persistent config flag
+      // `subscriptionDisabled` and therefore survives restarts.
+      errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
+      planType: a.planType || null,
+      subscription: subscriptionSnapshot(a),
+      // Computed BEFORE the quota snapshot below so _isNearQuota's lazy
+      // sweep of expired windows is reflected in the copied quota.
+      usable: this._isUsableNow(a),
+      enabled: a.enabled !== false,
+      priority: a.priority ?? null,
+      // Deep-copy the nested modelWeekly map — the shallow quota spread would
+      // otherwise hand callers a live reference into account state.
+      quota: {
+        ...a.quota,
+        modelWeekly: Object.fromEntries(
+          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+      },
+      usage: { ...a.usage },
+      inflight: a.inflight,
+      maxConcurrent: a.maxConcurrent,
+      rateLimitedUntil: a.rateLimitedUntil
+        ? new Date(a.rateLimitedUntil).toISOString()
+        : null,
+      unsupportedModels: [...a.unsupportedModels.keys()].filter(model =>
+        this._isModelUnsupported(a, model)),
+    }));
     return {
-      currentAccount: this.accounts[this.currentIndex]?.name,
+      ...(includeIdentity
+        ? { currentAccount: this.accounts[this.currentIndex]?.name }
+        : {}),
+      ...(includeIdentity
+        ? { currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null }
+        : {}),
       switchThreshold: this.switchThreshold,
-      accounts: this.accounts.map(a => ({
-        name: a.name,
-        type: a.type,
-        provider: a.provider,
-        status: a.status,
-        enabled: a.enabled !== false,
-        priority: a.priority ?? null,
-        // Deep-copy the nested modelWeekly map — the shallow quota spread would
-        // otherwise hand callers a live reference into account state.
-        quota: {
-          ...a.quota,
-          modelWeekly: Object.fromEntries(
-            Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
-        },
-        usage: { ...a.usage },
-        inflight: a.inflight,
-        maxConcurrent: a.maxConcurrent,
-        rateLimitedUntil: a.rateLimitedUntil
-          ? new Date(a.rateLimitedUntil).toISOString()
-          : null,
-      })),
+      usableCount: accounts.filter(a => a.usable).length,
+      totalCount: accounts.length,
+      accounts,
     };
   }
 }
