@@ -1215,7 +1215,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2049,12 +2049,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     const status = accountManager.getStatus();
     const capped = hasCapped(null);
-    const retryAfter = capped
-      ? 1
-      : computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    const recovery = capped
+      ? null
+      : fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    const retryAfter = capped ? 1 : recovery.retryAfter;
     const deadlineMode = ctx.continuity.maxWaitMs > 0;
     const maxCapacityWaits = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
     if (!deadlineMode && ctx.capacityWaits >= maxCapacityWaits) break;
+    // Fail fast when waiting cannot help: the fleet is blocked by a KNOWN quota
+    // reset (not merely at its concurrency cap, and not the 60s quota-healthy
+    // fallback — an account excluded by a bare 429 may free up any second) and
+    // that reset lies beyond the remaining continuity budget — e.g. every
+    // account spent its WEEKLY window and the reset is days away. Polling until
+    // the deadline would only hold the client for the full budget before
+    // returning the very same 429 (2026-09-04). Finalize exactly as the
+    // deadline would (`failedFast` → saved upstream 429 replay still wins).
+    if (deadlineMode && recovery?.soonestName != null) {
+      const remainingMs = startContinuityDeadline(ctx) - Date.now();
+      if (recovery.soonestMs > remainingMs) {
+        console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — soonest recovery in ${retryAfter}s exceeds the ${Math.max(0, remainingMs)}ms continuity budget; failing fast`);
+        ctx.failedFast = true;
+        break;
+      }
+    }
     console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — waiting ${Math.min(retryAfter * 1000, ctx.continuity.maxSleepMs)}ms`);
     ctx.capacityWaits += 1;
     const waited = await ctx.continuity.waitFor(
@@ -2118,11 +2135,40 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const deadlineExpired = ctx.continuity.maxWaitMs > 0
       && ctx.continuityDeadlineAt != null
       && Date.now() >= ctx.continuityDeadlineAt;
-    if (deadlineExpired && sendSaved429(res, ctx)) return;
+    if ((deadlineExpired || ctx.failedFast) && sendSaved429(res, ctx)) return;
     ctx.status = 429;
     const status = accountManager.getStatus();
-    const retryAfter = modelQuarantineRetryAfter(accts, ctx.model)
-      ?? computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    const recovery = fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    // A fleet-wide model quarantine (unsupported-model 400 contract) is not a
+    // usage limit: keep its own retry-after and the generic body.
+    const quarantineRetryAfter = modelQuarantineRetryAfter(accts, ctx.model);
+    const retryAfter = quarantineRetryAfter ?? recovery.retryAfter;
+    // Codex-native exhaustion body. The Codex CLI cannot read the generic
+    // rate_limit_error above ("exceeded retry limit, last status: 429"); it DOES
+    // natively render a 429 whose body is {error:{type:"usage_limit_reached",
+    // resets_at:<unix seconds>, plan_type}} ("You've hit your usage limit …
+    // try again at <time>"). Only for a QUOTA dead end (never a concurrency
+    // queue timeout) and only in deadline mode — the path the fail-fast above
+    // short-circuits; legacy polling keeps its historical body.
+    if (quarantineRetryAfter == null && ctx.provider === 'codex' && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
+        && !hasUsable(null)
+        && !hasCapped(null)) {
+      const resetsAt = Math.floor(Date.now() / 1000) + retryAfter;
+      const planType = codexPoolPlanType(accountManager.accounts, recovery.soonestName);
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'retry-after': String(retryAfter),
+      });
+      res.end(JSON.stringify({
+        error: {
+          type: 'usage_limit_reached',
+          message: `TeamCodex pool exhausted: all ${accts.length} accounts have hit their usage limit. Resets at ${new Date(resetsAt * 1000).toISOString()} (in ${retryAfter}s).`,
+          ...(planType ? { plan_type: planType } : {}),
+          resets_at: resetsAt,
+        },
+      }));
+      return;
+    }
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -3662,10 +3708,22 @@ function modelQuarantineRetryAfter(accounts, model) {
 }
 
 function computeRetryAfter(accounts, threshold = 0.98, model = null) {
+  return fleetRecovery(accounts, threshold, model).retryAfter;
+}
+
+// Soonest the fleet has anything to serve: `retryAfter` (whole seconds, for
+// headers/messages), `soonestMs` (the raw wait), and `soonestName` — the
+// account whose KNOWN reset/throttle sets that wait, or null when the minimum
+// is the 60s quota-healthy fallback (or the fleet is empty), i.e. when the
+// wait is a guess rather than a reset the proxy can compare a budget against.
+function fleetRecovery(accounts, threshold = 0.98, model = null) {
   const now = Date.now();
   const modelLabel = modelQuotaLabel(model);
   let soonest = Infinity;
-  const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
+  let soonestName = null;
+  const consider = (ms, name = null) => {
+    if (ms > 0 && ms < soonest) { soonest = ms; soonestName = name; }
+  };
   for (const acct of accounts) {
     if (acct.enabled === false || acct.status === 'error') continue;
     // freeAt = max(throttle, every over-threshold quota reset). The account is
@@ -3694,8 +3752,42 @@ function computeRetryAfter(accounts, threshold = 0.98, model = null) {
     if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
-    if (freeAt > 0) consider(freeAt - now);
+    if (freeAt > 0) consider(freeAt - now, acct.name);
     else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
+  return {
+    retryAfter: soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000)),
+    soonestMs: soonest === Infinity ? null : soonest,
+    soonestName,
+  };
+}
+
+// Plan spellings the Codex CLI deserializes into a known plan (upstream
+// codex-rs/protocol/src/auth.rs `PlanType::from_str`, verified 2026-09-04). A
+// value outside this set is omitted from the usage-limit body rather than
+// risking an unparseable plan_type that would drop the CLI back to its opaque
+// "exceeded retry limit" path.
+const CODEX_KNOWN_PLAN_TYPES = new Set([
+  'free', 'go', 'plus', 'pro', 'prolite', 'team',
+  'self_serve_business_prolite', 'self_serve_business_usage_based',
+  'business', 'ent26', 'enterprise_cbp_automation', 'enterprise_cbp_usage_based',
+  'enterprise', 'hc', 'education', 'edu', 'edu_plus', 'edu_pro',
+]);
+
+// Plan to report for a fleet-wide codex exhaustion: the soonest-recovering
+// account's plan (that is the account whose reset the message quotes), else
+// the most common plan across the eligible pool. Null when unknown — the body
+// then omits plan_type instead of guessing.
+function codexPoolPlanType(accounts, soonestName = null) {
+  const eligible = accounts.filter(a => a.enabled !== false && a.status !== 'error'
+    && typeof a.planType === 'string' && CODEX_KNOWN_PLAN_TYPES.has(a.planType));
+  const soonest = soonestName == null ? null : eligible.find(a => a.name === soonestName);
+  if (soonest) return soonest.planType;
+  const counts = new Map();
+  for (const a of eligible) counts.set(a.planType, (counts.get(a.planType) || 0) + 1);
+  let best = null;
+  for (const [plan, n] of counts) {
+    if (best == null || n > best.n) best = { plan, n };
+  }
+  return best?.plan ?? null;
 }
