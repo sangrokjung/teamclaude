@@ -1,5 +1,27 @@
 # Codex usage-limit fail-fast (2026-09-04)
 
+## Status (2026-09-05)
+
+- Scope: M (contract change on the 429 path, 3 source files + 2 test files).
+- Implemented on branch `fix/codex-usage-limit-fail-fast` (rebased onto
+  `sangrokjung/teamclaude` master `da523e4`).
+- Evidence: targeted `node --test` over `server-codex-usage-limit`,
+  `server-codex`, `server-429`, `server-model-fallback`, `concurrency`,
+  `codex-resume` = 132 pass / 0 fail; `npx eslint src/` clean. The full suite
+  was deliberately not run (host under load); the untouched suites do not
+  exercise the changed paths.
+- Independent adversarial review (maker ≠ checker, two fresh-context lanes:
+  Codex-CLI contract, regression safety): APPROVE / APPROVE. Minor notes, not
+  blocking: the extra `ctx.continuity.enabled` guard on the codex body is
+  redundant with the loop's earlier break; `codexPoolPlanType` correlates the
+  soonest account by `name` (cosmetic field only); a pre-existing
+  `planType` assignment in `src/index.js` lacks the string guard.
+- Deployment: the production daemon runs a frozen runtime artifact approved by
+  hash from the main checkout's working tree (`teamcodex_runtime_deployer.py`),
+  so landing this on master does NOT deploy it. It reaches production only when
+  a working tree containing it is approved. Until then the pool still answers
+  the generic 429 after the 15-minute continuity wait.
+
 ## Incident
 
 Every enabled ChatGPT account in the TeamCodex pool (port 3457) hit 100% of its
@@ -46,7 +68,7 @@ Requests" after a 15-minute hang.
   precedence at deadline finalization.
 - `planType` is now carried on the live `AccountManager` account (constructor,
   `addAccount`, `updateAccountTokens`, disk sync) but is **not** added to
-  `getStatus()` — no dashboard/CLI/TUI consumer wiring is required.
+  `getStatus()`, no dashboard/CLI/TUI consumer wiring is required.
 
 ## Acceptance
 
@@ -86,7 +108,7 @@ continuityMode: true })`).
 
 ## Verified upstream contract (openai/codex, fetched 2026-09-04 via `gh api`)
 
-- `codex-rs/codex-api/src/api_bridge.rs` — on `429 Too Many Requests` the body is
+- `codex-rs/codex-api/src/api_bridge.rs`: on `429 Too Many Requests` the body is
   deserialized as
 
   ```rust
@@ -104,12 +126,12 @@ continuityMode: true })`).
   429 body falls through to `CodexErr::RetryLimit` ("exceeded retry limit").
   `promo_message`, `rate_limit_reached_type`, and `rate_limits` are read from
   response *headers*, not the body, so the proxy does not need to emit them.
-- `codex-rs/protocol/src/error.rs` — `UsageLimitReachedError { plan_type,
+- `codex-rs/protocol/src/error.rs`: `UsageLimitReachedError { plan_type,
   resets_at, rate_limits, promo_message, rate_limit_reached_type }`; its
   `Display` prints "You've hit your usage limit … Try again at <local time>."
   with plan-specific wording for `plus`, `pro`/`prolite`, `free`/`go`, team and
   business plans, and a neutral line for unknown/absent plans.
-- `codex-rs/protocol/src/auth.rs` — `PlanType` is `#[serde(untagged)]`
+- `codex-rs/protocol/src/auth.rs`: `PlanType` is `#[serde(untagged)]`
   `Known(KnownPlan) | Unknown(String)`; `KnownPlan` is `rename_all = "lowercase"`
   with explicit renames. Accepted spellings: `free`, `go`, `plus`, `pro`,
   `prolite`, `team`, `self_serve_business_prolite`,
@@ -121,5 +143,5 @@ continuityMode: true })`).
   `{"error":{"type":"usage_limit_reached","message":"limit reached","resets_at":1704067242,"plan_type":"pro"}}`.
 - Local binary check (`@openai/codex-darwin-arm64` vendored `codex`, `strings`):
   contains `struct UsageErrorBody with 3 elements`, `typeplan_typeresets_at`,
-  `usage_limit_reached`, and the same lowercase plan spellings — the installed
+  `usage_limit_reached`, and the same lowercase plan spellings, the installed
   CLI parses the shape above.
