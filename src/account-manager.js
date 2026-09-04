@@ -67,6 +67,10 @@ export class AccountManager {
       refreshToken: acct.refreshToken || null,
       idToken: acct.idToken || null,
       accountId: acct.accountId || null,
+      // ChatGPT plan of a codex account (`chatgpt_plan_type` claim: 'pro',
+      // 'plus', 'free', ...). Informational — echoed back in the codex-native
+      // usage-limit body so the Codex CLI can word its message; never routes.
+      planType: typeof acct.planType === 'string' && acct.planType ? acct.planType : null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
       // Manual on/off switch. A disabled account is excluded from ALL rotation
@@ -1246,6 +1250,7 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
+    planType,
   }, persist = true) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
@@ -1259,6 +1264,7 @@ export class AccountManager {
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
     if (idToken) account.idToken = idToken;
+    if (typeof planType === 'string' && planType) account.planType = planType;
     if (accountId) {
       account.accountId = accountId;
       account.accountUuid = accountId;
@@ -1295,6 +1301,7 @@ export class AccountManager {
       refreshToken: acctData.refreshToken || null,
       idToken: acctData.idToken || null,
       accountId: acctData.accountId || null,
+      planType: typeof acctData.planType === 'string' && acctData.planType ? acctData.planType : null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
       enabled: acctData.enabled !== false,
