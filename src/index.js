@@ -3569,6 +3569,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
           !== JSON.stringify(diskCancellation)) {
         accountManager.setSubscriptionCancellation(mgr, diskCancellation, false);
       }
+      // Informational plan label (codex usage-limit body); a re-import may have
+      // learned it after the live account was constructed.
+      if (typeof diskAcct.planType === 'string' && diskAcct.planType && mgr.planType !== diskAcct.planType) {
+        mgr.planType = diskAcct.planType;
+      }
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
       // enabled/priority over the disk value and silently revert a CLI change.
