@@ -128,6 +128,7 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **Use-or-lose 우선순위** — 주간 한도 초기화가 가장 가까운 계정을 먼저 사용합니다.
 - **Codex 구독 계정 풀** — ChatGPT OAuth 계정을 별도 풀로 관리하고 공식 Codex 사용량 헤더를 추적합니다.
 - **429 즉시 장애 전환** — 사용량이 끝난 계정은 잠시 제외하고 다음 계정으로 요청을 재전송합니다.
+- **풀 전체 사용량 한도 즉시 응답** — 모든 계정이 확인된 초기화 시각까지 막혀 있고 그 시각이 연속성 deadline 밖이면 대기하지 않고 바로 응답합니다. Codex 모드에서는 `usage_limit_reached` 형태의 429를 돌려주므로 Codex CLI가 "재시도 한도 초과" 대신 사용량 한도와 재시도 가능 시각을 그대로 표시합니다. 동시 처리 한도에 걸린 경우, model quarantine, Anthropic 모드 응답은 그대로입니다.
 - **구독 해지·인증 오류 분리** — 해지 계정은 결제 종료일까지 추적하고, terminal 인증 증거를 결합해 `subscription-ended`와 일반 인증 오류를 구분합니다. 복구 가능한 오류는 TUI에 UUID 고정 재인증 동작을 표시합니다.
 - **자격 증명 비노출 복구 상태** — status, CLI, TUI에는 안전한 오류 이유와 복구 동작만 표시하고 token이나 고정 계정 식별자는 노출하지 않습니다.
 - **연속성 모드** — quota 또는 transient/global 429를 기본 15분 deadline 안에서 프록시가 내부 복구하며, probe 간격은 최대 30초입니다.
@@ -523,6 +524,86 @@ OAuth 계정이 각자의 독립 요청에서 같은 exact 거절을 기록한 �
 replay·failover하지 않으며, 사용할 OAuth 후보와 남은 fallback이 모두 없으면 가장 이른
 격리 TTL 만료를 `retry-after`에 담은 429를 즉시 반환합니다. 다른 모델은 계속 사용할 수
 있습니다.
+
+## 운영
+
+실제 운영 환경에서 이 fork를 어떻게 다루는지 정리했습니다. 상세 절차는 runbook에
+있고, 목록은 [`docs/README.md`](docs/README.md)에 있습니다.
+
+### 운영 서버는 이 체크아웃이 아니라 고정 아티팩트를 실행합니다
+
+launchd 서비스 `com.qjc.teamcodex`는 `src/*.js`를 해시로 고정한 스냅샷
+(`~/.local/share/teamcodex-runtime/artifacts/<sha256>/`)을 실행합니다. 커밋을
+머지해도 배포되지 않습니다. 지금 무엇이 돌고 있는지는 브랜치 이름이 아니라 해시로
+확인합니다. 이때 `HEAD`가 아니라 `GET`을 씁니다. status 빠른 경로는
+`req.method === 'GET'` 조건에 걸려 있어서 `curl -I`는 프록시 경로로 흘러가
+upstream으로 전달되고, 해시 헤더 없이 돌아옵니다.
+
+```bash
+curl -s -D - -o /dev/null http://127.0.0.1:3457/teamclaude/status \
+  | grep -i x-teamcodex-source-hash
+```
+
+후보 커밋에서 같은 해시를 재현하면(파일명 순으로 `src/*.js`를 정렬한 뒤 각 파일의
+`(파일명\0내용\0)`을 이어 sha256) 그 아티팩트의 출처 커밋을 특정할 수 있습니다.
+아티팩트 형식, 자동·수동 롤아웃 경로, 알려진 배포 스크립트 결함 2건, 배포 기록,
+롤백 절차는
+[TeamCodex runtime deployment](docs/runbooks/teamcodex-runtime-deployment.md)에
+있습니다.
+
+### 브랜치 계보 (2026-09-05)
+
+지금 읽고 있는 브랜치가 실제로 돌고 있는 코드일 가능성은 낮습니다. 기본 브랜치와
+`master`는 merge base가 오래됐고(`e15f4ff`, 2026-07-31) 이후 양쪽이 각자 갈라져
+나갔습니다.
+
+| 브랜치 | 설명 | `src/*.js` |
+|---|---|---|
+| `qjc/resilient-routing` | GitHub 기본 브랜치이자 공개 기준. 기능이 가장 많습니다 | 20 |
+| `master` | 더 오래된 계보. 구독 추적, 재인증, worker health, codex 복구, claude wrapper가 없습니다. 사용량 한도 즉시 응답(PR #16/#17)은 여기에 머지됐습니다 | 15 |
+| `fix/teamcodex-status-identity-release-20260902` | 커밋 `182cd3b`. 2026-09-05까지 돌던 고정 아티팩트의 출처입니다 | 20 |
+| `prod/codex-usage-limit-fail-fast-20260905` | `182cd3b` + 사용량 한도 즉시 응답. 2026-09-05 16:05 KST에 롤아웃한 아티팩트 `adea84fd…`의 출처입니다 | 20 |
+| `snapshot/local-worktree-20260905` | 로컬 작업 업로드본(Grok/Agy provider 풀, 재인증, worker health, 문서). 어디에도 머지되지 않았습니다 | 20+ |
+| `docs/ops-and-readme-20260905` | 사용량 한도 즉시 응답과 이 문서를 기본 브랜치로 가져오는 브랜치입니다 | 20 |
+
+### 풀 상태 감시
+
+프록시는 계정이 더 이상 요청을 처리하지 못하는 상태에서도 포트 응답은 계속합니다.
+그래서 살아 있는지만 확인하는 감시는 풀이 완전히 고갈된 동안에도 정상으로 보고합니다.
+어떤 감시 도구를 쓰든 `GET /teamclaude/status`에서 계정 건강을 읽어 경보를 거세요.
+
+| 신호 | 위치 | 의미 |
+|---|---|---|
+| 서빙 가능한 계정 없음 | `usableCount`가 0에 근접 | 다음 요청부터 429 |
+| 주간 사용량 압력 | `unified7dReset`이 아직 미래인 창들의 `accounts[].quota.unified7d` 평균 | 구독을 추가하면 장애를 막을 수 있는 유일한 구간에 울리는 경보 |
+| 멈춘 계정 | `accounts[].status == "error"`와 `errorReason`(예: `subscription-ended`) | 프록시가 스스로 못 고칩니다. 재로그인이나 구독 조치가 필요합니다 |
+| 줄어드는 풀 | `accounts[].subscription.state == "cancellation-scheduled"`와 `endsAt` | 정해진 날짜에 용량이 사라집니다 |
+| 끊어진 갱신 체인 | 풀 설정의 `expiresAt`이 이미 과거 | 재로그인 외에는 복구되지 않습니다 |
+
+자동 조치가 아니라 경보로 두세요. 재로그인은 브라우저가 필요하고 프록시 재시작은
+진행 중인 세션을 끊기 때문에 둘 다 사람이 판단할 일입니다. 계정 이름은 프록시 API
+키와 `x-teamcodex-status-identity: 1`을 함께 보낼 때만 응답에 나옵니다.
+
+### 풀이 고갈됐을 때
+
+```bash
+curl -s http://127.0.0.1:3457/teamclaude/status \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["usableCount"],"/",d["totalCount"])'
+```
+
+`usableCount == 0`이면 연결이나 프로세스 문제가 아니라 사용량이나 구독 문제입니다.
+프록시 재시작, 터널 복구, launchd 재등록, 모델 변경은 상황을 바꾸지 못합니다. 풀이
+사용량을 만들어낼 수는 없기 때문입니다.
+
+복구 방법은 셋 중 하나입니다. 구독 계정을 새로 추가하거나 갱신하거나
+(`teamcodex codex login`), 등급이 내려갔거나 해지된 계정을 disable해 슬롯을
+비우거나, 주간 초기화를 기다립니다. disable은 자리만 비울 뿐 사용량을 되돌리지
+않으므로 그것만으로는 고갈된 풀이 살아나지 않습니다. 진단 절차는
+[pool exhaustion runbook](docs/runbooks/codex-pool-exhaustion.md)에 있습니다.
+
+배포된 실행 파일 이름은 `teamcodex`이고 Codex 풀은 `codex` 하위 명령으로 고르므로,
+운영 절의 명령은 모두 `teamcodex codex …` 형태입니다. `teamclaude` 이름으로 설치한
+경우에도 같은 `codex` 하위 명령을 씁니다.
 
 ## 작동 방식
 

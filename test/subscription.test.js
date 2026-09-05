@@ -29,19 +29,19 @@ function codexAccount(name, extra = {}) {
 
 test('subscription target matching uses exact localparts and rejects prefix collisions', () => {
   const config = { provider: 'codex', accounts: [
-    codexAccount('sesileo981110'),
-    codexAccount('sesileo98'),
+    codexAccount('pooled-a-long'),
+    codexAccount('pooled-a'),
   ] };
 
-  assert.equal(findSubscriptionTarget(config, { selector: 'sesileo98' }).account.name, 'sesileo98');
+  assert.equal(findSubscriptionTarget(config, { selector: 'pooled-a' }).account.name, 'pooled-a');
   assert.throws(
-    () => findSubscriptionTarget(config, { selector: 'sesileo9' }),
+    () => findSubscriptionTarget(config, { selector: 'pooled-' }),
     /not found/,
   );
   assert.equal(findSubscriptionTarget(config, {
-    selector: 'sesileo98',
-    expectedAccountUuid: 'uuid-sesileo98',
-  }).account.name, 'sesileo98');
+    selector: 'pooled-a',
+    expectedAccountUuid: 'uuid-pooled-a',
+  }).account.name, 'pooled-a');
 });
 
 test('subscription target is Codex OAuth only and UUID mismatches fail closed', () => {

@@ -1,7 +1,7 @@
 # Codex -> Claude Code Handoff
 
 - Updated: `2026-08-30T16:34:00+09:00`
-- Project: `/Users/sangrok/projects/teamclaude`
+- Project: `<repo checkout>`
 
 ## 작업 목표
 

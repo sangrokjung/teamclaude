@@ -648,7 +648,10 @@ test('continuity deadline bounds a permanently utilization-exhausted fleet', asy
     const elapsed = Date.now() - started;
     assert.equal(res.status, 429);
     assert.equal(upstreamHits, 0, 'an exhausted fleet must not dispatch upstream before quota reset');
-    assert.ok(elapsed >= 40 && elapsed < 500, `continuity deadline should bound quota wait, took ${elapsed}ms`);
+    // The known reset (1h) lies beyond the 55ms budget, so the proxy fails fast
+    // instead of sleeping out the deadline (docs/specs/2026-09-04-codex-usage-limit-fail-fast.md);
+    // the deadline still bounds the worst case.
+    assert.ok(elapsed < 500, `continuity deadline should bound quota wait, took ${elapsed}ms`);
     assert.equal(am.accounts[0].inflight, 0);
   } finally {
     proxy.close();

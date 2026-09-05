@@ -11,7 +11,7 @@ session 또는 canonical session UUID로 재접속한다.
 
 이 문서는 2026-08-11 발생한 다음 두 증상의 통합 운영 SSOT다.
 
-- 정상 구독인 `qjc.kor` 계정이 연체처럼 해석되어 사용 대상에서 빠진 문제
+- 정상 구독인 `pooled-d` 계정이 연체처럼 해석되어 사용 대상에서 빠진 문제
 - 메인 머신에서 `codex` 실행 시 `관리 세션 상한`과 qgate 때문에 시작이 차단된 문제
 
 ## 절대 규칙
@@ -82,9 +82,9 @@ curl -fsS http://127.0.0.1:3456/teamclaude/status | jq '{
 5. 실제 upstream 응답에 exact structured error code가 있을 때만 조직 구독 접근
    비활성화로 판정한다.
 
-### 2026-08-11 `qjc.kor` 판정 근거
+### 2026-08-11 `pooled-d` 판정 근거
 
-사고 당시 `qjc.kor` 계정은 14:01 KST까지 실제 사용 기록이 있었고, 5시간 사용률
+사고 당시 `pooled-d` 계정은 14:01 KST까지 실제 사용 기록이 있었고, 5시간 사용률
 99%, 주간 사용률 20%, 5시간 window reset은 17:20 KST였다. 이는 결제 연체가
 아니라 5시간 quota 임계치 때문에 일시적으로 선택 대상에서 빠진 상태다.
 `status:active`, `errorReason:null`, `subscriptionDisabled:null`도 같은 결론을

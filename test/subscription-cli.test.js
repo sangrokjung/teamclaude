@@ -41,10 +41,10 @@ async function fixture() {
     provider: 'codex',
     proxy: { port: 1, apiKey: 'fixture-key' },
     accounts: [
-      account('sesileo981110@example.com'),
-      account('sesileo98@example.com'),
-      account('testacountqjc@example.com'),
-      account('test981110@example.com'),
+      account('pooled-a-long@example.com'),
+      account('pooled-a@example.com'),
+      account('pooled-b@example.com'),
+      account('pooled-c@example.com'),
     ],
   }, null, 2));
   return {
@@ -57,17 +57,17 @@ async function fixture() {
 test('subscription cancel selects exact localparts and stores the last usable local date', async () => {
   const fx = await fixture();
   try {
-    const exact = runSubscription(fx.configPath, ['cancel', 'sesileo98']);
+    const exact = runSubscription(fx.configPath, ['cancel', 'pooled-a']);
     assert.equal(exact.status, 0, exact.stderr);
-    assert.match(exact.stdout, /sesileo98@example\.com/);
+    assert.match(exact.stdout, /pooled-a@example\.com/);
 
-    const dated = runSubscription(fx.configPath, ['cancel', 'test981110', '--ends-on', '2026-09-06']);
+    const dated = runSubscription(fx.configPath, ['cancel', 'pooled-c', '--ends-on', '2026-09-06']);
     assert.equal(dated.status, 0, dated.stderr);
 
     const config = await fx.read();
-    const longName = config.accounts.find(a => a.email.startsWith('sesileo981110@'));
-    const exactName = config.accounts.find(a => a.email.startsWith('sesileo98@'));
-    const datedName = config.accounts.find(a => a.email.startsWith('test981110@'));
+    const longName = config.accounts.find(a => a.email.startsWith('pooled-a-long@'));
+    const exactName = config.accounts.find(a => a.email.startsWith('pooled-a@'));
+    const datedName = config.accounts.find(a => a.email.startsWith('pooled-c@'));
     assert.equal(longName.subscriptionCancellation, undefined, 'prefix collision must stay untouched');
     assert.equal(exactName.subscriptionCancellation.status, 'scheduled');
     assert.equal(exactName.subscriptionCancellation.endsAt, null);
@@ -81,13 +81,13 @@ test('subscription cancel accepts equals-form identity and end-date flags', asyn
   const fx = await fixture();
   try {
     const dated = runSubscription(fx.configPath, [
-      'cancel', 'test981110',
+      'cancel', 'pooled-c',
       '--ends-on=2026-09-06',
-      '--account-uuid=uuid-test981110@example.com',
+      '--account-uuid=uuid-pooled-c@example.com',
     ]);
     assert.equal(dated.status, 0, dated.stderr);
 
-    const account = (await fx.read()).accounts.find(a => a.email.startsWith('test981110@'));
+    const account = (await fx.read()).accounts.find(a => a.email.startsWith('pooled-c@'));
     assert.equal(account.subscriptionCancellation.endsAt, '2026-09-06T15:00:00.000Z');
   } finally {
     await fx.cleanup();
@@ -98,11 +98,11 @@ test('subscription cancel stores the KST end boundary on a non-KST host', async 
   const fx = await fixture();
   try {
     const result = runSubscription(fx.configPath, [
-      'cancel', 'test981110', '--ends-on', '2026-09-06',
+      'cancel', 'pooled-c', '--ends-on', '2026-09-06',
     ], 'America/New_York');
     assert.equal(result.status, 0, result.stderr);
 
-    const account = (await fx.read()).accounts.find(a => a.email.startsWith('test981110@'));
+    const account = (await fx.read()).accounts.find(a => a.email.startsWith('pooled-c@'));
     assert.equal(account.subscriptionCancellation.endsAt, '2026-09-06T15:00:00.000Z');
   } finally {
     await fx.cleanup();
@@ -119,21 +119,21 @@ test('subscription cancel and clear fail closed on typos, invalid dates, and UUI
     assert.equal(await readFile(fx.configPath, 'utf8'), before);
 
     const invalidDate = runSubscription(fx.configPath, [
-      'cancel', 'test981110', '--ends-on', '2026-02-30',
+      'cancel', 'pooled-c', '--ends-on', '2026-02-30',
     ]);
     assert.equal(invalidDate.status, 1);
     assert.match(invalidDate.stderr, /valid YYYY-MM-DD/);
     assert.equal(await readFile(fx.configPath, 'utf8'), before);
 
     const wrongUuid = runSubscription(fx.configPath, [
-      'clear', 'sesileo98', '--account-uuid', 'uuid-wrong-account',
+      'clear', 'pooled-a', '--account-uuid', 'uuid-wrong-account',
     ]);
     assert.equal(wrongUuid.status, 1);
     assert.match(wrongUuid.stderr, /expected identity/);
     assert.equal(await readFile(fx.configPath, 'utf8'), before);
 
     const wrongEqualsUuid = runSubscription(fx.configPath, [
-      'clear', 'sesileo98', '--account-uuid=uuid-wrong-account',
+      'clear', 'pooled-a', '--account-uuid=uuid-wrong-account',
     ]);
     assert.equal(wrongEqualsUuid.status, 1);
     assert.match(wrongEqualsUuid.stderr, /expected identity/);
@@ -146,15 +146,15 @@ test('subscription cancel and clear fail closed on typos, invalid dates, and UUI
 test('subscription clear removes only cancellation metadata', async () => {
   const fx = await fixture();
   try {
-    assert.equal(runSubscription(fx.configPath, ['cancel', 'testacountqjc']).status, 0);
+    assert.equal(runSubscription(fx.configPath, ['cancel', 'pooled-b']).status, 0);
     const tracked = await fx.read();
-    const before = tracked.accounts.find(a => a.email.startsWith('testacountqjc@'));
+    const before = tracked.accounts.find(a => a.email.startsWith('pooled-b@'));
 
     const cleared = runSubscription(fx.configPath, [
-      'clear', 'testacountqjc', '--account-uuid', before.accountUuid,
+      'clear', 'pooled-b', '--account-uuid', before.accountUuid,
     ]);
     assert.equal(cleared.status, 0, cleared.stderr);
-    const after = (await fx.read()).accounts.find(a => a.email.startsWith('testacountqjc@'));
+    const after = (await fx.read()).accounts.find(a => a.email.startsWith('pooled-b@'));
     assert.equal(after.subscriptionCancellation, undefined);
     assert.equal(after.accessToken, before.accessToken);
     assert.equal(after.refreshToken, before.refreshToken);

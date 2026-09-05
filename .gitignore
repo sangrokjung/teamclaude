@@ -2,3 +2,7 @@ node_modules/
 config.json
 *.log
 artifacts/
+
+# Python bytecode (the .py sources are tracked; the cache is redundant)
+__pycache__/
+*.pyc
