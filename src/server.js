@@ -161,6 +161,17 @@ const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 256 * 1024 * 1024;
 const REQUEST_LOG_BODY_BYTES = 16 * 1024;
+// How many DISTINCT accounts must answer 401 to one request before the proxy
+// stops blaming the credentials and blames the request. One account rejecting a
+// request is account-scoped evidence; two independent accounts rejecting the
+// SAME request is evidence about the only variable they share. See
+// docs/specs/2026-09-05-auth-401-cascade-guard.md (2026-09-05 incident: one
+// request parked 9 of 16 accounts whose tokens were later proven still valid).
+const AUTH_401_CASCADE_THRESHOLD = 2;
+// Monotonic stamp identifying WHICH request performed a given 401 park, so a
+// cascade rollback only reverts a park it still owns. Process-wide and never
+// persisted; it only has to be unique among live parks.
+let authParkSeq = 0;
 const DISPATCH_FAILURE_RETRY_AFTER_SECONDS = 5;
 const DISPATCH_FAILURE_COOLDOWN_MS = DISPATCH_FAILURE_RETRY_AFTER_SECONDS * 1000;
 const CONTINUITY_DISPATCH_GRACE_MS = 5;
@@ -1100,10 +1111,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         const reqId = ++requestCounter;
         hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-        // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
-        // `held` is the acquired account OBJECT — both stable across a concurrent
+        // tried429/tried5xx/authRetried/auth401 hold account OBJECTS (not indexes),
+        // and `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
+        // auth401 = accounts that answered 401 after their refresh chance (cascade
+        // guard input + per-request exclusion); authParked = what THIS request parked,
+        // kept so a cascade can put it back.
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1828,6 +1842,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   };
   const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model);
   const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model);
+  // An account that already answered 401 to THIS request is auth-failed FOR this
+  // request even when the cascade guard deliberately left its status intact.
+  // Both fleet-wide "everyone failed auth" checks below must see that, or a
+  // request nobody will authenticate falls into the continuity capacity wait
+  // (and finally a 429) instead of surfacing its 401 promptly.
+  const authFailedForRequest = a => a.status === 'error' || ctx.auth401.has(a);
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
   // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
@@ -1843,7 +1863,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (ctx.abortSignal?.aborted || res.destroyed) return;
 
     // On a failover retry, skip accounts already tried for this request.
-    const excludeForSelect = requestExclusions(new Set([...ctx.tried429, ...ctx.tried5xx]));
+    const excludeForSelect = requestExclusions(new Set([...ctx.tried429, ...ctx.tried5xx, ...ctx.auth401]));
     if (ctx.held != null) {
       account = ctx.held;
     } else {
@@ -1889,7 +1909,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const accts = ctx.provider === 'codex' && ctx.credentialType != null
       ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
       : accountManager.accounts;
-    const allAuthFailed = accts.length > 0 && accts.every(a => a.status === 'error');
+    const allAuthFailed = accts.length > 0 && accts.every(authFailedForRequest);
     const modelDeadEnd = !hasUsable(null) && !hasCapped(null);
     if (!allAuthFailed && modelDeadEnd && fleetIsQuotaExhausted(accountManager, accts, ctx.model)) {
       const fallback = nextModelFallback(ctx, req, body);
@@ -1943,14 +1963,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const accts = ctx.provider === 'codex' && ctx.credentialType != null
       ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
       : accountManager.accounts;
-    if (accts.length > 0 && accts.every(a => a.status === 'error')) {
+    if (accts.length > 0 && accts.every(authFailedForRequest)) {
       ctx.status = 401;
+      // A cascade means the accounts are still in rotation on purpose: telling
+      // the operator to re-login would send them after the wrong thing.
+      const requestScoped = ctx.authCascade && accts.some(a => a.status !== 'error');
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
         error: {
           type: 'authentication_error',
-          message: `All ${accts.length} accounts failed authentication. Re-login required.`,
+          message: requestScoped
+            ? `All ${accts.length} accounts rejected this request's authentication; the accounts stay in rotation.`
+            : `All ${accts.length} accounts failed authentication. Re-login required.`,
         },
       }));
       return;
@@ -2229,10 +2254,68 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // Refresh didn't help (failed / already retried / revoked-but-unexpired)
       // or it's an API-key account — fail this account out and switch.
-      if (account.status !== 'error') {
+      //
+      // Cascade guard: this account exhausted its refresh chance and still got
+      // 401, so record it. Once AUTH_401_CASCADE_THRESHOLD distinct accounts
+      // have done that for ONE request, the request is the common factor, not
+      // the credentials — stop parking, and put back what this request parked.
+      //
+      // Only UNEXPLAINED 401s count. An account that arrives here already
+      // parked carries evidence of its own (its refresh just failed, or its
+      // grant was revoked), so its 401 is already accounted for without blaming
+      // the request. Counting it would inflate the tally and let the NEXT
+      // account — whose 401 IS unexplained — trip the guard and escape parking
+      // (adversarial review 2026-09-05: with a degraded account visited first,
+      // a genuinely revoked account stayed in rotation, invisible to status).
+      // It needs no ctx.auth401 exclusion either: 'error' already removes it
+      // from selection.
+      if (account.status !== 'error') ctx.auth401.add(account);
+      if (!ctx.authCascade && ctx.auth401.size >= AUTH_401_CASCADE_THRESHOLD) {
+        ctx.authCascade = true;
+        const restored = [];
+        for (const parked of ctx.authParked) {
+          const target = parked.account;
+          // Revert ONLY a park this request still owns and that still reads
+          // exactly as this request wrote it. `_authParkSeq` is the ownership
+          // half: a later park stamps its own sequence, and `updateAccountTokens`
+          // (re-import / login) heals the status outright, so both outrank the
+          // revert. Credential GENERATION deliberately does NOT gate this:
+          // the background `refreshLapsedTokens` sweep bumps the generation
+          // while leaving an 'auth-rejected' park untouched (it only heals
+          // `_errorFromRefresh` accounts), so gating on it would strand a
+          // freshly-refreshed, perfectly valid account in the parked state —
+          // the exact outage this guard exists to prevent (Codex review
+          // 2026-09-05).
+          if (target._authParkSeq !== parked.seq
+              || target.status !== 'error'
+              || target.errorReason !== 'auth-rejected'
+              || target._errorFromRefresh !== false) continue;
+          target.status = parked.status;
+          target.errorReason = parked.errorReason;
+          target._errorFromRefresh = parked.errorFromRefresh;
+          delete target._authParkSeq;
+          restored.push(target.name);
+        }
+        ctx.authParked.length = 0;
+        console.log(`[TeamClaude] 401 from ${ctx.auth401.size} accounts on one request — request-scoped rejection, not parking accounts${restored.length > 0 ? ` (restored ${restored.join(', ')})` : ''}`);
+      }
+      if (ctx.authCascade) {
+        // Leave every account's status alone. An account already parked with
+        // its OWN evidence (a failed refresh) keeps that label untouched.
+        console.log(`[TeamClaude] 401 on "${account.name}" — left in rotation (request-scoped rejection)`);
+      } else if (account.status !== 'error') {
+        const seq = ++authParkSeq;
+        ctx.authParked.push({
+          account,
+          seq,
+          status: account.status,
+          errorReason: account.errorReason ?? null,
+          errorFromRefresh: account._errorFromRefresh,
+        });
         account.status = 'error';
         account._errorFromRefresh = false;
         account.errorReason = 'auth-rejected';
+        account._authParkSeq = seq; // ownership stamp for the rollback above
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
       } else if (account.authRevoked !== true
           && account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
@@ -2248,16 +2331,24 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       if (res.destroyed) return;
       if (retryCount < maxRetries) {
-        releaseHeld(); // this account is now 'error'; fail over to another
+        // Parked ('error') or, under the cascade guard, merely excluded for this
+        // request via ctx.auth401 — either way this account is out of the next
+        // selection, so the failover cannot loop back onto it.
+        releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
-      // Every account failed auth — surface the 401 to the client.
+      // Retry budget spent with every attempt rejected — surface the 401.
       ctx.status = 401;
       if (!res.headersSent) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'authentication_error', message: 'All accounts failed authentication.' },
+          error: {
+            type: 'authentication_error',
+            message: ctx.authCascade
+              ? 'All attempted accounts rejected this request\'s authentication; the accounts stay in rotation.'
+              : 'All accounts failed authentication.',
+          },
         }));
       }
       return;
