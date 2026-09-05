@@ -3,6 +3,14 @@ config.json
 *.log
 artifacts/
 
+# Local agent/session artifacts — never published (they carry account emails,
+# host paths and machine-local state).
+.codex/
+.claude/
+.omo/
+.deployment-backups/
+review-snapshots/
+
 # Python bytecode (the .py sources are tracked; the cache is redundant)
 __pycache__/
 *.pyc
