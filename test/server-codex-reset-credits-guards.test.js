@@ -513,3 +513,93 @@ test('fleet walk yields to an account that became routable while a no-spend atte
     assert.equal(am.accounts[2].quota.codexResetCredits, 2);
   });
 });
+
+test('account policy: a spent-but-ineffective or indeterminate redemption also uses up the request\'s single pass', async () => {
+  for (const variant of ['windows_reset_0', 'timeout']) {
+    const am = new AccountManager(makeCodexAccounts(2));
+    am.accounts[0].quota.codexResetCredits = 3; // healthy, serves first
+    am.accounts[1].quota.unified7d = 1;
+    am.accounts[1].quota.unified7dReset = Date.now() + 60 * HOUR;
+    am.accounts[1].quota.unified5h = 0.1;
+    am.accounts[1].quota.unified5hReset = Date.now() + HOUR;
+    am.accounts[1].quota.codexResetCredits = 3;
+    await withProxy(am, {
+      responses: () => ({ status: 429 }),
+      consume: () => variant === 'timeout' ? 'hang' : { status: 200, body: { code: 'reset', windows_reset: 0 } },
+    }, { codexResetCreditsPolicy: 'account', codexResetCreditsTimeoutMs: 100 },
+    async ({ proxyPort, calls }) => {
+      const r = await postResponses(proxyPort);
+      assert.equal(r.status, 429, `${variant}: ${r.text}`);
+      assert.equal(r.json?.error?.type, 'usage_limit_reached', variant);
+      assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0'], `${variant}: the exhausted account is never charged`);
+      assert.equal(am.accounts[1].quota.codexResetCredits, 3, variant);
+    });
+  }
+});
+
+test('fleet walk judges "dead end resolved?" with the request\'s own scope (credential-type pin)', async () => {
+  const am = new AccountManager([
+    ...makeCodexAccounts(2),
+    { name: 'api-key', provider: 'codex', type: 'api_key', apiKey: 'fixture-api-key', expiresAt: Date.now() + HOUR, priority: 5 },
+  ]);
+  am.accounts[0].priority = 0; // oauth codex-0 serves first and pins the request to oauth
+  am.accounts[0].quota.unified7d = 0.5;
+  am.accounts[0].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[0].quota.unified5h = 0.1;
+  am.accounts[0].quota.unified5hReset = Date.now() + HOUR;
+  am.accounts[0].quota.codexResetCredits = 3;
+  am.accounts[1].quota.unified7d = 1; // oauth codex-1 exhausted with credits
+  am.accounts[1].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[1].quota.unified5h = 0.1;
+  am.accounts[1].quota.unified5hReset = Date.now() + HOUR;
+  am.accounts[1].quota.codexResetCredits = 2;
+  am.accounts[2].quota.unified7d = 0.2; // api-key account is measured + usable but NOT for an oauth-pinned request
+  am.accounts[2].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[2].quota.unified5h = 0.1;
+  am.accounts[2].quota.unified5hReset = Date.now() + HOUR;
+  await withProxy(am, {
+    responses: (_n, token) => ({ status: token === 'Bearer tok-0' ? 429 : 200 }),
+    consume: (_n, token) => token === 'Bearer tok-0'
+      ? { status: 200, body: { code: 'nothing_to_reset', windows_reset: 0 } }
+      : { status: 200, body: { code: 'reset', windows_reset: 2 } },
+  }, { continuityMaxWaitMs: 4000, continuityMaxSleepMs: 50 }, async ({ proxyPort, calls }) => {
+    const r = await postResponses(proxyPort);
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0', 'Bearer tok-1'], 'the walk did not stop on the api-key account this request cannot use');
+    assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-0', 'Bearer tok-1']);
+    assert.ok(r.elapsedMs < 3000, `answered in ${r.elapsedMs}ms (no continuity wait)`);
+  });
+});
+
+test('cooldown 0 + account policy: a fleet pass earlier in the request blocks a second redemption in the 429 branch', async () => {
+  const am = new AccountManager(makeCodexAccounts(2));
+  exhaustWeekly(am, Date.now() + 60 * HOUR, [3, 3]);
+  await withProxy(am, { responses: () => ({ status: 429 }) },
+    { codexResetCreditsPolicy: 'account', codexResetCreditsCooldownMs: 0 },
+    async ({ proxyPort, calls }) => {
+      const r = await postResponses(proxyPort);
+      assert.equal(r.status, 429, r.text);
+      assert.equal(r.json?.error?.type, 'usage_limit_reached');
+      assert.equal(calls.consume.length, 1, 'one credit per request even without a cooldown');
+    });
+});
+
+test('the post-reset refresh that only reports legitimate new usage is not logged as a failed poll', async () => {
+  const am = new AccountManager(makeCodexAccounts(1));
+  let consumed = false;
+  await withProxy(am, {
+    usage: () => (consumed ? { used: 5, credits: 2 } : { used: 100, credits: 3 }),
+    consume: () => { consumed = true; return { status: 200, body: { code: 'reset', windows_reset: 2 } }; },
+  }, { codexUsageRefresh: true, warmupIntervalMs: 0 }, async ({ proxyPort, calls, logs }) => {
+    await waitFor(() => am.accounts[0].quota.codexUsageAt != null);
+    const r = await postResponses(proxyPort);
+    assert.equal(r.status, 200, r.text);
+    const polls = calls.usage.length;
+    await waitFor(() => calls.usage.length > polls, 4000);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(am.accounts[0].quota.unified7d, 0, 'grace holds the meter at 0 for now');
+    assert.equal(am.accounts[0].quota.codexResetCredits, 2, 'the count is still folded');
+    assert.ok(!am.accounts[0]._usageRefreshFailed, 'a grace-held poll is a successful poll');
+    assert.equal(logs.lines.filter(l => l.includes('usage refresh failed')).length, 0, logs.lines.join('\n'));
+  });
+});

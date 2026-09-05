@@ -1287,6 +1287,7 @@ export class AccountManager {
     }
 
     let applied = false;
+    let heldByGrace = false;
     const inResetGrace = withinCodexResetCreditGrace(account.quota);
     for (const [kind, window] of windows) {
       const resetAt = window.reset_at ?? (window.reset_after_seconds != null
@@ -1297,12 +1298,17 @@ export class AccountManager {
       // seconds and still report the pre-reset 100%. Inside the grace window
       // an authoritative payload may lower or keep the meter but not RAISE
       // it: a reset that genuinely failed still surfaces as a post-reset 429
-      // on the request path, which throttles the account as usual.
+      // on the request path, which throttles the account as usual. A window
+      // held back here was still RECOGNIZED — the poll succeeded, so callers
+      // must not classify it as a failed refresh.
       if (inResetGrace) {
         const utilKey = kind === '5h' ? 'unified5h' : 'unified7d';
         const stored = account.quota[utilKey];
         const incoming = Number(window.used_percent);
-        if (Number.isFinite(incoming) && typeof stored === 'number' && incoming / 100 > stored) continue;
+        if (Number.isFinite(incoming) && typeof stored === 'number' && incoming / 100 > stored) {
+          heldByGrace = true;
+          continue;
+        }
       }
       applied = applyCodexQuotaWindow(
         account.quota,
@@ -1311,7 +1317,7 @@ export class AccountManager {
         resetAt,
       ) || applied;
     }
-    return applied;
+    return applied || heldByGrace;
   }
 
   /**

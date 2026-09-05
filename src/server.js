@@ -730,8 +730,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // attempt that may have spent a credit (spent-no-reset / indeterminate) —
   // moving on to the next account after those is the double-spend path.
   // Returns true when at least one account is routable again.
-  async function redeemCodexResetCreditForFleet(accounts, reason, model = null) {
+  async function redeemCodexResetCreditForFleet(accounts, reason, model = null, resolved = null) {
     if (!resetCredits.enabled || warmupClosed) return false;
+    // "Has the dead end been resolved by someone else?" — judged with the
+    // CALLER's request scope (credential-type exclusions etc.), never with a
+    // pool-wide view that could see an account this request cannot use.
+    const deadEndResolved = typeof resolved === 'function'
+      ? resolved
+      : () => accountManager.anyUsable(null, model) || accountManager.anyCapped(null, model);
     const options = resetCreditEligibilityOptions(model);
     const candidates = rankCodexResetCreditCandidates(accounts, options);
     if (candidates.length === 0) {
@@ -752,7 +758,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // The dead end may have been resolved by someone else (operator reset,
       // another request's pass, a window rollover) while this attempt was in
       // flight: yield to the routable account instead of spending on the next.
-      if (accountManager.anyUsable(null, model) || accountManager.anyCapped(null, model)) return true;
+      if (deadEndResolved()) return true;
     }
     return false;
   }
@@ -763,9 +769,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     ? {
         policy: resetCredits.policy,
         fleet: redeemCodexResetCreditForFleet,
+        // Returns the full { reset, kind } so the 429 branch can charge the
+        // request's single pass for ANY outcome that may have spent a credit.
         account: (account, reason, model = null) =>
-          redeemCodexResetCredit(account, reason, { enforceEligibility: true, model })
-            .then(result => result.reset),
+          redeemCodexResetCredit(account, reason, { enforceEligibility: true, model }),
       }
     : null;
 
@@ -2258,7 +2265,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (!allAuthFailed && modelDeadEnd && ctx.resetCredits
         && ctx.resetCreditAttempts < 1 && !fleetModelQuarantined()) {
       ctx.resetCreditAttempts += 1;
-      const redeemed = await ctx.resetCredits.fleet(accts, 'fleet-exhausted', ctx.model);
+      const redeemed = await ctx.resetCredits.fleet(
+        accts,
+        'fleet-exhausted',
+        ctx.model,
+        () => hasUsable(null) || hasCapped(null), // request-scoped "dead end resolved?"
+      );
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       if (redeemed) {
         ctx.tried429.clear();
@@ -2927,23 +2939,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // Account policy: redeem a reset credit on THIS account and retry it
         // here, before throttling/switching. (The fleet policy waits for the
         // acquisition dead end instead, so rotation to a healthy account wins.)
-        // Once per account per request; the retry does NOT count toward
-        // maxRetries so a second 429 still reaches the normal throttle →
-        // dead end → Codex-native fail-fast body (never the legacy backstop).
+        // Once per account per request and only while the request's single
+        // redemption pass is unspent (a fleet pass earlier in this request
+        // already used it). The retry does NOT count toward maxRetries so a
+        // second 429 still reaches the normal throttle → dead end →
+        // Codex-native fail-fast body (never the legacy backstop).
         if (ctx.resetCredits?.policy === 'account' && !res.destroyed
-            && !ctx.resetCreditRetried.has(account)
-            && await ctx.resetCredits.account(account, '429-exhausted', ctx.model)) {
-          ctx.resetCreditRetried.add(account);
-          // This redemption IS the request's single pass: if the retry still
-          // 429s, the acquisition dead end must fail fast, not spend again.
-          ctx.resetCreditAttempts = Math.max(ctx.resetCreditAttempts, 1);
-          if (res.destroyed) return;
-          if (logDir) {
-            appendLogSection(`=== RESPONSE 429 — account quota exhausted, reset credit redeemed, retrying same account ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
-            flushRequestLog(logDir, reqId, logSections, hooks);
+            && ctx.resetCreditAttempts < 1
+            && !ctx.resetCreditRetried.has(account)) {
+          const attempt = await ctx.resetCredits.account(account, '429-exhausted', ctx.model);
+          // Any outcome that may have spent a credit (reset, reset with no
+          // windows, timeout/5xx) IS the request's single pass: the dead end
+          // that follows must fail fast, not walk the pool spending again.
+          if (attempt.kind !== 'no-spend') ctx.resetCreditAttempts = Math.max(ctx.resetCreditAttempts, 1);
+          if (attempt.reset) {
+            ctx.resetCreditRetried.add(account);
+            if (res.destroyed) return;
+            if (logDir) {
+              appendLogSection(`=== RESPONSE 429 — account quota exhausted, reset credit redeemed, retrying same account ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+              flushRequestLog(logDir, reqId, logSections, hooks);
+            }
+            releaseHeld();
+            return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
           }
-          releaseHeld();
-          return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
         }
         // (a) Account-level exhaustion: throttle this account (so
         // getActiveAccount skips it until it resets) and immediately

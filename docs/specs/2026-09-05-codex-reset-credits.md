@@ -33,6 +33,16 @@
   exposure); the fleet walk kept spending after a concurrent operator/other
   reset had already resolved the dead end (now yields when any account is
   usable/capped). Tests added for both.
+- Review round 3 (commit `2f89c60`, 2 fresh lenses + refuters): production
+  (fleet) path traced regression-free; 4 residual items on non-default
+  configurations fixed in round 4: the account-path redemption charged the
+  request's pass only on `reset` (now on any outcome that may have spent —
+  `reset`, `reset_no_windows`, indeterminate); the "dead end resolved?"
+  yield used a pool-wide view instead of the request's credential-type scope
+  (now a caller-supplied predicate); with `codexResetCreditsCooldownMs: 0`
+  the account policy could redeem again after a fleet pass (now gated on the
+  request's pass budget); a grace-held authoritative poll was reported as a
+  failed refresh (now counts as recognized). Tests added for all four.
 
 ## Incident / motivation
 

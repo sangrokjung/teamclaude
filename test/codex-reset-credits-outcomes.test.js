@@ -98,7 +98,7 @@ test('AccountManager.updateCodexUsage: inside the grace an authoritative payload
   assert.equal(a.quota.unified7d, 0);
   // Lagging backend still says 100% → skipped during the grace, count still folded.
   a.quota.codexResetCredits = 3;
-  assert.equal(am.updateCodexUsage(a, payload(100)), false, 'nothing applied');
+  assert.equal(am.updateCodexUsage(a, payload(100)), true, 'held by the grace, but still a recognized (successful) poll');
   assert.equal(a.quota.unified7d, 0, 'meter not raised inside the grace');
   assert.equal(a.quota.codexResetCredits, 2, 'the credit count is still authoritative');
   assert.ok(a.quota.codexUsageAt > 0, 'freshness stamp still advances');
