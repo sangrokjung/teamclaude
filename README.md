@@ -56,6 +56,8 @@ works too and always tracks the default branch.
 
 No. This does not share, resell, or pool accounts between people.
 
+> **One exception, added by this fork.** The opt-in BYOK surface (see *BYOK surface* under Configuration) relays a **third-party** client's request after normalizing it to the shape the upstream accepts from a first-party client. That is outside the "same client, your own sessions" reasoning below. It ships off, and enabling it is your decision and your risk.
+
 It routes **your own** authenticated sessions from **one machine**, which is exactly
 what you would do by switching accounts by hand, minus the manual re-login. Every
 request is signed with that account's own OAuth token, and nothing is proxied on behalf
@@ -173,6 +175,7 @@ cannot read that path.
 - **Account deduplication** — detects duplicate accounts by UUID and keeps the most recent
 - **Request logging** — optional full request/response logging for debugging
 - **Host CPU / RAM tracking** — live host CPU%, 1/5/15-min load average, and RAM usage in the TUI header, `teamclaude status`, and the `/teamclaude/status` JSON (`host` field); measured with Node built-ins only
+- **BYOK surface (fork)** — an opt-in `/byok` path prefix that lets an Anthropic-Messages-shaped third-party "bring your own key" client (an editor plugin, an AI browser's main process, your own script) use the pool. The proxy normalizes the request into the shape the upstream accepts from a first-party client, and strips browser-context headers the upstream rejects, while Claude Code traffic on `/v1/*` stays byte-identical. Off unless configured, and see the Terms of Service note before enabling
 - **Zero dependencies** — uses only Node.js built-in modules
 
 ## Quick Start
@@ -810,6 +813,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
 | `modelFallbacks` | Fork only — per-model fallback chains. Anthropic defaults to `{}` and applies a chain only for fresh-full cached model windows or fleet-wide labeled model-tier 429s. Codex defaults to `{ "gpt-5.6-sol": ["gpt-5.6-terra"] }` and uses that chain only on a new request after every eligible ChatGPT OAuth account independently rejected Sol as unsupported (see below) |
+| `byok` | Fork only — opt-in path-prefix surface that lets a third-party BYOK client use the pool; the proxy normalizes the request shape upstream requires and gates the lane with its own key (optional, default disabled; see *BYOK surface* below and the Terms of Service note) |
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
@@ -862,6 +866,97 @@ fresh-full fleet falls back before continuity sleeps. Semantics:
 - A fleet that is only locally capped or queued for concurrency keeps the original model. Unlabeled transient/global 429 recovery also keeps the original model and enters continuity after the account failover budget is handled, within `continuityMaxWaitMs`; no account state is poisoned.
 - Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
 
+### BYOK surface (fork)
+
+Third-party clients that support "bring your own key" — a base URL plus an API
+key per provider — cannot reach this proxy on the normal paths, even though the
+pool would happily serve them. The upstream rejects a request that does not
+arrive in the shape it expects from a first-party client, and it rejects a
+request carrying browser-context headers. A client cannot fix either from its
+own provider config, so the proxy does it — **only** on a dedicated path prefix.
+
+Read the Terms of Service note near the top of this README before enabling this.
+Unlike the rest of the proxy, this surface relays a third-party client's traffic.
+
+```json
+{
+  "byok": {
+    "enabled": true,
+    "prefix": "/byok",
+    "apiKey": "byok-change-me-to-a-secret",
+    "minUsableAccounts": 2,
+    "maxConcurrent": 2
+  }
+}
+```
+
+1. Replace `apiKey` with your own secret — generate one with
+   `openssl rand -base64 24`. The placeholder above is **refused on purpose**, so
+   copy-pasting this block as-is leaves the surface off.
+2. Run `teamclaude restart`. The BYOK config is resolved once when the server
+   starts; the TUI **R** reload only re-syncs accounts and will leave the surface
+   off.
+3. Point the client at `http://127.0.0.1:3456/byok` with that secret as its API
+   key. An Anthropic-Messages client then requests `/byok/v1/messages`, which the
+   proxy canonicalizes to `/v1/messages` before its normal routing.
+
+Confirm it is on: `/teamclaude/status` grows a `byok` object with `inflight`,
+`admitted`, `rejected`, and `injected` counters. If it stays `null`, the surface
+refused to enable and the reason is on stderr as
+`[TeamClaude] BYOK surface disabled: ...`.
+
+What the proxy does on that surface, and nothing else:
+
+- Normalizes the request `system` **only when the required block is absent**
+  (string and array forms both handled; your own system content is preserved
+  after it) and resyncs `content-length`. A request that already carries it is
+  forwarded byte-identical.
+- Drops `origin`, `referer`, `cookie`, and anything prefixed `sec-fetch-`,
+  `sec-ch-`, or `x-forwarded-` before dispatch, and answers `OPTIONS` locally so
+  a preflight is not relayed upstream. Note this makes the *request* acceptable
+  upstream; it does **not** make the proxy browser-reachable — real responses
+  carry no CORS headers, so a renderer-context `fetch()` still cannot read them.
+  Drive it from a background/extension/main process instead.
+- Rejects with `429` while usable accounts are below `minUsableAccounts`, and
+  caps concurrent BYOK requests at `maxConcurrent`. Claude Code is never gated by
+  these; BYOK yields to protect the fleet, not the reverse. `minUsableAccounts`
+  is a floor, not a target: with a single-account pool the default of `2` rejects
+  every BYOK request by design — set it to `1` (or `0`) to serve from a small
+  pool, trading away the headroom that keeps Claude Code unaffected.
+
+Why a path prefix instead of sniffing the request: Claude Code arrives on
+`/v1/...` and therefore cannot enter the normalizing lane at all. Its request
+bytes — and with them the per-account prompt-cache keys — are untouched by
+construction rather than by a classifier that could misfire.
+
+Safety rails, because this surface fronts real subscription credentials:
+
+- It is **off** unless `enabled` is true *and* `apiKey` is set. It refuses the
+  placeholder shipped in `config.example.json`, any `change-me` variant, and any
+  key shorter than 20 characters. The preflight answers any origin, so a known
+  default key would let a page the user merely visits spend the pool.
+- It does **not** inherit the localhost auth bypass the normal paths use: the
+  BYOK key is required even on loopback. Know the topology before exposing the
+  port: the supervisor owns the public port and re-dials the worker over
+  loopback, so the worker's own non-loopback rejection never fires in the shipped
+  layout, and a remote caller is gated by `proxy.apiKey` first. A caller holding
+  **both** secrets can therefore reach this surface from the network. Serving (or
+  hardening) BYOK remotely means making the supervisor BYOK-aware; that is a
+  separate change. Keep the port on loopback if that matters to you.
+- A `prefix` whose first segment collides with a path the proxy owns (`/v1`,
+  `/teamclaude`) is refused **at server start**, and the whole BYOK surface stays
+  disabled with the reason logged.
+- The control plane (`/teamclaude/*`), the OAuth relay (`/v1/oauth/token`), and
+  any dot-segment path are `404` on this surface.
+- A BYOK request is never staged as the fleet warm-up probe template, and a BYOK
+  `429` never advances the process-global cooldown — one third-party client must
+  not be able to stall every Claude Code session.
+- `config.byok` is read regardless of provider, so putting it in a Codex-mode
+  config opens the same lane in front of the Codex pool. Only the Anthropic lane
+  is tested.
+
+Tests: `test/byok.test.js` (pure functions) and `test/server-byok.test.js`
+(surface behavior, including a regression that pins Claude Code request bytes).
 ## Operations
 
 How this fork is operated in production. Detail lives in the runbooks, indexed by
