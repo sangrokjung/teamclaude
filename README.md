@@ -957,6 +957,81 @@ Safety rails, because this surface fronts real subscription credentials:
 
 Tests: `test/byok.test.js` (pure functions) and `test/server-byok.test.js`
 (surface behavior, including a regression that pins Claude Code request bytes).
+
+#### Worked example: the Aside browser
+
+[Aside](https://aside.com) is an AI browser with first-class BYOK support, and it
+is the client this surface was built against. Its provider config lives at
+`~/.aside/u/<account-index>/models.json` (`0` for the first signed-in account)
+and is hot-reloaded when you save it.
+
+```jsonc
+{
+  "providers": {
+    "teamclaude": {
+      "name": "TeamClaude Pool",
+      "baseUrl": "http://127.0.0.1:3456/byok",
+      "apiKey": "!/absolute/path/to/print-byok-key.sh",
+      "api": "anthropic-messages",
+      "models": [
+        { "id": "claude-sonnet-5", "name": "Sonnet 5 (pool)",
+          "contextWindow": 200000, "maxTokens": 64000,
+          "reasoning": true, "input": ["text", "image"],
+          "cost": { "input": 0, "output": 0 } }
+      ]
+    },
+    "teamcodex": {
+      "name": "TeamCodex Pool",
+      "baseUrl": "http://127.0.0.1:3457",
+      "apiKey": "<synthetic JWT, see below>",
+      "api": "openai-codex-responses",
+      "models": [
+        { "id": "gpt-5.6-terra", "name": "GPT-5.6 Terra (pool)",
+          "contextWindow": 200000, "maxTokens": 64000,
+          "reasoning": true, "input": ["text"],
+          "cost": { "input": 0, "output": 0 } }
+      ]
+    }
+  }
+}
+```
+
+Then `aside exec -m teamclaude/claude-sonnet-5 "..."` (or pick the model in the
+app). Four details are worth spelling out, because each one costs an afternoon to
+rediscover:
+
+- **Only the Claude side needs `/byok`.** The Anthropic upstream is what demands
+  the first-party request shape, so `teamclaude` points at `.../byok`. The Codex
+  backend has no equivalent gate, so `teamcodex` points straight at the proxy
+  port and needs no `byok` block in its config at all.
+- **Do not paste your key into `models.json`.** The `apiKey` field accepts
+  `${ENV_VAR}` and `!<command>` (the command's stdout becomes the value, 10s
+  timeout), so a two-line script that prints the key from
+  `~/.config/teamclaude.json` keeps the secret in exactly one place. Use an
+  absolute path. The command *is* run through `/bin/sh -c` (Node's
+  `child_process.exec`), so a leading `~` would in fact expand — pin the path
+  anyway rather than depend on which `$HOME` the Aside daemon process sees.
+  ```bash
+  #!/bin/sh
+  # chmod 700 this file, then reference it as "!/absolute/path/to/it"
+  exec /usr/bin/python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/teamclaude.json')))['byok']['apiKey'])"
+  ```
+- **`openai-codex-responses` needs a JWT-shaped `apiKey`.** Aside decodes it to
+  read a `chatgpt_account_id` claim before it ever sends a request, so a plain
+  string fails locally. The proxy discards that value and injects a real pooled
+  credential, so it is **not** a secret — any well-formed token works:
+  ```bash
+  python3 -c 'import base64,json;print("x."+base64.urlsafe_b64encode(json.dumps({"https://api.openai.com/auth":{"chatgpt_account_id":"pool"}}).encode()).decode().rstrip("=")+".y")'
+  ```
+- **Pick provider IDs that are not reserved.** Aside ships built-in providers
+  named `anthropic`, `openai`, `openai-codex`, `aside`, and about twenty more;
+  reusing one of those names collides. `teamclaude` and `teamcodex` are free.
+
+Both paths above were verified end to end against a live pool: an `aside exec`
+run on each provider returned a model response, and the proxy's `byok` counters
+moved for the Claude one. If a provider silently does not appear, check the Aside
+daemon log — a `models.json` that fails to parse is skipped without a prompt.
+
 ## Operations
 
 How this fork is operated in production. Detail lives in the runbooks, indexed by

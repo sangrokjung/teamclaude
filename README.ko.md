@@ -554,6 +554,72 @@ surface→workspace topology가 모두 일치할 때만 동작합니다. 세션�
 - 이 표면은 실제 구독 자격증명을 앞에 두므로, 짧은 키·기본 키는 거부되고 컨트롤 플레인은 404입니다.
 
 자세한 동작과 안전장치는 영문 README의 *BYOK surface (fork)* 절이 정본입니다.
+
+#### 실제 예시: Aside 브라우저
+
+[Aside](https://aside.com)는 BYOK를 1급으로 지원하는 AI 브라우저이고, 이 표면은 이 클라이언트를
+대상으로 만들었습니다. 프로바이더 설정은 `~/.aside/u/<계정 인덱스>/models.json`에 있고(첫 계정은 `0`)
+저장하면 바로 반영됩니다.
+
+```jsonc
+{
+  "providers": {
+    "teamclaude": {
+      "name": "TeamClaude Pool",
+      "baseUrl": "http://127.0.0.1:3456/byok",
+      "apiKey": "!/절대/경로/print-byok-key.sh",
+      "api": "anthropic-messages",
+      "models": [
+        { "id": "claude-sonnet-5", "name": "Sonnet 5 (pool)",
+          "contextWindow": 200000, "maxTokens": 64000,
+          "reasoning": true, "input": ["text", "image"],
+          "cost": { "input": 0, "output": 0 } }
+      ]
+    },
+    "teamcodex": {
+      "name": "TeamCodex Pool",
+      "baseUrl": "http://127.0.0.1:3457",
+      "apiKey": "<합성 JWT, 아래 참고>",
+      "api": "openai-codex-responses",
+      "models": [
+        { "id": "gpt-5.6-terra", "name": "GPT-5.6 Terra (pool)",
+          "contextWindow": 200000, "maxTokens": 64000,
+          "reasoning": true, "input": ["text"],
+          "cost": { "input": 0, "output": 0 } }
+      ]
+    }
+  }
+}
+```
+
+이후 `aside exec -m teamclaude/claude-sonnet-5 "..."`로 쓰거나 앱에서 모델을 고르면 됩니다.
+직접 알아내려면 한나절씩 걸리는 함정 네 가지를 적어 둡니다.
+
+- **`/byok`가 필요한 건 Claude 쪽뿐입니다.** 1차 클라이언트 형태를 요구하는 건 Anthropic 업스트림이라
+  `teamclaude`만 `.../byok`를 가리킵니다. Codex 백엔드에는 같은 관문이 없어서 `teamcodex`는 프록시
+  포트를 그대로 가리키고, 설정에 `byok` 블록 자체가 필요 없습니다.
+- **키를 `models.json`에 붙여넣지 마십시오.** `apiKey`는 `${환경변수}`와 `!<명령>`(명령의 stdout이
+  값이 됨, 10초 제한)을 받습니다. `~/.config/teamclaude.json`에서 키를 출력하는 두 줄짜리 스크립트를
+  두면 비밀값이 한 곳에만 남습니다. 이 명령은 `/bin/sh -c`(Node의 `child_process.exec`)를 거치므로 맨 앞 `~`도 실제로 확장됩니다.
+  다만 Aside 데몬 프로세스가 보는 `$HOME`에 의존하지 않도록 절대 경로로 고정하는 편이 안전합니다.
+  ```bash
+  #!/bin/sh
+  # chmod 700 후 "!/절대/경로" 형태로 참조
+  exec /usr/bin/python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/teamclaude.json')))['byok']['apiKey'])"
+  ```
+- **`openai-codex-responses`는 JWT 형태의 `apiKey`를 요구합니다.** Aside가 요청을 보내기 전에 이 값을
+  디코딩해 `chatgpt_account_id` 클레임을 읽기 때문에, 평범한 문자열이면 로컬에서 먼저 실패합니다.
+  프록시는 이 값을 버리고 실제 풀 자격증명을 주입하므로 **비밀값이 아닙니다.** 형식만 맞으면 됩니다:
+  ```bash
+  python3 -c 'import base64,json;print("x."+base64.urlsafe_b64encode(json.dumps({"https://api.openai.com/auth":{"chatgpt_account_id":"pool"}}).encode()).decode().rstrip("=")+".y")'
+  ```
+- **예약된 프로바이더 ID를 피하십시오.** Aside에는 `anthropic`·`openai`·`openai-codex`·`aside` 등
+  내장 프로바이더가 스무 개 넘게 있어서 이름이 겹치면 충돌합니다. `teamclaude`·`teamcodex`는 비어 있습니다.
+
+위 두 경로는 실제 계정 풀로 끝까지 확인했습니다. 각 프로바이더로 `aside exec`을 돌려 모델 응답을 받았고,
+Claude 쪽은 프록시의 `byok` 카운터가 올라가는 것까지 봤습니다. 프로바이더가 조용히 안 보이면 Aside
+데몬 로그를 보십시오. `models.json` 파싱에 실패하면 아무 안내 없이 건너뜁니다.
+
 Codex의 Sol→Terra fallback은 일반 400에 반응하지 않습니다. ChatGPT OAuth
 계정이 Sol을 지원하지 않는다는 exact 400을 반환한 경우에만 해당 계정·모델
 조합을 30분 격리하며, 거절된 POST는 재전송하지 않습니다. 모든 eligible
