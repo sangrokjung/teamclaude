@@ -3027,7 +3027,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // Codex-native fail-fast body) is decided; the one-shot flag keeps a
         // pathological stale-429 loop from bypassing the cap forever.
         const yieldToPass = ctx.resetCredits && ctx.resetCreditAttempts < 1 && !ctx.resetCreditBackstopYielded;
-        if (retryCount >= maxRetries && yieldToPass) ctx.resetCreditBackstopYielded = true;
+        if (retryCount >= maxRetries && yieldToPass) {
+          ctx.resetCreditBackstopYielded = true;
+          console.log(`[TeamCodex] Retry cap reached on "${account.name}" with an unspent reset-credit pass — yielding once to the acquisition dead end`);
+        }
         if (retryCount >= maxRetries && !yieldToPass) {
           ctx.status = 429;
           const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold, ctx.model);

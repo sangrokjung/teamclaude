@@ -506,3 +506,49 @@ test('the backstop yield re-arms after a fresh cycle: a second legitimate yield 
     assert.ok(r.elapsedMs >= 2000 && r.elapsedMs < 7000, `two throttle waits (${r.elapsedMs}ms)`);
   });
 });
+
+test('sustained exhaustion storm with no resets: the backstop never spins, no credit is spent, the request fails fast', async () => {
+  // Two permanently exhausted accounts whose credit count is unknown (never
+  // polled) → the fleet walk never has a candidate. Every dispatch is a
+  // genuine 429 with a 1 s throttle. The request must end inside the
+  // continuity budget with the Codex-native body, with zero consume POSTs and
+  // at most one backstop yield per cycle (observable through the log line).
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.join(' ')); };
+  try {
+    const am = new AccountManager(makeCodexAccounts(2));
+    for (const a of am.accounts) {
+      a.quota.unified7d = 0.5; // routable at first so the storm actually dispatches
+      a.quota.unified7dReset = Date.now() + 60 * HOUR;
+      a.quota.unified5h = 0.5;
+      a.quota.unified5hReset = Date.now() + 2 * HOUR;
+      a.quota.codexResetCredits = null;
+    }
+    const storm429 = res => {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': '1',
+        'x-codex-primary-used-percent': '100',
+        'x-codex-primary-window-minutes': '10080',
+        'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 1),
+      });
+      res.end(JSON.stringify({ error: { type: 'usage_limit_reached', message: 'The usage limit has been reached', plan_type: 'pro', resets_at: Math.floor(Date.now() / 1000) + 1 } }));
+    };
+    await withProxy(am, { responses: (_n, _token, res) => { storm429(res); return 'handled'; } },
+      { continuityMaxWaitMs: 3000, continuityMaxSleepMs: 50 }, async ({ proxyPort, calls }) => {
+        const r = await postResponses(proxyPort);
+        assert.equal(r.status, 429, r.text);
+        assert.equal(r.json?.error?.type, 'usage_limit_reached', r.text);
+        assert.doesNotMatch(r.text, /All accounts throttled/);
+        assert.ok(r.elapsedMs < 6000, `ended inside the budget (${r.elapsedMs}ms)`);
+        assert.equal(calls.consume.length, 0, 'unknown credit count → never redeemed');
+        assert.ok(calls.responses.length >= 2, 'the storm actually dispatched');
+        const yields = logs.filter(l => l.includes('yielding once to the acquisition dead end')).length;
+        const cycles = logs.filter(l => l.includes('No eligible capacity') && l.includes('waiting')).length;
+        assert.ok(yields <= cycles + 1, `yields ${yields} bounded by cycles ${cycles}`);
+      });
+  } finally {
+    console.log = original;
+  }
+});
