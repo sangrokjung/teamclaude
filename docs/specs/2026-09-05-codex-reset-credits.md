@@ -55,6 +55,14 @@
   answer), and left unspent only when the walk never reached the backend —
   otherwise the wait loop could re-POST consume on every iteration. Also: a
   held header fold still records the request in the usage counters.
+- Review round 6 (commit `0865c6c`, 2 lenses): **APPROVE / APPROVE**. Known
+  low residual, deliberately not fixed in this release: with the
+  non-default combination `codexResetCreditsPolicy: "account"` +
+  `codexResetCreditsCooldownMs: 0`, a definite no-spend answer in the 429
+  branch does not charge the pass, so the following fleet walk may POST
+  consume once more on the same account (bounded at 2 no-spend POSTs per
+  account per request, no credit spent, request still fails fast). The
+  production config (fleet policy, 30-min cooldown) is not exposed.
 
 ## Incident / motivation
 
