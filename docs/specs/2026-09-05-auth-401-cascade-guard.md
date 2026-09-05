@@ -150,6 +150,23 @@ still succeeds. Only the parking side effect is suppressed.
 - `npx eslint src/ test/`
 - Independent adversarial review (maker ≠ checker) + cross-model review (Codex)
 
+## Ordering requirement for any "promote a 401 to persistent revocation" change
+
+If a change is added that promotes a 401 to a PERSISTED revocation
+(`setAuthRevoked(..., persist)`) — for example on the grounds that the token
+generation actually advanced before the second 401 — it must be evaluated
+**after** the cascade check, and must not fire while `ctx.authCascade` is set.
+
+This is not hypothetical. In the incident above every account returned its
+second 401 immediately after a *successful* refresh, so a fresh-token promotion
+rule would have matched all of them. The parks were in-memory, which is why a
+daemon restart recovered the pool in seconds; persisted revocations would have
+survived the restart and required a manual re-login per account. A rule meant to
+catch one genuinely revoked account would have converted a transient upstream
+condition into a fleet-wide lockout.
+
+Promote only when the 401 is unexplained by the request — i.e. outside a cascade.
+
 ## Follow-ups raised by review (deliberately NOT in this change)
 
 Both reviewers approved the change and each left one item outside its scope.
