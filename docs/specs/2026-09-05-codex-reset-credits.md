@@ -97,6 +97,17 @@
   (count/reserve/pending/cooldown) while `canServe` and exhaustion still
   apply, so an operator redemption on a healthy or quarantined account cannot
   capture an automatic request's single pass. Tests added for all three.
+- Cross-model final re-check (Codex): two of the three confirmed fixed; one
+  HIGH on the one-shot flag — pinned for the whole request it also blocked a
+  LEGITIMATE second yield later in the same request (retry accounting is
+  reset to 0 at every fresh cycle: fleet redemption, model fallback,
+  continuity wait, overload backoff), e.g. first yield → no candidate → wait
+  → the account rolls over → stale/auth hops climb `retryCount` to the cap
+  again → genuine 429 → generic body instead of the dead end. Fixed in round
+  9: the flag re-arms at every one of those fresh-cycle points (wherever
+  `tried5xx` is cleared), so it blocks only repeated yields inside the same
+  stale-429 cycle. Test: two operator resets landing mid-flight, both
+  stale-retry-to-cap sequences yield, request finally served.
 
 ## Incident / motivation
 

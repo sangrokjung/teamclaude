@@ -449,3 +449,60 @@ test('restart with cooldown 0: a restored "pending" stamp blocks redemption unti
       assert.equal(calls.consume.length, 1, 'a reconciled count allows the (operator-chosen cooldown 0) redemption');
     });
 });
+
+test('the backstop yield re-arms after a fresh cycle: a second legitimate yield later in the same request is honoured', async () => {
+  // One account (maxRetries 1). Twice in a row: an operator reset lands while a
+  // request is in flight, its 429 is judged stale and retried (retryCount hits
+  // the cap), and the retry meets a genuine 429 → the cap must yield to the
+  // unspent pass BOTH times (the continuity wait in between re-arms the
+  // one-shot flag); the request finally gets served.
+  const fast429 = res => {
+    res.writeHead(429, {
+      'content-type': 'application/json',
+      'retry-after': '1',
+      'x-codex-primary-used-percent': '100',
+      'x-codex-primary-window-minutes': '10080',
+      // The window itself rolls over in ~1 s, so the request WAITS (inside the
+      // continuity budget) instead of failing fast — that wait is the "fresh
+      // cycle" that must re-arm the one-shot yield.
+      'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 1),
+    });
+    res.end(JSON.stringify({ error: { type: 'usage_limit_reached', message: 'The usage limit has been reached', plan_type: 'pro', resets_at: Math.floor(Date.now() / 1000) + 1 } }));
+  };
+  const am = new AccountManager(makeCodexAccounts(1));
+  am.accounts[0].quota.unified7d = 0.5;
+  am.accounts[0].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[0].quota.unified5h = 0.5;
+  am.accounts[0].quota.unified5hReset = Date.now() + 2 * HOUR;
+  am.accounts[0].quota.codexResetCredits = 5;
+  const held = {};
+  const arrived = {};
+  const arrivedPromise = n => new Promise(resolve => { arrived[n] = resolve; });
+  const p1 = arrivedPromise(1);
+  const p3 = arrivedPromise(3);
+  await withProxy(am, {
+    responses: (n, _token, res) => {
+      if (n === 1 || n === 3) { held[n] = res; arrived[n](); return 'handled'; } // held until an operator reset lands
+      if (n === 2 || n === 4) { fast429(res); return 'handled'; }             // genuine post-reset 429s (cap reached)
+      return { status: 200 };                                                 // #5 finally served
+    },
+  }, { continuityMaxWaitMs: 8000, continuityMaxSleepMs: 50 }, async ({ proxyPort, calls }) => {
+    const operatorReset = async () => {
+      const r = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/codex/reset-credit?account=codex-0`, { method: 'POST', headers: { 'x-api-key': 'k' } });
+      assert.equal(r.status, 200, await r.text());
+    };
+    const request = postResponses(proxyPort);
+    await p1;
+    await operatorReset();      // reset lands while #1 is in flight → #1's 429 is stale → retry (retryCount 1 = cap)
+    fast429(held[1]);
+    await p3;                   // after yield #1, the throttle (1 s) expires, the cycle re-arms, #3 is dispatched
+    await operatorReset();      // again: stale 429 → retry at the cap → genuine 429 → yield #2 must be honoured
+    fast429(held[3]);
+    const r = await request;
+    assert.equal(r.status, 200, r.text);
+    assert.doesNotMatch(r.text, /All accounts throttled/);
+    assert.equal(calls.responses.length, 5, 'held, genuine, held, genuine, served');
+    assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0', 'Bearer tok-0'], 'both redemptions were the operator\'s, none automatic');
+    assert.ok(r.elapsedMs >= 2000 && r.elapsedMs < 7000, `two throttle waits (${r.elapsedMs}ms)`);
+  });
+});
