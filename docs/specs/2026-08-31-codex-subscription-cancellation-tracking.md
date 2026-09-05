@@ -16,7 +16,7 @@ Track user-declared Codex subscription cancellations without removing accounts t
 4. ordinary authentication/refresh error unrelated to the declared effective date;
 5. Anthropic organization policy denial (`oauth_not_allowed_for_organization`).
 
-The initial operator metadata applies to `sesileo98`, `testacountqjc`, and `test981110`; `test981110` remains usable through 2026-09-06 KST, so its effective instant is 2026-09-07 00:00 KST.
+The initial operator metadata applies to `pooled-a`, `pooled-b`, and `pooled-c`; `pooled-c` remains usable through 2026-09-06 KST, so its effective instant is 2026-09-07 00:00 KST.
 
 ## Evidence and decision
 
@@ -62,7 +62,7 @@ The credential-free status API returns:
 1. `teamcodex codex subscription cancel <account> [--ends-on YYYY-MM-DD] [--account-uuid UUID]` records a cancellation without disabling the account; both `--flag value` and `--flag=value` forms preserve the same fail-closed identity/date semantics.
 2. `--ends-on` means usable through that local calendar date; the stored UTC instant is next-day local midnight.
 3. `teamcodex codex subscription clear <account> [--account-uuid UUID]` removes the declaration and reopens an account parked only as `subscription-ended`.
-4. Account matching uses the full configured name, full email, or exact email localpart. Prefix matching is forbidden, so `sesileo98` cannot select `sesileo981110`; `--account-uuid` optionally pins that selected identity.
+4. Account matching uses the full configured name, full email, or exact email localpart. Prefix matching is forbidden, so `pooled-a` cannot select `pooled-a-long`; `--account-uuid` optionally pins that selected identity.
 5. Before a known future end, terminal 401/refresh failure uses `auth-revoked`/`refresh-failed` and does not claim subscription end, even when the access token is expiring but still valid. A token-refresh network error, timeout, 5xx, or malformed success is non-terminal and does not change the account or subscription state.
 6. After the effective instant, or for a declared cancellation with unknown end, a terminal auth failure persists `subscription-ended` and excludes the account from rotation. A pre-end auth error is reclassified only after the boundary passes and a fresh terminal failure is observed.
 7. A valid Codex usage response or successful inference after that inference changes the cancellation record back to `scheduled`, clears the runtime error, and persists recovery. Non-streaming inference requires a parsed Responses object with a non-empty `id`, `object: "response"`, and `status: "completed"`; empty, malformed, failed, incomplete, or completed-looking bodies without an id preserve the ended state. Streaming inference requires `response.completed`; `response.failed`, `response.incomplete`, `error`, and `[DONE]` alone preserve the ended state.
