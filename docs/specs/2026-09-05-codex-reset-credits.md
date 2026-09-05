@@ -267,3 +267,16 @@ work, so this change ships via the runbook's **Path B** (manual staging from
 materialize/validate functions), then the plist is repointed, the service
 cycled, verified, and the approved-hash file updated. Live config
 `~/.config/teamcodex.json` gains `codexResetCredits: true` (fleet policy).
+
+**Deployed 2026-09-05 19:55 KST** — live artifact
+`6b538222f002b0f43efa799566085b20b09ae4424a5a012994ceab69de9a7425` (source
+commit `0865c6c`), rolled out with `scripts/teamcodex-manual-rollout.py`
+(idle wait → drain → bootout/bootstrap → verify → approve); rollback target
+`adea84fd…` kept as last-good. Live evidence: `GET /teamclaude/status` reports
+`x-teamcodex-source-hash: 6b538222…`, `resetCredits: {enabled: true, policy:
+"fleet", cooldownMs: 1800000, reserve: 0}` and a `codexResetCredits` count per
+account from the startup poll; an operator redemption on one weekly-exhausted
+account answered `{"reset":true,"outcome":"reset","resetCredits":2}` with
+`windows_reset=1`, the backend's own `wham/usage` then showed `used_percent: 0`
+and `available_count: 2`, the account rejoined rotation (usable 1 → 2 of 8),
+and a real `POST /codex/responses` through the proxy completed with `200`.
