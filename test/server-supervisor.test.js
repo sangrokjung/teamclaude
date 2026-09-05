@@ -1496,3 +1496,58 @@ globalThis.fetch = async (input, init) => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('supervisor fences the operator reset-credit route to loopback (codex mode)', { timeout: 20000 }, async t => {
+  const host = externalIPv4();
+  if (!host) {
+    t.skip('no non-loopback IPv4 interface is available');
+    return;
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-reset-credit-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port, apiKey: 'tc-remote-reset' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    accounts: [{
+      name: 'codex-0', provider: 'codex', type: 'oauth', accountUuid: 'ws-0', accountId: 'ws-0',
+      accessToken: 'tok-0', refreshToken: 'r-0', expiresAt: Date.now() + 3_600_000,
+    }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'codex', 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_PROVIDER: 'codex' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const remote = await request({
+      host,
+      port,
+      path: '/teamclaude/codex/reset-credit?account=codex-0',
+      method: 'POST',
+      headers: { 'x-api-key': 'tc-remote-reset', 'content-length': '0' },
+    });
+    assert.equal(remote.status, 403, remote.body);
+    assert.equal(JSON.parse(remote.body).error.type, 'permission_error');
+
+    // Loopback with the key reaches the worker; the dead upstream makes the
+    // redemption fail, which is a 409 (not a permission error).
+    const local = await request({
+      port,
+      path: '/teamclaude/codex/reset-credit?account=codex-0',
+      method: 'POST',
+      headers: { 'x-api-key': 'tc-remote-reset', 'content-length': '0' },
+    });
+    assert.equal(local.status, 409, local.body);
+    assert.equal(JSON.parse(local.body).reset, false);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});

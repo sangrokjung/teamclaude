@@ -12,6 +12,12 @@ export const CODEX_RESET_CREDIT_CODES = new Set([
 ]);
 export const DEFAULT_CODEX_RESET_CREDITS_COOLDOWN_MS = 30 * 60 * 1000;
 export const DEFAULT_CODEX_RESET_CREDITS_TIMEOUT_MS = 10_000;
+// After a successful reset the backend's usage meter may lag behind for a few
+// seconds. During this window an AUTHORITATIVE wham/usage payload may not
+// RAISE the just-zeroed utilization back over the threshold; a real post-reset
+// 429 (dispatched after the reset) still throttles the account normally, so a
+// reset that genuinely did not take effect self-corrects on the next request.
+export const CODEX_RESET_CREDIT_GRACE_MS = 120_000;
 
 /**
  * `<upstream minus trailing /codex>/wham/rate-limit-reset-credits[/consume]`.
@@ -52,6 +58,12 @@ export function parseCodexResetCreditsAvailable(payload) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+/** Is `now` inside the post-reset grace window of this quota? */
+export function withinCodexResetCreditGrace(quota, now = Date.now(), graceMs = CODEX_RESET_CREDIT_GRACE_MS) {
+  const resetAt = quota?.codexResetCreditResetAt;
+  return Number.isFinite(resetAt) && resetAt <= now && now - resetAt < graceMs;
+}
+
 /**
  * Is this account out of quota from the proxy's point of view? A throttle
  * with a future rateLimitedUntil (set on an exhaustion 429) or a measured
@@ -67,13 +79,16 @@ export function isCodexAccountExhausted(account, { now = Date.now(), isExhausted
 
 /**
  * Eligibility for an AUTOMATIC redemption. Returns { eligible, reason } so a
- * caller can log why a candidate was skipped.
+ * caller can log why a candidate was skipped. `canServe(account)` lets the
+ * caller exclude accounts that could not serve the request anyway (e.g. a
+ * model quarantine) — a reset there would restore quota nobody can use.
  */
 export function codexResetCreditEligibility(account, {
   now = Date.now(),
   reserve = 0,
   cooldownMs = DEFAULT_CODEX_RESET_CREDITS_COOLDOWN_MS,
   isExhausted,
+  canServe,
 } = {}) {
   if (!account || account.provider !== 'codex' || account.type !== 'oauth') {
     return { eligible: false, reason: 'not-codex-oauth' };
@@ -88,6 +103,9 @@ export function codexResetCreditEligibility(account, {
   if (credits <= reserve) return { eligible: false, reason: credits === 0 ? 'no-credits' : 'reserved' };
   const lastAt = Number.isFinite(quota.codexResetCreditLastAt) ? quota.codexResetCreditLastAt : 0;
   if (cooldownMs > 0 && now - lastAt < cooldownMs) return { eligible: false, reason: 'cooldown' };
+  if (typeof canServe === 'function' && canServe(account) !== true) {
+    return { eligible: false, reason: 'cannot-serve' };
+  }
   if (!isCodexAccountExhausted(account, { now, isExhausted })) {
     return { eligible: false, reason: 'not-exhausted' };
   }
@@ -114,6 +132,14 @@ export function rankCodexResetCreditCandidates(accounts, options = {}) {
       return a.index - b.index;
     })
     .map(({ account }) => account);
+}
+
+/** Why each codex account is (not) a candidate — for the operator log. */
+export function describeCodexResetCreditCandidates(accounts, options = {}) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  return list
+    .filter(account => account?.provider === 'codex')
+    .map(account => `${account.name}:${codexResetCreditEligibility(account, options).reason}`);
 }
 
 async function readErrorMessage(response) {
@@ -202,10 +228,32 @@ export async function consumeCodexResetCredit({
 }
 
 /**
+ * What an outcome means for the credit ledger and for a fleet walk:
+ *   'reset'          — a credit was spent AND the windows were reset (routable again)
+ *   'spent-no-reset' — the backend consumed a credit but reset nothing (windows_reset 0)
+ *   'indeterminate'  — the request may or may not have reached the backend
+ *                      (timeout / network / 5xx / unparseable); a credit MAY be gone
+ *   'no-spend'       — the backend definitely spent nothing (nothing_to_reset,
+ *                      no_credit, already_redeemed, 4xx, local skip)
+ * A fleet walk must stop after anything but 'no-spend': trying the next account
+ * after a spent or indeterminate outcome is exactly the double-spend path.
+ */
+export function codexResetCreditOutcomeKind(outcome) {
+  const code = outcome?.code;
+  if (code === 'reset') {
+    return outcome.windowsReset === 0 ? 'spent-no-reset' : 'reset';
+  }
+  if (code === 'nothing_to_reset' || code === 'no_credit' || code === 'already_redeemed') return 'no-spend';
+  if (typeof code === 'string' && /^http_4\d\d$/.test(code)) return 'no-spend';
+  if (code === 'token_refresh_failed' || code === 'skipped') return 'no-spend';
+  return 'indeterminate';
+}
+
+/**
  * Fold a redemption outcome into the live account. Returns true when the
  * upstream windows were reset and the account is routable again. Every
  * attempt (success or not) stamps codexResetCreditLastAt so the cooldown
- * bounds retries; only "reset" touches utilization/throttle.
+ * bounds retries; only a real reset touches utilization/throttle.
  */
 export function applyCodexResetCreditOutcome(account, outcome, now = Date.now()) {
   if (!account?.quota || !outcome) return false;
@@ -217,14 +265,23 @@ export function applyCodexResetCreditOutcome(account, outcome, now = Date.now())
     return false;
   }
   if (outcome.code !== 'reset') return false;
-  quota.unified5h = 0;
-  quota.unified7d = 0;
-  quota.unifiedStatus = null;
+  // A credit is gone either way — keep the cached count honest first.
   if (Number.isInteger(quota.codexResetCredits)) {
     quota.codexResetCredits = Math.max(0, quota.codexResetCredits - 1);
   }
   quota.codexResetCreditsConsumed = (Number.isInteger(quota.codexResetCreditsConsumed)
     ? quota.codexResetCreditsConsumed : 0) + 1;
+  if (outcome.windowsReset === 0) {
+    // "reset" with zero windows reset: nothing to route on. Leave the meters
+    // and any throttle alone so the request falls through to the normal
+    // exhaustion handling instead of bouncing on a still-full account.
+    quota.codexResetCreditLastOutcome = 'reset_no_windows';
+    return false;
+  }
+  quota.unified5h = 0;
+  quota.unified7d = 0;
+  quota.unifiedStatus = null;
+  quota.codexResetCreditResetAt = now;
   if (account.status === 'throttled') {
     account.status = 'active';
     account.rateLimitedUntil = null;

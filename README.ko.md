@@ -501,6 +501,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `codexResetCreditsPolicy` | `fleet`는 서비스 가능한 계정이 하나도 없을 때만 사용(건강한 계정으로의 회전이 항상 우선, dead end당 1장, 리셋권이 많은 계정부터), `account`는 소진 429를 받은 그 계정에서 즉시 사용하고 같은 계정으로 재시도 (기본 `fleet`) |
 | `codexResetCreditsCooldownMs` | 계정별 사용 시도 최소 간격(성공·실패 무관) — 리셋이 반영되지 않을 때 리셋권이 연달아 소모되는 것을 막는 상한 (기본 `1800000` = 30분) |
 | `codexResetCreditsReserve` | 자동 정책이 남겨 두는 계정별 리셋권 수 (기본 `0`). 로컬 운영 엔드포인트 `POST /teamclaude/codex/reset-credit?account=<name>`(loopback + proxy API key)은 정책·쿨다운·reserve를 무시하고 즉시 사용 |
+| `codexResetCreditsTimeoutMs` | 리셋권 사용 POST 1회의 타임아웃 (기본 `10000`). 타임아웃·네트워크 오류·5xx는 *불확정*으로 취급해 그 계정을 다시 폴링하고 같은 요청에서 다른 계정을 시도하지 않습니다(리셋권이 이미 소모됐을 수 있음) |
 | `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`, 연결 손실, ambiguous-dispatch 502를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |

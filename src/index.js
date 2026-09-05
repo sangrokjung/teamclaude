@@ -493,6 +493,15 @@ async function superviseServerCommand() {
       });
       return;
     }
+    // The worker only ever sees loopback (this supervisor forwards to it), so
+    // the operator-only reset-credit route must be fenced HERE, like rotate.
+    if (req.url.split('?', 1)[0] === '/teamclaude/codex/reset-credit' && !isLocal) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        type: 'error',
+        error: { type: 'permission_error', message: 'Reset credit redemption is local-only.' },
+      });
+      return;
+    }
     if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
       && bearerKey !== config.proxy.apiKey && !isLocal) {
       rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
@@ -2876,6 +2885,8 @@ async function statusCommand() {
           const consumed = q.codexResetCreditsConsumed ? `, ${q.codexResetCreditsConsumed} redeemed` : '';
           const last = q.codexResetCreditLastOutcome ? ` (last: ${q.codexResetCreditLastOutcome})` : '';
           console.log(`    Reset credits: ${q.codexResetCredits} available${consumed}${last}`);
+        } else if (data.resetCredits?.enabled) {
+          console.log('    Reset credits: unknown (no wham/usage poll has reported a count yet)');
         }
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';

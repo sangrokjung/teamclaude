@@ -10,6 +10,21 @@
   리셋 쿠폰을 자동으로 사용해서 계속 진행하게" — when the Codex pool is out
   of usage, redeem the ChatGPT *rate-limit reset credit* (the "Full reset"
   entry the Codex CLI shows under `/usage`) automatically instead of failing.
+- Review round 1 (commit `0c27bd2`, independent 3-lens adversarial workflow +
+  2 refuters per finding + completeness critic, maker ≠ checker):
+  REQUEST_CHANGES ×3. Confirmed defects fixed in round 2: account policy
+  bypassed every eligibility guard; a 429 dispatched before the reset landed
+  re-marked the account and could burn a second credit; indeterminate
+  (timeout/5xx) outcomes let the fleet walk spend another credit; a
+  model-quarantined account could be reset for nothing; the account-policy
+  retry chain could end in the legacy "All accounts throttled" body; the
+  1.5 s authoritative refresh could revert a lagging meter to 100%; the
+  operator route's loopback fence was dead under the production supervisor
+  (worker only sees loopback); `reset` with `windows_reset: 0` was applied
+  as a full reset; the no-candidate dead end was silent;
+  `codexResetCreditsTimeoutMs` was undocumented. Coverage gaps closed:
+  restart snapshot import, non-loopback 403 (worker + supervisor),
+  concurrency, and the "reset not honoured" bound.
 
 ## Incident / motivation
 
@@ -70,21 +85,49 @@ Files: `codex-rs/backend-client/src/client/rate_limit_resets.rs`,
    - `codexResetCreditsPolicy: "account"`: additionally, on an upstream 429
      classified as account exhaustion, redeem on THAT account and retry the
      same request on it before throttling/switching.
-3. **Never loop or burn credits blindly.** Per-account guards: single-flight,
+3. **Never loop or burn credits blindly.** Guards applied by BOTH policies
+   (`codexResetCreditEligibility`): single-flight per account,
    `codexResetCreditsCooldownMs` (default 30 min) after ANY attempt,
-   `codexResetCreditsReserve` (keep N credits per account), and only for
-   accounts the proxy considers exhausted (throttled with a future
-   `rateLimitedUntil`, or `isExhausted()`). A request attempts the fleet
-   redemption at most once per acquisition dead end, bounded by the pool size.
-4. **Apply the outcome locally at once.** `code === "reset"` clears the
-   account's unified 5h/7d utilization to 0, lifts a throttle, decrements the
-   cached credit count, and schedules an authoritative `wham/usage` refresh
-   (1.5 s later). `no_credit` zeroes the cached count; `nothing_to_reset` /
-   `already_redeemed` / HTTP / network failures only stamp the cooldown.
+   `codexResetCreditsReserve` (keep N credits per account), the credit count
+   must be known (a never-polled account is never redeemed), only accounts
+   the proxy considers exhausted (throttled with a future `rateLimitedUntil`,
+   or `isExhausted()`), and never an account quarantined for the requested
+   model (`canServe`). **One fleet pass per request**: if the reset account
+   still 429s afterwards the request fails fast instead of walking the pool.
+   The fleet walk stops after any outcome that may have spent a credit
+   (`reset` with `windows_reset: 0`, or an indeterminate timeout/network/5xx
+   answer); it only moves on after a definite no-spend answer
+   (`nothing_to_reset`, `no_credit`, `already_redeemed`, 4xx). The account
+   policy retries an account at most once per request, and that retry does
+   not count toward `maxRetries`, so a second 429 still ends in the
+   Codex-native body.
+4. **Apply the outcome locally at once.** `code === "reset"` (with
+   `windows_reset` absent or > 0) clears the account's unified 5h/7d
+   utilization to 0, lifts a throttle, decrements the cached credit count,
+   stamps `codexResetCreditResetAt`, and schedules an authoritative
+   `wham/usage` refresh (1.5 s later — after EVERY attempt, so an
+   indeterminate answer is reconciled too). `reset` with `windows_reset: 0`
+   decrements the count and stamps the cooldown but leaves meters/throttle
+   alone (`reset_no_windows`). `no_credit` zeroes the cached count;
+   `nothing_to_reset` / `already_redeemed` / HTTP / network failures only
+   stamp the cooldown. Two consistency fences protect a fresh reset: a
+   response to a request dispatched BEFORE `codexResetCreditResetAt` neither
+   folds its `x-codex-*` meter nor throttles on 429 (the request is retried),
+   and for `CODEX_RESET_CREDIT_GRACE_MS` (2 min) an authoritative payload may
+   not RAISE the meter — a reset that genuinely failed still throttles the
+   account through a real post-reset 429.
 5. **Operator trigger.** `POST /teamclaude/codex/reset-credit?account=<name>`
    (local-only, proxy API key when configured, body-free — mirrors
    `/teamclaude/rotate`) redeems on demand regardless of the automatic
-   policy/eligibility (explicit operator intent), still single-flight.
+   policy/eligibility (explicit operator intent), still single-flight. The
+   loopback fence lives in the supervisor (`src/index.js`) as well as the
+   worker, because the worker only ever sees the supervisor's loopback
+   connection.
+6. **Observability.** `GET /teamclaude/status` carries `resetCredits:
+   {enabled, policy, cooldownMs, reserve}`; `teamcodex status` prints a
+   `Reset credits:` line per account (or `unknown` while enabled but not yet
+   polled); a dead end with no eligible candidate logs one throttled
+   `[TeamCodex] Reset credit: no eligible account (<name>:<reason>, …)` line.
 
 ## Non-goals
 
@@ -109,7 +152,26 @@ Files: `codex-rs/backend-client/src/client/rate_limit_resets.rs`,
   `Bearer <its token>` + `chatgpt-account-id`, JSON `{redeem_request_id:
   <uuid>}` (no `credit_id`), then serves the request → `200`, in < 3 s;
   `quota.codexResetCredits === 2`, `unified7d === 0`, a
-  `[TeamCodex] Reset credit consumed` log line.
+  `[TeamCodex] Reset credit redeemed` log line.
+- Account policy with `reserve: 1` + 1 credit, or inside the cooldown, or
+  with an unknown count → zero consume calls, fail-fast body.
+- Upstream keeps answering 429 after a `reset` → exactly one consume per
+  request (both policies), final body `usage_limit_reached`, never the legacy
+  "All accounts throttled" text.
+- `reset` with `windows_reset: 0`, or a consume timeout → exactly one consume
+  call (the second candidate is not tried), count/cooldown recorded, fail-fast.
+- One of two exhausted accounts quarantined for the model → the consume lands
+  on the other; a fully quarantined fleet redeems nothing.
+- Two requests in flight on the last healthy account: the 429 that was
+  dispatched before the reset landed is retried, not throttled; one credit
+  for the episode; the account stays at 0%.
+- The backend still reports 100% on the refresh 1.5 s after the reset → the
+  account stays routable and the next request spends no second credit.
+- A restored quota snapshot inside the cooldown → zero consume calls; a
+  legacy snapshot without the ledger fields → `credits-unknown`, never
+  redeemed, one throttled no-candidate log line.
+- Five concurrent requests at the dead end → five `200`s, one consume.
+- `resetCredits` block present in codex status, absent in Anthropic status.
 - `nothing_to_reset` → one consume call, then the existing fail-fast
   `usage_limit_reached` 429; a second request within the cooldown makes NO
   further consume call.
@@ -123,18 +185,31 @@ Files: `codex-rs/backend-client/src/client/rate_limit_resets.rs`,
   falls through to the existing 429 path.
 - `codexResetCreditsReserve: 1` with 1 credit → not eligible.
 - Operator endpoint: local POST with key → 200 + outcome JSON; non-local →
-  403; wrong key → 401; unknown account → 404; non-reset outcome → 409.
+  403 at the worker AND at the supervisor; wrong key → 401; unknown account →
+  404; non-reset outcome → 409.
 - Anthropic provider with `codexResetCredits: true` → never calls consume.
 
 ## Test
 
 ```bash
 cd /Users/sangrok/.claude/worktrees/teamclaude-reset-credits-20260905
-node --test test/codex-reset-credits.test.js test/server-codex-reset-credits.test.js \
+node --test --test-concurrency=1 \
+  test/codex-reset-credits.test.js test/codex-reset-credits-outcomes.test.js \
+  test/server-codex-reset-credits.test.js test/server-codex-reset-credits-guards.test.js \
   test/server-codex-usage-limit.test.js test/server-codex.test.js test/server-429.test.js \
-  test/account-manager.test.js test/config.test.js
-npx eslint src/ test/codex-reset-credits.test.js test/server-codex-reset-credits.test.js
+  test/server-model-fallback.test.js test/account-manager.test.js test/config.test.js \
+  test/concurrency.test.js test/codex-resume.test.js test/server-rotation.test.js \
+  test/server-codex-model-compatibility.test.js test/server-codex-auto-detect.test.js \
+  test/server-midstream.test.js
+node --test --test-name-pattern "fences the operator" test/server-supervisor.test.js
+npx eslint src/ test/codex-reset-credits*.test.js test/server-codex-reset-credits*.test.js
 ```
+
+Round 2 evidence (2026-09-05): the 16-file set above = 331 pass / 0 fail;
+supervisor fence 1/1; eslint clean. Three pre-existing supervisor tests
+(`teamclaude run starts a missing proxy`, `CLI remove reloads…`, `live
+account removal lowers…`) fail identically on the untouched production
+lineage in this environment and are unrelated.
 
 ## Deployment note
 

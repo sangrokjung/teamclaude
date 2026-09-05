@@ -17,6 +17,7 @@
   "codexResetCreditsPolicy": "fleet",
   "codexResetCreditsCooldownMs": 1800000,
   "codexResetCreditsReserve": 0,
+  "codexResetCreditsTimeoutMs": 10000,
   "accounts": [
     {
       "name": "codex-pro-1",

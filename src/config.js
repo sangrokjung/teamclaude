@@ -392,6 +392,7 @@ export function createDefaultConfig() {
     codexResetCreditsPolicy: 'fleet',
     codexResetCreditsCooldownMs: 1800000,
     codexResetCreditsReserve: 0,
+    codexResetCreditsTimeoutMs: 10000,
     cmuxSessionRescue: false,
     cmuxSessionRescueIntervalMs: 1000,
     // Hard caps that bound proxy memory under a request flood.

@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
-import { parseCodexResetCreditsAvailable } from './codex-reset-credits.js';
+import { parseCodexResetCreditsAvailable, withinCodexResetCreditGrace } from './codex-reset-credits.js';
 import {
   cancellationIsDue,
   normalizeSubscriptionCancellation,
@@ -108,8 +108,9 @@ function emptyQuota() {
     codexResetCredits: null,            // integer ≥ 0 | null
     codexResetCreditsAt: null,          // ms timestamp of the count above
     codexResetCreditLastAt: null,       // ms timestamp of the last redemption attempt
-    codexResetCreditLastOutcome: null,  // reset | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
-    codexResetCreditsConsumed: 0,       // successful redemptions this snapshot lineage
+    codexResetCreditLastOutcome: null,  // reset | reset_no_windows | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
+    codexResetCreditsConsumed: 0,       // credits spent (reset or reset_no_windows) this snapshot lineage
+    codexResetCreditResetAt: null,      // ms timestamp of the last EFFECTIVE reset (grace window + stale-response fence)
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -1286,11 +1287,23 @@ export class AccountManager {
     }
 
     let applied = false;
+    const inResetGrace = withinCodexResetCreditGrace(account.quota);
     for (const [kind, window] of windows) {
       const resetAt = window.reset_at ?? (window.reset_after_seconds != null
         && Number.isFinite(Number(window.reset_after_seconds))
         ? Date.now() / 1000 + Number(window.reset_after_seconds)
         : null);
+      // Right after a reset credit the backend meter can lag for a few
+      // seconds and still report the pre-reset 100%. Inside the grace window
+      // an authoritative payload may lower or keep the meter but not RAISE
+      // it: a reset that genuinely failed still surfaces as a post-reset 429
+      // on the request path, which throttles the account as usual.
+      if (inResetGrace) {
+        const utilKey = kind === '5h' ? 'unified5h' : 'unified7d';
+        const stored = account.quota[utilKey];
+        const incoming = Number(window.used_percent);
+        if (Number.isFinite(incoming) && typeof stored === 'number' && incoming / 100 > stored) continue;
+      }
       applied = applyCodexQuotaWindow(
         account.quota,
         kind,
