@@ -128,6 +128,38 @@
   lines are gone, and the structural test pins "one bare `retryCount = 0`
   (inside the helper), two re-arm assignments, entry guard present, helper
   used, restart recursions present".
+- Cross-model pass on round 11 (Codex): no code defect and the entry re-arm
+  concern refuted (`resetCreditAttempts` is monotonic), but the structural
+  test still pinned count lower bounds (helper uses ≥ 2, literal-zero
+  recursions ≥ 7, only `retryCount = 0` counted), so a future restart via a
+  `retryCount + 1` shape, a constant, or a non-literal reset could evade it.
+  Round 12 (test-only, source hash unchanged) replaces the counts with an
+  enumeration: every `forwardRequest(` call in `server.js` is captured
+  (multi-line tolerant) and its retry argument must be `0`, `retryCount + 1`
+  or the account-policy bare `retryCount`; every write to `retryCount`
+  (`=`, compound, `++`/`--`) must sit inside `restartRetryCycle()` and there
+  must be exactly one; exactly two re-arm assignments. A mutant that inlines
+  the restart outside the helper fails the test.
+- Cross-model pass on round 12 (Codex): still REQUEST_CHANGES on the guard
+  alone — a regex over the argument list cannot enumerate a call whose
+  argument contains parentheses (so `transform(body), …, retryCount + 2`
+  would be silently un-enumerated), an alias (`const recurse =
+  forwardRequest`) bypasses the call scan, and the write regex misses
+  `&&=`/`||=`/`??=`/`**=`, destructuring targets, `for (retryCount of …)`
+  and shadowing declarations. Round 13 (test-only) replaces text matching
+  with a zero-dependency lexical audit (`test/helpers/retry-cycle-audit.js`):
+  a JS tokenizer that skips comments and keeps strings, template literals
+  (with `${}` nesting) and regex literals opaque, bracket matching, and a
+  walk that classifies every `forwardRequest` reference (definition / call /
+  anything else = violation) with the call's 6th argument split on top-level
+  commas, and every `retryCount` identifier as read, property key, write (any
+  assignment operator, `++`/`--`, destructuring or array-pattern target,
+  `for`-in/of target) or binding (`let`/`const`/`var`, pattern declaration,
+  function/arrow/method parameter). A self-test applies 17 mutants (the
+  Codex evasions plus aliasing, `++`, a helper that writes non-zero, a
+  second `forwardRequest`) and asserts each is detected, and a decoy source
+  (strings, comments, templates, regex, shorthand/computed properties,
+  member access) audits clean.
 
 ## Incident / motivation
 

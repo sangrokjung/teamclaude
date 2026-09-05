@@ -553,48 +553,98 @@ test('sustained exhaustion storm with no resets: the backstop never spins, no cr
   }
 });
 
-test('structural guard: every forwardRequest recursion and every retryCount write is enumerated and allowlisted', async () => {
-  // Design (after the Codex cross-model review): a fresh retry cycle is
-  // retryCount === 0 — re-armed once at forwardRequest entry (any restart that
-  // recurses with 0 is covered without call-site discipline) and by
-  // restartRetryCycle() for in-loop restarts. This guard does not count known
-  // patterns; it ENUMERATES every recursion and every write and rejects any
-  // that is not on the allowlist, so a new restart path cannot evade it.
+test('structural guard: every forwardRequest recursion and every retryCount write is enumerated by a lexical audit', async () => {
+  // Design (after two Codex cross-model rounds): a fresh retry cycle is
+  // retryCount === 0 — re-armed once at forwardRequest entry (so any restart
+  // that recurses with 0 is covered without call-site discipline) and by
+  // restartRetryCycle() for in-loop restarts. Text/regex matching could be
+  // evaded by a parenthesised argument, an alias, or a destructuring reset,
+  // so the guard tokenizes server.js (test/helpers/retry-cycle-audit.js) and
+  // walks brackets: every reference to forwardRequest must be the definition
+  // or a call whose retry argument is `0` / `retryCount + 1` / the
+  // account-policy bare `retryCount`; every binding or write of retryCount
+  // (any assignment operator, ++/--, destructuring, for-in/of, let/const/var,
+  // parameter shadowing) must be the single `retryCount = 0` inside the helper.
   const { readFile } = await import('node:fs/promises');
+  const { auditRetryCycle } = await import('./helpers/retry-cycle-audit.js');
   const source = await readFile(new URL('../src/server.js', import.meta.url), 'utf8');
 
-  // (1) Every call of forwardRequest(...) — multi-line tolerant. The 6th
-  // argument (retryCount) must be a literal 0 (fresh cycle → entry re-arm),
-  // `retryCount + 1` (a failover/stale hop inside the same cycle), or
-  // `retryCount` (the account-policy same-account retry, deliberately not a
-  // hop). Anything else is a new, unreviewed restart shape.
-  const calls = [...source.matchAll(/(?<!function )\bforwardRequest\(\s*([^()]*?)\)/g)];
-  assert.ok(calls.length >= 10, `expected the known recursion sites, found ${calls.length}`);
-  const allowed = new Set(['0', 'retryCount + 1', 'retryCount']);
-  const badCalls = calls
-    .map(m => ({ index: m.index, retryArg: m[1].split(',').map(a => a.trim())[5] }))
-    .filter(c => !allowed.has(c.retryArg))
-    .map(c => `offset ${c.index}: retry arg "${c.retryArg}"`);
-  assert.deepEqual(badCalls, [], `forwardRequest recursions with a non-allowlisted retry argument:\n${badCalls.join('\n')}`);
-  const freshCalls = calls.filter(m => m[1].split(',').map(a => a.trim())[5] === '0');
-  assert.ok(freshCalls.length >= 8, `fresh-cycle recursions (initial dispatch + restarts): ${freshCalls.length}`);
+  const audit = auditRetryCycle(source);
+  assert.deepEqual(audit.violations, [], `retry-cycle audit violations:\n${audit.violations.join('\n')}`);
+  assert.ok(audit.calls.length >= 10, `expected the known recursion sites, found ${audit.calls.length}`);
+  assert.ok(audit.calls.filter(c => c.retryArg === '0').length >= 8, 'fresh-cycle recursions (initial dispatch + restarts)');
+  assert.equal(audit.writes.length, 1, 'exactly one retryCount write, inside the helper');
 
-  // (2) Every write to retryCount (assignment, compound assignment, ++/--)
-  // must live inside restartRetryCycle(); the parameter is otherwise read-only.
-  const writes = [...source.matchAll(/(?:\bretryCount\s*(?:=(?!=)|\+=|-=|\*=|\/=|\+\+|--))|(?:(?:\+\+|--)\s*retryCount\b)/g)];
-  const helperStart = source.indexOf('const restartRetryCycle = () => {');
-  const helperEnd = source.indexOf('};', helperStart);
-  assert.ok(helperStart > 0 && helperEnd > helperStart, 'restartRetryCycle helper present');
-  const strayWrites = writes.filter(m => m.index < helperStart || m.index > helperEnd)
-    .map(m => `offset ${m.index}: ${m[0]}`);
-  assert.deepEqual(strayWrites, [], `retryCount writes outside restartRetryCycle():\n${strayWrites.join('\n')}`);
-  assert.equal(writes.length, 1, 'exactly one retryCount write, inside the helper');
-
-  // (3) The flag is re-armed in exactly two places: the entry guard and the helper.
-  const reArms = [...source.matchAll(/resetCreditBackstopYielded = false/g)];
+  // The flag is re-armed in exactly two places: the entry guard and the helper.
+  const reArms = [...source.matchAll(/ctx\.resetCreditBackstopYielded = false/g)];
   assert.equal(reArms.length, 2, `re-arm assignments: ${reArms.length}`);
   assert.match(source, /if \(retryCount === 0\) ctx\.resetCreditBackstopYielded = false;/, 'entry re-arm present');
+  const helperStart = audit.tokens[audit.helperRange[0]].start;
+  const helperEnd = audit.tokens[audit.helperRange[1]].end;
   assert.ok(reArms.some(m => m.index > helperStart && m.index < helperEnd), 'helper re-arms');
-  const helperUses = [...source.matchAll(/restartRetryCycle\(\);/g)];
-  assert.ok(helperUses.length >= 2, `in-loop restarts use the helper (found ${helperUses.length})`);
+  assert.ok((source.match(/restartRetryCycle\(\);/g) || []).length >= 2, 'in-loop restarts use the helper');
+});
+
+test('structural guard self-test: the lexical audit catches the evasions text matching missed', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { auditRetryCycle, tokenizeJs } = await import('./helpers/retry-cycle-audit.js');
+  const source = await readFile(new URL('../src/server.js', import.meta.url), 'utf8');
+  const helperCall = 'restartRetryCycle();';
+  assert.ok(source.includes(helperCall));
+  const replaceOnce = (needle, replacement) => {
+    assert.ok(source.includes(needle), `mutant anchor missing: ${needle}`);
+    return source.replace(needle, replacement);
+  };
+  const mutants = [
+    ['parenthesised argument + retryCount + 2 restart (regex could not enumerate it)',
+      replaceOnce(helperCall, 'return forwardRequest(req, res, String(body), accountManager, upstream, retryCount + 2, hooks, reqId, ctx, logDir);')],
+    ['multi-line call with a non-allowlisted constant',
+      replaceOnce(helperCall, 'return forwardRequest(\n  req, res, body,\n  accountManager, upstream,\n  1,\n  hooks, reqId, ctx, logDir);')],
+    ['alias of forwardRequest',
+      replaceOnce(helperCall, 'const recurse = forwardRequest; return recurse(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);')],
+    ['inline restart outside the helper',
+      replaceOnce(helperCall, 'retryCount = 0; ctx.resetCreditBackstopYielded = false;')],
+    ['destructuring reset', replaceOnce(helperCall, '({ retryCount } = { retryCount: 0 });')],
+    ['array-pattern reset', replaceOnce(helperCall, '[retryCount] = [0];')],
+    ['logical compound assignment', replaceOnce(helperCall, 'retryCount ??= 0;')],
+    ['exponent compound assignment', replaceOnce(helperCall, 'retryCount **= 0;')],
+    ['postfix update', replaceOnce(helperCall, 'retryCount++;')],
+    ['prefix update', replaceOnce(helperCall, '--retryCount;')],
+    ['for-of target', replaceOnce(helperCall, 'for (retryCount of [0]) break;')],
+    ['const shadowing', replaceOnce(helperCall, 'const retryCount = 0; void retryCount;')],
+    ['destructuring shadowing', replaceOnce(helperCall, 'const { retryCount } = ctx; void retryCount;')],
+    ['arrow parameter shadowing', replaceOnce(helperCall, 'const f = (retryCount) => retryCount; void f;')],
+    ['helper writes a non-zero value', replaceOnce('retryCount = 0;', 'retryCount = retryCount - retryCount;')],
+    ['helper loses its write', replaceOnce('retryCount = 0;', 'void 0;')],
+    ['second function named forwardRequest', source + '\nfunction forwardRequest(a, b, c, d, e, retryCount) { return retryCount; }\n'],
+  ];
+  for (const [name, mutated] of mutants) {
+    const { violations } = auditRetryCycle(mutated);
+    assert.ok(violations.length > 0, `mutant not detected: ${name}`);
+  }
+
+  // Decoys inside strings, comments, template literals and regex literals must
+  // NOT count, and reads must not be mistaken for writes.
+  const decoy = `
+    // retryCount = 5; forwardRequest(x, y, z, a, b, 9)
+    /* retryCount++ */
+    const s = 'retryCount = 1; forwardRequest(a,b,c,d,e,7,g)';
+    const t = \`retry \${retryCount} of \${max} — retryCount = 2\`;
+    const re = /retryCount\\s*=\\s*\\d+/;
+    const restartRetryCycle = () => { retryCount = 0; };
+    async function forwardRequest(req, res, body, am, up, retryCount, hooks, id, ctx, dir) {
+      if (retryCount === 0) ctx.flag = false;
+      const o = { retryCount, retryCount: retryCount + 1, n: ctx.retryCount };
+      console.log(o.retryCount, retryCount >= 3 ? 'x' : 'y', \`\${retryCount}\`);
+      log(retryCount);
+      if (retryCount < 3) return forwardRequest(req, res, body, am, up, retryCount + 1, hooks, id, ctx, dir);
+      restartRetryCycle();
+      return forwardRequest(req, res, body, am, up, 0, hooks, id, ctx, dir);
+    }
+  `;
+  const clean = auditRetryCycle(decoy);
+  assert.deepEqual(clean.violations, []);
+  assert.equal(clean.calls.length, 2);
+  assert.equal(clean.writes.length, 1);
+  assert.equal(tokenizeJs(decoy).filter(t => t.type === 'regex').length, 1);
 });
