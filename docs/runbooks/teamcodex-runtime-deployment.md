@@ -131,3 +131,22 @@ watches.
 - Service started 15:46 KST.
 - Verified live: 8 accounts, subscription ledger showing 4 entries,
   `inflight` observed at 10 under real traffic.
+
+## Path B helper script (2026-09-05)
+
+`scripts/teamcodex-manual-rollout.py` automates Path B end to end and was used
+for the 2026-09-05 reset-credit rollout (`stage <commit>` → artifact hash;
+`rollout <hash>` → wait for `x-teamcodex-active-requests: 0`, drain, back up
+and repoint the plist, `bootout`, wait for launchd teardown, `bootstrap`
+with retries, `wait_for_new_runtime`, write the approved hash + deploy state,
+log `deployed-manual`; rolls back on failure). Two gotchas learned that day:
+
+- The supervisor's `POST /teamclaude/deployment/drain` requires **both** the
+  lifecycle id header and the proxy API key (`x-api-key` from
+  `~/.config/teamcodex.json`); the deployer's own `set_deployment_drain`
+  sends only the lifecycle id and gets `403`. The script sends both.
+- Run the rollout detached (`nohup … &`) when the host is under memory
+  pressure: a harness-managed background task can be killed mid-wait.
+- Edit the live config with the artifact's own `src/config.js`
+  `atomicConfigUpdate` (`TEAMCLAUDE_PROVIDER=codex`) so the write honours the
+  same `<config>.lock` protocol as the running server's token refreshes.
