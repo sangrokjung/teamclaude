@@ -18,9 +18,21 @@
   `planType` assignment in `src/index.js` lacks the string guard.
 - Deployment: the production daemon runs a frozen runtime artifact approved by
   hash from the main checkout's working tree (`teamcodex_runtime_deployer.py`),
-  so landing this on master does NOT deploy it. It reaches production only when
-  a working tree containing it is approved. Until then the pool still answers
-  the generic 429 after the 15-minute continuity wait.
+  so landing this on master does NOT deploy it by itself.
+- Deployed 2026-09-05 16:05 KST on the production lineage (git `182cd3b`, the
+  exact source of the live artifact `85a38c…`) as branch
+  `prod/codex-usage-limit-fail-fast-20260905`: cherry-pick of PR #16 plus
+  `soonestKnown` (this lineage redacts account names from `getStatus()`, which
+  had silently disabled the fail-fast) and a quarantine-aware gate. Live
+  artifact `adea84fdb8e172074b011bd9e0aeaa3932c2442998e855514396993546db185b`
+  (`x-teamcodex-source-hash`). Rolled out with the deployer's own
+  materialize/drain/plist/bootstrap/verify functions; the stock
+  `replace_launchd_job` bootstraps immediately after `bootout` and failed
+  (launchd teardown race, the "bootout-orphaned" class the server guard
+  revives), so the manual rollout waits for the teardown and retries. Evidence
+  on this lineage: 16 test files sequential = 342 pass / 0 fail, new file 6/6,
+  eslint clean, independent adversarial review APPROVE. Post-deploy: a real
+  `codex exec` turn from studio2 through the tunnel completed (exit 0).
 
 ## Incident
 
