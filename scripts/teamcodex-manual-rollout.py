@@ -18,8 +18,10 @@ import time
 import urllib.error
 from pathlib import Path
 
-SPEC = importlib.util.spec_from_file_location(
-    "dep", "/Users/sangrok/.local/bin/teamcodex_runtime_deployer.py")
+DEPLOYER = os.environ.get(
+    "TEAMCODEX_DEPLOYER",
+    os.path.expanduser("~/.local/bin/teamcodex_runtime_deployer.py"))
+SPEC = importlib.util.spec_from_file_location("dep", DEPLOYER)
 dep = importlib.util.module_from_spec(SPEC)
 sys.modules["dep"] = dep
 SPEC.loader.exec_module(dep)

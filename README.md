@@ -914,7 +914,7 @@ Whatever monitor you run, alert on account health read from
 | Nothing can serve | `usableCount` at or near `0` | The next request gets a 429 |
 | Weekly pressure | mean `accounts[].quota.unified7d` over windows whose `unified7dReset` is still in the future | The only warning that arrives while adding a subscription still *prevents* the outage instead of ending it |
 | Parked account | `accounts[].status == "error"`, with `errorReason` (e.g. `subscription-ended`) | The proxy cannot self-heal this; it needs a re-login or a subscription fix |
-| Shrinking pool | `accounts[].subscription.state == "scheduled"` with `endsAt` | Capacity disappears on a known date |
+| Shrinking pool | `accounts[].subscription.state == "cancellation-scheduled"` with `endsAt` | Capacity disappears on a known date |
 | Broken refresh chain | `expiresAt` already in the past in the pool config | Only a re-login fixes it |
 
 Alert, do not automate: a re-login needs a browser and restarting the proxy kills

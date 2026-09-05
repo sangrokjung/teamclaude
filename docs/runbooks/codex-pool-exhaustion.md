@@ -288,7 +288,8 @@ from `GET /teamclaude/status`:
   the pool still serves, which is the only window in which adding or renewing a
   subscription prevents an outage rather than ending one. Around 85% is a
   workable trip point.
-- **Shrinking pool**: an enabled account with `subscription.state == "scheduled"`
+- **Shrinking pool**: an enabled account with `subscription.state ==
+  "cancellation-scheduled"`
   and an `endsAt` inside the next week loses its capacity on a known date.
 - **Late warning**: `usableCount` at or below a small floor. By the time it
   fires, the outage is already scheduled; use it to page, not to plan.

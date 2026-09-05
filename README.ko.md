@@ -577,7 +577,7 @@ curl -s -D - -o /dev/null http://127.0.0.1:3457/teamclaude/status \
 | 서빙 가능한 계정 없음 | `usableCount`가 0에 근접 | 다음 요청부터 429 |
 | 주간 사용량 압력 | `unified7dReset`이 아직 미래인 창들의 `accounts[].quota.unified7d` 평균 | 구독을 추가하면 장애를 막을 수 있는 유일한 구간에 울리는 경보 |
 | 멈춘 계정 | `accounts[].status == "error"`와 `errorReason`(예: `subscription-ended`) | 프록시가 스스로 못 고칩니다. 재로그인이나 구독 조치가 필요합니다 |
-| 줄어드는 풀 | `accounts[].subscription.state == "scheduled"`와 `endsAt` | 정해진 날짜에 용량이 사라집니다 |
+| 줄어드는 풀 | `accounts[].subscription.state == "cancellation-scheduled"`와 `endsAt` | 정해진 날짜에 용량이 사라집니다 |
 | 끊어진 갱신 체인 | 풀 설정의 `expiresAt`이 이미 과거 | 재로그인 외에는 복구되지 않습니다 |
 
 자동 조치가 아니라 경보로 두세요. 재로그인은 브라우저가 필요하고 프록시 재시작은
