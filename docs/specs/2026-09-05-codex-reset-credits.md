@@ -118,6 +118,16 @@
   accounts, unknown counts, no resets → fail-fast inside the budget, zero
   consume POSTs, yields bounded by wait cycles). A log line now marks each
   backstop yield.
+- Cross-model pass on the structural guard (Codex): the 9-site rule was
+  complete and regression-free, but a regex/line-proximity guard could be
+  evaded by a future site (multi-line call, expression body, restart without
+  a tried-set clear). Round 11 makes call-site discipline unnecessary: the
+  yield flag re-arms in exactly two places — at `forwardRequest` entry when
+  `retryCount === 0` (the initial dispatch and every restart that recurses
+  with 0) and in the in-loop `restartRetryCycle()` helper — the scattered
+  lines are gone, and the structural test pins "one bare `retryCount = 0`
+  (inside the helper), two re-arm assignments, entry guard present, helper
+  used, restart recursions present".
 
 ## Incident / motivation
 
