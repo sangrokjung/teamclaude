@@ -1981,6 +1981,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const fleetModelQuarantined = () => {
     const candidates = accountManager.accounts.filter(candidate =>
       candidate.enabled !== false
+      // `status !== 'error'` alone is not "usable by THIS request": the cascade
+      // guard deliberately leaves a 401'd account un-parked, so without the
+      // ctx.auth401 term an account this request can no longer select would
+      // still count as a live model-capable candidate. The codex pre-dispatch
+      // fallback then decides against a fallback it should have taken, and the
+      // request waits out the continuity deadline instead (adversarial review
+      // 2026-09-05).
+      && !ctx.auth401.has(candidate)
       && candidate.status !== 'error'
       && (ctx.provider !== 'codex' || ctx.credentialType == null
         || candidate.type === ctx.credentialType));

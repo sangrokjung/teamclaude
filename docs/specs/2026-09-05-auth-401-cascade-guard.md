@@ -138,10 +138,18 @@ still succeeds. Only the parking side effect is suppressed.
 7. The literal incident shape — forced refresh succeeds, the retried request is
    rejected again, across accounts — parks nobody, and each account is charged
    exactly its one post-refresh retry.
-8. A request nobody authenticates fails fast (asserted under the default 15-min
-   continuity deadline), it does not sit in the capacity wait.
+8. A request nobody authenticates fails fast, it does not sit in the capacity
+   wait. Asserted with continuity explicitly enabled — `createProxyServer`
+   leaves `continuityMode` OFF unless a test opts in, so a test that forgets it
+   breaks out on `!continuity.enabled` and proves nothing about this guard.
 9. A background token refresh landing between the park and the cascade does not
    block the rollback.
+10. `fleetModelQuarantined()` counts only accounts THIS request can still
+    select. Asserted with the only shape that falsifies: two accounts cascade
+    into `ctx.auth401` (so the fleet is not all-auth-failed) and a third,
+    untouched account is model-quarantined — without the exclusion the two
+    excluded accounts still look model-capable and the request waits out the
+    whole continuity deadline.
 
 ## Verification
 
@@ -172,7 +180,7 @@ Promote only when the 401 is unexplained by the request — i.e. outside a casca
 Both reviewers approved the change and each left one item outside its scope.
 Recorded here so they are not lost:
 
-- **MEDIUM, pre-existing.** The final relabel branch (`else if (account.expiresAt && …)`) overwrites whatever `errorReason` an account already had. Under genuine concurrency — another request calling `setSubscriptionDisabled` on an account while this request's already-dispatched call to it returns 401 — it rewrites `'subscription-disabled'` to `'auth-revoked'` while the persistent `subscriptionDisabled` flag stays true. The account then falls out of `recheckSubscriptionDisabled()`'s targets and is stranded until re-import or restart. Unchanged context in this diff (verified against the base commit), reproduced by the reviewer. Fix separately: never let this branch overwrite an `errorReason` that some other path owns.
+- **MEDIUM, pre-existing.** The final relabel branch (`else if (account.expiresAt && …)`) calls `markAuthenticationError(account, 'auth-revoked')` on an account that is already parked, with no ownership or cause check. That call unconditionally drops `_errorFromUsagePoll`, so a race between this request's in-flight dispatch and the usage-poll watchdog quarantining the same account strips the account's "auto-recovers on a valid usage poll" eligibility. Inherited unchanged from the base; reproduced by the reviewer. Fix separately: never let this branch overwrite state another path owns.
 - **LOW, hygiene.** `updateAccountTokens`' healing path clears `status`/`errorReason`/`_errorFromRefresh` but not a leftover `_authParkSeq`. Inert — the rollback guard's own `status !== 'error'` check blocks any later restore regardless — so it is stale state, not a bug.
 
 ## Rollback

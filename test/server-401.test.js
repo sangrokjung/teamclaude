@@ -214,6 +214,11 @@ test('a 401 cascade across the fleet parks nobody and does not loop', async () =
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    // Continuity ON: without it the loop breaks on `!continuity.enabled` and
+    // the fleet-wide auth check below is never load-bearing.
+    continuityMode: true,
+    continuityMaxWaitMs: 1500,
+    continuityMaxSleepMs: 50,
   });
   const proxyPort = await listen(proxy);
 
@@ -225,12 +230,11 @@ test('a 401 cascade across the fleet parks nobody and does not loop', async () =
       body: JSON.stringify({ model: 'x', messages: [] }),
     });
     const text = await res.text();
-    // Continuity deadline mode is ON by default (continuityMaxWaitMs = 15min).
-    // If the fleet-wide "everyone failed auth" checks stopped counting a
-    // non-parked 401 account, this request would sit in the capacity wait
-    // instead — surfacing as a multi-minute hang rather than a clear failure.
-    assert.ok(Date.now() - startedAt < 5_000,
-      `a request nobody authenticates must fail fast, took ${Date.now() - startedAt}ms`);
+    // With continuity enabled, if the fleet-wide "everyone failed auth" checks
+    // stopped counting a non-parked 401 account, this request would sit in the
+    // capacity wait until the deadline instead of surfacing its 401.
+    assert.ok(Date.now() - startedAt < 750,
+      `a request nobody authenticates must fail fast, took ${Date.now() - startedAt}ms of a 1500ms continuity deadline`);
     assert.equal(res.status, 401, 'a request nobody authenticates still surfaces 401, not a 429 backoff');
     assert.match(text, /stay in rotation/, 'the client message must not send the operator re-logging in');
     assert.deepEqual(
@@ -437,6 +441,66 @@ test('a cascade of refresh-succeeded-then-401 accounts parks nobody', async () =
     for (const [auth, count] of hits) {
       assert.equal(count, 2, `${auth} got ${count} hits — expected the original plus one post-refresh retry`);
     }
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The codex provider gates its pre-dispatch model fallback on
+// `fleetModelQuarantined()`, which counts "live" accounts. A cascade leaves a
+// 401'd account un-parked but excluded for this request, so that count has to
+// honour ctx.auth401 — otherwise the request neither fast-fails nor falls back
+// and instead waits out the continuity deadline (adversarial review 2026-09-05).
+// The shape that actually falsifies: the cascade must NOT make the fleet look
+// model-capable. Two accounts 401 (so they are excluded but deliberately not
+// parked) and a third, untouched account is model-quarantined for the requested
+// model. Only when fleetModelQuarantined() honours ctx.auth401 does the loop
+// see "nothing here can serve this model" and break; otherwise the two excluded
+// accounts still count as live model-capable candidates and the request waits
+// out the whole continuity deadline.
+test('a codex cascade does not leave the fleet looking model-capable', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    seen.push(req.headers['authorization'] || '');
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager([
+    { name: 'cx-a', provider: 'codex', type: 'oauth', accessToken: 'tok-a', expiresAt: Date.now() + 3600_000 },
+    { name: 'cx-b', provider: 'codex', type: 'oauth', accessToken: 'tok-b', expiresAt: Date.now() + 3600_000 },
+    { name: 'cx-c', provider: 'codex', type: 'oauth', accessToken: 'tok-c', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  am.markModelUnsupported(2, 'gpt-5.6'); // healthy, but cannot serve this model
+  const continuityMaxWaitMs = 1500;
+  const proxy = createProxyServer(am, {
+    provider: 'codex',
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    continuityMode: true,
+    continuityMaxWaitMs,
+    continuityMaxSleepMs: 50,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const startedAt = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    await res.text();
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < continuityMaxWaitMs / 2,
+      `the cascade must not be waited out; took ${elapsed}ms of a ${continuityMaxWaitMs}ms deadline`);
+    assert.deepEqual(am.accounts.filter(a => a.status === 'error').map(a => a.name), [],
+      'the cascade guard applies on the codex path too');
+    assert.ok(!seen.some(auth => auth.includes('tok-c')),
+      'the model-quarantined account must never be dispatched to');
   } finally {
     proxy.close();
     upstream.close();
