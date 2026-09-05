@@ -2187,6 +2187,17 @@ function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
 
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
+  // Fresh retry cycle = retryCount 0: the initial dispatch or ANY restart that
+  // recursed with 0 (fleet redemption, model fallback, continuity wait,
+  // overload backoff, network failover…). The one-shot backstop yield re-arms
+  // here — a single place no call site can forget — and only here plus
+  // restartRetryCycle() below; it stays armed inside a stale-429 cycle, which
+  // recurses with retryCount + 1.
+  if (retryCount === 0) ctx.resetCreditBackstopYielded = false;
+  const restartRetryCycle = () => {
+    retryCount = 0;
+    ctx.resetCreditBackstopYielded = false;
+  };
   if (ctx.provider === 'codex' && ctx.credentialType == null
       && accountManager.accounts.some(candidate => candidate.type === 'oauth'
         && accountManager._isModelUnsupported(candidate, ctx.model))) {
@@ -2301,8 +2312,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (pass.redeemed) {
         ctx.tried429.clear();
         ctx.tried5xx.clear();
-        ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
-        retryCount = 0;
+        restartRetryCycle();
         continue;
       }
     }
@@ -2313,7 +2323,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.model = fallback.model;
         ctx.tried429.clear();
         ctx.tried5xx.clear();
-        ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
         return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
     }
@@ -2357,8 +2366,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (!waited) break;
     ctx.tried429.clear();
     ctx.tried5xx.clear();
-    ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
-    retryCount = 0;
+    restartRetryCycle();
   }
   const releaseHeld = () => {
     if (ctx.held != null) {
@@ -2405,7 +2413,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.model = fallback.model;
         ctx.tried429.clear();
         ctx.tried5xx.clear();
-        ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
         return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
     }
@@ -2934,7 +2941,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             ctx.model = fallback.model;
             ctx.tried429.clear();
             ctx.tried5xx.clear();
-            ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
             return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
           }
         }
@@ -2963,7 +2969,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             return;
           }
           ctx.tried429.clear();
-          ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
           return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
         ctx.status = 429;
@@ -3096,7 +3101,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         if (waited) {
           ctx.tried429.clear();
           ctx.tried5xx.clear();
-          ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
           return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
       }
@@ -3207,7 +3211,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         await sleepOrAbort(waitMs, ctx.abortSignal);
         if (res.destroyed || ctx.abortSignal?.aborted) return;
         ctx.tried5xx.clear();
-        ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
         releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
@@ -3376,7 +3379,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           await sleepOrAbort(waitMs, ctx.abortSignal);
           if (res.destroyed || ctx.abortSignal?.aborted) return;
           ctx.tried5xx.clear();
-          ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
           return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
         ctx.status = 529;

@@ -553,26 +553,25 @@ test('sustained exhaustion storm with no resets: the backstop never spins, no cr
   }
 });
 
-test('structural guard: every fresh retry cycle in forwardRequest re-arms the one-shot backstop yield', async () => {
-  // The yield flag must be reset wherever the request's retry accounting
-  // restarts (retryCount = 0 or a recursion with retryCount 0), otherwise a
-  // legitimate later yield is blocked (Codex cross-model finding). Guard the
-  // rule structurally so a new fresh-cycle site cannot silently miss it.
+test('structural guard: the backstop yield can only be re-armed by the single fresh-cycle mechanism', async () => {
+  // Design (after the Codex cross-model review): a fresh retry cycle is
+  // defined by retryCount === 0 — re-armed once at forwardRequest entry (so
+  // any restart that recurses with 0 is covered without call-site discipline)
+  // and by restartRetryCycle() for in-loop restarts. Guard that no code path
+  // reintroduces a bare `retryCount = 0` or an ad-hoc flag reset.
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../src/server.js', import.meta.url), 'utf8');
-  const lines = source.split('\n');
-  const freshCycle = /(?:^\s*retryCount = 0;)|forwardRequest\(req, res, [\w.]+, accountManager, upstream, 0,/;
-  const misses = [];
-  let cycles = 0;
-  lines.forEach((line, i) => {
-    if (!freshCycle.test(line)) return;
-    const window = lines.slice(Math.max(0, i - 6), i + 1).join('\n');
-    // A fresh RETRY cycle always clears a tried set; the request handler's
-    // initial dispatch (retryCount 0, no tried set) is not one.
-    if (!/tried(429|5xx)\.clear\(\)/.test(window)) return;
-    cycles += 1;
-    if (!/resetCreditBackstopYielded = false/.test(window)) misses.push(`${i + 1}: ${line.trim()}`);
-  });
-  assert.ok(cycles >= 9, `expected to find the known fresh-cycle sites, found ${cycles}`);
-  assert.deepEqual(misses, [], `fresh-cycle sites without a re-arm:\n${misses.join('\n')}`);
+  const bareResets = source.match(/^\s*retryCount = 0;\s*$/gm) || [];
+  assert.equal(bareResets.length, 1, `only restartRetryCycle() may assign retryCount = 0 (found ${bareResets.length})`);
+  const reArms = source.match(/resetCreditBackstopYielded = false/g) || [];
+  assert.equal(reArms.length, 2, `exactly two re-arm sites: entry + restartRetryCycle (found ${reArms.length})`);
+  assert.match(source, /if \(retryCount === 0\) ctx\.resetCreditBackstopYielded = false;/, 'entry re-arm present');
+  assert.match(source, /const restartRetryCycle = \(\) => \{\s*retryCount = 0;\s*ctx\.resetCreditBackstopYielded = false;\s*\};/, 'helper present');
+  const helperUses = source.match(/restartRetryCycle\(\);/g) || [];
+  assert.ok(helperUses.length >= 2, `in-loop restarts use the helper (found ${helperUses.length})`);
+  // Every recursion that restarts the cycle passes retryCount 0 to forwardRequest
+  // (multi-line safe): the entry re-arm covers them all, so just assert they
+  // still exist as recursions with a literal 0 in the retryCount position.
+  const restarts = source.match(/forwardRequest\(\s*req,\s*res,\s*[^,]+,\s*accountManager,\s*upstream,\s*0,/g) || [];
+  assert.ok(restarts.length >= 7, `restart recursions found: ${restarts.length}`);
 });
