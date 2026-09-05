@@ -108,6 +108,16 @@
   `tried5xx` is cleared), so it blocks only repeated yields inside the same
   stale-429 cycle. Test: two operator resets landing mid-flight, both
   stale-retry-to-cap sequences yield, request finally served.
+- Cross-model pass on the re-arm (Codex): the 8 re-arm sites are bounded
+  progress points and the stale-429 recursion passes through none of them,
+  but the model-quota continuity success path (`tried429.clear()` +
+  `forwardRequest(…, 0, …)`, Anthropic model-scoped windows) was missed.
+  Fixed in round 10 with the same re-arm plus a structural test that every
+  fresh retry cycle (a `retryCount = 0` / recursion-with-0 next to a tried-set
+  clear) carries the re-arm, and a sustained-storm test (2 exhausted
+  accounts, unknown counts, no resets → fail-fast inside the budget, zero
+  consume POSTs, yields bounded by wait cycles). A log line now marks each
+  backstop yield.
 
 ## Incident / motivation
 

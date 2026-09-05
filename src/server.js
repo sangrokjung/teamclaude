@@ -2963,6 +2963,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             return;
           }
           ctx.tried429.clear();
+          ctx.resetCreditBackstopYielded = false; // fresh cycle: the one-shot yield re-arms
           return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
         }
         ctx.status = 429;

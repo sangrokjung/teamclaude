@@ -552,3 +552,27 @@ test('sustained exhaustion storm with no resets: the backstop never spins, no cr
     console.log = original;
   }
 });
+
+test('structural guard: every fresh retry cycle in forwardRequest re-arms the one-shot backstop yield', async () => {
+  // The yield flag must be reset wherever the request's retry accounting
+  // restarts (retryCount = 0 or a recursion with retryCount 0), otherwise a
+  // legitimate later yield is blocked (Codex cross-model finding). Guard the
+  // rule structurally so a new fresh-cycle site cannot silently miss it.
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../src/server.js', import.meta.url), 'utf8');
+  const lines = source.split('\n');
+  const freshCycle = /(?:^\s*retryCount = 0;)|forwardRequest\(req, res, [\w.]+, accountManager, upstream, 0,/;
+  const misses = [];
+  let cycles = 0;
+  lines.forEach((line, i) => {
+    if (!freshCycle.test(line)) return;
+    const window = lines.slice(Math.max(0, i - 6), i + 1).join('\n');
+    // A fresh RETRY cycle always clears a tried set; the request handler's
+    // initial dispatch (retryCount 0, no tried set) is not one.
+    if (!/tried(429|5xx)\.clear\(\)/.test(window)) return;
+    cycles += 1;
+    if (!/resetCreditBackstopYielded = false/.test(window)) misses.push(`${i + 1}: ${line.trim()}`);
+  });
+  assert.ok(cycles >= 9, `expected to find the known fresh-cycle sites, found ${cycles}`);
+  assert.deepEqual(misses, [], `fresh-cycle sites without a re-arm:\n${misses.join('\n')}`);
+});
