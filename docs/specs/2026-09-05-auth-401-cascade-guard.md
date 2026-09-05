@@ -3,27 +3,26 @@
 Status: implemented
 Date: 2026-09-05
 Area: `src/server.js` (`forwardRequest` 401 handler)
-Severity: incident-driven (production outage of 9/16 Claude accounts)
+Severity: incident-driven (most of a production pool parked at once)
 
 ## Incident
 
-2026-09-05 21:25 KST, the Claude pool (16 accounts) dropped to 7 usable. Nine
-accounts were parked with `status='error'`, `errorReason='auth-rejected'` inside
-a few seconds, all with the same `lastUsed` minute. `teamclaude-daemon.out.log`
-lines 21443–21483 show what happened: a SINGLE request walked the failover chain
-and every account it touched answered 401.
+2026-09-05, a production pool lost most of its usable accounts within seconds.
+Each of them was marked `status='error'`, `errorReason='auth-rejected'`, all
+sharing the same `lastUsed` minute. The daemon log shows what happened: a SINGLE
+request walked the failover chain and every account it touched answered 401.
 
 ```
 401 on "<account-1>" — forcing token refresh and retrying
 Token refreshed for account "<account-1>"        ← the refresh SUCCEEDED
 401 on "<account-1>" — auth failed, marking account error
 Switched to account "<account-2>" (current unavailable)
-... identical block, 9 accounts in a row ...
+... identical block, account after account ...
 Model fallback: claude-opus-5 → claude-sonnet-5 (no usable account)
 ```
 
-Post-incident probe (2026-09-05 22:5x, three of the parked accounts, same OAuth
-headers the proxy sends): `POST https://api.anthropic.com/v1/messages` returned
+Post-incident probe (a sample of the parked accounts, same OAuth headers the
+proxy sends): `POST https://api.anthropic.com/v1/messages` returned
 **200 OK on every one**. The credentials were never bad. The 401s were a
 transient upstream condition, and the pool stayed crippled for ~1.5h because a
 request-path auth error is deliberately not self-healing (only `reauth`,

@@ -166,7 +166,7 @@ const REQUEST_LOG_BODY_BYTES = 16 * 1024;
 // request is account-scoped evidence; two independent accounts rejecting the
 // SAME request is evidence about the only variable they share. See
 // docs/specs/2026-09-05-auth-401-cascade-guard.md (2026-09-05 incident: one
-// request parked 9 of 16 accounts whose tokens were later proven still valid).
+// request parked most of a pool whose tokens were later proven still valid).
 const AUTH_401_CASCADE_THRESHOLD = 2;
 // Monotonic stamp identifying WHICH request performed a given 401 park, so a
 // cascade rollback only reverts a park it still owns. Process-wide and never
