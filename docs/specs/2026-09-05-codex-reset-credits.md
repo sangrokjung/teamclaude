@@ -25,6 +25,14 @@
   `codexResetCreditsTimeoutMs` was undocumented. Coverage gaps closed:
   restart snapshot import, non-loopback 403 (worker + supervisor),
   concurrency, and the "reset not honoured" bound.
+- Review round 2 (commit `a912a0a`, 2 fresh lenses + 2 refuters per finding):
+  all 11 round-1 fixes confirmed to hold; 3 residual defects fixed in round 3:
+  the account-policy redemption did not count as the request's single pass
+  (a second credit could be spent at the following dead end — 2 per request,
+  not unbounded; live config uses the fleet policy so no production
+  exposure); the fleet walk kept spending after a concurrent operator/other
+  reset had already resolved the dead end (now yields when any account is
+  usable/capped). Tests added for both.
 
 ## Incident / motivation
 

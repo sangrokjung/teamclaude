@@ -749,6 +749,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const result = await redeemCodexResetCredit(candidate, reason, { enforceEligibility: true, model });
       if (result.reset) return true;
       if (result.kind !== 'no-spend') return false;
+      // The dead end may have been resolved by someone else (operator reset,
+      // another request's pass, a window rollover) while this attempt was in
+      // flight: yield to the routable account instead of spending on the next.
+      if (accountManager.anyUsable(null, model) || accountManager.anyCapped(null, model)) return true;
     }
     return false;
   }
@@ -2930,6 +2934,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             && !ctx.resetCreditRetried.has(account)
             && await ctx.resetCredits.account(account, '429-exhausted', ctx.model)) {
           ctx.resetCreditRetried.add(account);
+          // This redemption IS the request's single pass: if the retry still
+          // 429s, the acquisition dead end must fail fast, not spend again.
+          ctx.resetCreditAttempts = Math.max(ctx.resetCreditAttempts, 1);
           if (res.destroyed) return;
           if (logDir) {
             appendLogSection(`=== RESPONSE 429 — account quota exhausted, reset credit redeemed, retrying same account ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);

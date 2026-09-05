@@ -461,3 +461,55 @@ test('operator endpoint: a non-loopback caller is refused before any backend cal
     await Promise.all([closeServer(proxy), closeServer(upstream)]);
   }
 });
+
+test('account policy with a second exhausted account: an unhonoured reset still spends only ONE credit', async () => {
+  const am = new AccountManager(makeCodexAccounts(2));
+  am.accounts[0].quota.codexResetCredits = 3; // healthy, serves first
+  am.accounts[1].quota.unified7d = 1;
+  am.accounts[1].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[1].quota.unified5h = 0.1;
+  am.accounts[1].quota.unified5hReset = Date.now() + HOUR;
+  am.accounts[1].quota.codexResetCredits = 3;
+  await withProxy(am, { responses: () => ({ status: 429 }) }, { codexResetCreditsPolicy: 'account' },
+    async ({ proxyPort, calls }) => {
+      const r = await postResponses(proxyPort);
+      assert.equal(r.status, 429, r.text);
+      assert.equal(r.json?.error?.type, 'usage_limit_reached', r.text);
+      assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0'], 'the account-path redemption is the request\'s single pass');
+      assert.equal(am.accounts[1].quota.codexResetCredits, 3, 'the exhausted account keeps its credits');
+      assert.ok(r.elapsedMs < 3000, `answered in ${r.elapsedMs}ms`);
+    });
+});
+
+test('fleet walk yields to an account that became routable while a no-spend attempt was in flight', async () => {
+  const am = new AccountManager(makeCodexAccounts(3));
+  exhaustWeekly(am, Date.now() + 60 * HOUR, [3, 2, 2]); // ranks codex-0 first, then codex-1, codex-2
+  let releaseFirst = null;
+  const firstInFlight = new Promise(resolve => { releaseFirst = resolve; });
+  let unblockFirst = null;
+  const firstMayAnswer = new Promise(resolve => { unblockFirst = resolve; });
+  await withProxy(am, {
+    consume: async (n, token) => {
+      if (token === 'Bearer tok-0') {
+        releaseFirst();
+        await firstMayAnswer;
+        return { status: 200, body: { code: 'nothing_to_reset', windows_reset: 0 } };
+      }
+      return { status: 200, body: { code: 'reset', windows_reset: 2 } };
+    },
+  }, {}, async ({ proxyPort, calls }) => {
+    const pending = postResponses(proxyPort);
+    await firstInFlight;
+    // The operator resets codex-1 while codex-0's (slow, no-spend) attempt is in flight.
+    const operator = await fetch(`http://127.0.0.1:${proxyPort}/teamclaude/codex/reset-credit?account=codex-1`, {
+      method: 'POST', headers: { 'x-api-key': 'k' },
+    });
+    assert.equal(operator.status, 200, await operator.text());
+    unblockFirst();
+    const r = await pending;
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0', 'Bearer tok-1'], 'codex-2 is never charged');
+    assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-1'], 'served by the account the operator reset');
+    assert.equal(am.accounts[2].quota.codexResetCredits, 2);
+  });
+});
