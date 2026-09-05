@@ -1008,7 +1008,9 @@ rediscover:
   `${ENV_VAR}` and `!<command>` (the command's stdout becomes the value, 10s
   timeout), so a two-line script that prints the key from
   `~/.config/teamclaude.json` keeps the secret in exactly one place. Use an
-  absolute path — this is not run through a shell that expands `~`.
+  absolute path. The command *is* run through `/bin/sh -c` (Node's
+  `child_process.exec`), so a leading `~` would in fact expand — pin the path
+  anyway rather than depend on which `$HOME` the Aside daemon process sees.
   ```bash
   #!/bin/sh
   # chmod 700 this file, then reference it as "!/absolute/path/to/it"
