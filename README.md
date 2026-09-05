@@ -159,6 +159,7 @@ cannot read that path.
 - **Use-or-lose account priority** — measures each account once at startup, then prioritizes the account whose weekly (7d) quota resets soonest (then soonest session reset, then lowest usage), so quota about to renew unused is drained first; re-evaluates every 5 minutes and switches immediately when the active account reaches the quota threshold (default 98%). Pin explicit ranks in the TUI (`o`) or via `teamclaude priority` for the accounts you want first — everything unranked stays on this automatic (`auto`) ordering
 - **Codex subscription pooling** — `teamclaude codex ...` manages a separate ChatGPT OAuth account pool, injects each account's bearer token and `ChatGPT-Account-ID`, tracks the official `x-codex-primary-*` / `x-codex-secondary-*` windows, and fails exhausted requests over to the next Codex subscription
 - **Instant failover on 429** — an exhausted account (token quota hit) is throttled for its `retry-after` (clamped to 1s–5m) and skipped; a rate/concurrency 429 (quota left but hit too fast) tries up to `rateLimitFailovers` alternate accounts so concurrent overflow spreads instead of erroring. After that budget, transient/global 429s keep the original model, never throttle the fleet, and are retried internally within the bounded continuity deadline
+- **Fleet-wide usage-limit fail-fast** — when every account is blocked by a *known* quota reset or throttle that lands beyond the remaining continuity budget, the request stops polling immediately instead of sleeping out `continuityMaxWaitMs`. In Codex mode that dead end answers `429 {"error":{"type":"usage_limit_reached","plan_type":…,"resets_at":<unix seconds>}}` — the shape the Codex CLI renders as its own "You've hit your usage limit … Try again at <local time>" line instead of an opaque "exceeded retry limit". A fleet that is merely concurrency-capped, a model quarantine, and the Anthropic body are unchanged
 - **Cancellation-aware account health** — locally declared Codex cancellations stay usable through their paid end date, while terminal authentication evidence distinguishes `subscription-ended` from an ordinary credential error. Recoverable errors expose UUID-pinned re-authentication in the TUI
 - **Credential-free recovery status** — status, CLI, and TUI surfaces show the recovery action and safe reason without exposing tokens or stable account IDs
 - **Interactive TUI** — real-time dashboard with numbered account rows, color-coded quota bars showing usage %, reset countdowns, an activity log, and keyboard controls (switch, enable/disable, reorder accounts)
@@ -860,6 +861,86 @@ fresh-full fleet falls back before continuity sleeps. Semantics:
 - Fallback runs **before** a continuity-mode sleep when the cached fleet is fresh-full: rewriting to a served model beats sleeping until a weekly reset.
 - A fleet that is only locally capped or queued for concurrency keeps the original model. Unlabeled transient/global 429 recovery also keeps the original model and enters continuity after the account failover budget is handled, within `continuityMaxWaitMs`; no account state is poisoned.
 - Mind quality expectations when composing chains: a background agent may be fine falling all the way to a small model, but an interactive session usually is not — this fork's author runs `fable → opus` only, preferring a surfaced 429 (client retries/waits) over silently degrading below Opus.
+
+## Operations
+
+How this fork is operated in production. Detail lives in the runbooks, indexed by
+[`docs/README.md`](docs/README.md).
+
+### Production runs a frozen artifact, not this checkout
+
+The launchd service `com.qjc.teamcodex` executes a content-addressed snapshot of
+`src/*.js` under `~/.local/share/teamcodex-runtime/artifacts/<sha256>/`, staged by
+a machine-local deployer. Merging a commit does not deploy it. Resolve what is
+running by hash, never by branch name. Use `GET`, not `HEAD`: the status fast path
+is gated on `req.method === 'GET'`, so `curl -I` is forwarded upstream instead and
+comes back without the hash header.
+
+```bash
+curl -s -D - -o /dev/null http://127.0.0.1:3457/teamclaude/status \
+  | grep -i x-teamcodex-source-hash
+```
+
+Reproduce that hash from a candidate commit (sort `src/*.js` by filename, then
+sha256 over `(filename\0content\0)` for each file) to identify its source, and
+compare it against the deployment record. Artifact format, the automatic and
+manual rollout paths, the two known deployer defects, and rollback are in
+[TeamCodex runtime deployment](docs/runbooks/teamcodex-runtime-deployment.md).
+
+### Branch lineages (2026-09-05)
+
+The branch you are reading is probably not the code that is running. The default
+branch and `master` share an old merge base (`e15f4ff`, 2026-07-31) and have
+diverged in both directions since.
+
+| Branch | What it is | `src/*.js` |
+|---|---|---|
+| `qjc/resilient-routing` | GitHub default branch and public face; richest feature set | 20 |
+| `master` | Older, smaller lineage. No subscription tracking, reauth, worker health, codex recovery, or claude wrapper. The usage-limit fail-fast (PRs #16/#17) merged here | 15 |
+| `fix/teamcodex-status-identity-release-20260902` | Commit `182cd3b`, source of the frozen artifact that ran until 2026-09-05 | 20 |
+| `prod/codex-usage-limit-fail-fast-20260905` | `182cd3b` plus the usage-limit fail-fast; source of artifact `adea84fd…`, rolled out 2026-09-05 16:05 KST | 20 |
+| `snapshot/local-worktree-20260905` | Uploaded local work (Grok/Agy provider pools, reauth, worker health, docs); not merged anywhere | 20+ |
+| `docs/ops-and-readme-20260905` | Brings the fail-fast and these docs onto the default branch | 20 |
+
+### Pool health monitoring
+
+The proxy keeps answering on its port long after its accounts stop being able to
+serve, so a liveness probe reports green straight through a total pool outage.
+Whatever monitor you run, alert on account health read from
+`GET /teamclaude/status`:
+
+| Signal | Where | Why it matters |
+|---|---|---|
+| Nothing can serve | `usableCount` at or near `0` | The next request gets a 429 |
+| Weekly pressure | mean `accounts[].quota.unified7d` over windows whose `unified7dReset` is still in the future | The only warning that arrives while adding a subscription still *prevents* the outage instead of ending it |
+| Parked account | `accounts[].status == "error"`, with `errorReason` (e.g. `subscription-ended`) | The proxy cannot self-heal this; it needs a re-login or a subscription fix |
+| Shrinking pool | `accounts[].subscription.state == "scheduled"` with `endsAt` | Capacity disappears on a known date |
+| Broken refresh chain | `expiresAt` already in the past in the pool config | Only a re-login fixes it |
+
+Alert, do not automate: a re-login needs a browser and restarting the proxy kills
+live sessions, so both are human decisions. Account names are redacted from the
+status payload unless the caller presents the proxy API key together with
+`x-teamcodex-status-identity: 1`.
+
+### When the pool runs dry
+
+```bash
+curl -s http://127.0.0.1:3457/teamclaude/status \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["usableCount"],"/",d["totalCount"])'
+```
+
+`usableCount == 0` is quota or subscription, not plumbing. Restarting the proxy,
+reviving the tunnel, re-bootstrapping launchd, and switching model all leave it
+unchanged: the pool cannot manufacture quota. There are three independent moves.
+Add or renew a pooled subscription (`teamcodex codex login`), or disable an
+account that was downgraded or cancelled so it stops occupying a slot, or wait
+for the weekly reset. Disabling only frees the slot, it does not return spent
+usage, so on its own it will not bring an exhausted pool back. Full diagnosis in
+the [pool exhaustion runbook](docs/runbooks/codex-pool-exhaustion.md).
+
+The published binary is `teamcodex`, and the Codex pool is selected by the
+`codex` subcommand, so the Operations commands here read `teamcodex codex …`.
+An install under the `teamclaude` name takes the same `codex` subcommand.
 
 ## How It Works
 

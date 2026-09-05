@@ -32,7 +32,7 @@
   revives), so the manual rollout waits for the teardown and retries. Evidence
   on this lineage: 16 test files sequential = 342 pass / 0 fail, new file 6/6,
   eslint clean, independent adversarial review APPROVE. Post-deploy: a real
-  `codex exec` turn from studio2 through the tunnel completed (exit 0).
+  `codex exec` turn from a tunnelled second machine completed (exit 0).
 
 ## Incident
 
@@ -108,7 +108,6 @@ Requests" after a 15-minute hang.
 ## Test
 
 ```bash
-cd /private/tmp/teamclaude-codex-usage-limit
 node --test test/server-codex-usage-limit.test.js test/server-codex.test.js \
   test/server-429.test.js test/server-model-fallback.test.js test/concurrency.test.js
 npx eslint src/ test/server-codex-usage-limit.test.js
