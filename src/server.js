@@ -1460,7 +1460,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set() };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -3014,13 +3014,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
         // Safety backstop: each retry throttles a distinct account, so
         // getActiveAccount returns null before this can fire. Cap anyway —
-        // EXCEPT when this request still holds an unspent reset-credit pass:
-        // retryCount is shared with non-throttling hops (5xx/auth/stale
-        // failovers), so under a 5xx burst it can hit the cap on the very
-        // 429 that empties the pool. Let ONE more recursion reach the
-        // acquisition dead end, where the redemption (or the Codex-native
-        // fail-fast body) is decided; the pass budget bounds it afterwards.
-        if (retryCount >= maxRetries && !(ctx.resetCredits && ctx.resetCreditAttempts < 1)) {
+        // EXCEPT, exactly once per request, when it still holds an unspent
+        // reset-credit pass: retryCount is shared with non-throttling hops
+        // (5xx/auth/stale failovers), so under a 5xx burst it can hit the cap
+        // on the very 429 that empties the pool. That single extra recursion
+        // reaches the acquisition dead end, where the redemption (or the
+        // Codex-native fail-fast body) is decided; the one-shot flag keeps a
+        // pathological stale-429 loop from bypassing the cap forever.
+        const yieldToPass = ctx.resetCredits && ctx.resetCreditAttempts < 1 && !ctx.resetCreditBackstopYielded;
+        if (retryCount >= maxRetries && yieldToPass) ctx.resetCreditBackstopYielded = true;
+        if (retryCount >= maxRetries && !yieldToPass) {
           ctx.status = 429;
           const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold, ctx.model);
           if (!res.headersSent) {

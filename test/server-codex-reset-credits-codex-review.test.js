@@ -221,7 +221,7 @@ test('ledger durability: a restored "pending" stamp keeps the account inside its
     cooldownMs: 30 * 60 * 1000,
     isExhausted: a => after.isExhausted(a),
   });
-  assert.deepEqual(verdict, { eligible: false, reason: 'cooldown' });
+  assert.deepEqual(verdict, { eligible: false, reason: 'pending' }, 'fail-closed until a poll re-reads the count, whatever the cooldown');
 });
 
 test('fences hold for BOTH meters: a stale pre-reset 429 and a lagging accepted response carry 5h AND 7d at 100%', async () => {
@@ -385,4 +385,67 @@ test('the retry backstop yields once to an unspent redemption pass instead of th
     assert.equal(calls.consume.length, 1, 'still one credit for the episode');
     assert.equal(calls.responses.length, 4);
   });
+});
+
+test('an operator redemption on an account this request cannot use does not capture the automatic pass', async () => {
+  // codex-0 is quarantined for the model (operator resets it anyway, slowly);
+  // codex-1 is exhausted with credits. The automatic dead end must redeem on
+  // codex-1 instead of joining codex-0's in-flight redemption.
+  const am = new AccountManager(makeCodexAccounts(2));
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[0].quota.unified5h = 0.1;
+  am.accounts[0].quota.unified5hReset = Date.now() + 2 * HOUR;
+  am.accounts[0].quota.codexResetCredits = 3;
+  am.markModelUnsupported(am.accounts[0], 'gpt-5.6');
+  am.accounts[1].quota.unified7d = 1;
+  am.accounts[1].quota.unified7dReset = Date.now() + 60 * HOUR;
+  am.accounts[1].quota.unified5h = 0.1;
+  am.accounts[1].quota.unified5hReset = Date.now() + 2 * HOUR;
+  am.accounts[1].quota.codexResetCredits = 2;
+  let releaseOperator = null;
+  const operatorHeld = new Promise(resolve => { releaseOperator = resolve; });
+  await withProxy(am, {
+    consume: async (_n, token) => {
+      if (token === 'Bearer tok-0') await operatorHeld;
+      return { status: 200, body: { code: 'reset', windows_reset: 2 } };
+    },
+  }, {}, async ({ proxyPort, calls }) => {
+    const operator = fetch(`http://127.0.0.1:${proxyPort}/teamclaude/codex/reset-credit?account=codex-0`, {
+      method: 'POST', headers: { 'x-api-key': 'k' },
+    });
+    await waitFor(() => calls.consume.length === 1);
+    const r = await postResponses(proxyPort); // automatic dead end while codex-0's redemption is in flight
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0', 'Bearer tok-1'], 'the automatic pass went to the account that can serve');
+    assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-1']);
+    releaseOperator();
+    assert.equal((await operator).status, 200);
+  });
+});
+
+test('restart with cooldown 0: a restored "pending" stamp blocks redemption until the poll re-reads the count', async () => {
+  const before = new AccountManager(makeCodexAccounts(1));
+  exhaustBoth(before, Date.now() + 60 * HOUR, [3]);
+  before.accounts[0].quota.codexResetCreditLastAt = Date.now() - 5_000;
+  before.accounts[0].quota.codexResetCreditLastOutcome = 'pending';
+  before.accounts[0].quota.codexResetCreditsAt = Date.now() - 60_000;
+  const snapshot = JSON.parse(JSON.stringify(before.exportQuotaState()));
+  const restored = new AccountManager(makeCodexAccounts(1));
+  restored.importQuotaState(snapshot);
+  await withProxy(restored, {}, { codexResetCreditsCooldownMs: 0 }, async ({ proxyPort, calls }) => {
+    const r = await postResponses(proxyPort);
+    assert.equal(r.status, 429, r.text);
+    assert.equal(calls.consume.length, 0, 'fail-closed: no second redemption before the count is reconciled');
+  });
+  // The authoritative poll re-reads the count (2 left, still 100%) → eligible again.
+  const polled = new AccountManager(makeCodexAccounts(1));
+  polled.importQuotaState(snapshot);
+  await withProxy(polled, { usage: () => ({ used: 100, credits: 2 }) },
+    { codexResetCreditsCooldownMs: 0, codexUsageRefresh: true, warmupIntervalMs: 0 }, async ({ proxyPort, calls }) => {
+      await waitFor(() => polled.accounts[0].quota.codexResetCreditsAt > polled.accounts[0].quota.codexResetCreditLastAt);
+      const r = await postResponses(proxyPort);
+      assert.equal(r.status, 200, r.text);
+      assert.equal(calls.consume.length, 1, 'a reconciled count allows the (operator-chosen cooldown 0) redemption');
+    });
 });

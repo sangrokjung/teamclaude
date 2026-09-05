@@ -97,24 +97,47 @@ export function codexResetCreditEligibility(account, {
   if (account.status === 'error') return { eligible: false, reason: 'error' };
   if (account.authRevoked === true) return { eligible: false, reason: 'auth-revoked' };
   if (!account.credential) return { eligible: false, reason: 'no-credential' };
-  // A redemption already in flight on this account is joinable (single-flight
-  // shares its outcome) — judged before the cooldown, because the durable
-  // "pending" stamp written just before the consume POST would otherwise make
-  // every concurrent dead end miss the very redemption that will serve it.
-  if (account._resetCreditPromise) return { eligible: true, reason: 'in-flight' };
   const quota = account.quota || {};
-  const credits = quota.codexResetCredits;
-  if (!Number.isInteger(credits)) return { eligible: false, reason: 'credits-unknown' };
-  if (credits <= reserve) return { eligible: false, reason: credits === 0 ? 'no-credits' : 'reserved' };
-  const lastAt = Number.isFinite(quota.codexResetCreditLastAt) ? quota.codexResetCreditLastAt : 0;
-  if (cooldownMs > 0 && now - lastAt < cooldownMs) return { eligible: false, reason: 'cooldown' };
+  // A redemption already in flight on this account is joinable (single-flight
+  // shares its outcome): the ledger guards (credit count, reserve, pending,
+  // cooldown) are skipped for a joiner — the durable "pending" stamp written
+  // just before the consume POST would otherwise make every concurrent dead
+  // end miss the very redemption that will serve it. The REQUEST-side guards
+  // (can this account serve the model, is it actually exhausted) still apply,
+  // so an operator-initiated redemption on a healthy or quarantined account
+  // cannot capture an automatic request's single pass.
+  const inFlight = Boolean(account._resetCreditPromise);
+  if (!inFlight) {
+    const credits = quota.codexResetCredits;
+    if (!Number.isInteger(credits)) return { eligible: false, reason: 'credits-unknown' };
+    if (credits <= reserve) return { eligible: false, reason: credits === 0 ? 'no-credits' : 'reserved' };
+    if (isCodexResetCreditPending(quota, now)) return { eligible: false, reason: 'pending' };
+    const lastAt = Number.isFinite(quota.codexResetCreditLastAt) ? quota.codexResetCreditLastAt : 0;
+    if (cooldownMs > 0 && now - lastAt < cooldownMs) return { eligible: false, reason: 'cooldown' };
+  }
   if (typeof canServe === 'function' && canServe(account) !== true) {
     return { eligible: false, reason: 'cannot-serve' };
   }
   if (!isCodexAccountExhausted(account, { now, isExhausted })) {
     return { eligible: false, reason: 'not-exhausted' };
   }
-  return { eligible: true, reason: 'ok' };
+  return { eligible: true, reason: inFlight ? 'in-flight' : 'ok' };
+}
+
+// A restored "pending" stamp (the process died between the consume POST and
+// the outcome) is FAIL-CLOSED regardless of the configured cooldown: the
+// credit may already be gone. It resolves only when an authoritative
+// wham/usage poll has re-read the credit count after the stamp
+// (codexResetCreditsAt > codexResetCreditLastAt) or when the pending TTL
+// has passed (no polling configured).
+export const CODEX_RESET_CREDIT_PENDING_TTL_MS = 15 * 60 * 1000;
+
+export function isCodexResetCreditPending(quota, now = Date.now(), ttlMs = CODEX_RESET_CREDIT_PENDING_TTL_MS) {
+  if (quota?.codexResetCreditLastOutcome !== 'pending') return false;
+  const stampedAt = Number.isFinite(quota.codexResetCreditLastAt) ? quota.codexResetCreditLastAt : 0;
+  const polledAt = Number.isFinite(quota.codexResetCreditsAt) ? quota.codexResetCreditsAt : 0;
+  if (polledAt > stampedAt) return false;
+  return now - stampedAt < ttlMs;
 }
 
 /**

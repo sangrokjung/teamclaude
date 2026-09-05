@@ -87,6 +87,16 @@
      headers are shown not to impersonate loopback. (Codex's "rank by most
      exhausted" expectation is not the contract — every candidate is already
      at/over the threshold; ranking is by credits, then latest reset.)
+- Cross-model follow-up (Codex, on the fixes): REQUEST_CHANGES with three
+  HIGHs, all fixed in round 8: the backstop yield is now one-shot per
+  request (`ctx.resetCreditBackstopYielded`), so a pathological stale-429 loop
+  cannot bypass the cap forever; a restored `pending` stamp is FAIL-CLOSED
+  regardless of `codexResetCreditsCooldownMs` until an authoritative poll has
+  re-read the credit count after the stamp (or a 15-min TTL passes without
+  polling); and the in-flight join rule skips only the ledger guards
+  (count/reserve/pending/cooldown) while `canServe` and exhaustion still
+  apply, so an operator redemption on a healthy or quarantined account cannot
+  capture an automatic request's single pass. Tests added for all three.
 
 ## Incident / motivation
 

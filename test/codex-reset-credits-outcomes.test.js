@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import {
   CODEX_RESET_CREDIT_GRACE_MS,
+  CODEX_RESET_CREDIT_PENDING_TTL_MS,
   applyCodexResetCreditOutcome,
   codexResetCreditEligibility,
   codexResetCreditOutcomeKind,
   describeCodexResetCreditCandidates,
+  isCodexResetCreditPending,
   rankCodexResetCreditCandidates,
   withinCodexResetCreditGrace,
 } from '../src/codex-reset-credits.js';
@@ -123,13 +125,41 @@ test('eligibility: canServe excludes accounts that cannot serve the request (mod
     ['a:cannot-serve', 'b:ok']);
 });
 
-test('eligibility: an in-flight redemption on the account is joinable even inside the cooldown', () => {
+test('eligibility: an in-flight redemption is joinable past the ledger guards, but not past canServe/exhausted', () => {
   const opts = { now: Date.now(), cooldownMs: 30 * 60 * 1000, isExhausted: () => true };
   const busy = codexAccount();
   busy.quota.codexResetCreditLastAt = Date.now(); // the durable "pending" stamp
   busy.quota.codexResetCreditLastOutcome = 'pending';
-  assert.equal(codexResetCreditEligibility(busy, opts).reason, 'cooldown', 'no promise → the stamp is a real cooldown');
+  assert.equal(codexResetCreditEligibility(busy, opts).reason, 'pending', 'no promise → the stamp is fail-closed');
   busy._resetCreditPromise = Promise.resolve({ reset: true, kind: 'reset' });
   assert.deepEqual(codexResetCreditEligibility(busy, opts), { eligible: true, reason: 'in-flight' });
   assert.deepEqual(rankCodexResetCreditCandidates([busy], opts).map(a => a.name), ['codex-0']);
+  assert.equal(codexResetCreditEligibility(busy, { ...opts, canServe: () => false }).reason, 'cannot-serve',
+    'an operator redemption on a quarantined account is not a candidate for this request');
+  assert.equal(codexResetCreditEligibility(busy, { ...opts, isExhausted: () => false }).reason, 'not-exhausted',
+    'an operator redemption on a healthy account is not a candidate either');
+  const disabled = codexAccount({ enabled: false }); disabled._resetCreditPromise = busy._resetCreditPromise;
+  assert.equal(codexResetCreditEligibility(disabled, opts).reason, 'disabled');
+});
+
+test('eligibility: a restored "pending" stamp is fail-closed regardless of the cooldown until a poll re-reads the count or the TTL passes', () => {
+  const now = Date.now();
+  const base = { now, cooldownMs: 0, isExhausted: () => true };
+  const a = codexAccount();
+  a.quota.codexResetCreditLastAt = now - 60_000;
+  a.quota.codexResetCreditLastOutcome = 'pending';
+  a.quota.codexResetCreditsAt = now - 120_000; // last poll predates the stamp
+  assert.equal(isCodexResetCreditPending(a.quota, now), true);
+  assert.equal(codexResetCreditEligibility(a, base).reason, 'pending', 'cooldown 0 does not reopen a pending stamp');
+  a.quota.codexResetCreditsAt = now - 10_000; // an authoritative poll landed after the stamp
+  assert.equal(isCodexResetCreditPending(a.quota, now), false);
+  assert.equal(codexResetCreditEligibility(a, base).reason, 'ok');
+  a.quota.codexResetCreditsAt = null; // no polling at all → the TTL resolves it
+  a.quota.codexResetCreditLastAt = now - CODEX_RESET_CREDIT_PENDING_TTL_MS - 1;
+  assert.equal(isCodexResetCreditPending(a.quota, now), false);
+  a.quota.codexResetCreditLastAt = now - 1000;
+  assert.equal(isCodexResetCreditPending(a.quota, now), true);
+  assert.equal(codexResetCreditEligibility(a, base).reason, 'pending');
+  a.quota.codexResetCreditLastOutcome = 'reset';
+  assert.equal(isCodexResetCreditPending(a.quota, now), false, 'only the pending outcome is fail-closed');
 });

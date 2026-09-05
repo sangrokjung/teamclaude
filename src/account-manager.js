@@ -108,7 +108,7 @@ function emptyQuota() {
     codexResetCredits: null,            // integer ≥ 0 | null
     codexResetCreditsAt: null,          // ms timestamp of the count above
     codexResetCreditLastAt: null,       // ms timestamp of the last redemption attempt
-    codexResetCreditLastOutcome: null,  // reset | reset_no_windows | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
+    codexResetCreditLastOutcome: null,  // pending (consume POST in flight / died mid-flight — fail-closed until a poll re-reads the count) | reset | reset_no_windows | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
     codexResetCreditsConsumed: 0,       // credits spent (reset or reset_no_windows) this snapshot lineage
     codexResetCreditResetAt: null,      // ms timestamp of the last EFFECTIVE reset (grace window + stale-response fence)
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
