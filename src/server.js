@@ -26,6 +26,7 @@ import {
   describeCodexResetCreditCandidates,
   normalizeCodexResetCreditsConfig,
   rankCodexResetCreditCandidates,
+  withinCodexResetCreditGrace,
 } from './codex-reset-credits.js';
 import {
   CODEX_INVOCATION_HEADER,
@@ -730,8 +731,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // attempt that may have spent a credit (spent-no-reset / indeterminate) —
   // moving on to the next account after those is the double-spend path.
   // Returns true when at least one account is routable again.
+  // Returns { redeemed, chargePass }: `chargePass` is true when at least one
+  // attempt may have spent a credit (reset / spent-no-reset / indeterminate),
+  // so the caller charges the request's single pass only for spend-capable
+  // work — a walk with no eligible candidate leaves the pass unspent.
   async function redeemCodexResetCreditForFleet(accounts, reason, model = null, resolved = null) {
-    if (!resetCredits.enabled || warmupClosed) return false;
+    const nothing = { redeemed: false, chargePass: false };
+    if (!resetCredits.enabled || warmupClosed) return nothing;
     // "Has the dead end been resolved by someone else?" — judged with the
     // CALLER's request scope (credential-type exclusions etc.), never with a
     // pool-wide view that could see an account this request cannot use.
@@ -746,21 +752,21 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         resetCreditNoCandidateLoggedAt = now;
         console.log(`[TeamCodex] Reset credit: no eligible account at the quota dead end (${describeCodexResetCreditCandidates(accounts, options).join(', ') || 'no codex accounts'})`);
       }
-      return false;
+      return nothing;
     }
     for (const candidate of candidates) {
       // Re-judge right before acting: another request or the operator
       // endpoint may have redeemed (or exhausted the credits of) this
       // candidate while an earlier candidate's consume was in flight.
       const result = await redeemCodexResetCredit(candidate, reason, { enforceEligibility: true, model });
-      if (result.reset) return true;
-      if (result.kind !== 'no-spend') return false;
+      if (result.reset) return { redeemed: true, chargePass: true };
+      if (result.kind !== 'no-spend') return { redeemed: false, chargePass: true };
       // The dead end may have been resolved by someone else (operator reset,
       // another request's pass, a window rollover) while this attempt was in
       // flight: yield to the routable account instead of spending on the next.
-      if (deadEndResolved()) return true;
+      if (deadEndResolved()) return { redeemed: true, chargePass: false };
     }
-    return false;
+    return nothing;
   }
 
   // Handed to forwardRequest through ctx: null when automatic redemption is
@@ -2264,15 +2270,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // quarantine is not a quota problem — let the model fallback handle it.
     if (!allAuthFailed && modelDeadEnd && ctx.resetCredits
         && ctx.resetCreditAttempts < 1 && !fleetModelQuarantined()) {
-      ctx.resetCreditAttempts += 1;
-      const redeemed = await ctx.resetCredits.fleet(
+      const pass = await ctx.resetCredits.fleet(
         accts,
         'fleet-exhausted',
         ctx.model,
         () => hasUsable(null) || hasCapped(null), // request-scoped "dead end resolved?"
       );
+      // Only spend-capable work uses up the pass; a walk that found no
+      // eligible candidate leaves it for a later account-policy redemption.
+      if (pass.chargePass) ctx.resetCreditAttempts += 1;
       if (ctx.abortSignal?.aborted || res.destroyed) return;
-      if (redeemed) {
+      if (pass.redeemed) {
         ctx.tried429.clear();
         ctx.tried5xx.clear();
         retryCount = 0;
@@ -2608,6 +2616,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const staleAfterReset = ctx.provider === 'codex'
       && Number.isFinite(account.quota?.codexResetCreditResetAt)
       && dispatchedAt < account.quota.codexResetCreditResetAt;
+    // Inside the post-reset grace an ACCEPTED (non-429) response may still
+    // carry the pre-reset meter in its x-codex-* headers; folding it would
+    // re-mark the reset account at 100% and the authoritative poll could no
+    // longer lower it (it only refuses to RAISE). A 429 is folded regardless:
+    // the rejection itself is the evidence that the reset did not take.
+    const holdHeaderFold = staleAfterReset
+      || (ctx.provider === 'codex' && upstreamRes.status !== 429
+        && withinCodexResetCreditGrace(account.quota));
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -2624,7 +2640,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
       ctx.sawModelWeekly = true;
     }
-    if (!staleAfterReset) accountManager.updateQuota(account, rateLimitHeaders);
+    if (!holdHeaderFold) accountManager.updateQuota(account, rateLimitHeaders);
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token

@@ -603,3 +603,60 @@ test('the post-reset refresh that only reports legitimate new usage is not logge
     assert.equal(logs.lines.filter(l => l.includes('usage refresh failed')).length, 0, logs.lines.join('\n'));
   });
 });
+
+test('a fleet walk with no eligible candidate leaves the request\'s pass for a later account-policy redemption', async () => {
+  const am = new AccountManager(makeCodexAccounts(1));
+  const a = am.accounts[0];
+  a.quota.unified7d = 1;
+  a.quota.unified7dReset = Date.now() + 150; // the window rolls over while the request waits
+  a.quota.unified5h = 0.1;
+  a.quota.unified5hReset = Date.now() + HOUR;
+  a.quota.codexResetCredits = null; // no wham/usage poll yet → the fleet walk has no candidate
+  await withProxy(am, {
+    responses: (n, _token, res) => {
+      if (n !== 1) return { status: 200 };
+      // The count becomes known (a poll landed) only once the rolled-over
+      // account is already serving — so the 429 branch, not the fleet walk,
+      // is the first redemption opportunity.
+      a.quota.codexResetCredits = 3;
+      setTimeout(() => exhaustion429(res), 5);
+      return 'handled';
+    },
+  },
+    { codexResetCreditsPolicy: 'account', continuityMaxSleepMs: 10, continuityMaxWaitMs: 5000 },
+    async ({ proxyPort, calls, logs }) => {
+      const r = await postResponses(proxyPort);
+      assert.equal(r.status, 200, `${r.text}\n${logs.lines.join('\n')}`);
+      assert.ok(logs.lines.some(l => l.includes('no eligible account') && l.includes('credits-unknown')), logs.lines.join('\n'));
+      assert.deepEqual(calls.consume.map(c => c.token), ['Bearer tok-0'], 'the 429-branch redemption still had its pass');
+      assert.ok(logs.lines.some(l => l.includes('429-exhausted')), 'redeemed by the account branch, not the fleet walk');
+      assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-0', 'Bearer tok-0']);
+    });
+});
+
+test('a lagging meter in the headers of an ACCEPTED post-reset response cannot re-mark the reset account', async () => {
+  const am = new AccountManager(makeCodexAccounts(2));
+  exhaustWeekly(am, Date.now() + 60 * HOUR, [3, 3]);
+  am.accounts[0].quota.unified7dReset = Date.now() + 70 * HOUR; // codex-0 ranks first
+  await withProxy(am, {
+    responses: (_n, _token, res) => {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'x-codex-primary-used-percent': '100', // backend meter still lagging
+        'x-codex-primary-window-minutes': '10080',
+        'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 60 * 3600),
+      });
+      res.end(JSON.stringify({ id: 'response-id', usage: { input_tokens: 1, output_tokens: 1 } }));
+      return 'handled';
+    },
+  }, {}, async ({ proxyPort, calls }) => {
+    const first = await postResponses(proxyPort);
+    assert.equal(first.status, 200, first.text);
+    assert.equal(calls.consume.length, 1);
+    assert.equal(am.accounts[0].quota.unified7d, 0, 'the lagging 100% header was held back inside the grace');
+    const second = await postResponses(proxyPort);
+    assert.equal(second.status, 200, second.text);
+    assert.equal(calls.consume.length, 1, 'no second credit on the other account');
+    assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-0', 'Bearer tok-0']);
+  });
+});
