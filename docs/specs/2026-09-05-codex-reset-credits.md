@@ -63,6 +63,30 @@
   consume once more on the same account (bounded at 2 no-spend POSTs per
   account per request, no credit spent, request still fails fast). The
   production config (fleet policy, 30-min cooldown) is not exposed.
+- Cross-model review (OpenAI Codex via `codex-reviewer`, read-only, two
+  batches): REQUEST_CHANGES — two implementation HIGHs and four test gaps,
+  all addressed in round 7:
+  1. The exhaustion-429 "safety backstop" (`retryCount >= maxRetries`,
+     legacy "All accounts throttled" body) shares `retryCount` with
+     non-throttling hops (5xx/auth/stale failovers), so under a 5xx burst it
+     could fire on the very 429 that empties the pool and answer before the
+     acquisition dead end ever ran the redemption. Fix: the cap yields ONE
+     extra recursion while the request's redemption pass is unspent; the pass
+     budget bounds it afterwards. Test: stale-429 retry meets a genuine
+     post-reset 429 at the cap → Codex-native body, one credit.
+  2. The redemption ledger (cooldown stamp, outcome, count) was only
+     persisted by the 60 s periodic snapshot and the exit handler (which does
+     not run on SIGKILL), so a crash right after the backend consumed a
+     credit could let a restart redeem the same account again. Fix: a
+     "pending" stamp is written and the host persists the quota snapshot
+     BEFORE the consume POST (`hooks.onResetCreditLedger`), and again right
+     after the outcome; a restored `pending` stamp is inside the cooldown.
+  3. Tests: the three fences and the grace are now exercised with BOTH the 5h
+     and the 7d meter at 100%; the operator route and an automatic dead end
+     are shown to share one in-flight redemption; forwarded-for style
+     headers are shown not to impersonate loopback. (Codex's "rank by most
+     exhausted" expectation is not the contract — every candidate is already
+     at/over the threshold; ranking is by credits, then latest reset.)
 
 ## Incident / motivation
 

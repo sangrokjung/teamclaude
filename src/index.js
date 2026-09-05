@@ -1525,6 +1525,18 @@ async function proxyWorkerCommand() {
   // Existing configs predate continuityMode; treat it as enabled unless the
   // operator explicitly opts out.
   config.continuityMode = config.continuityMode !== false;
+  // Reset-credit ledger writes (pending intent before the consume POST and
+  // the outcome right after) are persisted immediately: the periodic snapshot
+  // is 60 s apart and the exit handler never runs on SIGKILL, so without this
+  // a crash right after the backend consumed a credit would forget the
+  // cooldown and let a restart redeem the same account again.
+  hooks.onResetCreditLedger = () => {
+    try {
+      saveQuotaSnapshot();
+    } catch (err) {
+      console.error(`[TeamCodex] Reset credit ledger snapshot failed: ${err.message}`);
+    }
+  };
   const server = createProxyServer(accountManager, config, hooks);
   let liveSyncChain = Promise.resolve();
   process.on('SIGHUP', () => {

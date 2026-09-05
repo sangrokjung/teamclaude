@@ -122,3 +122,14 @@ test('eligibility: canServe excludes accounts that cannot serve the request (mod
   assert.deepEqual(describeCodexResetCreditCandidates([a, b, { name: 'claude', provider: 'anthropic' }], { ...opts, canServe: acct => acct.name === 'b' }),
     ['a:cannot-serve', 'b:ok']);
 });
+
+test('eligibility: an in-flight redemption on the account is joinable even inside the cooldown', () => {
+  const opts = { now: Date.now(), cooldownMs: 30 * 60 * 1000, isExhausted: () => true };
+  const busy = codexAccount();
+  busy.quota.codexResetCreditLastAt = Date.now(); // the durable "pending" stamp
+  busy.quota.codexResetCreditLastOutcome = 'pending';
+  assert.equal(codexResetCreditEligibility(busy, opts).reason, 'cooldown', 'no promise → the stamp is a real cooldown');
+  busy._resetCreditPromise = Promise.resolve({ reset: true, kind: 'reset' });
+  assert.deepEqual(codexResetCreditEligibility(busy, opts), { eligible: true, reason: 'in-flight' });
+  assert.deepEqual(rankCodexResetCreditCandidates([busy], opts).map(a => a.name), ['codex-0']);
+});

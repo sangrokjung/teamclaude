@@ -698,6 +698,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           console.error(`[TeamCodex] Reset credit on "${account.name}" (${reason}) skipped — credential unusable (status ${account.status})`);
           return { reset: false, kind: 'no-spend', outcome };
         }
+        // Durable intent BEFORE the POST: stamp the cooldown as "pending" and
+        // ask the host to persist the quota snapshot now. If the process dies
+        // after the backend consumed the credit but before the outcome lands,
+        // a restart still sees the cooldown (and the poll reconciles the
+        // count) instead of redeeming this account a second time.
+        account.quota.codexResetCreditLastAt = Date.now();
+        account.quota.codexResetCreditLastOutcome = 'pending';
+        hooks.onResetCreditLedger?.(account);
         const outcome = await consumeCodexResetCredit({
           account,
           upstream,
@@ -705,6 +713,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
         const reset = applyCodexResetCreditOutcome(account, outcome);
         const kind = codexResetCreditOutcomeKind(outcome);
+        // …and persist the real outcome right away (the periodic snapshot is
+        // 60 s apart and the exit handler does not run on SIGKILL).
+        hooks.onResetCreditLedger?.(account);
         if (reset) {
           console.log(`[TeamCodex] Reset credit redeemed on "${account.name}" (${reason}): windows_reset=${outcome.windowsReset ?? '?'}, credits left=${account.quota.codexResetCredits ?? '?'}`);
         } else if (kind === 'spent-no-reset') {
@@ -3002,8 +3013,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         if (res.destroyed) return;
 
         // Safety backstop: each retry throttles a distinct account, so
-        // getActiveAccount returns null before this can fire. Cap anyway.
-        if (retryCount >= maxRetries) {
+        // getActiveAccount returns null before this can fire. Cap anyway —
+        // EXCEPT when this request still holds an unspent reset-credit pass:
+        // retryCount is shared with non-throttling hops (5xx/auth/stale
+        // failovers), so under a 5xx burst it can hit the cap on the very
+        // 429 that empties the pool. Let ONE more recursion reach the
+        // acquisition dead end, where the redemption (or the Codex-native
+        // fail-fast body) is decided; the pass budget bounds it afterwards.
+        if (retryCount >= maxRetries && !(ctx.resetCredits && ctx.resetCreditAttempts < 1)) {
           ctx.status = 429;
           const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold, ctx.model);
           if (!res.headersSent) {

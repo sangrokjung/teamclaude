@@ -97,6 +97,11 @@ export function codexResetCreditEligibility(account, {
   if (account.status === 'error') return { eligible: false, reason: 'error' };
   if (account.authRevoked === true) return { eligible: false, reason: 'auth-revoked' };
   if (!account.credential) return { eligible: false, reason: 'no-credential' };
+  // A redemption already in flight on this account is joinable (single-flight
+  // shares its outcome) — judged before the cooldown, because the durable
+  // "pending" stamp written just before the consume POST would otherwise make
+  // every concurrent dead end miss the very redemption that will serve it.
+  if (account._resetCreditPromise) return { eligible: true, reason: 'in-flight' };
   const quota = account.quota || {};
   const credits = quota.codexResetCredits;
   if (!Number.isInteger(credits)) return { eligible: false, reason: 'credits-unknown' };
