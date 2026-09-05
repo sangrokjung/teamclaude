@@ -204,6 +204,10 @@ launchd teardown before retrying `bootstrap`.
   that needs hands immediately.
 - Run it detached (`nohup … &`) when the host is under memory pressure, so a
   supervisor cannot kill it mid-wait and leave the plist repointed.
+- If the rollout also needs a config change, make it with the artifact's own
+  `src/config.js` `atomicConfigUpdate` (with `TEAMCLAUDE_PROVIDER=codex`) rather
+  than editing the file directly, so the write honours the same `<config>.lock`
+  protocol as the running server's token refreshes.
 
 Note the difference from Path B step 6: Path C writes the approved hash as soon
 as its own verification passes, rather than holding it back for several hours of
