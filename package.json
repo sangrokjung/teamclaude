@@ -5,14 +5,18 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
+    "teamclaude": "src/teamclaude.js",
     "teamcodex": "src/index.js"
   },
   "files": [
     "src/",
+    "scripts/install-macos.sh",
     "README.ko.md",
     "README.zh-CN.md",
     "config.example.json",
-    "config.codex.example.json"
+    "config.codex.example.json",
+    "config.grok.example.json",
+    "config.agy.example.json"
   ],
   "scripts": {
     "start": "node src/index.js",

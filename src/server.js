@@ -1,13 +1,36 @@
 import http from 'node:http';
-import { writeFile, mkdir, open, unlink } from 'node:fs/promises';
+import https from 'node:https';
+import { mkdir, open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
+import {
+  brotliDecompressSync,
+  createBrotliDecompress,
+  createGunzip,
+  createInflate,
+  gunzipSync,
+  inflateSync,
+} from 'node:zlib';
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { normalizeContinuityMaxWaitMs } from './config.js';
+import {
+  getProviderDefinition,
+  assertSupportedProvider,
+  buildProviderUpstreamUrl,
+  providerAuthHeaders,
+  validateProviderAccounts,
+} from './provider-config.js';
+import {
+  CODEX_INVOCATION_HEADER,
+  CODEX_RECOVERY_SESSION_HEADER,
+  codexRecoveryIdentity,
+  isCodexResponsesPath,
+} from './codex-recovery.js';
 import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
@@ -16,13 +39,115 @@ import {
 
 const HOP_BY_HOP_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding',
-  'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
+  'te', 'trailer', 'upgrade', 'proxy-connection',
+  'proxy-authorization', 'proxy-authenticate',
 ]);
 
 function connectionHeaderNames(value) {
   return new Set(
     String(value || '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean),
   );
+}
+
+function requestUpstreamRaw(url, { method, headers, body, signal }) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const request = transport.request(parsed, { method, headers, signal }, response => {
+      const responseHeaders = new Headers();
+      for (let index = 0; index < response.rawHeaders.length; index += 2) {
+        responseHeaders.append(response.rawHeaders[index], response.rawHeaders[index + 1]);
+      }
+      resolve({
+        status: response.statusCode || 502,
+        headers: responseHeaders,
+        body: Readable.toWeb(response),
+      });
+    });
+    request.once('error', reject);
+    request.end(body);
+  });
+}
+
+function decodeBodyForInspection(body, contentEncoding, maxBytes) {
+  const encodings = String(contentEncoding || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(value => value && value !== 'identity');
+  let decoded = body;
+  try {
+    for (const encoding of encodings.reverse()) {
+      const options = { maxOutputLength: maxBytes };
+      if (encoding === 'gzip' || encoding === 'x-gzip') {
+        decoded = gunzipSync(decoded, options);
+      } else if (encoding === 'deflate') {
+        decoded = inflateSync(decoded, options);
+      } else if (encoding === 'br') {
+        decoded = brotliDecompressSync(decoded, options);
+      } else {
+        return null;
+      }
+      if (decoded.length > maxBytes) return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function createCodexTerminalTracker(contentEncoding) {
+  const encodings = String(contentEncoding || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(value => value && value !== 'identity');
+  const framer = new SseFramer({ maxBufferedBytes: 64 * 1024 });
+  if (encodings.length === 0) return framer;
+
+  const decoders = [];
+  for (const encoding of encodings.reverse()) {
+    if (encoding === 'gzip' || encoding === 'x-gzip') decoders.push(createGunzip());
+    else if (encoding === 'deflate') decoders.push(createInflate());
+    else if (encoding === 'br') decoders.push(createBrotliDecompress());
+    else {
+      framer.inspectionFailed = true;
+      framer.push = () => {};
+      framer.finish = async () => {};
+      return framer;
+    }
+  }
+
+  for (let index = 0; index + 1 < decoders.length; index += 1) {
+    decoders[index].pipe(decoders[index + 1]);
+  }
+  const first = decoders[0];
+  const last = decoders[decoders.length - 1];
+  const trackDecoded = framer.push.bind(framer);
+  last.on('data', trackDecoded);
+  const decoderError = new Promise(resolve => {
+    for (const decoder of decoders) {
+      decoder.once('error', () => {
+        framer.inspectionFailed = true;
+        resolve();
+      });
+    }
+  });
+  framer.push = bytes => new Promise(resolve => {
+    first.write(bytes, error => {
+      if (error) framer.inspectionFailed = true;
+      resolve();
+    });
+  });
+  framer.finish = async () => {
+    const ended = new Promise(resolve => last.once('end', resolve));
+    first.end();
+    await Promise.race([ended, decoderError]);
+  };
+  const disposeFramer = framer.dispose.bind(framer);
+  framer.dispose = () => {
+    for (const decoder of decoders) decoder.destroy();
+    disposeFramer();
+  };
+  return framer;
 }
 
 // Legacy ceiling for model-tier polling when continuityMaxWaitMs is 0. Deadline
@@ -34,12 +159,24 @@ const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
-
+const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 256 * 1024 * 1024;
+const REQUEST_LOG_BODY_BYTES = 16 * 1024;
+const DISPATCH_FAILURE_RETRY_AFTER_SECONDS = 5;
+const DISPATCH_FAILURE_COOLDOWN_MS = DISPATCH_FAILURE_RETRY_AFTER_SECONDS * 1000;
+const CONTINUITY_DISPATCH_GRACE_MS = 5;
 export function createProxyServer(accountManager, config, hooks = {}) {
-  const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
-  const upstream = config.upstream || (provider === 'codex'
-    ? 'https://chatgpt.com/backend-api/codex'
-    : 'https://api.anthropic.com');
+  const provider = config.provider == null
+    ? 'anthropic'
+    : assertSupportedProvider(config.provider);
+  validateProviderAccounts(provider, accountManager.accounts, {
+    requireMetadata: true,
+    allowInternalAuth: true,
+  });
+  const definition = getProviderDefinition(provider);
+  const upstream = config.upstream || definition.defaultUpstream;
+  if (!upstream) {
+    throw new Error(`${provider} proxy requires an explicit upstream URL.`);
+  }
   const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -93,6 +230,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const maxResponseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes > 0
     ? Math.floor(config.maxResponseBytes)
     : DEFAULT_MAX_RESPONSE_BYTES;
+  const maxBufferedResponseBytes = Number.isFinite(config.maxBufferedResponseBytes)
+      && config.maxBufferedResponseBytes > 0
+    ? Math.floor(config.maxBufferedResponseBytes)
+    : DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
   const upstreamResponseTimeoutMs = Number.isFinite(config.upstreamResponseTimeoutMs)
       && config.upstreamResponseTimeoutMs > 0
     ? Math.floor(config.upstreamResponseTimeoutMs)
@@ -153,6 +294,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   let requestCounter = 0;
   let inFlightProxied = 0; // proxied (non-status/oauth) requests currently being handled
   let bufferedRequestBytes = 0;
+  let bufferedResponseBytes = 0;
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -175,12 +317,28 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // can't push an account over maxConcurrent, and only learns from a 2xx (or an
   // account-level quota 429). `config.activeWarmup: false` disables it all.
   const activeWarmup = provider === 'anthropic' && config.activeWarmup !== false;
+  const codexUsageRefresh = provider === 'codex' && config.codexUsageRefresh !== false;
   const warmupIntervalMs = Number.isFinite(config.warmupIntervalMs)
     ? Math.max(0, config.warmupIntervalMs)
     : 5 * 60 * 1000;
+  // A structured organization-access 403 is authoritative for that moment,
+  // but external billing/policy changes can restore the account later. Keep it
+  // out of client rotation while periodically rechecking with the known-good
+  // minimal probe shape. 0 disables only the automatic recheck; TUI R remains
+  // an explicit recovery path.
+  const subscriptionRecheckIntervalMs = Number.isFinite(config.subscriptionRecheckIntervalMs)
+    ? Math.max(0, config.subscriptionRecheckIntervalMs)
+    : 15 * 60 * 1000;
+  // Active fast lane (codex): max age of an account's authoritative usage data
+  // before a completed request on it triggers a background wham/usage re-fetch.
+  // 0 disables the fast lane (periodic + startup refresh stay on).
+  const codexUsageActiveMs = Number.isFinite(config.codexUsageActiveMs)
+    ? Math.max(0, config.codexUsageActiveMs)
+    : 60_000;
   const WARMUP_PROBE_TIMEOUT_MS = 15_000;
   let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
   let warmupInFlight = false; // guard against overlapping fan-outs
+  let codexRefreshPromise = null;
   let warmupClosed = false;   // set on server close: stop scheduling, abort in-flight probes
   const warmupAbort = new AbortController();
 
@@ -224,7 +382,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (probeTemplate && !probeTemplate._restored
         && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
     probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
-    setImmediate(() => { warmupUnmeasured(); });
+    setImmediate(() => {
+      warmupUnmeasured();
+      recheckSubscriptionDisabled();
+    });
     // Note: the already-measured accounts still missing their Fable window are
     // healed by the periodic top-up pass (topUpModelWeekly) and by an on-demand
     // R — NOT here. Kicking a top-up off this commit would race a concurrent R's
@@ -260,6 +421,102 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     return { signal: ac.signal, cleanup };
   }
 
+  function codexUsageEndpoint() {
+    const url = new URL(upstream);
+    url.pathname = `${url.pathname.replace(/\/codex\/?$/, '').replace(/\/$/, '')}/wham/usage`;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  }
+
+  async function refreshCodexAccount(account) {
+    if (warmupClosed || !account.credential) return false;
+    const ok = await fetchCodexUsageOnce(account);
+    // Failure visibility without 60s-cadence spam: log once per failure STREAK
+    // (first failure after a success), and once on recovery. A teardown abort
+    // (warmupClosed) or a removed account is not a data-staleness signal.
+    if (ok) {
+      if (account._usageRefreshFailed) {
+        account._usageRefreshFailed = false;
+        console.log(`[TeamClaude] Codex usage refresh recovered for "${account.name}"`);
+      }
+    } else if (!warmupClosed
+        && accountManager.accounts[account.index] === account
+        && !account._usageRefreshFailed) {
+      account._usageRefreshFailed = true;
+      console.error(`[TeamClaude] Codex usage refresh failed for "${account.name}" — usage data stays stale until a refresh succeeds`);
+    }
+    return ok;
+  }
+
+  async function fetchCodexUsageOnce(account) {
+    const probe = probeSignal();
+    try {
+      const headers = {
+        accept: 'application/json',
+        authorization: `Bearer ${account.credential}`,
+      };
+      if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+      const res = await fetch(codexUsageEndpoint(), { headers, signal: probe.signal });
+      if (!res.ok) {
+        await res.body?.cancel();
+        return false;
+      }
+      const payload = await res.json();
+      if (accountManager.accounts[account.index] !== account) return false;
+      return accountManager.updateCodexUsage(account, payload);
+    } catch {
+      return false;
+    } finally {
+      probe.cleanup();
+    }
+  }
+
+  async function refreshCodexQuotaAll() {
+    if (!codexUsageRefresh || warmupClosed) return -1;
+    if (codexRefreshPromise) return codexRefreshPromise;
+    codexRefreshPromise = (async () => {
+      while (!warmupClosed) {
+        const targets = accountManager.accounts.filter(a => a.provider === 'codex' && a.credential);
+        const outcomes = await Promise.all(targets.map(refreshCodexAccount));
+        const current = accountManager.accounts.filter(a => a.provider === 'codex' && a.credential);
+        if (targets.length === current.length && targets.every((account, i) => account === current[i])) {
+          return {
+            targets: targets.length,
+            measured: outcomes.filter(Boolean).length,
+          };
+        }
+      }
+      return -1;
+    })();
+    try {
+      return await codexRefreshPromise;
+    } finally {
+      codexRefreshPromise = null;
+    }
+  }
+
+  // Active fast lane: called from the request-completion path (the finally that
+  // releases the concurrency slot — runs for SSE and non-SSE alike) with the
+  // account that served the request. When that account's authoritative usage
+  // stamp (quota.codexUsageAt — set only by the wham/usage apply, never by
+  // per-response headers) is older than codexUsageActiveMs, kick a background
+  // refreshCodexAccount. Fire-and-forget: it must never block, delay, or fail
+  // the response path, and _usageRefreshing keeps it single-flight per account
+  // (a failed attempt doesn't stamp freshness, so the next completed request
+  // simply retries).
+  function maybeRefreshCodexUsage(account) {
+    if (!codexUsageRefresh || warmupClosed || codexUsageActiveMs <= 0) return;
+    if (!account || account.provider !== 'codex' || account._usageRefreshing) return;
+    if (accountManager.accounts[account.index] !== account) return;
+    if (Date.now() - (account.quota?.codexUsageAt ?? 0) < codexUsageActiveMs) return;
+    account._usageRefreshing = true;
+    Promise.resolve()
+      .then(() => refreshCodexAccount(account))
+      .catch(() => { /* refreshCodexAccount is already best-effort */ })
+      .finally(() => { account._usageRefreshing = false; });
+  }
+
   // Probe one account: send a minimal /v1/messages with its own auth and fold the
   // rate-limit headers into its quota. Best-effort and side-effect-light:
   //  - Never refreshes tokens — a background refresh failure could mark the account
@@ -283,6 +540,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
   async function warmupAccount(account, { force = false } = {}) {
     if (!probeTemplate || warmupClosed || account._warming) return;
+    if (account.authRevoked === true) return;
     // Don't refresh from a background probe; skip an OAuth account that needs one.
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
     // Re-confirm it's still an available, unmeasured, idle candidate — unless
@@ -302,6 +560,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const res = await fetch(`${upstream}/v1/messages`, {
         method: 'POST', headers, body: buildProbeBody(probeTemplate), signal: probe.signal,
       });
+      // A completed 2xx is authoritative proof that this organization can use
+      // Claude Code again. Clear the durable quarantine before folding quota so
+      // the account immediately returns to selection and the config flag is
+      // removed through onAccountFlag.
+      if (res.ok && account.subscriptionDisabled
+          && accountManager.accounts[account.index] === account) {
+        console.log(`[TeamClaude] Subscription access recheck succeeded for "${account.name}" — returning account to rotation`);
+        accountManager.setSubscriptionDisabled(account, false);
+        delete account._subscriptionRecheckAt;
+      }
       const rl = {};
       for (const [k, v] of res.headers.entries()) {
         if (k.startsWith('anthropic-ratelimit-')) rl[k] = v;
@@ -376,9 +644,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // no probe template exists yet (nothing has flowed through the proxy, so there
   // is no known-accepted request shape to replay).
   async function refreshQuotaAll() {
+    if (provider === 'codex') return refreshCodexQuotaAll();
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
-      a.status !== 'error' && a.inflight === 0 && !a._warming);
+      (a.status !== 'error' || a.errorReason === 'subscription-disabled')
+      && a.authRevoked !== true
+      && a.inflight === 0 && !a._warming);
     // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
     // background failure could mark an account 'error' before any real request
     // proved auth), so an account that has sat idle past its token lifetime
@@ -388,7 +659,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     // failures are the same actionable truth the client path would surface.
     await Promise.all(targets.map(a =>
       accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
-    const alive = targets.filter(a => a.status !== 'error');
+    const alive = targets.filter(a =>
+      (a.status !== 'error' || a.errorReason === 'subscription-disabled')
+      && a.authRevoked !== true);
     // Renew both probe budgets — R is an explicit "measure everything now".
     for (const a of alive) { a._partialProbes = 0; a._mwProbes = 0; }
     const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
@@ -409,7 +682,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpModelWeekly() {
     if (!activeWarmup || warmupClosed || !probeTemplate || !probeTemplate._elicitsModelWeekly) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.authRevoked !== true
+      && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsModelWeekly(a));
     if (!targets.length) return;
     await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
@@ -430,7 +704,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpPartialQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.authRevoked !== true
+      && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsPartialRemeasure(a));
     if (!targets.length) return;
     // Revive lapsed tokens FIRST (same rationale as refreshQuotaAll): a partial
@@ -446,6 +721,32 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     const alive = targets.filter(a => a.status !== 'error');
     if (!alive.length) return;
     await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
+  }
+
+  // Revalidate only the narrowly classified organization-access quarantine.
+  // Other auth errors stay parked until re-import/login because a generic
+  // probe must never revive revoked credentials. Each account is paced before
+  // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  async function recheckSubscriptionDisabled() {
+    if (!activeWarmup || warmupClosed || !probeTemplate
+        || subscriptionRecheckIntervalMs <= 0) return;
+    const now = Date.now();
+    const targets = accountManager.accounts.filter(a =>
+      a.enabled !== false && a.authRevoked !== true
+      && a.subscriptionDisabled === true
+      && a.errorReason === 'subscription-disabled'
+      && a.inflight === 0 && !a._warming
+      && (!a._subscriptionRecheckAt || now >= a._subscriptionRecheckAt));
+    if (!targets.length) return;
+    for (const account of targets) {
+      account._subscriptionRecheckAt = now + subscriptionRecheckIntervalMs;
+    }
+    await Promise.all(targets.map(async account => {
+      await accountManager.ensureTokenFresh(account)
+        .catch(() => { /* keep quarantined; the next interval retries */ });
+      if (account.errorReason !== 'subscription-disabled') return false;
+      return warmupAccount(account, { force: true });
+    }));
   }
 
   // Probe every currently-unmeasured idle account in parallel. Guarded so two
@@ -477,6 +778,27 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
+  }
+  // Subscription recovery has its OWN scheduler. It must not inherit
+  // `warmupIntervalMs: 0` (quota startup-only mode), or a later organization
+  // access 403 would be parked forever even though automatic rechecks remain
+  // enabled. Tick at least once a minute; `_subscriptionRecheckAt` above keeps
+  // the configured per-account interval authoritative and prevents early probes.
+  let subscriptionRecheckTimer = null;
+  if (activeWarmup && subscriptionRecheckIntervalMs > 0) {
+    const tickMs = Math.min(subscriptionRecheckIntervalMs, 60_000);
+    subscriptionRecheckTimer = setInterval(() => {
+      recheckSubscriptionDisabled();
+    }, tickMs);
+    subscriptionRecheckTimer.unref();
+  }
+  let codexUsageTimer = null;
+  if (codexUsageRefresh) {
+    setImmediate(() => { refreshCodexQuotaAll(); });
+    if (warmupIntervalMs > 0) {
+      codexUsageTimer = setInterval(() => { refreshCodexQuotaAll(); }, warmupIntervalMs);
+      codexUsageTimer.unref();
+    }
   }
 
   function rejectEarlyRequest(req, res, statusCode, headers, payload) {
@@ -594,7 +916,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           return;
         }
-        const result = accountManager.rotateActiveAccount(null, true);
+        const result = accountManager.rotateActiveAccount(null, true, recoveryAccountUuid);
         if (!result.rotated) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
@@ -622,7 +944,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // `host` rides along so `teamcodex status` (a separate process) can show
         // the machine the PROXY runs on — CPU% is measured between status calls
         // by the tracker, RAM/loadavg are instantaneous.
-        res.end(JSON.stringify({ ...accountManager.getStatus(), host: hostTracker.sample() }, null, 2));
+        const includeIdentity = isLocal
+          && Boolean(proxyApiKey)
+          && clientKey === proxyApiKey
+          && req.headers['x-teamcodex-status-identity'] === '1';
+        res.end(JSON.stringify({
+          ...accountManager.getStatus({ includeIdentity }),
+          host: hostTracker.sample(),
+          lifecycleId: config.lifecycleId || null,
+        }, null, 2));
         return;
       }
 
@@ -646,6 +976,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       inFlightProxied++;
       let requestBufferedBytes = 0;
+      let responseBufferedBytes = 0;
+      let auxiliaryResponseBytes = 0;
+      let logResponseBytes = 0;
+      let responseReleased = false;
+      let releaseIdleLogReservation = null;
       const reserveRequestBytes = bytes => {
         if (bytes <= 0) return true;
         if (bytes > maxBufferedRequestBytes - bufferedRequestBytes) return false;
@@ -661,6 +996,63 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         bufferedRequestBytes -= bytes;
         requestBufferedBytes -= bytes;
       };
+      const reserveResponseBytes = bytes => {
+        if (bytes <= 0) return true;
+        if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) {
+          releaseIdleLogReservation?.();
+        }
+        if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) return false;
+        bufferedResponseBytes += bytes;
+        responseBufferedBytes += bytes;
+        return true;
+      };
+      const releaseResponseBytes = () => {
+        if (responseReleased) return;
+        responseReleased = true;
+        if (responseBufferedBytes > bufferedResponseBytes) {
+          throw new Error('Response buffer reservation underflow');
+        }
+        bufferedResponseBytes -= responseBufferedBytes;
+        responseBufferedBytes = 0;
+      };
+      const reserveAuxiliaryResponseBytes = bytes => {
+        if (bytes <= 0) return true;
+        if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) return false;
+        bufferedResponseBytes += bytes;
+        auxiliaryResponseBytes += bytes;
+        return true;
+      };
+      const releaseAuxiliaryResponseBytes = (bytes = auxiliaryResponseBytes) => {
+        if (bytes <= 0) return;
+        if (bytes > auxiliaryResponseBytes || bytes > bufferedResponseBytes) {
+          throw new Error('Auxiliary response buffer reservation underflow');
+        }
+        bufferedResponseBytes -= bytes;
+        auxiliaryResponseBytes -= bytes;
+      };
+      const reserveLogResponseBytes = bytes => {
+        if (bytes <= 0) return true;
+        if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) return false;
+        bufferedResponseBytes += bytes;
+        logResponseBytes += bytes;
+        return true;
+      };
+      const releaseLogResponseBytes = bytes => {
+        if (bytes <= 0) return;
+        if (bytes > logResponseBytes || bytes > bufferedResponseBytes) {
+          throw new Error('Request log buffer reservation underflow');
+        }
+        bufferedResponseBytes -= bytes;
+        logResponseBytes -= bytes;
+      };
+      const registerIdleLogReservation = release => {
+        releaseIdleLogReservation = release;
+        return () => {
+          if (releaseIdleLogReservation === release) releaseIdleLogReservation = null;
+        };
+      };
+      res.once('finish', releaseResponseBytes);
+      res.once('close', releaseResponseBytes);
       bodyDeadline = startRequestBodyDeadline(req, res);
       try {
         const bodyRead = await readRequestBody(req, {
@@ -681,7 +1073,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           });
           return;
         }
-        const body = bodyRead.body;
+        let body = bodyRead.body;
 
         // Let client token refresh requests pass through to upstream untouched.
         // The proxy manages its own tokens via ensureTokenFresh(); intercepting
@@ -695,8 +1087,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             body,
             maxResponseBytes,
             upstreamResponseTimeoutMs,
+            reserveResponseBytes,
           );
           return; // outer finally decrements inFlightProxied
+        }
+
+        if (provider === 'codex') {
+          body = normalizeCodexRequestBody(req, body);
         }
 
         // Track request
@@ -706,7 +1103,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -762,10 +1159,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           // Release the concurrency slot held by this request (if any). A failover
           // releases the previous account before re-acquiring, so at this point only
           // the last-held slot remains; releaseAccount guards against double-release.
+          const servedAccount = ctx.held;
           if (ctx.held != null) {
             accountManager.releaseAccount(ctx.held);
             ctx.held = null;
           }
+          // Codex fast-lane usage refresh for the account that just finished
+          // serving — AFTER the slot release so it can never hold capacity,
+          // and fire-and-forget so it can never delay this response.
+          if (servedAccount != null) maybeRefreshCodexUsage(servedAccount);
           hooks.onRequestEnd?.(reqId, {
             method: req.method, path: req.url,
             account: ctx.account, status: ctx.status,
@@ -774,9 +1176,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       } finally {
         bodyDeadline.cleanup();
         try {
-          releaseRequestBytes(requestBufferedBytes);
+          if (res.writableFinished || res.destroyed) releaseResponseBytes();
         } finally {
-          inFlightProxied--;
+          try {
+            releaseAuxiliaryResponseBytes();
+          } finally {
+            try {
+              releaseRequestBytes(requestBufferedBytes);
+            } finally {
+              inFlightProxied--;
+            }
+          }
         }
       }
     } catch (err) {
@@ -798,6 +1208,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     warmupClosed = true;
     warmupAbort.abort();
     if (warmupTimer) clearInterval(warmupTimer);
+    if (subscriptionRecheckTimer) clearInterval(subscriptionRecheckTimer);
+    if (codexUsageTimer) clearInterval(codexUsageTimer);
   };
   const closeServer = server.close.bind(server);
   server.close = (cb) => { shutdownWarmup(); return closeServer(cb); };
@@ -828,6 +1240,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
+    setImmediate(() => { recheckSubscriptionDisabled(); });
     return true;
   };
 
@@ -919,6 +1332,7 @@ async function relayRaw(
   body,
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   upstreamResponseTimeoutMs = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
+  reserveResponseBytes = () => true,
 ) {
   // Abort the relay if the client disconnects, so a hung upstream OAuth endpoint
   // can't pin this connection (and its admission-control inFlightProxied slot)
@@ -944,10 +1358,15 @@ async function relayRaw(
       method: req.method,
       headers: requestHeaders,
       body: body.length > 0 ? body : undefined,
+      redirect: 'manual',
       signal: deadline.signal,
     });
 
-    const responseBody = await readBodyBounded(upstreamRes.body, maxResponseBytes);
+    const responseBody = await readBodyBounded(
+      upstreamRes.body,
+      maxResponseBytes,
+      reserveResponseBytes,
+    );
     if (responseBody === null) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -960,6 +1379,7 @@ async function relayRaw(
     const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+      if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
       if (key === 'content-encoding' || key === 'content-length') continue;
       responseHeaders[key] = value;
     }
@@ -1046,7 +1466,7 @@ async function raceTimeout(promise, timeoutMs, message) {
   }
 }
 
-async function readBodyBounded(webStream, maxBytes) {
+async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true) {
   if (!webStream) return Buffer.alloc(0);
   const reader = webStream.getReader();
   const chunks = [];
@@ -1054,10 +1474,13 @@ async function readBodyBounded(webStream, maxBytes) {
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (done) return Buffer.concat(chunks, totalBytes);
+      if (done) {
+        if (!reserveBytes(totalBytes)) return null;
+        return Buffer.concat(chunks, totalBytes);
+      }
       const chunk = Buffer.from(value);
       totalBytes += chunk.length;
-      if (totalBytes > maxBytes) {
+      if (totalBytes > maxBytes || !reserveBytes(chunk.length)) {
         await reader.cancel().catch(() => {});
         return null;
       }
@@ -1068,6 +1491,15 @@ async function readBodyBounded(webStream, maxBytes) {
   }
 }
 
+function isClaudeSubscriptionAccessDisabled(body) {
+  try {
+    const payload = JSON.parse(body.toString());
+    return payload?.error?.type === 'permission_error'
+      && payload?.error?.details?.error_code === 'oauth_not_allowed_for_organization';
+  } catch {
+    return false;
+  }
+}
 
 function logTimestamp() {
   const d = new Date();
@@ -1079,24 +1511,103 @@ async function writeRequestLog(logDir, reqId, sections) {
   if (!logDir) return;
   const ts = logTimestamp();
   const filename = `${ts}_${String(reqId).padStart(5, '0')}.log`;
+  let file = null;
   try {
-    await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
+    file = await open(join(logDir, filename), 'wx', 0o600);
+    for (let index = 0; index < sections.length; index++) {
+      if (index > 0) await file.write('\n\n');
+      await file.write(sections[index]);
+    }
   } catch (err) {
     console.error(`[TeamClaude] Failed to write log: ${err.message}`);
+  } finally {
+    await file?.close().catch(() => {});
   }
 }
 
-function formatHeaders(headers) {
-  if (headers.entries) {
-    return [...headers.entries()].map(([k, v]) => `  ${k}: ${v}`).join('\n');
+function flushRequestLog(logDir, reqId, sections, hooks) {
+  if (!logDir || sections.flushing || sections.released || sections.length === 0) return;
+  sections.flushing = true;
+  void (async () => {
+    try {
+      await hooks.beforeRequestLogFlush?.();
+      await writeRequestLog(logDir, reqId, sections);
+    } finally {
+      sections.release?.();
+    }
+  })().catch(err => {
+    console.error(`[TeamClaude] Failed to flush log: ${err.message}`);
+  });
+}
+
+function formatLogBody(heading, body) {
+  if (body.length === 0) return `${heading}\n(empty)`;
+  const logged = body.subarray(0, REQUEST_LOG_BODY_BYTES).toString('utf8');
+  const truncation = body.length > REQUEST_LOG_BODY_BYTES
+    ? `\n[log body truncated after ${REQUEST_LOG_BODY_BYTES} of ${body.length} bytes]`
+    : '';
+  return `${heading} (${body.length} bytes) ===\n${logged}${truncation}`;
+}
+
+async function writeStreamRequestLog(logDir, reqId, sections, heading, streamLog, truncation, hooks) {
+  if (!logDir || sections.flushing) return;
+  sections.flushing = true;
+  const ts = logTimestamp();
+  const filename = `${ts}_${String(reqId).padStart(5, '0')}.log`;
+  let file = null;
+  try {
+    await hooks.beforeRequestLogFlush?.();
+    file = await open(join(logDir, filename), 'wx', 0o600);
+    for (let index = 0; index < sections.length; index++) {
+      if (index > 0) await file.write('\n\n');
+      await file.write(sections[index]);
+    }
+    if (sections.length > 0) await file.write('\n\n');
+    await file.write(`${heading}\n`);
+    for (const chunk of streamLog.chunks) await file.write(chunk);
+    if (truncation) await file.write(truncation);
+  } catch (err) {
+    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
+  } finally {
+    await file?.close().catch(() => {});
+    sections.release?.();
   }
-  return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+}
+
+const CODEX_LOG_HEADER_ALLOWLIST = new Set([
+  'accept',
+  'content-length',
+  'content-type',
+  'retry-after',
+  'user-agent',
+]);
+
+function formatHeaders(headers, metadataOnly = false) {
+  const entries = headers.entries ? [...headers.entries()] : Object.entries(headers);
+  const sensitive = /^(?:authorization|proxy-authorization|x-api-key|x-goog-api-key|chatgpt-account-id|cookie|set-cookie|(?:x-|openai-)?request-id)$/i;
+  return entries
+    .filter(([key]) => !sensitive.test(key)
+      && (!metadataOnly || CODEX_LOG_HEADER_ALLOWLIST.has(key.toLowerCase())))
+    .map(([key, value]) => `  ${key}: ${value}`)
+    .join('\n');
+}
+
+function formatRequestUrlForLog(url, metadataOnly = false) {
+  if (!metadataOnly) return url;
+  try {
+    const parsed = new URL(url);
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return '[invalid-url]';
+  }
 }
 
 // Candidate transient statuses. A separate method gate permits internal
 // failover/backoff only for replay-safe requests; an ambiguous POST passes
 // through because a 5xx does not prove the upstream skipped its execution.
-const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 529]);
+const RETRYABLE_STATUS = new Set([500, 502, 503, 504, 507, 529]);
 // Sleep that also resolves immediately if `signal` aborts — so a client that
 // disconnects during an overload backoff doesn't keep its account slot reserved
 // for the whole (up to multi-second) wait. Cleans up its timer/listener either way.
@@ -1137,6 +1648,14 @@ const envInt = (name, def) => {
   return Number.isFinite(v) ? v : def;
 };
 
+function parseRetryAfterMs(value, nowMs = Date.now()) {
+  if (value == null || value === '') return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(value);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : 0;
+}
+
 function extractRequestModel(body) {
   try {
     const json = JSON.parse(body.toString());
@@ -1156,6 +1675,37 @@ function extractRequestModel(body) {
   } catch {
     return { model: null, advisorToolIndex: null };
   }
+}
+
+// Codex runtimes can retain deprecated request fields after a model upgrade.
+// Remove only the known-incompatible field; implicit prompt caching remains
+// available and no unsupported TTL is guessed on the client's behalf.
+function normalizeCodexRequestBody(req, body) {
+  let json;
+  try {
+    json = JSON.parse(body.toString());
+  } catch {
+    return body;
+  }
+  if (!json || typeof json !== 'object' || Array.isArray(json)
+      || !Object.hasOwn(json, 'prompt_cache_retention')) return body;
+  delete json.prompt_cache_retention;
+  const normalizedBody = Buffer.from(JSON.stringify(json));
+  req.headers['content-length'] = String(normalizedBody.length);
+  return normalizedBody;
+}
+
+function isCodexChatGptModelUnsupported(body, model) {
+  if (typeof model !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(model)) return false;
+  let payload;
+  try {
+    payload = JSON.parse(body.toString());
+  } catch {
+    return false;
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+      || Object.keys(payload).length !== 1) return false;
+  return payload.detail === `The '${model}' model is not supported when using Codex with a ChatGPT account.`;
 }
 
 // --- Model fallback (config.modelFallbacks) --------------------------------
@@ -1230,10 +1780,13 @@ function sendSaved429(res, ctx) {
   return true;
 }
 
-function sendUpstreamTimeout(res, ctx) {
+function sendUpstreamTimeout(res, ctx, headers = { 'Content-Type': 'application/json' }) {
   if (res.destroyed || res.headersSent) return false;
   ctx.status = 502;
-  res.writeHead(502, { 'Content-Type': 'application/json' });
+  res.writeHead(502, {
+    ...headers,
+    'retry-after': headers['retry-after'] ?? String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
+  });
   res.end(JSON.stringify({
     type: 'error',
     error: { type: 'proxy_error', message: 'Upstream response timed out.' },
@@ -1241,8 +1794,40 @@ function sendUpstreamTimeout(res, ctx) {
   return true;
 }
 
+function fleetIsQuotaExhausted(accountManager, accounts, model) {
+  const candidates = accounts.filter(account => account.enabled !== false && account.status !== 'error');
+  return candidates.length > 0
+    && candidates.every(account => !accountManager._isDispatchFailureCoolingDown(account)
+      && (accountManager.isExhausted(account) || accountManager.isModelExhausted(account, model)));
+}
+
+function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
+  const identity = ctx.provider === 'codex' && method === 'POST'
+      && isCodexResponsesPath(req.url)
+    ? codexRecoveryIdentity(req.headers, body)
+    : null;
+  if (identity) headers['X-TeamCodex-Recovery-Session'] = identity.sessionId;
+  return headers;
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
+  if (ctx.provider === 'codex' && ctx.credentialType == null
+      && accountManager.accounts.some(candidate => candidate.type === 'oauth'
+        && accountManager._isModelUnsupported(candidate, ctx.model))) {
+    ctx.credentialType = 'oauth';
+  }
+  const requestExclusions = (extra = null) => {
+    const excluded = new Set(extra || []);
+    if (ctx.provider === 'codex' && ctx.credentialType != null) {
+      for (const candidate of accountManager.accounts) {
+        if (candidate.type !== ctx.credentialType) excluded.add(candidate);
+      }
+    }
+    return excluded.size > 0 ? excluded : null;
+  };
+  const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model);
+  const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model);
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
   // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
@@ -1258,15 +1843,37 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (ctx.abortSignal?.aborted || res.destroyed) return;
 
     // On a failover retry, skip accounts already tried for this request.
-    const excludeForSelect = (ctx.tried429.size || ctx.tried5xx.size)
-      ? new Set([...ctx.tried429, ...ctx.tried5xx])
-      : null;
+    const excludeForSelect = requestExclusions(new Set([...ctx.tried429, ...ctx.tried5xx]));
     if (ctx.held != null) {
       account = ctx.held;
     } else {
+      // A continuity request must keep its FIFO position while the fleet is
+      // merely concurrency-capped. Re-applying the short overflow timeout on
+      // every loop removes the waiter and appends it at the back again, so a
+      // saturated fleet can starve an older request indefinitely. The overall
+      // continuity deadline already bounds this wait; client abort still
+      // removes it immediately. Preserve an explicit queueTimeoutMs: 0 opt-out.
+      let acquireTimeoutMs = ctx.queueTimeoutMs;
+      const preferred = typeof ctx.preferredAccountUuid === 'string'
+        ? accountManager.accounts.find(a => a.accountUuid === ctx.preferredAccountUuid)
+        : null;
+      const selectionHasUsable = ctx.preferredAccountUuid == null
+        ? hasUsable(excludeForSelect)
+        : preferred && accountManager._isAvailable(preferred, ctx.model)
+          && accountManager._hasCapacity(preferred)
+          && !(excludeForSelect && excludeForSelect.has(preferred));
+      const selectionHasCapped = ctx.preferredAccountUuid == null
+        ? hasCapped(excludeForSelect)
+        : preferred && accountManager._isAvailable(preferred, ctx.model)
+          && !accountManager._hasCapacity(preferred)
+          && !(excludeForSelect && excludeForSelect.has(preferred));
+      if (acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
+          && !selectionHasUsable && selectionHasCapped) {
+        acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
+      }
       account = await accountManager.acquireAccount(
         excludeForSelect,
-        ctx.queueTimeoutMs,
+        acquireTimeoutMs,
         ctx.abortSignal,
         ctx.affinityKey,
         ctx.model,
@@ -1279,11 +1886,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     if (account || ctx.abortSignal?.aborted || res.destroyed) break;
 
-    const accts = accountManager.accounts;
+    const accts = ctx.provider === 'codex' && ctx.credentialType != null
+      ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
+      : accountManager.accounts;
     const allAuthFailed = accts.length > 0 && accts.every(a => a.status === 'error');
-    const modelDeadEnd = !accountManager.anyUsable(null, ctx.model)
-      && !accountManager.anyCapped(null, ctx.model);
-    if (!allAuthFailed && modelDeadEnd) {
+    const modelDeadEnd = !hasUsable(null) && !hasCapped(null);
+    if (!allAuthFailed && modelDeadEnd && fleetIsQuotaExhausted(accountManager, accts, ctx.model)) {
       const fallback = nextModelFallback(ctx, req, body);
       if (fallback) {
         console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
@@ -1297,7 +1905,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
 
     const status = accountManager.getStatus();
-    const capped = accountManager.anyCapped(null, ctx.model);
+    const capped = hasCapped(null);
     const retryAfter = capped
       ? 1
       : computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
@@ -1332,7 +1940,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // If every account is in auth-error state, this is an authentication
     // problem (revoked/expired tokens needing re-login), not a rate limit —
     // return 401 so the client surfaces it instead of pointlessly backing off.
-    const accts = accountManager.accounts;
+    const accts = ctx.provider === 'codex' && ctx.credentialType != null
+      ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
+      : accountManager.accounts;
     if (accts.length > 0 && accts.every(a => a.status === 'error')) {
       ctx.status = 401;
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1350,8 +1960,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // queue timeout, which must never silently change the client's model),
     // walk the configured fallback chain before surfacing a 429.
     if (!res.destroyed
-        && !accountManager.anyUsable(null, ctx.model)
-        && !accountManager.anyCapped(null, ctx.model)) {
+        && !hasUsable(null)
+        && !hasCapped(null)
+        && fleetIsQuotaExhausted(accountManager, accts, ctx.model)) {
       const fallback = nextModelFallback(ctx, req, body);
       if (fallback) {
         console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
@@ -1383,6 +1994,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   }
 
   // Track which account handles this request
+  if (ctx.provider === 'codex' && ctx.credentialType == null) {
+    ctx.credentialType = account.type;
+  }
   ctx.account = account.name;
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
@@ -1391,6 +2005,26 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // request's account slot on a possibly-hung token endpoint).
   await raceAbort(accountManager.ensureTokenFresh(account), ctx.abortSignal);
   if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone — outer finally frees the slot
+
+  if (account.authRevoked === true) {
+    releaseHeld();
+    if (res.destroyed) return;
+    if (retryCount < maxRetries) {
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    }
+    ctx.status = 401;
+    if (!res.headersSent) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'authentication_error',
+          message: 'Account authentication was revoked. Re-login required.',
+        },
+      }));
+    }
+    return;
+  }
 
   if (typeof ctx.preferredAccountUuid === 'string') {
     const preferredStillEligible = account.accountUuid === ctx.preferredAccountUuid
@@ -1446,9 +2080,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk) || connectionHeaders.has(lk)) continue;
-    if (lk === 'x-api-key') continue;
+    if (lk === 'x-api-key' || lk === 'x-goog-api-key') continue;
     if (lk === 'authorization') continue;
     if (lk === 'chatgpt-account-id') continue;
+    if (lk === CODEX_INVOCATION_HEADER) continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
@@ -1458,6 +2093,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (ctx.provider === 'codex') {
     headers['authorization'] = `Bearer ${account.credential}`;
     if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+  } else if (ctx.provider === 'grok' || ctx.provider === 'agy') {
+    Object.assign(headers, providerAuthHeaders(ctx.provider, account));
   } else if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
@@ -1469,41 +2106,60 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     && req.url.startsWith('/codex/');
   const upstreamUrl = hasDuplicatedCodexPrefix
     ? `${upstream.replace(/\/$/, '')}${req.url.slice('/codex'.length)}`
-    : `${upstream}${req.url}`;
+    : buildProviderUpstreamUrl(ctx.provider, upstream, req.url);
   const method = req.method;
   const replaySafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
+  const metadataOnlyLog = ctx.provider === 'codex';
 
   // Build log sections
   const logSections = [];
+  let logSectionBytes = 0;
+  let logSectionReleased = false;
+  let unregisterIdleLogReservation = () => {};
+  logSections.release = () => {
+    if (logSectionReleased) return;
+    logSectionReleased = true;
+    logSections.released = true;
+    unregisterIdleLogReservation();
+    ctx.releaseLogResponseBytes(logSectionBytes);
+    logSectionBytes = 0;
+    logSections.length = 0;
+  };
+  const appendLogSection = section => {
+    if (!logDir || logSections.flushing || logSectionReleased) return false;
+    const separatorBytes = logSections.length > 0 ? 2 : 0;
+    const sectionBytes = Buffer.byteLength(section) + separatorBytes;
+    if (!ctx.reserveLogResponseBytes(sectionBytes)) return false;
+    logSectionBytes += sectionBytes;
+    logSections.push(section);
+    return true;
+  };
+  unregisterIdleLogReservation = ctx.registerIdleLogReservation(() => {
+    if (logSections.flushing || logSectionReleased) return false;
+    logSections.release();
+    return true;
+  });
   if (logDir) {
-    const safeHeaders = { ...headers };
-    // Mask credentials in logs
-    if (safeHeaders['x-api-key']) {
-      safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    }
-    if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
-    }
-    logSections.push(
-      `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
+    appendLogSection(
+      `=== REQUEST (account: pool-${account.index}, retry: ${retryCount}) ===\n${method} ${formatRequestUrlForLog(upstreamUrl, metadataOnlyLog)}\n${formatHeaders(headers, metadataOnlyLog)}`,
     );
-    if (body.length > 0) {
-      try {
-        logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
-      } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`);
-      }
+    if (!metadataOnlyLog && body.length > 0) {
+      appendLogSection(formatLogBody('=== REQUEST BODY', body));
     }
   }
 
   const continuityRemainingMs = ctx.continuityDeadlineAt == null
     ? null
     : Math.max(0, ctx.continuityDeadlineAt - Date.now());
-  if (continuityRemainingMs != null && continuityRemainingMs <= 1) {
-    if (ctx.abortSignal?.aborted || res.destroyed) return;
-    if (sendSaved429(res, ctx)) return;
-    sendUpstreamTimeout(res, ctx);
-    return;
+  if (continuityRemainingMs != null && continuityRemainingMs <= CONTINUITY_DISPATCH_GRACE_MS) {
+    try {
+      if (ctx.abortSignal?.aborted || res.destroyed) return;
+      if (sendSaved429(res, ctx)) return;
+      sendUpstreamTimeout(res, ctx);
+      return;
+    } finally {
+      logSections.release();
+    }
   }
   const continuityBoundedTimeout = continuityRemainingMs != null
     && continuityRemainingMs <= ctx.upstreamResponseTimeoutMs;
@@ -1512,19 +2168,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     continuityBoundedTimeout ? continuityRemainingMs : ctx.upstreamResponseTimeoutMs,
   );
   try {
-    const upstreamRequest = fetch(upstreamUrl, {
+    const requestOptions = {
       method,
       headers,
       body: ['GET', 'HEAD'].includes(method) ? undefined : body,
-      redirect: 'manual',
-      // Abort the upstream call when the client disconnects (ctx.abortSignal is
-      // tied to res 'close'). Without this, a client that drops mid-SSE while the
-      // upstream stalls would leave streamResponse blocked in reader.read(), so
-      // the per-account slot and inFlightProxied never release — repeated stalls
-      // would leak the proxy to capacity. Aborting rejects the read and unwinds
-      // the finally that frees the slot.
       signal: upstreamDeadline.signal,
-    });
+    };
+    const upstreamRequest = ctx.provider === 'codex'
+      ? requestUpstreamRaw(upstreamUrl, requestOptions)
+      : fetch(upstreamUrl, { ...requestOptions, redirect: 'manual' });
     ctx.preferredAccountUuid = null;
     const upstreamRes = await upstreamRequest;
     const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
@@ -1568,8 +2220,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // (or non-fatal) refresh leaves status intact → retry the same account.
         if (account.status !== 'error') {
           if (logDir) {
-            logSections.push(`=== RESPONSE 401 — forced token refresh, retrying ===`);
-            writeRequestLog(logDir, reqId, logSections);
+            appendLogSection(`=== RESPONSE 401 — forced token refresh, retrying ===`);
+            flushRequestLog(logDir, reqId, logSections, hooks);
           }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
@@ -1580,15 +2232,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (account.status !== 'error') {
         account.status = 'error';
         account._errorFromRefresh = false;
+        account.errorReason = 'auth-rejected';
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
-      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+      } else if (account.authRevoked !== true
+          && account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
         // A 401 on a still-valid token is account-level rejection evidence.
         // It must override a refresh-failure label so the sweep cannot revive it.
+        // The displayed reason follows the cause label for the same reason.
         account._errorFromRefresh = false;
+        account.errorReason = 'auth-rejected';
       }
       if (logDir) {
-        logSections.push(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
+        appendLogSection(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
       if (res.destroyed) return;
       if (retryCount < maxRetries) {
@@ -1607,6 +2263,121 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
+    // Anthropic returns a completed 403 when an OAuth account's organization
+    // has disabled Claude Code subscription access. This is account-scoped and
+    // safe to replay: the upstream explicitly rejected the request before doing
+    // work. Match the product-specific JSON message narrowly; unrelated 403s
+    // remain byte-preserving pass-through responses and do not poison the pool.
+    if (ctx.provider === 'anthropic' && upstreamRes.status === 403 && account.type === 'oauth') {
+      const responseBody = await readBodyBounded(
+        upstreamRes.body,
+        ctx.maxResponseBytes,
+        ctx.reserveResponseBytes,
+      );
+      if (responseBody === null) {
+        ctx.status = 502;
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: 'Upstream 403 response exceeded the proxy limit.' },
+          }));
+        }
+        return;
+      }
+
+      const subscriptionDisabled = isClaudeSubscriptionAccessDisabled(responseBody);
+      if (subscriptionDisabled) {
+        // Park + persist: marks the account error (refresh sweeps and
+        // _recoverSoonest cannot revive it) and mirrors the flag into config
+        // via the onAccountFlag hook, so a restart keeps the lapsed label
+        // instead of resetting to active until the next 403.
+        accountManager.setSubscriptionDisabled(account, true);
+        if (ctx.subscriptionRecheckIntervalMs > 0) {
+          account._subscriptionRecheckAt = Date.now() + ctx.subscriptionRecheckIntervalMs;
+        }
+        console.log(`[TeamClaude] 403 subscription access disabled on "${account.name}" — marking account error and switching`);
+        if (logDir) {
+          appendLogSection(`=== RESPONSE 403 — subscription access disabled, account marked error ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
+        }
+        if (res.destroyed) return;
+        const hasAlternative = hasUsable(null) || hasCapped(null);
+        if (retryCount < maxRetries && hasAlternative) {
+          releaseHeld();
+          return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+        }
+      }
+
+      ctx.status = 403;
+      const responseHeaders = {};
+      const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
+      for (const [key, value] of upstreamRes.headers.entries()) {
+        if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+        if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
+        if (key === 'content-encoding' || key === 'content-length') continue;
+        responseHeaders[key] = value;
+      }
+      if (logDir && !subscriptionDisabled) {
+        appendLogSection(`=== RESPONSE 403 ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        if (!metadataOnlyLog) appendLogSection(formatLogBody('=== RESPONSE BODY', responseBody));
+        flushRequestLog(logDir, reqId, logSections, hooks);
+      }
+      if (!res.headersSent) res.writeHead(403, responseHeaders);
+      res.end(responseBody.length > 0 ? responseBody : undefined);
+      return;
+    }
+
+    if (ctx.provider === 'codex' && upstreamRes.status === 400 && account.type === 'oauth') {
+      const responseBody = await readBodyBounded(
+        upstreamRes.body,
+        ctx.maxResponseBytes,
+        ctx.reserveResponseBytes,
+      );
+      if (responseBody === null) {
+        ctx.status = 502;
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: 'Upstream 400 response exceeded the proxy limit.' },
+          }));
+        }
+        return;
+      }
+
+      const inspectionBody = decodeBodyForInspection(
+        responseBody,
+        upstreamRes.headers.get('content-encoding'),
+        ctx.maxResponseBytes,
+      );
+      const modelUnsupported = inspectionBody != null
+        && isCodexChatGptModelUnsupported(inspectionBody, ctx.model);
+      if (modelUnsupported) {
+        accountManager.markModelUnsupported(account, ctx.model);
+        console.log(`[TeamClaude] codex-model-unsupported for ${ctx.model} — quarantined; POST was not replayed`);
+      }
+
+      ctx.status = 400;
+      const responseHeaders = {};
+      const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
+      for (const [key, value] of upstreamRes.headers.entries()) {
+        if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+        if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
+        if (ctx.provider !== 'codex'
+            && (key === 'content-encoding' || key === 'content-length')) continue;
+        responseHeaders[key] = value;
+      }
+      if (logDir) {
+        appendLogSection(`=== RESPONSE 400${modelUnsupported ? ' — codex model unsupported' : ''} ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        if (!metadataOnlyLog && !modelUnsupported) appendLogSection(formatLogBody('=== RESPONSE BODY', responseBody));
+        flushRequestLog(logDir, reqId, logSections, hooks);
+      }
+      if (!res.headersSent) res.writeHead(400, responseHeaders);
+      res.end(responseBody.length > 0 ? responseBody : undefined);
+      return;
+    }
+
     // Handle 429s. A 429 can mean two very different things:
     //   (a) this account is out of quota (account-level exhaustion), or
     //   (b) a transient / global / IP / request-level limit that would 429 on
@@ -1619,7 +2390,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
       retryAfter = Math.min(Math.max(retryAfter, 1), 300); // clamp [1s, 5m]
-      const responseBody = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      const responseBody = await readBodyBounded(
+        upstreamRes.body,
+        ctx.maxResponseBytes,
+        ctx.reserveResponseBytes,
+      );
       if (responseBody === null) {
         ctx.status = 502;
         if (!res.headersSent) {
@@ -1635,10 +2410,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
       for (const [key, value] of upstreamRes.headers.entries()) {
         if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
-        if (key === 'content-encoding' || key === 'content-length') continue;
+        if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
+        if (ctx.provider !== 'codex'
+            && (key === 'content-encoding' || key === 'content-length')) continue;
         responseHeaders[key] = value;
       }
-      if (responseHeaders['retry-after'] == null) {
+      const responseRetryAfter = responseHeaders['retry-after'];
+      if (responseRetryAfter == null
+          || (Number.isFinite(Number(responseRetryAfter)) && Number(responseRetryAfter) < 1)) {
         responseHeaders['retry-after'] = String(retryAfter);
       }
       ctx.last429 = { body: responseBody, headers: responseHeaders };
@@ -1650,8 +2429,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.tried429.add(account);
         console.log(`[TeamClaude] 429 (model quota exhausted) on "${account.name}" — switching for ${ctx.model}`);
         if (!res.destroyed
-            && (accountManager.anyUsable(ctx.tried429, ctx.model)
-              || accountManager.anyCapped(ctx.tried429, ctx.model))) {
+            && (hasUsable(ctx.tried429) || hasCapped(ctx.tried429))) {
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
@@ -1660,9 +2438,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // a (possibly days-away) weekly reset or surfacing a 429, walk the
         // configured fallback chain — a rewrite to a still-served model keeps
         // the client's turn alive.
-        {
+        if (!res.destroyed && fleetIsQuotaExhausted(accountManager, accountManager.accounts, ctx.model)) {
           const fallback = nextModelFallback(ctx, req, body);
-          if (fallback && !res.destroyed) {
+          if (fallback) {
             console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (fleet exhausted for ${ctx.model})`);
             ctx.model = fallback.model;
             ctx.tried429.clear();
@@ -1717,8 +2495,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         console.log(`[TeamClaude] 429 (quota exhausted) on "${account.name}" — throttling ${retryAfter}s, switching accounts`);
         accountManager.markRateLimited(account, retryAfter);
         if (logDir) {
-          logSections.push(`=== RESPONSE 429 — account quota exhausted, throttled ${retryAfter}s, switching ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== RESPONSE 429 — account quota exhausted, throttled ${retryAfter}s, switching ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         if (res.destroyed) return;
 
@@ -1752,12 +2530,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       ctx.tried429.add(account);
       const failoverLimit = ctx.continuity.rateLimitFailovers;
       if (!res.destroyed && retryCount < maxRetries && ctx.tried429.size <= failoverLimit
-          && (accountManager.anyUsable(ctx.tried429, ctx.model)
-            || accountManager.anyCapped(ctx.tried429, ctx.model))) {
+          && (hasUsable(ctx.tried429) || hasCapped(ctx.tried429))) {
         console.log(`[TeamClaude] 429 (rate/transient) on "${account.name}" — switching account for this request`);
         if (logDir) {
-          logSections.push(`=== RESPONSE 429 — rate/transient, switching account (not throttled) ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== RESPONSE 429 — rate/transient, switching account (not throttled) ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         releaseHeld(); // free this account's slot before trying another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -1795,8 +2572,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       console.log(`[TeamClaude] 429 (global) on "${account.name}" — failover budget exhausted, passing through`);
       ctx.status = 429;
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — global, passed through after exhausting failover budget ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
+        appendLogSection(`=== RESPONSE 429 — global, passed through after exhausting failover budget ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
       if (sendSaved429(res, ctx)) return;
       if (res.destroyed) return;
@@ -1829,17 +2606,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // A 5xx only proves the response failed, not that the upstream skipped
       // the request. Replaying a POST here can duplicate inference, tool side
-      // effects, and billing. Leave retries to the client unless the HTTP
-      // method itself is replay-safe.
+      // effects, and billing. Complete 503/507 responses are still ambiguous:
+      // the provider may have accepted the request before the error surfaced.
+      // Only exact-session TUI continuation may recover an unsafe POST.
       if (!replaySafe) {
+        accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
         console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
         ctx.status = code;
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== RESPONSE ${code} — unsafe request was not replayed ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         if (!res.destroyed && !res.headersSent) {
-          res.writeHead(code, { 'Content-Type': 'application/json' });
+          const responseHeaders = codexRecoveryResponseHeaders(
+            req,
+            body,
+            ctx,
+            method,
+            {
+              'Content-Type': 'application/json',
+              'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
+            },
+          );
+          res.writeHead(code, responseHeaders);
           res.end(JSON.stringify({
             type: 'error',
             error: {
@@ -1855,16 +2644,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
       const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
 
-      // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this request.
+      // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this
+      // request.
       ctx.tried5xx.add(account);
       const exclude5xx = new Set([...ctx.tried429, ...ctx.tried5xx]);
       if (!res.destroyed && retryCount < maxRetries
-          && (accountManager.anyUsable(exclude5xx, ctx.model)
-            || accountManager.anyCapped(exclude5xx, ctx.model))) {
+          && (hasUsable(exclude5xx) || hasCapped(exclude5xx))) {
         console.log(`[TeamClaude] ${code} on "${account.name}" — switching account for this request`);
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — transient upstream 5xx, switching account ===\n${formatHeaders(upstreamRes.headers)}`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== RESPONSE ${code} — transient upstream 5xx, switching account ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         releaseHeld(); // free this account's slot before trying another
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -1872,23 +2661,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // (2) Every account 5xx'd for this request → upstream overload. Back off and
       // retry the whole fleet so the client transparently rides out the blip.
-      if (!res.destroyed && ctx.overloadRetries < maxOverload) {
-        const waitMs = Math.min(
+      const overloadRetryOpen = ctx.overloadRetries < maxOverload;
+      if (!res.destroyed && overloadRetryOpen) {
+        const retryAfterMs = parseRetryAfterMs(upstreamRes.headers.get('retry-after'));
+        const backoffMs = Math.min(
           backoffBase * 2 ** Math.min(ctx.overloadRetries, 30),
           backoffCap,
         );
+        const waitMs = Math.max(retryAfterMs, backoffMs);
         ctx.overloadRetries += 1;
-        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload})`);
+        const retryBudget = `${ctx.overloadRetries}/${maxOverload}`;
+        console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}, ${retryBudget})`);
         if (logDir) {
-          logSections.push(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}) ===`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== RESPONSE ${code} — all accounts overloaded, backoff ${waitMs}ms (retry ${ctx.overloadRetries}, ${retryBudget}) ===`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         await sleepOrAbort(waitMs, ctx.abortSignal);
-        // Client gone during the backoff → bail; the outer finally releases the
-        // slot promptly instead of holding it for the rest of the wait.
         if (res.destroyed || ctx.abortSignal?.aborted) return;
-        ctx.tried5xx.clear(); // fresh round: let every account be tried again
-        releaseHeld();        // re-acquire from the full set on the next round
+        ctx.tried5xx.clear();
+        releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
 
@@ -1896,8 +2687,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       console.log(`[TeamClaude] ${code} on "${account.name}" — overload persisted after ${ctx.overloadRetries} backoffs, passing through`);
       ctx.status = code;
       if (logDir) {
-        logSections.push(`=== RESPONSE ${code} — overload persisted after ${ctx.overloadRetries} backoffs, passed through ===\n${formatHeaders(upstreamRes.headers)}`);
-        writeRequestLog(logDir, reqId, logSections);
+        appendLogSection(`=== RESPONSE ${code} — overload persisted after ${ctx.overloadRetries} backoffs, passed through ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
       if (res.destroyed) return;
       if (!res.headersSent) {
@@ -1912,18 +2703,30 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
     // Log response headers
     if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
+      appendLogSection(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
     }
 
     ctx.status = upstreamRes.status;
 
-    // Build response headers (skip hop-by-hop and encoding headers)
+    if (ctx.provider === 'codex' && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+      accountManager.clearModelUnsupported(account, ctx.model);
+    }
+
+    // A 2xx on this account is live upstream proof its subscription serves
+    // again — clear the persistent lapse flag (memory + config). Guarded on
+    // the flag so the common path never touches account or config state.
+    if (account.subscriptionDisabled && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+      console.log(`[TeamClaude] 2xx on "${account.name}" — clearing subscription-disabled flag`);
+      accountManager.setSubscriptionDisabled(account, false);
+    }
+
     const responseHeaders = {};
     const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
     for (const [key, value] of upstreamRes.headers.entries()) {
       if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
-      // Strip content-encoding/content-length since fetch may auto-decompress
-      if (key === 'content-encoding' || key === 'content-length') continue;
+      if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
+      if (ctx.provider !== 'codex'
+          && (key === 'content-encoding' || key === 'content-length')) continue;
       responseHeaders[key] = value;
     }
 
@@ -1931,8 +2734,23 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the supervisor only frames what the worker framed, so a local copy that
     // drifts would silently break recovery on whatever the two classify differently.
     if (isStreaming && upstreamRes.body) {
-      const streamLog = logDir
-        ? { chunks: [], bytes: 0, truncated: false, maxBytes: ctx.maxResponseBytes }
+      const contentEncoding = upstreamRes.headers.get('content-encoding');
+      const parseStreamUsage = ctx.provider !== 'codex'
+        || !String(contentEncoding || '')
+          .split(',')
+          .some(encoding => encoding.trim() && encoding.trim().toLowerCase() !== 'identity');
+      const terminalTracker = ctx.provider === 'codex'
+        ? createCodexTerminalTracker(contentEncoding)
+        : null;
+      const streamLog = logDir && !metadataOnlyLog
+        ? {
+            chunks: [],
+            bytes: 0,
+            truncated: false,
+            maxBytes: ctx.maxResponseBytes,
+            reserveBytes: ctx.reserveAuxiliaryResponseBytes,
+            releaseBytes: ctx.releaseAuxiliaryResponseBytes,
+          }
         : null;
       // With recovery on, response headers are DEFERRED until the first whole
       // SSE frame arrives: an upstream that dies before producing anything
@@ -1954,10 +2772,29 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.maxResponseBytes,
         ctx.streamIdleTimeoutMs,
         ctx.streamTotalTimeoutMs,
+        ctx.reserveResponseBytes,
+        ctx.reserveAuxiliaryResponseBytes,
+        ctx.releaseAuxiliaryResponseBytes,
+        parseStreamUsage,
+        terminalTracker,
       );
       if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
+        if (!replaySafe && !outcome.bufferBudgetExceeded) {
+          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
+        }
         ctx.status = 502;
-        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.writeHead(502, codexRecoveryResponseHeaders(
+          req,
+          body,
+          ctx,
+          method,
+          replaySafe
+            ? { 'Content-Type': 'application/json' }
+            : {
+                'Content-Type': 'application/json',
+                'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
+              },
+        ));
         res.end(JSON.stringify({
           type: 'error',
           error: {
@@ -1973,13 +2810,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // an unsafe POST is surfaced as a retryable error for the client to
         // decide, avoiding a hidden duplicate execution inside the proxy.
         if (!replaySafe) {
+          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
           console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
           if (logDir) {
-            logSections.push(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
-            writeRequestLog(logDir, reqId, logSections);
+            appendLogSection(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
+            flushRequestLog(logDir, reqId, logSections, hooks);
           }
           ctx.status = 529;
-          res.writeHead(529, { 'Content-Type': 'application/json', 'retry-after': '5' });
+          res.writeHead(529, codexRecoveryResponseHeaders(
+            req,
+            body,
+            ctx,
+            method,
+            { 'Content-Type': 'application/json', 'retry-after': '5' },
+          ));
           res.end(JSON.stringify({
             type: 'error',
             error: {
@@ -1992,14 +2836,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
         console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} before any data on "${account.name}" — replaying on another account`);
         if (logDir) {
-          logSections.push(`=== STREAM ${outcome.preStreamFailure} before any data — replaying ===`);
-          writeRequestLog(logDir, reqId, logSections);
+          appendLogSection(`=== STREAM ${outcome.preStreamFailure} before any data — replaying ===`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
         }
         ctx.tried5xx.add(account);
         const excludeStream = new Set([...ctx.tried429, ...ctx.tried5xx]);
         if (retryCount < maxRetries
-            && (accountManager.anyUsable(excludeStream, ctx.model)
-              || accountManager.anyCapped(excludeStream, ctx.model))) {
+            && (hasUsable(excludeStream) || hasCapped(excludeStream))) {
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
@@ -2027,28 +2870,61 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }));
         return;
       }
+      if (outcome.incompleteStream && !res.destroyed && !replaySafe) {
+        accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
+        console.log(`[TeamClaude] Codex stream ended without a terminal event on "${account.name}" — account cooled; response was not replayed`);
+      }
       if (outcome.injected) {
-        // NOT an account failure: the response was already partially delivered,
-        // so the only recovery that helps is the CLIENT retrying — which the
-        // injected error event triggers. No account state is mutated.
+        // Partial output is already committed, so recovery remains client-side.
+        // For a still-connected unsafe request, keep health/quota status intact
+        // but apply a short process-local cooldown before the client's retry.
+        if (!replaySafe && !res.destroyed) {
+          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
+        }
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
       }
-      if (logDir) {
-        const loggedBody = Buffer.concat(streamLog.chunks, streamLog.bytes).toString();
+      if (streamLog) {
         const truncation = streamLog.truncated
           ? `\n[stream log truncated at ${streamLog.maxBytes} bytes]`
           : '';
-        logSections.push(`=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===\n${loggedBody}${truncation}`);
-        writeRequestLog(logDir, reqId, logSections);
+        const heading = `=== RESPONSE BODY (streamed${outcome.injected ? `; ${outcome.reason} → injected retryable error event` : ''}) ===`;
+        await writeStreamRequestLog(logDir, reqId, logSections, heading, streamLog, truncation, hooks);
+        streamLog.releaseBytes(streamLog.bytes);
+        streamLog.bytes = 0;
+        streamLog.chunks.length = 0;
       }
     } else {
       // Buffer non-SSE bodies before sending headers so replay-safe methods can
       // recover from body-read failures and oversized upstream responses can be
       // rejected cleanly without exposing partial attacker-controlled bytes.
-      const buf = await readBodyBounded(upstreamRes.body, ctx.maxResponseBytes);
+      let responseBufferBudgetExhausted = false;
+      const reserveBufferedResponse = bytes => {
+        const reserved = ctx.reserveResponseBytes(bytes);
+        if (!reserved) responseBufferBudgetExhausted = true;
+        return reserved;
+      };
+      const buf = await readBodyBounded(
+        upstreamRes.body,
+        ctx.maxResponseBytes,
+        reserveBufferedResponse,
+      );
       if (buf === null) {
+        if (!replaySafe && !responseBufferBudgetExhausted) {
+          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
+        }
         ctx.status = 502;
-        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.writeHead(502, codexRecoveryResponseHeaders(
+          req,
+          body,
+          ctx,
+          method,
+          replaySafe
+            ? { 'Content-Type': 'application/json' }
+            : {
+                'Content-Type': 'application/json',
+                'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
+              },
+        ));
         res.end(JSON.stringify({
           type: 'error',
           error: { type: 'proxy_error', message: 'Upstream response exceeded the proxy limit.' },
@@ -2056,17 +2932,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return;
       }
       extractUsageFromBody(buf, account, accountManager);
-      if (logDir) {
-        if (buf.length === 0) {
-          logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        } else {
-          try {
-            logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-          } catch {
-            logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
-          }
-        }
-        writeRequestLog(logDir, reqId, logSections);
+      if (logDir && !metadataOnlyLog) {
+        appendLogSection(formatLogBody('=== RESPONSE BODY', buf));
+        flushRequestLog(logDir, reqId, logSections, hooks);
+      } else if (logDir) {
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
       if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       res.end(buf.length ? buf : undefined);
@@ -2076,8 +2946,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (continuityBoundedTimeout && replaySafe && sendSaved429(res, ctx)) return;
       console.error(`[TeamClaude] Upstream response timed out on account "${account.name}"`);
       if (logDir) {
-        logSections.push('=== ERROR ===\nUpstream response timed out.');
-        writeRequestLog(logDir, reqId, logSections);
+        appendLogSection('=== ERROR ===\nUpstream response timed out.');
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
 
       ctx.tried5xx.add(account);
@@ -2089,7 +2959,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
 
-      sendUpstreamTimeout(res, ctx);
+      if (!replaySafe) accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
+
+      sendUpstreamTimeout(res, ctx, codexRecoveryResponseHeaders(
+        req,
+        body,
+        ctx,
+        method,
+        { 'Content-Type': 'application/json' },
+      ));
       return;
     }
 
@@ -2104,8 +2982,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message);
 
     if (logDir) {
-      logSections.push(`=== ERROR ===\n${err.stack || err.message}`);
-      writeRequestLog(logDir, reqId, logSections);
+      appendLogSection(metadataOnlyLog
+        ? '=== ERROR ===\nUpstream request failed.'
+        : `=== ERROR ===\n${err.stack || err.message}`);
+      flushRequestLog(logDir, reqId, logSections, hooks);
     }
 
     // Undici surfaces a connection that dies WHILE READING THE BODY differently
@@ -2128,6 +3008,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // account-local failover for replay-safe methods only. A network blip does
     // not poison the account; exclusion remains per-request via tried5xx.
     if (isTransient) {
+      if (!replaySafe) accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
       if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
         if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
@@ -2139,7 +3020,17 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
       if (!replaySafe && !res.headersSent && !res.destroyed) {
         ctx.status = 502;
-        res.writeHead(502, { 'Content-Type': 'application/json' });
+        const responseHeaders = codexRecoveryResponseHeaders(
+          req,
+          body,
+          ctx,
+          method,
+          {
+            'Content-Type': 'application/json',
+            'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
+          },
+        );
+        res.writeHead(502, responseHeaders);
         res.end(JSON.stringify({
           type: 'error',
           error: {
@@ -2158,7 +3049,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (replaySafe && retryCount < maxRetries && !res.headersSent) {
       // Preserve a prior refresh-failure label, but label a new request-path
       // send failure so a later token rotation cannot blindly revive it.
-      if (account.status !== 'error') account._errorFromRefresh = false;
+      if (account.status !== 'error') {
+        account._errorFromRefresh = false;
+        account.errorReason = 'send-failed';
+      }
       account.status = 'error';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
@@ -2166,7 +3060,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     ctx.status = 502;
 
     if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.writeHead(502, codexRecoveryResponseHeaders(
+        req,
+        body,
+        ctx,
+        method,
+        { 'Content-Type': 'application/json' },
+      ));
       res.end(JSON.stringify({
         type: 'error',
         error: { type: 'proxy_error', message: `Upstream error: ${err.message}` },
@@ -2174,6 +3074,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
   } finally {
     upstreamDeadline.dispose();
+    if (!logSections.flushing) logSections.release();
   }
 }
 
@@ -2208,11 +3109,23 @@ async function streamResponse(
   transactionMaxBytes = DEFAULT_MAX_RESPONSE_BYTES,
   streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   streamTotalTimeoutMs = null,
+  reserveResponseBytes = () => true,
+  reserveAuxiliaryResponseBytes = () => true,
+  releaseAuxiliaryResponseBytes = () => {},
+  parseUsage = true,
+  terminalTracker = null,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
-  const framer = recover ? new SseFramer() : null;
+  let sseBufferBytes = 0;
+  let usageBufferDisabled = !parseUsage;
+  const framer = recover
+    ? new SseFramer({
+        reserveBytes: reserveAuxiliaryResponseBytes,
+        releaseBytes: releaseAuxiliaryResponseBytes,
+      })
+    : null;
   const bufferedFrames = transactional ? [] : null;
   let bufferedBytes = 0;
   let spillFile = null;
@@ -2226,6 +3139,8 @@ async function streamResponse(
     reason: null,
     preStreamFailure: null,
     limitExceeded: false,
+    bufferBudgetExceeded: false,
+    incompleteStream: false,
   };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -2243,25 +3158,47 @@ async function streamResponse(
   const forwardChunk = (bytes) => {
     ensureHeaders?.(); // first whole frame is ready — commit the deferred headers
     const ok = res.write(bytes);
-    const text = decoder.decode(bytes, { stream: true });
     if (streamLog && !streamLog.truncated) {
       const remaining = streamLog.maxBytes - streamLog.bytes;
       const logged = bytes.length <= remaining ? bytes : bytes.subarray(0, remaining);
       if (logged.length > 0) {
-        streamLog.chunks.push(Buffer.from(logged));
-        streamLog.bytes += logged.length;
+        if (streamLog.reserveBytes(logged.length)) {
+          streamLog.chunks.push(Buffer.from(logged));
+          streamLog.bytes += logged.length;
+        } else {
+          streamLog.truncated = true;
+        }
       }
       if (logged.length < bytes.length) streamLog.truncated = true;
     }
-    sseBuffer += text;
-    const events = sseBuffer.split('\n\n');
-    sseBuffer = events.pop(); // keep incomplete event
-    // Usage parsing is best-effort: a "partial event" that grows this large is
-    // a giant content delta or a CRLF-only stream — nothing parseSSEUsage could
-    // read either way. Drop it instead of buffering without bound.
-    if (sseBuffer.length > 1_048_576) sseBuffer = '';
-    for (const event of events) {
-      parseSSEUsage(event, account, accountManager);
+    if (!usageBufferDisabled) {
+      if (!reserveAuxiliaryResponseBytes(bytes.length)) {
+        releaseAuxiliaryResponseBytes(sseBufferBytes);
+        sseBuffer = '';
+        sseBufferBytes = 0;
+        usageBufferDisabled = true;
+      } else {
+        sseBufferBytes += bytes.length;
+        const text = decoder.decode(bytes, { stream: true });
+        sseBuffer += text;
+        const events = sseBuffer.split('\n\n');
+        sseBuffer = events.pop(); // keep incomplete event
+        const retainedBytes = Buffer.byteLength(sseBuffer);
+        releaseAuxiliaryResponseBytes(sseBufferBytes - retainedBytes);
+        sseBufferBytes = retainedBytes;
+        // Usage parsing is best-effort: a "partial event" that grows this large is
+        // a giant content delta or a CRLF-only stream — nothing parseSSEUsage could
+        // read either way. Drop it instead of buffering without bound.
+        if (sseBuffer.length > 1_048_576) {
+          releaseAuxiliaryResponseBytes(sseBufferBytes);
+          sseBuffer = '';
+          sseBufferBytes = 0;
+          usageBufferDisabled = true;
+        }
+        for (const event of events) {
+          parseSSEUsage(event, account, accountManager);
+        }
+      }
     }
     return ok;
   };
@@ -2304,13 +3241,22 @@ async function streamResponse(
     }
   };
 
-  const stageChunk = async (bytes) => {
+  const stageChunk = async (bytes, auxiliaryReservationBytes = 0) => {
     if (bufferedBytes + bytes.length > transactionMaxBytes) {
       outcome.limitExceeded = true;
       return false;
     }
-    const copy = Buffer.from(bytes);
-    if (!spillFile && bufferedBytes + copy.length > TRANSACTION_MEMORY_BYTES) {
+    const reservationBytes = auxiliaryReservationBytes || bytes.length;
+    if (!reserveResponseBytes(reservationBytes)) {
+      outcome.limitExceeded = true;
+      outcome.bufferBudgetExceeded = true;
+      return false;
+    }
+    if (auxiliaryReservationBytes > 0) {
+      framer.releaseForwarded(auxiliaryReservationBytes, false);
+      releaseAuxiliaryResponseBytes(auxiliaryReservationBytes);
+    }
+    if (!spillFile && bufferedBytes + bytes.length > TRANSACTION_MEMORY_BYTES) {
       spillPath = join(tmpdir(), `teamclaude-stream-${process.pid}-${randomUUID()}.tmp`);
       spillFile = await open(spillPath, 'wx+', 0o600);
       try {
@@ -2320,15 +3266,15 @@ async function streamResponse(
       for (const frame of bufferedFrames) await writeSpill(frame);
       bufferedFrames.length = 0;
     }
-    if (spillFile) await writeSpill(copy);
-    else bufferedFrames.push(copy);
-    bufferedBytes += copy.length;
+    if (spillFile) await writeSpill(bytes);
+    else bufferedFrames.push(bytes);
+    bufferedBytes += bytes.length;
     return true;
   };
 
   const relayChunk = async (bytes) => {
     if (transactional) {
-      return stageChunk(bytes);
+      return stageChunk(bytes, framer?.forwardedReservationBytes || 0);
     }
     if (!forwardChunk(bytes) && !await waitForDrain()) return false;
     return !res.destroyed;
@@ -2408,22 +3354,36 @@ async function streamResponse(
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
+      await terminalTracker?.push(step.value);
       const bytes = framer ? framer.push(step.value) : step.value;
+      if (framer?.limitExceeded) {
+        outcome.limitExceeded = true;
+        outcome.bufferBudgetExceeded = framer.bufferBudgetExceeded;
+        break;
+      }
       if (!bytes || bytes.length === 0) continue; // partial frame still buffering
 
       // Handle backpressure — also bail out if client disconnects,
       // because 'drain' will never fire on a destroyed socket. Both listeners
       // are removed once either fires, so a long stream with many backpressure
       // pauses doesn't accumulate dead 'close' listeners.
-      if (!await relayChunk(bytes)) break;
+      const relayed = await relayChunk(bytes);
+      if (!transactional) framer?.releaseForwarded(bytes.length);
+      if (!relayed) break;
     }
 
     if (outcome.limitExceeded) return outcome;
 
     // Parse any remaining (partial / never-forwarded) text for usage tracking
-    const tail = framer && framer.pending.length ? decoder.decode(framer.pending) : '';
-    if ((sseBuffer + tail).trim()) {
-      parseSSEUsage(sseBuffer + tail, account, accountManager);
+    if (sseBuffer.trim()) {
+      parseSSEUsage(sseBuffer, account, accountManager);
+    }
+
+    await terminalTracker?.finish?.();
+
+    if (!framer && terminalTracker && !terminalTracker.sawTerminal
+        && !res.destroyed && !res.writableEnded) {
+      outcome.incompleteStream = true;
     }
 
     if (framer && !res.destroyed && !res.writableEnded) {
@@ -2431,10 +3391,12 @@ async function streamResponse(
         // Complete stream — flush any trailing bytes after the terminal event
         // (comments / blank lines) for byte fidelity; finally ends normally.
         if (framer.pending.length) {
+          const pending = framer.takePending();
           if (transactional) {
-            if (!await stageChunk(framer.pending)) return outcome;
+            if (!await stageChunk(pending, pending.length)) return outcome;
           } else {
-            res.write(framer.pending);
+            res.write(pending);
+            framer.releaseForwarded(pending.length);
           }
         }
         if (transactional) await flushTransaction();
@@ -2462,6 +3424,9 @@ async function streamResponse(
     reader.cancel().catch(() => {});
     if (spillFile) await spillFile.close().catch(() => {});
     if (spillPath && !spillUnlinked) await unlink(spillPath).catch(() => {});
+    framer?.dispose();
+    terminalTracker?.dispose();
+    releaseAuxiliaryResponseBytes(sseBufferBytes);
     // Only end a response whose headers went out — a deferred-headers response
     // being handed back for replay (preStreamFailure) must stay untouched.
     if (res.headersSent && !res.writableEnded) res.end();
@@ -2548,6 +3513,9 @@ function computeRetryAfter(accounts, threshold = 0.98, model = null) {
     // then gives the soonest the fleet has anything to serve.
     let freeAt = 0;
     if (acct.rateLimitedUntil) freeAt = Math.max(freeAt, new Date(acct.rateLimitedUntil).getTime());
+    if (acct.dispatchFailureCooldownUntil) {
+      freeAt = Math.max(freeAt, new Date(acct.dispatchFailureCooldownUntil).getTime());
+    }
     const q = acct.quota || {};
     if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
       freeAt = Math.max(freeAt, q.unified5hReset);

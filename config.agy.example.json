@@ -1,0 +1,23 @@
+{
+  "provider": "agy",
+  "proxy": {
+    "port": 3459,
+    "apiKey": "tc-change-me-to-a-secret"
+  },
+  "upstream": "https://daily-cloudcode-pa.googleapis.com",
+  "accounts": [
+    {
+      "name": "agy-primary",
+      "provider": "agy",
+      "type": "oauth",
+      "accountUuid": "<google-account-id>",
+      "accessToken": "<consumer-access-token>",
+      "refreshToken": "<consumer-refresh-token>",
+      "expiresAt": 0,
+      "authMethod": "consumer",
+      "projectId": "<optional-project-id>",
+      "oauthTokenEndpoint": "https://oauth2.googleapis.com/token",
+      "oauthClientId": "<google-oauth-client-id>"
+    }
+  ]
+}

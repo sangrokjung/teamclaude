@@ -46,11 +46,36 @@ teamcodex codex import    # 기존 ~/.codex/auth.json 가져오기
 teamcodex server          # 프록시 시작 후 `teamcodex run`
 ```
 
-명령은 `teamcodex` 하나입니다. `teamclaude` 바이너리는 일부러 설치하지 않습니다. 같은
-이름을 쓰는 원본 패키지와 충돌하지 않기 위해서입니다.
+패키지는 두 명령을 모두 설치합니다. Claude 계정 풀은 `teamclaude`, 같은 CLI 진입점과
+provider 하위 명령은 `teamcodex`를 사용할 수 있습니다. 아래 예시는 Claude에
+`teamclaude`, Codex에 `teamclaude codex`를 사용합니다.
 
 저장소에서 바로 받고 싶다면 `npm i -g github:sangrokjung/teamclaude`도 동작합니다.
 이쪽은 항상 기본 브랜치를 따라갑니다.
+
+### 여러 Mac에 동일하게 설치
+
+각 Mac에 같은 고정 패키지를 독립적으로 설치합니다. 저장소에서는 tarball을 한 번 만든 뒤
+그 파일을 포함된 설치 스크립트에 전달하세요.
+
+```bash
+TARBALL=$(npm pack --silent)
+TARBALL_PATH="$PWD/$TARBALL"
+tar -xOf "$TARBALL_PATH" package/scripts/install-macos.sh | bash -s -- --check-only
+tar -xOf "$TARBALL_PATH" package/scripts/install-macos.sh |
+  bash -s -- --source "$TARBALL_PATH"
+```
+
+설치 스크립트는 글로벌 npm 패키지만 바꿉니다. 다음 파일은 읽거나 복사하거나
+동기화하지 않습니다: `~/.config/teamclaude.json`, `~/.config/teamcodex.json`,
+`~/.claude/.credentials.json`, `~/.codex/auth.json`.
+
+OAuth 로그인/import는 각 Mac에서 별도로 실행하세요. OAuth config를 Mac 사이에 복사하면
+안 됩니다. refresh endpoint가 refresh token을 회전할 수 있어 두 Mac이 같은 refresh
+chain을 공유하면 서로 인증을 무효화할 수 있습니다. threshold·fallback model 같은 비밀이
+아닌 설정은 각 머신에 별도로 적용할 수 있지만 credential, quota snapshot, state file,
+port는 각 머신이 소유합니다. 자세한 절차는
+[다중 Mac 운영 runbook](docs/runbooks/multi-mac-installation.md)을 참고하세요.
 
 ## 이용약관에 문제가 없나요?
 
@@ -166,6 +191,23 @@ teamclaude run
 > `teamclaude run`은 프록시가 없으면 자동으로 background supervisor를 기동합니다. proxy worker가 비정상 종료되어도 public listener는 유지되고 worker가 자동 재기동됩니다.
 > `launchModel` fallback은 일반 한도 기준으로 사용 가능한 계정 전부의 모델별 window가 유효하게 측정된 한도 도달 상태일 때만 적용됩니다. 미측정 또는 만료 window가 하나라도 있으면 조기 downgrade하지 않습니다.
 
+프록시가 `All N accounts exhausted. Retry in Ns.`를 반환하면 recovery parent는
+짧은 일반 backoff로 조기 재시도하지 않습니다. 서버가 알려준 `Retry in` 시간만큼
+기다린 뒤 같은 세션을 `--resume <session-id> continue`로 다시 실행합니다. 이 재개는
+`claudeAutoResumeMaxRetries` 횟수에 포함되며, 대기 중 `Ctrl-C`로 중단할 수 있습니다.
+`codexFallbackOnExhaustion: true`이고 전체 일반 quota 소진이 확인된 경우에는 기존
+Codex 인계가 우선합니다.
+
+Anthropic이 한 OAuth 계정에 구조화된 `oauth_not_allowed_for_organization`
+403을 반환하면 TeamClaude는 해당 계정만 인증 오류로 격리하고, 완결된 거부
+요청을 다른 사용 가능한 계정으로 재전송합니다. 일반 permission 403은 그대로
+전달해 계정 풀을 오염시키지 않습니다. 모든 계정이 거부되면 마지막 원본 403을
+유지하므로 조직 관리자가 Claude Code 구독 접근을 활성화하거나 운영자가 계정을
+다시 import/login할 수 있습니다. 격리된 계정은 저장된 정상 요청 형식으로 기본
+15분마다 독립 재검증하며, 2xx가 확인되면 자동으로 rotation에 복귀합니다. 이
+재검증은 quota용 `warmupIntervalMs`가 `0`이어도 계속됩니다. 대응 절차는
+[subscription-disabled runbook](docs/runbooks/claude-subscription-disabled.md)을 참고하세요.
+
 기존 Claude Code 로그인 정보를 가져올 수도 있습니다.
 
 ```bash
@@ -209,11 +251,22 @@ ID를 생략한 명령은 cmux를 사용할 수 없거나 현재 탭에 신뢰�
 resume binding이 없으면 추측하지 않고 실패합니다. 새 세션은
 `teamcodex codex run`으로 시작하세요. cmux가 정확한 checkpoint와 TeamCodex
 provider 인자를 함께 기록하므로 이후 탭 복원도 프록시 경로를 유지합니다.
-`--remote`, `--remote-auth-token-env`, `--oss`, `--local-provider`는 이 경로를
-벗어나므로 resume 명령에서 거부합니다.
+run과 resume 모두 compact `-cVALUE`/`-c=VALUE`를 포함한 provider/base URL
+설정 덮어쓰기와 `--remote`,
+`--remote-auth-token-env`, `--oss`, `--local-provider`를 거부합니다.
 진단과 레거시 세션 복구는
 [Codex provider/session 복구 runbook](docs/runbooks/codex-provider-session-recovery.md)을
 참고하세요.
+
+TeamCodex로 시작한 Codex 프로세스가 예기치 않게 종료되면 wrapper는 현재 cmux
+프록시가 현재 wrapper invocation과 exact session을 결속한 짧은 수명의 1회용
+receipt를 기록했고 그 UUID가 현재 cmux surface와 일치할 때만 그 exact session을
+**최대 한 번** 자동으로 다시 엽니다. 명시적 `codex resume SESSION_ID`도 동일 ID만
+한 번 재시도합니다. signal, 취소 상태 130, 일반 설정·인증 오류, 누락·불일치
+receipt, 누락·손상·동일한 binding, 두 번째 실패에서는 더 실행하지 않습니다.
+이는 HTTP 요청 replay가 아니라 저장된 session 재개입니다. 업스트림이 접수했는지
+불확실한 POST는 프록시가 두 번 보내지 않습니다. 복구 안내에는 checkpoint UUID를
+출력하지 않으며 receipt 소비와 cmux lookup은 합쳐서 총 5초를 넘기지 않습니다.
 
 현재 공식 Codex CLI에 로그인된 계정을 가져올 수도 있습니다.
 
@@ -226,6 +279,11 @@ teamclaude codex import --name codex-pro-1
 로그인을 수행하므로 TeamCodex와 일반 `~/.codex/auth.json`이 동일한 refresh
 token을 서로 갱신하며 충돌하지 않습니다.
 
+`teamclaude codex run`이 주입하는 provider는 `requires_openai_auth = false`로
+동작합니다. 프록시가 풀 계정의 자격 증명을 직접 주입하므로 로컬 Codex CLI에
+별도의 ChatGPT 로그인이 없어도 되고, `~/.codex/auth.json`이 만료·폐기되어도
+로그인 화면이 `codex run`을 막지 않습니다.
+
 ### Codex 계정 제어
 
 ```bash
@@ -236,6 +294,32 @@ teamclaude codex enable codex-pro-1
 teamclaude codex priority codex-pro-2 0
 teamclaude codex restart
 ```
+
+## Grok · Agy 계정 풀
+
+Grok과 Agy는 각각 별도 설정 파일과 포트를 사용하는 구독 OAuth 풀입니다. 한 설정에는
+하나의 provider만 두며, credential은 0600 권한의 config에 저장되고 status에는 표시하지
+않습니다.
+
+```bash
+# xAI Grok (기본: ~/.config/teamgrok.json · :3458)
+teamclaude grok login --name grok-main    # 공식 Grok OAuth 브라우저 로그인
+teamclaude grok import --from ~/.grok/auth.json --name grok-main
+teamclaude grok server
+teamclaude grok env
+
+# Google Antigravity / Gemini-compatible upstream
+teamclaude agy login --name agy-main      # macOS Keychain consumer OAuth 가져오기 및 Google 계정 식별자 확인
+teamclaude agy import --from ./agy-credential.json --name agy-main
+teamclaude agy server
+teamclaude agy env
+```
+
+Grok과 Agy 모두 구독 credential을 `Authorization: Bearer`로 upstream에 전달합니다.
+Grok 기본 upstream은 `https://cli-chat-proxy.grok.com/v1`, Agy는
+`https://daily-cloudcode-pa.googleapis.com`입니다. 두 provider 모두 `--api-key`를
+거부합니다. `teamclaude grok|agy accounts`, `disable`, `enable`, `priority`, `api`
+명령으로 기존 계정 제어 기능을 동일하게 사용할 수 있습니다.
 
 ## Hermes Agent 연결
 

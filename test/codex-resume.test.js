@@ -13,24 +13,22 @@ async function fixture(binding) {
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-resume-'));
   const codexLog = join(dir, 'codex.json');
   const cmuxLog = join(dir, 'cmux.json');
-  await writeFile(join(dir, 'codex'), `#!/usr/bin/env node
+await writeFile(join(dir, 'codex'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
+const readEnv = name => process.env[name] ?? null;
 writeFileSync(process.env.CODEX_LOG, JSON.stringify({
   args: process.argv.slice(2),
-  openaiApiKey: process.env.OPENAI_API_KEY ?? null,
-  codexApiKey: process.env.CODEX_API_KEY ?? null,
-  codexAccessToken: process.env.CODEX_ACCESS_TOKEN ?? null,
+  openaiApiKey: readEnv('OPENAI_API_KEY'),
+  codexApiKey: readEnv('CODEX_API_KEY'),
+  codexAccessToken: readEnv('CODEX_ACCESS_TOKEN'),
 }));
 `);
   await writeFile(join(dir, 'cmux'), `#!/usr/bin/env node
 import { writeFileSync } from 'node:fs';
-const credentials = [
-  'OPENAI_API_KEY',
-  'CODEX_API_KEY',
-  'CODEX_ACCESS_TOKEN',
-  'TEAMCLAUDE_CODEX_PROXY_TOKEN',
-];
-if (credentials.some((key) => process.env[key])) process.exit(70);
+if (process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY
+    || process.env.CODEX_ACCESS_TOKEN || process.env.TEAMCLAUDE_CODEX_PROXY_TOKEN) {
+  process.exit(70);
+}
 writeFileSync(process.env.CMUX_LOG, JSON.stringify(process.argv.slice(2)));
 process.stdout.write(process.env.CMUX_BINDING);
 `);
@@ -49,6 +47,7 @@ process.stdout.write(process.env.CMUX_BINDING);
     env: {
       ...process.env,
       PATH: `${dir}:${process.env.PATH}`,
+      TEAMCODEX_CODEX_BIN: join(dir, 'codex'),
       TEAMCLAUDE_CONFIG: join(dir, 'teamcodex.json'),
       CODEX_LOG: codexLog,
       CMUX_LOG: cmuxLog,
@@ -77,7 +76,7 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     // When
     const result = spawnSync(
       process.execPath,
-      [entry, 'codex', 'resume', SESSION_ID, '-c', 'model_provider="openai"'],
+      [entry, 'codex', 'resume', SESSION_ID, '--model', 'fable'],
       { encoding: 'utf8', env: fx.env },
     );
 
@@ -87,9 +86,8 @@ test('codex resume launches an explicit session through TeamCodex', async () => 
     const child = JSON.parse(await readFile(fx.codexLog, 'utf8'));
     const resumeIndex = child.args.indexOf('resume');
     const providerIndex = child.args.indexOf('model_provider="teamcodex_proxy"');
-    const bypassIndex = child.args.indexOf('model_provider="openai"');
     assert.deepEqual(child.args.slice(resumeIndex, resumeIndex + 2), ['resume', SESSION_ID]);
-    assert.ok(providerIndex > bypassIndex);
+    assert.ok(providerIndex > resumeIndex);
     assert.equal(child.openaiApiKey, null);
     assert.equal(child.codexApiKey, null);
     assert.equal(child.codexAccessToken, null);
@@ -102,6 +100,11 @@ test('codex resume rejects options that bypass TeamCodex provider routing', asyn
   // Given
   const fx = await fixture({});
   const unsafeArgs = [
+    ['-c', 'model_provider="openai"'],
+    ['-cmodel_provider="openai"'],
+    ['-c=model_provider="openai"'],
+    ['--config', 'chatgpt_base_url="https://api.openai.com"'],
+    ['--config=model_providers.teamcodex_proxy.base_url="https://api.openai.com"'],
     ['--remote', 'ws://127.0.0.1:9999'],
     ['--remote=ws://127.0.0.1:9999'],
     ['--remote-auth-token-env', 'REMOTE_TOKEN'],
@@ -125,6 +128,26 @@ test('codex resume rejects options that bypass TeamCodex provider routing', asyn
       assert.match(result.stderr, /bypasses TeamCodex provider routing/);
       assert.equal(await exists(fx.codexLog), false);
     }
+  } finally {
+    await rm(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test('codex resume rejects conflicting selectors before launching Codex', async () => {
+  const fx = await fixture({
+    resume_binding: { kind: 'codex', checkpoint_id: SESSION_ID },
+  });
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [entry, 'codex', 'resume', '--last', '--all'],
+      { encoding: 'utf8', env: fx.env },
+    );
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /selector/);
+    assert.equal(await exists(fx.codexLog), false);
   } finally {
     await rm(fx.dir, { recursive: true, force: true });
   }

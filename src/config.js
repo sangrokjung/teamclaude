@@ -3,6 +3,14 @@ import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, rmSyn
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
+import {
+  getProviderDefinition,
+  assertSupportedProvider,
+  normalizeProvider,
+  providerConfigFileName,
+  providerDefaultPort,
+  validateProviderAccounts,
+} from './provider-config.js';
 
 const DEFAULT_TOKEN_REFRESH_INTERVAL_MS = 300_000;
 const MIN_TOKEN_REFRESH_INTERVAL_MS = 60_000;
@@ -18,6 +26,17 @@ export function normalizeContinuityMaxWaitMs(value) {
   if (!Number.isFinite(value)) return DEFAULT_CONTINUITY_MAX_WAIT_MS;
   if (value <= 0) return 0;
   return Math.max(1, Math.floor(value));
+}
+
+export function assertSafeProxyConfig(config) {
+  if (typeof config?.proxy?.apiKey !== 'string' || config.proxy.apiKey.trim() === '') {
+    throw new Error('Server startup requires a non-empty proxy.apiKey.');
+  }
+  const provider = config?.provider == null
+    ? normalizeProvider(process.env.TEAMCLAUDE_PROVIDER)
+    : assertSupportedProvider(config.provider);
+  getProviderDefinition(provider);
+  validateProviderAccounts(provider, config?.accounts, { requireMetadata: true });
 }
 
 async function syncParentDirectory(path) {
@@ -251,9 +270,7 @@ function writeFileAtomicSync(path, data, mode = 0o600) {
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  const fileName = process.env.TEAMCLAUDE_PROVIDER === 'codex'
-    ? 'teamcodex.json'
-    : 'teamclaude.json';
+  const fileName = providerConfigFileName(process.env.TEAMCLAUDE_PROVIDER);
   return join(configDir, fileName);
 }
 
@@ -311,16 +328,17 @@ export function writeQuotaCacheSync(data) {
 }
 
 export function createDefaultConfig() {
-  const provider = process.env.TEAMCLAUDE_PROVIDER === 'codex' ? 'codex' : 'anthropic';
+  const provider = normalizeProvider(process.env.TEAMCLAUDE_PROVIDER);
+  const definition = getProviderDefinition(provider);
   return {
     provider,
     proxy: {
-      port: provider === 'codex' ? 3457 : 3456,
+      port: providerDefaultPort(provider),
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
-    upstream: provider === 'codex'
-      ? 'https://chatgpt.com/backend-api/codex'
-      : 'https://api.anthropic.com',
+    upstream: provider === 'agy'
+      ? (process.env.CLOUD_CODE_URL || definition.defaultUpstream)
+      : definition.defaultUpstream,
     switchThreshold: 0.98,
     tokenRefreshIntervalMs: DEFAULT_TOKEN_REFRESH_INTERVAL_MS,
     // Max simultaneous in-flight requests per account before load spreads to the
@@ -335,6 +353,9 @@ export function createDefaultConfig() {
     // How long (ms) a request waits for a free slot when every account is at its
     // cap, before returning 429. 0 = never queue.
     overflowQueueTimeoutMs: 15000,
+    // Bound requests accepted by the stable supervisor while its worker is
+    // still starting or being replaced.
+    workerReadyTimeoutMs: 30000,
     // Keep client requests inside the proxy while quota/cooldowns recover rather
     // than surfacing a 429 that interrupts an interactive Claude Code session.
     // A zero max wait retains the legacy fixed retry-count behavior.
@@ -345,6 +366,9 @@ export function createDefaultConfig() {
     // Maximum buffered upstream response per request. Transactional SSE spills
     // to disk after 1 MiB; non-SSE and OAuth responses remain memory-bounded.
     maxResponseBytes: 64 * 1024 * 1024,
+    // Process-wide bytes retained across all buffered responses, including
+    // transactional SSE spill files and non-SSE/OAuth response bodies.
+    maxBufferedResponseBytes: 256 * 1024 * 1024,
     // Total deadline for upstream response headers and buffered response bodies.
     // Long-lived SSE bodies are exempt after their response headers arrive.
     upstreamResponseTimeoutMs: 300000,
@@ -360,7 +384,9 @@ export function createDefaultConfig() {
     // Keys and targets are plain API model IDs (no "[1m]"-style suffixes); a
     // suffixed incoming model falls back to its suffix-stripped entry.
     // e.g. { "claude-fable-5": ["claude-opus-4-8", "claude-sonnet-5"] }
-    modelFallbacks: {},
+    modelFallbacks: provider === 'codex'
+      ? { 'gpt-5.6-sol': ['gpt-5.6-terra'] }
+      : {},
     activeWarmup: provider === 'anthropic',
     launchModel: null,
     autoResumeClaude: true,

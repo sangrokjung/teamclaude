@@ -364,6 +364,49 @@ test('persistent global 429 returns the last upstream response at the continuity
   }
 });
 
+test('saved continuity 429 replaces zero Retry-After while preserving positive upstream guidance', async t => {
+  for (const [upstreamRetryAfter, expectedRetryAfter] of [['0', '1'], ['17', '17']]) {
+    await t.test(`upstream Retry-After ${upstreamRetryAfter}`, async () => {
+      let upstreamHits = 0;
+      const upstream = http.createServer((_req, res) => {
+        upstreamHits++;
+        res.writeHead(429, {
+          'retry-after': upstreamRetryAfter,
+          'content-type': 'application/json',
+          'x-upstream-attempt': String(upstreamHits),
+        });
+        res.end(JSON.stringify({ type: 'error', upstreamAttempt: upstreamHits }));
+      });
+      const upstreamPort = await listen(upstream);
+      const am = new AccountManager(makeAccountsForServer(1), 0.98);
+      const proxy = startContinuityProxy(am, upstreamPort, {
+        continuityMaxWaitMs: 35,
+        continuityMaxSleepMs: 10,
+        continuityJitterMs: 0,
+        rateLimitFailovers: 0,
+      });
+      const proxyPort = await listen(proxy);
+
+      try {
+        const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+          signal: AbortSignal.timeout(1000),
+        });
+        assert.equal(response.status, 429);
+        assert.equal(response.headers.get('retry-after'), expectedRetryAfter,
+          'a saved 429 must never instruct the client to retry immediately');
+        assert.ok(upstreamHits >= 1, 'the terminal response must originate from an upstream 429');
+        assert.equal(am.accounts[0].inflight, 0);
+      } finally {
+        proxy.close();
+        upstream.close();
+      }
+    });
+  }
+});
+
 test('stalled replay-safe retry returns the last upstream 429 at the continuity deadline', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
@@ -513,6 +556,65 @@ test('expired continuity deadline returns saved 429 without another unsafe upstr
     assert.equal(upstreamHits, 1, 'an expired deadline must stop before replaying an unsafe POST');
     assert.equal(tokenChecks, 2);
     assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('continuity dispatch grace preserves a saved 429 before an unsafe retry starts', async () => {
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    if (upstreamHits === 1) {
+      res.writeHead(429, {
+        'retry-after': '1',
+        'content-type': 'application/json',
+        'x-upstream-attempt': '1',
+      });
+      res.end(JSON.stringify({ type: 'error', upstreamAttempt: 1 }));
+      return;
+    }
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'unexpected upstream retry' }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  const initialNow = 1_000_000;
+  let now = initialNow;
+  let tokenChecks = 0;
+  am.ensureTokenFresh = async () => {
+    tokenChecks++;
+    if (tokenChecks === 2) now = initialNow + 16;
+  };
+  const proxy = startContinuityProxy(am, upstreamPort, {
+    continuityMaxWaitMs: 20,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+    upstreamResponseTimeoutMs: 120,
+    rateLimitFailovers: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const originalDateNow = Date.now;
+    Date.now = () => now;
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+        signal: AbortSignal.timeout(1000),
+      });
+      assert.equal(response.status, 429);
+      assert.deepEqual(await response.json(), { type: 'error', upstreamAttempt: 1 });
+      assert.equal(response.headers.get('x-upstream-attempt'), '1');
+      assert.equal(upstreamHits, 1, 'the deadline edge must not start an unsafe retry');
+      assert.equal(tokenChecks, 2);
+      assert.equal(am.accounts[0].inflight, 0);
+    } finally {
+      Date.now = originalDateNow;
+    }
   } finally {
     proxy.close();
     upstream.close();

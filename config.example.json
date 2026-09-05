@@ -3,6 +3,7 @@
     "port": 3456,
     "apiKey": "tc-change-me-to-a-secret"
   },
+  "provider": "anthropic",
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "maxConcurrentPerAccount": 3,

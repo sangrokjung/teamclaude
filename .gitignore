@@ -2,3 +2,15 @@ node_modules/
 config.json
 *.log
 artifacts/
+
+# Local agent/session artifacts — never published (they carry account emails,
+# host paths and machine-local state). Added 2026-09-05 after a public-repo
+# scan found pooled account addresses in the debug journals.
+.codex/
+.omo/
+.deployment-backups/
+review-snapshots/
+.debug-journal-*.md
+.ulw-*.md
+*.tgz
+__pycache__/

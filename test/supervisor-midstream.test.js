@@ -99,6 +99,7 @@ test('supervisor bounds an idle worker SSE relay and releases public admission',
     proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    codexUsageRefresh: false,
     continuityMode: false,
     streamIdleTimeoutMs: 200,
     maxConcurrentPerAccount: 1,
@@ -256,8 +257,16 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-sse-'));
   const configPath = join(dir, 'config.json');
   const port = await unusedPort();
+  const invocationId = '01900000-0000-4000-8000-000000000042';
+  const sessionId = '01900000-0000-7000-8000-000000000043';
+  let upstreamHits = 0;
   const upstream = http.createServer((req, res) => {
+    upstreamHits += 1;
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (upstreamHits > 1) {
+      res.end('event: response.completed\ndata: {"type":"response.completed"}\n\n');
+      return;
+    }
     res.write('event: response.output_text.delta\ndata: {"delta":"hi"}\n\n');
     res.write('data: {"partial'); // cut mid-event, then die
     setTimeout(() => res.socket.destroy(), 30);
@@ -268,6 +277,7 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
     proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    codexUsageRefresh: false,
     accounts: [{
       name: 'codex-pro', provider: 'codex', type: 'oauth',
       accessToken: 'tok', refreshToken: 'r',
@@ -286,7 +296,10 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
     const result = await new Promise((resolve, reject) => {
       const req = http.request({
         host: '127.0.0.1', port, path: '/codex/responses', method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-teamcodex-invocation': invocationId,
+        },
       }, res => {
         const chunks = [];
         const settle = cleanEnd => () => resolve({ body: Buffer.concat(chunks).toString(), cleanEnd });
@@ -296,12 +309,168 @@ test('supervised codex worker (env-only provider, provider-less config) keeps le
         res.once('error', settle(false));
       });
       req.once('error', reject);
-      req.end(JSON.stringify({ model: 'gpt-5.6', input: 'hi' }));
+      req.end(JSON.stringify({
+        model: 'gpt-5.6',
+        input: 'hi',
+        prompt_cache_key: sessionId,
+      }));
     });
     assert.ok(!result.body.includes('overloaded_error'),
       'codex mode must never receive anthropic-shaped injected errors');
     assert.ok(result.body.includes('response.output_text.delta'), 'stream relayed');
+
+    const consume = await waitUntil(async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/teamclaude/codex-recovery/consume`,
+        {
+          method: 'POST',
+          headers: { 'x-teamcodex-invocation': invocationId },
+        },
+      );
+      return response.status === 200 ? response : null;
+    }, 'partial SSE recovery receipt was not recorded');
+    const consumeBody = await consume.text();
+    assert.equal(consume.status, 200, consumeBody);
+    assert.deepEqual(JSON.parse(consumeBody), { sessionId });
+
+    const completedInvocationId = '01900000-0000-4000-8000-000000000044';
+    const completedSessionId = '01900000-0000-7000-8000-000000000045';
+    const completed = await fetch(`http://127.0.0.1:${port}/codex/responses`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamcodex-invocation': completedInvocationId,
+      },
+      body: JSON.stringify({
+        model: 'gpt-5.6',
+        input: 'next',
+        prompt_cache_key: completedSessionId,
+      }),
+    });
+    assert.equal(completed.status, 200);
+    await completed.arrayBuffer();
+    const completedConsume = await fetch(
+      `http://127.0.0.1:${port}/teamclaude/codex-recovery/consume`,
+      {
+        method: 'POST',
+        headers: { 'x-teamcodex-invocation': completedInvocationId },
+      },
+    );
+    assert.equal(completedConsume.status, 404, 'a clean response must not mint a receipt');
   } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex worker death after response start records one recovery receipt without replay', { timeout: 20000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-response-death-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  const invocationId = '01900000-0000-4000-8000-000000000046';
+  const sessionId = '01900000-0000-7000-8000-000000000047';
+  let upstreamHits = 0;
+  const streams = new Set();
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: response.output_text.delta\ndata: {"delta":"started"}\n\n');
+    const timer = setInterval(() => {
+      if (!res.destroyed) res.write('event: ping\ndata: {"type":"ping"}\n\n');
+    }, 20);
+    streams.add(res);
+    res.once('close', () => {
+      clearInterval(timer);
+      streams.delete(res);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    workerHealthIntervalMs: 60_000,
+    accounts: [{
+      name: 'codex-pro', provider: 'codex', type: 'oauth',
+      accessToken: 'tok', refreshToken: 'r',
+      accountId: 'ws-1', accountUuid: 'ws-1',
+      expiresAt: Date.now() + 3_600_000,
+    }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'codex', 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    let markFirstData;
+    const firstData = new Promise(resolve => { markFirstData = resolve; });
+    const resultPromise = new Promise((resolve, reject) => {
+      const chunks = [];
+      const req = http.request({
+        host: '127.0.0.1', port, path: '/codex/responses', method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-teamcodex-invocation': invocationId,
+        },
+      }, res => {
+        let settled = false;
+        const settle = cleanEnd => () => {
+          if (settled) return;
+          settled = true;
+          resolve({ body: Buffer.concat(chunks).toString(), cleanEnd });
+        };
+        res.on('data', chunk => {
+          chunks.push(chunk);
+          markFirstData();
+        });
+        res.once('end', settle(true));
+        res.once('aborted', settle(false));
+        res.once('error', settle(false));
+      });
+      req.once('error', reject);
+      req.end(JSON.stringify({
+        model: 'gpt-5.6',
+        input: 'hi',
+        prompt_cache_key: sessionId,
+      }));
+    });
+
+    await firstData;
+    process.kill(initial.workerPid, 'SIGKILL');
+    const result = await resultPromise;
+    assert.equal(result.cleanEnd, false, 'Codex keeps raw SSE semantics after partial output');
+    assert.match(result.body, /response\.output_text\.delta/);
+    assert.equal(upstreamHits, 1, 'worker death must not replay the uncertain POST');
+
+    const consume = await waitUntil(async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/teamclaude/codex-recovery/consume`,
+        {
+          method: 'POST',
+          headers: { 'x-teamcodex-invocation': invocationId },
+        },
+      );
+      return response.status === 200 ? response : null;
+    }, 'response-started worker death receipt was not recorded');
+    assert.deepEqual(await consume.json(), { sessionId });
+    const consumedAgain = await fetch(
+      `http://127.0.0.1:${port}/teamclaude/codex-recovery/consume`,
+      {
+        method: 'POST',
+        headers: { 'x-teamcodex-invocation': invocationId },
+      },
+    );
+    assert.equal(consumedAgain.status, 404);
+  } finally {
+    for (const res of streams) res.destroy();
     await stopChild(child);
     await close(upstream);
     await rm(dir, { recursive: true, force: true });

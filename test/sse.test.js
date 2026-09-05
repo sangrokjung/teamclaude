@@ -102,6 +102,157 @@ test('oversized frame degrades to passthrough, keeps flowing, still spots the te
   assert.equal(f.sawTerminal, true);
 });
 
+test('retained frame bytes reserve and release their exact lifetime', () => {
+  let reserved = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => { reserved += bytes; return true; },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  assert.equal(f.push(b('event: ping\ndata: partial')), null);
+  assert.equal(reserved, b('event: ping\ndata: partial').length);
+  const out = f.push(b('\n\n'));
+  assert.equal(reserved, out.length);
+  f.releaseForwarded(out.length);
+  assert.equal(reserved, 0);
+  f.dispose();
+  assert.equal(reserved, 0);
+});
+
+test('a first partial frame needs only one aggregate reservation', () => {
+  const partial = b('event: ping\ndata: partial');
+  let reserved = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => {
+      if (reserved + bytes > partial.length) return false;
+      reserved += bytes;
+      return true;
+    },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  assert.equal(f.push(partial), null);
+  assert.equal(f.limitExceeded, false);
+  assert.equal(reserved, partial.length);
+  f.dispose();
+  assert.equal(reserved, 0);
+});
+
+test('concatenating a partial frame reserves the destination peak', () => {
+  const first = b('event: ping\ndata: par');
+  const second = b('tial\n\n');
+  const combinedBytes = first.length + second.length;
+  let reserved = 0;
+  let peak = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => {
+      reserved += bytes;
+      peak = Math.max(peak, reserved);
+      return true;
+    },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  assert.equal(f.push(first), null);
+  const out = f.push(second);
+  assert.equal(out.toString(), Buffer.concat([first, second]).toString());
+  assert.equal(peak, combinedBytes * 2);
+  assert.equal(reserved, combinedBytes);
+  f.releaseForwarded(out.length);
+  assert.equal(reserved, 0);
+});
+
+test('a failed concatenation peak keeps only the original partial frame reserved', () => {
+  const first = b('event: ping\ndata: par');
+  const second = b('tial\n\n');
+  const maxBytes = (first.length + second.length) * 2 - 1;
+  let reserved = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => {
+      if (reserved + bytes > maxBytes) return false;
+      reserved += bytes;
+      return true;
+    },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  assert.equal(f.push(first), null);
+  assert.equal(f.push(second), null);
+  assert.equal(f.limitExceeded, true);
+  assert.equal(f.pending.toString(), first.toString());
+  assert.equal(reserved, first.length);
+  f.dispose();
+  assert.equal(reserved, 0);
+});
+
+test('splitting a complete frame reserves the copied remainder peak', () => {
+  const frame = b('event: ping\ndata: ok\n\n');
+  const remainder = b('event: next\ndata: partial');
+  const input = Buffer.concat([frame, remainder]);
+  let reserved = 0;
+  let peak = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => {
+      reserved += bytes;
+      peak = Math.max(peak, reserved);
+      return true;
+    },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  const out = f.push(input);
+  assert.equal(out.toString(), frame.toString());
+  assert.equal(peak, input.length + remainder.length);
+  f.releaseForwarded(out.length);
+  assert.equal(reserved, remainder.length);
+  f.dispose();
+  assert.equal(reserved, 0);
+});
+
+test('a trailing partial frame transfers its reservation to the consumer', () => {
+  const frame = b('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  const trailing = b(': trailing-comment');
+  let reserved = 0;
+  const f = new SseFramer({
+    reserveBytes: bytes => { reserved += bytes; return true; },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  const out = f.push(Buffer.concat([frame, trailing]));
+  f.releaseForwarded(out.length);
+  const tail = f.takePending();
+  assert.equal(tail.toString(), trailing.toString());
+  f.releaseForwarded(tail.length);
+  assert.equal(reserved, 0);
+  f.dispose();
+});
+
+test('aggregate reservation failure leaves no retained frame bytes', () => {
+  let reserved = 0;
+  const f = new SseFramer({
+    reserveBytes: () => false,
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  assert.equal(f.push(b('event: ping\ndata: partial')), null);
+  assert.equal(f.limitExceeded, true);
+  assert.equal(f.pending.length, 0);
+  assert.equal(reserved, 0);
+  f.dispose();
+});
+
+test('passthrough chunks stay reserved until their consumer releases them', () => {
+  let reserved = 0;
+  const f = new SseFramer({
+    maxBufferedBytes: 4,
+    reserveBytes: bytes => { reserved += bytes; return true; },
+    releaseBytes: bytes => { reserved -= bytes; },
+  });
+  const first = f.push(b('oversized'));
+  assert.equal(f.passthrough, true);
+  assert.equal(reserved, first.length);
+  f.releaseForwarded(first.length);
+  assert.equal(reserved, 0);
+  const second = f.push(b('raw'));
+  assert.equal(reserved, second.length);
+  f.releaseForwarded(second.length);
+  assert.equal(reserved, 0);
+  f.dispose();
+});
+
 test('sseErrorEvent is a parseable retryable error frame', () => {
   const frame = sseErrorEvent('boom');
   assert.match(frame, /^event: error\ndata: .+\n\n$/s);

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { TUI } from '../src/tui.js';
+import { TUI, applyTuiAccountMutation } from '../src/tui.js';
 
 // Build a TUI wired to a real AccountManager + a config copy, without start()
 // (start() is what touches stdin/stdout — the constructor just sets fields). A
@@ -21,6 +21,298 @@ function makeTUI(names = ['a0', 'a1', 'a2']) {
   });
   return { tui, am, config, saves: () => saves, mutations };
 }
+
+function makeOAuthTUI(accounts, reauthenticate, saveResult) {
+  const am = new AccountManager(accounts.map(a => ({ ...a })), 0.98, 0, 5);
+  for (const [index, account] of accounts.entries()) {
+    if (account.status) am.accounts[index].status = account.status;
+  }
+  const config = { accounts: accounts.map(a => ({ ...a })) };
+  const mutations = [];
+  const tui = new TUI({
+    accountManager: am,
+    config,
+    saveConfig: async (_snapshot, mutation) => {
+      mutations.push(mutation);
+      return saveResult === undefined ? config : saveResult;
+    },
+    syncAccounts: async () => 0,
+    reauthenticate,
+    onQuit: () => {},
+  });
+  return { tui, am, config, mutations };
+}
+
+function makeProviderTUI(provider) {
+  const account = provider === 'grok'
+    ? {
+      name: 'grok-sub', provider, type: 'oauth', accessToken: 'access', refreshToken: 'refresh',
+      expiresAt: Date.now() + 3600_000, accountUuid: 'grok-user',
+      oauthIssuer: 'https://auth.x.ai', oauthClientId: 'grok-client',
+    }
+    : {
+      name: 'agy-sub', provider, type: 'oauth', accessToken: 'access', refreshToken: null,
+      expiresAt: Date.now() + 3600_000, accountUuid: 'agy-user', authMethod: 'consumer',
+    };
+  const am = new AccountManager([account], 0.98, 0, 5);
+  return new TUI({
+    accountManager: am,
+    config: { provider, proxy: { port: provider === 'grok' ? 3458 : 3459 }, accounts: [account] },
+    saveConfig: async () => {}, syncAccounts: async () => 0, onQuit: () => {},
+  });
+}
+
+test('Grok and Agy TUI surfaces use provider labels and OAuth-only add guidance', () => {
+  for (const [provider, brand, port] of [['grok', 'TeamGrok', '3458'], ['agy', 'TeamAgy', '3459']]) {
+    const tui = makeProviderTUI(provider);
+    assert.equal(tui._brandLabel(), brand);
+    assert.equal(tui._proxyPort(), Number(port));
+    tui.mode = 'add';
+    const footer = stripAnsi(tui._renderFooter());
+    assert.match(footer, new RegExp(`teamcodex ${provider} (login|import)`));
+    assert.doesNotMatch(footer, /API key|Import Claude Code/);
+    tui._keyAdd('k');
+    assert.equal(tui.mode, 'add', `${provider} does not open API-key input`);
+  }
+});
+
+test('Grok and Agy TUI import existing OAuth credentials without API-key fields', async () => {
+  for (const provider of ['grok', 'agy']) {
+    const am = new AccountManager([], 0.98, 0, 5);
+    const config = { provider, accounts: [] };
+    const mutations = [];
+    const tui = new TUI({
+      accountManager: am,
+      config,
+      saveConfig: async (_snapshot, mutation) => { mutations.push(mutation); },
+      syncAccounts: async () => 0,
+      importProviderCredentials: async () => provider === 'grok'
+        ? {
+          accessToken: 'grok-access', refreshToken: 'grok-refresh',
+          expiresAt: Date.now() + 3600_000, accountUuid: 'grok-user',
+          oauthIssuer: 'https://auth.x.ai', oauthClientId: 'grok-client',
+        }
+        : {
+          accessToken: 'agy-access', refreshToken: null,
+          expiresAt: Date.now() + 3600_000, accountUuid: 'agy-user', authMethod: 'consumer',
+        },
+      onQuit: () => {},
+    });
+
+    await tui._doImport();
+
+    assert.equal(config.accounts.length, 1);
+    assert.equal(config.accounts[0].provider, provider);
+    assert.equal(config.accounts[0].type, 'oauth');
+    assert.equal(Object.hasOwn(config.accounts[0], 'apiKey'), false);
+    assert.equal(am.accounts.length, 1);
+    assert.equal(am.accounts[0].provider, provider);
+    assert.equal(mutations.at(-1).type, 'upsert');
+  }
+});
+
+test('a stale TUI reauth mutation cannot clear a newer disk quarantine', () => {
+  const now = Date.now();
+  const account = {
+    name: 'auth@example.com', type: 'oauth', provider: 'anthropic', accountUuid: 'auth-id',
+    accessToken: 'new-access', refreshToken: 'new-refresh', expiresAt: now + 3600_000,
+    source: 'reauth', authVerifiedAt: now, authVerifiedAccountUuid: 'auth-id',
+  };
+  const diskConfig = {
+    accounts: [{
+      ...account,
+      accessToken: 'old-access', refreshToken: 'old-refresh',
+      authRevoked: true, authRevokedAt: now + 1_000,
+      importFrom: '/fixture/credentials.json',
+    }],
+  };
+  const manager = new AccountManager([{
+    ...diskConfig.accounts[0], accessToken: 'new-access', refreshToken: 'new-refresh',
+  }], 0.98, 0, 5);
+  applyTuiAccountMutation(diskConfig, { accounts: [account] }, manager, {
+    type: 'upsert', account, previous: account,
+    clearFields: ['authRevoked', 'authRevokedAt', 'importFrom'],
+  });
+  assert.equal(diskConfig.accounts[0].authRevoked, true);
+  assert.equal(diskConfig.accounts[0].authRevokedAt, now + 1_000);
+  assert.equal(diskConfig.accounts[0].importFrom, '/fixture/credentials.json');
+});
+
+test('a legacy account cannot be revived by an imported credential with a different UUID', () => {
+  const now = Date.now();
+  const legacy = {
+    name: 'legacy@example.com',
+    type: 'oauth',
+    provider: 'anthropic',
+    accountUuid: null,
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    expiresAt: now + 3600_000,
+    authRevoked: true,
+    authRevokedAt: now - 1000,
+  };
+  const imported = {
+    ...legacy,
+    accountUuid: 'uuid-other',
+    accessToken: 'other-access',
+    refreshToken: 'other-refresh',
+    source: 'import',
+    authVerifiedAt: now,
+    authVerifiedAccountUuid: 'uuid-other',
+  };
+  const manager = new AccountManager([{ ...legacy, accountUuid: 'uuid-other' }], 0.98, 0, 5);
+  manager.accounts[0].credential = imported.accessToken;
+  manager.accounts[0].accessToken = imported.accessToken;
+  manager.accounts[0].refreshToken = imported.refreshToken;
+  const diskConfig = { accounts: [{ ...legacy }] };
+
+  applyTuiAccountMutation(diskConfig, { accounts: [imported] }, manager, {
+    type: 'upsert',
+    account: imported,
+    previous: legacy,
+    clearFields: ['authRevoked', 'authRevokedAt', 'importFrom'],
+  });
+
+  assert.equal(diskConfig.accounts[0].authRevoked, true,
+    'an import proof must not clear a legacy account quarantine');
+  assert.equal(diskConfig.accounts[0].authRevokedAt, legacy.authRevokedAt);
+});
+
+test('TUI import cannot replace a quarantined legacy account by same-name profile', async () => {
+  const now = Date.now();
+  const legacy = {
+    name: 'legacy@example.com',
+    type: 'oauth',
+    provider: 'anthropic',
+    accountUuid: null,
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    expiresAt: now + 3600_000,
+    authRevoked: true,
+    authRevokedAt: now - 1000,
+    status: 'error',
+  };
+  const { tui, am, config, mutations } = makeOAuthTUI([legacy]);
+  tui.importAnthropicCredentials = async () => ({
+    accessToken: 'other-access', refreshToken: 'other-refresh', expiresAt: now + 7200_000,
+  });
+  tui.fetchAnthropicProfile = async () => ({
+    accountUuid: 'uuid-other', email: 'legacy@example.com',
+  });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].credential, 'old-access');
+  assert.equal(am.accounts[0].accountUuid, null);
+  assert.equal(am.accounts[0].authRevoked, true);
+  assert.equal(config.accounts[0].accessToken, 'old-access');
+  assert.equal(config.accounts[0].accountUuid, null);
+  assert.equal(config.accounts[0].authRevoked, true);
+  assert.equal(mutations.length, 0);
+});
+
+test('TUI import honors a live quarantine even when the config snapshot is stale', async () => {
+  const now = Date.now();
+  const legacy = {
+    name: 'legacy@example.com',
+    type: 'oauth',
+    provider: 'anthropic',
+    accountUuid: null,
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    expiresAt: now + 3600_000,
+  };
+  const { tui, am, config, mutations } = makeOAuthTUI([legacy]);
+  am.accounts[0].authRevoked = true;
+  am.accounts[0].authRevokedAt = now - 1000;
+  am.accounts[0].status = 'error';
+  am.accounts[0].errorReason = 'auth-revoked';
+  tui.importAnthropicCredentials = async () => ({
+    accessToken: 'other-access', refreshToken: 'other-refresh', expiresAt: now + 7200_000,
+  });
+  tui.fetchAnthropicProfile = async () => ({
+    accountUuid: 'uuid-other', email: 'legacy@example.com',
+  });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].credential, 'old-access');
+  assert.equal(am.accounts[0].accountUuid, null);
+  assert.equal(am.accounts[0].authRevoked, true);
+  assert.equal(config.accounts[0].accessToken, 'old-access');
+  assert.equal(mutations.length, 0);
+});
+
+test('TUI import with a matching stable UUID can heal a quarantined account', async () => {
+  const now = Date.now();
+  const account = {
+    name: 'stable@example.com',
+    type: 'oauth',
+    provider: 'anthropic',
+    accountUuid: 'uuid-stable',
+    accessToken: 'old-access',
+    refreshToken: 'old-refresh',
+    expiresAt: now + 3600_000,
+    authRevoked: true,
+    authRevokedAt: now - 1000,
+    status: 'error',
+  };
+  const { tui, am, config, mutations } = makeOAuthTUI([account]);
+  tui.importAnthropicCredentials = async () => ({
+    accessToken: 'new-access', refreshToken: 'new-refresh', expiresAt: now + 7200_000,
+  });
+  tui.fetchAnthropicProfile = async () => ({
+    accountUuid: 'uuid-stable', email: 'stable@example.com',
+  });
+
+  await tui._doImport();
+
+  assert.equal(am.accounts[0].credential, 'new-access');
+  assert.equal(am.accounts[0].accountUuid, 'uuid-stable');
+  assert.equal(am.accounts[0].authRevoked, undefined);
+  assert.equal(config.accounts[0].accessToken, 'new-access');
+  assert.equal(config.accounts[0].authRevoked, undefined);
+  assert.equal(mutations.at(-1).clearFields?.includes('authRevoked'), true);
+});
+
+test('a missing or malformed legacy revocation timestamp cannot be bypassed by a proof marker', () => {
+  for (const badTimestamp of [undefined, 'not-a-timestamp']) {
+    const now = Date.now();
+    const legacy = {
+      name: 'legacy@example.com',
+      type: 'oauth',
+      provider: 'anthropic',
+      accountUuid: null,
+      accessToken: 'old-access',
+      refreshToken: 'old-refresh',
+      expiresAt: now + 3600_000,
+      authRevoked: true,
+      ...(badTimestamp === undefined ? {} : { authRevokedAt: badTimestamp }),
+    };
+    const incoming = {
+      ...legacy,
+      accountUuid: 'uuid-reauth',
+      accessToken: 'fresh-access',
+      refreshToken: 'fresh-refresh',
+      source: 'reauth',
+      authVerifiedAt: now + 1,
+      authVerifiedAccountUuid: 'uuid-reauth',
+    };
+    const manager = new AccountManager([{ ...legacy, accountUuid: 'uuid-reauth' }], 0.98, 0, 5);
+    manager.accounts[0].credential = incoming.accessToken;
+    manager.accounts[0].accessToken = incoming.accessToken;
+    manager.accounts[0].refreshToken = incoming.refreshToken;
+    const diskConfig = { accounts: [{ ...legacy }] };
+    applyTuiAccountMutation(diskConfig, { accounts: [incoming] }, manager, {
+      type: 'upsert',
+      account: incoming,
+      previous: legacy,
+      clearFields: ['authRevoked', 'authRevokedAt', 'importFrom'],
+    });
+    assert.equal(diskConfig.accounts[0].authRevoked, true,
+      `invalid authRevokedAt (${String(badTimestamp)}) must fail closed`);
+  }
+});
 
 // ── normal-mode cursor: ↑/↓ select, action keys act on the selection ─────────
 
@@ -62,6 +354,399 @@ test('normal mode: "d" asks for confirmation (enters select mode, not a direct d
   tui.mode = 'normal'; tui.selIdx = 1;
   tui._keyNormal('d');
   assert.equal(tui.mode, 'select', 'delete is destructive → confirmation step, not a direct action');
+});
+
+test('error OAuth account exposes a re-authentication action, but active account does not', () => {
+  const { tui, am } = makeOAuthTUI([
+    { name: 'broken@example.com', type: 'oauth', accountUuid: 'broken-id', accessToken: 'old', refreshToken: 'old-r', status: 'error' },
+    { name: 'ok@example.com', type: 'oauth', accountUuid: 'ok-id', accessToken: 'ok', refreshToken: 'ok-r', status: 'active' },
+  ]);
+
+  tui.selIdx = 0;
+  assert.match(stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false)), /reauth/, 'error row is visibly actionable');
+  assert.match(stripAnsi(tui._renderFooter()), /재인증 필요.*\[r\]/, 'selected error account exposes the re-auth action');
+
+  tui.selIdx = 1;
+  tui.selAcct = am.accounts[1];
+  assert.doesNotMatch(stripAnsi(tui._renderFooter()), /재인증 필요/, 'active account does not expose re-auth');
+});
+
+test('re-authentication updates only the selected account and persists its identity', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    { name: 'broken@example.com', type: 'oauth', accountUuid: 'broken-id', accessToken: 'old', refreshToken: 'old-r', expiresAt: 1, status: 'error' },
+    { name: 'ok@example.com', type: 'oauth', accountUuid: 'ok-id', accessToken: 'ok', refreshToken: 'ok-r', status: 'active' },
+  ], async account => ({
+    credentials: { accessToken: 'fresh', refreshToken: 'fresh-r', expiresAt: 999 },
+    profile: { accountUuid: account.accountUuid, email: account.name },
+  }));
+
+  tui.selIdx = 0;
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'fresh');
+  assert.equal(am.accounts[0].refreshToken, 'fresh-r');
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[1].credential, 'ok');
+  assert.equal(am.accounts[1].status, 'active');
+  assert.equal(config.accounts[0].accessToken, 'fresh');
+  assert.equal(config.accounts[1].accessToken, 'ok');
+  assert.equal(mutations.at(-1).type, 'upsert');
+  assert.equal(mutations.at(-1).account.accountUuid, 'broken-id');
+});
+
+test('re-authentication rejects a different profile without changing either account', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    { name: 'broken@example.com', type: 'oauth', accountUuid: 'broken-id', accessToken: 'old', refreshToken: 'old-r', status: 'error' },
+    { name: 'ok@example.com', type: 'oauth', accountUuid: 'ok-id', accessToken: 'ok', refreshToken: 'ok-r', status: 'active' },
+  ], async () => ({
+    credentials: { accessToken: 'wrong', refreshToken: 'wrong-r', expiresAt: 999 },
+    profile: { accountUuid: 'ok-id', email: 'ok@example.com' },
+  }));
+
+  tui.selIdx = 0;
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[1].credential, 'ok');
+  assert.equal(config.accounts[0].accessToken, 'old');
+  assert.equal(config.accounts[1].accessToken, 'ok');
+  assert.equal(mutations.length, 0, 'mismatched login must not persist tokens');
+});
+
+test('subscription-disabled OAuth accounts cannot be re-authenticated or expose re-auth UI', () => {
+  const { tui, am } = makeOAuthTUI([
+    {
+      name: 'lapsed@example.com',
+      type: 'oauth',
+      accountUuid: 'lapsed-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      status: 'error',
+    },
+  ]);
+  am.accounts[0].errorReason = 'subscription-disabled';
+  tui.selIdx = 0;
+
+  assert.equal(tui._canReauthenticate(am.accounts[0]), false);
+  assert.doesNotMatch(stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false)), /reauth/);
+  assert.doesNotMatch(stripAnsi(tui._renderFooter()), /reauth|재인증 필요/);
+});
+
+test('disabled OAuth error accounts cannot be re-authenticated or expose re-auth UI', async () => {
+  let calls = 0;
+  const { tui, am } = makeOAuthTUI([
+    {
+      name: 'disabled@example.com',
+      type: 'oauth',
+      accountUuid: 'disabled-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      enabled: false,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => { calls++; return null; });
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+
+  const canReauthenticate = tui._canReauthenticate(am.accounts[0]);
+  const rowHasReauth = /reauth/.test(stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false)));
+  const footerHasReauth = /reauth|재인증 필요/.test(stripAnsi(tui._renderFooter()));
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.deepEqual({ canReauthenticate, rowHasReauth, footerHasReauth, calls }, {
+    canReauthenticate: false,
+    rowHasReauth: false,
+    footerHasReauth: false,
+    calls: 0,
+  });
+});
+
+test('non-Anthropic OAuth accounts cannot be re-authenticated or expose re-auth UI', async () => {
+  let calls = 0;
+  const { tui, am } = makeOAuthTUI([
+    {
+      name: 'codex@example.com',
+      type: 'oauth',
+      provider: 'codex',
+      accountUuid: 'codex-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      status: 'error',
+    },
+  ], async () => { calls++; return null; });
+  tui.selIdx = 0;
+
+  assert.equal(tui._canReauthenticate(am.accounts[0]), false);
+  assert.doesNotMatch(stripAnsi(tui._renderAcct(am.accounts[0], 0, 10, true, false)), /reauth/);
+  assert.doesNotMatch(stripAnsi(tui._renderFooter()), /reauth|재인증 필요/);
+  tui._keyNormal('r');
+  await Promise.resolve();
+  assert.equal(calls, 0);
+});
+
+test('re-authentication with incomplete credentials preserves selected account and config without saving', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 123,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'fresh', refreshToken: 'fresh-r' },
+    profile: { accountUuid: 'broken-id', email: 'broken@example.com' },
+  }));
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 123);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'token-expired');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 0, 'incomplete credentials must not persist tokens');
+});
+
+test('re-authentication rejection preserves selected account and config without saving', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 456,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => {
+    throw new Error('oauth browser failed');
+  });
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 456);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'token-expired');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 0, 'rejected login must not persist tokens');
+});
+
+test('re-authentication rejects a profile with mismatched UUID even when email matches', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 789,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'wrong', refreshToken: 'wrong-r', expiresAt: 999 },
+    profile: { accountUuid: 'other-id', email: 'broken@example.com' },
+  }));
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 789);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'token-expired');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 0, 'identity-mismatched login must not persist tokens');
+});
+
+test('re-authentication rejects a profile missing UUID when the stored account has one', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 790,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'wrong', refreshToken: 'wrong-r', expiresAt: 1000 },
+    profile: { email: 'broken@example.com' },
+  }));
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 790);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 0, 'a missing profile UUID must not use an email fallback');
+});
+
+test('re-authentication fails closed when config has a same-name account with a different UUID', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'live-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 791,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'fresh', refreshToken: 'fresh-r', expiresAt: 1001 },
+    profile: { accountUuid: 'live-id', email: 'broken@example.com' },
+  }));
+  config.accounts[0].accountUuid = 'config-other-id';
+  config.accounts[0].accessToken = 'config-old';
+  config.accounts[0].refreshToken = 'config-old-r';
+  config.accounts[0].expiresAt = 792;
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 791);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 0, 'a UUID mismatch in config must not be repaired by name');
+});
+
+test('re-authentication rolls back when the config save result omits the updated account', async () => {
+  const { tui, am, config, mutations } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 321,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'fresh', refreshToken: 'fresh-r', expiresAt: 654 },
+    profile: { accountUuid: 'broken-id', email: 'broken@example.com' },
+  }), { accounts: [] });
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 321);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'token-expired');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+  assert.equal(mutations.length, 1, 'the attempted save is recorded, but its no-op result must fail re-auth');
+});
+
+test('re-authentication rolls back when the config save callback returns no result', async () => {
+  const { tui, am, config } = makeOAuthTUI([
+    {
+      name: 'broken@example.com',
+      type: 'oauth',
+      accountUuid: 'broken-id',
+      accessToken: 'old',
+      refreshToken: 'old-r',
+      expiresAt: 322,
+      status: 'error',
+      errorReason: 'token-expired',
+    },
+  ], async () => ({
+    credentials: { accessToken: 'fresh', refreshToken: 'fresh-r', expiresAt: 655 },
+    profile: { accountUuid: 'broken-id', email: 'broken@example.com' },
+  }));
+  tui.saveConfig = async () => undefined;
+  am.accounts[0].errorReason = 'token-expired';
+  tui.selIdx = 0;
+  const beforeConfig = { ...config.accounts[0] };
+
+  tui._keyNormal('r');
+  await tui._reauthPromise;
+
+  assert.equal(am.accounts[0].credential, 'old');
+  assert.equal(am.accounts[0].refreshToken, 'old-r');
+  assert.equal(am.accounts[0].expiresAt, 322);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.deepEqual(config.accounts[0], beforeConfig);
+});
+
+test('selected account action bar makes account deletion discoverable', () => {
+  const { tui } = makeTUI(['alpha', 'yoon']);
+  tui.selIdx = 1;
+
+  const footer = stripAnsi(tui._renderFooter());
+  assert.match(footer, /Selected: yoon/, 'the action bar names the selected account');
+  assert.match(footer, /\[d\] Delete account/, 'delete is exposed as an explicit selected-account action');
+});
+
+test('delete confirmation names the selected account and Esc cancels', () => {
+  const { tui, config } = makeTUI(['alpha', 'yoon']);
+  tui.selIdx = 1;
+  tui._keyNormal('d');
+
+  const footer = stripAnsi(tui._renderFooter());
+  assert.match(footer, /Delete account "yoon"\?/, 'confirmation repeats the destructive target');
+  assert.match(footer, /\[Enter\] Confirm delete/, 'confirmation action is explicit');
+  assert.match(footer, /\[Esc\] Cancel/, 'cancel action is explicit');
+
+  tui._keySelect('esc');
+  assert.deepEqual(config.accounts.map(a => a.name), ['alpha', 'yoon']);
+});
+
+test('delete confirmation removes yoon from memory and persisted config', () => {
+  const { tui, am, config, mutations } = makeTUI(['alpha', 'yoon']);
+  tui.selIdx = 1;
+
+  tui._keyNormal('d');
+  tui._keySelect('enter');
+
+  assert.deepEqual(am.accounts.map(a => a.name), ['alpha']);
+  assert.deepEqual(config.accounts.map(a => a.name), ['alpha']);
+  assert.equal(mutations.at(-1).type, 'remove');
+  assert.equal(mutations.at(-1).account.name, 'yoon');
 });
 
 test('select-mode (delete) → Enter removes the cursor account, Esc cancels', async () => {

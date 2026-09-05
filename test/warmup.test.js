@@ -319,6 +319,45 @@ test('refreshQuotaAll refreshes disabled accounts for display too', async () => 
   }
 });
 
+test('forced quota refresh never probes an auth-revoked account, even with subscription recovery enabled', async () => {
+  const seenAuth = [];
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    seenAuth.push(req.headers.authorization || null);
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const accounts = makeAccounts(2);
+  accounts[1].authRevoked = true;
+  accounts[1].subscriptionDisabled = true;
+  const am = new AccountManager(accounts, 0.98, 0, 3);
+  const proxy = createProxyServer(am, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+    subscriptionRecheckIntervalMs: 5,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const first = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-x', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(first.status, 200);
+    await proxy.refreshQuotaAll();
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    assert.equal(seenAuth.includes('Bearer tok-1'), false,
+      'no forced warmup or subscription recheck may spend a revoked credential');
+    assert.equal(am.accounts[1].authRevoked, true);
+    assert.equal(am.accounts[1].errorReason, 'auth-revoked');
+  } finally {
+    await new Promise(resolve => proxy.close(resolve));
+    await new Promise(resolve => upstream.close(resolve));
+  }
+});
+
 // The self-heal that fixes the "one enabled account stuck without its Fbl bar"
 // report: an account fully measured for 5h/7d but missing the Fable window is
 // not an ordinary warm-up candidate, so the periodic timer's top-up pass must

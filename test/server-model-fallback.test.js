@@ -538,3 +538,44 @@ test('capped fleet queue timeout does not trigger model fallback', async () => {
     upstream.close();
   }
 });
+
+test('cooldown-only fleet does not trigger model fallback', async () => {
+  const attempts = [];
+  const upstream = http.createServer(async (req, res) => {
+    const body = await readJsonBody(req);
+    attempts.push(body.model);
+    ok200(res, { ok: true, served: body.model });
+  });
+  const upstreamPort = await listen(upstream);
+
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  for (const account of am.accounts) {
+    account.dispatchFailureCooldownUntil = Date.now() + 3_000;
+  }
+  const proxy = startProxy(am, upstreamPort, {
+    modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
+    continuityMode: false,
+  });
+  const proxyPort = await listen(proxy);
+  const log = console.log;
+  const fallbackLogs = [];
+  console.log = (...args) => {
+    if (String(args[0]).includes('Model fallback:')) fallbackLogs.push(args.join(' '));
+  };
+
+  try {
+    const res = await post(proxyPort, 'claude-fable-5');
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.deepEqual(attempts, [], 'cooldown-only fleet must not dispatch fallback upstream');
+    assert.deepEqual(fallbackLogs, [], 'cooldown-only fleet must not select a fallback model');
+    const retryAfter = Number.parseInt(res.headers.get('retry-after'), 10);
+    assert.ok(retryAfter >= 1 && retryAfter <= 5,
+      `retry-after should reflect the remaining cooldown, got ${retryAfter}s`);
+    assert.ok(am.accounts.every(account => account.status === 'active'));
+  } finally {
+    console.log = log;
+    proxy.close();
+    upstream.close();
+  }
+});

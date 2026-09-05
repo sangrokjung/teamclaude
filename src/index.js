@@ -1,31 +1,50 @@
 #!/usr/bin/env node
 
 import { fork, spawn, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
+import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
-  assertSafeCodexResumeArgs,
+  importGrokCredentials,
+  importAgyCredentials,
+  loginGrokCredentials,
+  refreshProviderAccessToken,
+} from './provider-oauth.js';
+import {
+  assertSafeCodexArgs,
   buildCodexProxyArgs,
+  codexCliNotFoundMessage,
   importCodexCredentials,
   parseCodexCredentialsJson,
   refreshCodexAccessToken,
+  resolveCodexCliBin,
 } from './codex.js';
 import {
+  currentCmuxCodexBaseline,
   currentCmuxCodexSessionId,
   isCodexSessionId,
 } from './codex-session.js';
+import {
+  CODEX_INVOCATION_HEADER,
+  CODEX_RECOVERY_CONSUME_PATH,
+  CODEX_RECOVERY_SESSION_HEADER,
+  codexRecoveryIdentity,
+  isCodexInvocationId,
+  isCodexResponsesPath,
+} from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
+import { reauthenticateAccount } from './reauth.js';
 import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
@@ -35,16 +54,49 @@ import {
   createCmuxSessionRescuer,
   defaultCmuxRescuePaths,
 } from './cmux-session-rescue.js';
+import {
+  PROBE_BROKEN,
+  createLoopStallMeter,
+  healthProbeVerdict,
+  unhealthyWorkerAction,
+} from './worker-health.js';
+import {
+  PROVIDER_NAMES,
+  assertSupportedProvider,
+  getProviderDefinition,
+  buildProviderUpstreamUrl,
+  normalizeProvider,
+  providerAuthHeaders,
+  validateProviderAccounts,
+} from './provider-config.js';
 
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
+const LIFECYCLE_ID_ENV = 'TEAMCLAUDE_LIFECYCLE_ID';
+const DEPLOYMENT_DRAIN_PATH = '/teamclaude/deployment/drain';
+const LIFECYCLE_ID_HEADER = 'x-teamcodex-lifecycle-id';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+function runtimeSourceHash(entryPath) {
+  const sourceDir = dirname(entryPath);
+  const digest = createHash('sha256');
+  const files = readdirSync(sourceDir).filter(name => name.endsWith('.js')).sort();
+  for (const name of files) {
+    digest.update(name);
+    digest.update('\0');
+    digest.update(readFileSync(join(sourceDir, name)));
+    digest.update('\0');
+  }
+  return digest.digest('hex');
+}
+
+const RUNTIME_SOURCE_HASH = runtimeSourceHash(process.argv[1]);
 const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
   'connection',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
+  'proxy-connection',
   'te',
   'trailer',
   'transfer-encoding',
@@ -59,12 +111,26 @@ const SUPERVISOR_HOP_BY_HOP_HEADERS = new Set([
 // the dispatch `await`s command functions mid-module — a declaration placed
 // after it throws ReferenceError the moment statusCommand touches it.
 const ERROR_REASON_LABELS = {
-  'subscription-disabled': '구독연체',
+  'subscription-disabled': '조직의 Claude Code 접근 차단',
   'auth-revoked': '인증무효 — 재로그인 필요',
   'refresh-failed': 'refresh 실패',
   'auth-rejected': '인증거부',
   'send-failed': '송신실패',
 };
+
+/**
+ * Did the worker's listener actively fail, or did we merely run out of patience?
+ * A refused/reset connection is something the listener DID; a timeout is only
+ * the absence of an answer, which a stalled supervisor produces on its own.
+ */
+function probeFailureKind(err) {
+  const code = err?.code;
+  if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EPIPE'
+      || code === 'ERR_SOCKET_CLOSED' || code === 'EHOSTUNREACH') {
+    return PROBE_BROKEN;
+  }
+  return undefined;
+}
 
 function connectionHeaderNames(value) {
   return new Set(
@@ -89,10 +155,10 @@ function publicRequestCapacity(config, accounts = config.accounts || []) {
 }
 
 const args = process.argv.slice(2);
-const cliProvider = args[0] === 'codex' ? 'codex' : 'anthropic';
-if (cliProvider === 'codex') {
+const cliProvider = PROVIDER_NAMES.includes(args[0]) ? args[0] : 'anthropic';
+if (cliProvider !== 'anthropic') {
   args.shift();
-  process.env.TEAMCLAUDE_PROVIDER = 'codex';
+  process.env.TEAMCLAUDE_PROVIDER = cliProvider;
 }
 const command = args[0];
 
@@ -126,6 +192,10 @@ switch (command) {
     await loginCommand();
     process.exit(0);
     break;
+  case 'reauth':
+    await reauthenticateCommand();
+    process.exit(0);
+    break;
   case 'env':
     await envCommand();
     process.exit(0);
@@ -152,6 +222,10 @@ switch (command) {
     break;
   case 'priority':
     await setPriorityCommand();
+    process.exit(0);
+    break;
+  case 'subscription':
+    await subscriptionCommand();
     process.exit(0);
     break;
   case 'api':
@@ -186,6 +260,7 @@ async function serverCommand() {
 
 async function superviseServerCommand() {
   const config = await loadOrCreateConfig();
+  assertSafeProxyConfig(config);
   const port = config?.proxy?.port;
   const existing = await findRunningServer(config);
   if (existing && existing.port === port) {
@@ -222,20 +297,42 @@ async function superviseServerCommand() {
   const workerHealthIntervalMs = Number.isFinite(config.workerHealthIntervalMs)
     ? Math.max(50, config.workerHealthIntervalMs)
     : 5_000;
+  // Measured on the live daemon (2026-08-07, host load1 25-35): the probe path
+  // runs p50 8ms but p99 1.44s / max 1.64s. A 2s budget left no headroom, so
+  // ordinary host contention convicted a healthy worker every few minutes.
   const workerHealthTimeoutMs = Number.isFinite(config.workerHealthTimeoutMs)
-    ? Math.max(10, config.workerHealthTimeoutMs)
-    : 2_000;
+    ? Math.max(1, config.workerHealthTimeoutMs)
+    : 5_000;
+  const workerReadyTimeoutMs = Number.isFinite(config.workerReadyTimeoutMs)
+      && config.workerReadyTimeoutMs > 0
+    ? Math.max(1, Math.floor(config.workerReadyTimeoutMs))
+    : 30_000;
   const workerHealthFailureThreshold = Number.isFinite(config.workerHealthFailureThreshold)
     ? Math.max(1, Math.floor(config.workerHealthFailureThreshold))
-    : 2;
+    : 3;
+  // A worker whose event loop still answers IPC can drain its in-flight work on
+  // SIGTERM; only a worker that ignores that grace gets SIGKILLed.
+  const workerRecycleGraceMs = Number.isFinite(config.workerRecycleGraceMs)
+    ? Math.max(0, Math.floor(config.workerRecycleGraceMs))
+    : 5_000;
+  const deploymentDrainLeaseMs = Number.isFinite(config.deploymentDrainLeaseMs)
+    ? Math.max(100, Math.floor(config.deploymentDrainLeaseMs))
+    : 15_000;
+  // Deliberately NOT the HTTP budget: an IPC round trip on a live loop is
+  // sub-millisecond, so a floor keeps a deliberately tiny health timeout from
+  // making every worker look wedged.
+  const workerPingTimeoutMs = Math.max(500, workerHealthTimeoutMs);
   const workerWaiters = new Set();
   const clientAgents = new WeakMap();
   const statePath = getServerStatePath();
+  const lifecycleId = randomUUID();
   let worker = null;
   let workerReady = false;
   let workerPort = null;
   let hasBeenReady = false;
   let stopping = false;
+  let deploymentDraining = false;
+  let deploymentDrainTimer = null;
   let activePublicRequests = 0;
   let activeBufferedRequestBytes = 0;
   let restartCount = 0;
@@ -244,9 +341,61 @@ async function superviseServerCommand() {
   let healthTimer = null;
   let healthInFlight = false;
   let healthFailures = 0;
+  let recycleInFlight = false;
+  let contentionNoticeAt = 0;
+  let pingSeq = 0;
+  const pongWaiters = new Map();
+  // Watches OUR own event loop, the one that relays every SSE byte and holds
+  // the probe's timeout timer. A probe that raced a stall of ours proves
+  // nothing about the worker (see worker-health.js).
+  const loopStall = createLoopStallMeter();
   let forceTimer = null;
   let sessionRescuer = null;
+  const codexRecoveryReceipts = new Map();
   let finish;
+
+  function storeCodexRecoveryReceipt(identity) {
+    if (!identity) return;
+    const now = Date.now();
+    for (const [id, receipt] of codexRecoveryReceipts) {
+      if (receipt.expiresAt <= now) codexRecoveryReceipts.delete(id);
+    }
+    if (codexRecoveryReceipts.size >= 1024) {
+      codexRecoveryReceipts.delete(codexRecoveryReceipts.keys().next().value);
+    }
+    codexRecoveryReceipts.set(identity.invocationId, {
+      sessionId: identity.sessionId,
+      expiresAt: now + 30_000,
+    });
+  }
+
+  function consumeCodexRecoveryReceipt(req, res, isLocal) {
+    if (req.url !== CODEX_RECOVERY_CONSUME_PATH) return false;
+    if (!isLocal || req.method !== 'POST') {
+      rejectPublicRequest(req, res, isLocal ? 405 : 403, {
+        'content-type': 'application/json',
+      }, {
+        error: { type: 'permission_error', message: 'Codex recovery receipts are local-only POST resources.' },
+      });
+      return true;
+    }
+    const invocationId = req.headers[CODEX_INVOCATION_HEADER];
+    const receipt = isCodexInvocationId(invocationId)
+      ? codexRecoveryReceipts.get(invocationId)
+      : null;
+    if (!receipt || receipt.expiresAt <= Date.now()) {
+      if (receipt) codexRecoveryReceipts.delete(invocationId);
+      rejectPublicRequest(req, res, 404, { 'content-type': 'application/json' }, {
+        error: { type: 'not_found', message: 'No recoverable Codex failure was recorded for this invocation.' },
+      });
+      return true;
+    }
+    codexRecoveryReceipts.delete(invocationId);
+    rejectPublicRequest(req, res, 200, { 'content-type': 'application/json' }, {
+      sessionId: receipt.sessionId,
+    });
+    return true;
+  }
 
   function rejectPublicRequest(req, res, statusCode, headers, payload) {
     req.pause();
@@ -254,6 +403,39 @@ async function superviseServerCommand() {
     res.once('finish', () => req.destroy());
     res.writeHead(statusCode, { ...headers, connection: 'close' });
     res.end(JSON.stringify(payload));
+  }
+
+  function consumeDeploymentDrain(req, res, isLocal) {
+    if (req.url !== DEPLOYMENT_DRAIN_PATH) return false;
+    if (!isLocal || req.headers[LIFECYCLE_ID_HEADER] !== lifecycleId) {
+      rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
+        error: { type: 'permission_error', message: 'Deployment control requires the live local lifecycle identity.' },
+      });
+      return true;
+    }
+    if ((req.method !== 'POST' && req.method !== 'DELETE')
+        || (req.headers['content-length'] != null && req.headers['content-length'] !== '0')
+        || req.headers['transfer-encoding'] != null) {
+      rejectPublicRequest(req, res, 405, { 'content-type': 'application/json' }, {
+        error: { type: 'invalid_request_error', message: 'Deployment control accepts empty POST or DELETE requests.' },
+      });
+      return true;
+    }
+    clearTimeout(deploymentDrainTimer);
+    deploymentDrainTimer = null;
+    deploymentDraining = req.method === 'POST';
+    if (deploymentDraining) {
+      deploymentDrainTimer = setTimeout(() => {
+        deploymentDraining = false;
+        deploymentDrainTimer = null;
+      }, deploymentDrainLeaseMs);
+      deploymentDrainTimer.unref?.();
+    }
+    rejectPublicRequest(req, res, 200, { 'content-type': 'application/json' }, {
+      draining: deploymentDraining,
+      activeRequests: activePublicRequests,
+    });
+    return true;
   }
 
   const listener = http.createServer((req, res) => {
@@ -268,6 +450,14 @@ async function superviseServerCommand() {
     const isLocal = remoteAddr === '127.0.0.1'
       || remoteAddr === '::1'
       || remoteAddr === '::ffff:127.0.0.1';
+    if (!isLocal) delete req.headers['x-teamcodex-status-identity'];
+    if (consumeDeploymentDrain(req, res, isLocal)) return;
+    if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
+    if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      res.setHeader('x-teamcodex-active-requests', String(activePublicRequests));
+      res.setHeader('x-teamcodex-source-hash', RUNTIME_SOURCE_HASH);
+      res.setHeader('x-teamcodex-deployment-draining', deploymentDraining ? '1' : '0');
+    }
     if (hasRecoveryMarker && recoveryAccountUuid == null) {
       rejectPublicRequest(req, res, 403, { 'content-type': 'application/json' }, {
         type: 'error',
@@ -302,6 +492,16 @@ async function superviseServerCommand() {
       && req.url === '/teamclaude/status'
       && (contentLength == null || contentLength === '0')
       && req.headers['transfer-encoding'] == null;
+    if (deploymentDraining && !bypassAdmission) {
+      rejectPublicRequest(
+        req,
+        res,
+        503,
+        { 'content-type': 'application/json', 'retry-after': '1' },
+        { error: { type: 'overloaded_error', message: 'Proxy is draining for a verified deployment' } },
+      );
+      return;
+    }
     if (!bypassAdmission && activePublicRequests >= maxPublicRequests) {
       rejectPublicRequest(
         req,
@@ -424,12 +624,19 @@ async function superviseServerCommand() {
       return Promise.resolve({ worker, port: workerPort });
     }
     return new Promise(resolve => {
-      const waiter = { resolve, res };
-      workerWaiters.add(waiter);
-      res.once('close', () => {
+      let timer = null;
+      const settle = target => {
         if (!workerWaiters.delete(waiter)) return;
-        resolve(null);
-      });
+        if (timer !== null) clearTimeout(timer);
+        res.removeListener('close', onClose);
+        resolve(target);
+      };
+      const onClose = () => settle(null);
+      const waiter = { resolve: settle, res };
+      workerWaiters.add(waiter);
+      res.once('close', onClose);
+      timer = setTimeout(() => settle(null), workerReadyTimeoutMs);
+      timer.unref?.();
     });
   }
 
@@ -453,7 +660,6 @@ async function superviseServerCommand() {
       ? { worker, port: workerPort }
       : null;
     for (const waiter of workerWaiters) {
-      workerWaiters.delete(waiter);
       waiter.resolve(target);
     }
   }
@@ -513,9 +719,13 @@ async function superviseServerCommand() {
       let settled = false;
       let clientGone = false; // the CLIENT aborted — any upstream error is self-inflicted
       let sseFramer = null; // set when relaying an SSE response with streamRecovery on
+      let recoverySseTracker = null; // tracks Codex terminal events without changing raw relay bytes
       let streamIdleTimer = null;
       let drainCleanup = null;
       const replaySafe = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+      const recoveryIdentity = req.method === 'POST' && isCodexResponsesPath(req.url)
+        ? codexRecoveryIdentity(req.headers, body)
+        : null;
       let workerConnectionEstablished = false;
       const connectionHeaders = connectionHeaderNames(req.headers.connection);
       const headers = {};
@@ -591,6 +801,10 @@ async function superviseServerCommand() {
         if (settled) return;
         clearRelayTimers();
         settled = true;
+        if (!clientGone && responseStarted && recoveryIdentity
+            && !recoverySseTracker?.sawTerminal) {
+          storeCodexRecoveryReceipt(recoveryIdentity);
+        }
         // The client went away: OUR close handler destroyed the upstream leg,
         // so this error is self-inflicted. The worker is healthy — recycling
         // it here would let one aborted terminal (a single Esc during the
@@ -621,13 +835,18 @@ async function superviseServerCommand() {
           return;
         }
         if (target.worker === worker) {
-          workerReady = false;
-          workerPort = null;
           resetClientAgent(req);
-          if (!stopping && target.worker.exitCode == null) target.worker.kill('SIGKILL');
+          // One relay socket failed; that is evidence about this connection,
+          // not the shared worker process. Its exit event or the independent
+          // HTTP+IPC health path owns global replacement decisions.
+          if (target.worker.exitCode != null || !target.worker.connected) {
+            workerReady = false;
+            workerPort = null;
+          }
         }
         if (!stopping && !res.destroyed
-            && (replaySafe || !workerConnectionEstablished) && attempt < 3) {
+            && (replaySafe || !workerConnectionEstablished)
+            && attempt < 3) {
           // A rejection here (bad forwarded header, synchronous http.request
           // option error) must still settle the outer promise. Without the
           // rejection arm the awaiting frame never returns, the client hangs,
@@ -647,13 +866,18 @@ async function superviseServerCommand() {
           return;
         }
         if (!res.headersSent && !res.destroyed) {
-          res.writeHead(502, { 'content-type': 'application/json' });
+          if (workerConnectionEstablished) storeCodexRecoveryReceipt(recoveryIdentity);
+          const failureHeaders = { 'content-type': 'application/json' };
+          if (!replaySafe && workerConnectionEstablished) failureHeaders['retry-after'] = '5';
+          res.writeHead(502, failureHeaders);
           res.end(JSON.stringify({
             error: {
               type: 'proxy_error',
-              message: !replaySafe && workerConnectionEstablished
-                ? 'Proxy worker failed after dispatch; request was not replayed'
-                : 'Proxy worker unavailable',
+              message: attempt > 0
+                ? `Proxy worker died on ${attempt + 1} consecutive attempts; the request was replayed and still failed`
+                : (!replaySafe && workerConnectionEstablished
+                  ? 'Proxy worker failed after dispatch; request was not replayed'
+                  : 'Proxy worker unavailable'),
             },
           }));
         }
@@ -678,6 +902,14 @@ async function superviseServerCommand() {
         const responseHeaders = {};
         for (const [key, value] of Object.entries(upstreamRes.headers)) {
           const lowerKey = key.toLowerCase();
+          if (lowerKey === CODEX_RECOVERY_SESSION_HEADER) {
+            const invocationId = req.headers[CODEX_INVOCATION_HEADER];
+            if (req.method === 'POST' && isCodexResponsesPath(req.url)
+                && isCodexInvocationId(invocationId) && isCodexSessionId(value)) {
+              storeCodexRecoveryReceipt({ invocationId, sessionId: value });
+            }
+            continue;
+          }
           if (SUPERVISOR_HOP_BY_HOP_HEADERS.has(lowerKey)
               || responseConnectionHeaders.has(lowerKey)) continue;
           responseHeaders[key] = value;
@@ -686,9 +918,13 @@ async function superviseServerCommand() {
         if (isEventStream(upstreamRes.headers['content-type'])) {
           const framer = streamRecovery ? new SseFramer() : null;
           sseFramer = framer;
+          recoverySseTracker = recoveryIdentity ? (framer || new SseFramer()) : null;
           armStreamIdle(upstreamRes);
           upstreamRes.on('data', chunk => {
             armStreamIdle(upstreamRes);
+            if (recoverySseTracker && recoverySseTracker !== framer) {
+              recoverySseTracker.push(chunk);
+            }
             const bytes = framer ? framer.push(chunk) : chunk;
             // writableEnded guard: retryOrFail may have already ENDED this
             // response (graceful injection); a straggler chunk must not
@@ -703,6 +939,9 @@ async function superviseServerCommand() {
             if (settled) return;
             clearRelayTimers();
             settled = true;
+            if (recoveryIdentity && !recoverySseTracker?.sawTerminal) {
+              storeCodexRecoveryReceipt(recoveryIdentity);
+            }
             if (!res.destroyed && !res.writableEnded) {
               // Clean worker end. The worker's own recovery already injects on
               // truncation, so relay as-is; flush any un-framed tail (possible
@@ -742,6 +981,7 @@ async function superviseServerCommand() {
       ...process.env,
       [SUPERVISED_WORKER_ENV]: '1',
       [SUPERVISOR_PID_ENV]: String(process.pid),
+      [LIFECYCLE_ID_ENV]: lifecycleId,
     };
     const child = fork(process.argv[1], ['server'], {
       env: childEnv,
@@ -751,6 +991,12 @@ async function superviseServerCommand() {
     let becameReady = false;
 
     child.on('message', message => {
+      if (message?.type === 'teamcodex:pong') {
+        // Resolved even for a worker we have since replaced: pingWorker's own
+        // waiter map is the authority, and a stale id simply has no waiter.
+        pongWaiters.get(message.id)?.();
+        return;
+      }
       if (child !== worker) return;
       if (message?.type === 'teamcodex:shutdown') {
         requestShutdown({ workerWillExit: true });
@@ -776,6 +1022,12 @@ async function superviseServerCommand() {
         port,
         startedAt: new Date().toISOString(),
         config: getConfigPath(),
+        lifecycle: {
+          version: 1,
+          id: lifecycleId,
+          supervisor: readProcessIdentity(process.pid),
+          worker: readProcessIdentity(child.pid),
+        },
       }).then(() => { ownsStateFile = true; }, () => {});
       clearTimeout(stableTimer);
       stableTimer = setTimeout(() => { restartCount = 0; }, 5_000);
@@ -834,28 +1086,116 @@ async function superviseServerCommand() {
     });
   }
 
+  /**
+   * IPC round trip to the worker. A pong proves the worker's event loop is
+   * RUNNING, which an HTTP probe cannot distinguish from "the loop is fine but
+   * the host is starved" — and it never touches the busy listener.
+   */
+  function pingWorker(child, timeoutMs) {
+    return new Promise(resolve => {
+      if (!child || child.exitCode != null || !child.connected) {
+        resolve(false);
+        return;
+      }
+      const id = ++pingSeq;
+      let done = false;
+      const settle = alive => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pongWaiters.delete(id);
+        resolve(alive);
+      };
+      const timer = setTimeout(() => settle(false), timeoutMs);
+      timer.unref?.();
+      pongWaiters.set(id, () => settle(true));
+      try {
+        child.send({ type: 'teamcodex:ping', id }, err => {
+          if (err) settle(false);
+        });
+      } catch {
+        settle(false);
+      }
+    });
+  }
+
+  async function recycleUnhealthyWorker(checkedWorker, broken) {
+    if (recycleInFlight || stopping || checkedWorker !== worker) return;
+    recycleInFlight = true;
+    try {
+      const stallAtPing = loopStall.read();
+      const ipcAlive = await pingWorker(checkedWorker, workerPingTimeoutMs);
+      if (stopping || checkedWorker !== worker) return;
+      const action = unhealthyWorkerAction({
+        broken,
+        ipcAlive,
+        selfStallMs: loopStall.read() - stallAtPing,
+        timeoutMs: workerPingTimeoutMs,
+        tickMs: loopStall.tickMs,
+      });
+      if (action === 'keep') {
+        // Killing here would destroy every in-flight turn to fix nothing: the
+        // loop answers, and the replacement inherits the same starved host.
+        if (Date.now() - contentionNoticeAt >= 60_000) {
+          contentionNoticeAt = Date.now();
+          console.error('[TeamClaude] Proxy worker death is uncorroborated under host contention; keeping it.');
+        }
+        return;
+      }
+      workerReady = false;
+      workerPort = null;
+      if (action === 'drain') {
+        console.error(`[TeamClaude] Proxy worker listener is broken while its event loop runs; draining it (${workerRecycleGraceMs}ms grace).`);
+        checkedWorker.kill('SIGTERM');
+        const escalate = setTimeout(() => {
+          if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+        }, workerRecycleGraceMs);
+        escalate.unref?.();
+        return;
+      }
+      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and does not answer IPC; restarting it.`);
+      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+    } finally {
+      recycleInFlight = false;
+    }
+  }
+
   function checkWorkerHealth() {
-    if (stopping || healthInFlight || !workerReady || !workerPort || !worker) return;
+    if (stopping || healthInFlight || recycleInFlight
+        || !workerReady || !workerPort || !worker) return;
     const checkedWorker = worker;
     const checkedPort = workerPort;
+    const stallAtStart = loopStall.read();
     healthInFlight = true;
     let settled = false;
-    const finishCheck = healthy => {
+    const finishCheck = (healthy, failure) => {
       if (settled) return;
       settled = true;
       healthInFlight = false;
       if (checkedWorker !== worker || stopping) return;
-      if (healthy) {
+      const verdict = healthProbeVerdict({
+        ok: healthy,
+        failure,
+        selfStallMs: loopStall.read() - stallAtStart,
+        timeoutMs: workerHealthTimeoutMs,
+        tickMs: loopStall.tickMs,
+      });
+      if (verdict === 'healthy') {
         healthFailures = 0;
+        return;
+      }
+      // 'inconclusive': we were frozen ourselves. Neither a strike nor a reset —
+      // the probe simply carries no information about the worker.
+      if (verdict === 'inconclusive') return;
+      if (verdict === 'broken') {
+        healthFailures = 0;
+        void recycleUnhealthyWorker(checkedWorker, true);
         return;
       }
       healthFailures += 1;
       if (healthFailures < workerHealthFailureThreshold) return;
-      console.error(`[TeamClaude] Proxy worker failed ${healthFailures} health checks; restarting it.`);
       healthFailures = 0;
-      workerReady = false;
-      workerPort = null;
-      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+      void recycleUnhealthyWorker(checkedWorker, false);
     };
     const healthReq = http.get({
       host: '127.0.0.1',
@@ -864,14 +1204,21 @@ async function superviseServerCommand() {
       agent: false,
     }, healthRes => {
       healthRes.resume();
-      healthRes.once('end', () => finishCheck(healthRes.statusCode === 200));
+      // A non-200 answer is the listener actively saying something wrong; a
+      // stalled supervisor cannot fabricate that, so it is never discounted.
+      healthRes.once('end', () => finishCheck(
+        healthRes.statusCode === 200,
+        healthRes.statusCode === 200 ? undefined : PROBE_BROKEN,
+      ));
       healthRes.once('error', () => finishCheck(false));
       healthRes.once('aborted', () => finishCheck(false));
     });
     healthReq.setTimeout(workerHealthTimeoutMs, () => {
-      healthReq.destroy(new Error('Proxy worker health check timed out'));
+      const err = new Error('Proxy worker health check timed out');
+      err.code = 'ETIMEDOUT';
+      healthReq.destroy(err);
     });
-    healthReq.once('error', () => finishCheck(false));
+    healthReq.once('error', err => finishCheck(false, probeFailureKind(err)));
   }
 
   function requestShutdown({ workerWillExit = false } = {}) {
@@ -882,6 +1229,7 @@ async function superviseServerCommand() {
     clearTimeout(restartTimer);
     clearTimeout(stableTimer);
     clearInterval(healthTimer);
+    clearTimeout(deploymentDrainTimer);
     sessionRescuer?.stop();
     closePublicListener();
     if (!worker) {
@@ -901,6 +1249,8 @@ async function superviseServerCommand() {
       clearTimeout(stableTimer);
       clearInterval(healthTimer);
       clearTimeout(forceTimer);
+      clearTimeout(deploymentDrainTimer);
+      loopStall.stop();
       sessionRescuer?.stop();
       resolve(code);
     };
@@ -927,10 +1277,13 @@ async function superviseServerCommand() {
 
 async function proxyWorkerCommand() {
   const config = await loadOrCreateConfig();
+  config.lifecycleId = process.env[LIFECYCLE_ID_ENV] || null;
   // Normalize by the FULL codex-mode signal (subcommand OR inherited env, see
   // isCodexMode): createProxyServer keys on config.provider, and a supervised
   // worker only carries the env var.
-  if (!config.provider && isCodexMode(config)) config.provider = 'codex';
+  if (!config.provider) config.provider = process.env.TEAMCLAUDE_PROVIDER || cliProvider;
+  config.provider = normalizeProvider(config.provider);
+  validateProviderAccounts(config.provider, config.accounts, { requireMetadata: true });
   const codexMode = isCodexMode(config);
 
   // --log-to <dir>
@@ -943,6 +1296,9 @@ async function proxyWorkerCommand() {
     if (codexMode) {
       console.error('  teamcodex codex login      Isolated Codex OAuth login');
       console.error('  teamcodex codex import     Import the current Codex login');
+    } else if (config.provider === 'grok' || config.provider === 'agy') {
+      console.error(`  teamcodex ${config.provider} login      Add a subscription OAuth account`);
+      console.error(`  teamcodex ${config.provider} import     Import official CLI OAuth credentials`);
     } else {
       console.error('  teamcodex import           Import from Claude Code');
       console.error('  teamcodex login            OAuth login via browser');
@@ -1040,11 +1396,127 @@ async function proxyWorkerCommand() {
       const memIdx = findConfigAccount(config, account);
       if (memIdx >= 0) applyOAuthTokens(config.accounts[memIdx], diskAccount);
       if (conflict && diskAccount.accessToken) {
-        accountManager.updateAccountTokens(account, diskAccount, false);
+        accountManager.updateAccountTokens(account, diskAccount, false, {
+          clearAuthRevoked: false,
+        });
         console.log(`[TeamClaude] Kept newer disk credential for account "${account.name}"`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
+
+  // Persist the subscription-lapse flag the moment the request path flips it
+  // (a subscription 403 sets it; a later 2xx on the account clears it), so a
+  // restart restores the lapsed state instead of showing the account active
+  // until the next failure. Same discipline as onTokenRefresh: re-read disk
+  // (atomicConfigUpdate), match by identity (findConfigAccount), then mirror
+  // the result into the long-lived in-memory config copy so a later TUI save
+  // cannot resurrect the pre-change value.
+  accountManager.onAccountFlag((account, disabled) => atomicConfigUpdate(diskConfig => {
+    const cfgIdx = findConfigAccount(diskConfig, account);
+    if (cfgIdx < 0) return;
+    if (disabled) diskConfig.accounts[cfgIdx].subscriptionDisabled = true;
+    else delete diskConfig.accounts[cfgIdx].subscriptionDisabled;
+  }).then(() => {
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    if (disabled) config.accounts[memIdx].subscriptionDisabled = true;
+    else delete config.accounts[memIdx].subscriptionDisabled;
+  }).catch(err => console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`)));
+  const authPersistenceChains = new WeakMap();
+  const persistAuthRevocationNow = async (account, revoked, previousTokens = null, generation = null) => {
+    const expectedGeneration = Number.isFinite(generation)
+      ? generation
+      : (account._authRevocationGeneration || 0);
+    const isCurrent = () => accountManager.accounts[account.index] === account
+      && (account._authRevocationGeneration || 0) === expectedGeneration
+      && (account.authRevoked === true) === (revoked === true);
+    if (!isCurrent()) return Promise.resolve();
+
+    let credentialConflict = false;
+    let diskProofIsNewer = false;
+    return atomicConfigUpdate(diskConfig => {
+      if (!isCurrent()) return;
+      const cfgIdx = findConfigAccount(diskConfig, account);
+      if (cfgIdx < 0) return;
+      const diskAccount = diskConfig.accounts[cfgIdx];
+      const hasStoredCredential = diskAccount.accessToken != null || diskAccount.refreshToken != null;
+      diskProofIsNewer = hasVerifiedAuthRecovery(diskAccount, account);
+      if (revoked && previousTokens && hasStoredCredential
+          && !storedCredentialMatches(diskAccount, previousTokens)) {
+        credentialConflict = true;
+      }
+      if (revoked && !diskProofIsNewer) {
+        diskAccount.authRevoked = true;
+        diskAccount.authRevokedAt = Math.max(
+          authTimestamp(diskAccount.authRevokedAt),
+          authTimestamp(account.authRevokedAt),
+          Date.now(),
+        );
+      } else if (hasVerifiedAuthRecovery(diskAccount, account)) {
+        delete diskAccount.authRevoked;
+        delete diskAccount.authRevokedAt;
+        delete diskAccount.importFrom;
+      }
+    }).then(diskConfig => {
+      if (!isCurrent()) return;
+      const diskIdx = findConfigAccount(diskConfig, account);
+      if (diskIdx < 0) return;
+      const diskAccount = diskConfig.accounts[diskIdx];
+      const verifiedConflictRecovery = credentialConflict
+        && hasVerifiedAuthRecovery(diskAccount, account);
+      const verifiedRecovery = diskProofIsNewer || verifiedConflictRecovery;
+      if (verifiedRecovery && diskAccount.accessToken
+          && (diskProofIsNewer || !liveCredentialMatchesStored(account, diskAccount))) {
+        accountManager.updateAccountTokens(account, diskAccount, false, {
+          clearAuthRevoked: verifiedRecovery,
+        });
+      }
+
+      if (diskAccount.authRevoked === true && !verifiedRecovery
+          && account.authRevoked !== true) {
+        accountManager.setAuthRevoked(account, true, false);
+      } else if (verifiedRecovery && account.authRevoked === true) {
+        accountManager.setAuthRevoked(account, false, false);
+      }
+
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx >= 0) {
+        const memAccount = config.accounts[memIdx];
+        if (diskAccount.authVerifiedAt != null) memAccount.authVerifiedAt = diskAccount.authVerifiedAt;
+        else delete memAccount.authVerifiedAt;
+        if (diskAccount.authVerifiedAccountUuid != null) {
+          memAccount.authVerifiedAccountUuid = diskAccount.authVerifiedAccountUuid;
+        } else {
+          delete memAccount.authVerifiedAccountUuid;
+        }
+        if (diskAccount.authRevoked === true) {
+          memAccount.authRevoked = true;
+          memAccount.authRevokedAt = diskAccount.authRevokedAt;
+          if (account.authRevoked !== true) accountManager.setAuthRevoked(account, true, false);
+        } else if (revoked === false || verifiedRecovery) {
+          delete memAccount.authRevoked;
+          delete memAccount.authRevokedAt;
+        }
+      }
+    }).catch(err => console.error(
+      `[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${err.message}`,
+    ));
+  };
+  const persistAuthRevocation = (account, revoked, previousTokens = null, generation = null) => {
+    const prior = authPersistenceChains.get(account) || Promise.resolve();
+    const current = prior.catch(() => {}).then(() => persistAuthRevocationNow(
+      account,
+      revoked,
+      previousTokens,
+      generation,
+    ));
+    authPersistenceChains.set(account, current);
+    current.finally(() => {
+      if (authPersistenceChains.get(account) === current) authPersistenceChains.delete(account);
+    });
+    return current;
+  };
+  accountManager.onAuthRevoked(persistAuthRevocation);
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -1060,7 +1532,7 @@ async function proxyWorkerCommand() {
       syncAccounts: async () => {
         const diskConfig = await loadConfig();
         if (!diskConfig) return 0;
-        return syncAccountsFromDisk(diskConfig, config, accountManager);
+        return syncAccountsFromDisk(diskConfig, config, accountManager, persistAuthRevocation);
       },
       // R also forces a fleet-wide quota re-measure. `server` is assigned below
       // (before listen), and the TUI only starts inside the listen callback, so
@@ -1098,7 +1570,8 @@ async function proxyWorkerCommand() {
     liveSyncChain = liveSyncChain.then(async () => {
       const diskConfig = await loadConfig();
       if (!diskConfig) return;
-      await syncAccountsFromDisk(diskConfig, config, accountManager);
+      await syncAccountsFromDisk(diskConfig, config, accountManager, persistAuthRevocation);
+      if (codexMode) await server.refreshQuotaAll();
       if (process.connected) {
         process.send({
           type: 'teamcodex:capacity',
@@ -1197,6 +1670,15 @@ async function proxyWorkerCommand() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
   }
+  // Liveness corroboration for the supervisor. Answering proves this worker's
+  // event loop is running, which its HTTP probe cannot tell apart from a
+  // starved host — and it costs no listener, no request path, no allocation.
+  process.on('message', message => {
+    if (message?.type !== 'teamcodex:ping' || !process.connected) return;
+    try {
+      process.send({ type: 'teamcodex:pong', id: message.id });
+    } catch { /* the channel closed mid-answer; the supervisor times out */ }
+  });
   process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
 }
 
@@ -1216,13 +1698,76 @@ function isPidAlive(pid) {
   catch (e) { return e.code === 'EPERM'; }
 }
 
-async function waitForExit(pid, timeoutMs) {
+function readProcessIdentity(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || process.platform === 'win32') return null;
+  try {
+    const result = spawnSync(
+      'ps',
+      ['-o', 'ppid=', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)],
+      { encoding: 'utf8' },
+    );
+    if (result.status !== 0 || !result.stdout?.trim()) return null;
+    const line = result.stdout.trim();
+    const match = line.match(/^(\d+)\s+(.{24})\s+([\s\S]+)$/);
+    if (!match) return null;
+    return {
+      pid,
+      ppid: Number(match[1]),
+      startedAt: match[2].trim(),
+      command: match[3].trim(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameProcessIdentity(recorded, current) {
+  return Boolean(recorded && current
+    && recorded.pid === current.pid
+    && recorded.ppid === current.ppid
+    && recorded.startedAt === current.startedAt
+    && recorded.command === current.command);
+}
+
+function isExpectedServerIdentity(identity, { worker = false, supervisorPid = null } = {}) {
+  if (!identity || typeof identity.command !== 'string') return false;
+  if (!identity.command.includes(process.argv[1]) || !identity.command.includes('server')) return false;
+  if (worker) {
+    return identity.ppid === supervisorPid
+      && identity.command.includes(process.argv[1]);
+  }
+  return identity.ppid > 0;
+}
+
+function verifyLifecycleState(state, ownerPid, port) {
+  if (!state?.lifecycle || state.lifecycle.version !== 1
+      || typeof state.lifecycle.id !== 'string' || state.lifecycle.id.length < 16) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  if (state.pid !== ownerPid || state.port !== port || state.config !== getConfigPath()) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  const supervisor = readProcessIdentity(state.pid);
+  if (!sameProcessIdentity(state.lifecycle.supervisor, supervisor)
+      || !isExpectedServerIdentity(supervisor)) {
+    return { ok: false, reason: 'unverified-lifecycle' };
+  }
+  return { ok: true, supervisor };
+}
+
+function verifyWorkerIdentity(state, supervisor) {
+  const worker = readProcessIdentity(state?.workerPid);
+  return sameProcessIdentity(state?.lifecycle?.worker, worker)
+    && isExpectedServerIdentity(worker, { worker: true, supervisorPid: supervisor.pid });
+}
+
+async function waitForExit(identity, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isPidAlive(pid)) return true;
+    if (!sameProcessIdentity(identity, readProcessIdentity(identity.pid))) return true;
     await delay(150);
   }
-  return !isPidAlive(pid);
+  return !sameProcessIdentity(identity, readProcessIdentity(identity.pid));
 }
 
 /**
@@ -1230,7 +1775,7 @@ async function waitForExit(pid, timeoutMs) {
  * returns our JSON shape, not just any 200 — so a foreign process occupying the
  * port is NOT mistaken for our server (it falls through to the EADDRINUSE path).
  */
-async function probeServer(port, timeoutMs = 1500) {
+async function probeServer(port, timeoutMs = 1500, expectedLifecycleId = null) {
   if (!port) return false;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1238,7 +1783,10 @@ async function probeServer(port, timeoutMs = 1500) {
     const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: ctrl.signal });
     if (!res.ok) return false;
     const data = await res.json();
-    return Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+    const validShape = Array.isArray(data?.accounts) && typeof data?.switchThreshold === 'number';
+    if (!validShape) return false;
+    if (expectedLifecycleId != null && data.lifecycleId !== expectedLifecycleId) return false;
+    return true;
   } catch { return false; }
   finally { clearTimeout(timer); }
 }
@@ -1278,10 +1826,17 @@ async function findRunningServer(config) {
   for (const port of candidates) {
     if (!(await probeServer(port))) continue;
     const ownerPid = lsofPid(port); // authoritative: who actually holds the socket
-    if (ownerPid) return { pid: ownerPid, port };
-    // lsof unavailable: trust the recorded pid only if alive AND recorded for THIS port.
-    if (state?.pid && state.port === port && isPidAlive(state.pid)) return { pid: state.pid, port };
-    return { pid: null, port };
+    if (!ownerPid) return { pid: null, port, lifecycleVerified: false, reason: 'no-pid' };
+    const verified = verifyLifecycleState(state, ownerPid, port);
+    const lifecycleMatches = verified.ok
+      && await probeServer(port, 1500, state.lifecycle.id);
+    return {
+      pid: ownerPid,
+      port,
+      lifecycleVerified: lifecycleMatches,
+      identity: lifecycleMatches ? verified.supervisor : null,
+      reason: lifecycleMatches ? null : 'unverified-lifecycle',
+    };
   }
 
   // Nothing TeamClaude-shaped answers on any candidate port. Only drop the state
@@ -1321,6 +1876,40 @@ async function ensureProxyRunning(config) {
   throw new Error(`Proxy failed to start${detail}. Run "teamcodex server" to inspect the startup error.`);
 }
 
+async function waitForClaudeProxyRecovery(config) {
+  const pollMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
+    ? Math.max(250, Math.floor(config.claudeAutoResumeBackoffMs))
+    : 1000;
+  let recoveryConfig = config;
+  let nextLocalStartAt = 0;
+
+  while (true) {
+    const diskConfig = await loadConfig().catch(() => null);
+    if (diskConfig?.proxy?.port) {
+      recoveryConfig = {
+        ...recoveryConfig,
+        ...diskConfig,
+        proxy: { ...recoveryConfig.proxy, ...diskConfig.proxy },
+      };
+    }
+
+    const running = await findRunningServer(recoveryConfig);
+    if (running) return running;
+
+    const canStartLocalProxy = Array.isArray(recoveryConfig.accounts)
+      && recoveryConfig.accounts.length > 0;
+    if (canStartLocalProxy && Date.now() >= nextLocalStartAt) {
+      nextLocalStartAt = Date.now() + 15_000;
+      try {
+        return await ensureProxyRunning(recoveryConfig);
+      } catch {
+        // Keep the CLI parent alive while the exact session is parked.
+      }
+    }
+    await delay(pollMs);
+  }
+}
+
 /**
  * Stop the running server: SIGTERM, wait for graceful exit, escalate to SIGKILL.
  * Returns { stopped, reason?, pid?, port? }.
@@ -1334,6 +1923,13 @@ async function stopRunningServer() {
 
   const { pid, port } = found;
   if (!pid) return { stopped: false, reason: 'no-pid', port };
+  if (!found.lifecycleVerified || !found.identity) {
+    return { stopped: false, reason: 'unverified-lifecycle', pid, port };
+  }
+
+  if (!sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+    return { stopped: false, reason: 'unverified-lifecycle', pid, port };
+  }
 
   try {
     process.kill(pid, 'SIGTERM');
@@ -1343,17 +1939,31 @@ async function stopRunningServer() {
     throw e;
   }
 
-  if (!(await waitForExit(pid, 6000))) {
+  if (!(await waitForExit(found.identity, 6000))) {
+    if (!sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+      return { stopped: true, pid, port };
+    }
     try { process.kill(pid, 'SIGKILL'); } catch { /* may have just exited */ }
-    await waitForExit(pid, 2000);
+    await waitForExit(found.identity, 2000);
   }
-  if (isPidAlive(pid)) return { stopped: false, reason: 'failed', pid, port };
+  if (sameProcessIdentity(found.identity, readProcessIdentity(pid))) {
+    return { stopped: false, reason: 'failed', pid, port };
+  }
 
   await clearServerState();
   return { stopped: true, pid, port };
 }
 
+function refuseSelfDisruptiveLifecycleCommand(command) {
+  if (process.env.TEAMCLAUDE_SESSION_SUPERVISED !== '1') return false;
+  console.error(
+    `[TeamClaude] Refusing to ${command} the proxy from a supervised Claude or Codex session. Use a separate terminal.`,
+  );
+  process.exit(1);
+}
+
 async function stopCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('stop')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped TeamClaude server (pid ${r.pid}, port ${r.port}).`);
@@ -1372,6 +1982,10 @@ async function stopCommand() {
       console.error(`No permission to signal pid ${r.pid}.`);
       process.exit(1);
       break;
+    case 'unverified-lifecycle':
+      console.error(`Refusing to signal pid ${r.pid}: lifecycle identity could not be verified.`);
+      process.exit(1);
+      break;
     default:
       console.error(`Failed to stop pid ${r.pid} on port ${r.port}.`);
       process.exit(1);
@@ -1379,11 +1993,15 @@ async function stopCommand() {
 }
 
 async function restartCommand() {
+  if (refuseSelfDisruptiveLifecycleCommand('restart')) return;
   const r = await stopRunningServer();
   if (r.stopped) {
     console.log(`Stopped previous server (pid ${r.pid}).`);
   } else if (r.reason !== 'not-running') {
-    console.error(`Could not stop the existing server (${r.reason}); aborting restart.`);
+    const reason = r.reason === 'unverified-lifecycle'
+      ? 'lifecycle identity unverified'
+      : r.reason;
+    console.error(`Could not stop the existing server (${reason}); aborting restart.`);
     if (r.reason === 'no-pid') {
       console.error(`Stop it manually first:  kill $(lsof -nP -iTCP:${r.port} -sTCP:LISTEN -t)`);
     }
@@ -1399,7 +2017,19 @@ async function restartCommand() {
 
 async function importCommand() {
   const config = await loadOrCreateConfig();
-  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  if (!config.provider) config.provider = process.env.TEAMCLAUDE_PROVIDER || cliProvider;
+  if (cliProvider === 'grok' || cliProvider === 'agy') {
+    if (hasFlag('--api-key')) {
+      console.error(`${cliProvider} subscription accounts use OAuth credentials; --api-key is not supported.`);
+      process.exit(1);
+    }
+    const fromPath = argValue('--from');
+    const creds = cliProvider === 'grok'
+      ? await importGrokCredentials(fromPath || undefined)
+      : await importAgyCredentials(fromPath || null);
+    await upsertProviderOAuthAccount(argValue('--name'), creds, cliProvider, 'import');
+    return;
+  }
   const codexMode = isCodexMode(config);
 
   let name = argValue('--name');
@@ -1453,7 +2083,24 @@ async function importCommand() {
 
 async function loginCommand() {
   const config = await loadOrCreateConfig();
-  if (!config.provider && cliProvider === 'codex') config.provider = 'codex';
+  if (!config.provider) config.provider = process.env.TEAMCLAUDE_PROVIDER || cliProvider;
+  if (cliProvider === 'grok' || cliProvider === 'agy') {
+    if (hasFlag('--api-key')) {
+      console.error(`${cliProvider} subscription accounts use OAuth credentials; --api-key is not supported.`);
+      process.exit(1);
+    }
+    let creds;
+    try {
+      creds = cliProvider === 'grok'
+        ? await loginGrokCredentials()
+        : await importAgyCredentials();
+    } catch (err) {
+      console.error(`${cliProvider} OAuth login failed: ${err.message}`);
+      process.exit(1);
+    }
+    await upsertProviderOAuthAccount(argValue('--name'), creds, cliProvider, 'login');
+    return;
+  }
   if (isCodexMode(config)) {
     if (args.includes('--api')) {
       console.error('Codex subscription pooling supports ChatGPT OAuth accounts only.');
@@ -1503,13 +2150,14 @@ async function loginCodexCommand() {
 
   try {
     console.log('Starting isolated Codex OAuth login...');
-    const result = spawnSync('codex', loginArgs, {
+    const codexBin = resolveCodexCliBin();
+    const result = spawnSync(codexBin, loginArgs, {
       stdio: 'inherit',
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     if (result.error) {
       if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
+        console.error(codexCliNotFoundMessage(codexBin));
       } else {
         console.error(`Failed to start Codex login: ${result.error.message}`);
       }
@@ -1573,12 +2221,48 @@ async function loginOAuthCommand() {
   await upsertOAuthAccount(name, creds, 'login');
 }
 
+async function reauthenticateCommand() {
+  const name = args[1];
+  const expectedAccountUuid = argValue('--account-uuid');
+  if (!name || name.startsWith('--')) {
+    console.error('Usage: teamclaude reauth <account-name> [--account-uuid UUID]');
+    process.exit(1);
+  }
+
+  console.log(`Starting OAuth re-authentication for "${name}"...`);
+  let result;
+  try {
+    result = await reauthenticateAccount({
+      name,
+      expectedAccountUuid,
+      loadConfig,
+      login: loginOAuth,
+      fetchProfile,
+      atomicUpdate: atomicConfigUpdate,
+    });
+  } catch (err) {
+    console.error(`OAuth re-authentication rejected: ${err.message}`);
+    process.exit(1);
+  }
+  console.log(`Re-authenticated account "${result.updated.name}"`);
+  console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(result.savedConfig);
+}
+
 // ── env ─────────────────────────────────────────────────────
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
   if (isCodexMode(config)) {
     console.log('teamcodex codex run');
+    return;
+  }
+  if (config.provider === 'grok') {
+    console.log(`export GROK_CLI_CHAT_PROXY_BASE_URL=http://localhost:${config.proxy.port}/v1`);
+    return;
+  }
+  if (config.provider === 'agy') {
+    console.log(`export CLOUD_CODE_URL=http://localhost:${config.proxy.port}`);
     return;
   }
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
@@ -1699,14 +2383,45 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+async function seedClaudeRecoveryAccount(config, childEnv) {
+  // Preserve any inherited credential; it may be a real external OAuth token.
+  if (Object.hasOwn(childEnv, 'CLAUDE_CODE_OAUTH_TOKEN')) return;
+
+  const port = Number(config.proxy?.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: {
+        'x-api-key': config.proxy.apiKey,
+        'x-teamcodex-status-identity': '1',
+      },
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok) return;
+    const status = await response.json();
+    if (typeof status?.currentAccountUuid !== 'string'
+        || status.currentAccountUuid.length === 0) return;
+    childEnv.CLAUDE_CODE_OAUTH_TOKEN = buildClaudeRecoveryEnv(
+      childEnv,
+      status.currentAccountUuid,
+    ).CLAUDE_CODE_OAUTH_TOKEN;
+  } catch {}
+}
+
 async function recoverExpiredClaudeLogin(config, childEnv) {
+  const recoveryToken = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
+  const failedAccountUuid = parseClaudeRecoveryAccount(
+    typeof recoveryToken === 'string' ? `Bearer ${recoveryToken}` : null,
+  );
+  const headers = {};
+  if (config.proxy.apiKey) headers['x-api-key'] = config.proxy.apiKey;
+  if (failedAccountUuid) headers.authorization = `Bearer ${recoveryToken}`;
   const response = await fetch(
     `http://127.0.0.1:${config.proxy.port}/teamclaude/rotate`,
     {
       method: 'POST',
-      headers: config.proxy.apiKey
-        ? { 'x-api-key': config.proxy.apiKey }
-        : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
       signal: AbortSignal.timeout(1500),
     },
   );
@@ -1717,16 +2432,19 @@ async function recoverExpiredClaudeLogin(config, childEnv) {
   }
   if (!response.ok) return { rotated: false, reason: 'rotation-unavailable' };
   if (result?.rotated !== true
-      || typeof result.previousAccount !== 'string'
-      || typeof result.currentAccount !== 'string'
+      || typeof result.previousAccountUuid !== 'string'
       || typeof result.currentAccountUuid !== 'string'
-      || result.previousAccount === result.currentAccount) {
+      || result.previousAccountUuid === result.currentAccountUuid
+      || (failedAccountUuid && result.previousAccountUuid !== failedAccountUuid)) {
     return { rotated: false, reason: 'rotation-unavailable' };
   }
   return {
     rotated: true,
     previousAccount: result.previousAccount,
+    previousAccountUuid: result.previousAccountUuid,
+    markerAccountUuid: failedAccountUuid || result.previousAccountUuid,
     currentAccount: result.currentAccount,
+    currentAccountUuid: result.currentAccountUuid,
     childEnv: buildClaudeRecoveryEnv(childEnv, result.currentAccountUuid),
   };
 }
@@ -1737,6 +2455,76 @@ function propagateChildExit(result) {
     return;
   }
   process.exit(result.status ?? 1);
+}
+
+function codexChildFailedUnexpectedly(result) {
+  return !result.error && !result.signal && result.status != null
+    && result.status !== 0 && result.status !== 130;
+}
+
+async function currentCodexRecoverySession(
+  initialArgs,
+  baselineSessionId,
+  receiptSessionId,
+  timeoutMs = 3000,
+) {
+  if (!isCodexSessionId(receiptSessionId)) return null;
+  if (initialArgs[0] === 'resume' && isCodexSessionId(initialArgs[1])) {
+    return initialArgs[1] === receiptSessionId ? initialArgs[1] : null;
+  }
+  if (!process.env.CMUX_SURFACE_ID) return null;
+  const sessionId = await currentCmuxCodexSessionId(timeoutMs).catch(() => null);
+  return sessionId && sessionId !== baselineSessionId && sessionId === receiptSessionId
+    ? sessionId
+    : null;
+}
+
+function codexRecoveryArgs(initialArgs, sessionId) {
+  if (initialArgs[0] !== 'resume' || initialArgs[1] !== sessionId) {
+    return ['resume', sessionId];
+  }
+  const optionsWithValues = new Set([
+    '-a', '--add-dir', '--ask-for-approval', '-C', '--cd', '-c', '--config',
+    '--disable', '--enable', '-i', '--image', '-m', '--model', '-p', '--profile',
+    '--remote', '--remote-auth-token-env', '-s', '--sandbox',
+  ]);
+  const recovery = ['resume', sessionId];
+  for (let index = 2; index < initialArgs.length; index++) {
+    const arg = initialArgs[index];
+    if (arg === '--' || !arg.startsWith('-')) break;
+    recovery.push(arg);
+    const option = arg.split('=', 1)[0];
+    if (optionsWithValues.has(option) && !arg.includes('=')) {
+      if (index + 1 >= initialArgs.length) break;
+      recovery.push(initialArgs[++index]);
+    }
+  }
+  return recovery;
+}
+
+async function consumeCodexRecoveryReceipt(port, invocationId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${port}${CODEX_RECOVERY_CONSUME_PATH}`,
+        {
+          method: 'POST',
+          headers: { [CODEX_INVOCATION_HEADER]: invocationId },
+          signal: AbortSignal.timeout(Math.min(1000, remainingMs)),
+        },
+      );
+      if (response.status === 404) return null;
+      if (response.ok) {
+        const value = await response.json().catch(() => null);
+        return isCodexSessionId(value?.sessionId) ? value.sessionId : null;
+      }
+    } catch {}
+    const delayMs = Math.min(200, deadline - Date.now());
+    if (delayMs > 0) await delay(delayMs);
+  }
+  return null;
 }
 
 async function codexResumeCommand() {
@@ -1761,7 +2549,7 @@ async function codexResumeCommand() {
     sessionId = candidate;
   }
   try {
-    assertSafeCodexResumeArgs(resumeArgs);
+    assertSafeCodexArgs(resumeArgs);
   } catch (err) {
     console.error(`[TeamCodex] ${err.message}`);
     process.exit(1);
@@ -1770,6 +2558,12 @@ async function codexResumeCommand() {
 }
 
 async function runCommand(clientArgsOverride = null) {
+  if (process.env.TEAMCLAUDE_SESSION_SUPERVISED === '1') {
+    console.error(
+      '[TeamClaude] Refusing nested supervised Claude launch: TEAMCLAUDE_CLAUDE_BIN must point to the native Claude vendor binary.',
+    );
+    process.exit(75);
+  }
   const config = await loadOrCreateConfig();
   if (!isCodexMode(config)) {
     try {
@@ -1787,21 +2581,113 @@ async function runCommand(clientArgsOverride = null) {
   if (clientArgs[0] === '--') clientArgs.shift();
 
   const childEnv = { ...process.env };
+  const claudeBin = typeof childEnv.TEAMCLAUDE_CLAUDE_BIN === 'string'
+    && childEnv.TEAMCLAUDE_CLAUDE_BIN.length > 0
+    ? childEnv.TEAMCLAUDE_CLAUDE_BIN
+    : 'claude';
+  childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
     delete childEnv.CODEX_ACCESS_TOKEN;
     delete childEnv.TEAMCLAUDE_CODEX_PROXY_TOKEN;
-    const codexArgs = buildCodexProxyArgs(config.proxy.port, clientArgs);
-    const result = spawnSync('codex', codexArgs, {
-      stdio: 'inherit',
-      env: childEnv,
-    });
+    try {
+      assertSafeCodexArgs(clientArgs);
+    } catch (err) {
+      console.error(`[TeamCodex] ${err.message}`);
+      process.exit(1);
+    }
+    const codexBin = resolveCodexCliBin();
+    const invocationId = randomUUID();
+    childEnv.TEAMCODEX_INVOCATION_ID = invocationId;
+    const explicitSessionId = clientArgs[0] === 'resume' && isCodexSessionId(clientArgs[1])
+      ? clientArgs[1]
+      : null;
+    const hasCmuxSurface = Boolean(process.env.CMUX_SURFACE_ID);
+    let baselineSessionId = null;
+    let baselineTrusted = Boolean(explicitSessionId) || !hasCmuxSurface;
+    if (!explicitSessionId && hasCmuxSurface) {
+      try {
+        const baseline = await currentCmuxCodexBaseline();
+        baselineSessionId = baseline.sessionId;
+        baselineTrusted = baseline.trusted;
+      } catch {
+        baselineTrusted = false;
+      }
+    }
+    const launchCodex = launchArgs => spawnSync(
+      codexBin,
+      buildCodexProxyArgs(config.proxy.port, launchArgs),
+      { stdio: 'inherit', env: childEnv },
+    );
+    let result = launchCodex(clientArgs);
     if (result.error) {
       if (result.error.code === 'ENOENT') {
-        console.error('Codex CLI not found in PATH. Install it first.');
+        console.error(codexCliNotFoundMessage(codexBin));
       } else {
         console.error(`Failed to start codex: ${result.error.message}`);
+      }
+      process.exit(1);
+    }
+    if (codexChildFailedUnexpectedly(result)) {
+      const recoveryDeadline = Date.now() + 5000;
+      const receiptSessionId = await consumeCodexRecoveryReceipt(
+        config.proxy.port,
+        invocationId,
+        Math.max(1, recoveryDeadline - Date.now()),
+      );
+      const sessionId = baselineTrusted && Date.now() < recoveryDeadline
+        ? await currentCodexRecoverySession(
+          clientArgs,
+          baselineSessionId,
+          receiptSessionId,
+          Math.max(1, recoveryDeadline - Date.now()),
+        )
+        : null;
+      if (sessionId) {
+        console.error('[TeamCodex] Codex exited unexpectedly; resuming its trusted exact session once.');
+        result = launchCodex(codexRecoveryArgs(clientArgs, sessionId));
+        if (result.error) {
+          if (result.error.code === 'ENOENT') {
+            console.error(codexCliNotFoundMessage(codexBin));
+          } else {
+            console.error(`Failed to restart codex: ${result.error.message}`);
+          }
+          process.exit(1);
+        }
+      }
+    }
+    return propagateChildExit(result);
+  }
+
+  if (config.provider === 'agy') {
+    delete childEnv.ANTHROPIC_API_KEY;
+    delete childEnv.ANTHROPIC_AUTH_TOKEN;
+    delete childEnv.GEMINI_API_KEY;
+    delete childEnv.GOOGLE_GEMINI_BASE_URL;
+    childEnv.CLOUD_CODE_URL = `http://localhost:${config.proxy.port}`;
+    const result = spawnSync('agy', clientArgs, { stdio: 'inherit', env: childEnv });
+    if (result.error) {
+      if (result.error.code === 'ENOENT') {
+        console.error('Antigravity CLI (agy) not found in PATH. Install it first.');
+      } else {
+        console.error(`Failed to start agy: ${result.error.message}`);
+      }
+      process.exit(1);
+    }
+    return propagateChildExit(result);
+  }
+
+  if (config.provider === 'grok') {
+    delete childEnv.XAI_API_KEY;
+    delete childEnv.XAI_BASE_URL;
+    childEnv.GROK_CLI_CHAT_PROXY_BASE_URL = `http://localhost:${config.proxy.port}/v1`;
+    const result = spawnSync('grok', clientArgs, { stdio: 'inherit', env: childEnv });
+    if (result.error) {
+      if (result.error.code === 'ENOENT') {
+        console.error('Grok CLI not found in PATH. Use `teamcodex grok env` with an OpenAI-compatible client.');
+      } else {
+        console.error(`Failed to start grok: ${result.error.message}`);
       }
       process.exit(1);
     }
@@ -1811,8 +2697,9 @@ async function runCommand(clientArgsOverride = null) {
   delete childEnv.ANTHROPIC_API_KEY;
   delete childEnv.ANTHROPIC_AUTH_TOKEN;
   childEnv.ANTHROPIC_BASE_URL = `http://localhost:${config.proxy.port}`;
-  childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
+  childEnv.DISABLE_GROWTHBOOK = '1';
   await syncLaunchModel(config, clientArgs, childEnv);
+  await seedClaudeRecoveryAccount(config, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
@@ -1823,6 +2710,10 @@ async function runCommand(clientArgsOverride = null) {
       config,
       fetchStatus: async () => {
         const response = await fetch(`http://127.0.0.1:${config.proxy.port}/teamclaude/status`, {
+          headers: {
+            'x-api-key': config.proxy.apiKey,
+            'x-teamcodex-status-identity': '1',
+          },
           signal: AbortSignal.timeout(1500),
         });
         if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
@@ -1830,7 +2721,19 @@ async function runCommand(clientArgsOverride = null) {
       },
       recoverLoginExpired: ({ childEnv: recoveryEnv }) =>
         recoverExpiredClaudeLogin(config, recoveryEnv),
-      spawnClaude: (recoveryArgs, recoveryEnv) => spawn('claude', recoveryArgs, {
+      recoverLimit: ({ childEnv: recoveryEnv }) =>
+        recoverExpiredClaudeLogin(config, recoveryEnv),
+      waitForConnectionRecovery: async ({ childEnv: recoveryEnv }) => {
+        const recovered = await waitForClaudeProxyRecovery(config);
+        config.proxy.port = recovered.port;
+        return {
+          childEnv: {
+            ...recoveryEnv,
+            ANTHROPIC_BASE_URL: `http://localhost:${recovered.port}`,
+          },
+        };
+      },
+      spawnClaude: (recoveryArgs, recoveryEnv) => spawn(claudeBin, recoveryArgs, {
         stdio: 'inherit',
         env: recoveryEnv,
       }),
@@ -1855,7 +2758,7 @@ async function runCommand(clientArgsOverride = null) {
     return propagateChildExit(result);
   }
 
-  const result = spawnSync('claude', clientArgs, {
+  const result = spawnSync(claudeBin, clientArgs, {
     stdio: 'inherit',
     env: childEnv,
   });
@@ -1892,8 +2795,10 @@ async function statusCommand() {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
 
-    const pidStr = running.pid ? `pid ${running.pid}, ` : '';
-    console.log(`Server:         running (${pidStr}port ${running.port})`);
+    const identity = running.lifecycleVerified
+      ? `${running.pid ? `pid ${running.pid}, ` : ''}port ${running.port}`
+      : `lifecycle identity unverified, port ${running.port}`;
+    console.log(`Server:         running (${identity})`);
     // Host CPU/RAM of the machine the proxy runs on (absent from older servers).
     // CPU% is measured between two status calls, so the very first call shows "-".
     if (data.host?.cpu && data.host?.memory) {
@@ -1963,7 +2868,11 @@ async function accountsCommand() {
 
   if (config.accounts.length === 0) {
     console.log('No accounts configured.');
-    console.log('Add one with: teamcodex import, teamcodex login, or teamcodex login --api');
+    if (config.provider === 'grok' || config.provider === 'agy') {
+      console.log(`Add one with: teamcodex ${config.provider} import or teamcodex ${config.provider} login`);
+    } else {
+      console.log('Add one with: teamcodex import, teamcodex login, or teamcodex login --api');
+    }
     return;
   }
 
@@ -1975,11 +2884,10 @@ async function accountsCommand() {
     config = await atomicConfigUpdate(async cfg => {
       await Promise.all(cfg.accounts.map(async account => {
         if (account.type !== 'oauth' || !account.refreshToken
+          || account.authRevoked === true
           || !isTokenExpiringSoon(account.expiresAt)) return;
         try {
-          const newTokens = account.provider === 'codex'
-            ? await refreshCodexAccessToken(account.refreshToken)
-            : await refreshAccessToken(account.refreshToken);
+          const newTokens = await refreshStoredAccessToken(account);
           applyOAuthTokens(account, newTokens);
         } catch {}
       }));
@@ -1989,6 +2897,8 @@ async function accountsCommand() {
   // Fetch profiles in parallel for all OAuth accounts
   const profiles = await Promise.all(
     config.accounts.map(a => {
+      if (a.provider === 'grok' || a.provider === 'agy') return null;
+      if (a.authRevoked === true) return null;
       if (a.type !== 'oauth' || !a.accessToken) return null;
       if (a.provider === 'codex') {
         return {
@@ -2074,7 +2984,7 @@ async function accountsCommand() {
     const p = profiles[i];
 
     if (a.type === 'apikey') {
-      console.log(`  [${i + 1}] ${a.name} (apikey)  ${a.apiKey?.slice(0, 15)}...`);
+      console.log(`  [${i + 1}] ${a.name} (${a.provider || config.provider || 'anthropic'} apikey)  ${a.apiKey?.slice(0, 4)}...`);
       continue;
     }
 
@@ -2085,6 +2995,13 @@ async function accountsCommand() {
       const src = a.source ? `, ${a.source}` : '';
       console.log(`  [${i + 1}] ${a.name} (Codex ${plan}${src})`);
       if (p?.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
+      if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
+      continue;
+    }
+    if (a.provider === 'grok' || a.provider === 'agy') {
+      const label = a.provider === 'grok' ? 'Grok' : 'Agy';
+      const src = a.source ? `, ${a.source}` : '';
+      console.log(`  [${i + 1}] ${a.name} (${label} subscription${src})`);
       if (verbose && a.expiresAt) printTokenExpiry(a.expiresAt);
       continue;
     }
@@ -2121,13 +3038,17 @@ async function apiCommand() {
     console.error('Example: teamcodex api /api/oauth/claude_cli/roles');
     process.exit(1);
   }
+  if (!path.startsWith('/') || path.startsWith('//')) {
+    console.error('The api command requires a relative API path beginning with a single /.');
+    process.exit(1);
+  }
 
   // Find account to use
   const accountName = argValue('--account');
   const method = (argValue('--method') || 'GET').toUpperCase();
   const data = argValue('--data');
   const running = await findRunningServer(config).catch(() => null);
-  const useRunningProxy = !accountName && !path.startsWith('http') && running;
+  const useRunningProxy = !accountName && running;
 
   let url;
   let headers;
@@ -2141,8 +3062,16 @@ async function apiCommand() {
       account = accounts.find(a => a.name === accountName);
       if (!account) { console.error(`Account "${accountName}" not found`); process.exit(1); }
     } else {
-      account = accounts.find(a => a.type === 'oauth') || accounts[0];
+      account = accounts.find(a => a.type === 'oauth' && a.authRevoked !== true)
+        || accounts.find(a => a.authRevoked !== true);
       if (!account) { console.error('No accounts configured'); process.exit(1); }
+    }
+
+    if (account.authRevoked === true
+        && account.type === 'oauth'
+        && (account.provider || normalizeProvider(config.provider)) === 'anthropic') {
+      console.error(`Account "${account.name}" is quarantined after invalid_grant; re-authenticate it first.`);
+      process.exit(1);
     }
 
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) {
@@ -2160,9 +3089,8 @@ async function apiCommand() {
         if (!stored) throw new Error(`Account "${account.name}" was removed during refresh`);
         const refreshToken = stored.refreshToken || account.refreshToken;
         if (!refreshToken) throw new Error(`Account "${account.name}" has no refresh token`);
-        const newTokens = (stored.provider || account.provider) === 'codex'
-          ? await refreshCodexAccessToken(refreshToken)
-          : await refreshAccessToken(refreshToken);
+        const refreshAccount = { ...account, ...stored, refreshToken };
+        const newTokens = await refreshStoredAccessToken(refreshAccount);
         applyOAuthTokens(stored, newTokens);
         refreshed = { ...account, ...stored };
       });
@@ -2170,21 +3098,21 @@ async function apiCommand() {
     }
 
     const credential = account.accessToken || account.apiKey;
-    const isOAuth = account.type === 'oauth';
-    const codexMode = isCodexMode(config);
-    const upstream = config.upstream || (codexMode
-      ? 'https://chatgpt.com/backend-api/codex'
-      : 'https://api.anthropic.com');
-    url = path.startsWith('http') ? path : `${upstream}${path}`;
-    headers = isOAuth
-      ? { 'Authorization': `Bearer ${credential}` }
-      : { 'x-api-key': credential };
+    const provider = normalizeProvider(config.provider);
+    const codexMode = provider === 'codex';
+    const upstream = config.upstream || getProviderDefinition(provider).defaultUpstream;
+    if (!upstream) {
+      console.error(`${provider} requires an explicit upstream URL in the config.`);
+      process.exit(1);
+    }
+    url = buildProviderUpstreamUrl(provider, upstream, path);
+    headers = providerAuthHeaders(provider, { ...account, credential });
     if (codexMode && account.accountId) {
       headers['ChatGPT-Account-ID'] = account.accountId;
     }
   }
 
-  const fetchOpts = { method, headers };
+  const fetchOpts = { method, headers, redirect: 'manual' };
   if (data) {
     headers['Content-Type'] = 'application/json';
     fetchOpts.body = data;
@@ -2238,8 +3166,8 @@ async function noteRunningServerReload(config) {
     const running = await findRunningServer(config);
     if (!running) return false;
     const state = await readServerState();
-    const workerPid = state?.pid === running.pid && state.port === running.port
-      && isPidAlive(state.workerPid)
+    const workerPid = running.lifecycleVerified && running.identity
+      && verifyWorkerIdentity(state, running.identity)
       ? state.workerPid
       : null;
     if (!workerPid) {
@@ -2305,6 +3233,38 @@ async function setPriorityCommand() {
   await noteRunningServerReload(config);
 }
 
+async function subscriptionCommand() {
+  const name = args[1];
+  const state = args[2];
+  if (!name || (state !== 'disabled' && state !== 'ok')) {
+    console.error('Usage: teamcodex subscription <account-name> <disabled|ok>');
+    console.error('  "disabled" records a confirmed organization access denial and keeps the');
+    console.error('  account out of rotation while TeamClaude rechecks it. "ok" clears it now.');
+    process.exit(1);
+  }
+  // The flag models a Claude Code organization-access denial (Anthropic OAuth 403);
+  // the Codex pool has no equivalent signal, so refuse rather than write a
+  // flag nothing would ever read or clear.
+  if (isCodexMode(await loadConfig())) {
+    console.error('subscription <disabled|ok> applies to Claude (Anthropic) accounts only, not the Codex pool.');
+    process.exit(1);
+  }
+  const disabled = state === 'disabled';
+  let found = false;
+  const config = await atomicConfigUpdate(cfg => {
+    const acct = cfg.accounts.find(a => a.name === name);
+    if (!acct) return;
+    found = true;
+    if (disabled) acct.subscriptionDisabled = true;
+    else delete acct.subscriptionDisabled;
+  });
+  if (!found) { console.error(`Account "${name}" not found`); process.exit(1); }
+  console.log(disabled
+    ? `Marked "${name}" subscription-disabled (organization access denied; auto-rechecked)`
+    : `Cleared the subscription flag for "${name}" (back into rotation)`);
+  await noteRunningServerReload(config);
+}
+
 // ── help ────────────────────────────────────────────────────
 
 function showHelp() {
@@ -2341,17 +3301,49 @@ Config: ${getConfigPath()}
 `);
     return;
   }
+  if (cliProvider === 'grok' || cliProvider === 'agy') {
+    console.log(`TeamCodex - Multi-account ${cliProvider === 'grok' ? 'xAI Grok' : 'Google Antigravity'} subscription proxy
+
+Usage: teamcodex ${cliProvider} [command] [options]
+
+Commands:
+  server              Start the ${cliProvider} proxy server
+  stop                Stop the running proxy
+  restart             Restart the proxy
+  login               Add a subscription OAuth account
+  import              Import official CLI OAuth credentials
+  env                 Print client environment variables
+  status              Show proxy & account status
+  accounts            List configured accounts
+  remove <name>       Remove an account
+  disable <name>      Disable an account
+  enable <name>       Re-enable an account
+  priority <name> <n> Set selection priority ("auto" clears it)
+  api <path>          Call an upstream endpoint with one account
+  help                Show this help
+
+Options:
+  --name NAME         Set account name
+  --from PATH         Credential file (Grok: ~/.grok/auth.json; Agy: Keychain by default)
+
+Config: ${getConfigPath()}
+`);
+    return;
+  }
   console.log(`TeamCodex - one local proxy for Claude Code and Codex accounts
 
 Usage: teamcodex [command] [options]
 
 Commands:
+  grok [command]       Manage the xAI Grok subscription proxy
+  agy [command]        Manage the Google Antigravity subscription proxy
   server              Start the proxy server (default)
   stop                Stop the running proxy server
   restart             Stop the running server (if any) and start a fresh one
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
+  reauth <name>       Re-authenticate one existing OAuth account
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
@@ -2361,6 +3353,9 @@ Commands:
   enable <name>       Re-enable a disabled account
   priority <name> <n> Set selection priority (lower = preferred; "auto" to return
                       to automatic ordering — weekly reset soonest drained first)
+  subscription <name> <disabled|ok>
+                      Mark an account's Claude subscription lapsed (kept out of
+                      rotation, survives restarts) or clear the mark
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 
@@ -2391,6 +3386,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   let action = 'Added';
+  let blocked = false;
   const savedConfig = await atomicConfigUpdate(cfg => {
     if (!name) {
       // First FREE account-N (not `count + 1`, which collides after a delete)
@@ -2406,6 +3402,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
+      ...(profileOk && (profile.accountUuid || profile.email) ? {
+        authVerifiedAt: Date.now(),
+        authVerifiedAccountUuid: profile.accountUuid || null,
+      } : {}),
     };
     let idx = profile?.accountUuid
       ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
@@ -2417,11 +3417,25 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      const profileMatches = profileOk && (previous.accountUuid
+        ? Boolean(profile.accountUuid && previous.accountUuid === profile.accountUuid)
+        : Boolean(profile.email && previous.name
+          && previous.name.toLowerCase() === profile.email.toLowerCase()));
+      const verifiedRecovery = previous.authRevoked !== true
+        || (profileMatches && hasVerifiedAuthProof(account, previous));
+      if (previous.authRevoked === true && !verifiedRecovery) {
+        blocked = true;
+        return;
+      }
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
     }
   });
+  if (blocked) {
+    console.error(`Account "${name}" is quarantined after invalid_grant; use teamcodex reauth "${name}".`);
+    return;
+  }
   console.log(`${action} account "${name}"`);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
@@ -2469,6 +3483,59 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
   await noteRunningServerReload(savedConfig);
 }
 
+async function upsertProviderOAuthAccount(name, creds, provider, source = 'unknown') {
+  const definition = getProviderDefinition(provider);
+  let action = 'Added';
+  const savedConfig = await atomicConfigUpdate(cfg => {
+    const currentProvider = normalizeProvider(cfg.provider, provider);
+    if (cfg.accounts.length > 0 && currentProvider !== provider) {
+      throw new Error(`Config uses provider "${currentProvider}"; cannot add a "${provider}" account`);
+    }
+    const providerChanged = currentProvider !== provider;
+    cfg.provider = provider;
+    if (providerChanged || !cfg.upstream) cfg.upstream = definition.defaultUpstream;
+    if (!name) name = creds.email || `${provider}-${String(creds.accountUuid || '').slice(0, 8)}`;
+    if (!name || name === `${provider}-`) {
+      let n = 1;
+      do { name = `${provider}-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+    }
+    const account = {
+      name,
+      provider,
+      type: 'oauth',
+      source,
+      accountUuid: creds.accountUuid,
+      accessToken: creds.accessToken,
+      refreshToken: creds.refreshToken,
+      expiresAt: creds.expiresAt,
+    };
+    for (const field of [
+      'email', 'oauthIssuer', 'oauthClientId', 'authMode', 'authMethod',
+      'projectId', 'oauthTokenEndpoint',
+    ]) {
+      if (creds[field] != null) account[field] = creds[field];
+    }
+    let idx = creds.accountUuid
+      ? cfg.accounts.findIndex(a => a.accountUuid === creds.accountUuid)
+      : -1;
+    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+    if (idx >= 0) {
+      action = 'Updated';
+      const previous = cfg.accounts[idx];
+      if (previous.enabled !== undefined) account.enabled = previous.enabled;
+      if (previous.priority !== undefined) account.priority = previous.priority;
+      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
+      cfg.accounts[idx] = account;
+    } else {
+      cfg.accounts.push(account);
+    }
+    validateProviderAccounts(provider, cfg.accounts, { requireMetadata: true });
+  });
+  console.log(`${action} ${provider} subscription account "${name}"`);
+  console.log(`Saved to ${getConfigPath()}`);
+  await noteRunningServerReload(savedConfig);
+}
+
 // ── config sync helpers ─────────────────────────────────────
 
 /**
@@ -2490,6 +3557,51 @@ function storedCredentialMatches(account, previousTokens) {
     && (account.refreshToken ?? null) === (previousTokens.refreshToken ?? null);
 }
 
+function liveCredentialMatchesStored(account, stored) {
+  return (account.credential ?? null) === (stored.accessToken ?? null)
+    && (account.refreshToken ?? null) === (stored.refreshToken ?? null);
+}
+
+function authTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
+function hasVerifiedAuthProof(stored, live, includeStoredRevocation = true) {
+  const verifiedAt = authTimestamp(stored?.authVerifiedAt);
+  if (!verifiedAt || !stored?.accessToken || !stored?.refreshToken) return false;
+  if (!['reauth', 'import', 'login'].includes(stored.source)) return false;
+  const storedUuid = stored.accountUuid || null;
+  // A durable recovery proof must bind BOTH sides to the same stable identity.
+  // Legacy name-only rows are not enough: a disk import can reuse the name while
+  // carrying credentials for an entirely different Anthropic account. Treat a
+  // missing UUID on either side as unverified and require the explicit `reauth`
+  // path to install a UUID before quarantine can be cleared.
+  const liveUuid = live?.accountUuid || null;
+  const explicitLegacyReauth = !liveUuid
+    && stored.source === 'reauth'
+    && typeof stored.name === 'string'
+    && typeof live?.name === 'string'
+    && stored.name.toLowerCase() === live.name.toLowerCase();
+  if ((!storedUuid || !liveUuid || storedUuid !== liveUuid)
+      && !explicitLegacyReauth) return false;
+  if ((stored.authVerifiedAccountUuid || null) !== storedUuid) return false;
+  // A revoked marker with no valid timestamp is fail-closed. Otherwise a
+  // malformed/omitted `authRevokedAt` would produce a zero floor and let any
+  // later-looking marker clear an account whose revocation time is unknown.
+  if (stored.authRevoked === true && !authTimestamp(stored.authRevokedAt)) return false;
+  if (live?.authRevoked === true && !authTimestamp(live.authRevokedAt)) return false;
+  const floor = includeStoredRevocation
+    ? Math.max(authTimestamp(live?.authRevokedAt), authTimestamp(stored.authRevokedAt))
+    : authTimestamp(live?.authRevokedAt);
+  return verifiedAt > floor;
+}
+
+function hasVerifiedAuthRecovery(stored, live) {
+  return hasVerifiedAuthProof(stored, live);
+}
+
 function applyOAuthTokens(account, tokens) {
   account.accessToken = tokens.accessToken;
   account.refreshToken = tokens.refreshToken;
@@ -2503,13 +3615,32 @@ function applyOAuthTokens(account, tokens) {
   if (tokens.planType) account.planType = tokens.planType;
 }
 
+async function refreshStoredAccessToken(account) {
+  if (account.provider === 'codex') return refreshCodexAccessToken(account.refreshToken);
+  if (account.provider === 'grok' || account.provider === 'agy') {
+    return refreshProviderAccessToken(account);
+  }
+  return refreshAccessToken(account.refreshToken);
+}
+
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
  * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
  * Returns the number of new accounts added.
  */
-async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
+async function syncAccountsFromDisk(diskConfig, memConfig, accountManager, persistAuthRevocation = null) {
+  const liveProvider = assertSupportedProvider(
+    memConfig.provider || accountManager.accounts[0]?.provider || 'anthropic',
+  );
+  const diskProvider = diskConfig.provider == null
+    ? liveProvider
+    : assertSupportedProvider(diskConfig.provider);
+  if (diskProvider !== liveProvider) {
+    throw new Error(`Live provider is "${liveProvider}"; refusing reload for "${diskProvider}"`);
+  }
+  validateProviderAccounts(liveProvider, diskConfig.accounts, { requireMetadata: true });
   let added = 0;
+  const authPersistenceTasks = [];
 
   // Disk is authoritative for the account set. Without this removal pass, a CLI
   // `remove` changed only the file while the running worker kept routing traffic
@@ -2551,10 +3682,19 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
       // enabled/priority over the disk value and silently revert a CLI change.
+      // Subscription-lapse flag from disk, both directions: a CLI
+      // `subscription <name> disabled|ok` while the server runs must park /
+      // free the live account on reload. persist=false — the change came FROM
+      // disk, so echoing it back would only churn the config.
+      const wantLapsed = diskAcct.subscriptionDisabled === true;
+      if (mgr.provider === 'anthropic' && (mgr.subscriptionDisabled === true) !== wantLapsed) {
+        accountManager.setSubscriptionDisabled(mgr, wantLapsed, false);
+      }
       const memAcct = memConfig.accounts[memIdx];
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
+        if (wantLapsed) memAcct.subscriptionDisabled = true; else delete memAcct.subscriptionDisabled;
       }
     }
 
@@ -2564,13 +3704,23 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       try {
         const creds = diskAcct.provider === 'codex'
           ? await importCodexCredentials(diskAcct.importFrom)
-          : await importCredentials(diskAcct.importFrom);
+          : diskAcct.provider === 'grok'
+            ? await importGrokCredentials(diskAcct.importFrom)
+            : diskAcct.provider === 'agy'
+              ? await importAgyCredentials(diskAcct.importFrom)
+              : await importCredentials(diskAcct.importFrom);
         freshCred = {
           accessToken: creds.accessToken,
           refreshToken: creds.refreshToken,
           expiresAt: creds.expiresAt,
           idToken: creds.idToken,
           accountId: creds.accountId,
+          accountUuid: creds.accountUuid,
+          oauthIssuer: creds.oauthIssuer,
+          oauthClientId: creds.oauthClientId,
+          authMethod: creds.authMethod,
+          projectId: creds.projectId,
+          oauthTokenEndpoint: creds.oauthTokenEndpoint,
         };
       } catch (err) {
         console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
@@ -2582,31 +3732,104 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         expiresAt: diskAcct.expiresAt,
         idToken: diskAcct.idToken,
         accountId: diskAcct.accountId,
+        accountUuid: diskAcct.accountUuid,
+        oauthIssuer: diskAcct.oauthIssuer,
+        oauthClientId: diskAcct.oauthClientId,
+        authMethod: diskAcct.authMethod,
+        projectId: diskAcct.projectId,
+        oauthTokenEndpoint: diskAcct.oauthTokenEndpoint,
       };
-    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
+    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey
+        && liveProvider !== 'grok' && liveProvider !== 'agy') {
       freshCred = { apiKey: diskAcct.apiKey };
     }
 
-    if (!freshCred || !mgr) continue;
+    if (!mgr) continue;
 
-    if (freshCred.accessToken) {
+    const liveWasAuthRevoked = mgr.authRevoked === true;
+    const liveAuthRevokedAt = authTimestamp(mgr.authRevokedAt);
+    const diskWasAuthRevoked = diskAcct.authRevoked === true;
+    let diskIsStaler = false;
+    let verifiedRecovery = false;
+    if (freshCred?.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
         mgr.refreshToken !== freshCred.refreshToken ||
         (freshCred.accountId && mgr.accountId !== freshCred.accountId);
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
-      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
+      diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
         freshCred.expiresAt < mgr.expiresAt;
-      if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
+      verifiedRecovery = !diskIsStaler && hasVerifiedAuthRecovery(diskAcct, mgr);
+      // A quarantined account may receive a new credential only when the disk
+      // record carries a proof bound to the live UUID. In particular, do not
+      // install a same-name legacy import for a different account merely to
+      // park it again after the fact; the old live credential stays quarantined.
+      const credentialMayReplace = !(liveWasAuthRevoked || diskWasAuthRevoked)
+        || verifiedRecovery;
+      if (changed && !diskIsStaler && credentialMayReplace) {
+        accountManager.updateAccountTokens(mgr.index, freshCred, false, {
+          clearAuthRevoked: verifiedRecovery,
+        });
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
-    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
+    } else if (freshCred?.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
-      if (mgr.status === 'error') mgr.status = 'active';
+      if (mgr.status === 'error') {
+        mgr.status = 'active';
+        delete mgr.errorReason;
+      }
       console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
     }
+
+    if (mgr.provider === 'anthropic' && mgr.type === 'oauth') {
+      verifiedRecovery = !diskIsStaler && hasVerifiedAuthRecovery(diskAcct, mgr);
+      const keepQuarantined = (liveWasAuthRevoked || diskWasAuthRevoked)
+        && !verifiedRecovery;
+      if (keepQuarantined) {
+        if (mgr.authRevoked !== true) accountManager.setAuthRevoked(mgr, true, false);
+        if (!diskWasAuthRevoked) {
+          diskAcct.authRevoked = true;
+          diskAcct.authRevokedAt = liveAuthRevokedAt || Date.now();
+        }
+      } else if (verifiedRecovery) {
+        if (mgr.authRevoked === true) accountManager.setAuthRevoked(mgr, false, false);
+        if (diskWasAuthRevoked) {
+          delete diskAcct.authRevoked;
+          delete diskAcct.authRevokedAt;
+          delete diskAcct.importFrom;
+        }
+      }
+      const memAcct = memConfig.accounts[memIdx];
+      if (memAcct) {
+        if (diskAcct.authRevoked === true) {
+          memAcct.authRevoked = true;
+          memAcct.authRevokedAt = diskAcct.authRevokedAt;
+        } else {
+          delete memAcct.authRevoked;
+          delete memAcct.authRevokedAt;
+        }
+        if (diskAcct.authVerifiedAt != null) memAcct.authVerifiedAt = diskAcct.authVerifiedAt;
+        else delete memAcct.authVerifiedAt;
+        if (diskAcct.authVerifiedAccountUuid != null) {
+          memAcct.authVerifiedAccountUuid = diskAcct.authVerifiedAccountUuid;
+        } else {
+          delete memAcct.authVerifiedAccountUuid;
+        }
+      }
+      const authStateChanged = (keepQuarantined && !diskWasAuthRevoked)
+        || (verifiedRecovery && diskWasAuthRevoked);
+      if (typeof persistAuthRevocation === 'function' && authStateChanged) {
+        const generation = mgr._authRevocationGeneration || 0;
+        authPersistenceTasks.push(Promise.resolve(persistAuthRevocation(
+          mgr,
+          keepQuarantined,
+          null,
+          generation,
+        )));
+      }
+    }
   }
+  if (authPersistenceTasks.length > 0) await Promise.all(authPersistenceTasks);
   return added;
 }
 
@@ -2623,14 +3846,24 @@ function isCodexMode(config) {
 }
 
 async function resolveAccounts(config) {
+  const provider = normalizeProvider(config.provider || process.env.TEAMCLAUDE_PROVIDER || cliProvider);
+  validateProviderAccounts(provider, config.accounts, { requireMetadata: true });
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      if (acct.importFrom) {
+      const accountProvider = normalizeProvider(acct.provider || provider);
+      const quarantinedAnthropic = accountProvider === 'anthropic' && acct.authRevoked === true;
+      if (quarantinedAnthropic) {
+        accounts.push({ ...acct, provider: accountProvider });
+      } else if (acct.importFrom) {
         try {
           const creds = acct.provider === 'codex'
             ? await importCodexCredentials(acct.importFrom)
-            : await importCredentials(acct.importFrom);
+            : acct.provider === 'grok'
+              ? await importGrokCredentials(acct.importFrom)
+              : acct.provider === 'agy'
+                ? await importAgyCredentials(acct.importFrom)
+                : await importCredentials(acct.importFrom);
           // Carry accountUuid through so the live account can be matched UUID-first
           // on sync (otherwise it stays null and a name change misroutes the update).
           accounts.push({
@@ -2641,6 +3874,12 @@ async function resolveAccounts(config) {
             maxConcurrent: acct.maxConcurrent,
             enabled: acct.enabled,
             priority: acct.priority,
+            subscriptionDisabled: acct.subscriptionDisabled,
+            authRevoked: acct.authRevoked,
+            authRevokedAt: acct.authRevokedAt,
+            authVerifiedAt: acct.authVerifiedAt,
+            authVerifiedAccountUuid: acct.authVerifiedAccountUuid,
+            source: acct.source,
             ...creds,
           });
           console.log(`Imported "${acct.name}" from ${acct.importFrom}`);
@@ -2653,7 +3892,7 @@ async function resolveAccounts(config) {
         console.error(`No token for "${acct.name}", skipping`);
       }
     } else if (acct.type === 'apikey' && acct.apiKey) {
-      accounts.push(acct);
+      accounts.push({ ...acct, provider: acct.provider || provider });
     }
   }
   return accounts;
@@ -2662,6 +3901,10 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+function hasFlag(flag) {
+  return args.some(value => value === flag || value.startsWith(`${flag}=`));
 }
 
 function handleServerListenError(err, port) {

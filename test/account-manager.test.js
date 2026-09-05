@@ -72,8 +72,13 @@ test('explicit priority still beats weekly ordering', () => {
 test('tie on reset time → lowest utilization wins', () => {
   const am = new AccountManager(makeAccounts(2), 0.98);
   const reset = 60 * MIN;
-  setSession(am, 0, 0.40, reset);
-  setSession(am, 1, 0.20, reset);
+  // One shared `now`, like the sibling tie tests: setSession defaults to
+  // Date.now() PER CALL, so on a loaded host a millisecond between the two
+  // lines makes acct-0 reset sooner and the reset rule wins before the
+  // utilization tiebreak is ever reached (observed as a suite flake).
+  const now = Date.now();
+  setSession(am, 0, 0.40, reset, now);
+  setSession(am, 1, 0.20, reset, now);
   assert.equal(am.getActiveAccount().name, 'acct-1');
 });
 
@@ -166,6 +171,7 @@ test('rotateActiveAccount switches to another available account without exposing
   assert.deepEqual(result, {
     rotated: true,
     previousAccount: 'acct-0',
+    previousAccountUuid: 'uuid-0',
     currentAccount: 'acct-1',
     currentAccountUuid: 'uuid-1',
   });
@@ -174,6 +180,7 @@ test('rotateActiveAccount switches to another available account without exposing
     'currentAccount',
     'currentAccountUuid',
     'previousAccount',
+    'previousAccountUuid',
     'rotated',
   ]);
 });
@@ -211,6 +218,24 @@ test('rotateActiveAccount leaves state unchanged when no alternative is usable',
   assert.equal(am.currentIndex, 0);
   assert.equal(am.lastEvalAt, 12345);
   assert.deepEqual(accounts, inputBefore);
+});
+
+test('rotateActiveAccount excludes the failed recovery UUID instead of the global current account', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  am.accounts[0].accountUuid = 'uuid-a';
+  am.accounts[1].accountUuid = 'uuid-b';
+  am.currentIndex = 0;
+
+  const result = am.rotateActiveAccount(null, true, 'uuid-b');
+
+  assert.deepEqual(result, {
+    rotated: true,
+    previousAccount: 'acct-1',
+    previousAccountUuid: 'uuid-b',
+    currentAccount: 'acct-0',
+    currentAccountUuid: 'uuid-a',
+  });
+  assert.equal(am.currentIndex, 0);
 });
 
 test('a preferred recovery account survives concurrent global rotations and warm-up', async () => {
@@ -715,6 +740,22 @@ test('importQuotaState skips unknown accounts, expired throttles, and tolerates 
   assert.equal(am.accounts[0].rateLimitedUntil, null);
 });
 
+test('importQuotaState keeps auth-revoked status ahead of a restored throttle', () => {
+  const am = new AccountManager([{
+    ...makeAccounts(1)[0],
+    authRevoked: true,
+    expiresAt: Date.now() - HOUR,
+  }], 0.98);
+  am.importQuotaState([{
+    name: 'acct-0',
+    rateLimitedUntil: Date.now() + HOUR,
+  }]);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'auth-revoked');
+  assert.equal(am.accounts[0].authRevoked, true);
+  assert.equal(am.accounts[0].rateLimitedUntil, null);
+});
+
 test('getStatus exposes modelWeekly as a detached copy', () => {
   const am = new AccountManager(makeAccounts(1), 0.98);
   const now = Date.now();
@@ -727,4 +768,443 @@ test('getStatus exposes modelWeekly as a detached copy', () => {
   status.accounts[0].quota.modelWeekly['7d_oi'].utilization = 0;
   assert.equal(am.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0.94,
     'mutating the snapshot must not reach live account state');
+});
+
+test('getStatus hides stable account identity by default and exposes it only internally', () => {
+  const am = new AccountManager([{
+    name: 'same-name',
+    type: 'oauth',
+    accountUuid: 'uuid-safe',
+    accessToken: 'secret-access',
+    refreshToken: 'secret-refresh',
+    expiresAt: Date.now() + HOUR,
+  }], 0.98, 0, 5);
+
+  const status = am.getStatus({ includeIdentity: true });
+  assert.equal(status.currentAccountUuid, 'uuid-safe');
+  assert.equal(status.accounts[0].accountUuid, 'uuid-safe');
+  assert.equal('accessToken' in status.accounts[0], false);
+  assert.equal('refreshToken' in status.accounts[0], false);
+  const publicStatus = am.getStatus();
+  assert.equal('currentAccountUuid' in publicStatus, false);
+  assert.equal('accountUuid' in publicStatus.accounts[0], false);
+});
+
+// ── errorReason: WHY an account is parked, and who is usable now ────────────
+
+function fetchStub(handler) {
+  const original = globalThis.fetch;
+  globalThis.fetch = handler;
+  return () => { globalThis.fetch = original; };
+}
+
+test('invalid_grant refresh failure → errorReason auth-revoked; updateAccountTokens heals it', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+  acct.expiresAt = Date.now() - HOUR;   // expired → a failed refresh parks the account
+  const restore = fetchStub(async () => ({
+    ok: false,
+    status: 400,
+    text: async () => '{"error":"invalid_grant","error_description":"Refresh token revoked"}',
+    body: { cancel: async () => {} },
+  }));
+  try { await am.ensureTokenFresh(0); } finally { restore(); }
+
+  assert.equal(acct.status, 'error');
+  assert.equal(acct.errorReason, 'auth-revoked');
+  const parked = am.getStatus();
+  assert.equal(parked.accounts[0].errorReason, 'auth-revoked');
+  assert.equal(parked.accounts[0].usable, false);
+  assert.equal(parked.usableCount, 0);
+  assert.equal(parked.totalCount, 1);
+
+  // Re-import/login (updateAccountTokens) is the heal path — reason must clear.
+  am.updateAccountTokens(0, { accessToken: 'new-at', refreshToken: 'new-rt', expiresAt: Date.now() + HOUR });
+  assert.equal(acct.status, 'active');
+  assert.equal(acct.errorReason, undefined);
+  const healed = am.getStatus();
+  assert.equal(healed.accounts[0].errorReason, null);
+  assert.equal(healed.accounts[0].usable, true);
+  assert.equal(healed.usableCount, 1);
+});
+
+test('invalid_grant quarantine survives a restart and prevents another refresh attempt', async () => {
+  const source = makeAccounts(1);
+  source[0].expiresAt = Date.now() - HOUR;
+  const am = new AccountManager(source, 0.98);
+  let refreshCalls = 0;
+  const restore = fetchStub(async () => {
+    refreshCalls++;
+    return {
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_grant","error_description":"Refresh token revoked"}',
+      body: { cancel: async () => {} },
+    };
+  });
+  try {
+    await am.ensureTokenFresh(0);
+  } finally {
+    restore();
+  }
+
+  assert.equal(refreshCalls, 1);
+  assert.equal(am.accounts[0].authRevoked, true, 'the revoked marker must be durable state');
+  const persisted = { ...source[0], authRevoked: am.accounts[0].authRevoked };
+  const restarted = new AccountManager([persisted], 0.98);
+  assert.equal(restarted.accounts[0].status, 'error');
+  assert.equal(restarted.accounts[0].errorReason, 'auth-revoked');
+  assert.equal(restarted.accounts[0].authRevoked, true);
+
+  let unexpectedRefresh = false;
+  const restartRestore = fetchStub(async () => {
+    unexpectedRefresh = true;
+    throw new Error('restart must not retry a revoked refresh token');
+  });
+  try {
+    await restarted.ensureTokenFresh(0, true);
+  } finally {
+    restartRestore();
+  }
+  assert.equal(unexpectedRefresh, false);
+});
+
+test('stale invalid_grant from an old refresh cannot quarantine a newly reauthenticated credential', async () => {
+  const source = makeAccounts(1);
+  source[0].expiresAt = Date.now() - HOUR;
+  const am = new AccountManager(source, 0.98);
+  let releaseRefresh;
+  let refreshStarted;
+  const started = new Promise(resolve => { refreshStarted = resolve; });
+  const restore = fetchStub(async () => {
+    refreshStarted();
+    await new Promise(resolve => { releaseRefresh = resolve; });
+    return {
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_grant"}',
+      body: { cancel: async () => {} },
+    };
+  });
+  try {
+    const pending = am.ensureTokenFresh(0);
+    await started;
+
+    am.updateAccountTokens(0, {
+      accessToken: 'fresh-at',
+      refreshToken: 'fresh-rt',
+      expiresAt: Date.now() + HOUR,
+    }, false);
+    releaseRefresh();
+    await pending;
+  } finally {
+    restore();
+  }
+
+  assert.equal(am.accounts[0].credential, 'fresh-at');
+  assert.equal(am.accounts[0].refreshToken, 'fresh-rt');
+  assert.equal(am.accounts[0].authRevoked, undefined,
+    'the old refresh result must not re-park a fresh credential');
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('stale invalid_grant cannot quarantine a credential reinstalled with the same token strings', async () => {
+  const source = makeAccounts(1);
+  source[0].expiresAt = Date.now() - HOUR;
+  const am = new AccountManager(source, 0.98);
+  let releaseRefresh;
+  let refreshStarted;
+  const started = new Promise(resolve => { refreshStarted = resolve; });
+  const restore = fetchStub(async () => {
+    refreshStarted();
+    await new Promise(resolve => { releaseRefresh = resolve; });
+    return {
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_grant"}',
+      body: { cancel: async () => {} },
+    };
+  });
+  try {
+    const pending = am.ensureTokenFresh(0);
+    await started;
+
+    am.updateAccountTokens(0, {
+      accessToken: source[0].accessToken,
+      refreshToken: source[0].refreshToken,
+      expiresAt: Date.now() + HOUR,
+    }, false);
+    releaseRefresh();
+    await pending;
+  } finally {
+    restore();
+  }
+
+  assert.equal(am.accounts[0].authRevoked, undefined,
+    'a credential installation is newer evidence even when token strings compare equal');
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('auth-revoked quarantine notifies persistence and only fresh credentials clear it', async () => {
+  const source = makeAccounts(1);
+  source[0].expiresAt = Date.now() - HOUR;
+  const am = new AccountManager(source, 0.98);
+  const events = [];
+  am.onAuthRevoked((account, revoked) => {
+    events.push({ name: account.name, revoked });
+  });
+  const restore = fetchStub(async () => ({
+    ok: false,
+    status: 400,
+    text: async () => '{"error":"invalid_grant"}',
+    body: { cancel: async () => {} },
+  }));
+  try { await am.ensureTokenFresh(0); } finally { restore(); }
+
+  assert.deepEqual(events, [{ name: 'acct-0', revoked: true }]);
+  am.updateAccountTokens(0, {
+    accessToken: 'fresh-at', refreshToken: 'fresh-rt', expiresAt: Date.now() + HOUR,
+  });
+  assert.deepEqual(events, [
+    { name: 'acct-0', revoked: true },
+    { name: 'acct-0', revoked: false },
+  ]);
+  assert.equal(am.accounts[0].authRevoked, undefined);
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('unverified credential sync keeps an auth-revoked account parked', () => {
+  const am = new AccountManager([{
+    ...makeAccounts(1)[0],
+    authRevoked: true,
+    expiresAt: Date.now() - HOUR,
+  }], 0.98);
+  am.updateAccountTokens(0, {
+    accessToken: 'unverified-at',
+    refreshToken: 'unverified-rt',
+    expiresAt: Date.now() + HOUR,
+  }, false, { clearAuthRevoked: false });
+
+  assert.equal(am.accounts[0].authRevoked, true);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'auth-revoked');
+});
+
+test('restored auth-revoked accounts stay out of selection, recovery, and affinity', async () => {
+  const am = new AccountManager([
+    { ...makeAccounts(1)[0], authRevoked: true, expiresAt: Date.now() - HOUR },
+    { ...makeAccounts(1)[0], name: 'acct-1', accessToken: 'tok-1', refreshToken: 'r-1' },
+  ], 0.98, 0, 1);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'auth-revoked');
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+  assert.equal(am._recoverSoonest(), null);
+
+  const socket = {};
+  const acquired = await am.acquireAccount(null, socket);
+  assert.equal(acquired.name, 'acct-1');
+  am.releaseAccount(acquired);
+  assert.equal(am.accounts[0].inflight, 0);
+});
+
+test('auth-revoked quarantine stays authoritative when subscription access is also disabled', () => {
+  const am = new AccountManager([{
+    ...makeAccounts(1)[0],
+    authRevoked: true,
+    subscriptionDisabled: true,
+    expiresAt: Date.now() - HOUR,
+  }], 0.98);
+  const account = am.accounts[0];
+
+  assert.equal(account.status, 'error');
+  assert.equal(account.errorReason, 'auth-revoked',
+    'a revoked refresh token must not be masked as a subscription lapse');
+
+  am.setSubscriptionDisabled(account, false, false);
+  assert.equal(account.status, 'error');
+  assert.equal(account.errorReason, 'auth-revoked',
+    'clearing the secondary flag must not make a revoked account look active');
+
+  am.setAuthRevoked(account, false, false);
+  assert.equal(account.status, 'active');
+  assert.equal(account.errorReason, undefined);
+});
+
+test('auth quarantine persistence callbacks carry a monotonic state generation', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const events = [];
+  am.onAuthRevoked((_account, revoked, _previousTokens, generation) => {
+    events.push({ revoked, generation });
+  });
+
+  am.setAuthRevoked(am.accounts[0], true);
+  am.setAuthRevoked(am.accounts[0], false);
+
+  assert.deepEqual(events, [
+    { revoked: true, generation: 1 },
+    { revoked: false, generation: 2 },
+  ]);
+});
+
+test('a non-invalid_grant refresh failure → errorReason refresh-failed', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+  acct.expiresAt = Date.now() - HOUR;
+  const restore = fetchStub(async () => { throw new Error('fetch failed'); });
+  try { await am.ensureTokenFresh(0); } finally { restore(); }
+  assert.equal(acct.status, 'error');
+  assert.equal(acct.errorReason, 'refresh-failed');
+});
+
+test('usable is false for disabled, throttled, and over-threshold accounts', () => {
+  const am = new AccountManager(makeAccounts(4), 0.98);
+  am.setEnabled('acct-1', false);
+  am.accounts[2].status = 'throttled';
+  am.accounts[2].rateLimitedUntil = Date.now() + HOUR;
+  setSession(am, 3, 0.99, HOUR);   // over switchThreshold
+  const status = am.getStatus();
+  assert.deepEqual(status.accounts.map(a => a.usable), [true, false, false, false]);
+  assert.equal(status.usableCount, 1);
+  assert.equal(status.totalCount, 4);
+});
+
+test('status remains unusable when an external mutation restores active status but leaves authRevoked', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const account = am.accounts[0];
+  account.authRevoked = true;
+  account.status = 'active';
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].usable, false);
+});
+
+test('dispatch failure cooldown temporarily excludes an account without persisting health state', () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  const now = Date.now();
+  for (let index = 0; index < am.accounts.length; index++) {
+    setSession(am, index, 0.1, HOUR, now);
+    setWeekly(am, index, 0.1, 2 * HOUR, now);
+  }
+  am.currentIndex = 0;
+
+  assert.equal(am.markDispatchFailureCooldown(am.accounts[0], 5_000), true);
+  assert.equal(am.getActiveAccount(), am.accounts[1], 'the next request avoids the failed account');
+  assert.equal(am.accounts[0].status, 'active', 'a transport failure is not a quota or auth error');
+  assert.equal(am.getStatus().accounts[0].usable, false, 'status agrees with selection during cooldown');
+
+  const snapshot = am.exportQuotaState();
+  assert.equal('dispatchFailureCooldownUntil' in snapshot[0], false, 'the cooldown is process-local');
+  const restored = new AccountManager(makeAccounts(2), 0.98, 0);
+  restored.importQuotaState(snapshot);
+  assert.equal(restored.accounts[0].dispatchFailureCooldownUntil, 0, 'a restart does not revive stale cooldown');
+
+  const coolingOnly = new AccountManager(makeAccounts(1), 0.98, 0);
+  coolingOnly.accounts[0].status = 'throttled';
+  coolingOnly.accounts[0].rateLimitedUntil = Date.now() - 1;
+  assert.equal(coolingOnly.markDispatchFailureCooldown(coolingOnly.accounts[0], 5_000), true);
+  assert.equal(coolingOnly._recoverSoonest(), null, 'recovery must not bypass an active cooldown');
+
+  am.accounts[0].dispatchFailureCooldownUntil = Date.now() - 1;
+  am.currentIndex = 0;
+  assert.equal(am.getActiveAccount(), am.accounts[0], 'expiry restores ordinary selection');
+});
+
+// ── persistent subscription-lapse flag (config subscriptionDisabled) ────────
+
+test('config subscriptionDisabled restores the account as a hard subscription error', () => {
+  const accts = makeAccounts(2);
+  accts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accts, 0.98);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+  // Not refresh-caused: the token-refresh sweep must not revive it.
+  assert.equal(am.accounts[0]._errorFromRefresh, false);
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].errorReason, 'subscription-disabled');
+  assert.equal(status.accounts[0].usable, false);
+  assert.equal(status.usableCount, 1);
+  // Selection routes around the lapsed account.
+  assert.equal(am.getActiveAccount().name, 'acct-1');
+});
+
+test('subscriptionDisabled is anthropic-scoped: a codex account ignores it', () => {
+  const accts = makeAccounts(1);
+  accts[0].provider = 'codex';
+  accts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accts, 0.98);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+});
+
+test('_recoverSoonest never revives a subscription-disabled account', () => {
+  const accts = makeAccounts(1);
+  accts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accts, 0.98);
+  // A past throttle window would revive an ordinary all-unavailable fleet via
+  // _recoverSoonest — a lapsed subscription is billing state, not a quota
+  // window, so the rollover must not return it to rotation.
+  am.accounts[0].rateLimitedUntil = Date.now() - 1000;
+  assert.equal(am.getActiveAccount(), null);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+});
+
+test('re-imported credentials clear subscriptionDisabled and notify the flag hook', () => {
+  const accts = makeAccounts(1);
+  accts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accts, 0.98);
+  const events = [];
+  am.onAccountFlag((account, disabled) => { events.push([account.name, disabled]); });
+  am.updateAccountTokens(0, { accessToken: 'new-at', refreshToken: 'new-rt', expiresAt: Date.now() + HOUR });
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+  assert.equal(am.accounts[0].errorReason, undefined);
+  assert.deepEqual(events, [['acct-0', false]]);
+});
+
+test('setSubscriptionDisabled parks/frees the account and fires the hook only on change', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const events = [];
+  am.onAccountFlag((account, disabled) => { events.push([account.name, disabled]); });
+
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
+  assert.equal(am.accounts[0]._errorFromRefresh, false);
+
+  // Re-flagging an already-flagged account must not churn the config.
+  am.setSubscriptionDisabled(am.accounts[0], true);
+  assert.deepEqual(events, [['acct-0', true]]);
+
+  am.setSubscriptionDisabled(am.accounts[0], false);
+  assert.equal(am.accounts[0].status, 'active');
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+  assert.equal(am.accounts[0].errorReason, undefined);
+  assert.deepEqual(events, [['acct-0', true], ['acct-0', false]]);
+
+  // persist=false applies a disk-sourced change without echoing it back.
+  am.setSubscriptionDisabled(am.accounts[0], true, false);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.deepEqual(events, [['acct-0', true], ['acct-0', false]]);
+});
+
+test('clearing subscriptionDisabled leaves an unrelated error parked', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  am.accounts[0].status = 'error';
+  am.accounts[0].errorReason = 'auth-rejected';
+  am.accounts[0]._errorFromRefresh = false;
+  am.accounts[0].subscriptionDisabled = true;
+  am.setSubscriptionDisabled(am.accounts[0], false);
+  assert.equal(am.accounts[0].subscriptionDisabled, undefined);
+  // The auth rejection is separate evidence; the flag clear must not lift it.
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'auth-rejected');
+});
+
+test('a restored throttle snapshot cannot overwrite the subscription-disabled park', () => {
+  const accts = makeAccounts(1);
+  accts[0].subscriptionDisabled = true;
+  const am = new AccountManager(accts, 0.98);
+  am.importQuotaState([{ name: 'acct-0', rateLimitedUntil: Date.now() + HOUR }]);
+  assert.equal(am.accounts[0].status, 'error');
+  assert.equal(am.accounts[0].errorReason, 'subscription-disabled');
 });

@@ -46,6 +46,46 @@ async function status(port) {
   }
 }
 
+async function anyStatus(port) {
+  try {
+    return await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+  } catch {
+    return null;
+  }
+}
+
+test('status exposes the supervisor active-request count without counting itself', {
+  timeout: 15000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-active-count-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    provider: 'anthropic',
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: {
+      ...process.env,
+      TEAMCLAUDE_CONFIG: configPath,
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    const response = await waitUntil(() => status(port), 'proxy did not start');
+    assert.equal(response.headers.get('x-teamcodex-active-requests'), '0');
+    assert.match(response.headers.get('x-teamcodex-source-hash'), /^[a-f0-9]{64}$/);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function readState(path) {
   try {
     return JSON.parse(await readFile(path, 'utf8'));
@@ -78,6 +118,7 @@ function request({ host = '127.0.0.1', port, path, method = 'GET', headers, body
       res.on('data', chunk => chunks.push(chunk));
       res.once('end', () => resolve({
         status: res.statusCode,
+        headers: res.headers,
         body: Buffer.concat(chunks).toString(),
       }));
       res.once('error', reject);
@@ -115,6 +156,7 @@ test('proxy worker crash keeps the listener reachable and replacement serves the
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
+    provider: 'anthropic',
     proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
@@ -188,6 +230,135 @@ test('proxy worker crash keeps the listener reachable and replacement serves the
   } finally {
     await stopChild(child);
     await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('one reset relay socket does not SIGKILL an otherwise healthy shared worker', {
+  timeout: 20000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-relay-reset-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const preloadPath = join(dir, 'reset-one-relay.mjs');
+  const resetPath = join(dir, 'relay-reset');
+  const port = await unusedPort();
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(preloadPath, `
+import { writeFileSync } from 'node:fs';
+import http from 'node:http';
+
+if (process.env.TEAMCLAUDE_SUPERVISED_WORKER === '1') {
+  const createServer = http.createServer;
+  http.createServer = (...args) => {
+    const server = createServer(...args);
+    let resetNextRelay = true;
+    server.prependListener('request', req => {
+      if (resetNextRelay && req.method === 'POST' && req.url === '/v1/messages') {
+        resetNextRelay = false;
+        writeFileSync(${JSON.stringify(resetPath)}, '1');
+        req.socket.destroy();
+      }
+    });
+    return server;
+  };
+}
+`);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    workerHealthIntervalMs: 60_000,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+      TEAMCLAUDE_CONFIG: configPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    const first = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(first.status, 502);
+    await first.arrayBuffer();
+    await readFile(resetPath);
+
+    await waitUntil(() => status(port), 'proxy did not remain reachable');
+    const afterReset = await readState(statePath);
+    assert.equal(afterReset?.workerPid, initial.workerPid,
+      'one failed relay connection is not proof that the shared worker died');
+    assert.ok(isPidAlive(initial.workerPid));
+
+    const second = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test-model', messages: [] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(second.status, 200);
+    assert.equal((await second.json()).ok, true);
+    assert.equal((await readState(statePath))?.workerPid, initial.workerPid,
+      'the same healthy worker must serve the next request');
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('supervisor bounds requests that arrive before its worker becomes ready', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-pre-ready-'));
+  const configPath = join(dir, 'config.json');
+  const preloadPath = join(dir, 'delay-worker.mjs');
+  const port = await unusedPort();
+  await writeFile(preloadPath, `
+if (process.env.TEAMCLAUDE_SUPERVISED_WORKER === '1') {
+  await new Promise(resolve => setTimeout(resolve, 750));
+}
+`);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    workerReadyTimeoutMs: 50,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --import=${preloadPath}`.trim(),
+      TEAMCLAUDE_CONFIG: configPath,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    const startedAt = Date.now();
+    const early = await waitUntil(() => anyStatus(port), 'public listener did not bind');
+    const elapsed = Date.now() - startedAt;
+    assert.equal(early.status, 503);
+    assert.ok(elapsed < 500, `pre-ready wait exceeded its deadline: ${elapsed}ms`);
+    assert.match((await early.json()).error?.message || '', /starting|restarting/i);
+    await waitUntil(() => status(port), 'worker never became ready', 5000);
+  } finally {
+    await stopChild(child);
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -307,7 +478,7 @@ test('supervisor strips request headers nominated by Connection before worker fo
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: '' },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     accounts: [{ name: 'primary', type: 'apikey', apiKey: 'placeholder' }],
@@ -578,6 +749,7 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
+    provider: 'anthropic',
     proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
@@ -589,7 +761,11 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
   }));
 
   const child = spawn(process.execPath, [entry, 'server'], {
-    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    env: {
+      ...process.env,
+      TEAMCLAUDE_CONFIG: configPath,
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
@@ -765,7 +941,7 @@ test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 150
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     accounts: [{
@@ -836,6 +1012,74 @@ test('SIGHUP replaces a same-name account when its UUID changes', { timeout: 150
   }
 });
 
+test('SIGHUP rejects an API-key replacement for a live Grok OAuth account', { timeout: 15000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-provider-boundary-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  let seenAuth = null;
+  const upstream = http.createServer((req, res) => {
+    seenAuth = req.headers.authorization || null;
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    provider: 'grok',
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}/v1`,
+    activeWarmup: false,
+    accounts: [{
+      name: 'grok-live', provider: 'grok', type: 'oauth', accountUuid: 'grok-user',
+      accessToken: 'old-access', refreshToken: 'old-refresh',
+      expiresAt: Date.now() + 3_600_000,
+      oauthIssuer: 'https://auth.x.ai', oauthClientId: 'grok-client',
+    }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  delete env.TEAMCLAUDE_PROVIDER;
+  delete env.TEAMCLAUDE_SESSION_SUPERVISED;
+  delete env.CMUX_SURFACE_ID;
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    const disk = JSON.parse(await readFile(configPath, 'utf8'));
+    disk.accounts[0] = {
+      ...disk.accounts[0],
+      type: 'apikey',
+      apiKey: 'api-key-must-not-reach-upstream',
+      accessToken: undefined,
+      refreshToken: undefined,
+    };
+    await writeFile(configPath, JSON.stringify(disk));
+    process.kill(initial.workerPid, 'SIGHUP');
+    await waitUntil(() => /Account config reload failed/.test(output), 'invalid OAuth reload was not rejected');
+
+    const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'grok-build', messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(seenAuth, 'Bearer old-access');
+    const body = await fetch(`http://127.0.0.1:${port}/teamclaude/status`).then(result => result.json());
+    assert.equal(body.accounts[0].type, 'oauth');
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('supervisor buffer budget limits the double-buffered public request count', { timeout: 15000 }, async () => {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-public-budget-'));
   const configPath = join(dir, 'config.json');
@@ -856,7 +1100,7 @@ test('supervisor buffer budget limits the double-buffered public request count',
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 8,
@@ -924,7 +1168,7 @@ test('supervisor admits five small held POSTs by actual request byte budget', { 
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 8,
@@ -998,7 +1242,7 @@ test('supervisor releases admission after a partial request body deadline', { ti
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxConcurrentPerAccount: 1,
@@ -1086,7 +1330,7 @@ test('supervisor rejects when the budget cannot fit one double-buffered request'
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxRequestBytes,
@@ -1134,7 +1378,7 @@ test('supervisor rejects an oversized body before the request ends', { timeout: 
   });
   const upstreamPort = await listen(upstream);
   await writeFile(configPath, JSON.stringify({
-    proxy: { port },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     maxRequestBytes: 4,
@@ -1378,6 +1622,420 @@ globalThis.fetch = async (input, init) => {
       'old profile UUID must not be attached to the replacement credential');
   } finally {
     if (listing.exitCode == null) listing.kill('SIGKILL');
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a probe that timed out because the SUPERVISOR froze must not condemn the worker', { timeout: 30000 }, async t => {
+  if (process.platform === 'win32') {
+    t.skip('SIGSTOP is not available on Windows');
+    return;
+  }
+  // Reproduces the live 2026-08-07 failure exactly. The supervisor relays every
+  // SSE byte and holds the probe's timeout timer on ONE event loop; under host
+  // load that loop stalls, and on resume the overdue timer fires before the
+  // worker's reply is read from the socket. The old code counted that as the
+  // worker's fault and SIGKILLed it, killing every in-flight turn with it
+  // (198 consecutive worker deaths in one log window, zero worker crashes).
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-contention-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    workerHealthIntervalMs: 50,
+    workerHealthTimeoutMs: 200,
+    workerHealthFailureThreshold: 1,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let frozenWorker = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+
+    // Park a probe in flight (the worker cannot answer it yet), then freeze the
+    // supervisor itself for far longer than the probe budget.
+    frozenWorker = initial.workerPid;
+    process.kill(frozenWorker, 'SIGSTOP');
+    await delay(120);
+    process.kill(child.pid, 'SIGSTOP');
+    await delay(1500);
+    // The worker is healthy again BEFORE the supervisor gets to judge it.
+    process.kill(frozenWorker, 'SIGCONT');
+    frozenWorker = null;
+    process.kill(child.pid, 'SIGCONT');
+
+    await delay(1200);
+
+    assert.ok(await status(port), 'the proxy must still serve');
+    const now = await readState(statePath);
+    assert.equal(now.workerPid, initial.workerPid,
+      'a probe that expired during OUR OWN freeze carries no evidence about the worker');
+    assert.ok(isPidAlive(initial.workerPid));
+  } finally {
+    if (frozenWorker && isPidAlive(frozenWorker)) {
+      try { process.kill(frozenWorker, 'SIGCONT'); } catch {}
+    }
+    try { process.kill(child.pid, 'SIGCONT'); } catch {}
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a supervisor freeze during IPC corroboration must not kill a worker that already ponged', {
+  timeout: 30000,
+}, async t => {
+  if (process.platform === 'win32') {
+    t.skip('SIGSTOP is not available on Windows');
+    return;
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-ipc-stall-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    workerHealthIntervalMs: 50,
+    workerHealthTimeoutMs: 1000,
+    workerHealthFailureThreshold: 1,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let frozenWorker = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    frozenWorker = initial.workerPid;
+    process.kill(frozenWorker, 'SIGSTOP');
+    await delay(1200);
+    process.kill(child.pid, 'SIGSTOP');
+    await delay(100);
+    process.kill(frozenWorker, 'SIGCONT');
+    frozenWorker = null;
+    await delay(1500);
+    process.kill(child.pid, 'SIGCONT');
+    await delay(1200);
+
+    assert.ok(await status(port), 'the proxy must still serve after contention');
+    const now = await readState(statePath);
+    assert.equal(now.workerPid, initial.workerPid,
+      'an overdue supervisor timer cannot prove the worker missed IPC');
+    assert.ok(isPidAlive(initial.workerPid));
+  } finally {
+    if (frozenWorker && isPidAlive(frozenWorker)) {
+      try { process.kill(frozenWorker, 'SIGCONT'); } catch {}
+    }
+    try { process.kill(child.pid, 'SIGCONT'); } catch {}
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a worker death after upstream accepts POST returns 502 without replay', { timeout: 20000 }, async () => {
+  // Once the worker connection is established the supervisor cannot prove
+  // whether upstream accepted the POST. A stale replayOnWorkerDeath setting
+  // must not override the no-duplicate-inference safety boundary.
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-supervisor-replay-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      upstreamHits += 1;
+      const answer = () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, hit: upstreamHits }));
+      };
+      // Hold the first attempt open so the worker can be killed mid-flight.
+      if (upstreamHits === 1) setTimeout(answer, 2000);
+      else answer();
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    workerHealthIntervalMs: 60_000,
+    replayOnWorkerDeath: true,
+    accounts: [{ name: 'primary', type: 'apikey', apiKey: 'placeholder' }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+
+    const pending = request({
+      port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1, messages: [] }),
+    });
+
+    await waitUntil(() => (upstreamHits >= 1 ? true : null), 'request never reached upstream');
+    process.kill(initial.workerPid, 'SIGKILL');
+
+    const response = await pending;
+    assert.equal(response.status, 502);
+    assert.equal(response.headers['retry-after'], '5');
+    assert.equal(upstreamHits, 1, 'the replacement worker must not re-dispatch an uncertain POST');
+    assert.match(response.body, /request was not replayed/i);
+
+    const replaced = await waitUntil(async () => {
+      const next = await readState(statePath);
+      return next?.workerPid !== initial.workerPid ? next : null;
+    }, 'worker was not replaced');
+    assert.ok(isPidAlive(replaced.workerPid));
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a Codex worker-death receipt is nonce-bound, session-bound, and consumed once', { timeout: 20000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-supervisor-receipt-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  const invocationId = '01900000-0000-4000-8000-000000000020';
+  const sessionId = '01900000-0000-7000-8000-000000000021';
+  let upstreamHits = 0;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      upstreamHits += 1;
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      }, 2000);
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    workerHealthIntervalMs: 60_000,
+    accounts: [{
+      name: 'codex-test',
+      provider: 'codex',
+      type: 'oauth',
+      accessToken: 'placeholder',
+      accountId: 'workspace-test',
+      expiresAt: Date.now() + 60_000,
+    }],
+  }));
+
+  const child = spawn(process.execPath, [entry, 'codex', 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const initial = await waitUntil(() => readState(statePath), 'server state was not written');
+    const pending = request({
+      port,
+      path: '/codex/responses',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamcodex-invocation': invocationId,
+      },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [], prompt_cache_key: sessionId }),
+    });
+
+    await waitUntil(() => (upstreamHits >= 1 ? true : null), 'request never reached upstream');
+    process.kill(initial.workerPid, 'SIGKILL');
+    const failed = await pending;
+    assert.equal(failed.status, 502);
+    assert.equal(failed.headers['x-teamcodex-recovery-session'], undefined);
+    assert.equal(upstreamHits, 1);
+
+    await waitUntil(async () => {
+      const next = await readState(statePath);
+      return next?.workerPid !== initial.workerPid ? next : null;
+    }, 'worker was not replaced');
+
+    const consume = () => request({
+      port,
+      path: '/teamclaude/codex-recovery/consume',
+      method: 'POST',
+      headers: { 'x-teamcodex-invocation': invocationId },
+    });
+    const first = await consume();
+    assert.equal(first.status, 200, first.body);
+    assert.deepEqual(JSON.parse(first.body), { sessionId });
+    const second = await consume();
+    assert.equal(second.status, 404);
+
+    const unrelatedInvocationId = '01900000-0000-4000-8000-000000000022';
+    const beforeUnrelated = await readState(statePath);
+    const unrelated = request({
+      port,
+      path: '/codex/not-responses',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-teamcodex-invocation': unrelatedInvocationId,
+      },
+      body: JSON.stringify({ prompt_cache_key: sessionId }),
+    });
+    await waitUntil(() => (upstreamHits >= 2 ? true : null), 'unrelated request never reached upstream');
+    process.kill(beforeUnrelated.workerPid, 'SIGKILL');
+    assert.equal((await unrelated).status, 502);
+    await waitUntil(async () => {
+      const next = await readState(statePath);
+      return next?.workerPid !== beforeUnrelated.workerPid ? next : null;
+    }, 'worker was not replaced after unrelated request');
+    const unrelatedConsume = await request({
+      port,
+      path: '/teamclaude/codex-recovery/consume',
+      method: 'POST',
+      headers: { 'x-teamcodex-invocation': unrelatedInvocationId },
+    });
+    assert.equal(unrelatedConsume.status, 404, 'only /codex/responses may mint a recovery receipt');
+  } finally {
+    await stopChild(child);
+    await close(upstream);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('deployment drain atomically blocks new admissions and can be released', {
+  timeout: 15000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-deployment-drain-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'codex', 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const state = await waitUntil(
+      () => readState(statePath),
+      'server lifecycle was not written',
+    );
+    const control = (method, lifecycleId) => request({
+      port,
+      path: '/teamclaude/deployment/drain',
+      method,
+      headers: {
+        'content-length': '0',
+        'x-teamcodex-lifecycle-id': lifecycleId,
+      },
+    });
+
+    assert.equal((await control('POST', 'forged-lifecycle-id')).status, 403);
+    const activated = await control('POST', state.lifecycle.id);
+    assert.equal(activated.status, 200, activated.body);
+    assert.deepEqual(JSON.parse(activated.body), {
+      draining: true,
+      activeRequests: 0,
+    });
+
+    const duringDrain = await request({
+      port,
+      path: '/codex/responses',
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
+    });
+    assert.equal(duringDrain.status, 503);
+    assert.equal(JSON.parse(duringDrain.body).error.type, 'overloaded_error');
+
+    const drainedStatus = await status(port);
+    assert.equal(drainedStatus.headers.get('x-teamcodex-deployment-draining'), '1');
+
+    const released = await control('DELETE', state.lifecycle.id);
+    assert.equal(released.status, 200, released.body);
+    assert.deepEqual(JSON.parse(released.body), {
+      draining: false,
+      activeRequests: 0,
+    });
+    const resumedStatus = await status(port);
+    assert.equal(resumedStatus.headers.get('x-teamcodex-deployment-draining'), '0');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('deployment drain lease self-releases if the deployer disappears', {
+  timeout: 15000,
+}, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-deployment-drain-lease-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    deploymentDrainLeaseMs: 200,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const child = spawn(process.execPath, [entry, 'codex', 'server'], {
+    env: { ...process.env, TEAMCLAUDE_CONFIG: configPath },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    const state = await waitUntil(
+      () => readState(statePath),
+      'server lifecycle was not written',
+    );
+    const activated = await request({
+      port,
+      path: '/teamclaude/deployment/drain',
+      method: 'POST',
+      headers: {
+        'content-length': '0',
+        'x-teamcodex-lifecycle-id': state.lifecycle.id,
+      },
+    });
+    assert.equal(activated.status, 200, activated.body);
+    await delay(500);
+    const resumed = await status(port);
+    assert.equal(resumed.headers.get('x-teamcodex-deployment-draining'), '0');
+  } finally {
+    await stopChild(child);
     await rm(dir, { recursive: true, force: true });
   }
 });

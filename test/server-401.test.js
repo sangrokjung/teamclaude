@@ -92,3 +92,45 @@ test('all accounts failing auth → returns 401 to the client', async () => {
     upstream.close();
   }
 });
+
+test('revocation observed during token refresh never dispatches upstream', async () => {
+  let hits = 0;
+  const upstream = http.createServer((_req, res) => {
+    hits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{
+    name: 'revoked',
+    type: 'oauth',
+    provider: 'anthropic',
+    accessToken: 'tok-revoked',
+    refreshToken: 'refresh',
+    expiresAt: Date.now() + 3600_000,
+  }], 0.98);
+  const originalEnsure = am.ensureTokenFresh.bind(am);
+  am.ensureTokenFresh = async account => {
+    am.setAuthRevoked(account, true, false);
+    return originalEnsure(account);
+  };
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await res.text();
+    assert.equal(res.status, 401);
+    assert.equal(hits, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

@@ -107,6 +107,18 @@ test('status renders an error account reason instead of dying as "unreachable"',
   assert.match(res.stdout, /good@example\.com/);
 });
 
+test('status describes subscription-disabled as organization access denial, never delinquency', async () => {
+  const res = await runStatusAgainst(basePayload([
+    account('blocked@example.com', {
+      status: 'error', errorReason: 'subscription-disabled', usable: false,
+    }),
+  ]));
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /조직의 Claude Code 접근 차단/);
+  assert.doesNotMatch(res.stdout, /연체/);
+});
+
 test('status lists healthy accounts with quota lines', async () => {
   const res = await runStatusAgainst(basePayload([account('a@example.com'), account('b@example.com')]));
 

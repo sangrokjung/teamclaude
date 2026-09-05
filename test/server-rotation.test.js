@@ -74,11 +74,13 @@ test('loopback rotate endpoint switches active account without persisting config
     'currentAccount',
     'currentAccountUuid',
     'previousAccount',
+    'previousAccountUuid',
     'rotated',
   ]);
   assert.deepEqual(body, {
     rotated: true,
     previousAccount: 'account-a',
+    previousAccountUuid: 'uuid-a',
     currentAccount: 'account-b',
     currentAccountUuid: 'uuid-b',
   });
@@ -188,6 +190,55 @@ test('recovery auth pins each session to its rotated account across concurrent r
 
   assert.equal(response.status, 200);
   assert.equal(selectedSecondAccount, true);
+});
+
+test('rotate endpoint excludes the caller recovery UUID when global current belongs to another session', async t => {
+  const manager = new AccountManager([
+    {
+      name: 'account-a',
+      accountUuid: 'uuid-a',
+      type: 'oauth',
+      accessToken: 'fixture-a',
+      expiresAt: Date.now() + 60_000,
+    },
+    {
+      name: 'account-b',
+      accountUuid: 'uuid-b',
+      type: 'oauth',
+      accessToken: 'fixture-b',
+      expiresAt: Date.now() + 60_000,
+    },
+  ], 0.98, 0);
+  manager.currentIndex = 0;
+  const server = createProxyServer(manager, {
+    proxy: { apiKey: 'fixture-proxy-key' },
+    upstream: 'http://127.0.0.1:1',
+    activeWarmup: false,
+  });
+  t.after(() => close(server));
+  const port = await listen(server);
+  const recoveryEnv = buildClaudeRecoveryEnv({
+    ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
+  }, 'uuid-b');
+
+  const response = await fetch(`http://127.0.0.1:${port}/teamclaude/rotate`, {
+    method: 'POST',
+    headers: {
+      'x-api-key': 'fixture-proxy-key',
+      authorization: `Bearer ${recoveryEnv.CLAUDE_CODE_OAUTH_TOKEN}`,
+    },
+  });
+  const result = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(result, {
+    rotated: true,
+    previousAccount: 'account-b',
+    previousAccountUuid: 'uuid-b',
+    currentAccount: 'account-a',
+    currentAccountUuid: 'uuid-a',
+  });
+  assert.equal(manager.currentIndex, 0);
 });
 
 test('loopback malformed recovery marker is rejected before upstream dispatch', async t => {

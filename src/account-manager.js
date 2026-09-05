@@ -1,11 +1,85 @@
 import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
+import { refreshProviderAccessToken } from './provider-oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
+const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
+const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_MODEL_UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
+const CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES = 64;
+const MODEL_WEEKLY_MAX_ENTRIES = 64;
+
+function isInvalidGrantError(error) {
+  if (!error) return false;
+  if (typeof error.code === 'string' && error.code.toLowerCase() === 'invalid_grant') return true;
+  return /\binvalid_grant\b/i.test(String(error.message || error));
+}
+
+function supportsAuthRevocation(account) {
+  return account?.type === 'oauth' && account?.provider === 'anthropic';
+}
+
+function normalizeAuthRevokedAt(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  return normalizeExpiresAt(timestamp);
+}
 
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+function codexWindowKind(windowMinutes) {
+  if (windowMinutes === CODEX_SESSION_WINDOW_MINUTES) return '5h';
+  if (windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES) return '7d';
+  return null;
+}
+
+function normalizeResetMs(value) {
+  if (value == null || value === '') return null;
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) return null;
+  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
+}
+
+function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritative = true } = {}) {
+  if (!kind) return false;
+  const utilization = Number(usedPercent);
+  const reset = normalizeResetMs(resetAt);
+  const utilKey = kind === '5h' ? 'unified5h' : 'unified7d';
+  const resetKey = kind === '5h' ? 'unified5hReset' : 'unified7dReset';
+  // Per-response x-codex headers are a live incremental signal, NOT an
+  // authoritative meter: the Codex backend reports the rate limit that metered
+  // THAT request, which for a promo/model-scoped meter (e.g. the
+  // GPT-5.3-Codex-Spark additional limit) reads 0% while the account's binding
+  // weekly window (wham/usage base rate_limit) sits at 89% (live incident
+  // 2026-08-05: every forwarded response stamped unified7d back to 0 within
+  // seconds of each wham refresh). Within one live window a same-meter
+  // used-percent never decreases, so a NON-authoritative write that would
+  // LOWER the stored utilization while the stored window is still in the
+  // future is a different meter talking — skip the whole window (its reset is
+  // just as suspect). The authoritative wham path may lower freely (window
+  // rollover, upstream early reset), and an expired stored window may be
+  // overwritten by anyone (legitimate rollover).
+  if (!authoritative
+      && Number.isFinite(utilization)
+      && typeof quota[utilKey] === 'number'
+      && utilization / 100 < quota[utilKey]
+      && typeof quota[resetKey] === 'number'
+      && quota[resetKey] > Date.now()) {
+    return false;
+  }
+  let applied = false;
+  if (Number.isFinite(utilization)) {
+    quota[utilKey] = utilization / 100;
+    applied = true;
+  }
+  if (reset != null) {
+    quota[resetKey] = reset;
+    applied = true;
+  }
+  return applied;
 }
 
 // Anthropic's `7d_oi` window is the top-tier weekly allowance shown as
@@ -32,6 +106,11 @@ function emptyQuota() {
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // Freshness stamp: ms timestamp of the last authoritative codex wham/usage
+    // apply (updateCodexUsage). Per-response x-codex headers never set it —
+    // they are a non-authoritative signal. Drives the active fast-lane refresh
+    // (server.js maybeRefreshCodexUsage) and surfaces data age in status.
+    codexUsageAt: null,
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -64,10 +143,26 @@ export class AccountManager {
       provider: acct.provider || 'anthropic',
       accountUuid: acct.accountUuid || null,
       credential: acct.accessToken || acct.apiKey,
+      accessToken: acct.accessToken || null,
       refreshToken: acct.refreshToken || null,
+      oauthIssuer: acct.oauthIssuer || null,
+      oauthClientId: acct.oauthClientId || null,
+      authMethod: acct.authMethod || null,
+      projectId: acct.projectId || null,
+      oauthTokenEndpoint: acct.oauthTokenEndpoint || null,
       idToken: acct.idToken || null,
       accountId: acct.accountId || null,
       expiresAt: acct.expiresAt || null,
+      // Every credential installation advances this local generation, even if
+      // its token strings happen to compare equal. A refresh request captures
+      // the generation before it leaves the process; its late success or
+      // invalid_grant must never overwrite or quarantine a newer installation.
+      _credentialGeneration: 0,
+      ...(supportsAuthRevocation({ type: acct.type, provider: acct.provider || 'anthropic' })
+        && acct.authRevoked === true ? {
+          authRevoked: true,
+          authRevokedAt: normalizeAuthRevokedAt(acct.authRevokedAt),
+        } : {}),
       status: 'active',
       // Manual on/off switch. A disabled account is excluded from ALL rotation
       // (warm-up, use-or-lose selection, recover, acquire) via _isAvailable —
@@ -86,12 +181,25 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      // A timeout or transport failure after dispatch is ambiguous for an unsafe
+      // request. Keep this process-local, short cooldown separate from quota and
+      // auth state so the next client retry can use another healthy account.
+      dispatchFailureCooldownUntil: 0,
+      unsupportedModels: new Map(),
       // Concurrency: how many requests are in flight through this account right
       // now, and the per-account cap above which the selector treats it as
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
     }));
+    // Restore durable auth-revocation and subscription-lapse flags. Auth
+    // revocation is intentionally Anthropic OAuth-only; other providers may
+    // use the same error string for a different credential contract.
+    this.accounts.forEach((account, i) => this._restoreAuthRevokedFlag(account, accounts[i]));
+    // Restore persistent subscription-lapse flags (config `subscriptionDisabled`)
+    // so a restart keeps a lapsed account out of rotation instead of resetting
+    // it to active until the next 403 re-detects it.
+    this.accounts.forEach((account, i) => this._restoreSubscriptionFlag(account, accounts[i]));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     this.reevalIntervalMs = reevalIntervalMs;
@@ -213,24 +321,31 @@ export class AccountManager {
    * changing persisted priority/enabled settings. Used by local recovery
    * control paths that must abandon the current account before retrying.
    */
-  rotateActiveAccount(model = null, requireAccountUuid = false) {
+  rotateActiveAccount(model = null, requireAccountUuid = false, failedAccountUuid = null) {
     const current = this.accounts[this.currentIndex] || null;
+    const failed = typeof failedAccountUuid === 'string'
+      ? this.accounts.find(account => account.accountUuid === failedAccountUuid) || null
+      : current;
+    if (typeof failedAccountUuid === 'string' && !failed) {
+      return { rotated: false, reason: 'no-alternative-account' };
+    }
     const exclude = new Set();
-    if (current) exclude.add(current);
+    if (failed) exclude.add(failed);
     if (requireAccountUuid) {
       for (const account of this.accounts) {
         if (!account.accountUuid) exclude.add(account);
       }
     }
     const next = this._selectBest(exclude, model);
-    if (!next || next === current) {
+    if (!next || next === failed) {
       return { rotated: false, reason: 'no-alternative-account' };
     }
     this.currentIndex = next.index;
     this.lastEvalAt = Date.now();
     return {
       rotated: true,
-      previousAccount: current?.name || null,
+      previousAccount: failed?.name || null,
+      previousAccountUuid: failed?.accountUuid || null,
       currentAccount: next.name,
       currentAccountUuid: next.accountUuid || null,
     };
@@ -844,6 +959,10 @@ export class AccountManager {
     // never chosen for a new request. _recoverSoonest iterates accounts directly
     // (not via this), so it skips disabled accounts itself.
     if (account.enabled === false) return false;
+    if (account.authRevoked === true) return false;
+
+    if (this._isDispatchFailureCoolingDown(account)) return false;
+    if (account.dispatchFailureCooldownUntil) account.dispatchFailureCooldownUntil = 0;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -854,9 +973,63 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (this._isModelUnsupported(account, model)) return false;
     if (this._isNearQuota(account, model)) return false;
 
     return true;
+  }
+
+  _isDispatchFailureCoolingDown(account, now = Date.now()) {
+    return Number.isFinite(account?.dispatchFailureCooldownUntil)
+      && account.dispatchFailureCooldownUntil > now;
+  }
+
+  /**
+   * Keep a transport-failed account out of new selection briefly without
+   * changing its quota/auth health or persisting the transient condition.
+   */
+  markDispatchFailureCooldown(accountIndex, cooldownMs) {
+    const account = this._resolve(accountIndex);
+    if (!account || !Number.isFinite(cooldownMs) || cooldownMs <= 0) return false;
+    const until = Date.now() + Math.floor(cooldownMs);
+    account.dispatchFailureCooldownUntil = Math.max(account.dispatchFailureCooldownUntil || 0, until);
+    console.log(`[TeamClaude] Account "${account.name}" dispatch failure cooldown for ${Math.ceil(cooldownMs / 1000)}s`);
+    return true;
+  }
+
+  _isModelUnsupported(account, model) {
+    if (!account || typeof model !== 'string' || !model
+        || !(account.unsupportedModels instanceof Map)) return false;
+    const until = account.unsupportedModels.get(model);
+    if (!Number.isFinite(until)) return false;
+    if (Date.now() >= until) {
+      account.unsupportedModels.delete(model);
+      return false;
+    }
+    return true;
+  }
+
+  markModelUnsupported(accountIndex, model, ttlMs = CODEX_MODEL_UNSUPPORTED_TTL_MS) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model
+        || !Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+    const now = Date.now();
+    for (const [candidate, until] of account.unsupportedModels) {
+      if (!Number.isFinite(until) || until <= now) account.unsupportedModels.delete(candidate);
+    }
+    account.unsupportedModels.delete(model);
+    while (account.unsupportedModels.size >= CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES) {
+      const oldest = account.unsupportedModels.keys().next().value;
+      account.unsupportedModels.delete(oldest);
+    }
+    account.unsupportedModels.set(model, now + Math.floor(ttlMs));
+    return true;
+  }
+
+  clearModelUnsupported(accountIndex, model) {
+    const account = this._resolve(accountIndex);
+    if (!account || typeof model !== 'string' || !model) return false;
+    return account.unsupportedModels.delete(model);
   }
 
   _isNearQuota(account, model = null) {
@@ -961,6 +1134,12 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      if (account.authRevoked === true) continue;
+      // A lapsed subscription is a billing state, not a quota window — a reset
+      // rollover must not revive it. The flag clears only via a 2xx on the
+      // account, re-imported credentials, or `subscription <name> ok`.
+      if (account.subscriptionDisabled) continue;
+      if (this._isDispatchFailureCoolingDown(account)) continue;
       if (this._isModelNearQuota(account, model)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
@@ -976,6 +1155,7 @@ export class AccountManager {
     if (soonestAccount && soonestTime <= Date.now()) {
       soonestAccount.status = 'active';
       soonestAccount.rateLimitedUntil = null;
+      delete soonestAccount.errorReason;
       this.currentIndex = soonestAccount.index;
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
       return soonestAccount;
@@ -992,23 +1172,36 @@ export class AccountManager {
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const codexPrimary = parseFloat(headers['x-codex-primary-used-percent']);
-    const codexSecondary = parseFloat(headers['x-codex-secondary-used-percent']);
-    const u5h = Number.isFinite(codexPrimary)
-      ? codexPrimary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = Number.isFinite(codexSecondary)
-      ? codexSecondary / 100
-      : parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
     if (!isNaN(u5h)) account.quota.unified5h = u5h;
     if (!isNaN(u7d)) account.quota.unified7d = u7d;
 
-    const r5h = headers['x-codex-primary-reset-at']
-      || headers['anthropic-ratelimit-unified-5h-reset'];
-    const r7d = headers['x-codex-secondary-reset-at']
-      || headers['anthropic-ratelimit-unified-7d-reset'];
+    const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
+    const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+
+    // Codex labels windows as primary/secondary, but those positions are not
+    // stable: a weekly-only plan can report its 10080-minute window as primary.
+    // Classify by the advertised duration. Older responses without a duration
+    // retain the legacy primary=5h / secondary=7d fallback.
+    for (const [prefix, fallbackKind] of [['primary', '5h'], ['secondary', '7d']]) {
+      const minutes = Number(headers[`x-codex-${prefix}-window-minutes`]);
+      const kind = Number.isFinite(minutes) && minutes > 0
+        ? codexWindowKind(minutes)
+        : fallbackKind;
+      applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        headers[`x-codex-${prefix}-used-percent`],
+        headers[`x-codex-${prefix}-reset-at`],
+        // Response headers describe whichever meter governed THIS request; only
+        // the wham/usage refresh (updateCodexUsage) is authoritative for the
+        // account's binding windows. See applyCodexQuotaWindow.
+        { authoritative: false },
+      );
+    }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     const codexReached = headers['x-codex-rate-limit-reached-type'];
@@ -1020,17 +1213,33 @@ export class AccountManager {
     // around from the last such request. Matched generically so a renamed or
     // newly added window is picked up as-is.
     for (const [key, value] of Object.entries(headers)) {
-      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]+)-(utilization|reset)$/.exec(key);
+      const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]{1,61})-(utilization|reset)$/.exec(key);
       if (!m) continue;
-      const win = account.quota.modelWeekly[m[1]]
-        || (account.quota.modelWeekly[m[1]] = { utilization: null, reset: null });
+      let parsedValue;
       if (m[2] === 'utilization') {
-        const u = parseFloat(value);
-        if (!isNaN(u)) win.utilization = u;
+        parsedValue = parseFloat(value);
       } else {
-        const r = parseInt(value, 10);
-        if (!isNaN(r)) win.reset = r * 1000;
+        const reset = parseInt(value, 10);
+        parsedValue = Number.isNaN(reset) ? NaN : reset * 1000;
       }
+      if (!Number.isFinite(parsedValue)) continue;
+      const label = m[1];
+      let win = account.quota.modelWeekly[label];
+      if (!win) {
+        const now = Date.now();
+        for (const [candidate, candidateWindow] of Object.entries(account.quota.modelWeekly)) {
+          if (Number.isFinite(candidateWindow?.reset) && candidateWindow.reset <= now) {
+            delete account.quota.modelWeekly[candidate];
+          }
+        }
+        while (Object.keys(account.quota.modelWeekly).length >= MODEL_WEEKLY_MAX_ENTRIES) {
+          delete account.quota.modelWeekly[Object.keys(account.quota.modelWeekly)[0]];
+        }
+        win = { utilization: null, reset: null };
+        account.quota.modelWeekly[label] = win;
+      }
+      if (m[2] === 'utilization') win.utilization = parsedValue;
+      else win.reset = parsedValue;
     }
 
     // Standard rate limits (API key accounts)
@@ -1065,6 +1274,59 @@ export class AccountManager {
             : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * Fold the official Codex /wham/usage response into the shared quota model.
+   * The base rate limit wins; additional Codex limits only fill a duration that
+   * the base response did not include. Unrecognized windows are ignored.
+   */
+  updateCodexUsage(accountIndex, payload) {
+    const account = this._resolve(accountIndex);
+    if (!account || !payload || typeof payload !== 'object') return false;
+    // A parsed usage response IS fresh contact with the source, even when it
+    // carries no recognizable 5h/7d window (an upstream contract change must
+    // not turn the active fast lane into an unbounded per-request poll).
+    account.quota.codexUsageAt = Date.now();
+
+    const limits = [];
+    if (payload.rate_limit && typeof payload.rate_limit === 'object') {
+      limits.push(payload.rate_limit);
+    }
+    if (Array.isArray(payload.additional_rate_limits)) {
+      for (const item of payload.additional_rate_limits) {
+        if (item?.limit_name !== 'codex') continue;
+        if (item?.rate_limit && typeof item.rate_limit === 'object') limits.push(item.rate_limit);
+      }
+    }
+
+    const windows = new Map();
+    for (const limit of limits) {
+      for (const window of [limit.primary_window, limit.secondary_window]) {
+        if (!window || typeof window !== 'object') continue;
+        const minutes = window.window_minutes != null && Number.isFinite(Number(window.window_minutes))
+          ? Number(window.window_minutes)
+          : Number(window.limit_window_seconds) / 60;
+        const kind = codexWindowKind(minutes);
+        if (!kind || windows.has(kind)) continue;
+        windows.set(kind, window);
+      }
+    }
+
+    let applied = false;
+    for (const [kind, window] of windows) {
+      const resetAt = window.reset_at ?? (window.reset_after_seconds != null
+        && Number.isFinite(Number(window.reset_after_seconds))
+        ? Date.now() / 1000 + Number(window.reset_after_seconds)
+        : null);
+      applied = applyCodexQuotaWindow(
+        account.quota,
+        kind,
+        window.used_percent,
+        resetAt,
+      ) || applied;
+    }
+    return applied;
   }
 
   /**
@@ -1133,6 +1395,7 @@ export class AccountManager {
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
+    if (account.authRevoked === true) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
@@ -1144,23 +1407,29 @@ export class AccountManager {
         accessToken: account.credential,
         refreshToken: account.refreshToken,
         expiresAt: account.expiresAt,
+        credentialGeneration: account._credentialGeneration || 0,
       };
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
         const newTokens = account.provider === 'codex'
           ? await refreshCodexAccessToken(account.refreshToken)
-          : await refreshAccessToken(account.refreshToken);
+          : (account.provider === 'grok' || account.provider === 'agy')
+            ? await refreshProviderAccessToken(account)
+            : await refreshAccessToken(account.refreshToken);
         // Another live sync may have installed a newer rotated token while this
         // network request was in flight. Never let the late result from the old
         // refresh token replace that newer credential.
-        if (account.credential !== previousTokens.accessToken
+        if (account._credentialGeneration !== previousTokens.credentialGeneration
+          || account.credential !== previousTokens.accessToken
           || account.refreshToken !== previousTokens.refreshToken) {
           console.log(`[TeamClaude] Discarded stale token refresh for account "${account.name}"`);
           return;
         }
         account.credential = newTokens.accessToken;
+        account.accessToken = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        account._credentialGeneration = (account._credentialGeneration || 0) + 1;
         if (newTokens.idToken) account.idToken = newTokens.idToken;
         if (newTokens.accountId) {
           account.accountId = newTokens.accountId;
@@ -1172,6 +1441,7 @@ export class AccountManager {
         if (account.status === 'error' && account._errorFromRefresh) {
           account.status = 'active';
           delete account._errorFromRefresh;
+          delete account.errorReason;
         }
         delete account._refreshRetryAt;
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
@@ -1184,6 +1454,30 @@ export class AccountManager {
         }
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        if (supportsAuthRevocation(account) && isInvalidGrantError(err)) {
+          if (account._credentialGeneration !== previousTokens.credentialGeneration
+              || account.credential !== previousTokens.accessToken
+              || account.refreshToken !== previousTokens.refreshToken) {
+            console.log(`[TeamClaude] Discarded stale auth revocation for account "${account.name}"`);
+            return;
+          }
+          const changed = account.authRevoked !== true;
+          this.setAuthRevoked(account, true, false);
+          delete account._refreshRetryAt;
+          if (changed && this.accounts[account.index] === account) {
+            try {
+              await this._onAuthRevoked?.(
+                account,
+                true,
+                previousTokens,
+                account._authRevocationGeneration,
+              );
+            } catch (persistError) {
+              console.error(`[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${persistError.message}`);
+            }
+          }
+          return;
+        }
         account._refreshRetryAt = Date.now() + REFRESH_SWEEP_RETRY_MS;
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token.
@@ -1193,6 +1487,13 @@ export class AccountManager {
           if (account.status !== 'error') {
             account.status = 'error';
             account._errorFromRefresh = true;
+            // Why the account is out (surfaced by getStatus; in-memory only,
+            // never persisted — same policy as status). invalid_grant from the
+            // OAuth endpoint means the refresh chain itself was revoked
+            // (re-login required); anything else is a generic refresh failure.
+            account.errorReason = err.message?.includes('invalid_grant')
+              ? 'auth-revoked'
+              : 'refresh-failed';
           }
         }
       } finally {
@@ -1216,6 +1517,7 @@ export class AccountManager {
       const now = Date.now();
       const targets = this.accounts.filter(a =>
         a.type === 'oauth' && a.refreshToken
+        && a.authRevoked !== true
         && (!a._refreshRetryAt || now >= a._refreshRetryAt)
         && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
       for (const account of targets) {
@@ -1237,6 +1539,10 @@ export class AccountManager {
     this._onTokenRefresh = callback;
   }
 
+  onAuthRevoked(callback) {
+    this._onAuthRevoked = callback;
+  }
+
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1246,7 +1552,13 @@ export class AccountManager {
     expiresAt,
     idToken,
     accountId,
-  }, persist = true) {
+    accountUuid,
+    oauthIssuer,
+    oauthClientId,
+    authMethod,
+    projectId,
+    oauthTokenEndpoint,
+  }, persist = true, { clearAuthRevoked = true } = {}) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
@@ -1254,18 +1566,34 @@ export class AccountManager {
       accessToken: account.credential,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
+      credentialGeneration: account._credentialGeneration || 0,
     };
     account.credential = accessToken;
-    if (refreshToken) account.refreshToken = refreshToken;
+    account.accessToken = accessToken;
+    if (refreshToken !== undefined) account.refreshToken = refreshToken || null;
     account.expiresAt = expiresAt;
+    account._credentialGeneration = (account._credentialGeneration || 0) + 1;
     if (idToken) account.idToken = idToken;
     if (accountId) {
       account.accountId = accountId;
       account.accountUuid = accountId;
     }
-    if (account.status === 'error') {
+    for (const [field, value] of Object.entries({
+      accountUuid, oauthIssuer, oauthClientId, authMethod, projectId, oauthTokenEndpoint,
+    })) {
+      if (value != null) account[field] = value;
+    }
+    // Fresh external credentials (re-import / login) are the operator's signal
+    // the account is fixed — clear the persistent subscription-lapse flag too,
+    // persisting its removal along with this update's own persistence mode.
+    if (clearAuthRevoked && account.authRevoked === true) {
+      this.setAuthRevoked(account, false, persist, previousTokens);
+    }
+    if (account.subscriptionDisabled) this.setSubscriptionDisabled(account, false, persist);
+    if (account.status === 'error' && account.authRevoked !== true) {
       account.status = 'active';
       delete account._errorFromRefresh;
+      delete account.errorReason;
     }
     delete account._refreshRetryAt;
     console.log(`[TeamClaude] Updated tokens for account "${account.name}"`);
@@ -1292,19 +1620,34 @@ export class AccountManager {
       provider: acctData.provider || 'anthropic',
       accountUuid: acctData.accountUuid || null,
       credential: acctData.accessToken || acctData.apiKey,
+      accessToken: acctData.accessToken || null,
       refreshToken: acctData.refreshToken || null,
+      oauthIssuer: acctData.oauthIssuer || null,
+      oauthClientId: acctData.oauthClientId || null,
+      authMethod: acctData.authMethod || null,
+      projectId: acctData.projectId || null,
+      oauthTokenEndpoint: acctData.oauthTokenEndpoint || null,
       idToken: acctData.idToken || null,
       accountId: acctData.accountId || null,
       expiresAt: acctData.expiresAt || null,
+      _credentialGeneration: 0,
       status: 'active',
       enabled: acctData.enabled !== false,
       priority: Number.isFinite(acctData.priority) ? Math.floor(acctData.priority) : null,
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      dispatchFailureCooldownUntil: 0,
+      unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
     });
+    if (supportsAuthRevocation(this.accounts[index]) && acctData.authRevoked === true) {
+      this._restoreAuthRevokedFlag(this.accounts[index], acctData);
+    }
+    // Same restore leg as the constructor: an account added at runtime from a
+    // config that carries the subscription-lapse flag starts parked.
+    this._restoreSubscriptionFlag(this.accounts[index], acctData);
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
     // account sits idle.
@@ -1360,6 +1703,128 @@ export class AccountManager {
     this._drainWaiters();
     this._reprioritize();
     return account;
+  }
+
+  /**
+   * Config-restore leg of the persistent subscription-lapse flag: an account
+   * whose config carries `subscriptionDisabled: true` (anthropic only — the
+   * Codex pool has no equivalent 403 signal) starts parked as the same hard
+   * request-path error the live 403 handler produces. `_errorFromRefresh`
+   * stays false so the token-refresh sweep cannot revive it, and
+   * _recoverSoonest skips it explicitly.
+   */
+  _restoreSubscriptionFlag(account, acctData) {
+    if (acctData?.subscriptionDisabled !== true || account.provider !== 'anthropic') return;
+    account.subscriptionDisabled = true;
+    account.status = 'error';
+    account._errorFromRefresh = false;
+    account.errorReason = account.authRevoked === true
+      ? 'auth-revoked'
+      : 'subscription-disabled';
+  }
+
+  _restoreAuthRevokedFlag(account, acctData) {
+    if (!supportsAuthRevocation(account) || acctData?.authRevoked !== true) return;
+    account.authRevoked = true;
+    account.authRevokedAt = normalizeAuthRevokedAt(acctData.authRevokedAt);
+    account.status = 'error';
+    account._errorFromRefresh = false;
+    account.errorReason = 'auth-revoked';
+  }
+
+  setAuthRevoked(ref, revoked, persist = true, previousTokens = null) {
+    const account = this._resolveRef(ref);
+    if (!account || !supportsAuthRevocation(account)) return null;
+    const next = revoked === true;
+    const had = account.authRevoked === true;
+    if (had !== next) {
+      account._authRevocationGeneration = (account._authRevocationGeneration || 0) + 1;
+    }
+    const generation = account._authRevocationGeneration || 0;
+    if (next) {
+      account.authRevoked = true;
+      account.authRevokedAt = Date.now();
+      account.status = 'error';
+      account._errorFromRefresh = false;
+      account.errorReason = 'auth-revoked';
+    } else {
+      delete account.authRevoked;
+      delete account.authRevokedAt;
+      if (account.subscriptionDisabled === true) {
+        account.status = 'error';
+        account._errorFromRefresh = false;
+        account.errorReason = 'subscription-disabled';
+      } else if (account.status === 'error' && account.errorReason === 'auth-revoked') {
+        account.status = 'active';
+        delete account._errorFromRefresh;
+        delete account.errorReason;
+        this._drainWaiters();
+      }
+    }
+    if (persist && had !== next && this.accounts[account.index] === account) {
+      try {
+        const result = this._onAuthRevoked?.(account, next, previousTokens, generation);
+        if (result && typeof result.then === 'function') {
+          result.catch(error => console.error(
+            `[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${error.message}`,
+          ));
+        }
+      } catch (error) {
+        console.error(`[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${error.message}`);
+      }
+    }
+    return account;
+  }
+
+  /**
+   * Set or clear the persistent subscription-lapse flag. Setting parks the
+   * account as a request-path error ('subscription-disabled') that neither the
+   * refresh sweep nor _recoverSoonest revives; clearing returns it to rotation
+   * only when the subscription flag is what parked it (an unrelated error
+   * stays). The change is mirrored to config through the onAccountFlag hook —
+   * skipped when nothing changed (no config churn) and when `persist` is false
+   * (the change itself came FROM disk, e.g. syncAccountsFromDisk).
+   */
+  setSubscriptionDisabled(ref, disabled, persist = true) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    disabled = disabled === true;
+    const had = account.subscriptionDisabled === true;
+    if (disabled) {
+      account.subscriptionDisabled = true;
+      account.status = 'error';
+      account._errorFromRefresh = false;
+      account.errorReason = account.authRevoked === true
+        ? 'auth-revoked'
+        : 'subscription-disabled';
+    } else {
+      delete account.subscriptionDisabled;
+      if (account.authRevoked === true) {
+        account.status = 'error';
+        account._errorFromRefresh = false;
+        account.errorReason = 'auth-revoked';
+      } else if (account.status === 'error' && account.errorReason === 'subscription-disabled') {
+        account.status = 'active';
+        delete account._errorFromRefresh;
+        delete account.errorReason;
+        // The account can serve again — hand its capacity to queued waiters.
+        this._drainWaiters();
+      }
+    }
+    // Same liveness guard as the token-persist paths: never emit a stale index
+    // for an account removed while a reference to it was still held.
+    if (persist && had !== disabled && this.accounts[account.index] === account) {
+      this._onAccountFlag?.(account, disabled);
+    }
+    return account;
+  }
+
+  /**
+   * Set a callback to persist per-account flag changes (subscriptionDisabled)
+   * to config — the persistence twin of onTokenRefresh.
+   */
+  onAccountFlag(callback) {
+    this._onAccountFlag = callback;
   }
 
   /**
@@ -1477,7 +1942,11 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
-      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()) {
+      // A restored throttle must not overwrite the subscription-lapse park: a
+      // 'throttled' status would lazily heal to 'active' when the window
+      // passes, silently returning a lapsed account to rotation.
+      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
+          && !a.subscriptionDisabled && !a.authRevoked) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -1485,33 +1954,72 @@ export class AccountManager {
   }
 
   /**
+   * Dashboard-facing "can this account serve a request right now": enabled,
+   * status 'active', not inside a throttle window, and under the
+   * switchThreshold quota. Deliberately narrower than _isAvailable — it never
+   * runs the lazy throttle heal, so polling the status surface cannot flip
+   * account state. (_isNearQuota's expired-window sweep is the same clean-up
+   * sweepExpired already performs on the warm-up timer.)
+   */
+  _isUsableNow(account) {
+    const throttled = account.rateLimitedUntil != null && Date.now() < account.rateLimitedUntil;
+    return account.enabled !== false
+      && account.authRevoked !== true
+      && account.status === 'active'
+      && !throttled
+      && !this._isDispatchFailureCoolingDown(account)
+      && !this._isNearQuota(account);
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
-  getStatus() {
+  getStatus({ includeIdentity = false } = {}) {
+    const accounts = this.accounts.map(a => ({
+      name: a.name,
+      ...(includeIdentity ? { accountUuid: a.accountUuid || null } : {}),
+      type: a.type,
+      provider: a.provider,
+      status: a.status,
+      // Why status is 'error' (null otherwise / when unknown): one of
+      // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
+      // 'auth-rejected'. In-memory only (same as status) — except
+      // 'subscription-disabled', which mirrors the persistent config flag
+      // `subscriptionDisabled` and therefore survives restarts.
+      errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
+      // Computed BEFORE the quota snapshot below so _isNearQuota's lazy
+      // sweep of expired windows is reflected in the copied quota.
+      usable: this._isUsableNow(a),
+      enabled: a.enabled !== false,
+      priority: a.priority ?? null,
+      // Deep-copy the nested modelWeekly map — the shallow quota spread would
+      // otherwise hand callers a live reference into account state.
+      quota: {
+        ...a.quota,
+        modelWeekly: Object.fromEntries(
+          Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
+      },
+      usage: { ...a.usage },
+      inflight: a.inflight,
+      maxConcurrent: a.maxConcurrent,
+      rateLimitedUntil: a.rateLimitedUntil
+        ? new Date(a.rateLimitedUntil).toISOString()
+        : null,
+      dispatchFailureCooldownUntil: this._isDispatchFailureCoolingDown(a)
+        ? new Date(a.dispatchFailureCooldownUntil).toISOString()
+        : null,
+      unsupportedModels: [...a.unsupportedModels.keys()].filter(model =>
+        this._isModelUnsupported(a, model)),
+    }));
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
+      ...(includeIdentity
+        ? { currentAccountUuid: this.accounts[this.currentIndex]?.accountUuid || null }
+        : {}),
       switchThreshold: this.switchThreshold,
-      accounts: this.accounts.map(a => ({
-        name: a.name,
-        type: a.type,
-        provider: a.provider,
-        status: a.status,
-        enabled: a.enabled !== false,
-        priority: a.priority ?? null,
-        // Deep-copy the nested modelWeekly map — the shallow quota spread would
-        // otherwise hand callers a live reference into account state.
-        quota: {
-          ...a.quota,
-          modelWeekly: Object.fromEntries(
-            Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
-        },
-        usage: { ...a.usage },
-        inflight: a.inflight,
-        maxConcurrent: a.maxConcurrent,
-        rateLimitedUntil: a.rateLimitedUntil
-          ? new Date(a.rateLimitedUntil).toISOString()
-          : null,
-      })),
+      usableCount: accounts.filter(a => a.usable).length,
+      totalCount: accounts.length,
+      accounts,
     };
   }
 }

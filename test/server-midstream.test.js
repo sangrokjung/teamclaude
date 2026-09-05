@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -34,6 +34,7 @@ function startProxy(am, upstreamPort, overrides = {}) {
     proxy: { apiKey: 'k' },
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
+    codexUsageRefresh: false,
     ...overrides,
   });
 }
@@ -111,13 +112,68 @@ test('mid-event socket kill → complete events + injected retryable error, clea
     assert.equal(injected?.type, 'error');
     assert.equal(injected?.error?.type, 'overloaded_error', 'injected error must be client-retryable');
 
-    // A mid-stream network death is not the account's fault.
-    assert.ok(am.accounts.every(a => a.status === 'active'), 'no account may be poisoned');
+    // The network death must not poison account health status, but an unsafe
+    // injected response still applies a transient selection cooldown.
+    assert.ok(am.accounts.every(a => a.status === 'active'), 'account health status must stay active');
+    const cooled = am.accounts.filter(a => a.dispatchFailureCooldownUntil > Date.now());
+    assert.equal(cooled.length, 1, 'exactly the failed account should be cooling down');
+    assert.equal(am.getStatus().accounts.find(a => a.name === cooled[0].name)?.usable, false,
+      'cooldown makes the failed account unavailable without changing its status');
 
     // The proxy itself must remain fully serviceable (the client will retry).
     const again = await streamPost(proxyPort);
     assert.equal(again.status, 200);
     assert.equal(JSON.parse(again.body).ok, true);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('unsafe partial SSE injection cools the failed account before a client retry', async () => {
+  const auths = [];
+  let requests = 0;
+  const upstream = http.createServer((req, res) => {
+    auths.push(req.headers.authorization || '');
+    requests += 1;
+    if (requests === 1) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+      res.write('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"partial"}}\n\n');
+      setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'healthy-secondary-response' }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  const resetAt = Date.now() + 3_600_000;
+  for (const account of am.accounts) {
+    account.quota.unified5h = 0.1;
+    account.quota.unified5hReset = resetAt;
+    account.quota.unified7d = 0.1;
+    account.quota.unified7dReset = resetAt;
+  }
+  am.currentIndex = 0;
+  const proxy = startProxy(am, upstreamPort, { sessionAffinity: false });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const first = await streamPost(proxyPort);
+    assert.equal(first.status, 200);
+    assert.equal(first.cleanEnd, true);
+    assert.equal(lastErrorEvent(first.body)?.error?.type, 'overloaded_error');
+    assert.ok(am.accounts[0].dispatchFailureCooldownUntil > Date.now(),
+      'an unsafe partial stream that triggers injected retry must cool its account');
+    assert.equal(am.accounts[0].inflight, 0);
+
+    const second = await streamPost(proxyPort);
+    assert.equal(second.status, 200);
+    assert.deepEqual(JSON.parse(second.body), { id: 'healthy-secondary-response' });
+    assert.deepEqual(auths, ['Bearer tok-0', 'Bearer tok-1'],
+      'the immediate client retry must use a healthy account');
+    assert.equal(am.accounts[1].inflight, 0);
   } finally {
     proxy.close();
     upstream.close();
@@ -298,6 +354,28 @@ test('complete stream passes through byte-identically (odd chunk boundaries) and
   }
 });
 
+test('terminal stream preserves trailing bytes after the final SSE boundary', async () => {
+  const full = 'event: message_stop\ndata: {"type":"message_stop"}\n\n: trailing-comment';
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(full);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const r = await streamPost(proxyPort);
+    assert.equal(r.cleanEnd, true);
+    assert.equal(r.body, full);
+    assert.equal(am.accounts[0].status, 'active');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('continuity mode spills a large complete SSE transaction and preserves byte fidelity', async () => {
   const largeText = 'x'.repeat(1_100_000);
   const full = 'event: message_start\ndata: {"type":"message_start"}\n\n'
@@ -317,6 +395,386 @@ test('continuity mode spills a large complete SSE transaction and preserves byte
     assert.equal(r.cleanEnd, true);
     assert.equal(r.body, full);
     assert.ok(!r.body.includes('overloaded_error'));
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('transactional spool and non-SSE bodies share an aggregate response budget', async () => {
+  const heldText = 'x'.repeat(600_000);
+  const heldPrefix = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    + `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"${heldText}"}}\n\n`;
+  const heldStop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let heldChunkSent;
+  const heldChunkObserved = new Promise(resolve => { heldChunkSent = resolve; });
+  const ordinaryBody = 'y'.repeat(600_000);
+
+  const upstream = http.createServer(async (req, res) => {
+    if (req.headers['x-test-id'] === 'held-spool') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(heldPrefix);
+      heldChunkSent();
+      await heldReleased;
+      res.end(heldStop);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_500_000,
+  });
+  const proxyPort = await listen(proxy);
+
+  const heldRequest = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': 'held-spool' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+
+  try {
+    await heldChunkObserved;
+    await delay(30);
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'aggregate-overflow' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502);
+    const rejectedBody = await rejected.json();
+    assert.equal(rejectedBody.error?.type, 'proxy_error');
+
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    assert.equal(await held.text(), heldPrefix + heldStop);
+
+    const afterRelease = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'after-release' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(afterRelease.status, 200, 'completion must release the shared reservation');
+    assert.equal((await afterRelease.arrayBuffer()).byteLength, ordinaryBody.length);
+    assert.ok(am.accounts.every(account => account.inflight === 0));
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('transactional staging transfers each fragmented frame into the shared budget', async () => {
+  const first = `event: content_block_delta\ndata: ${'x'.repeat(300_000)}\n\n`;
+  const second = `event: content_block_delta\ndata: ${'z'.repeat(300_000)}\n\n`;
+  const stop = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const ordinaryBody = 'y'.repeat(400_000);
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let secondSent;
+  const secondObserved = new Promise(resolve => { secondSent = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    if (req.headers['x-test-id'] === 'fragmented-spool') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(first);
+      res.write(second);
+      secondSent();
+      await heldReleased;
+      res.end(stop);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_300_000,
+  });
+  const proxyPort = await listen(proxy);
+  const heldRequest = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': 'fragmented-spool' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+
+  try {
+    await secondObserved;
+    await delay(30);
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'fragmented-overflow' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502);
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    assert.equal(await held.text(), first + second + stop);
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('aggregate response budget covers retained SSE request logs', async () => {
+  const heldFrame = `event: content_block_delta\ndata: ${'x'.repeat(700_000)}\n\n`;
+  const ordinaryBody = 'y'.repeat(400_000);
+  const logDir = await mkdtemp(join(tmpdir(), 'teamclaude-aggregate-stream-log-'));
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let heldChunkSent;
+  const heldChunkObserved = new Promise(resolve => { heldChunkSent = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    if (req.headers['x-test-id'] === 'held-log') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(heldFrame);
+      heldChunkSent();
+      await heldReleased;
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    streamRecovery: false,
+    logDir,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_000_000,
+  });
+  const proxyPort = await listen(proxy);
+  const heldRequest = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': 'held-log' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+
+  try {
+    await heldChunkObserved;
+    await delay(30);
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'log-overflow' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502, 'stream-log copies must consume the shared budget');
+    const rejectedBody = await rejected.json();
+    assert.equal(rejectedBody.error?.type, 'proxy_error');
+
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    assert.equal(await held.text(), heldFrame, 'log pressure must not truncate the client stream');
+
+    let logFlushed = false;
+    for (let i = 0; i < 300 && !logFlushed; i++) {
+      await delay(10);
+      const files = await readdir(logDir);
+      for (const file of files) {
+        if ((await stat(join(logDir, file))).size >= heldFrame.length) logFlushed = true;
+      }
+    }
+    assert.equal(logFlushed, true, 'the retained log must flush before its budget is reusable');
+
+    const afterRelease = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'log-after-release' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(afterRelease.status, 200, 'finishing the logged stream must release its reservation');
+    assert.equal((await afterRelease.arrayBuffer()).byteLength, ordinaryBody.length);
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
+    proxy.close();
+    upstream.close();
+    await rm(logDir, { recursive: true, force: true });
+  }
+});
+
+test('aggregate response budget covers an incomplete recovery SSE frame', async () => {
+  const heldPartial = `event: content_block_delta\ndata: ${'x'.repeat(300_000)}`;
+  const heldTail = '\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const ordinaryBody = 'y'.repeat(400_000);
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let heldChunkSent;
+  const heldChunkObserved = new Promise(resolve => { heldChunkSent = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    if (req.headers['x-test-id'] === 'held-frame') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(heldPartial);
+      heldChunkSent();
+      await heldReleased;
+      res.end(heldTail);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_000_000,
+  });
+  const proxyPort = await listen(proxy);
+  const heldRequest = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': 'held-frame' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+
+  try {
+    await heldChunkObserved;
+    await delay(30);
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'frame-overflow' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502, 'SseFramer.pending must consume the shared budget');
+    const rejectedBody = await rejected.json();
+    assert.equal(rejectedBody.error?.type, 'proxy_error');
+
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    assert.equal(await held.text(), heldPartial + heldTail);
+
+    const afterRelease = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'frame-after-release' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(afterRelease.status, 200, 'finishing the framed stream must release its reservation');
+    assert.equal((await afterRelease.arrayBuffer()).byteLength, ordinaryBody.length);
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('aggregate response budget covers the incomplete SSE usage parser tail', async () => {
+  const heldPartial = `event: content_block_delta\ndata: ${'x'.repeat(700_000)}`;
+  const ordinaryBody = 'y'.repeat(400_000);
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let heldChunkSent;
+  const heldChunkObserved = new Promise(resolve => { heldChunkSent = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    if (req.headers['x-test-id'] === 'held-usage') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(heldPartial);
+      heldChunkSent();
+      await heldReleased;
+      res.end('\n\n');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    streamRecovery: false,
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_000_000,
+  });
+  const proxyPort = await listen(proxy);
+  const heldRequest = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': 'held-usage' },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+
+  try {
+    await heldChunkObserved;
+    await delay(30);
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'usage-overflow' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502, 'the usage parser tail must consume the shared budget');
+    const rejectedBody = await rejected.json();
+    assert.equal(rejectedBody.error?.type, 'proxy_error');
+
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    assert.equal(await held.text(), `${heldPartial}\n\n`);
+
+    const afterRelease = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-id': 'usage-after-release' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(afterRelease.status, 200, 'finishing the parser stream must release its reservation');
+    assert.equal((await afterRelease.arrayBuffer()).byteLength, ordinaryBody.length);
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('non-SSE concatenation peak stays inside the aggregate response budget', async () => {
+  const ordinaryBody = 'y'.repeat(600_000);
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end(ordinaryBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    maxResponseBytes: 2 * 1024 * 1024,
+    maxBufferedResponseBytes: 1_000_000,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const rejected = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+      signal: AbortSignal.timeout(3000),
+    });
+    assert.equal(rejected.status, 502, 'chunks plus Buffer.concat output must fit the shared budget');
+    const body = await rejected.json();
+    assert.equal(body.error?.type, 'proxy_error');
   } finally {
     proxy.close();
     upstream.close();
@@ -349,9 +807,78 @@ test('transactional SSE rejects a response above the configured spool ceiling', 
     });
     const body = await res.json();
     assert.equal(res.status, 502);
+    assert.equal(res.headers.get('retry-after'), '5',
+      'an unsafe oversized stream must not invite an immediate retry');
     assert.equal(body.error?.type, 'proxy_error');
+    assert.ok(am.accounts[0].dispatchFailureCooldownUntil > Date.now(),
+      'the completed oversized stream must briefly skip its account');
     assert.equal(am.accounts[0].inflight, 0, 'the rejected stream must release its account slot');
   } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('transactional SSE local response budget pressure does not cool a healthy account', async () => {
+  const heldFrame = `event: message_start\ndata: ${'x'.repeat(70 * 1024)}\n\n`;
+  const overflowFrame = `event: content_block_delta\ndata: ${'y'.repeat(70 * 1024)}\n\n`;
+  const stopFrame = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const complete = 'event: message_start\ndata: {"type":"message_start"}\n\n' + stopFrame;
+  let releaseHeld;
+  const heldReleased = new Promise(resolve => { releaseHeld = resolve; });
+  let markHeldChunk;
+  const heldChunkObserved = new Promise(resolve => { markHeldChunk = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    if (req.headers['x-test-id'] === 'held-local-budget') {
+      res.write(heldFrame);
+      markHeldChunk();
+      await heldReleased;
+      res.end(stopFrame);
+      return;
+    }
+    if (req.headers['x-test-id'] === 'overflow-local-budget') {
+      res.end(overflowFrame + stopFrame);
+      return;
+    }
+    res.end(complete);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    continuityMode: true,
+    maxResponseBytes: 512 * 1024,
+    maxBufferedResponseBytes: 160 * 1024,
+  });
+  const proxyPort = await listen(proxy);
+  const request = testId => fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-test-id': testId },
+    body: JSON.stringify({ model: 'x', messages: [] }),
+    signal: AbortSignal.timeout(3000),
+  });
+  const heldRequest = request('held-local-budget');
+
+  try {
+    await heldChunkObserved;
+    const limited = await request('overflow-local-budget');
+    assert.equal(limited.status, 502, 'shared response budget pressure must be rejected before headers');
+    assert.equal(limited.headers.get('retry-after'), '5', 'the client still needs nonzero retry guidance');
+    assert.equal(am.accounts[0].dispatchFailureCooldownUntil, 0,
+      'proxy-local budget pressure must not quarantine a healthy account');
+
+    releaseHeld();
+    const held = await heldRequest;
+    assert.equal(held.status, 200);
+    await held.arrayBuffer();
+
+    const afterRelease = await request('after-local-budget-release');
+    assert.equal(afterRelease.status, 200, 'released local capacity must make the same account immediately usable');
+    await afterRelease.arrayBuffer();
+    assert.equal(am.accounts[0].dispatchFailureCooldownUntil, 0);
+  } finally {
+    releaseHeld();
+    await heldRequest.catch(() => {});
     proxy.close();
     upstream.close();
   }
@@ -429,6 +956,55 @@ test('SSE death before ANY frame with no alternate account → proper retryable 
     assert.equal(r.cleanEnd, true);
     assert.equal(JSON.parse(r.body).error.type, 'overloaded_error');
     assert.equal(am.accounts[0].status, 'active');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('unsafe pre-stream SSE failure cools the failed account before a client retry', async () => {
+  const auths = [];
+  let requests = 0;
+  const upstream = http.createServer((req, res) => {
+    auths.push(req.headers.authorization || '');
+    requests += 1;
+    if (requests === 1) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.flushHeaders?.();
+      setTimeout(() => res.socket.destroy(), 20);
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'healthy-secondary-response' }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0);
+  const resetAt = Date.now() + 3_600_000;
+  for (const account of am.accounts) {
+    account.quota.unified5h = 0.1;
+    account.quota.unified5hReset = resetAt;
+    account.quota.unified7d = 0.1;
+    account.quota.unified7dReset = resetAt;
+  }
+  am.currentIndex = 0;
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const first = await streamPost(proxyPort);
+    assert.equal(first.status, 529);
+    assert.equal(first.headers['retry-after'], '5');
+    assert.deepEqual(auths, ['Bearer tok-0']);
+    assert.ok(am.accounts[0].dispatchFailureCooldownUntil > Date.now(),
+      'the upstream-accepted unsafe stream must temporarily leave selection');
+    assert.equal(am.accounts[0].inflight, 0);
+
+    const second = await streamPost(proxyPort);
+    assert.equal(second.status, 200);
+    assert.deepEqual(JSON.parse(second.body), { id: 'healthy-secondary-response' });
+    assert.deepEqual(auths, ['Bearer tok-0', 'Bearer tok-1'],
+      'the immediate client retry must use a healthy account');
+    assert.equal(am.accounts[1].inflight, 0);
   } finally {
     proxy.close();
     upstream.close();
@@ -926,10 +1502,119 @@ test('SSE request logging is capped without truncating the client stream', async
       files = await readdir(logDir);
     }
     assert.equal(files.length, 1);
-    const log = await readFile(join(logDir, files[0]), 'utf8');
+    const logPath = join(logDir, files[0]);
+    const log = await readFile(logPath, 'utf8');
     assert.match(log, /\[stream log truncated at 1024 bytes\]/);
     assert.ok(log.length < full.length, 'the on-disk log must not retain the full oversized stream');
+    assert.equal((await stat(logPath)).mode & 0o777, 0o600, 'request logs must be owner-only');
   } finally {
+    proxy.close();
+    upstream.close();
+    await rm(logDir, { recursive: true, force: true });
+  }
+});
+
+test('non-SSE request logging caps retained body copies without changing the response', async () => {
+  const responseBody = JSON.stringify({ output: 'y'.repeat(200_000) });
+  const requestBody = { model: 'x', input: 'x'.repeat(200_000) };
+  const logDir = await mkdtemp(join(tmpdir(), 'teamclaude-non-sse-log-cap-'));
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(responseBody);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, {
+    logDir,
+    maxResponseBytes: 512 * 1024,
+    maxBufferedResponseBytes: 1024 * 1024,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const response = await streamPost(proxyPort, { body: requestBody });
+    assert.equal(response.status, 200);
+    assert.equal(response.body, responseBody, 'logging limits must not alter the client response');
+    let files = [];
+    for (let i = 0; i < 100 && files.length === 0; i++) {
+      await delay(10);
+      files = await readdir(logDir);
+    }
+    assert.equal(files.length, 1);
+    const logPath = join(logDir, files[0]);
+    const log = await readFile(logPath, 'utf8');
+    assert.match(log, /log body truncated after \d+ of \d+ bytes/);
+    assert.ok((await stat(logPath)).size < 40_000, 'request and response body log copies must stay bounded');
+    assert.equal((await stat(logPath)).mode & 0o777, 0o600, 'request logs must stay owner-only');
+  } finally {
+    proxy.close();
+    upstream.close();
+    await rm(logDir, { recursive: true, force: true });
+  }
+});
+
+test('non-SSE log reservations stay in the shared budget until async flush completes', async () => {
+  const logDir = await mkdtemp(join(tmpdir(), 'teamclaude-non-sse-log-budget-'));
+  let upstreamRequests = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamRequests += 1;
+    const size = upstreamRequests === 1 ? 1000 : 30_000;
+    res.writeHead(200, { 'content-type': 'application/octet-stream' });
+    res.end('y'.repeat(size));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  let releaseFirstFlush;
+  const firstFlushReleased = new Promise(resolve => { releaseFirstFlush = resolve; });
+  let markFirstFlushStarted;
+  const firstFlushStarted = new Promise(resolve => { markFirstFlushStarted = resolve; });
+  let flushes = 0;
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    codexUsageRefresh: false,
+    logDir,
+    maxResponseBytes: 128 * 1024,
+    maxBufferedResponseBytes: 70_000,
+  }, {
+    beforeRequestLogFlush: async () => {
+      flushes += 1;
+      if (flushes !== 1) return;
+      markFirstFlushStarted();
+      await firstFlushReleased;
+    },
+  });
+  const proxyPort = await listen(proxy);
+  const firstRequest = streamPost(proxyPort, {
+    body: { model: 'x', input: 'x'.repeat(20_000) },
+  });
+
+  try {
+    await firstFlushStarted;
+    const first = await firstRequest;
+    assert.equal(first.status, 200);
+    assert.equal(first.body.length, 1000);
+
+    const duringFlush = await streamPost(proxyPort, {
+      body: { model: 'x', input: 'small' },
+    });
+    assert.equal(duringFlush.status, 502, 'a pending log flush must keep its shared reservation');
+    assert.equal(JSON.parse(duringFlush.body).error?.type, 'proxy_error');
+    assert.equal(am.accounts[0].dispatchFailureCooldownUntil, 0,
+      'local buffer pressure must not quarantine a healthy account');
+
+    releaseFirstFlush();
+    for (let i = 0; i < 100 && (await readdir(logDir)).length === 0; i++) await delay(10);
+
+    const afterFlush = await streamPost(proxyPort, {
+      body: { model: 'x', input: 'small' },
+    });
+    assert.equal(afterFlush.status, 200, 'completed log flush must release its reservation');
+    assert.equal(afterFlush.body.length, 30_000);
+  } finally {
+    releaseFirstFlush();
+    await firstRequest.catch(() => {});
     proxy.close();
     upstream.close();
     await rm(logDir, { recursive: true, force: true });

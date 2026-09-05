@@ -46,8 +46,9 @@ teamcodex codex import    # pick up your existing ~/.codex/auth.json
 teamcodex server          # start the proxy, then `teamcodex run`
 ```
 
-The command is `teamcodex`. This package deliberately does not install a `teamclaude`
-binary so it cannot collide with upstream's package of that name.
+The package installs both commands: `teamclaude` for the Claude pool and
+`teamcodex` for the same CLI entry point plus provider subcommands. The examples
+below use `teamclaude` for Claude and `teamclaude codex` for Codex.
 
 Prefer installing straight from the repository? `npm i -g github:sangrokjung/teamclaude`
 works too and always tracks the default branch.
@@ -152,6 +153,31 @@ From a local checkout, prefer
 `npm install -g <dir>` symlinks the checkout, which can break supervisors that
 cannot read that path.
 
+### Install on multiple Macs
+
+Install the same pinned package independently on every Mac. From a checkout,
+build one tarball and pass that exact file to the included installer on each
+machine:
+
+```bash
+TARBALL=$(npm pack --silent)
+TARBALL_PATH="$PWD/$TARBALL"
+tar -xOf "$TARBALL_PATH" package/scripts/install-macos.sh | bash -s -- --check-only
+tar -xOf "$TARBALL_PATH" package/scripts/install-macos.sh |
+  bash -s -- --source "$TARBALL_PATH"
+```
+
+The installer changes only the global npm package. It never reads, copies, or
+synchronizes `~/.config/teamclaude.json`, `~/.config/teamcodex.json`,
+`~/.claude/.credentials.json`, or `~/.codex/auth.json`.
+
+Run OAuth login/import separately on every Mac. Do not copy an OAuth config
+between machines: refresh endpoints can rotate the refresh token, so two Macs
+sharing one refresh chain can invalidate each other. Non-secret settings such
+as thresholds or fallback models may be applied separately, but credentials,
+quota snapshots, state files, and ports remain owned by each machine. See the
+[multi-Mac runbook](docs/runbooks/multi-mac-installation.md).
+
 </details>
 
 ## Features
@@ -243,11 +269,24 @@ The no-ID form fails closed when cmux is unavailable or the current surface
 does not have a valid Codex resume binding. It never guesses from working
 directory or recency. Start new sessions with `teamcodex codex run`; cmux then
 records the exact checkpoint together with the TeamCodex provider overrides,
-so later tab restoration keeps the proxy route. Resume rejects Codex
-`--remote`, `--remote-auth-token-env`, `--oss`, and `--local-provider` options
-because they would leave that route. See the
+so later tab restoration keeps the proxy route. Run and resume reject Codex
+provider/base-URL overrides (including compact `-cVALUE`/`-c=VALUE`) plus
+`--remote`, `--remote-auth-token-env`, `--oss`,
+and `--local-provider` because they would leave that route. See the
 [Codex provider/session recovery runbook](docs/runbooks/codex-provider-session-recovery.md)
 for diagnosis and legacy-session recovery.
+
+When a TeamCodex-launched Codex process exits unexpectedly, the wrapper
+automatically reopens it **once** only if the proxy recorded a short-lived,
+one-time receipt binding this wrapper invocation to the exact Codex session and
+that UUID matches the current cmux surface. An explicit
+`codex resume SESSION_ID` may retry only that same ID. Signals, cancel status
+130, ordinary config/auth errors, missing or mismatched receipts,
+missing/malformed/unchanged bindings, and a second failure stop without another
+launch. This is session recovery, not hidden HTTP replay: an uncertain POST is
+never dispatched twice by the proxy.
+The recovery notice does not expose the checkpoint UUID, and receipt
+consumption plus the cmux lookup share a strict five-second total budget.
 
 You can import the account currently logged into the official Codex CLI instead:
 
@@ -261,15 +300,16 @@ the same rotating refresh token used by `~/.codex/auth.json`; running plain
 `codex` afterward can rotate that token outside the proxy. If that happens,
 re-import the account or log it in again through `teamclaude codex login`.
 
-`teamclaude codex run` starts an HTTP-only Responses provider that still uses
-Codex's first-party ChatGPT auth path (`requires_openai_auth = true`) and
-redirects `chatgpt_base_url` to the local proxy. This preserves the
-subscription-only model catalog while preventing the default Responses
-WebSocket from bypassing the HTTP proxy. The proxy discards the client's
-incoming bearer token and account ID before forwarding, then injects the
-selected pool account's credentials. The official Codex CLI must still have a
-normal ChatGPT login to initialize its first-party auth path, but that
-credential is never forwarded upstream by TeamCodex.
+`teamclaude codex run` starts an HTTP-only Responses provider with
+`requires_openai_auth = false` and redirects `chatgpt_base_url` to the local
+proxy, while `supports_websockets = false` keeps the default Responses
+WebSocket from bypassing the HTTP proxy. The proxy discards any client-sent
+bearer token and account ID before forwarding, then injects the selected pool
+account's credentials. The local Codex CLI therefore needs **no ChatGPT login
+of its own** to run through the proxy, and a revoked or expired `~/.codex/auth.json`
+can never block `codex run` with the sign-in screen while the pool is healthy
+(this was the failure mode before 2026-08-03, when the override still set
+`requires_openai_auth = true`).
 
 Codex usage is learned from response headers as traffic flows, so newly added
 accounts show unmeasured quota until each account handles a request.
@@ -284,6 +324,32 @@ teamclaude codex enable codex-pro-1
 teamclaude codex priority codex-pro-2 0
 teamclaude codex restart
 ```
+
+## Grok and Agy account pools
+
+Grok and Agy use independent subscription OAuth pools, config files, and ports. Each
+config contains one provider; credentials are stored in the 0600 config and never
+shown in status output.
+
+```bash
+# xAI Grok (default: ~/.config/teamgrok.json, port 3458)
+teamclaude grok login --name grok-main    # opens official Grok OAuth in isolated home
+teamclaude grok import --from ~/.grok/auth.json --name grok-main
+teamclaude grok server
+teamclaude grok env
+
+# Google Antigravity / Gemini-compatible upstream
+teamclaude agy login --name agy-main      # imports consumer OAuth from macOS Keychain and resolves the Google account identity
+teamclaude agy import --from ./agy-credential.json --name agy-main
+teamclaude agy server
+teamclaude agy env
+```
+
+Grok and Agy subscription credentials are sent as `Authorization: Bearer`. Grok uses
+`https://cli-chat-proxy.grok.com/v1` and Agy uses the consumer Cloud Code endpoint
+`https://daily-cloudcode-pa.googleapis.com` by default. `--api-key` is rejected for
+both providers. Existing `accounts`, `disable`, `enable`, `priority`, and `api`
+commands work with both provider pools.
 
 ### Hermes Agent through TeamCodex
 
@@ -416,11 +482,30 @@ and waits for the listener before launching Claude Code. The server keeps that
 public listener in a supervisor process, so a crashed proxy worker is replaced
 while new connections wait instead of failing with `ConnectionRefused`.
 
+If Anthropic rejects one OAuth account with the structured
+`oauth_not_allowed_for_organization` 403, TeamClaude parks only that account as
+an auth error and retries the completed rejection on another available account.
+Other permission 403s are passed through unchanged and never poison the pool.
+If every account is rejected, the last original 403 remains visible so an admin
+can enable Claude Code subscription access or the operator can re-import/login
+the account. Quarantined accounts are independently rechecked with the last
+known-good request shape every 15 minutes by default and return to rotation on
+an accepted 2xx, even when quota warm-up is startup-only (`warmupIntervalMs: 0`).
+See [the subscription-disabled runbook](docs/runbooks/claude-subscription-disabled.md).
+
 With `autoResumeClaude: true`, the launcher gives a new Claude Code conversation
 an explicit session ID and watches only that transcript for terminal API errors.
 `Request timed out` and terminal rate/overload errors restart the same conversation
 as `--resume <session-id> continue`, up to `claudeAutoResumeMaxRetries`, so an
 interactive session does not wait indefinitely at the prompt for a person.
+
+When the proxy returns `All N accounts exhausted. Retry in Ns.`, the recovery
+parent does not retry early with the short generic backoff. It waits for the
+server-provided `Retry in` duration, then restarts the same session as
+`--resume <session-id> continue`. This restart counts toward
+`claudeAutoResumeMaxRetries`, and Ctrl-C can cancel the parked launcher. When
+`codexFallbackOnExhaustion: true` has fresh evidence that the whole general
+quota fleet is exhausted, the existing Codex handoff still takes precedence.
 
 Existing Claude processes cannot acquire a recovery parent retroactively.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
@@ -603,8 +688,8 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
       "name": "user@example.com",
       "type": "oauth",
       "accountUuid": "...",
-      "accessToken": "sk-ant-oat01-...",
-      "refreshToken": "sk-ant-ort01-...",
+      "accessToken": "<access-token>",
+      "refreshToken": "<refresh-token>",
       "expiresAt": 1774384968427,
       "enabled": true,
       "priority": 0
@@ -644,6 +729,9 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
 | `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions already blocked on `Login expired`; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
+| `workerHealthTimeoutMs` | Supervisor HTTP health-probe deadline (optional, default `5000`). A timeout during supervisor self-stall is inconclusive rather than evidence against the worker |
+| `workerHealthFailureThreshold` | Consecutive conclusive health failures before IPC corroboration/recycle (optional, default `3`) |
+| `workerRecycleGraceMs` | SIGTERM drain grace for a conclusively broken worker before SIGKILL (optional, default `5000`) |
 
 ### Model fallbacks (fork)
 

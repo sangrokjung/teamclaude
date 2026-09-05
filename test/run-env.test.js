@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { parseClaudeRecoveryAccount } from '../src/claude-auth.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
 const forbiddenResumeArgs = new Set(['resume', '--resume', '--last', '--continue']);
@@ -128,6 +129,116 @@ console.log(JSON.stringify({
     assert.equal(child.oauthToken, 'oauth-must-reach-child');
     assert.equal(child.baseUrl, `http://localhost:${server.port}`);
     assert.deepEqual(child.args, ['--model', 'fable']);
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run uses TEAMCLAUDE_CLAUDE_BIN instead of re-entering the PATH wrapper', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-native-bin-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = join(dir, 'claude-vendor');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({
+  args: process.argv.slice(2),
+  supervised: process.env.TEAMCLAUDE_SESSION_SUPERVISED ?? null,
+}));
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port } }));
+
+    const result = spawnSync(process.execPath, [entry, 'run', '--', '--version'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        TEAMCLAUDE_PROVIDER: 'anthropic',
+        TEAMCLAUDE_CONFIG: configPath,
+        TEAMCLAUDE_CLAUDE_BIN: fakeClaude,
+        TEAMCLAUDE_SESSION_SUPERVISED: '',
+      },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()), {
+      args: ['--version'],
+      supervised: '1',
+    });
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run rejects an inherited supervised marker before spawning Claude', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-nested-supervision-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = join(dir, 'claude-vendor');
+    const configPath = join(dir, 'config.json');
+    const invocationLog = join(dir, 'invocations.log');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+appendFileSync(process.env.INVOCATION_LOG, 'spawned\\n');
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port } }));
+
+    const result = spawnSync(process.execPath, [entry, 'run'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        TEAMCLAUDE_PROVIDER: 'anthropic',
+        TEAMCLAUDE_CONFIG: configPath,
+        TEAMCLAUDE_CLAUDE_BIN: fakeClaude,
+        TEAMCLAUDE_SESSION_SUPERVISED: '1',
+        INVOCATION_LOG: invocationLog,
+      },
+    });
+
+    assert.equal(result.status, 75, result.stderr);
+    assert.match(result.stderr, /nested supervised Claude launch/i);
+    await assert.rejects(readFile(invocationLog, 'utf8'), { code: 'ENOENT' });
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('run seeds a missing Claude OAuth marker from the live proxy account', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-seed-oauth-'));
+  let server;
+  const accountUuid = '11111111-1111-4111-8111-111111111111';
+  try {
+    server = await startStatusServer(dir, { currentAccountUuid: accountUuid, accounts: [] });
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({
+  oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+}));
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port, apiKey: 'proxy-key' } }));
+
+    const env = {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      TEAMCLAUDE_CONFIG: configPath,
+    };
+    delete env.CLAUDE_CODE_OAUTH_TOKEN;
+    const result = spawnSync(process.execPath, [entry, 'run'], {
+      encoding: 'utf8',
+      env,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const child = JSON.parse(result.stdout.trim());
+    assert.equal(parseClaudeRecoveryAccount(`Bearer ${child.oauthToken}`), accountUuid);
   } finally {
     if (server) await stopStatusServer(server);
     await rm(dir, { recursive: true, force: true });
@@ -436,4 +547,42 @@ test('run preserves fallback when no general-available Fable candidate remains',
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8[1m]']);
   });
+});
+
+test('codex run marks the launched CLI as supervised', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-run-supervised-child-'));
+  const fakeCodex = join(dir, 'codex');
+  const configPath = join(dir, 'teamcodex.json');
+  try {
+    await writeFile(fakeCodex, `#!/usr/bin/env node
+console.log(JSON.stringify({
+  supervised: process.env.TEAMCLAUDE_SESSION_SUPERVISED ?? null,
+}));
+`);
+    await chmod(fakeCodex, 0o755);
+    await writeFile(configPath, JSON.stringify({
+      provider: 'codex',
+      proxy: { port: 4567, apiKey: 'proxy-key' },
+    }));
+
+    const result = spawnSync(
+      process.execPath,
+      [entry, 'codex', 'run', '--', '--version'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${dir}:${process.env.PATH}`,
+          TEAMCODEX_CODEX_BIN: fakeCodex,
+          TEAMCLAUDE_CONFIG: configPath,
+          TEAMCLAUDE_SESSION_SUPERVISED: '',
+        },
+      },
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).supervised, '1');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

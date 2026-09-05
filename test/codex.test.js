@@ -6,8 +6,10 @@ import { join } from 'node:path';
 import http from 'node:http';
 import {
   buildCodexProxyArgs,
+  codexCliNotFoundMessage,
   importCodexCredentials,
   refreshCodexAccessToken,
+  resolveCodexCliBin,
 } from '../src/codex.js';
 
 function jwt(payload) {
@@ -115,7 +117,7 @@ test('refreshCodexAccessToken uses the official Codex refresh contract', async (
   }
 });
 
-test('buildCodexProxyArgs uses first-party auth with an HTTP-only local provider', () => {
+test('buildCodexProxyArgs uses a login-free HTTP-only local provider', () => {
   // Given
   const userArgs = ['exec', '--json', 'say hello'];
 
@@ -128,9 +130,69 @@ test('buildCodexProxyArgs uses first-party auth with an HTTP-only local provider
   assert.equal(args[1], 'model_provider="teamcodex_proxy"');
   assert.equal(args[2], '-c');
   assert.match(args[3], /base_url = "http:\/\/127\.0\.0\.1:4567\/codex"/);
-  assert.match(args[3], /requires_openai_auth = true/);
+  assert.match(args[3], /requires_openai_auth = false/);
   assert.match(args[3], /supports_websockets = false/);
+  assert.match(
+    args[3],
+    /env_http_headers = \{ "X-TeamCodex-Invocation" = "TEAMCODEX_INVOCATION_ID" \}/,
+  );
   assert.doesNotMatch(args[3], /env_key/);
   assert.equal(args[4], '-c');
   assert.equal(args[5], 'chatgpt_base_url="http://127.0.0.1:4567"');
+});
+
+test('resolveCodexCliBin prefers env override, then the node-sibling CLI, then PATH', () => {
+  // Given: an explicit override always wins
+  assert.equal(
+    resolveCodexCliBin({
+      env: { TEAMCODEX_CODEX_BIN: '/opt/custom/codex' },
+      execPath: '/nodes/v24/bin/node',
+      exists: () => true,
+    }),
+    '/opt/custom/codex',
+  );
+
+  // Given: no override — the CLI co-installed with this Node beats a PATH
+  // lookup that a shell wrapper/symlink may shadow
+  assert.equal(
+    resolveCodexCliBin({
+      env: {},
+      execPath: '/nodes/v24/bin/node',
+      exists: p => p === join('/nodes/v24/bin', 'codex'),
+    }),
+    join('/nodes/v24/bin', 'codex'),
+  );
+
+  // Given: neither — bare PATH lookup is the legacy fallback
+  assert.equal(
+    resolveCodexCliBin({ env: {}, execPath: '/nodes/v24/bin/node', exists: () => false }),
+    'codex',
+  );
+
+  // Given: win32 — the extension-less sibling is npm's unspawnable POSIX shim,
+  // so the bare lookup (which resolves codex.exe) must win
+  assert.equal(
+    resolveCodexCliBin({
+      env: {},
+      execPath: 'C:\\nodejs\\node.exe',
+      exists: () => true,
+      platform: 'win32',
+    }),
+    'codex',
+  );
+});
+
+test('codexCliNotFoundMessage names the resolved binary and the override source', () => {
+  assert.equal(
+    codexCliNotFoundMessage('codex', {}),
+    'Codex CLI not found in PATH. Install it first.',
+  );
+  assert.equal(
+    codexCliNotFoundMessage('/opt/custom/codex', { TEAMCODEX_CODEX_BIN: '/opt/custom/codex' }),
+    'Codex CLI not found at /opt/custom/codex — check TEAMCODEX_CODEX_BIN.',
+  );
+  assert.equal(
+    codexCliNotFoundMessage('/nodes/v24/bin/codex', {}),
+    'Codex CLI not found at /nodes/v24/bin/codex. Install it first.',
+  );
 });
