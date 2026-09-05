@@ -2064,7 +2064,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the deadline would only hold the client for the full budget before
     // returning the very same 429 (2026-09-04). Finalize exactly as the
     // deadline would (`failedFast` → saved upstream 429 replay still wins).
-    if (deadlineMode && recovery?.soonestName != null) {
+    if (deadlineMode && recovery?.soonestKnown) {
       const remainingMs = startContinuityDeadline(ctx) - Date.now();
       if (recovery.soonestMs > remainingMs) {
         console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — soonest recovery in ${retryAfter}s exceeds the ${Math.max(0, remainingMs)}ms continuity budget; failing fast`);
@@ -2137,7 +2137,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       && Date.now() >= ctx.continuityDeadlineAt;
     if ((deadlineExpired || ctx.failedFast) && sendSaved429(res, ctx)) return;
     ctx.status = 429;
-    const status = accountManager.getStatus();
+    // Internal snapshot: identity is needed only to attribute the plan of the
+    // soonest-recovering account; it never leaves the process.
+    const status = accountManager.getStatus({ includeIdentity: true });
     const recovery = fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
     // A fleet-wide model quarantine (unsupported-model 400 contract) is not a
     // usage limit: keep its own retry-after and the generic body.
@@ -3721,8 +3723,13 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
   const modelLabel = modelQuotaLabel(model);
   let soonest = Infinity;
   let soonestName = null;
-  const consider = (ms, name = null) => {
-    if (ms > 0 && ms < soonest) { soonest = ms; soonestName = name; }
+  // `known` marks a minimum set by an actual reset/throttle timestamp (vs the
+  // 60s quota-healthy guess). Tracked separately from the name because the
+  // public status snapshot redacts account names (includeIdentity=false) — the
+  // fail-fast decision must not silently disappear with the name.
+  let soonestKnown = false;
+  const consider = (ms, name = null, known = false) => {
+    if (ms > 0 && ms < soonest) { soonest = ms; soonestName = name ?? null; soonestKnown = known; }
   };
   for (const acct of accounts) {
     if (acct.enabled === false || acct.status === 'error') continue;
@@ -3752,13 +3759,14 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
     if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
-    if (freeAt > 0) consider(freeAt - now, acct.name);
+    if (freeAt > 0) consider(freeAt - now, acct.name, true);
     else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }
   return {
     retryAfter: soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000)),
     soonestMs: soonest === Infinity ? null : soonest,
     soonestName,
+    soonestKnown,
   };
 }
 
