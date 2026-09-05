@@ -2870,6 +2870,13 @@ async function statusCommand() {
           line += `    ${name}: ${(w.utilization * 100).toFixed(1)}% used`;
         }
         console.log(line);
+        // Codex reset credits ("Full reset" grants). Guarded with != null so a
+        // status from an older server (no field) prints nothing extra.
+        if (q.codexResetCredits != null) {
+          const consumed = q.codexResetCreditsConsumed ? `, ${q.codexResetCreditsConsumed} redeemed` : '';
+          const last = q.codexResetCreditLastOutcome ? ` (last: ${q.codexResetCreditLastOutcome})` : '';
+          console.log(`    Reset credits: ${q.codexResetCredits} available${consumed}${last}`);
+        }
       } else {
         const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
         const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';

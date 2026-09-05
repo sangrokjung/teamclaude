@@ -13,6 +13,10 @@
   "continuityMaxWaitMs": 900000,
   "continuityMaxSleepMs": 30000,
   "activeWarmup": false,
+  "codexResetCredits": false,
+  "codexResetCreditsPolicy": "fleet",
+  "codexResetCreditsCooldownMs": 1800000,
+  "codexResetCreditsReserve": 0,
   "accounts": [
     {
       "name": "codex-pro-1",

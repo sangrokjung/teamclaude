@@ -381,6 +381,17 @@ export function createDefaultConfig() {
     claudeAutoResumeMaxRetries: 3,
     claudeAutoResumeBackoffMs: 2000,
     codexFallbackOnExhaustion: false,
+    // Codex mode: redeem the account's ChatGPT rate-limit reset credits (the
+    // free "Full reset" grants the Codex CLI lists under /usage) automatically
+    // when the pool is out of quota. Policy 'fleet' redeems only when NO pooled
+    // account can serve (the quota dead end that otherwise fails fast);
+    // 'account' additionally redeems on the account that just got an
+    // exhaustion 429 and retries it. Per-account cooldown after any attempt;
+    // `reserve` keeps that many credits untouched. Ignored unless provider=codex.
+    codexResetCredits: false,
+    codexResetCreditsPolicy: 'fleet',
+    codexResetCreditsCooldownMs: 1800000,
+    codexResetCreditsReserve: 0,
     cmuxSessionRescue: false,
     cmuxSessionRescueIntervalMs: 1000,
     // Hard caps that bound proxy memory under a request flood.

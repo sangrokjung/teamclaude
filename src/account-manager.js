@@ -1,5 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { refreshCodexAccessToken } from './codex.js';
+import { parseCodexResetCreditsAvailable } from './codex-reset-credits.js';
 import {
   cancellationIsDue,
   normalizeSubscriptionCancellation,
@@ -99,6 +100,16 @@ function emptyQuota() {
     // they are a non-authoritative signal. Drives the active fast-lane refresh
     // (server.js maybeRefreshCodexUsage) and surfaces data age in status.
     codexUsageAt: null,
+    // Codex rate-limit reset credits ("Full reset" grants): cached
+    // available_count from the last wham/usage apply (null = unknown), its
+    // stamp, and the redemption ledger the automatic policy keys off
+    // (src/codex-reset-credits.js). Persisted with the quota snapshot so a
+    // restart keeps the cooldown.
+    codexResetCredits: null,            // integer ≥ 0 | null
+    codexResetCreditsAt: null,          // ms timestamp of the count above
+    codexResetCreditLastAt: null,       // ms timestamp of the last redemption attempt
+    codexResetCreditLastOutcome: null,  // reset | nothing_to_reset | no_credit | already_redeemed | http_<n> | timeout | error
+    codexResetCreditsConsumed: 0,       // successful redemptions this snapshot lineage
     // Model-scoped weekly windows, keyed by header window label — e.g. `7d_oi`,
     // the separate weekly limit for the top model tier shown as "Fable" in
     // Claude's usage UI. Parsed generically from
@@ -1245,6 +1256,10 @@ export class AccountManager {
     // carries no recognizable 5h/7d window (an upstream contract change must
     // not turn the active fast lane into an unbounded per-request poll).
     account.quota.codexUsageAt = Date.now();
+    // Reset-credit count rides on the same payload. Absent/invalid → null so
+    // the automatic redemption stays off until the backend reports a count.
+    account.quota.codexResetCredits = parseCodexResetCreditsAvailable(payload);
+    account.quota.codexResetCreditsAt = account.quota.codexUsageAt;
 
     const limits = [];
     if (payload.rate_limit && typeof payload.rate_limit === 'object') {

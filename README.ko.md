@@ -497,6 +497,10 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429/프록시·터널 연결 손실을 같은 세션으로 자동 재개 |
 | `claudeAmbiguousDispatchMaxResumes` | 원본 POST 실행 여부가 불확실한 exact 502의 전용 동일 session continuation 횟수. proxy는 원본 POST를 replay하지 않으며, `0`은 비활성, 기본 `1`; 값을 늘리면 중복 inference·과금 위험을 명시적으로 수용 |
 | `codexFallbackOnExhaustion` | 대체 Claude 계정이 없거나 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
+| `codexResetCredits` | Codex 모드 전용 — 풀이 quota를 다 쓰면 `usage_limit_reached` 429를 돌려주는 대신 계정의 ChatGPT rate-limit reset credit(Codex CLI `/usage`의 "Full reset" 무료 리셋권)을 자동으로 사용합니다. 개수는 `wham/usage` 폴링마다 갱신되고(status의 `quota.codexResetCredits`), 사용은 `/wham/rate-limit-reset-credits/consume`에 새 idempotency key로 POST합니다 (기본 `false`) |
+| `codexResetCreditsPolicy` | `fleet`는 서비스 가능한 계정이 하나도 없을 때만 사용(건강한 계정으로의 회전이 항상 우선, dead end당 1장, 리셋권이 많은 계정부터), `account`는 소진 429를 받은 그 계정에서 즉시 사용하고 같은 계정으로 재시도 (기본 `fleet`) |
+| `codexResetCreditsCooldownMs` | 계정별 사용 시도 최소 간격(성공·실패 무관) — 리셋이 반영되지 않을 때 리셋권이 연달아 소모되는 것을 막는 상한 (기본 `1800000` = 30분) |
+| `codexResetCreditsReserve` | 자동 정책이 남겨 두는 계정별 리셋권 수 (기본 `0`). 로컬 운영 엔드포인트 `POST /teamclaude/codex/reset-credit?account=<name>`(loopback + proxy API key)은 정책·쿨다운·reserve를 무시하고 즉시 사용 |
 | `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`, 연결 손실, ambiguous-dispatch 502를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
