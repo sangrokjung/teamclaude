@@ -553,25 +553,48 @@ test('sustained exhaustion storm with no resets: the backstop never spins, no cr
   }
 });
 
-test('structural guard: the backstop yield can only be re-armed by the single fresh-cycle mechanism', async () => {
+test('structural guard: every forwardRequest recursion and every retryCount write is enumerated and allowlisted', async () => {
   // Design (after the Codex cross-model review): a fresh retry cycle is
-  // defined by retryCount === 0 — re-armed once at forwardRequest entry (so
-  // any restart that recurses with 0 is covered without call-site discipline)
-  // and by restartRetryCycle() for in-loop restarts. Guard that no code path
-  // reintroduces a bare `retryCount = 0` or an ad-hoc flag reset.
+  // retryCount === 0 — re-armed once at forwardRequest entry (any restart that
+  // recurses with 0 is covered without call-site discipline) and by
+  // restartRetryCycle() for in-loop restarts. This guard does not count known
+  // patterns; it ENUMERATES every recursion and every write and rejects any
+  // that is not on the allowlist, so a new restart path cannot evade it.
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../src/server.js', import.meta.url), 'utf8');
-  const bareResets = source.match(/^\s*retryCount = 0;\s*$/gm) || [];
-  assert.equal(bareResets.length, 1, `only restartRetryCycle() may assign retryCount = 0 (found ${bareResets.length})`);
-  const reArms = source.match(/resetCreditBackstopYielded = false/g) || [];
-  assert.equal(reArms.length, 2, `exactly two re-arm sites: entry + restartRetryCycle (found ${reArms.length})`);
+
+  // (1) Every call of forwardRequest(...) — multi-line tolerant. The 6th
+  // argument (retryCount) must be a literal 0 (fresh cycle → entry re-arm),
+  // `retryCount + 1` (a failover/stale hop inside the same cycle), or
+  // `retryCount` (the account-policy same-account retry, deliberately not a
+  // hop). Anything else is a new, unreviewed restart shape.
+  const calls = [...source.matchAll(/(?<!function )\bforwardRequest\(\s*([^()]*?)\)/g)];
+  assert.ok(calls.length >= 10, `expected the known recursion sites, found ${calls.length}`);
+  const allowed = new Set(['0', 'retryCount + 1', 'retryCount']);
+  const badCalls = calls
+    .map(m => ({ index: m.index, retryArg: m[1].split(',').map(a => a.trim())[5] }))
+    .filter(c => !allowed.has(c.retryArg))
+    .map(c => `offset ${c.index}: retry arg "${c.retryArg}"`);
+  assert.deepEqual(badCalls, [], `forwardRequest recursions with a non-allowlisted retry argument:\n${badCalls.join('\n')}`);
+  const freshCalls = calls.filter(m => m[1].split(',').map(a => a.trim())[5] === '0');
+  assert.ok(freshCalls.length >= 8, `fresh-cycle recursions (initial dispatch + restarts): ${freshCalls.length}`);
+
+  // (2) Every write to retryCount (assignment, compound assignment, ++/--)
+  // must live inside restartRetryCycle(); the parameter is otherwise read-only.
+  const writes = [...source.matchAll(/(?:\bretryCount\s*(?:=(?!=)|\+=|-=|\*=|\/=|\+\+|--))|(?:(?:\+\+|--)\s*retryCount\b)/g)];
+  const helperStart = source.indexOf('const restartRetryCycle = () => {');
+  const helperEnd = source.indexOf('};', helperStart);
+  assert.ok(helperStart > 0 && helperEnd > helperStart, 'restartRetryCycle helper present');
+  const strayWrites = writes.filter(m => m.index < helperStart || m.index > helperEnd)
+    .map(m => `offset ${m.index}: ${m[0]}`);
+  assert.deepEqual(strayWrites, [], `retryCount writes outside restartRetryCycle():\n${strayWrites.join('\n')}`);
+  assert.equal(writes.length, 1, 'exactly one retryCount write, inside the helper');
+
+  // (3) The flag is re-armed in exactly two places: the entry guard and the helper.
+  const reArms = [...source.matchAll(/resetCreditBackstopYielded = false/g)];
+  assert.equal(reArms.length, 2, `re-arm assignments: ${reArms.length}`);
   assert.match(source, /if \(retryCount === 0\) ctx\.resetCreditBackstopYielded = false;/, 'entry re-arm present');
-  assert.match(source, /const restartRetryCycle = \(\) => \{\s*retryCount = 0;\s*ctx\.resetCreditBackstopYielded = false;\s*\};/, 'helper present');
-  const helperUses = source.match(/restartRetryCycle\(\);/g) || [];
+  assert.ok(reArms.some(m => m.index > helperStart && m.index < helperEnd), 'helper re-arms');
+  const helperUses = [...source.matchAll(/restartRetryCycle\(\);/g)];
   assert.ok(helperUses.length >= 2, `in-loop restarts use the helper (found ${helperUses.length})`);
-  // Every recursion that restarts the cycle passes retryCount 0 to forwardRequest
-  // (multi-line safe): the entry re-arm covers them all, so just assert they
-  // still exist as recursions with a literal 0 in the retryCount position.
-  const restarts = source.match(/forwardRequest\(\s*req,\s*res,\s*[^,]+,\s*accountManager,\s*upstream,\s*0,/g) || [];
-  assert.ok(restarts.length >= 7, `restart recursions found: ${restarts.length}`);
 });
