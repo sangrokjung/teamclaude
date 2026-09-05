@@ -658,5 +658,26 @@ test('a lagging meter in the headers of an ACCEPTED post-reset response cannot r
     assert.equal(second.status, 200, second.text);
     assert.equal(calls.consume.length, 1, 'no second credit on the other account');
     assert.deepEqual(calls.responses.map(c => c.token), ['Bearer tok-0', 'Bearer tok-0']);
+    assert.equal(am.accounts[0].usage.totalRequests, 2, 'held folds still count the requests');
+    assert.ok(am.accounts[0].usage.lastUsed, 'lastUsed stamped despite the hold');
+  });
+});
+
+test('cooldown 0: a definite no-spend walk still charges the pass, so the wait loop cannot re-POST consume every iteration', async () => {
+  const am = new AccountManager(makeCodexAccounts(1));
+  const a = am.accounts[0];
+  a.quota.unified5h = 1;
+  a.quota.unified5hReset = Date.now() + 300; // rolls over inside the continuity budget
+  a.quota.unified7d = 0.2;
+  a.quota.unified7dReset = Date.now() + 60 * HOUR;
+  a.quota.codexResetCredits = 3;
+  await withProxy(am, {
+    consume: () => ({ status: 200, body: { code: 'nothing_to_reset', windows_reset: 0 } }),
+  }, { codexResetCreditsCooldownMs: 0, continuityMaxSleepMs: 10, continuityMaxWaitMs: 5000 },
+  async ({ proxyPort, calls }) => {
+    const r = await postResponses(proxyPort);
+    assert.equal(r.status, 200, r.text);
+    assert.equal(calls.consume.length, 1, 'exactly one backend attempt per request even without a cooldown');
+    assert.ok(r.elapsedMs >= 250 && r.elapsedMs < 4000, `served after the rollover (${r.elapsedMs}ms)`);
   });
 });

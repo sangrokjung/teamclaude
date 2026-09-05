@@ -754,19 +754,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
       return nothing;
     }
+    // A walk that never reached the backend (every candidate re-judged as
+    // ineligible) leaves the pass unspent; one that made ANY real attempt —
+    // even a definite no-spend answer — charges it, so a request cannot
+    // re-POST consume on every wait-loop iteration (cooldown 0 has no other
+    // brake). The local NO_RESET sentinel is the "no attempt" marker.
+    let attempted = false;
     for (const candidate of candidates) {
       // Re-judge right before acting: another request or the operator
       // endpoint may have redeemed (or exhausted the credits of) this
       // candidate while an earlier candidate's consume was in flight.
       const result = await redeemCodexResetCredit(candidate, reason, { enforceEligibility: true, model });
+      if (result !== NO_RESET) attempted = true;
       if (result.reset) return { redeemed: true, chargePass: true };
       if (result.kind !== 'no-spend') return { redeemed: false, chargePass: true };
       // The dead end may have been resolved by someone else (operator reset,
       // another request's pass, a window rollover) while this attempt was in
       // flight: yield to the routable account instead of spending on the next.
-      if (deadEndResolved()) return { redeemed: true, chargePass: false };
+      if (deadEndResolved()) return { redeemed: true, chargePass: attempted };
     }
-    return nothing;
+    return { redeemed: false, chargePass: attempted };
   }
 
   // Handed to forwardRequest through ctx: null when automatic redemption is
@@ -2640,7 +2647,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
       ctx.sawModelWeekly = true;
     }
-    if (!holdHeaderFold) accountManager.updateQuota(account, rateLimitHeaders);
+    // A held fold still records the request itself (usage counters / lastUsed
+    // live in updateQuota): fold an empty header set instead of skipping.
+    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders);
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token

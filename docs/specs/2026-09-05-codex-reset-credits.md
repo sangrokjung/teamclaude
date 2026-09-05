@@ -43,6 +43,18 @@
   the account policy could redeem again after a fleet pass (now gated on the
   request's pass budget); a grace-held authoritative poll was reported as a
   failed refresh (now counts as recognized). Tests added for all four.
+- Review round 4 (commit `8701da7`, 2 lenses): **APPROVE / APPROVE**. Two
+  low items applied in round 5 (`acf07c9`): a fleet walk that found no
+  eligible candidate no longer charges the request's pass (a later
+  account-policy redemption may still be its first spend), and accepted
+  (non-429) responses inside the post-reset grace no longer fold their
+  lagging `x-codex-*` meter (third consistency fence, see Goal 4).
+- Review round 5 (commit `acf07c9`): production lens APPROVE; one medium
+  regression on `codexResetCreditsCooldownMs: 0` fixed in round 6: the pass
+  is now charged by ANY real backend attempt (even a definite no-spend
+  answer), and left unspent only when the walk never reached the backend —
+  otherwise the wait loop could re-POST consume on every iteration. Also: a
+  held header fold still records the request in the usage counters.
 
 ## Incident / motivation
 
@@ -112,6 +124,11 @@ Files: `codex-rs/backend-client/src/client/rate_limit_resets.rs`,
    or `isExhausted()`), and never an account quarantined for the requested
    model (`canServe`). **One fleet pass per request**: if the reset account
    still 429s afterwards the request fails fast instead of walking the pool.
+   The pass is charged by any walk that actually reached the backend (reset,
+   spent-no-reset, indeterminate, or a definite no-spend answer) and by an
+   account-policy attempt with a spend-capable outcome; a walk that found no
+   eligible candidate leaves it unspent so a later 429-branch redemption can
+   still be the request's first spend.
    The fleet walk stops after any outcome that may have spent a credit
    (`reset` with `windows_reset: 0`, or an indeterminate timeout/network/5xx
    answer); it only moves on after a definite no-spend answer
@@ -133,7 +150,11 @@ Files: `codex-rs/backend-client/src/client/rate_limit_resets.rs`,
    folds its `x-codex-*` meter nor throttles on 429 (the request is retried),
    and for `CODEX_RESET_CREDIT_GRACE_MS` (2 min) an authoritative payload may
    not RAISE the meter — a reset that genuinely failed still throttles the
-   account through a real post-reset 429.
+   account through a real post-reset 429. Third fence (round 5): inside the
+   same grace an ACCEPTED (non-429) response's `x-codex-*` meter is not
+   folded either (the request is still counted), because the header path may
+   RAISE and the authoritative poll could then no longer lower it; a 429 is
+   always folded — the rejection is the evidence that the reset did not take.
 5. **Operator trigger.** `POST /teamclaude/codex/reset-credit?account=<name>`
    (local-only, proxy API key when configured, body-free — mirrors
    `/teamclaude/rotate`) redeems on demand regardless of the automatic
