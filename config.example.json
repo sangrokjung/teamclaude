@@ -34,6 +34,13 @@
   "claudeSafeguardMaxResumes": 1,
   "claudeAmbiguousDispatchMaxResumes": 1,
   "claudeConnectionRecoveryMaxWaitMs": 900000,
+  "byok": {
+    "enabled": false,
+    "prefix": "/byok",
+    "apiKey": "byok-change-me-to-a-secret",
+    "minUsableAccounts": 2,
+    "maxConcurrent": 2
+  },
   "codexFallbackOnExhaustion": false,
   "codexAuthFailureThreshold": 3,
   "cmuxSessionRescue": false,

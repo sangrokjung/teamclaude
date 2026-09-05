@@ -514,6 +514,46 @@ surface→workspace topology가 모두 일치할 때만 동작합니다. 세션�
 
 버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
 
+### BYOK 표면 (fork 전용)
+
+"자기 키를 넣어 쓰는"(BYOK) 서드파티 클라이언트는 이 프록시의 일반 경로로는 붙지 못합니다. 업스트림이
+1차 클라이언트에게 기대하는 형태가 아닌 요청과, 브라우저 컨텍스트 헤더가 붙은 요청을 거부하기 때문입니다.
+클라이언트가 자기 설정으로는 둘 다 고칠 수 없어서, 프록시가 **전용 경로 prefix에서만** 대신 맞춰 줍니다.
+
+켜기 전에 이 문서 앞쪽 "이용약관에 문제가 없나요?" 절을 읽으십시오. 이 표면은 프록시의 다른 부분과 달리
+**서드파티 클라이언트의 트래픽을 중계**합니다.
+
+```json
+{
+  "byok": {
+    "enabled": true,
+    "prefix": "/byok",
+    "apiKey": "byok-change-me-to-a-secret",
+    "minUsableAccounts": 2,
+    "maxConcurrent": 2
+  }
+}
+```
+
+1. `apiKey`를 자기 비밀값으로 바꿉니다(`openssl rand -base64 24`). 위 예시 값은 **의도적으로 거부**되므로
+   그대로 복사하면 표면이 켜지지 않습니다.
+2. `teamclaude restart`를 실행합니다. BYOK 설정은 서버 기동 시 한 번만 해석되고, TUI **R** 리로드는
+   계정만 다시 읽어서 표면이 꺼진 채로 남습니다.
+3. 클라이언트의 base URL을 `http://127.0.0.1:3456/byok`로, API 키를 그 비밀값으로 지정합니다.
+
+켜졌는지는 `/teamclaude/status`에 `byok` 객체(`inflight`/`admitted`/`rejected`/`injected`)가 생기는지로
+확인합니다. `null`이면 켜지지 않은 것이고, 이유가 `[TeamClaude] BYOK surface disabled: ...`로 로그에 남습니다.
+
+주의할 점:
+
+- 기존 Claude Code 트래픽(`/v1/*`)은 이 레인에 **구조적으로 들어올 수 없어** 바이트 단위로 그대로입니다.
+- `minUsableAccounts`는 목표가 아니라 하한선입니다. 계정이 1개면 기본값 `2`가 모든 BYOK 요청을 거부합니다.
+  작은 풀에서 쓰려면 `1`(또는 `0`)로 낮추되, Claude Code를 보호하던 여유를 포기하는 것입니다.
+- 프리플라이트는 모든 origin에 응답하지만 실제 응답에는 CORS 헤더가 없습니다. 즉 브라우저 렌더러의
+  `fetch()`는 응답을 읽지 못합니다. 백그라운드·확장·메인 프로세스에서 호출하십시오.
+- 이 표면은 실제 구독 자격증명을 앞에 두므로, 짧은 키·기본 키는 거부되고 컨트롤 플레인은 404입니다.
+
+자세한 동작과 안전장치는 영문 README의 *BYOK surface (fork)* 절이 정본입니다.
 Codex의 Sol→Terra fallback은 일반 400에 반응하지 않습니다. ChatGPT OAuth
 계정이 Sol을 지원하지 않는다는 exact 400을 반환한 경우에만 해당 계정·모델
 조합을 30분 격리하며, 거절된 POST는 재전송하지 않습니다. 모든 eligible
