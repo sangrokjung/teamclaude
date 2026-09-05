@@ -17,6 +17,14 @@ import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+import {
+  normalizeByokConfig,
+  matchByokSurface,
+  hasUnsafeSegments,
+  applyByokRequest,
+  answerByokPreflight,
+  admitByok,
+} from './byok.js';
 import { normalizeContinuityMaxWaitMs } from './config.js';
 import {
   getProviderDefinition,
@@ -246,6 +254,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       && config.streamTotalTimeoutMs > 0
     ? Math.floor(config.streamTotalTimeoutMs)
     : provider === 'anthropic' ? DEFAULT_STREAM_TOTAL_TIMEOUT_MS : null;
+  // BYOK compatibility surface (see src/byok.js). Disabled unless the config
+  // both enables it and carries its own key — it must not inherit the localhost
+  // auth bypass, since any local process can reach the port.
+  const byokConfig = normalizeByokConfig(config.byok);
+  if (byokConfig.error) {
+    console.error(`[TeamClaude] BYOK surface disabled: ${byokConfig.error}`);
+  }
+  const byokStats = { inflight: 0, admitted: 0, rejected: 0, injected: 0 };
+
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -855,6 +872,76 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       const isRotateRequest = req.url === '/teamclaude/rotate';
+
+      // BYOK lane. Claude Code never carries this prefix, so no traffic on
+      // /v1/... can reach the normalization below — the isolation is structural.
+      // Resolved BEFORE the generic auth check because this surface carries its
+      // own credential and deliberately does not honor the localhost bypass.
+      const byokMatch = byokConfig.enabled
+        ? matchByokSurface(req.url, byokConfig.prefix)
+        : null;
+      if (byokMatch) {
+        // Local-only, like the other credentialed surfaces above. The public
+        // port is owned by the supervisor, whose own proxy-key check (index.js)
+        // rejects a remote request before it can reach this worker — so a
+        // remote BYOK client could never authenticate anyway. Saying so here
+        // keeps the two layers from disagreeing.
+        if (!isLocal) {
+          rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'permission_error', message: 'The BYOK surface is local-only.' },
+          });
+          return;
+        }
+        if (answerByokPreflight(req, res)) return;
+        // The control plane (status, rotate, drain), the OAuth relay (which is
+        // handled before body normalization and would skip the header scrub),
+        // and dot-segment paths all stay off this surface.
+        const [byokPathname] = byokMatch.path.split('?');
+        if (byokPathname === '/'
+          || byokPathname.startsWith('/teamclaude/')
+          || byokPathname === '/v1/oauth/token'
+          || hasUnsafeSegments(byokMatch.path)) {
+          rejectEarlyRequest(req, res, 404, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'not_found_error', message: 'Not available on the BYOK surface.' },
+          });
+          return;
+        }
+        if (clientKey !== byokConfig.apiKey && bearerKey !== byokConfig.apiKey) {
+          byokStats.rejected += 1;
+          rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Invalid BYOK API key' },
+          });
+          return;
+        }
+        // BYOK shares the Claude Code account pool, which has no per-client
+        // reservation, so it yields while the pool is thin and never occupies
+        // more than its own concurrency slice.
+        const verdict = admitByok({
+          usableCount: accountManager.getStatus().usableCount,
+          byokInflight: byokStats.inflight,
+          config: byokConfig,
+        });
+        if (!verdict.ok) {
+          byokStats.rejected += 1;
+          rejectEarlyRequest(req, res, 429, {
+            'Content-Type': 'application/json',
+            'retry-after': String(verdict.retryAfter),
+          }, {
+            type: 'error',
+            error: {
+              type: 'rate_limit_error',
+              message: verdict.reason === 'headroom'
+                ? 'BYOK paused: the account pool is below its usable-account floor.'
+                : 'BYOK concurrency limit reached.',
+            },
+          });
+          return;
+        }
+        req.url = byokMatch.path;
+      }
       if (hasRecoveryMarker && recoveryAccountUuid == null) {
         rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
           type: 'error',
@@ -952,6 +1039,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           ...accountManager.getStatus({ includeIdentity }),
           host: hostTracker.sample(),
           lifecycleId: config.lifecycleId || null,
+          byok: byokConfig.enabled
+            ? { prefix: byokConfig.prefix, ...byokStats }
+            : null,
         }, null, 2));
         return;
       }
@@ -962,6 +1052,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // accounts for public-path copies before forwarding to a worker.
       const admissionCapacity = accountManager.totalCapacity();
       if (inFlightProxied >= admissionCapacity) {
+        if (byokMatch) byokStats.rejected += 1;
         rejectEarlyRequest(
           req,
           res,
@@ -975,6 +1066,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
       inFlightProxied++;
+      if (byokMatch) {
+        byokStats.inflight += 1;
+        byokStats.admitted += 1;
+      }
       let requestBufferedBytes = 0;
       let responseBufferedBytes = 0;
       let auxiliaryResponseBytes = 0;
@@ -1096,6 +1191,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           body = normalizeCodexRequestBody(req, body);
         }
 
+        // Normalize the BYOK request exactly once, here — not inside
+        // forwardRequest, which recurses once per account and would stack the
+        // injection. Every retry and model fallback reuses this buffer.
+        if (byokMatch) {
+          const normalized = applyByokRequest(req, body);
+          body = normalized.body;
+          if (normalized.injected) byokStats.injected += 1;
+        }
+
         // Track request
         const reqId = ++requestCounter;
         hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
@@ -1103,7 +1207,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
         // `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1132,7 +1236,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // response also tells us whether this request's model tier reports
             // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
             // limit) — the one property worth a one-way template upgrade.
-            if (ctx.advisorToolIndex == null
+            // A BYOK request carries a synthesized shape, so it must never be
+            // promoted to the fleet warm-up template — that would replay a
+            // third-party client's prompt across every account's probe.
+            if (ctx.advisorToolIndex == null && ctx.byok !== true
                 && (!probeTemplate || probeTemplate._restored
                   || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly))) {
               const candidate = stageProbeTemplate(req, body);
@@ -1185,6 +1292,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
               releaseRequestBytes(requestBufferedBytes);
             } finally {
               inFlightProxied--;
+              if (byokMatch) byokStats.inflight -= 1;
             }
           }
         }
@@ -2545,7 +2653,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const deadlineAt = deadlineMode ? startContinuityDeadline(ctx) : null;
       const deadlineOpen = deadlineMode && Date.now() < deadlineAt;
       const legacyRetryOpen = !deadlineMode && ctx.overloadRetries < maxOverload;
-      if (ctx.continuity.enabled && !res.destroyed && (deadlineOpen || legacyRetryOpen)) {
+      // A BYOK 429 must not open the process-global cooldown: that variable is
+      // shared with every Claude Code session, so one third-party client's
+      // headerless 429 would stall the whole fleet. BYOK falls straight through
+      // to the pass-through 429 below and lets its own client back off.
+      if (ctx.continuity.enabled && ctx.byok !== true
+          && !res.destroyed && (deadlineOpen || legacyRetryOpen)) {
         const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
         const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
         const exponentialBackoff = Math.min(

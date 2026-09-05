@@ -31,6 +31,13 @@
   "autoResumeClaude": true,
   "claudeAutoResumeMaxRetries": 3,
   "claudeAutoResumeBackoffMs": 2000,
+  "byok": {
+    "enabled": false,
+    "prefix": "/byok",
+    "apiKey": "byok-change-me-to-a-secret",
+    "minUsableAccounts": 2,
+    "maxConcurrent": 2
+  },
   "codexFallbackOnExhaustion": false,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,
