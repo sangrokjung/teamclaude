@@ -17,14 +17,25 @@ import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
+import {
+  normalizeByokConfig,
+  matchByokSurface,
+  hasUnsafeSegments,
+  applyByokRequest,
+  answerByokPreflight,
+  admitByok,
+} from './byok.js';
 import { normalizeContinuityMaxWaitMs } from './config.js';
 import {
-  getProviderDefinition,
-  assertSupportedProvider,
-  buildProviderUpstreamUrl,
-  providerAuthHeaders,
-  validateProviderAccounts,
-} from './provider-config.js';
+  applyCodexResetCreditOutcome,
+  codexResetCreditEligibility,
+  codexResetCreditOutcomeKind,
+  consumeCodexResetCredit,
+  describeCodexResetCreditCandidates,
+  normalizeCodexResetCreditsConfig,
+  rankCodexResetCreditCandidates,
+  withinCodexResetCreditGrace,
+} from './codex-reset-credits.js';
 import {
   CODEX_INVOCATION_HEADER,
   CODEX_RECOVERY_SESSION_HEADER,
@@ -42,6 +53,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-connection',
   'proxy-authorization', 'proxy-authenticate',
 ]);
+const CODEX_ERROR_INSPECTION_MAX_BYTES = 16 * 1024;
 
 function connectionHeaderNames(value) {
   return new Set(
@@ -70,6 +82,7 @@ function requestUpstreamRaw(url, { method, headers, body, signal }) {
 }
 
 function decodeBodyForInspection(body, contentEncoding, maxBytes) {
+  if (body.length > maxBytes) return null;
   const encodings = String(contentEncoding || '')
     .split(',')
     .map(value => value.trim().toLowerCase())
@@ -95,59 +108,84 @@ function decodeBodyForInspection(body, contentEncoding, maxBytes) {
   }
 }
 
-function createCodexTerminalTracker(contentEncoding) {
+function createEncodedSseObserver(contentEncoding, reserveBytes, releaseBytes) {
   const encodings = String(contentEncoding || '')
     .split(',')
     .map(value => value.trim().toLowerCase())
     .filter(value => value && value !== 'identity');
-  const framer = new SseFramer({ maxBufferedBytes: 64 * 1024 });
-  if (encodings.length === 0) return framer;
+  if (encodings.length !== 1) return null;
 
-  const decoders = [];
-  for (const encoding of encodings.reverse()) {
-    if (encoding === 'gzip' || encoding === 'x-gzip') decoders.push(createGunzip());
-    else if (encoding === 'deflate') decoders.push(createInflate());
-    else if (encoding === 'br') decoders.push(createBrotliDecompress());
-    else {
-      framer.inspectionFailed = true;
-      framer.push = () => {};
-      framer.finish = async () => {};
-      return framer;
-    }
-  }
+  let decoder;
+  if (encodings[0] === 'gzip' || encodings[0] === 'x-gzip') decoder = createGunzip();
+  else if (encodings[0] === 'deflate') decoder = createInflate();
+  else if (encodings[0] === 'br') decoder = createBrotliDecompress();
+  else return null;
 
-  for (let index = 0; index + 1 < decoders.length; index += 1) {
-    decoders[index].pipe(decoders[index + 1]);
-  }
-  const first = decoders[0];
-  const last = decoders[decoders.length - 1];
-  const trackDecoded = framer.push.bind(framer);
-  last.on('data', trackDecoded);
-  const decoderError = new Promise(resolve => {
-    for (const decoder of decoders) {
-      decoder.once('error', () => {
-        framer.inspectionFailed = true;
-        resolve();
-      });
+  const framer = new SseFramer({ reserveBytes, releaseBytes });
+  let failed = false;
+  let settled = false;
+  let resolveFinished;
+  const finished = new Promise(resolve => { resolveFinished = resolve; });
+  const settle = didFail => {
+    failed ||= didFail;
+    if (settled) return;
+    settled = true;
+    resolveFinished();
+  };
+
+  decoder.on('data', chunk => {
+    if (failed) return;
+    const frames = framer.push(chunk);
+    if (framer.limitExceeded) {
+      failed = true;
+      decoder.destroy();
+      return;
     }
+    if (frames?.length) framer.releaseForwarded(frames.length);
   });
-  framer.push = bytes => new Promise(resolve => {
-    first.write(bytes, error => {
-      if (error) framer.inspectionFailed = true;
-      resolve();
-    });
-  });
-  framer.finish = async () => {
-    const ended = new Promise(resolve => last.once('end', resolve));
-    first.end();
-    await Promise.race([ended, decoderError]);
+  decoder.once('end', () => settle(false));
+  decoder.once('error', () => settle(true));
+  decoder.once('close', () => settle(!decoder.readableEnded));
+
+  return {
+    async push(chunk) {
+      if (failed || decoder.destroyed || decoder.writableEnded) return;
+      if (decoder.write(chunk)) return;
+      await Promise.race([
+        new Promise(resolve => decoder.once('drain', resolve)),
+        finished,
+      ]);
+    },
+    async finish() {
+      if (!failed && !decoder.destroyed && !decoder.writableEnded) decoder.end();
+      await finished;
+    },
+    get sawResponseCompleted() {
+      return !failed && framer.sawResponseCompleted;
+    },
+    dispose() {
+      decoder.destroy();
+      framer.dispose();
+    },
   };
-  const disposeFramer = framer.dispose.bind(framer);
-  framer.dispose = () => {
-    for (const decoder of decoders) decoder.destroy();
-    disposeFramer();
-  };
-  return framer;
+}
+
+function isCodexInferenceRequest(req) {
+  if (req.method !== 'POST') return false;
+  const path = req.url.split('?')[0];
+  return /^\/(?:codex\/)?responses(?:\/compact)?$/.test(path);
+}
+
+function isCompletedCodexResponse(body) {
+  if (!body?.length) return false;
+  try {
+    const response = JSON.parse(body.toString('utf8'));
+    return typeof response?.id === 'string' && response.id.length > 0
+      && response.object === 'response'
+      && response.status === 'completed';
+  } catch {
+    return false;
+  }
 }
 
 // Legacy ceiling for model-tier polling when continuityMaxWaitMs is 0. Deadline
@@ -161,22 +199,23 @@ const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 256 * 1024 * 1024;
 const REQUEST_LOG_BODY_BYTES = 16 * 1024;
-const DISPATCH_FAILURE_RETRY_AFTER_SECONDS = 5;
-const DISPATCH_FAILURE_COOLDOWN_MS = DISPATCH_FAILURE_RETRY_AFTER_SECONDS * 1000;
-const CONTINUITY_DISPATCH_GRACE_MS = 5;
+// How many DISTINCT accounts must answer 401 to one request before the proxy
+// stops blaming the credentials and blames the request. One account rejecting a
+// request is account-scoped evidence; two independent accounts rejecting the
+// SAME request is evidence about the only variable they share. See
+// docs/specs/2026-09-05-auth-401-cascade-guard.md (2026-09-05 incident: one
+// request parked most of a pool whose tokens were later proven still valid).
+const AUTH_401_CASCADE_THRESHOLD = 2;
+// Monotonic stamp identifying WHICH request performed a given 401 park, so a
+// cascade rollback only reverts a park it still owns. Process-wide and never
+// persisted; it only has to be unique among live parks.
+let authParkSeq = 0;
+
 export function createProxyServer(accountManager, config, hooks = {}) {
-  const provider = config.provider == null
-    ? 'anthropic'
-    : assertSupportedProvider(config.provider);
-  validateProviderAccounts(provider, accountManager.accounts, {
-    requireMetadata: true,
-    allowInternalAuth: true,
-  });
-  const definition = getProviderDefinition(provider);
-  const upstream = config.upstream || definition.defaultUpstream;
-  if (!upstream) {
-    throw new Error(`${provider} proxy requires an explicit upstream URL.`);
-  }
+  const provider = config.provider === 'codex' ? 'codex' : 'anthropic';
+  const upstream = config.upstream || (provider === 'codex'
+    ? 'https://chatgpt.com/backend-api/codex'
+    : 'https://api.anthropic.com');
   const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -246,6 +285,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       && config.streamTotalTimeoutMs > 0
     ? Math.floor(config.streamTotalTimeoutMs)
     : provider === 'anthropic' ? DEFAULT_STREAM_TOTAL_TIMEOUT_MS : null;
+  // BYOK compatibility surface (see src/byok.js). Disabled unless the config
+  // both enables it and carries its own key — it must not inherit the localhost
+  // auth bypass, since any local process can reach the port.
+  const byokConfig = normalizeByokConfig(config.byok);
+  if (byokConfig.error) {
+    console.error(`[TeamClaude] BYOK surface disabled: ${byokConfig.error}`);
+  }
+  const byokStats = { inflight: 0, admitted: 0, rejected: 0, injected: 0 };
+
   let globalCooldownUntil = 0;
 
   const continuity = {
@@ -335,6 +383,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const codexUsageActiveMs = Number.isFinite(config.codexUsageActiveMs)
     ? Math.max(0, config.codexUsageActiveMs)
     : 60_000;
+  // Reset credits (codex): automatic redemption policy. `enabled` gates only
+  // the automatic triggers; the local operator endpoint always works in codex
+  // mode. See src/codex-reset-credits.js + docs/specs/2026-09-05-codex-reset-credits.md.
+  const resetCredits = normalizeCodexResetCreditsConfig(config, provider);
+  // Auto-quarantine (codex): consecutive terminal (401/403) auth failures on
+  // the wham/usage poll before the proxy escalates to a forced token refresh
+  // plus a confirm re-poll. In-memory streak; the poll cadence is the pacing.
+  const codexAuthFailureThreshold = Number.isFinite(config.codexAuthFailureThreshold)
+    && config.codexAuthFailureThreshold >= 1
+    ? Math.floor(config.codexAuthFailureThreshold)
+    : 3;
   const WARMUP_PROBE_TIMEOUT_MS = 15_000;
   let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
   let warmupInFlight = false; // guard against overlapping fan-outs
@@ -431,7 +490,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   async function refreshCodexAccount(account) {
     if (warmupClosed || !account.credential) return false;
-    const ok = await fetchCodexUsageOnce(account);
+    const outcome = await fetchCodexUsageOnce(account);
+    await watchCodexAuthOutcome(account, outcome);
+    const ok = outcome.applied;
     // Failure visibility without 60s-cadence spam: log once per failure STREAK
     // (first failure after a success), and once on recovery. A teardown abort
     // (warmupClosed) or a removed account is not a data-staleness signal.
@@ -460,16 +521,108 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const res = await fetch(codexUsageEndpoint(), { headers, signal: probe.signal });
       if (!res.ok) {
         await res.body?.cancel();
-        return false;
+        // 401/403 are credential verdicts from the backend — the only terminal
+        // auth evidence a poll can carry. 5xx/429/anything else is transient
+        // noise and (as before) never mutates account state.
+        return {
+          applied: false,
+          authOk: false,
+          terminalAuth: res.status === 401 || res.status === 403,
+        };
       }
       const payload = await res.json();
-      if (accountManager.accounts[account.index] !== account) return false;
-      return accountManager.updateCodexUsage(account, payload);
+      if (accountManager.accounts[account.index] !== account) {
+        return { applied: false, authOk: false, terminalAuth: false };
+      }
+      const applied = accountManager.updateCodexUsage(account, payload);
+      if (applied) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
+      }
+      return { applied, authOk: true, terminalAuth: false };
     } catch {
-      return false;
+      // Network error / timeout / unparseable 2xx body: non-terminal.
+      return { applied: false, authOk: false, terminalAuth: false };
     } finally {
       probe.cleanup();
     }
+  }
+
+  // Auto subscription-termination detection: usage polls double as credential
+  // health checks. Only a streak of terminal (401/403) poll failures — never a
+  // single one, and never 5xx/network noise — escalates, and even then the
+  // account is parked only after a forced refresh + confirm re-poll agrees.
+  // Accounts parked here are tagged `_errorFromUsagePoll`, which scopes the
+  // automatic poll-success recovery in markAccountSuccess to THIS quarantine
+  // (request-path 401 parks keep their stricter healing rules). Streaks are
+  // in-memory only; a restart starts clean. Any positive auth evidence resets
+  // the streak: a valid poll here, and a completed inference / applied poll via
+  // markAccountSuccess — so an account that is actively serving traffic cannot
+  // be quarantined by usage-endpoint-only 401/403s.
+  async function watchCodexAuthOutcome(account, outcome) {
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (outcome.authOk) {
+      account._usageAuthStreak = 0;
+      return;
+    }
+    if (!outcome.terminalAuth) return; // transient noise: streak neither grows nor resets
+    if (account.status === 'error') return; // already parked — polls continue only for recovery
+    const streak = (account._usageAuthStreak ?? 0) + 1;
+    account._usageAuthStreak = streak;
+    if (streak < codexAuthFailureThreshold) return;
+    // Escalating consumes the streak: whatever the verdict below, the next
+    // escalation needs a fresh streak (the poll interval is the pacing).
+    account._usageAuthStreak = 0;
+    await confirmCodexAuthFailure(account);
+  }
+
+  async function confirmCodexAuthFailure(account) {
+    // Step 1: one forced token refresh. A terminal refresh failure (401 /
+    // invalid_grant) parks the account inside ensureTokenFresh — including the
+    // r7 delegation to subscription-ended when a declared cancellation is due.
+    await accountManager.ensureTokenFresh(account, true)
+      .catch(() => { /* terminal failures are handled inside ensureTokenFresh */ });
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (account.status === 'error') {
+      // Attribute the park precisely: during the awaited refresh the
+      // request-path 401 handler may have parked this account itself
+      // ('auth-revoked', `_errorFromRefresh` false). Only a refresh-caused
+      // park (`_errorFromRefresh` true — set by ensureTokenFresh's terminal
+      // failure, including the r7 subscription-ended delegation's
+      // refresh-failed entry) belongs to THIS escalation; claiming a
+      // request-path park would make it poll-healable, breaking the pinned
+      // "request-path parks keep their stricter healing" contract.
+      if (account._errorFromRefresh === true) account._errorFromUsagePoll = true;
+      return;
+    }
+    // Step 2: re-poll once with the (possibly refreshed) credential. Terminal
+    // again = a live token the backend still rejects → quarantine. A healthy
+    // or inconclusive confirm leaves the account alone.
+    const confirm = await fetchCodexUsageOnce(account);
+    if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+    if (confirm.authOk || !confirm.terminalAuth) return;
+    // Parked by another path while the re-poll was in flight: that park keeps
+    // its own healing rules — never re-mark or re-tag it here.
+    if (account.status === 'error') return;
+    // Circuit breaker: poll-only evidence must never park the LAST available
+    // account. If the whole fleet is truly dead, real request traffic (or a
+    // terminal token refresh) still parks the final account on request-path
+    // evidence; a usage-endpoint-only outage must not empty an idle pool.
+    // The streak stays consumed — the next threshold re-judges availability.
+    if (!accountManager.hasOtherAvailableAccount(account)) {
+      console.error(`[TeamClaude] Codex account "${account.name}" failed the usage-poll auth confirmation, but it is the last available account — quarantine deferred (re-judged on the next failure streak)`);
+      return;
+    }
+    accountManager.markAuthenticationError(account, 'auth-revoked');
+    // Tag synchronously with the park (no await in between): a concurrent
+    // request-path park can never be mistaken for this one.
+    if (account.status === 'error') account._errorFromUsagePoll = true;
+    console.error(`[TeamClaude] Codex account "${account.name}" quarantined: usage polls and a fresh token both rejected (auto-recovers on a valid usage poll)`);
+    await accountManager.waitForAccountFlag(account).catch(err => {
+      console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
+    });
   }
 
   async function refreshCodexQuotaAll() {
@@ -517,6 +670,164 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       .finally(() => { account._usageRefreshing = false; });
   }
 
+  // Codex reset credits. One redemption attempt per account at a time; the
+  // outcome is folded into the account at once (a "reset" makes it routable
+  // again immediately) and an authoritative wham/usage refresh follows shortly
+  // after so the meter reflects the backend's view. Best-effort throughout —
+  // a failure here never breaks the request path, it just falls through to the
+  // existing exhaustion handling.
+  const RESET_CREDIT_REFRESH_DELAY_MS = 1500;
+  const RESET_CREDIT_NO_CANDIDATE_LOG_MS = 60_000;
+  let resetCreditNoCandidateLoggedAt = 0;
+  const NO_RESET = Object.freeze({ reset: false, kind: 'no-spend', outcome: null });
+
+  function resetCreditEligibilityOptions(model = null) {
+    return {
+      reserve: resetCredits.reserve,
+      cooldownMs: resetCredits.cooldownMs,
+      isExhausted: candidate => accountManager.isExhausted(candidate),
+      // A reset on an account quarantined for the requested model restores
+      // quota nobody can use for this request.
+      canServe: candidate => !accountManager._isModelUnsupported(candidate, model),
+    };
+  }
+
+  function scheduleResetCreditUsageRefresh(account) {
+    if (!codexUsageRefresh || warmupClosed) return;
+    const timer = setTimeout(() => {
+      if (warmupClosed || accountManager.accounts[account.index] !== account) return;
+      refreshCodexAccount(account).catch(() => { /* best-effort */ });
+    }, RESET_CREDIT_REFRESH_DELAY_MS);
+    timer.unref?.();
+  }
+
+  // One redemption attempt on one account. Returns { reset, kind, outcome }:
+  // `reset` = routable again; `kind` classifies the attempt for the fleet walk
+  // (see codexResetCreditOutcomeKind). `enforceEligibility` applies the
+  // automatic-policy guards (credits known/reserve/cooldown/exhausted/can
+  // serve); the operator endpoint passes false. Single-flight per account.
+  async function redeemCodexResetCredit(account, reason, { enforceEligibility = true, model = null } = {}) {
+    if (provider !== 'codex' || !account || account.provider !== 'codex') return NO_RESET;
+    if (enforceEligibility) {
+      const verdict = codexResetCreditEligibility(account, resetCreditEligibilityOptions(model));
+      if (!verdict.eligible) return NO_RESET;
+    }
+    if (account._resetCreditPromise) return account._resetCreditPromise;
+    account._resetCreditPromise = (async () => {
+      try {
+        // ensureTokenFresh never throws — a failed refresh only logs and may
+        // park the account — so judge the result, not an exception.
+        await accountManager.ensureTokenFresh(account);
+        if (accountManager.accounts[account.index] !== account) return NO_RESET;
+        if (!account.credential || account.status === 'error' || account.authRevoked === true
+            || isTokenExpiringSoon(account.expiresAt)) {
+          const outcome = { ok: false, code: 'token_refresh_failed', windowsReset: null, status: null, error: null };
+          applyCodexResetCreditOutcome(account, outcome);
+          console.error(`[TeamCodex] Reset credit on "${account.name}" (${reason}) skipped — credential unusable (status ${account.status})`);
+          return { reset: false, kind: 'no-spend', outcome };
+        }
+        // Durable intent BEFORE the POST: stamp the cooldown as "pending" and
+        // ask the host to persist the quota snapshot now. If the process dies
+        // after the backend consumed the credit but before the outcome lands,
+        // a restart still sees the cooldown (and the poll reconciles the
+        // count) instead of redeeming this account a second time.
+        account.quota.codexResetCreditLastAt = Date.now();
+        account.quota.codexResetCreditLastOutcome = 'pending';
+        hooks.onResetCreditLedger?.(account);
+        const outcome = await consumeCodexResetCredit({
+          account,
+          upstream,
+          timeoutMs: resetCredits.timeoutMs,
+        });
+        const reset = applyCodexResetCreditOutcome(account, outcome);
+        const kind = codexResetCreditOutcomeKind(outcome);
+        // …and persist the real outcome right away (the periodic snapshot is
+        // 60 s apart and the exit handler does not run on SIGKILL).
+        hooks.onResetCreditLedger?.(account);
+        if (reset) {
+          console.log(`[TeamCodex] Reset credit redeemed on "${account.name}" (${reason}): windows_reset=${outcome.windowsReset ?? '?'}, credits left=${account.quota.codexResetCredits ?? '?'}`);
+        } else if (kind === 'spent-no-reset') {
+          console.error(`[TeamCodex] Reset credit SPENT on "${account.name}" (${reason}) but the backend reset no windows (windows_reset=0); credits left=${account.quota.codexResetCredits ?? '?'}`);
+        } else if (kind === 'indeterminate') {
+          console.error(`[TeamCodex] Reset credit on "${account.name}" (${reason}) indeterminate: ${outcome.code}${outcome.error ? ` — ${outcome.error}` : ''}; refreshing usage, not trying other accounts this pass`);
+        } else {
+          console.log(`[TeamCodex] Reset credit NOT applied on "${account.name}" (${reason}): ${outcome.code}${outcome.error ? ` — ${outcome.error}` : ''}`);
+        }
+        // Re-read the authoritative meter after ANY attempt: a reset must be
+        // confirmed, and an indeterminate/unexpected answer may have changed
+        // the backend state without telling us.
+        scheduleResetCreditUsageRefresh(account);
+        return { reset, kind, outcome };
+      } finally {
+        account._resetCreditPromise = null;
+      }
+    })();
+    return account._resetCreditPromise;
+  }
+
+  // Fleet-level automatic redemption: walk the eligible exhausted accounts
+  // (most credits first). Stops at the first reset, and ALSO after any
+  // attempt that may have spent a credit (spent-no-reset / indeterminate) —
+  // moving on to the next account after those is the double-spend path.
+  // Returns true when at least one account is routable again.
+  // Returns { redeemed, chargePass }: `chargePass` is true when at least one
+  // attempt may have spent a credit (reset / spent-no-reset / indeterminate),
+  // so the caller charges the request's single pass only for spend-capable
+  // work — a walk with no eligible candidate leaves the pass unspent.
+  async function redeemCodexResetCreditForFleet(accounts, reason, model = null, resolved = null) {
+    const nothing = { redeemed: false, chargePass: false };
+    if (!resetCredits.enabled || warmupClosed) return nothing;
+    // "Has the dead end been resolved by someone else?" — judged with the
+    // CALLER's request scope (credential-type exclusions etc.), never with a
+    // pool-wide view that could see an account this request cannot use.
+    const deadEndResolved = typeof resolved === 'function'
+      ? resolved
+      : () => accountManager.anyUsable(null, model) || accountManager.anyCapped(null, model);
+    const options = resetCreditEligibilityOptions(model);
+    const candidates = rankCodexResetCreditCandidates(accounts, options);
+    if (candidates.length === 0) {
+      const now = Date.now();
+      if (now - resetCreditNoCandidateLoggedAt >= RESET_CREDIT_NO_CANDIDATE_LOG_MS) {
+        resetCreditNoCandidateLoggedAt = now;
+        console.log(`[TeamCodex] Reset credit: no eligible account at the quota dead end (${describeCodexResetCreditCandidates(accounts, options).join(', ') || 'no codex accounts'})`);
+      }
+      return nothing;
+    }
+    // A walk that never reached the backend (every candidate re-judged as
+    // ineligible) leaves the pass unspent; one that made ANY real attempt —
+    // even a definite no-spend answer — charges it, so a request cannot
+    // re-POST consume on every wait-loop iteration (cooldown 0 has no other
+    // brake). The local NO_RESET sentinel is the "no attempt" marker.
+    let attempted = false;
+    for (const candidate of candidates) {
+      // Re-judge right before acting: another request or the operator
+      // endpoint may have redeemed (or exhausted the credits of) this
+      // candidate while an earlier candidate's consume was in flight.
+      const result = await redeemCodexResetCredit(candidate, reason, { enforceEligibility: true, model });
+      if (result !== NO_RESET) attempted = true;
+      if (result.reset) return { redeemed: true, chargePass: true };
+      if (result.kind !== 'no-spend') return { redeemed: false, chargePass: true };
+      // The dead end may have been resolved by someone else (operator reset,
+      // another request's pass, a window rollover) while this attempt was in
+      // flight: yield to the routable account instead of spending on the next.
+      if (deadEndResolved()) return { redeemed: true, chargePass: attempted };
+    }
+    return { redeemed: false, chargePass: attempted };
+  }
+
+  // Handed to forwardRequest through ctx: null when automatic redemption is
+  // off, so the request path stays byte-identical to the pre-feature behavior.
+  const resetCreditController = resetCredits.enabled
+    ? {
+        policy: resetCredits.policy,
+        fleet: redeemCodexResetCreditForFleet,
+        // Returns the full { reset, kind } so the 429 branch can charge the
+        // request's single pass for ANY outcome that may have spent a credit.
+        account: (account, reason, model = null) =>
+          redeemCodexResetCredit(account, reason, { enforceEligibility: true, model }),
+      }
+    : null;
+
   // Probe one account: send a minimal /v1/messages with its own auth and fold the
   // rate-limit headers into its quota. Best-effort and side-effect-light:
   //  - Never refreshes tokens — a background refresh failure could mark the account
@@ -540,7 +851,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
   async function warmupAccount(account, { force = false } = {}) {
     if (!probeTemplate || warmupClosed || account._warming) return;
-    if (account.authRevoked === true) return;
     // Don't refresh from a background probe; skip an OAuth account that needs one.
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
     // Re-confirm it's still an available, unmeasured, idle candidate — unless
@@ -648,7 +958,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
       (a.status !== 'error' || a.errorReason === 'subscription-disabled')
-      && a.authRevoked !== true
       && a.inflight === 0 && !a._warming);
     // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
     // background failure could mark an account 'error' before any real request
@@ -660,8 +969,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(targets.map(a =>
       accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
     const alive = targets.filter(a =>
-      (a.status !== 'error' || a.errorReason === 'subscription-disabled')
-      && a.authRevoked !== true);
+      a.status !== 'error' || a.errorReason === 'subscription-disabled');
     // Renew both probe budgets — R is an explicit "measure everything now".
     for (const a of alive) { a._partialProbes = 0; a._mwProbes = 0; }
     const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
@@ -682,8 +990,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpModelWeekly() {
     if (!activeWarmup || warmupClosed || !probeTemplate || !probeTemplate._elicitsModelWeekly) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.authRevoked !== true
-      && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsModelWeekly(a));
     if (!targets.length) return;
     await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
@@ -704,8 +1011,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpPartialQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.authRevoked !== true
-      && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsPartialRemeasure(a));
     if (!targets.length) return;
     // Revive lapsed tokens FIRST (same rationale as refreshQuotaAll): a partial
@@ -732,8 +1038,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         || subscriptionRecheckIntervalMs <= 0) return;
     const now = Date.now();
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.authRevoked !== true
-      && a.subscriptionDisabled === true
+      a.enabled !== false && a.subscriptionDisabled === true
       && a.errorReason === 'subscription-disabled'
       && a.inflight === 0 && !a._warming
       && (!a._subscriptionRecheckAt || now >= a._subscriptionRecheckAt));
@@ -855,6 +1160,80 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
       const isRotateRequest = req.url === '/teamclaude/rotate';
+
+      // BYOK lane. Claude Code never carries this prefix, so no traffic on
+      // /v1/... can reach the normalization below — the isolation is structural.
+      // Resolved BEFORE the generic auth check because this surface carries its
+      // own credential and deliberately does not honor the localhost bypass.
+      const byokMatch = byokConfig.enabled
+        ? matchByokSurface(req.url, byokConfig.prefix)
+        : null;
+      if (byokMatch) {
+        // Local-only, like the other credentialed surfaces above. The public
+        // port is owned by the supervisor, whose own proxy-key check (index.js)
+        // rejects a remote request before it can reach this worker — so a
+        // remote BYOK client could never authenticate anyway. Saying so here
+        // keeps the two layers from disagreeing.
+        if (!isLocal) {
+          rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'permission_error', message: 'The BYOK surface is local-only.' },
+          });
+          return;
+        }
+        if (answerByokPreflight(req, res)) return;
+        // The control plane (status, rotate, drain), the OAuth relay (which is
+        // handled before body normalization and would skip the header scrub),
+        // and dot-segment paths all stay off this surface.
+        const [byokPathname] = byokMatch.path.split('?');
+        if (byokPathname === '/'
+          || byokPathname.startsWith('/teamclaude/')
+          || byokPathname === '/v1/oauth/token'
+          || hasUnsafeSegments(byokMatch.path)) {
+          rejectEarlyRequest(req, res, 404, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'not_found_error', message: 'Not available on the BYOK surface.' },
+          });
+          return;
+        }
+        if (clientKey !== byokConfig.apiKey && bearerKey !== byokConfig.apiKey) {
+          byokStats.rejected += 1;
+          rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'authentication_error', message: 'Invalid BYOK API key' },
+          });
+          return;
+        }
+        // BYOK shares the Claude Code account pool, which has no per-client
+        // reservation, so it yields while the pool is thin and never occupies
+        // more than its own concurrency slice.
+        const verdict = admitByok({
+          usableCount: accountManager.getStatus().usableCount,
+          byokInflight: byokStats.inflight,
+          config: byokConfig,
+        });
+        if (!verdict.ok) {
+          byokStats.rejected += 1;
+          rejectEarlyRequest(req, res, 429, {
+            'Content-Type': 'application/json',
+            'retry-after': String(verdict.retryAfter),
+          }, {
+            type: 'error',
+            error: {
+              type: 'rate_limit_error',
+              message: verdict.reason === 'headroom'
+                ? 'BYOK paused: the account pool is below its usable-account floor.'
+                : 'BYOK concurrency limit reached.',
+            },
+          });
+          return;
+        }
+        req.url = byokMatch.path;
+      }
+      // Operator trigger for a Codex reset credit. Same trust boundary as
+      // rotation: loopback only, proxy API key when one is configured, body-free.
+      const isResetCreditRequest = provider === 'codex'
+        && req.url.split('?', 1)[0] === '/teamclaude/codex/reset-credit';
       if (hasRecoveryMarker && recoveryAccountUuid == null) {
         rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
           type: 'error',
@@ -876,7 +1255,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
         return;
       }
-      if (isRotateRequest && proxyApiKey
+      if (isResetCreditRequest && !isLocal) {
+        rejectEarlyRequest(req, res, 403, { 'Content-Type': 'application/json' }, {
+          type: 'error',
+          error: { type: 'permission_error', message: 'Reset credit redemption is local-only.' },
+        });
+        return;
+      }
+      if ((isRotateRequest || isResetCreditRequest) && proxyApiKey
           && clientKey !== proxyApiKey && bearerKey !== proxyApiKey) {
         rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
           type: 'error',
@@ -933,6 +1319,58 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      if (isResetCreditRequest) {
+        if (req.method !== 'POST') {
+          rejectEarlyRequest(
+            req,
+            res,
+            405,
+            { 'Content-Type': 'application/json', Allow: 'POST' },
+            {
+              type: 'error',
+              error: { type: 'invalid_request_error', message: 'Reset credit redemption requires POST.' },
+            },
+          );
+          return;
+        }
+        const contentLength = req.headers['content-length'];
+        const bodyFree = (contentLength == null || contentLength === '0')
+          && req.headers['transfer-encoding'] == null;
+        if (!bodyFree) {
+          rejectEarlyRequest(req, res, 400, { 'Content-Type': 'application/json' }, {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Reset credit redemption does not accept a body; pass ?account=<name>.' },
+          });
+          return;
+        }
+        const requestedName = new URL(req.url, 'http://localhost').searchParams.get('account');
+        const target = typeof requestedName === 'string' && requestedName.length > 0
+          ? accountManager.accounts.find(candidate => candidate.provider === 'codex' && candidate.name === requestedName)
+          : null;
+        if (!target) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'not_found_error', message: 'Unknown Codex account; pass ?account=<name>.' },
+          }));
+          return;
+        }
+        // Explicit operator intent bypasses the automatic policy/eligibility
+        // (cooldown, reserve, exhaustion) but keeps the single-flight guard.
+        const { reset } = await redeemCodexResetCredit(target, 'operator', { enforceEligibility: false });
+        const quota = target.quota || {};
+        res.writeHead(reset ? 200 : 409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          account: target.name,
+          reset,
+          outcome: quota.codexResetCreditLastOutcome ?? null,
+          resetCredits: quota.codexResetCredits ?? null,
+          unified5h: quota.unified5h ?? null,
+          unified7d: quota.unified7d ?? null,
+        }));
+        return;
+      }
+
       const isStatusRequest = req.method === 'GET' && req.url === '/teamclaude/status';
       const contentLength = req.headers['content-length'];
       const bodyFreeStatus = isStatusRequest
@@ -951,7 +1389,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         res.end(JSON.stringify({
           ...accountManager.getStatus({ includeIdentity }),
           host: hostTracker.sample(),
-          lifecycleId: config.lifecycleId || null,
+          ...(provider === 'codex'
+            ? {
+                resetCredits: {
+                  enabled: resetCredits.enabled,
+                  policy: resetCredits.policy,
+                  cooldownMs: resetCredits.cooldownMs,
+                  reserve: resetCredits.reserve,
+                },
+              }
+            : {}),
+          ...(includeIdentity ? { lifecycleId: config.lifecycleId || null } : {}),
+          byok: byokConfig.enabled
+            ? { prefix: byokConfig.prefix, ...byokStats }
+            : null,
         }, null, 2));
         return;
       }
@@ -962,6 +1413,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // accounts for public-path copies before forwarding to a worker.
       const admissionCapacity = accountManager.totalCapacity();
       if (inFlightProxied >= admissionCapacity) {
+        if (byokMatch) byokStats.rejected += 1;
         rejectEarlyRequest(
           req,
           res,
@@ -975,6 +1427,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
       inFlightProxied++;
+      if (byokMatch) {
+        byokStats.inflight += 1;
+        byokStats.admitted += 1;
+      }
       let requestBufferedBytes = 0;
       let responseBufferedBytes = 0;
       let auxiliaryResponseBytes = 0;
@@ -998,6 +1454,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       };
       const reserveResponseBytes = bytes => {
         if (bytes <= 0) return true;
+        if (responseReleased) return false;
         if (bytes > maxBufferedResponseBytes - bufferedResponseBytes) {
           releaseIdleLogReservation?.();
         }
@@ -1008,12 +1465,17 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       };
       const releaseResponseBytes = () => {
         if (responseReleased) return;
+        releaseReservedResponseBytes(responseBufferedBytes);
         responseReleased = true;
-        if (responseBufferedBytes > bufferedResponseBytes) {
+      };
+      const releaseReservedResponseBytes = bytes => {
+        if (bytes <= 0) return;
+        if (responseReleased) return;
+        if (bytes > responseBufferedBytes || bytes > bufferedResponseBytes) {
           throw new Error('Response buffer reservation underflow');
         }
-        bufferedResponseBytes -= responseBufferedBytes;
-        responseBufferedBytes = 0;
+        bufferedResponseBytes -= bytes;
+        responseBufferedBytes -= bytes;
       };
       const reserveAuxiliaryResponseBytes = bytes => {
         if (bytes <= 0) return true;
@@ -1088,6 +1550,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             maxResponseBytes,
             upstreamResponseTimeoutMs,
             reserveResponseBytes,
+            releaseReservedResponseBytes,
           );
           return; // outer finally decrements inFlightProxied
         }
@@ -1096,14 +1559,26 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           body = normalizeCodexRequestBody(req, body);
         }
 
+        // Normalize the BYOK request exactly once, here — not inside
+        // forwardRequest, which recurses once per account and would stack the
+        // injection. Every retry and model fallback reuses this buffer.
+        if (byokMatch) {
+          const normalized = applyByokRequest(req, body);
+          body = normalized.body;
+          if (normalized.injected) byokStats.injected += 1;
+        }
+
         // Track request
         const reqId = ++requestCounter;
         hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
 
-        // tried429/tried5xx/authRetried hold account OBJECTS (not indexes), and
-        // `held` is the acquired account OBJECT — both stable across a concurrent
+        // tried429/tried5xx/authRetried/auth401 hold account OBJECTS (not indexes),
+        // and `held` is the acquired account OBJECT — both stable across a concurrent
         // removeAccount() re-index, so a release/exclude can't target the wrong account.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, continuity, continuityDeadlineAt: null, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs };
+        // auth401 = accounts that answered 401 after their refresh chance (cascade
+        // guard input + per-request exclusion); authParked = what THIS request parked,
+        // kept so a cascade can put it back.
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1132,7 +1607,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // response also tells us whether this request's model tier reports
             // the model-scoped weekly windows (ctx.sawModelWeekly → the Fable
             // limit) — the one property worth a one-way template upgrade.
-            if (ctx.advisorToolIndex == null
+            // A BYOK request carries a synthesized shape, so it must never be
+            // promoted to the fleet warm-up template — that would replay a
+            // third-party client's prompt across every account's probe.
+            if (ctx.advisorToolIndex == null && ctx.byok !== true
                 && (!probeTemplate || probeTemplate._restored
                   || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly))) {
               const candidate = stageProbeTemplate(req, body);
@@ -1185,6 +1663,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
               releaseRequestBytes(requestBufferedBytes);
             } finally {
               inFlightProxied--;
+              if (byokMatch) byokStats.inflight -= 1;
             }
           }
         }
@@ -1333,6 +1812,7 @@ async function relayRaw(
   maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
   upstreamResponseTimeoutMs = DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS,
   reserveResponseBytes = () => true,
+  releaseResponseBytes = () => {},
 ) {
   // Abort the relay if the client disconnects, so a hung upstream OAuth endpoint
   // can't pin this connection (and its admission-control inFlightProxied slot)
@@ -1366,6 +1846,7 @@ async function relayRaw(
       upstreamRes.body,
       maxResponseBytes,
       reserveResponseBytes,
+      releaseResponseBytes,
     );
     if (responseBody === null) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -1466,17 +1947,36 @@ async function raceTimeout(promise, timeoutMs, message) {
   }
 }
 
-async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true) {
+async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true, releaseBytes = () => {}) {
   if (!webStream) return Buffer.alloc(0);
   const reader = webStream.getReader();
   const chunks = [];
   let totalBytes = 0;
+  let reservedChunkBytes = 0;
+  let finalReservedBytes = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
-        if (!reserveBytes(totalBytes)) return null;
-        return Buffer.concat(chunks, totalBytes);
+        if (!reserveBytes(totalBytes)) {
+          releaseBytes(reservedChunkBytes);
+          reservedChunkBytes = 0;
+          return null;
+        }
+        finalReservedBytes = totalBytes;
+        let result;
+        try {
+          result = Buffer.concat(chunks, totalBytes);
+        } catch (error) {
+          releaseBytes(finalReservedBytes + reservedChunkBytes);
+          finalReservedBytes = 0;
+          reservedChunkBytes = 0;
+          throw error;
+        }
+        releaseBytes(reservedChunkBytes);
+        reservedChunkBytes = 0;
+        finalReservedBytes = 0;
+        return result;
       }
       const chunk = Buffer.from(value);
       totalBytes += chunk.length;
@@ -1484,9 +1984,11 @@ async function readBodyBounded(webStream, maxBytes, reserveBytes = () => true) {
         await reader.cancel().catch(() => {});
         return null;
       }
+      reservedChunkBytes += chunk.length;
       chunks.push(chunk);
     }
   } finally {
+    if (reservedChunkBytes > 0) releaseBytes(reservedChunkBytes);
     reader.releaseLock();
   }
 }
@@ -1764,6 +2266,11 @@ function nextModelFallback(ctx, req, body) {
   return null;
 }
 
+function logModelFallback(ctx, fallback, reason) {
+  const decision = ctx.provider === 'codex' ? 'codex-model-fallback' : 'Model fallback';
+  console.log(`[TeamClaude] ${decision}: ${ctx.model} → ${fallback.model} (${reason})`);
+}
+
 function startContinuityDeadline(ctx) {
   if (ctx.continuity.maxWaitMs <= 0) return null;
   if (ctx.continuityDeadlineAt == null) {
@@ -1783,22 +2290,12 @@ function sendSaved429(res, ctx) {
 function sendUpstreamTimeout(res, ctx, headers = { 'Content-Type': 'application/json' }) {
   if (res.destroyed || res.headersSent) return false;
   ctx.status = 502;
-  res.writeHead(502, {
-    ...headers,
-    'retry-after': headers['retry-after'] ?? String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
-  });
+  res.writeHead(502, headers);
   res.end(JSON.stringify({
     type: 'error',
     error: { type: 'proxy_error', message: 'Upstream response timed out.' },
   }));
   return true;
-}
-
-function fleetIsQuotaExhausted(accountManager, accounts, model) {
-  const candidates = accounts.filter(account => account.enabled !== false && account.status !== 'error');
-  return candidates.length > 0
-    && candidates.every(account => !accountManager._isDispatchFailureCoolingDown(account)
-      && (accountManager.isExhausted(account) || accountManager.isModelExhausted(account, model)));
 }
 
 function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
@@ -1812,6 +2309,17 @@ function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
 
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
+  // Fresh retry cycle = retryCount 0: the initial dispatch or ANY restart that
+  // recursed with 0 (fleet redemption, model fallback, continuity wait,
+  // overload backoff, network failover…). The one-shot backstop yield re-arms
+  // here — a single place no call site can forget — and only here plus
+  // restartRetryCycle() below; it stays armed inside a stale-429 cycle, which
+  // recurses with retryCount + 1.
+  if (retryCount === 0) ctx.resetCreditBackstopYielded = false;
+  const restartRetryCycle = () => {
+    retryCount = 0;
+    ctx.resetCreditBackstopYielded = false;
+  };
   if (ctx.provider === 'codex' && ctx.credentialType == null
       && accountManager.accounts.some(candidate => candidate.type === 'oauth'
         && accountManager._isModelUnsupported(candidate, ctx.model))) {
@@ -1828,6 +2336,31 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   };
   const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model);
   const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model);
+  // An account that already answered 401 to THIS request is auth-failed FOR this
+  // request even when the cascade guard deliberately left its status intact.
+  // Both fleet-wide "everyone failed auth" checks below must see that, or a
+  // request nobody will authenticate falls into the continuity capacity wait
+  // (and finally a 429) instead of surfacing its 401 promptly.
+  const authFailedForRequest = a => a.status === 'error' || ctx.auth401.has(a);
+  const fleetModelQuarantined = () => {
+    const candidates = accountManager.accounts.filter(candidate =>
+      candidate.enabled !== false
+      // `status !== 'error'` alone is not "usable by THIS request": the cascade
+      // guard deliberately leaves a 401'd account un-parked, so without the
+      // ctx.auth401 term an account this request can no longer select would
+      // still count as a live model-capable candidate. The codex pre-dispatch
+      // fallback then decides against a fallback it should have taken, and the
+      // request waits out the continuity deadline instead (adversarial review
+      // 2026-09-05).
+      && !ctx.auth401.has(candidate)
+      && candidate.status !== 'error'
+      && (ctx.provider !== 'codex' || ctx.credentialType == null
+        || candidate.type === ctx.credentialType));
+    return candidates.length > 0
+      && candidates.every(candidate => accountManager._isModelUnsupported(candidate, ctx.model));
+  };
+  const canUsePreDispatchFallback = () => ctx.provider !== 'codex'
+    || fleetModelQuarantined();
 
   // Reserve a per-account concurrency slot. On a 401 same-account refresh-retry
   // the slot is already held (ctx.held set, exclude unchanged) → reuse it.
@@ -1843,7 +2376,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (ctx.abortSignal?.aborted || res.destroyed) return;
 
     // On a failover retry, skip accounts already tried for this request.
-    const excludeForSelect = requestExclusions(new Set([...ctx.tried429, ...ctx.tried5xx]));
+    const excludeForSelect = requestExclusions(new Set([...ctx.tried429, ...ctx.tried5xx, ...ctx.auth401]));
     if (ctx.held != null) {
       account = ctx.held;
     } else {
@@ -1889,12 +2422,40 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const accts = ctx.provider === 'codex' && ctx.credentialType != null
       ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
       : accountManager.accounts;
-    const allAuthFailed = accts.length > 0 && accts.every(a => a.status === 'error');
+    const allAuthFailed = accts.length > 0 && accts.every(authFailedForRequest);
     const modelDeadEnd = !hasUsable(null) && !hasCapped(null);
-    if (!allAuthFailed && modelDeadEnd && fleetIsQuotaExhausted(accountManager, accts, ctx.model)) {
+    // Quota dead end with automatic reset credits on: redeem a "Full reset"
+    // on the best exhausted account and re-acquire, BEFORE any model fallback
+    // or the fail-fast 429 — the operator asked for the pool to keep serving
+    // the requested model while credits remain. Bounded per request by the
+    // pool size; each pass already walks every eligible candidate.
+    // ONE fleet pass per request: if the reset account still 429s afterwards
+    // (backend did not honour the reset), the request must fail fast rather
+    // than walk the pool spending one credit per account. A fleet-wide model
+    // quarantine is not a quota problem — let the model fallback handle it.
+    if (!allAuthFailed && modelDeadEnd && ctx.resetCredits
+        && ctx.resetCreditAttempts < 1 && !fleetModelQuarantined()) {
+      const pass = await ctx.resetCredits.fleet(
+        accts,
+        'fleet-exhausted',
+        ctx.model,
+        () => hasUsable(null) || hasCapped(null), // request-scoped "dead end resolved?"
+      );
+      // Only spend-capable work uses up the pass; a walk that found no
+      // eligible candidate leaves it for a later account-policy redemption.
+      if (pass.chargePass) ctx.resetCreditAttempts += 1;
+      if (ctx.abortSignal?.aborted || res.destroyed) return;
+      if (pass.redeemed) {
+        ctx.tried429.clear();
+        ctx.tried5xx.clear();
+        restartRetryCycle();
+        continue;
+      }
+    }
+    if (!allAuthFailed && modelDeadEnd && canUsePreDispatchFallback()) {
       const fallback = nextModelFallback(ctx, req, body);
       if (fallback) {
-        console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
+        logModelFallback(ctx, fallback, `no usable account for ${ctx.model}`);
         ctx.model = fallback.model;
         ctx.tried429.clear();
         ctx.tried5xx.clear();
@@ -1902,16 +2463,35 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
     }
     const canEventuallyRecover = accts.some(a => a.enabled !== false && a.status !== 'error');
+    const modelQuarantined = fleetModelQuarantined();
+    if (modelQuarantined) break;
     if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
 
     const status = accountManager.getStatus();
     const capped = hasCapped(null);
-    const retryAfter = capped
-      ? 1
-      : computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    const recovery = capped
+      ? null
+      : fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    const retryAfter = capped ? 1 : recovery.retryAfter;
     const deadlineMode = ctx.continuity.maxWaitMs > 0;
     const maxCapacityWaits = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
     if (!deadlineMode && ctx.capacityWaits >= maxCapacityWaits) break;
+    // Fail fast when waiting cannot help: the fleet is blocked by a KNOWN quota
+    // reset (not merely at its concurrency cap, and not the 60s quota-healthy
+    // fallback — an account excluded by a bare 429 may free up any second) and
+    // that reset lies beyond the remaining continuity budget — e.g. every
+    // account spent its WEEKLY window and the reset is days away. Polling until
+    // the deadline would only hold the client for the full budget before
+    // returning the very same 429 (2026-09-04). Finalize exactly as the
+    // deadline would (`failedFast` → saved upstream 429 replay still wins).
+    if (deadlineMode && recovery?.soonestKnown) {
+      const remainingMs = startContinuityDeadline(ctx) - Date.now();
+      if (recovery.soonestMs > remainingMs) {
+        console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — soonest recovery in ${retryAfter}s exceeds the ${Math.max(0, remainingMs)}ms continuity budget; failing fast`);
+        ctx.failedFast = true;
+        break;
+      }
+    }
     console.log(`[TeamClaude] No eligible capacity${ctx.model ? ` for ${ctx.model}` : ''} — waiting ${Math.min(retryAfter * 1000, ctx.continuity.maxSleepMs)}ms`);
     ctx.capacityWaits += 1;
     const waited = await ctx.continuity.waitFor(
@@ -1922,7 +2502,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (!waited) break;
     ctx.tried429.clear();
     ctx.tried5xx.clear();
-    retryCount = 0;
+    restartRetryCycle();
   }
   const releaseHeld = () => {
     if (ctx.held != null) {
@@ -1943,14 +2523,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const accts = ctx.provider === 'codex' && ctx.credentialType != null
       ? accountManager.accounts.filter(candidate => candidate.type === ctx.credentialType)
       : accountManager.accounts;
-    if (accts.length > 0 && accts.every(a => a.status === 'error')) {
+    if (accts.length > 0 && accts.every(authFailedForRequest)) {
       ctx.status = 401;
+      // A cascade means the accounts are still in rotation on purpose: telling
+      // the operator to re-login would send them after the wrong thing.
+      const requestScoped = ctx.authCascade && accts.some(a => a.status !== 'error');
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         type: 'error',
         error: {
           type: 'authentication_error',
-          message: `All ${accts.length} accounts failed authentication. Re-login required.`,
+          message: requestScoped
+            ? `All ${accts.length} accounts rejected this request's authentication; the accounts stay in rotation.`
+            : `All ${accts.length} accounts failed authentication. Re-login required.`,
         },
       }));
       return;
@@ -1962,10 +2547,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (!res.destroyed
         && !hasUsable(null)
         && !hasCapped(null)
-        && fleetIsQuotaExhausted(accountManager, accts, ctx.model)) {
+        && canUsePreDispatchFallback()) {
       const fallback = nextModelFallback(ctx, req, body);
       if (fallback) {
-        console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (no usable account for ${ctx.model})`);
+        logModelFallback(ctx, fallback, `no usable account for ${ctx.model}`);
         ctx.model = fallback.model;
         ctx.tried429.clear();
         ctx.tried5xx.clear();
@@ -1975,10 +2560,42 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const deadlineExpired = ctx.continuity.maxWaitMs > 0
       && ctx.continuityDeadlineAt != null
       && Date.now() >= ctx.continuityDeadlineAt;
-    if (deadlineExpired && sendSaved429(res, ctx)) return;
+    if ((deadlineExpired || ctx.failedFast) && sendSaved429(res, ctx)) return;
     ctx.status = 429;
-    const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts, accountManager.switchThreshold, ctx.model);
+    // Internal snapshot: identity is needed only to attribute the plan of the
+    // soonest-recovering account; it never leaves the process.
+    const status = accountManager.getStatus({ includeIdentity: true });
+    const recovery = fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    // A fleet-wide model quarantine (unsupported-model 400 contract) is not a
+    // usage limit: keep its own retry-after and the generic body.
+    const quarantineRetryAfter = modelQuarantineRetryAfter(accts, ctx.model);
+    const retryAfter = quarantineRetryAfter ?? recovery.retryAfter;
+    // Codex-native exhaustion body. The Codex CLI cannot read the generic
+    // rate_limit_error above ("exceeded retry limit, last status: 429"); it DOES
+    // natively render a 429 whose body is {error:{type:"usage_limit_reached",
+    // resets_at:<unix seconds>, plan_type}} ("You've hit your usage limit …
+    // try again at <time>"). Only for a QUOTA dead end (never a concurrency
+    // queue timeout) and only in deadline mode — the path the fail-fast above
+    // short-circuits; legacy polling keeps its historical body.
+    if (quarantineRetryAfter == null && ctx.provider === 'codex' && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0
+        && !hasUsable(null)
+        && !hasCapped(null)) {
+      const resetsAt = Math.floor(Date.now() / 1000) + retryAfter;
+      const planType = codexPoolPlanType(accountManager.accounts, recovery.soonestName);
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'retry-after': String(retryAfter),
+      });
+      res.end(JSON.stringify({
+        error: {
+          type: 'usage_limit_reached',
+          message: `TeamCodex pool exhausted: all ${accts.length} accounts have hit their usage limit. Resets at ${new Date(resetsAt * 1000).toISOString()} (in ${retryAfter}s).`,
+          ...(planType ? { plan_type: planType } : {}),
+          resets_at: resetsAt,
+        },
+      }));
+      return;
+    }
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -2005,26 +2622,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // request's account slot on a possibly-hung token endpoint).
   await raceAbort(accountManager.ensureTokenFresh(account), ctx.abortSignal);
   if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone — outer finally frees the slot
-
-  if (account.authRevoked === true) {
-    releaseHeld();
-    if (res.destroyed) return;
-    if (retryCount < maxRetries) {
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
-    }
-    ctx.status = 401;
-    if (!res.headersSent) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'authentication_error',
-          message: 'Account authentication was revoked. Re-login required.',
-        },
-      }));
-    }
-    return;
-  }
 
   if (typeof ctx.preferredAccountUuid === 'string') {
     const preferredStillEligible = account.accountUuid === ctx.preferredAccountUuid
@@ -2080,7 +2677,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   for (const [key, value] of Object.entries(req.headers)) {
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk) || connectionHeaders.has(lk)) continue;
-    if (lk === 'x-api-key' || lk === 'x-goog-api-key') continue;
+    if (lk === 'x-api-key') continue;
     if (lk === 'authorization') continue;
     if (lk === 'chatgpt-account-id') continue;
     if (lk === CODEX_INVOCATION_HEADER) continue;
@@ -2093,8 +2690,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   if (ctx.provider === 'codex') {
     headers['authorization'] = `Bearer ${account.credential}`;
     if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
-  } else if (ctx.provider === 'grok' || ctx.provider === 'agy') {
-    Object.assign(headers, providerAuthHeaders(ctx.provider, account));
   } else if (isOAuth) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
@@ -2106,7 +2701,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     && req.url.startsWith('/codex/');
   const upstreamUrl = hasDuplicatedCodexPrefix
     ? `${upstream.replace(/\/$/, '')}${req.url.slice('/codex'.length)}`
-    : buildProviderUpstreamUrl(ctx.provider, upstream, req.url);
+    : `${upstream}${req.url}`;
   const method = req.method;
   const replaySafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
   const metadataOnlyLog = ctx.provider === 'codex';
@@ -2151,7 +2746,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const continuityRemainingMs = ctx.continuityDeadlineAt == null
     ? null
     : Math.max(0, ctx.continuityDeadlineAt - Date.now());
-  if (continuityRemainingMs != null && continuityRemainingMs <= CONTINUITY_DISPATCH_GRACE_MS) {
+  if (continuityRemainingMs != null && continuityRemainingMs <= 1) {
     try {
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       if (sendSaved429(res, ctx)) return;
@@ -2174,6 +2769,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       body: ['GET', 'HEAD'].includes(method) ? undefined : body,
       signal: upstreamDeadline.signal,
     };
+    const dispatchedAt = Date.now();
     const upstreamRequest = ctx.provider === 'codex'
       ? requestUpstreamRaw(upstreamUrl, requestOptions)
       : fetch(upstreamUrl, { ...requestOptions, redirect: 'manual' });
@@ -2181,6 +2777,23 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const upstreamRes = await upstreamRequest;
     const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
     if (isStreaming && upstreamRes.status !== 429) upstreamDeadline.stopTimeout();
+    // A response to a request dispatched BEFORE this account's reset credit
+    // landed describes the pre-reset meter (e.g. a 429 that was already in
+    // flight on the last healthy account). Its x-codex headers must not
+    // re-mark the freshly reset account as exhausted, and a 429 from it is
+    // retried rather than throttled — otherwise the fleet would burn a second
+    // credit on another account for a window that is already open.
+    const staleAfterReset = ctx.provider === 'codex'
+      && Number.isFinite(account.quota?.codexResetCreditResetAt)
+      && dispatchedAt < account.quota.codexResetCreditResetAt;
+    // Inside the post-reset grace an ACCEPTED (non-429) response may still
+    // carry the pre-reset meter in its x-codex-* headers; folding it would
+    // re-mark the reset account at 100% and the authoritative poll could no
+    // longer lower it (it only refuses to RAISE). A 429 is folded regardless:
+    // the rejection itself is the evidence that the reset did not take.
+    const holdHeaderFold = staleAfterReset
+      || (ctx.provider === 'codex' && upstreamRes.status !== 429
+        && withinCodexResetCreditGrace(account.quota));
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -2197,8 +2810,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (Object.keys(rateLimitHeaders).some(k => k.startsWith('anthropic-ratelimit-unified-7d_'))) {
       ctx.sawModelWeekly = true;
     }
-    accountManager.updateQuota(account, rateLimitHeaders);
-
+    // A held fold still records the request itself (usage counters / lastUsed
+    // live in updateQuota): fold an empty header set instead of skipping.
+    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders);
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
@@ -2229,35 +2843,110 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
       // Refresh didn't help (failed / already retried / revoked-but-unexpired)
       // or it's an API-key account — fail this account out and switch.
-      if (account.status !== 'error') {
-        account.status = 'error';
-        account._errorFromRefresh = false;
-        account.errorReason = 'auth-rejected';
+      //
+      // Cascade guard: this account exhausted its refresh chance and still got
+      // 401, so record it. Once AUTH_401_CASCADE_THRESHOLD distinct accounts
+      // have done that for ONE request, the request is the common factor, not
+      // the credentials — stop parking, and put back what this request parked.
+      //
+      // Only UNEXPLAINED 401s count. An account that arrives here already
+      // parked carries evidence of its own (its refresh just failed, or its
+      // grant was revoked), so its 401 is already accounted for without blaming
+      // the request. Counting it would inflate the tally and let the NEXT
+      // account — whose 401 IS unexplained — trip the guard and escape parking
+      // (adversarial review 2026-09-05: with a degraded account visited first,
+      // a genuinely revoked account stayed in rotation, invisible to status).
+      // It needs no ctx.auth401 exclusion either: 'error' already removes it
+      // from selection.
+      if (account.status !== 'error') ctx.auth401.add(account);
+      if (!ctx.authCascade && ctx.auth401.size >= AUTH_401_CASCADE_THRESHOLD) {
+        ctx.authCascade = true;
+        const restored = [];
+        for (const parked of ctx.authParked) {
+          const target = parked.account;
+          // Revert ONLY a park this request still owns and that still reads
+          // exactly as this request wrote it. `_authParkSeq` is the ownership
+          // half: a later park stamps its own sequence, and `updateAccountTokens`
+          // (re-import / login) heals the status outright, so both outrank the
+          // revert. Credential GENERATION deliberately does NOT gate this:
+          // the background `refreshLapsedTokens` sweep bumps the generation
+          // while leaving an 'auth-revoked' park untouched (it only heals
+          // `_errorFromRefresh` accounts), so gating on it would strand a
+          // freshly-refreshed, perfectly valid account in the parked state —
+          // the exact outage this guard exists to prevent (Codex review
+          // 2026-09-05).
+          if (target._authParkSeq !== parked.seq
+              || target.status !== 'error'
+              || target.errorReason !== 'auth-revoked'
+              || target._errorFromRefresh !== false) continue;
+          target.status = parked.status;
+          if (parked.errorReason == null) delete target.errorReason;
+          else target.errorReason = parked.errorReason;
+          if (parked.errorFromRefresh === undefined) delete target._errorFromRefresh;
+          else target._errorFromRefresh = parked.errorFromRefresh;
+          // markAuthenticationError drops the usage-poll cause tag; put it back
+          // so the poll-quarantine healing rules keep applying to this account.
+          if (parked.errorFromUsagePoll !== undefined) target._errorFromUsagePoll = parked.errorFromUsagePoll;
+          delete target._authParkSeq;
+          restored.push(target.name);
+        }
+        ctx.authParked.length = 0;
+        console.log(`[TeamClaude] 401 from ${ctx.auth401.size} accounts on one request — request-scoped rejection, not parking accounts${restored.length > 0 ? ` (restored ${restored.join(', ')})` : ''}`);
+      }
+      if (ctx.authCascade) {
+        // Leave every account's status alone. An account already parked with
+        // its OWN evidence (a failed refresh) keeps that label untouched.
+        console.log(`[TeamClaude] 401 on "${account.name}" — left in rotation (request-scoped rejection)`);
+      } else if (account.status !== 'error') {
+        const before = {
+          status: account.status,
+          errorReason: account.errorReason ?? null,
+          errorFromRefresh: account._errorFromRefresh,
+          errorFromUsagePoll: account._errorFromUsagePoll,
+        };
+        accountManager.markAuthenticationError(account, 'auth-revoked');
+        // Claim the park only if it actually landed the way the rollback
+        // expects. markAuthenticationError has codex cancellation branches that
+        // park under a different reason (or not at all); those are not ours to
+        // revert, so they get no ownership stamp.
+        if (account.status === 'error' && account.errorReason === 'auth-revoked') {
+          const seq = ++authParkSeq;
+          account._authParkSeq = seq; // ownership stamp for the rollback above
+          ctx.authParked.push({ account, seq, ...before });
+        }
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
-      } else if (account.authRevoked !== true
-          && account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
         // A 401 on a still-valid token is account-level rejection evidence.
         // It must override a refresh-failure label so the sweep cannot revive it.
-        // The displayed reason follows the cause label for the same reason.
-        account._errorFromRefresh = false;
-        account.errorReason = 'auth-rejected';
+        accountManager.markAuthenticationError(account, 'auth-revoked');
       }
+      await accountManager.waitForAccountFlag(account).catch(err => {
+        console.error(`[TeamClaude] Failed to persist subscription state for "${account.name}": ${err.message}`);
+      });
       if (logDir) {
         appendLogSection(`=== RESPONSE 401 — auth failure, account marked error ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
         flushRequestLog(logDir, reqId, logSections, hooks);
       }
       if (res.destroyed) return;
       if (retryCount < maxRetries) {
-        releaseHeld(); // this account is now 'error'; fail over to another
+        // Parked ('error') or, under the cascade guard, merely excluded for this
+        // request via ctx.auth401 — either way this account is out of the next
+        // selection, so the failover cannot loop back onto it.
+        releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
-      // Every account failed auth — surface the 401 to the client.
+      // Retry budget spent with every attempt rejected — surface the 401.
       ctx.status = 401;
       if (!res.headersSent) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'authentication_error', message: 'All accounts failed authentication.' },
+          error: {
+            type: 'authentication_error',
+            message: ctx.authCascade
+              ? 'All attempted accounts rejected this request\'s authentication; the accounts stay in rotation.'
+              : 'All accounts failed authentication.',
+          },
         }));
       }
       return;
@@ -2273,6 +2962,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2296,6 +2986,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         if (ctx.subscriptionRecheckIntervalMs > 0) {
           account._subscriptionRecheckAt = Date.now() + ctx.subscriptionRecheckIntervalMs;
         }
+        const flagPersisted = await accountManager.waitForAccountFlag(account).then(
+          () => true,
+          err => {
+            console.error(`[TeamClaude] Failed to persist subscription state for "${account.name}": ${err.message}`);
+            return false;
+          },
+        );
         console.log(`[TeamClaude] 403 subscription access disabled on "${account.name}" — marking account error and switching`);
         if (logDir) {
           appendLogSection(`=== RESPONSE 403 — subscription access disabled, account marked error ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
@@ -2303,7 +3000,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }
         if (res.destroyed) return;
         const hasAlternative = hasUsable(null) || hasCapped(null);
-        if (retryCount < maxRetries && hasAlternative) {
+        if (flagPersisted && retryCount < maxRetries && hasAlternative) {
           releaseHeld();
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
         }
@@ -2333,6 +3030,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2346,13 +3044,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return;
       }
 
-      const inspectionBody = decodeBodyForInspection(
-        responseBody,
-        upstreamRes.headers.get('content-encoding'),
-        ctx.maxResponseBytes,
-      );
-      const modelUnsupported = inspectionBody != null
-        && isCodexChatGptModelUnsupported(inspectionBody, ctx.model);
+      let modelUnsupported = false;
+      if (ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+        try {
+          const inspectionBody = decodeBodyForInspection(
+            responseBody,
+            upstreamRes.headers.get('content-encoding'),
+            CODEX_ERROR_INSPECTION_MAX_BYTES,
+          );
+          modelUnsupported = inspectionBody != null
+            && isCodexChatGptModelUnsupported(inspectionBody, ctx.model);
+        } finally {
+          ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+        }
+      }
       if (modelUnsupported) {
         accountManager.markModelUnsupported(account, ctx.model);
         console.log(`[TeamClaude] codex-model-unsupported for ${ctx.model} — quarantined; POST was not replayed`);
@@ -2394,6 +3099,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         upstreamRes.body,
         ctx.maxResponseBytes,
         ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (responseBody === null) {
         ctx.status = 502;
@@ -2415,12 +3121,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             && (key === 'content-encoding' || key === 'content-length')) continue;
         responseHeaders[key] = value;
       }
-      const responseRetryAfter = responseHeaders['retry-after'];
-      if (responseRetryAfter == null
-          || (Number.isFinite(Number(responseRetryAfter)) && Number(responseRetryAfter) < 1)) {
+      if (responseHeaders['retry-after'] == null) {
         responseHeaders['retry-after'] = String(retryAfter);
       }
       ctx.last429 = { body: responseBody, headers: responseHeaders };
+
+      if (staleAfterReset && !res.destroyed && retryCount < maxRetries) {
+        console.log(`[TeamCodex] 429 on "${account.name}" was dispatched before its reset credit landed — ignoring it and retrying`);
+        if (logDir) {
+          appendLogSection(`=== RESPONSE 429 — dispatched before reset credit, retrying ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+          flushRequestLog(logDir, reqId, logSections, hooks);
+        }
+        releaseHeld();
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
 
       // A model-scoped exhaustion must only exclude this account for that model.
       // Globally throttling it would unnecessarily remove healthy Sonnet/Haiku
@@ -2438,10 +3152,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // a (possibly days-away) weekly reset or surfacing a 429, walk the
         // configured fallback chain — a rewrite to a still-served model keeps
         // the client's turn alive.
-        if (!res.destroyed && fleetIsQuotaExhausted(accountManager, accountManager.accounts, ctx.model)) {
+        {
           const fallback = nextModelFallback(ctx, req, body);
-          if (fallback) {
-            console.log(`[TeamClaude] Model fallback: ${ctx.model} → ${fallback.model} (fleet exhausted for ${ctx.model})`);
+          if (fallback && !res.destroyed) {
+            logModelFallback(ctx, fallback, `fleet exhausted for ${ctx.model}`);
             ctx.model = fallback.model;
             ctx.tried429.clear();
             ctx.tried5xx.clear();
@@ -2487,6 +3201,33 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       if (accountManager.isExhausted(account)) {
+        // Account policy: redeem a reset credit on THIS account and retry it
+        // here, before throttling/switching. (The fleet policy waits for the
+        // acquisition dead end instead, so rotation to a healthy account wins.)
+        // Once per account per request and only while the request's single
+        // redemption pass is unspent (a fleet pass earlier in this request
+        // already used it). The retry does NOT count toward maxRetries so a
+        // second 429 still reaches the normal throttle → dead end →
+        // Codex-native fail-fast body (never the legacy backstop).
+        if (ctx.resetCredits?.policy === 'account' && !res.destroyed
+            && ctx.resetCreditAttempts < 1
+            && !ctx.resetCreditRetried.has(account)) {
+          const attempt = await ctx.resetCredits.account(account, '429-exhausted', ctx.model);
+          // Any outcome that may have spent a credit (reset, reset with no
+          // windows, timeout/5xx) IS the request's single pass: the dead end
+          // that follows must fail fast, not walk the pool spending again.
+          if (attempt.kind !== 'no-spend') ctx.resetCreditAttempts = Math.max(ctx.resetCreditAttempts, 1);
+          if (attempt.reset) {
+            ctx.resetCreditRetried.add(account);
+            if (res.destroyed) return;
+            if (logDir) {
+              appendLogSection(`=== RESPONSE 429 — account quota exhausted, reset credit redeemed, retrying same account ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+              flushRequestLog(logDir, reqId, logSections, hooks);
+            }
+            releaseHeld();
+            return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+          }
+        }
         // (a) Account-level exhaustion: throttle this account (so
         // getActiveAccount skips it until it resets) and immediately
         // re-dispatch to another available account — never sleep holding the
@@ -2501,8 +3242,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         if (res.destroyed) return;
 
         // Safety backstop: each retry throttles a distinct account, so
-        // getActiveAccount returns null before this can fire. Cap anyway.
-        if (retryCount >= maxRetries) {
+        // getActiveAccount returns null before this can fire. Cap anyway —
+        // EXCEPT, exactly once per request, when it still holds an unspent
+        // reset-credit pass: retryCount is shared with non-throttling hops
+        // (5xx/auth/stale failovers), so under a 5xx burst it can hit the cap
+        // on the very 429 that empties the pool. That single extra recursion
+        // reaches the acquisition dead end, where the redemption (or the
+        // Codex-native fail-fast body) is decided; the one-shot flag keeps a
+        // pathological stale-429 loop from bypassing the cap forever.
+        const yieldToPass = ctx.resetCredits && ctx.resetCreditAttempts < 1 && !ctx.resetCreditBackstopYielded;
+        if (retryCount >= maxRetries && yieldToPass) {
+          ctx.resetCreditBackstopYielded = true;
+          console.log(`[TeamCodex] Retry cap reached on "${account.name}" with an unspent reset-credit pass — yielding once to the acquisition dead end`);
+        }
+        if (retryCount >= maxRetries && !yieldToPass) {
           ctx.status = 429;
           const ra = computeRetryAfter(accountManager.getStatus().accounts, accountManager.switchThreshold, ctx.model);
           if (!res.headersSent) {
@@ -2525,8 +3278,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // spreads to an idle account instead of failing. Crucially we do NOT
       // throttle the account: throttling on a request-global 429 would poison
       // the fleet for unrelated requests. The configured failover budget bounds
-      // this replay before continuity handling or passthrough; no
-      // account state is mutated either way.
+      // this replay before continuity handling or passthrough; no account
+      // state is mutated either way. A complete 429 rejection is replayable
+      // even for POST because upstream completed the rejection.
       ctx.tried429.add(account);
       const failoverLimit = ctx.continuity.rateLimitFailovers;
       if (!res.destroyed && retryCount < maxRetries && ctx.tried429.size <= failoverLimit
@@ -2545,7 +3299,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const deadlineAt = deadlineMode ? startContinuityDeadline(ctx) : null;
       const deadlineOpen = deadlineMode && Date.now() < deadlineAt;
       const legacyRetryOpen = !deadlineMode && ctx.overloadRetries < maxOverload;
-      if (ctx.continuity.enabled && !res.destroyed && (deadlineOpen || legacyRetryOpen)) {
+      // A BYOK 429 must not open the process-global cooldown: that variable is
+      // shared with every Claude Code session, so one third-party client's
+      // headerless 429 would stall the whole fleet. BYOK falls straight through
+      // to the pass-through 429 below and lets its own client back off.
+      if (ctx.continuity.enabled && ctx.byok !== true
+          && !res.destroyed && (deadlineOpen || legacyRetryOpen)) {
         const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
         const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
         const exponentialBackoff = Math.min(
@@ -2610,7 +3369,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // the provider may have accepted the request before the error surfaced.
       // Only exact-session TUI continuation may recover an unsafe POST.
       if (!replaySafe) {
-        accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
         console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
         ctx.status = code;
         if (logDir) {
@@ -2623,10 +3381,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             body,
             ctx,
             method,
-            {
-              'Content-Type': 'application/json',
-              'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
-            },
+            { 'Content-Type': 'application/json' },
           );
           res.writeHead(code, responseHeaders);
           res.end(JSON.stringify({
@@ -2734,14 +3489,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the supervisor only frames what the worker framed, so a local copy that
     // drifts would silently break recovery on whatever the two classify differently.
     if (isStreaming && upstreamRes.body) {
-      const contentEncoding = upstreamRes.headers.get('content-encoding');
       const parseStreamUsage = ctx.provider !== 'codex'
-        || !String(contentEncoding || '')
+        || !String(upstreamRes.headers.get('content-encoding') || '')
           .split(',')
           .some(encoding => encoding.trim() && encoding.trim().toLowerCase() !== 'identity');
-      const terminalTracker = ctx.provider === 'codex'
-        ? createCodexTerminalTracker(contentEncoding)
-        : null;
       const streamLog = logDir && !metadataOnlyLog
         ? {
             chunks: [],
@@ -2776,24 +3527,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.reserveAuxiliaryResponseBytes,
         ctx.releaseAuxiliaryResponseBytes,
         parseStreamUsage,
-        terminalTracker,
+        upstreamRes.headers.get('content-encoding'),
       );
       if (outcome.limitExceeded && !res.headersSent && !res.destroyed) {
-        if (!replaySafe && !outcome.bufferBudgetExceeded) {
-          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
-        }
         ctx.status = 502;
         res.writeHead(502, codexRecoveryResponseHeaders(
           req,
           body,
           ctx,
           method,
-          replaySafe
-            ? { 'Content-Type': 'application/json' }
-            : {
-                'Content-Type': 'application/json',
-                'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
-              },
+          { 'Content-Type': 'application/json' },
         ));
         res.end(JSON.stringify({
           type: 'error',
@@ -2810,7 +3553,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // an unsafe POST is surfaced as a retryable error for the client to
         // decide, avoiding a hidden duplicate execution inside the proxy.
         if (!replaySafe) {
-          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
           console.log(`[TeamClaude] Upstream stream ${outcome.preStreamFailure} after ${method} dispatch on "${account.name}" — not replaying`);
           if (logDir) {
             appendLogSection(`=== STREAM ${outcome.preStreamFailure} — unsafe request was not replayed ===`);
@@ -2870,18 +3612,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }));
         return;
       }
-      if (outcome.incompleteStream && !res.destroyed && !replaySafe) {
-        accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
-        console.log(`[TeamClaude] Codex stream ended without a terminal event on "${account.name}" — account cooled; response was not replayed`);
-      }
       if (outcome.injected) {
-        // Partial output is already committed, so recovery remains client-side.
-        // For a still-connected unsafe request, keep health/quota status intact
-        // but apply a short process-local cooldown before the client's retry.
-        if (!replaySafe && !res.destroyed) {
-          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
-        }
+        // NOT an account failure: the response was already partially delivered,
+        // so the only recovery that helps is the CLIENT retrying — which the
+        // injected error event triggers. No account state is mutated.
         console.log(`[TeamClaude] Upstream stream ${outcome.reason} on "${account.name}" — appended retryable error event for client-side retry`);
+      }
+      if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && outcome.responseCompleted) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
       }
       if (streamLog) {
         const truncation = streamLog.truncated
@@ -2892,38 +3635,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         streamLog.releaseBytes(streamLog.bytes);
         streamLog.bytes = 0;
         streamLog.chunks.length = 0;
+      } else if (logDir) {
+        flushRequestLog(logDir, reqId, logSections, hooks);
       }
     } else {
       // Buffer non-SSE bodies before sending headers so replay-safe methods can
       // recover from body-read failures and oversized upstream responses can be
       // rejected cleanly without exposing partial attacker-controlled bytes.
-      let responseBufferBudgetExhausted = false;
-      const reserveBufferedResponse = bytes => {
-        const reserved = ctx.reserveResponseBytes(bytes);
-        if (!reserved) responseBufferBudgetExhausted = true;
-        return reserved;
-      };
       const buf = await readBodyBounded(
         upstreamRes.body,
         ctx.maxResponseBytes,
-        reserveBufferedResponse,
+        ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
       );
       if (buf === null) {
-        if (!replaySafe && !responseBufferBudgetExhausted) {
-          accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
-        }
         ctx.status = 502;
         res.writeHead(502, codexRecoveryResponseHeaders(
           req,
           body,
           ctx,
           method,
-          replaySafe
-            ? { 'Content-Type': 'application/json' }
-            : {
-                'Content-Type': 'application/json',
-                'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
-              },
+          { 'Content-Type': 'application/json' },
         ));
         res.end(JSON.stringify({
           type: 'error',
@@ -2931,7 +3663,35 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }));
         return;
       }
-      extractUsageFromBody(buf, account, accountManager);
+      let responseCompleted = false;
+      if (ctx.provider === 'codex' && upstreamRes.headers.get('content-encoding')) {
+        if (ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+          try {
+            const inspectionBody = decodeBodyForInspection(
+              buf,
+              upstreamRes.headers.get('content-encoding'),
+              CODEX_ERROR_INSPECTION_MAX_BYTES,
+            );
+            if (inspectionBody != null) {
+              extractUsageFromBody(inspectionBody, account, accountManager);
+              responseCompleted = isCompletedCodexResponse(inspectionBody);
+            }
+          } finally {
+            ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+          }
+        }
+      } else {
+        extractUsageFromBody(buf, account, accountManager);
+        responseCompleted = isCompletedCodexResponse(buf);
+      }
+      if (ctx.provider === 'codex' && isCodexInferenceRequest(req)
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && responseCompleted) {
+        accountManager.markAccountSuccess(account);
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
+        });
+      }
       if (logDir && !metadataOnlyLog) {
         appendLogSection(formatLogBody('=== RESPONSE BODY', buf));
         flushRequestLog(logDir, reqId, logSections, hooks);
@@ -2958,8 +3718,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         releaseHeld();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
       }
-
-      if (!replaySafe) accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
 
       sendUpstreamTimeout(res, ctx, codexRecoveryResponseHeaders(
         req,
@@ -3008,7 +3766,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // account-local failover for replay-safe methods only. A network blip does
     // not poison the account; exclusion remains per-request via tried5xx.
     if (isTransient) {
-      if (!replaySafe) accountManager.markDispatchFailureCooldown(account, DISPATCH_FAILURE_COOLDOWN_MS);
       if (replaySafe && !res.headersSent && !res.destroyed && retryCount < maxRetries) {
         ctx.tried5xx.add(account);
         if (accountManager.anyUsable(ctx.tried5xx, ctx.model)
@@ -3025,10 +3782,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           body,
           ctx,
           method,
-          {
-            'Content-Type': 'application/json',
-            'retry-after': String(DISPATCH_FAILURE_RETRY_AFTER_SECONDS),
-          },
+          { 'Content-Type': 'application/json' },
         );
         res.writeHead(502, responseHeaders);
         res.end(JSON.stringify({
@@ -3054,6 +3808,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         account.errorReason = 'send-failed';
       }
       account.status = 'error';
+      account.errorReason = 'send-failed';
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }
@@ -3113,24 +3868,33 @@ async function streamResponse(
   reserveAuxiliaryResponseBytes = () => true,
   releaseAuxiliaryResponseBytes = () => {},
   parseUsage = true,
-  terminalTracker = null,
+  contentEncoding = null,
 ) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
   let sseBufferBytes = 0;
   let usageBufferDisabled = !parseUsage;
-  const framer = recover
+  const framer = recover && parseUsage
     ? new SseFramer({
         reserveBytes: reserveAuxiliaryResponseBytes,
         releaseBytes: releaseAuxiliaryResponseBytes,
-      })
+    })
     : null;
+  const terminalObserver = framer || (parseUsage ? new SseFramer() : null);
+  const encodedTerminalObserver = parseUsage
+    ? null
+    : createEncodedSseObserver(
+        contentEncoding,
+        reserveAuxiliaryResponseBytes,
+        releaseAuxiliaryResponseBytes,
+      );
   const bufferedFrames = transactional ? [] : null;
   let bufferedBytes = 0;
   let spillFile = null;
   let spillPath = null;
   let spillUnlinked = false;
+  let endedNormally = false;
   const streamDeadlineAt = Number.isFinite(streamTotalTimeoutMs)
     ? Date.now() + streamTotalTimeoutMs
     : Infinity;
@@ -3139,8 +3903,8 @@ async function streamResponse(
     reason: null,
     preStreamFailure: null,
     limitExceeded: false,
-    bufferBudgetExceeded: false,
-    incompleteStream: false,
+    completed: false,
+    responseCompleted: false,
   };
 
   // Append a well-formed retryable error frame and end. Only called when every
@@ -3249,7 +4013,6 @@ async function streamResponse(
     const reservationBytes = auxiliaryReservationBytes || bytes.length;
     if (!reserveResponseBytes(reservationBytes)) {
       outcome.limitExceeded = true;
-      outcome.bufferBudgetExceeded = true;
       return false;
     }
     if (auxiliaryReservationBytes > 0) {
@@ -3349,17 +4112,22 @@ async function streamResponse(
         if (framer) break; // client gone — nothing left to salvage
         throw err; // legacy mode: caller decides (destroys the client socket)
       }
-      if (step.done) break;
+      if (step.done) {
+        endedNormally = true;
+        break;
+      }
 
       // Client disconnected — stop reading from upstream
       if (res.destroyed) break;
 
-      await terminalTracker?.push(step.value);
       const bytes = framer ? framer.push(step.value) : step.value;
       if (framer?.limitExceeded) {
         outcome.limitExceeded = true;
-        outcome.bufferBudgetExceeded = framer.bufferBudgetExceeded;
         break;
+      }
+      if (!framer) {
+        if (encodedTerminalObserver) await encodedTerminalObserver.push(step.value);
+        else terminalObserver?.push(step.value);
       }
       if (!bytes || bytes.length === 0) continue; // partial frame still buffering
 
@@ -3377,13 +4145,6 @@ async function streamResponse(
     // Parse any remaining (partial / never-forwarded) text for usage tracking
     if (sseBuffer.trim()) {
       parseSSEUsage(sseBuffer, account, accountManager);
-    }
-
-    await terminalTracker?.finish?.();
-
-    if (!framer && terminalTracker && !terminalTracker.sawTerminal
-        && !res.destroyed && !res.writableEnded) {
-      outcome.incompleteStream = true;
     }
 
     if (framer && !res.destroyed && !res.writableEnded) {
@@ -3419,13 +4180,18 @@ async function streamResponse(
       // else: framing degraded to passthrough — the last relayed bytes may sit
       // mid-event, where an injected frame would corrupt the parse. End plainly.
     }
+    await encodedTerminalObserver?.finish();
+    outcome.completed = endedNormally && (!framer || framer.sawTerminal);
+    outcome.responseCompleted = endedNormally
+      && (terminalObserver?.sawResponseCompleted || encodedTerminalObserver?.sawResponseCompleted || false);
   } finally {
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (spillFile) await spillFile.close().catch(() => {});
     if (spillPath && !spillUnlinked) await unlink(spillPath).catch(() => {});
     framer?.dispose();
-    terminalTracker?.dispose();
+    if (!framer) terminalObserver?.dispose();
+    encodedTerminalObserver?.dispose();
     releaseAuxiliaryResponseBytes(sseBufferBytes);
     // Only end a response whose headers went out — a deferred-headers response
     // being handed back for replay (preStreamFailure) must stay untouched.
@@ -3501,11 +4267,46 @@ function extractUsageFromBody(buffer, account, accountManager) {
 // whole fleet's wait at the short fallback even when every other account is
 // hours from reset. Disabled/auth-error accounts never return on a timer, so
 // they're skipped. Falls back to 60s when nothing contributes anything.
+function modelQuarantineRetryAfter(accounts, model) {
+  if (typeof model !== 'string' || !model) return null;
+  const now = Date.now();
+  let soonest = Infinity;
+  let eligible = 0;
+  for (const account of accounts) {
+    if (account.enabled === false || account.status === 'error') continue;
+    eligible += 1;
+    const until = account.unsupportedModels instanceof Map
+      ? account.unsupportedModels.get(model)
+      : null;
+    if (!Number.isFinite(until) || until <= now) return null;
+    soonest = Math.min(soonest, until);
+  }
+  if (eligible === 0 || soonest === Infinity) return null;
+  return Math.max(1, Math.ceil((soonest - now) / 1000));
+}
+
 function computeRetryAfter(accounts, threshold = 0.98, model = null) {
+  return fleetRecovery(accounts, threshold, model).retryAfter;
+}
+
+// Soonest the fleet has anything to serve: `retryAfter` (whole seconds, for
+// headers/messages), `soonestMs` (the raw wait), and `soonestName` — the
+// account whose KNOWN reset/throttle sets that wait, or null when the minimum
+// is the 60s quota-healthy fallback (or the fleet is empty), i.e. when the
+// wait is a guess rather than a reset the proxy can compare a budget against.
+function fleetRecovery(accounts, threshold = 0.98, model = null) {
   const now = Date.now();
   const modelLabel = modelQuotaLabel(model);
   let soonest = Infinity;
-  const consider = ms => { if (ms > 0 && ms < soonest) soonest = ms; };
+  let soonestName = null;
+  // `known` marks a minimum set by an actual reset/throttle timestamp (vs the
+  // 60s quota-healthy guess). Tracked separately from the name because the
+  // public status snapshot redacts account names (includeIdentity=false) — the
+  // fail-fast decision must not silently disappear with the name.
+  let soonestKnown = false;
+  const consider = (ms, name = null, known = false) => {
+    if (ms > 0 && ms < soonest) { soonest = ms; soonestName = name ?? null; soonestKnown = known; }
+  };
   for (const acct of accounts) {
     if (acct.enabled === false || acct.status === 'error') continue;
     // freeAt = max(throttle, every over-threshold quota reset). The account is
@@ -3513,9 +4314,6 @@ function computeRetryAfter(accounts, threshold = 0.98, model = null) {
     // then gives the soonest the fleet has anything to serve.
     let freeAt = 0;
     if (acct.rateLimitedUntil) freeAt = Math.max(freeAt, new Date(acct.rateLimitedUntil).getTime());
-    if (acct.dispatchFailureCooldownUntil) {
-      freeAt = Math.max(freeAt, new Date(acct.dispatchFailureCooldownUntil).getTime());
-    }
     const q = acct.quota || {};
     if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
       freeAt = Math.max(freeAt, q.unified5hReset);
@@ -3537,8 +4335,43 @@ function computeRetryAfter(accounts, threshold = 0.98, model = null) {
     if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
-    if (freeAt > 0) consider(freeAt - now);
+    if (freeAt > 0) consider(freeAt - now, acct.name, true);
     else consider(60_000); // quota-healthy (merely capped/queued): a slot frees in seconds — cap the fleet wait at the short fallback
   }
-  return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
+  return {
+    retryAfter: soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000)),
+    soonestMs: soonest === Infinity ? null : soonest,
+    soonestName,
+    soonestKnown,
+  };
+}
+
+// Plan spellings the Codex CLI deserializes into a known plan (upstream
+// codex-rs/protocol/src/auth.rs `PlanType::from_str`, verified 2026-09-04). A
+// value outside this set is omitted from the usage-limit body rather than
+// risking an unparseable plan_type that would drop the CLI back to its opaque
+// "exceeded retry limit" path.
+const CODEX_KNOWN_PLAN_TYPES = new Set([
+  'free', 'go', 'plus', 'pro', 'prolite', 'team',
+  'self_serve_business_prolite', 'self_serve_business_usage_based',
+  'business', 'ent26', 'enterprise_cbp_automation', 'enterprise_cbp_usage_based',
+  'enterprise', 'hc', 'education', 'edu', 'edu_plus', 'edu_pro',
+]);
+
+// Plan to report for a fleet-wide codex exhaustion: the soonest-recovering
+// account's plan (that is the account whose reset the message quotes), else
+// the most common plan across the eligible pool. Null when unknown — the body
+// then omits plan_type instead of guessing.
+function codexPoolPlanType(accounts, soonestName = null) {
+  const eligible = accounts.filter(a => a.enabled !== false && a.status !== 'error'
+    && typeof a.planType === 'string' && CODEX_KNOWN_PLAN_TYPES.has(a.planType));
+  const soonest = soonestName == null ? null : eligible.find(a => a.name === soonestName);
+  if (soonest) return soonest.planType;
+  const counts = new Map();
+  for (const a of eligible) counts.set(a.planType, (counts.get(a.planType) || 0) + 1);
+  let best = null;
+  for (const [plan, n] of counts) {
+    if (best == null || n > best.n) best = { plan, n };
+  }
+  return best?.plan ?? null;
 }

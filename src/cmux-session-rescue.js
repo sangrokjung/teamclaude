@@ -5,11 +5,12 @@ import { promisify } from 'node:util';
 import {
   buildResumeCommand,
   claimSessionOnce,
-  hasUnresolvedLoginExpired,
+  hasUnresolvedRecoverableApiError,
   inspectClaudeProcess,
   readPrivateJson,
   resolveTrustedClaudePath,
   sameClaudeProcess,
+  unresolvedRecoverableApiErrorKind,
   validSession,
 } from './cmux-session-guards.js';
 
@@ -107,7 +108,7 @@ export async function rescueCmuxSessionsOnce({
   const currentSessions = sessions(store);
   for (const session of currentSessions) {
     if (!validSession(store, session)) continue;
-    if (!await hasUnresolvedLoginExpired(
+    if (!await hasUnresolvedRecoverableApiError(
       session.transcriptPath,
       transcriptRoot,
       session.sessionId,
@@ -127,7 +128,7 @@ export async function rescueCmuxSessionsOnce({
         || fresh.pid !== session.pid
         || fresh.workspaceId !== session.workspaceId
         || !validSession(freshStore, fresh)) continue;
-    if (!await hasUnresolvedLoginExpired(
+    if (!await hasUnresolvedRecoverableApiError(
       fresh.transcriptPath,
       transcriptRoot,
       fresh.sessionId,
@@ -154,11 +155,12 @@ export async function rescueCmuxSessionsOnce({
         || final.pid !== fresh.pid
         || final.workspaceId !== fresh.workspaceId
         || !validSession(finalStore, final)) continue;
-    if (!await hasUnresolvedLoginExpired(
+    const finalFailureKind = await unresolvedRecoverableApiErrorKind(
       final.transcriptPath,
       transcriptRoot,
       final.sessionId,
-    )) continue;
+    );
+    if (!finalFailureKind) continue;
     const finalInfo = await inspectProcess(final.pid);
     if (!await sameClaudeProcess(
       final,
@@ -173,6 +175,7 @@ export async function rescueCmuxSessionsOnce({
       nodePath,
       scriptPath,
       configPath,
+      continueLastPrompt: !['ambiguous_connection', 'ambiguous_dispatch'].includes(finalFailureKind),
     });
     try {
       if (!await claimRecovery(storePath, key)) {

@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const CODEX_REFRESH_ENDPOINT = 'https://auth.openai.com/oauth/token';
@@ -91,8 +92,20 @@ export async function refreshCodexAccessToken(
   });
 
   if (!response.ok) {
-    await response.body?.cancel();
-    throw new Error(`Codex token refresh failed (${response.status})`);
+    let terminalAuthentication = response.status === 401;
+    if (response.status === 400) {
+      const raw = await response.text().catch(() => '');
+      try {
+        terminalAuthentication = JSON.parse(raw)?.error === 'invalid_grant';
+      } catch {
+        terminalAuthentication = false;
+      }
+    } else {
+      await response.body?.cancel();
+    }
+    const error = new Error(`Codex token refresh failed (${response.status})`);
+    error.terminalAuthentication = terminalAuthentication;
+    throw error;
   }
 
   const data = await response.json();
@@ -144,6 +157,39 @@ export function codexCliNotFoundMessage(codexBin, env = process.env) {
   return env.TEAMCODEX_CODEX_BIN
     ? `Codex CLI not found at ${codexBin} — check TEAMCODEX_CODEX_BIN.`
     : `Codex CLI not found at ${codexBin}. Install it first.`;
+}
+
+export async function loginCodexCredentials({
+  codexBin = resolveCodexCliBin(),
+  deviceAuth = false,
+  env = process.env,
+  run = spawnSync,
+} = {}) {
+  const codexHome = await mkdtemp(join(tmpdir(), 'teamcodex-login-'));
+  const loginArgs = ['login', '-c', 'cli_auth_credentials_store="file"'];
+  if (deviceAuth) loginArgs.push('--device-auth');
+
+  try {
+    const result = run(codexBin, loginArgs, {
+      stdio: 'inherit',
+      env: { ...env, CODEX_HOME: codexHome },
+    });
+    if (result?.error) {
+      if (result.error.code === 'ENOENT') {
+        throw new Error(codexCliNotFoundMessage(codexBin, env));
+      }
+      throw new Error(`Failed to start Codex login: ${result.error.message}`);
+    }
+    if (result?.status !== 0) {
+      const status = result?.status ?? 1;
+      const error = new Error(`Codex login exited with status ${status}`);
+      error.exitCode = status;
+      throw error;
+    }
+    return await importCodexCredentials(join(codexHome, 'auth.json'));
+  } finally {
+    await rm(codexHome, { recursive: true, force: true });
+  }
 }
 
 export function buildCodexProxyArgs(port, userArgs) {

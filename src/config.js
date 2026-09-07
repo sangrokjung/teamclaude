@@ -3,14 +3,6 @@ import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, rmSyn
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
-import {
-  getProviderDefinition,
-  assertSupportedProvider,
-  normalizeProvider,
-  providerConfigFileName,
-  providerDefaultPort,
-  validateProviderAccounts,
-} from './provider-config.js';
 
 const DEFAULT_TOKEN_REFRESH_INTERVAL_MS = 300_000;
 const MIN_TOKEN_REFRESH_INTERVAL_MS = 60_000;
@@ -32,11 +24,6 @@ export function assertSafeProxyConfig(config) {
   if (typeof config?.proxy?.apiKey !== 'string' || config.proxy.apiKey.trim() === '') {
     throw new Error('Server startup requires a non-empty proxy.apiKey.');
   }
-  const provider = config?.provider == null
-    ? normalizeProvider(process.env.TEAMCLAUDE_PROVIDER)
-    : assertSupportedProvider(config.provider);
-  getProviderDefinition(provider);
-  validateProviderAccounts(provider, config?.accounts, { requireMetadata: true });
 }
 
 async function syncParentDirectory(path) {
@@ -270,7 +257,9 @@ function writeFileAtomicSync(path, data, mode = 0o600) {
 export function getConfigPath() {
   if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  const fileName = providerConfigFileName(process.env.TEAMCLAUDE_PROVIDER);
+  const fileName = process.env.TEAMCLAUDE_PROVIDER === 'codex'
+    ? 'teamcodex.json'
+    : 'teamclaude.json';
   return join(configDir, fileName);
 }
 
@@ -328,17 +317,16 @@ export function writeQuotaCacheSync(data) {
 }
 
 export function createDefaultConfig() {
-  const provider = normalizeProvider(process.env.TEAMCLAUDE_PROVIDER);
-  const definition = getProviderDefinition(provider);
+  const provider = process.env.TEAMCLAUDE_PROVIDER === 'codex' ? 'codex' : 'anthropic';
   return {
     provider,
     proxy: {
-      port: providerDefaultPort(provider),
+      port: provider === 'codex' ? 3457 : 3456,
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
     },
-    upstream: provider === 'agy'
-      ? (process.env.CLOUD_CODE_URL || definition.defaultUpstream)
-      : definition.defaultUpstream,
+    upstream: provider === 'codex'
+      ? 'https://chatgpt.com/backend-api/codex'
+      : 'https://api.anthropic.com',
     switchThreshold: 0.98,
     tokenRefreshIntervalMs: DEFAULT_TOKEN_REFRESH_INTERVAL_MS,
     // Max simultaneous in-flight requests per account before load spreads to the
@@ -393,6 +381,18 @@ export function createDefaultConfig() {
     claudeAutoResumeMaxRetries: 3,
     claudeAutoResumeBackoffMs: 2000,
     codexFallbackOnExhaustion: false,
+    // Codex mode: redeem the account's ChatGPT rate-limit reset credits (the
+    // free "Full reset" grants the Codex CLI lists under /usage) automatically
+    // when the pool is out of quota. Policy 'fleet' redeems only when NO pooled
+    // account can serve (the quota dead end that otherwise fails fast);
+    // 'account' additionally redeems on the account that just got an
+    // exhaustion 429 and retries it. Per-account cooldown after any attempt;
+    // `reserve` keeps that many credits untouched. Ignored unless provider=codex.
+    codexResetCredits: false,
+    codexResetCreditsPolicy: 'fleet',
+    codexResetCreditsCooldownMs: 1800000,
+    codexResetCreditsReserve: 0,
+    codexResetCreditsTimeoutMs: 10000,
     cmuxSessionRescue: false,
     cmuxSessionRescueIntervalMs: 1000,
     // Hard caps that bound proxy memory under a request flood.

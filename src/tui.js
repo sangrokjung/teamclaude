@@ -1,8 +1,8 @@
-import { importCredentials, fetchProfile, loginOAuth } from './oauth.js';
+import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
-import { importGrokCredentials, importAgyCredentials } from './provider-oauth.js';
-import { providerDefaultPort } from './provider-config.js';
 import { createHostTracker } from './system-metrics.js';
+import { subscriptionSnapshot } from './subscription.js';
+import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -21,9 +21,44 @@ const red = s => fg(31, s);
 const cyan = s => fg(36, s);
 const gray = s => fg(90, s);
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
-const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+function isWideCodePoint(codePoint) {
+  return (codePoint >= 0x1100 && codePoint <= 0x115f)
+    || (codePoint >= 0x2329 && codePoint <= 0x232a)
+    || (codePoint >= 0x2e80 && codePoint <= 0xa4cf)
+    || (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+    || (codePoint >= 0xf900 && codePoint <= 0xfaff)
+    || (codePoint >= 0xfe10 && codePoint <= 0xfe6f)
+    || (codePoint >= 0xff00 && codePoint <= 0xff60)
+    || (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+    || (codePoint >= 0x1f300 && codePoint <= 0x1faff)
+    || (codePoint >= 0x20000 && codePoint <= 0x3fffd);
+}
+
+function isCombiningCodePoint(codePoint) {
+  return (codePoint >= 0x300 && codePoint <= 0x36f)
+    || (codePoint >= 0x1ab0 && codePoint <= 0x1aff)
+    || (codePoint >= 0x1dc0 && codePoint <= 0x1dff)
+    || (codePoint >= 0x20d0 && codePoint <= 0x20ff)
+    || (codePoint >= 0xfe00 && codePoint <= 0xfe0f)
+    || (codePoint >= 0xe0100 && codePoint <= 0xe01ef);
+}
+
+export function displayWidth(value) {
+  let width = 0;
+  for (let i = 0; i < value.length;) {
+    if (value[i] === '\x1b') {
+      const end = value.indexOf('m', i);
+      if (end >= 0) { i = end + 1; continue; }
+    }
+    const codePoint = value.codePointAt(i);
+    if (codePoint == null) break;
+    if (!isCombiningCodePoint(codePoint)) width += isWideCodePoint(codePoint) ? 2 : 1;
+    i += codePoint > 0xffff ? 2 : 1;
+  }
+  return width;
+}
+
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -40,15 +75,19 @@ function truncate(s, w) {
       const end = s.indexOf('m', i);
       if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
     }
-    out += s[i];
-    visible++;
-    i++;
+    const codePoint = s.codePointAt(i);
+    if (codePoint == null) break;
+    const charWidth = isCombiningCodePoint(codePoint) ? 0 : isWideCodePoint(codePoint) ? 2 : 1;
+    if (visible + charWidth > w) break;
+    out += s.slice(i, i + (codePoint > 0xffff ? 2 : 1));
+    visible += charWidth;
+    i += codePoint > 0xffff ? 2 : 1;
   }
   return out + RESET;
 }
 
 /** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+export function fitLine(s, w) {
   const v = vw(s);
   if (v > w) return truncate(s, w);
   if (v < w) return s + ' '.repeat(w - v);
@@ -124,81 +163,6 @@ function findAccountByIdentity(accounts, account) {
   return accounts.find(candidate => sameAccountIdentity(candidate, account));
 }
 
-function authTimestamp(value) {
-  const timestamp = Number(value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
-  return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
-}
-
-function hasVerifiedAuthProof(stored, live, allowLegacyReauth = false) {
-  const verifiedAt = authTimestamp(stored?.authVerifiedAt);
-  const storedUuid = stored?.accountUuid || null;
-  if (!verifiedAt || !stored?.accessToken || !stored?.refreshToken
-      || !['reauth', 'import', 'login'].includes(stored.source)) return false;
-  const liveUuid = live?.accountUuid || null;
-  // Imports/logins must prove the same stable UUID on both sides. A legacy
-  // row has no identity to compare, so it cannot be revived by a same-name
-  // credential; the explicit reauth flow writes the UUID before this merge.
-  const explicitLegacyReauth = allowLegacyReauth
-    && stored.source === 'reauth'
-    && storedUuid
-    && !liveUuid
-    && typeof stored.name === 'string'
-    && typeof live?.name === 'string'
-    && stored.name.toLowerCase() === live.name.toLowerCase();
-  if ((!storedUuid || !liveUuid || storedUuid !== liveUuid) && !explicitLegacyReauth) return false;
-  if ((stored.authVerifiedAccountUuid || null) !== storedUuid) return false;
-  // Never let an absent/malformed revocation timestamp turn an unknown
-  // quarantine age into a zero floor.
-  if (stored.authRevoked === true && !authTimestamp(stored.authRevokedAt)) return false;
-  if (live?.authRevoked === true && !authTimestamp(live.authRevokedAt)) return false;
-  return verifiedAt > Math.max(
-    authTimestamp(live?.authRevokedAt),
-    authTimestamp(stored.authRevokedAt),
-  );
-}
-
-function mergeAuthState(existing, incoming) {
-  const merged = { ...existing, ...incoming };
-  const incomingProof = hasVerifiedAuthProof(incoming, existing, incoming.source === 'reauth');
-  const existingProof = hasVerifiedAuthProof(existing, existing);
-  if (existingProof && !incomingProof) {
-    for (const field of ['authRevoked', 'authRevokedAt', 'authVerifiedAt', 'authVerifiedAccountUuid', 'source']) {
-      if (existing[field] === undefined) delete merged[field];
-      else merged[field] = existing[field];
-    }
-  } else if (existing.authRevoked === true && !incomingProof) {
-    // A quarantined row keeps its credential/identity payload until an
-    // independently verified proof arrives. Merging a different UUID here
-    // would still install the wrong token even if the marker itself survived.
-    for (const field of [
-      'name', 'type', 'provider', 'accountUuid', 'accessToken', 'refreshToken',
-      'expiresAt', 'idToken', 'accountId', 'email', 'oauthIssuer', 'oauthClientId',
-      'authMethod', 'projectId', 'oauthTokenEndpoint', 'source',
-      'authVerifiedAt', 'authVerifiedAccountUuid', 'importFrom',
-    ]) {
-      if (existing[field] === undefined) delete merged[field];
-      else merged[field] = existing[field];
-    }
-    merged.authRevoked = true;
-    merged.authRevokedAt = Math.max(
-      authTimestamp(existing.authRevokedAt),
-      authTimestamp(incoming.authRevokedAt),
-    ) || existing.authRevokedAt || incoming.authRevokedAt;
-  }
-  return merged;
-}
-
-function applyClearFields(account, fields, existing = null) {
-  const proofClearsQuarantine = existing?.authRevoked !== true
-    || hasVerifiedAuthProof(account, existing, account?.source === 'reauth');
-  for (const field of fields || []) {
-    if (!proofClearsQuarantine
-        && (field === 'authRevoked' || field === 'authRevokedAt' || field === 'importFrom')) continue;
-    delete account[field];
-  }
-}
-
 function persistedAccount(snapshot, accountManager, account) {
   const configAccount = findAccountByIdentity(snapshot.accounts, account) || account;
   const liveAccount = findAccountByIdentity(accountManager.accounts, configAccount);
@@ -232,13 +196,9 @@ export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mu
     const current = findAccountByIdentity(diskConfig.accounts, account);
     const existing = previous || current;
     if (existing) {
-      const merged = mergeAuthState(existing, account);
-      applyClearFields(merged, mutation.clearFields, existing);
-      diskConfig.accounts[diskConfig.accounts.indexOf(existing)] = merged;
+      diskConfig.accounts[diskConfig.accounts.indexOf(existing)] = { ...existing, ...account };
     } else {
-      const created = { ...account };
-      applyClearFields(created, mutation.clearFields);
-      diskConfig.accounts.push(created);
+      diskConfig.accounts.push(account);
     }
     return;
   }
@@ -263,23 +223,14 @@ export function applyTuiAccountMutation(diskConfig, snapshot, accountManager, mu
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, reauthenticate, importCredentials: importAnthropicCredentials, fetchProfile: fetchAnthropicProfile, importProviderCredentials, onQuit }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, refreshQuota, reauthenticate, onQuit }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
     this.refreshQuota = refreshQuota;  // optional: forced fleet quota re-measure (R)
-    this.importAnthropicCredentials = importAnthropicCredentials || importCredentials;
-    this.fetchAnthropicProfile = fetchAnthropicProfile || fetchProfile;
-    this.importProviderCredentials = importProviderCredentials || (() => {
-      if (config?.provider === 'grok') return importGrokCredentials();
-      if (config?.provider === 'agy') return importAgyCredentials();
-      return null;
-    });
     this.reauthenticate = reauthenticate || (async () => {
-      const credentials = await loginOAuth();
-      const profile = await this.fetchAnthropicProfile(credentials.accessToken);
-      return { credentials, profile };
+      throw new Error('OAuth re-authentication is not configured');
     });
     this.onQuit = onQuit;
     this._host = createHostTracker(); // host CPU/RAM shown in the header
@@ -494,9 +445,6 @@ export class TUI {
 
   _keyAdd(k) {
     if (k === 'i') { this._doImport(); this.mode = 'normal'; }
-    else if (k === 'k' && (this.config.provider === 'grok' || this.config.provider === 'agy')) {
-      this._addLog(`${this.config.provider} subscription accounts use OAuth; API keys are not supported`);
-    }
     else if (k === 'k' && this.config.provider !== 'codex') {
       this.mode = 'input';
       this.inputPrompt = 'API key';
@@ -557,163 +505,11 @@ export class TUI {
   }
 
   _canReauthenticate(account) {
-    return Boolean(account
-      && account.type === 'oauth'
-      && (!account.provider || account.provider === 'anthropic')
-      && account.enabled !== false
-      && account.status === 'error'
-      && account.errorReason !== 'subscription-disabled'
-      && !account._reauthenticating);
+    return canReauthenticateTuiAccount(this, account);
   }
 
   _doReauthenticate(account) {
-    if (!this._canReauthenticate(account) || this._reauthPromise) return this._reauthPromise;
-    const wasRunning = this.running;
-    const previousLive = {
-      credential: account.credential,
-      accessToken: account.accessToken,
-      refreshToken: account.refreshToken,
-      expiresAt: account.expiresAt,
-      accountUuid: account.accountUuid,
-      status: account.status,
-      errorReason: account.errorReason,
-      errorFromRefresh: account._errorFromRefresh,
-      refreshRetryAt: account._refreshRetryAt,
-      authRevoked: account.authRevoked,
-      authRevokedAt: account.authRevokedAt,
-      authVerifiedAt: account.authVerifiedAt,
-      authVerifiedAccountUuid: account.authVerifiedAccountUuid,
-    };
-    const configAccount = account.accountUuid
-      ? this.config.accounts.find(a => a.accountUuid === account.accountUuid)
-      : this.config.accounts.find(a => a.name === account.name);
-    const previousConfig = configAccount ? { ...configAccount } : null;
-    const pinnedUuid = account.accountUuid || null;
-    let currentConfigAccount = null;
-
-    account._reauthenticating = true;
-    this._addLog(`Re-authentication required for "${account.name}" — opening browser...`);
-
-    const run = async () => {
-      if (wasRunning) this.stop();
-      try {
-        const result = await this.reauthenticate(account);
-        const credentials = result?.credentials || result;
-        const profile = result?.profile;
-        if (!credentials?.accessToken || !credentials?.refreshToken || credentials.expiresAt == null) {
-          throw new Error('OAuth login returned incomplete credentials');
-        }
-        if (!profile || profile.error) {
-          throw new Error(`could not verify the logged-in account${profile?.error ? `: ${profile.error}` : ''}`);
-        }
-        const sameUuid = Boolean(account.accountUuid && profile.accountUuid
-          && account.accountUuid === profile.accountUuid);
-        const sameEmail = !account.accountUuid && account.name && profile.email
-          && account.name.toLowerCase() === profile.email.toLowerCase();
-        if (!sameUuid && !sameEmail) {
-          throw new Error(`logged-in account does not match "${account.name}"`);
-        }
-        currentConfigAccount = pinnedUuid
-          ? this.config.accounts.find(a => a.accountUuid === pinnedUuid)
-          : this.config.accounts.find(a => a.name === account.name);
-        if (!currentConfigAccount
-            || (pinnedUuid && currentConfigAccount.name !== account.name)
-            || !this.am.accounts.includes(account)) {
-          throw new Error('selected account changed while re-authentication was in progress');
-        }
-        const newUuid = profile.accountUuid || account.accountUuid;
-        const authVerifiedAt = Date.now();
-        if (currentConfigAccount) {
-          Object.assign(currentConfigAccount, {
-            accessToken: credentials.accessToken,
-            refreshToken: credentials.refreshToken,
-            expiresAt: credentials.expiresAt,
-            accountUuid: newUuid,
-            source: 'reauth',
-            authVerifiedAt,
-            authVerifiedAccountUuid: newUuid || null,
-          });
-          delete currentConfigAccount.authRevoked;
-          delete currentConfigAccount.authRevokedAt;
-          delete currentConfigAccount.importFrom;
-        }
-
-        this.am.updateAccountTokens(account, {
-          accessToken: credentials.accessToken,
-          refreshToken: credentials.refreshToken,
-          expiresAt: credentials.expiresAt,
-        }, false);
-        account.accountUuid = newUuid;
-        account.authVerifiedAt = authVerifiedAt;
-        account.authVerifiedAccountUuid = newUuid || null;
-        const savedConfig = await this.saveConfig(this.config, {
-          type: 'upsert',
-          account: {
-            name: account.name,
-            type: account.type,
-            source: 'reauth',
-            accountUuid: newUuid,
-            accessToken: credentials.accessToken,
-            refreshToken: credentials.refreshToken,
-            expiresAt: credentials.expiresAt,
-            authVerifiedAt,
-            authVerifiedAccountUuid: newUuid || null,
-          },
-          previous: previousConfig,
-          clearFields: ['authRevoked', 'authRevokedAt', 'importFrom'],
-        });
-        if (!Array.isArray(savedConfig?.accounts)) {
-          throw new Error('re-authenticated account persistence could not be verified');
-        }
-        const persisted = findAccountByIdentity(savedConfig.accounts, {
-          name: account.name,
-          accountUuid: newUuid,
-        });
-        if (!persisted
-            || persisted.accessToken !== credentials.accessToken
-            || persisted.refreshToken !== credentials.refreshToken
-            || persisted.expiresAt !== credentials.expiresAt
-            || persisted.authRevoked === true
-            || persisted.authRevokedAt != null
-            || persisted.importFrom != null
-            || persisted.authVerifiedAt !== authVerifiedAt
-            || persisted.authVerifiedAccountUuid !== (newUuid || null)) {
-          throw new Error('re-authenticated account was not persisted');
-        }
-        this._addLog(`Re-authenticated "${account.name}" successfully`);
-      } catch (e) {
-        account.credential = previousLive.credential;
-        account.accessToken = previousLive.accessToken;
-        account.refreshToken = previousLive.refreshToken;
-        account.expiresAt = previousLive.expiresAt;
-        account.accountUuid = previousLive.accountUuid;
-        account.status = previousLive.status;
-        if (previousLive.errorReason === undefined) delete account.errorReason;
-        else account.errorReason = previousLive.errorReason;
-        if (previousLive.errorFromRefresh === undefined) delete account._errorFromRefresh;
-        else account._errorFromRefresh = previousLive.errorFromRefresh;
-        if (previousLive.refreshRetryAt === undefined) delete account._refreshRetryAt;
-        else account._refreshRetryAt = previousLive.refreshRetryAt;
-        if (previousLive.authRevoked === undefined) delete account.authRevoked;
-        else account.authRevoked = previousLive.authRevoked;
-        if (previousLive.authRevokedAt === undefined) delete account.authRevokedAt;
-        else account.authRevokedAt = previousLive.authRevokedAt;
-        if (previousLive.authVerifiedAt === undefined) delete account.authVerifiedAt;
-        else account.authVerifiedAt = previousLive.authVerifiedAt;
-        if (previousLive.authVerifiedAccountUuid === undefined) delete account.authVerifiedAccountUuid;
-        else account.authVerifiedAccountUuid = previousLive.authVerifiedAccountUuid;
-        if (currentConfigAccount && previousConfig) {
-          Object.keys(currentConfigAccount).forEach(key => delete currentConfigAccount[key]);
-          Object.assign(currentConfigAccount, previousConfig);
-        }
-        this._addLog(`Re-authentication failed for "${account.name}": ${e.message}`);
-      } finally {
-        delete account._reauthenticating;
-        if (wasRunning) this.start();
-      }
-    };
-    this._reauthPromise = run().finally(() => { this._reauthPromise = null; });
-    return this._reauthPromise;
+    return reauthenticateTuiAccount(this, account);
   }
 
   async _doImport() {
@@ -721,14 +517,10 @@ export class TUI {
       await this._doImportCodex();
       return;
     }
-    if (this.config.provider === 'grok' || this.config.provider === 'agy') {
-      await this._doImportProvider();
-      return;
-    }
     try {
       this._addLog('Importing credentials...');
-      const creds = await this.importAnthropicCredentials('~/.claude/.credentials.json');
-      const profile = await this.fetchAnthropicProfile(creds.accessToken);
+      const creds = await importCredentials('~/.claude/.credentials.json');
+      const profile = await fetchProfile(creds.accessToken);
       const profileOk = profile && !profile.error;
 
       if (!profileOk) {
@@ -753,10 +545,6 @@ export class TUI {
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
-        ...(profileOk && (profile.accountUuid || profile.email) ? {
-          authVerifiedAt: Date.now(),
-          authVerifiedAccountUuid: profile.accountUuid || null,
-        } : {}),
       };
 
       // Deduplicate: match by UUID first, then by name
@@ -765,7 +553,6 @@ export class TUI {
         : -1;
       if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
       let previous = null;
-      let verifiedReimport = false;
 
       if (idx >= 0) {
         // Preserve manual routing settings across a re-import (the new entry
@@ -773,34 +560,31 @@ export class TUI {
         // account / clear its priority).
         const prev = this.config.accounts[idx];
         previous = prev;
-        const amAcct = (prev.accountUuid && this.am.accounts.find(a => a.accountUuid === prev.accountUuid))
-          || this.am.accounts.find(a => a.name === prev.name);
-        const quarantined = prev.authRevoked === true || amAcct?.authRevoked === true;
-        verifiedReimport = quarantined
-          ? hasVerifiedAuthProof(entry, prev)
-            && (!amAcct || hasVerifiedAuthProof(entry, amAcct))
-          : profileOk && (prev.accountUuid
-            ? prev.accountUuid === profile.accountUuid
-            : Boolean(profile.email && prev.name
-              && prev.name.toLowerCase() === profile.email.toLowerCase()));
-        if (quarantined && !verifiedReimport) {
-          this._addLog(`Import rejected for "${name}" — account is quarantined; use re-authentication`);
-          return;
-        }
         if (prev.enabled !== undefined) entry.enabled = prev.enabled;
         if (prev.priority !== undefined) entry.priority = prev.priority;
+        if (prev.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = prev.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         // Update the running account manager entry, matched by IDENTITY (the
         // previous entry's UUID first, then name) — NOT the config index `idx`,
         // which can point at a different live account when a tokenless config entry
         // was skipped at load (config.accounts is not index-aligned with
         // accountManager.accounts).
+        const amAcct = (prev.accountUuid && this.am.accounts.find(a => a.accountUuid === prev.accountUuid))
+          || this.am.accounts.find(a => a.name === prev.name);
         if (amAcct) {
-          this.am.updateAccountTokens(amAcct, entry, false, {
-            clearAuthRevoked: !quarantined || verifiedReimport,
-          });
+          amAcct.credential = creds.accessToken;
+          amAcct.refreshToken = creds.refreshToken;
+          amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
+          if (amAcct.status === 'error') {
+            amAcct.status = 'active';
+            delete amAcct._errorFromRefresh;
+            delete amAcct.errorReason;
+          }
+          delete amAcct._refreshRetryAt;
         } else {
           // The matched config entry had no live AccountManager account (it was
           // skipped at load — e.g. previously tokenless). Now that we have fresh
@@ -814,74 +598,9 @@ export class TUI {
         this._addLog(`Imported account "${name}"`);
       }
 
-      await this.saveConfig(this.config, {
-        type: 'upsert',
-        account: entry,
-          previous,
-        clearFields: verifiedReimport ? ['authRevoked', 'authRevokedAt', 'importFrom'] : undefined,
-      });
-    } catch (e) {
-      this._addLog(`Import failed: ${e.message}`);
-    }
-  }
-
-  async _doImportProvider() {
-    const provider = this.config.provider;
-    try {
-      this._addLog(`Importing ${provider} subscription credentials...`);
-      const creds = await this.importProviderCredentials();
-      if (!creds?.accessToken || !creds.accountUuid) {
-        throw new Error(`${provider} import returned incomplete OAuth credentials`);
-      }
-      let name = creds.email || `${provider}-${String(creds.accountUuid).slice(0, 8)}`;
-      if (this.config.accounts.some(a => a.name === name && a.accountUuid !== creds.accountUuid)) {
-        let n = 1;
-        do { name = `${provider}-${n++}`; } while (this.config.accounts.some(a => a.name === name));
-      }
-      const entry = {
-        name,
-        provider,
-        type: 'oauth',
-        source: 'import',
-        accountUuid: creds.accountUuid,
-        accessToken: creds.accessToken,
-        refreshToken: creds.refreshToken ?? null,
-        expiresAt: creds.expiresAt,
-      };
-      for (const field of [
-        'email', 'oauthIssuer', 'oauthClientId', 'authMode', 'authMethod',
-        'projectId', 'oauthTokenEndpoint',
-      ]) {
-        if (creds[field] != null) entry[field] = creds[field];
-      }
-
-      const previousIndex = this.config.accounts.findIndex(a =>
-        (a.accountUuid && a.accountUuid === entry.accountUuid) || a.name === name);
-      const previous = previousIndex >= 0 ? this.config.accounts[previousIndex] : null;
-      if (previous?.enabled !== undefined) entry.enabled = previous.enabled;
-      if (previous?.priority !== undefined) entry.priority = previous.priority;
-      if (previous?.maxConcurrent !== undefined) entry.maxConcurrent = previous.maxConcurrent;
-
-      if (previousIndex >= 0) {
-        this.config.accounts[previousIndex] = entry;
-        const live = this.am.accounts.find(a =>
-          (a.accountUuid && a.accountUuid === entry.accountUuid) || a.name === previous.name);
-        if (live) {
-          this.am.updateAccountTokens(live, entry);
-          live.name = entry.name;
-          live.provider = provider;
-        } else {
-          this.am.addAccount(entry);
-        }
-        this._addLog(`Updated ${provider} account "${name}"`);
-      } else {
-        this.config.accounts.push(entry);
-        this.am.addAccount(entry);
-        this._addLog(`Imported ${provider} account "${name}"`);
-      }
       await this.saveConfig(this.config, { type: 'upsert', account: entry, previous });
     } catch (e) {
-      this._addLog(`${provider} import failed: ${e.message}`);
+      this._addLog(`Import failed: ${e.message}`);
     }
   }
 
@@ -917,6 +636,9 @@ export class TUI {
         previous = this.config.accounts[idx];
         if (previous.enabled !== undefined) entry.enabled = previous.enabled;
         if (previous.priority !== undefined) entry.priority = previous.priority;
+        if (previous.subscriptionCancellation !== undefined) {
+          entry.subscriptionCancellation = previous.subscriptionCancellation;
+        }
         this.config.accounts[idx] = entry;
         const live = this.am.accounts.find(a =>
           a.accountUuid === creds.accountId || a.name === previous.name);
@@ -1121,23 +843,6 @@ export class TUI {
 
   // ── rendering ──────────────────────────────────────
 
-  _provider() {
-    return this.config.provider || 'anthropic';
-  }
-
-  _brandLabel() {
-    return {
-      anthropic: 'TeamClaude',
-      codex: 'TeamCodex',
-      grok: 'TeamGrok',
-      agy: 'TeamAgy',
-    }[this._provider()] || 'TeamClaude';
-  }
-
-  _proxyPort() {
-    return this.config.proxy?.port || providerDefaultPort(this._provider());
-  }
-
   render() {
     if (!this.running) return;
     const W = process.stdout.columns || 80;
@@ -1151,8 +856,8 @@ export class TUI {
     const lines = [];
 
     // ── Header
-    const left = bold(` ${this._brandLabel()}`);
-    const port = this._proxyPort();
+    const left = bold(this.config.provider === 'codex' ? ' TeamCodex' : ' TeamClaude');
+    const port = this.config.proxy?.port || (this.config.provider === 'codex' ? 3457 : 3456);
     // Host CPU/RAM at a glance (render loop ticks often enough for live CPU%).
     // Thresholds mirror the quota bars: calm → green-ish default, 70%+ warns,
     // 90%+ screams — this box dying from overload is a real failure mode.
@@ -1267,17 +972,25 @@ export class TUI {
     if (a.enabled === false) {
       status = gray('disabled');
     } else {
-      switch (a.status) {
-        case 'active':    status = isCur ? green('active') : 'active'; break;
-        case 'throttled': status = yellow('throttled'); break;
-        case 'exhausted': status = red('exhausted'); break;
-        // The structured 403 means organization access is denied; it does not
-        // prove payment delinquency. Keep it distinct from generic auth error.
-        // ASCII on purpose: double-width Hangul would break rpad().
-        case 'error':     status = red(a.errorReason === 'subscription-disabled'
+      const subscription = subscriptionSnapshot(a);
+      if (subscription.state === 'ended') {
+        status = red('sub ended');
+      } else if (a.status === 'error') {
+        status = red(a.errorReason === 'subscription-disabled'
           ? 'access'
-          : this._canReauthenticate(a) ? 'reauth' : 'error'); break;
-        default:          status = a.status || 'ready';
+          : this._canReauthenticate(a) ? 'reauth' : 'error');
+      } else if (subscription.state === 'end-date-reached') {
+        status = yellow('sub due');
+      } else if (subscription.state === 'cancellation-scheduled') {
+        status = yellow('canceling');
+      } else {
+        switch (a.status) {
+          case 'active':    status = isCur ? green('active') : 'active'; break;
+          case 'throttled': status = yellow('throttled'); break;
+          case 'exhausted': status = red('exhausted'); break;
+          case 'error':     status = red('error'); break;
+          default:          status = a.status || 'ready';
+        }
       }
     }
     status = rpad(status, 10);
@@ -1344,28 +1057,19 @@ export class TUI {
     switch (this.mode) {
       case 'normal': {
         const selected = this._selected();
-        if (!selected) {
-          return ` [${bold('a')}] Add account  [${bold('R')}] Reload  [${bold('q')}] Quit`;
-        }
         const reauth = this._canReauthenticate(selected)
           ? `  ${red('재인증 필요')} [${bold('r')}]`
           : '';
-        return ` [${bold('d')}] Delete account  Selected: ${bold(selected.name)}${reauth}  ${dim('↑↓')} Select  [${bold('s')}] Switch  [${bold('e')}] Enable/disable  [${bold('o')}] Order  [${bold('a')}] Add  [${bold('R')}] Reload  [${bold('q')}] Quit`;
+        return ` ${dim('↑↓')} select  ${bold('s')}witch  ${bold('e')}toggle  ${bold('o')}rder  ${bold('d')}elete${reauth}  ${bold('a')}dd  ${bold('R')}eload  ${bold('q')}uit`;
       }
-      case 'select': {
-        const selected = this._selected();
-        return ` ${red(`Delete account "${selected?.name || '?'}"?`)}  [${bold('Enter')}] Confirm delete  [${bold('Esc')}] Cancel  ${dim('↑↓ Change target')}`;
-      }
+      case 'select':
+        return ` ${dim('↑↓')} select  ${bold('Enter')} delete  ${bold('Esc')} cancel`;
       case 'order':
         return ` ${dim('↑↓')} move (up = preferred)  ${bold('a')}uto-all (reset order, weekly-reset)  ${bold('c')}lear rank  ${bold('Enter')}/${bold('Esc')} done`;
       case 'add':
-        if (this.config.provider === 'codex') {
-          return ` ${bold('i')}mport Codex login  ${bold('Esc')} cancel`;
-        }
-        if (this.config.provider === 'grok' || this.config.provider === 'agy') {
-          return ` ${bold('i')}mport ${this.config.provider} OAuth  (or run teamcodex ${this.config.provider} login)  ${bold('Esc')} cancel`;
-        }
-        return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
+        return this.config.provider === 'codex'
+          ? ` ${bold('i')}mport Codex login  ${bold('Esc')} cancel`
+          : ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
         return ` ${this.inputPrompt}: ${this.inputBuf}█`;
       default:
