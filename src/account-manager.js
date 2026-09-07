@@ -128,9 +128,55 @@ function emptyQuota() {
   };
 }
 
+// Default overshoot allowance for a quota reserve, in utilization points.
+const DEFAULT_RESERVE_GUARD_BAND = 0.05;
+
+// `allowZero` separates the two uses: a headroom of 0 means "do not reserve this
+// window" (returned as null), while a guardBand of 0 is a legitimate "no
+// overshoot allowance".
+function normalizeReserveFraction(value, { allowZero = false } = {}) {
+  if (!Number.isFinite(value)) return null;
+  if (value < 0 || value >= 1) return null;
+  if (!allowZero && value === 0) return null;
+  return value;
+}
+
+// A Claude Design credential is bound to ONE claude.ai account and spends that
+// account's quota WITHOUT passing through this proxy, so proxy inference has to
+// leave headroom on it or design work stops. `quotaReserve` names that account
+// and how much of each window to keep free.
+//
+// This is deliberately a TOP-LEVEL config key rather than a per-account field:
+// the import/login paths preserve only `enabled`, `priority` and `maxConcurrent`
+// on an existing account entry, so a per-account reserve would be silently
+// dropped on the next re-login — exactly the accounts most likely to be touched.
+//
+// Shape: { accountUuid | name, session, weekly, guardBand? }, each fraction the
+// portion of that window to keep FREE. A malformed value yields null (no
+// reserve) rather than throwing: failing open preserves rotation.
+export function normalizeQuotaReserve(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const accountUuid = typeof raw.accountUuid === 'string' && raw.accountUuid ? raw.accountUuid : null;
+  const name = typeof raw.name === 'string' && raw.name ? raw.name : null;
+  if (!accountUuid && !name) return null;
+  const session = normalizeReserveFraction(raw.session);
+  const weekly = normalizeReserveFraction(raw.weekly);
+  if (session === null && weekly === null) return null;
+  const rawGuard = normalizeReserveFraction(raw.guardBand, { allowZero: true });
+  const guardBand = rawGuard === null ? DEFAULT_RESERVE_GUARD_BAND : rawGuard;
+  // headroom + guardBand reaching 1 would clamp the ceiling to 0, and because
+  // the comparison is `>=` that holds the account out even on a brand-new
+  // window with utilization 0 — a permanent, unrecoverable disable, which is
+  // the opposite of this function's fail-open contract. Reject instead.
+  if (session !== null && session + guardBand >= 1) return null;
+  if (weekly !== null && weekly + guardBand >= 1) return null;
+  return { accountUuid, name, session, weekly, guardBand };
+}
+
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256) {
+  constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256, quotaReserve = null) {
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
+    this.quotaReserve = normalizeQuotaReserve(quotaReserve);
     // Hard cap on the overflow queue so a flood of concurrent requests can't grow
     // it (and the buffered bodies / sockets / timers it pins) without bound. Past
     // this depth acquireAccount rejects immediately (→ 429) instead of queuing.
@@ -185,12 +231,20 @@ export class AccountManager {
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
+      // Last logged quota-reserve state. Initialized so the first _isAvailable
+      // pass doesn't read undefined and log a spurious "rejoining rotation".
+      _reserveHeld: false,
       _subscriptionFlagPromise: Promise.resolve(),
       _accountWritePending: false,
       };
     });
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    // Announce the reserve once at startup. A typo like `"session": 40` or
+    // `"session": "0.4"` normalizes to null and silently protects nothing, which
+    // looks identical to a working reserve from the outside — so say plainly
+    // whether one is armed, and against which account.
+    this._logReserveConfig(quotaReserve);
     this.reevalIntervalMs = reevalIntervalMs;
     this.lastEvalAt = 0; // 0 forces a priority pick on the first request
     this.maxWarmupTries = 3; // give up warming an account after this many unmeasured attempts
@@ -963,7 +1017,90 @@ export class AccountManager {
     if (this._isModelUnsupported(account, model)) return false;
     if (this._isNearQuota(account, model)) return false;
 
+    // The reserved account stays IN rotation (unlike `enabled: false`) but stops
+    // accepting new inference once it crosses its ceiling, so the credential
+    // bound to it keeps usable quota. Gating here rather than in _isNearQuota
+    // leaves that predicate — and every usableCount assertion built on it —
+    // meaning exactly what it meant before.
+    if (this._isReserveExceeded(account)) {
+      this._noteReserveState(account, true);
+      return false;
+    }
+    this._noteReserveState(account, false);
+
     return true;
+  }
+
+  // Utilization ceilings for the reserved account, or null for every other
+  // account (and whenever no reserve is configured, so the default fleet
+  // behaves exactly as it did before this feature existed).
+  _reserveCeilings(account) {
+    const reserve = this.quotaReserve;
+    if (!reserve || !account) return null;
+    // uuid first, then name — the same order every other lookup in this codebase
+    // uses. The name fallback matters: the import/login path overwrites
+    // accountUuid from a profile fetch that only warns on failure, so a network
+    // blip would otherwise drop the reserve even though the name still matches.
+    const matches = (reserve.accountUuid && account.accountUuid === reserve.accountUuid)
+      || (reserve.name && account.name === reserve.name);
+    if (!matches) return null;
+    const ceiling = (headroom) => (headroom === null
+      ? null
+      : Math.max(0, 1 - headroom - reserve.guardBand));
+    return { session: ceiling(reserve.session), weekly: ceiling(reserve.weekly) };
+  }
+
+  // An UNMEASURED window must never reserve the account out: quota is null on a
+  // cold start and again right after a window rollover, and parking the account
+  // on missing data would remove it from rotation with no evidence at all.
+  _isReserveExceeded(account) {
+    const ceilings = this._reserveCeilings(account);
+    if (!ceilings) return false;
+    const quota = account.quota;
+    if (ceilings.session !== null
+      && Number.isFinite(quota.unified5h)
+      && quota.unified5h >= ceilings.session) return true;
+    if (ceilings.weekly !== null
+      && Number.isFinite(quota.unified7d)
+      && quota.unified7d >= ceilings.weekly) return true;
+    return false;
+  }
+
+  // Public predicate for callers outside this class (server.js needs to treat a
+  // reserve hold the same as "this account cannot serve" when deciding whether
+  // the fleet is out of quota for a model — otherwise selection dead-ends while
+  // the model-fallback chain still thinks the fleet is healthy).
+  isReserveHeld(account) {
+    return this._isReserveExceeded(account);
+  }
+
+  _logReserveConfig(raw) {
+    if (raw == null) return;
+    if (!this.quotaReserve) {
+      console.warn('[TeamClaude] quotaReserve is present in config but could not be parsed — NO account is protected. Expected { accountUuid | name, session, weekly, guardBand? } with fractions in [0,1).');
+      return;
+    }
+    const target = this.accounts.find(a => this._reserveCeilings(a));
+    const label = this.quotaReserve.name || this.quotaReserve.accountUuid;
+    if (!target) {
+      console.warn(`[TeamClaude] quotaReserve targets "${label}" but no such account is configured — NO account is protected.`);
+      return;
+    }
+    const ceilings = this._reserveCeilings(target);
+    const fmt = (v) => (v === null ? 'none' : v.toFixed(2));
+    console.log(`[TeamClaude] Quota reserve armed on "${target.name}": session ceiling ${fmt(ceilings.session)}, weekly ceiling ${fmt(ceilings.weekly)}`);
+  }
+
+  // Log only on transition. _isAvailable runs on every selection pass, so an
+  // unconditional log here would flood the activity pane.
+  _noteReserveState(account, held) {
+    if (!this.quotaReserve || !this._reserveCeilings(account)) return;
+    if (account._reserveHeld === held) return;
+    account._reserveHeld = held;
+    const quota = account.quota;
+    console.log(held
+      ? `[TeamClaude] Account "${account.name}" held out of rotation by quota reserve (5h ${quota.unified5h}, 7d ${quota.unified7d})`
+      : `[TeamClaude] Account "${account.name}" back under its quota reserve, rejoining rotation`);
   }
 
   _isModelUnsupported(account, model) {
@@ -1110,6 +1247,12 @@ export class AccountManager {
       if (account.errorReason === 'subscription-ended') continue;
       if (this._isModelUnsupported(account, model)) continue;
       if (this._isModelNearQuota(account, model)) continue;
+      // A reserved-out account must not be revived here either. This path
+      // mutates state before returning (status, rateLimitedUntil, currentIndex),
+      // and _tryAcquire re-gates on _isAvailable — so recovering it would park
+      // the sticky primary on an account that can never serve and repeat the
+      // mutation on every subsequent request.
+      if (this._isReserveExceeded(account)) continue;
       const resetTime = account.rateLimitedUntil
         || account.quota.unified5hReset
         || account.quota.unified7dReset
@@ -1983,7 +2126,12 @@ export class AccountManager {
     return account.enabled !== false
       && account.status === 'active'
       && !throttled
-      && !this._isNearQuota(account);
+      && !this._isNearQuota(account)
+      // Mirrors the _isAvailable gate so status/usableCount agree with routing.
+      // With no reserve configured this is always false, so existing counts are
+      // unchanged. (Deliberately not _noteReserveState here — status is polled,
+      // and logging a transition from a read path would flood the log.)
+      && !this._isReserveExceeded(account);
   }
 
   /**
