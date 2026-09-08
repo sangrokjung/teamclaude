@@ -193,6 +193,35 @@ function isCompletedCodexResponse(body) {
 const MODEL_EXHAUST_WAIT_PASSES = 10;
 const TRANSACTION_MEMORY_BYTES = 1024 * 1024;
 const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const EMPTY_BYTES = Buffer.alloc(0);
+const SSE_EVENT_BOUNDARY = Buffer.from('\n\n');
+
+/**
+ * Append `bytes` to the pending raw SSE buffer and split off every complete
+ * event on the byte-level "\n\n" boundary. Returns the complete events (raw
+ * bytes, boundary stripped) and the remaining incomplete tail — always a copy
+ * for the tail so the concatenated chunk can be garbage-collected. Splitting
+ * on bytes keeps this exact for any UTF-8 payload: the boundary is ASCII, so it
+ * can never fall inside a multi-byte character (a text-level split cannot say
+ * the same once a chunk ends mid-character).
+ */
+function splitSseEvents(pending, bytes) {
+  const joined = pending.length === 0
+    ? Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    : Buffer.concat([pending, bytes]);
+  const events = [];
+  let start = 0;
+  for (
+    let idx = joined.indexOf(SSE_EVENT_BOUNDARY, start);
+    idx !== -1;
+    idx = joined.indexOf(SSE_EVENT_BOUNDARY, start)
+  ) {
+    events.push(joined.subarray(start, idx));
+    start = idx + SSE_EVENT_BOUNDARY.length;
+  }
+  const rest = start === joined.length ? EMPTY_BYTES : Buffer.from(joined.subarray(start));
+  return { events, rest };
+}
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
@@ -2775,7 +2804,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       : fetch(upstreamUrl, { ...requestOptions, redirect: 'manual' });
     ctx.preferredAccountUuid = null;
     const upstreamRes = await upstreamRequest;
-    const isStreaming = isEventStream(upstreamRes.headers.get('content-type'));
+    const contentType = upstreamRes.headers.get('content-type');
+    let isStreaming = isEventStream(contentType);
+    // The Codex backend can omit Content-Type on successful Responses SSE.
+    // Its explicit stream request still identifies that wire format.
+    if (!contentType && ctx.provider === 'codex' && req.method === 'POST'
+        && isCodexResponsesPath(req.url) && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+      try { isStreaming = JSON.parse(body.toString()).stream === true; }
+      catch { /* Invalid request JSON does not establish a streaming response. */ }
+    }
     if (isStreaming && upstreamRes.status !== 429) upstreamDeadline.stopTimeout();
     // A response to a request dispatched BEFORE this account's reset credit
     // landed describes the pre-reset meter (e.g. a 429 that was already in
@@ -3871,8 +3908,15 @@ async function streamResponse(
   contentEncoding = null,
 ) {
   const reader = webStream.getReader();
-  const decoder = new TextDecoder();
-  let sseBuffer = '';
+  // Usage-parsing side buffer, kept as RAW BYTES and split on the SSE event
+  // boundary as bytes ("\n\n" is ASCII, so the split can never land inside a
+  // multi-byte UTF-8 sequence). Reservations are in raw bytes too, so the
+  // ledger below stays exact. Decoding text first (TextDecoder in streaming
+  // mode) retained partial characters inside the decoder, made the re-encoded
+  // retained length disagree with the bytes reserved, and threw
+  // "Auxiliary response buffer reservation underflow" on the next flush —
+  // which left the client response open forever (2026-09-08 incident).
+  let sseBuffer = EMPTY_BYTES;
   let sseBufferBytes = 0;
   let usageBufferDisabled = !parseUsage;
   const framer = recover && parseUsage
@@ -3938,16 +3982,14 @@ async function streamResponse(
     if (!usageBufferDisabled) {
       if (!reserveAuxiliaryResponseBytes(bytes.length)) {
         releaseAuxiliaryResponseBytes(sseBufferBytes);
-        sseBuffer = '';
+        sseBuffer = EMPTY_BYTES;
         sseBufferBytes = 0;
         usageBufferDisabled = true;
       } else {
         sseBufferBytes += bytes.length;
-        const text = decoder.decode(bytes, { stream: true });
-        sseBuffer += text;
-        const events = sseBuffer.split('\n\n');
-        sseBuffer = events.pop(); // keep incomplete event
-        const retainedBytes = Buffer.byteLength(sseBuffer);
+        const { events, rest } = splitSseEvents(sseBuffer, bytes);
+        sseBuffer = rest; // keep incomplete event (raw bytes)
+        const retainedBytes = sseBuffer.length;
         releaseAuxiliaryResponseBytes(sseBufferBytes - retainedBytes);
         sseBufferBytes = retainedBytes;
         // Usage parsing is best-effort: a "partial event" that grows this large is
@@ -3955,12 +3997,12 @@ async function streamResponse(
         // read either way. Drop it instead of buffering without bound.
         if (sseBuffer.length > 1_048_576) {
           releaseAuxiliaryResponseBytes(sseBufferBytes);
-          sseBuffer = '';
+          sseBuffer = EMPTY_BYTES;
           sseBufferBytes = 0;
           usageBufferDisabled = true;
         }
         for (const event of events) {
-          parseSSEUsage(event, account, accountManager);
+          parseSSEUsage(event.toString('utf8'), account, accountManager);
         }
       }
     }
@@ -4143,8 +4185,9 @@ async function streamResponse(
     if (outcome.limitExceeded) return outcome;
 
     // Parse any remaining (partial / never-forwarded) text for usage tracking
-    if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, account, accountManager);
+    if (sseBuffer.length > 0) {
+      const trailing = sseBuffer.toString('utf8');
+      if (trailing.trim()) parseSSEUsage(trailing, account, accountManager);
     }
 
     if (framer && !res.destroyed && !res.writableEnded) {
