@@ -165,6 +165,12 @@ function createEncodedSseObserver(contentEncoding, reserveBytes, releaseBytes) {
     get sawResponseCompleted() {
       return !failed && framer.sawResponseCompleted;
     },
+    // Which terminal event ended the decoded stream (see SseFramer.terminalEvent),
+    // so an encoded codex stream that ends with an upstream `error` /
+    // `response.failed` is recognised exactly like an identity-encoded one.
+    get terminalEvent() {
+      return failed ? null : framer.terminalEvent;
+    },
     dispose() {
       decoder.destroy();
       framer.dispose();
@@ -4275,7 +4281,8 @@ async function streamResponse(
     outcome.responseCompleted = endedNormally
       && (terminalObserver?.sawResponseCompleted || encodedTerminalObserver?.sawResponseCompleted || false);
   } finally {
-    outcome.terminalEvent = framer?.terminalEvent || terminalObserver?.terminalEvent || null;
+    outcome.terminalEvent = framer?.terminalEvent || terminalObserver?.terminalEvent
+      || encodedTerminalObserver?.terminalEvent || null;
     // Cancel upstream reader to stop consuming data nobody needs
     reader.cancel().catch(() => {});
     if (spillFile) await spillFile.close().catch(() => {});

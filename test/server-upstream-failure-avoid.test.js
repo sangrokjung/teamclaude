@@ -12,6 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { gzipSync, gunzipSync } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
@@ -52,6 +53,19 @@ function measure(am) {
   return am;
 }
 
+// An encoded upstream body carries content-length, so the client sees 'end' as
+// soon as the bytes land — a few ms before the proxy finishes decoding the
+// tail and arms the steer-away. A real CLI reconnects only after its backoff;
+// the test waits explicitly instead of assuming that ordering.
+async function waitForAvoid(account, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!(account.avoidUntil > Date.now())) {
+    if (Date.now() > deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  return true;
+}
+
 function tokenOf(req) {
   const auth = req.headers['authorization'] || '';
   return auth.replace(/^Bearer\s+/i, '');
@@ -72,11 +86,10 @@ function keepAliveClient() {
       const localPort = res.socket?.localPort ?? null;
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({
-        status: res.statusCode,
-        text: Buffer.concat(chunks).toString('utf8'),
-        localPort,
-      }));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks);
+        resolve({ status: res.statusCode, text: raw.toString('utf8'), raw, localPort });
+      });
     });
     req.on('error', reject);
     req.end(body);
@@ -156,6 +169,57 @@ test('codex: an upstream in-stream error terminal is relayed verbatim, and the r
     assert.equal(retry.localPort, first.localPort, 'the reconnect reused the keep-alive socket');
     assert.equal(retry.status, 200);
     assert.match(retry.text, /response\.completed/);
+    assert.deepEqual(hits, ['tok-a', 'tok-b'], 'the reconnect is steered away from the failing account');
+  } finally {
+    client.destroy();
+    closeAll(proxy, upstream);
+  }
+});
+
+test('codex: a gzip-encoded upstream stream that ends with an error terminal is detected and the reconnect is steered away', async () => {
+  // The Codex backend may answer with a compressed SSE body; the proxy keeps
+  // the bytes encoded and watches the terminal through the encoded observer.
+  // That observer must report the terminal event too, or this whole class of
+  // failure would never steer (adversarial review finding, 2026-09-16).
+  const hits = [];
+  const errorStream = gzipSync(Buffer.from(
+    'event: response.created\ndata: {"type":"response.created"}\n\n'
+    + 'event: error\ndata: {"type":"error","message":"An error occurred while processing your request. Please include the request ID 7339907b in your message."}\n\n',
+  ));
+  const okStream = gzipSync(Buffer.from(
+    'event: response.created\ndata: {"type":"response.created"}\n\n'
+    + 'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+  ));
+  const upstream = http.createServer((req, res) => {
+    const tok = tokenOf(req);
+    hits.push(tok);
+    const payload = tok === 'tok-a' ? errorStream : okStream;
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'content-encoding': 'gzip',
+      'content-length': String(payload.length),
+    });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const am = measure(new AccountManager(accounts({ provider: 'codex', accountId: 'ws-1' }), 0.98));
+  const proxy = createProxyServer(am, {
+    provider: 'codex', upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false, codexUsageRefresh: false,
+  });
+  const proxyPort = await listen(proxy);
+  const client = keepAliveClient();
+  try {
+    const body = JSON.stringify({ model: 'gpt-5', stream: true, input: [] });
+    const headers = { accept: 'text/event-stream' };
+    const first = await client.send(proxyPort, '/codex/responses', body, headers);
+    assert.equal(first.status, 200);
+    assert.match(gunzipSync(first.raw).toString('utf8'), /request ID 7339907b/,
+      'the encoded error stream reaches the client byte-for-byte');
+    assert.equal(await waitForAvoid(am.accounts[0]), true, 'the encoded error terminal was recognised');
+
+    const retry = await client.send(proxyPort, '/codex/responses', body, headers);
+    assert.equal(retry.localPort, first.localPort, 'the reconnect reused the keep-alive socket');
+    assert.equal(retry.status, 200);
     assert.deepEqual(hits, ['tok-a', 'tok-b'], 'the reconnect is steered away from the failing account');
   } finally {
     client.destroy();
