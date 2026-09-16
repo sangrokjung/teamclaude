@@ -120,6 +120,17 @@ function decodeBodyForInspection(body, contentEncoding, maxBytes) {
 // the legacy no-replay passthrough.
 const CODEX_CAPACITY_REPLAY_STATUS = new Set([503, 529]);
 
+// The admission predicate for that replay. Exported so the client-side
+// guards (`headersSent` / `writableEnded` / `destroyed`) can be pinned by a
+// unit test with a fake `res` — through the HTTP black box the proxy never
+// sends headers before the 5xx handler runs, so `headersSent` cannot be
+// exercised end-to-end. Pure: reads flags only, no side effects.
+export function codexCapacityReplayEligible({ replaySafe, provider, method, url, status, res }) {
+  return !replaySafe && provider === 'codex' && method === 'POST'
+    && isCodexResponsesPath(url) && CODEX_CAPACITY_REPLAY_STATUS.has(status)
+    && res != null && !res.headersSent && !res.writableEnded && !res.destroyed;
+}
+
 function isCodexCapacityRejectionBody(decoded) {
   let parsed;
   try {
@@ -3503,9 +3514,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // and by TEAMCODEX_OVERLOAD_HOLD_MS (total hold per client request; 0
       // disables the exception). No account state is mutated on this path.
       let codexReplayable = false;
-      if (!replaySafe && ctx.provider === 'codex' && method === 'POST'
-          && isCodexResponsesPath(req.url) && CODEX_CAPACITY_REPLAY_STATUS.has(code)
-          && !res.headersSent && !res.writableEnded && !res.destroyed) {
+      if (codexCapacityReplayEligible({
+        replaySafe, provider: ctx.provider, method, url: req.url, status: code, res,
+      })) {
         codexReplayable = await readCodexCapacityRejection(upstreamRes, ctx);
       } else {
         await upstreamRes.body?.cancel();

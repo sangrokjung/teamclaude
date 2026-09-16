@@ -10,7 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, codexCapacityReplayEligible } from '../src/server.js';
 
 const PINNED_503 = /^Upstream overloaded \(HTTP 503\)\. Request was not replayed\.$/;
 const ENV_KEYS = [
@@ -50,6 +50,17 @@ function closeServer(server) {
     server.closeAllConnections();
   });
 }
+
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail('condition was not met before timeout');
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function drainRequest(request) {
   for await (const chunk of request) {
@@ -396,3 +407,71 @@ test('anthropic-mode unsafe POST 503 with a JSON body is not replayed (unchanged
     await Promise.all([closeServer(proxy), closeServer(upstream)]);
   }
 }));
+
+// (c5) The client is gone before the delayed 503 arrives: `res.destroyed` is
+// already true when the 5xx handler runs, so the rejection must never be
+// replayed onto another account — the upstream hit count stays at 1 (checked
+// again after the whole fast backoff window) and account state is untouched.
+test('codex JSON 503 arriving after the client aborted is never replayed', () => withEnv(FAST_ENV, async () => {
+  let upstreamHits = 0;
+  let releaseUpstream;
+  const upstreamGate = new Promise(resolve => { releaseUpstream = resolve; });
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    upstreamHits++;
+    if (upstreamHits === 1) {
+      await upstreamGate; // hold the 503 until the client has hung up
+      try { jsonRejection(res); } catch { /* proxy may have dropped the socket */ }
+      return;
+    }
+    ok200(res); // a replay would land here — it must not
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const before = snapshotAccounts(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const client = http.request({
+      host: '127.0.0.1', port: proxyPort, method: 'POST', path: '/codex/responses',
+      headers: { 'content-type': 'application/json' },
+    });
+    client.on('error', () => {}); // "socket hang up" is the expected outcome
+    const clientClosed = new Promise(resolve => client.once('close', resolve));
+    client.end(JSON.stringify({ model: 'gpt-5.6', input: [] }));
+    await waitFor(() => upstreamHits === 1); // request is in the upstream's hands
+    client.destroy();                        // client goes away first
+    await clientClosed;
+    await sleep(50);                         // let the proxy observe res 'close'
+    releaseUpstream();                       // now the 503 JSON arrives
+    await sleep(400);                        // > failover + 2×~50ms backoff window
+    assert.equal(upstreamHits, 1, 'a 503 that arrives after the client is gone must not be replayed');
+    assert.deepEqual(snapshotAccounts(manager), before, 'no account state may change');
+    await waitFor(() => manager.accounts.every(account => account.inflight === 0));
+    await sleep(100);
+    assert.equal(upstreamHits, 1, 'still no replay after the slot was released');
+  } finally {
+    await Promise.all([closeServer(proxy), closeServer(upstream)]);
+  }
+}));
+
+// (c6) Helper-level pin of the client-side guards. `headersSent` cannot be
+// reached through the HTTP black box (the proxy writes no headers before the
+// 5xx handler), so the exported admission predicate is checked with fake `res`
+// objects directly.
+test('codexCapacityReplayEligible refuses once headers were sent, the response ended, or the socket died', () => {
+  const fresh = { headersSent: false, writableEnded: false, destroyed: false };
+  const base = { replaySafe: false, provider: 'codex', method: 'POST', url: '/codex/responses', status: 503, res: fresh };
+  assert.equal(codexCapacityReplayEligible(base), true);
+  assert.equal(codexCapacityReplayEligible({ ...base, status: 529 }), true);
+  assert.equal(codexCapacityReplayEligible({ ...base, url: '/codex/responses?trace=1' }), true);
+  assert.equal(codexCapacityReplayEligible({ ...base, res: { ...fresh, headersSent: true } }), false, 'headers already sent');
+  assert.equal(codexCapacityReplayEligible({ ...base, res: { ...fresh, writableEnded: true } }), false, 'response already ended');
+  assert.equal(codexCapacityReplayEligible({ ...base, res: { ...fresh, destroyed: true } }), false, 'client socket gone');
+  assert.equal(codexCapacityReplayEligible({ ...base, res: null }), false);
+  assert.equal(codexCapacityReplayEligible({ ...base, status: 502 }), false, 'only 503/529 qualify');
+  assert.equal(codexCapacityReplayEligible({ ...base, status: 507 }), false);
+  assert.equal(codexCapacityReplayEligible({ ...base, provider: undefined, url: '/v1/messages' }), false, 'anthropic mode');
+  assert.equal(codexCapacityReplayEligible({ ...base, method: 'GET', replaySafe: true }), false, 'replay-safe methods use the normal path');
+  assert.equal(codexCapacityReplayEligible({ ...base, url: '/codex/other' }), false, 'responses path only');
+});
