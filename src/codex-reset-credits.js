@@ -58,6 +58,30 @@ export function parseCodexResetCreditsAvailable(payload) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+export function codexUsageConfirmsExhaustion(payload, threshold = 1, now = Date.now()) {
+  if (!Number.isFinite(threshold) || threshold <= 0 || threshold > 1) return false;
+  const limits = [payload?.rate_limit,
+    ...(Array.isArray(payload?.additional_rate_limits)
+      ? payload.additional_rate_limits.filter(item => item?.limit_name === 'codex').map(item => item.rate_limit)
+      : [])];
+  const seen = new Set();
+  for (const limit of limits) {
+    for (const window of [limit?.primary_window, limit?.secondary_window]) {
+      if (!window) continue;
+      const minutes = window.window_minutes ?? (window.limit_window_seconds / 60);
+      if (![300, 10080].includes(minutes) || seen.has(minutes)) continue;
+      seen.add(minutes);
+      const used = window.used_percent;
+      const reset = typeof window.reset_at === 'number'
+        ? window.reset_at * (window.reset_at < 1_000_000_000_000 ? 1000 : 1)
+        : typeof window.reset_after_seconds === 'number' ? now + window.reset_after_seconds * 1000 : NaN;
+      if (typeof used === 'number' && Number.isFinite(used) && used >= threshold * 100
+          && Number.isFinite(reset) && reset > now) return true;
+    }
+  }
+  return false;
+}
+
 /** Is `now` inside the post-reset grace window of this quota? */
 export function withinCodexResetCreditGrace(quota, now = Date.now(), graceMs = CODEX_RESET_CREDIT_GRACE_MS) {
   const resetAt = quota?.codexResetCreditResetAt;
@@ -89,6 +113,8 @@ export function codexResetCreditEligibility(account, {
   cooldownMs = DEFAULT_CODEX_RESET_CREDITS_COOLDOWN_MS,
   isExhausted,
   canServe,
+  isBlocked,
+  allowInFlight = true,
 } = {}) {
   if (!account || account.provider !== 'codex' || account.type !== 'oauth') {
     return { eligible: false, reason: 'not-codex-oauth' };
@@ -97,6 +123,9 @@ export function codexResetCreditEligibility(account, {
   if (account.status === 'error') return { eligible: false, reason: 'error' };
   if (account.authRevoked === true) return { eligible: false, reason: 'auth-revoked' };
   if (!account.credential) return { eligible: false, reason: 'no-credential' };
+  if (typeof isBlocked === 'function' && isBlocked(account) === true) {
+    return { eligible: false, reason: 'blocked' };
+  }
   const quota = account.quota || {};
   // A redemption already in flight on this account is joinable (single-flight
   // shares its outcome): the ledger guards (credit count, reserve, pending,
@@ -106,7 +135,7 @@ export function codexResetCreditEligibility(account, {
   // (can this account serve the model, is it actually exhausted) still apply,
   // so an operator-initiated redemption on a healthy or quarantined account
   // cannot capture an automatic request's single pass.
-  const inFlight = Boolean(account._resetCreditPromise);
+  const inFlight = allowInFlight && Boolean(account._resetCreditPromise);
   if (!inFlight) {
     const credits = quota.codexResetCredits;
     if (!Number.isInteger(credits)) return { eligible: false, reason: 'credits-unknown' };
@@ -269,7 +298,9 @@ export async function consumeCodexResetCredit({
 export function codexResetCreditOutcomeKind(outcome) {
   const code = outcome?.code;
   if (code === 'reset') {
-    return outcome.windowsReset === 0 ? 'spent-no-reset' : 'reset';
+    if (outcome.windowsReset === 0) return 'spent-no-reset';
+    return Number.isInteger(outcome.windowsReset) && outcome.windowsReset > 0
+      ? 'reset' : 'indeterminate';
   }
   if (code === 'nothing_to_reset' || code === 'no_credit' || code === 'already_redeemed') return 'no-spend';
   if (typeof code === 'string' && /^http_4\d\d$/.test(code)) return 'no-spend';
@@ -306,11 +337,15 @@ export function applyCodexResetCreditOutcome(account, outcome, now = Date.now())
     quota.codexResetCreditLastOutcome = 'reset_no_windows';
     return false;
   }
+  if (!Number.isInteger(outcome.windowsReset) || outcome.windowsReset < 1) {
+    quota.codexResetCreditLastOutcome = 'reset_malformed';
+    return false;
+  }
   quota.unified5h = 0;
   quota.unified7d = 0;
   quota.unifiedStatus = null;
   quota.codexResetCreditResetAt = now;
-  if (account.status === 'throttled') {
+  if (account.status === 'throttled' || account.status === 'exhausted') {
     account.status = 'active';
     account.rateLimitedUntil = null;
   }

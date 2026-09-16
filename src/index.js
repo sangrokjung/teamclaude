@@ -2656,6 +2656,7 @@ async function runCommand(clientArgsOverride = null) {
     ? childEnv.TEAMCLAUDE_CLAUDE_BIN
     : 'claude';
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
+  childEnv.TEAMCLAUDE_PROVIDER = isCodexMode(config) ? 'codex' : 'anthropic';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;

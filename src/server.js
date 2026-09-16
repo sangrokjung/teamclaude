@@ -26,9 +26,11 @@ import {
   admitByok,
 } from './byok.js';
 import { normalizeContinuityMaxWaitMs } from './config.js';
+import { cancellationIsDue } from './subscription.js';
 import {
   applyCodexResetCreditOutcome,
   codexResetCreditEligibility,
+  codexUsageConfirmsExhaustion,
   codexResetCreditOutcomeKind,
   consumeCodexResetCredit,
   describeCodexResetCreditCandidates,
@@ -517,11 +519,19 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     return url.toString();
   }
 
-  async function refreshCodexAccount(account) {
+  async function refreshCodexAccount(account, { allowReset = true } = {}) {
     if (warmupClosed || !account.credential) return false;
+    const resetEligibleBeforePoll = account.status !== 'error' && !cancellationIsDue(account);
     const outcome = await fetchCodexUsageOnce(account);
     await watchCodexAuthOutcome(account, outcome);
     const ok = outcome.applied;
+    if (allowReset && resetEligibleBeforePoll && ok && outcome.exhaustedForReset
+        && !withinCodexResetCreditGrace(account.quota)
+        && resetCredits.enabled && resetCredits.policy === 'account') {
+      await redeemCodexResetCredit(account, 'account-usage-exhausted', {
+        deadEndResolved: () => cancellationIsDue(account),
+      });
+    }
     // Failure visibility without 60s-cadence spam: log once per failure STREAK
     // (first failure after a success), and once on recovery. A teardown abort
     // (warmupClosed) or a removed account is not a data-staleness signal.
@@ -570,7 +580,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           console.error(`[TeamClaude] Failed to persist subscription recovery for "${account.name}": ${err.message}`);
         });
       }
-      return { applied, authOk: true, terminalAuth: false };
+      return { applied, authOk: true, terminalAuth: false,
+        exhaustedForReset: applied && codexUsageConfirmsExhaustion(payload, accountManager.switchThreshold),
+      };
     } catch {
       // Network error / timeout / unparseable 2xx body: non-terminal.
       return { applied: false, authOk: false, terminalAuth: false };
@@ -715,6 +727,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       reserve: resetCredits.reserve,
       cooldownMs: resetCredits.cooldownMs,
       isExhausted: candidate => accountManager.isExhausted(candidate),
+      isBlocked: candidate => cancellationIsDue(candidate),
       // A reset on an account quarantined for the requested model restores
       // quota nobody can use for this request.
       canServe: candidate => !accountManager._isModelUnsupported(candidate, model),
@@ -725,7 +738,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!codexUsageRefresh || warmupClosed) return;
     const timer = setTimeout(() => {
       if (warmupClosed || accountManager.accounts[account.index] !== account) return;
-      refreshCodexAccount(account).catch(() => { /* best-effort */ });
+      refreshCodexAccount(account, { allowReset: false }).catch(() => { /* best-effort */ });
     }, RESET_CREDIT_REFRESH_DELAY_MS);
     timer.unref?.();
   }
@@ -735,19 +748,25 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // (see codexResetCreditOutcomeKind). `enforceEligibility` applies the
   // automatic-policy guards (credits known/reserve/cooldown/exhausted/can
   // serve); the operator endpoint passes false. Single-flight per account.
-  async function redeemCodexResetCredit(account, reason, { enforceEligibility = true, model = null } = {}) {
+  async function redeemCodexResetCredit(account, reason, {
+    enforceEligibility = true, model = null, deadEndResolved = null,
+  } = {}) {
     if (provider !== 'codex' || !account || account.provider !== 'codex') return NO_RESET;
     if (enforceEligibility) {
       const verdict = codexResetCreditEligibility(account, resetCreditEligibilityOptions(model));
       if (!verdict.eligible) return NO_RESET;
     }
-    if (account._resetCreditPromise) return account._resetCreditPromise;
+    while (account._resetCreditPromise) {
+      const result = await account._resetCreditPromise;
+      if (result !== NO_RESET || deadEndResolved?.()) return result;
+      if (enforceEligibility && !codexResetCreditEligibility(account, resetCreditEligibilityOptions(model)).eligible) return NO_RESET;
+    }
     account._resetCreditPromise = (async () => {
       try {
         // ensureTokenFresh never throws — a failed refresh only logs and may
         // park the account — so judge the result, not an exception.
         await accountManager.ensureTokenFresh(account);
-        if (accountManager.accounts[account.index] !== account) return NO_RESET;
+        if (warmupClosed || accountManager.accounts[account.index] !== account) return NO_RESET;
         if (!account.credential || account.status === 'error' || account.authRevoked === true
             || isTokenExpiringSoon(account.expiresAt)) {
           const outcome = { ok: false, code: 'token_refresh_failed', windowsReset: null, status: null, error: null };
@@ -755,6 +774,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           console.error(`[TeamCodex] Reset credit on "${account.name}" (${reason}) skipped — credential unusable (status ${account.status})`);
           return { reset: false, kind: 'no-spend', outcome };
         }
+        if (enforceEligibility && !codexResetCreditEligibility(account, {
+          ...resetCreditEligibilityOptions(model), allowInFlight: false,
+        }).eligible) return NO_RESET;
+        if (deadEndResolved?.()) return NO_RESET;
         // Durable intent BEFORE the POST: stamp the cooldown as "pending" and
         // ask the host to persist the quota snapshot now. If the process dies
         // after the backend consumed the credit but before the outcome lands,
@@ -832,7 +855,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       // Re-judge right before acting: another request or the operator
       // endpoint may have redeemed (or exhausted the credits of) this
       // candidate while an earlier candidate's consume was in flight.
-      const result = await redeemCodexResetCredit(candidate, reason, { enforceEligibility: true, model });
+      const result = await redeemCodexResetCredit(candidate, reason, {
+        enforceEligibility: true, model, deadEndResolved,
+      });
       if (result !== NO_RESET) attempted = true;
       if (result.reset) return { redeemed: true, chargePass: true };
       if (result.kind !== 'no-spend') return { redeemed: false, chargePass: true };
