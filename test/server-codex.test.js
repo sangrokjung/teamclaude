@@ -71,13 +71,11 @@ async function observeCodexPath(upstreamPath) {
   }
 }
 
-test('Codex continuity never replays a complete upstream 503 POST', async () => {
+test('Codex replays a complete JSON 503 capacity rejection onto another account (B1)', async () => {
   let upstreamHits = 0;
-  const upstreamHitAt = [];
   const upstream = http.createServer(async (req, res) => {
     await drainRequest(req);
     upstreamHits++;
-    upstreamHitAt.push(Date.now());
     if (upstreamHits === 1) {
       res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '0' });
       res.end(JSON.stringify({
@@ -123,14 +121,11 @@ test('Codex continuity never replays a complete upstream 503 POST', async () => 
       body: JSON.stringify({ model: 'gpt-5.6', input: [] }),
     });
 
-    assert.equal(response.status, 503);
-    assert.equal(response.headers.get('retry-after'), '5',
-      'an ambiguous unsafe overload must tell the client not to retry immediately');
-    assert.match((await response.json()).error.message, /Request was not replayed/);
-    assert.equal(upstreamHits, 1);
-    assert.equal(upstreamHitAt.length, 1);
-    assert.ok(manager.accounts[0].dispatchFailureCooldownUntil > Date.now(),
-      'the failed account must be skipped by an immediate independent retry');
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { id: 'response-after-recovery' });
+    assert.equal(upstreamHits, 2, 'a complete JSON 503 is a pre-inference rejection and is replayed once');
+    assert.ok(manager.accounts.every(account => account.status !== 'throttled' && account.status !== 'error'),
+      `no account state may change on a capacity replay, got ${manager.accounts.map(a => a.status).join(',')}`);
     assert.ok(manager.accounts.every(account => account.inflight === 0));
   } finally {
     await Promise.all([closeServer(proxy), closeServer(upstream)]);
@@ -370,7 +365,30 @@ test('Codex continuity requires a Cloudflare ray for 507 request-buffer replay',
   }
 });
 
-test('Codex overload deadline cannot enable POST redispatch', async () => {
+const B1_ENV_KEYS = [
+  'TEAMCLAUDE_OVERLOAD_RETRIES', 'TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS',
+  'TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 'TEAMCODEX_OVERLOAD_HOLD_MS',
+];
+function withB1Env(values, fn) {
+  const saved = Object.fromEntries(B1_ENV_KEYS.map(key => [key, process.env[key]]));
+  for (const key of B1_ENV_KEYS) {
+    if (values[key] === undefined) delete process.env[key];
+    else process.env[key] = values[key];
+  }
+  return fn().finally(() => {
+    for (const key of B1_ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+}
+
+test('Codex persistent JSON 503 is replayed within the retry budget, then passes through unchanged (B1)', () => withB1Env({
+  TEAMCLAUDE_OVERLOAD_RETRIES: '1',
+  TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS: '50',
+  TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS: '60',
+  TEAMCODEX_OVERLOAD_HOLD_MS: '5000',
+}, async () => {
   let upstreamHits = 0;
   const upstream = http.createServer(async (req, res) => {
     await drainRequest(req);
@@ -389,7 +407,7 @@ test('Codex overload deadline cannot enable POST redispatch', async () => {
   const proxy = createProxyServer(manager, {
     provider: 'codex', upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false, codexUsageRefresh: false, continuityMode: true,
-    codexOverloadMaxWaitMs: 35, continuityMaxSleepMs: 10, continuityJitterMs: 0,
+    continuityMaxSleepMs: 10, continuityJitterMs: 0,
   });
   const proxyPort = await listen(proxy);
 
@@ -401,22 +419,27 @@ test('Codex overload deadline cannot enable POST redispatch', async () => {
     });
     const elapsedMs = Date.now() - startedAt;
     assert.equal(response.status, 503);
-    assert.match((await response.json()).error.message, /Request was not replayed/);
-    assert.equal(upstreamHits, 1);
-    assert.ok(elapsedMs < 500, `no-replay response took ${elapsedMs}ms`);
+    assert.match((await response.json()).error.message, /^Upstream overloaded \(HTTP 503\)\. Request was not replayed\.$/);
+    assert.equal(upstreamHits, 2, 'one backoff replay (TEAMCLAUDE_OVERLOAD_RETRIES=1), then the legacy passthrough');
+    assert.ok(elapsedMs < 2000, `bounded replay took ${elapsedMs}ms`);
+    assert.ok(manager.accounts[0].status !== 'throttled' && manager.accounts[0].status !== 'error');
     assert.equal(manager.accounts[0].inflight, 0);
   } finally {
     await Promise.all([closeServer(proxy), closeServer(upstream)]);
   }
-});
+}));
 
-test('Codex POST does not redispatch regardless of Retry-After', async t => {
+test('Codex JSON 503 whose Retry-After would overrun the hold cap passes through immediately (B1)', async t => {
   const cases = [
     ['delta-seconds', () => '1'],
     ['HTTP-date', () => new Date(Date.now() + 5_000).toUTCString()],
   ];
   for (const [label, retryAfter] of cases) {
-    await t.test(label, async () => {
+    await t.test(label, () => withB1Env({
+      TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS: '50',
+      TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS: '60',
+      TEAMCODEX_OVERLOAD_HOLD_MS: '200',
+    }, async () => {
       let upstreamHits = 0;
       const upstream = http.createServer(async (req, res) => {
         await drainRequest(req);
@@ -437,8 +460,7 @@ test('Codex POST does not redispatch regardless of Retry-After', async t => {
       const proxy = createProxyServer(manager, {
         provider: 'codex', upstream: `http://127.0.0.1:${upstreamPort}`,
         activeWarmup: false, codexUsageRefresh: false, continuityMode: true,
-        codexOverloadMaxWaitMs: 35, continuityMaxSleepMs: 1_000,
-        continuityJitterMs: 0,
+        continuityMaxSleepMs: 1_000, continuityJitterMs: 0,
       });
       const proxyPort = await listen(proxy);
       try {
@@ -449,14 +471,14 @@ test('Codex POST does not redispatch regardless of Retry-After', async t => {
         });
         const elapsedMs = Date.now() - startedAt;
         assert.equal(response.status, 503);
-        assert.equal(upstreamHits, 1);
+        assert.equal(upstreamHits, 1, `${label}: a wait past the hold cap must not replay`);
         assert.match((await response.json()).error.message, /Request was not replayed/);
         assert.ok(elapsedMs < 500, `${label} no-replay response took ${elapsedMs}ms`);
         assert.equal(manager.accounts[0].inflight, 0);
       } finally {
         await Promise.all([closeServer(proxy), closeServer(upstream)]);
       }
-    });
+    }));
   }
 });
 

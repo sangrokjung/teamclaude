@@ -110,6 +110,53 @@ function decodeBodyForInspection(body, contentEncoding, maxBytes) {
   }
 }
 
+// Codex-mode capacity replay (qjc fork, "B1"). The Codex backend answers a
+// capacity rejection with a COMPLETE HTTP 503 (or 529) whose body is a small
+// JSON error object. A complete JSON error means the request was refused
+// before inference started, so replaying it cannot duplicate inference, tool
+// side effects, or billing. Only that exact shape is replayable — see the
+// RETRYABLE_STATUS handler in forwardRequest. Anything else (HTML from a CDN,
+// a truncated body, an SSE stream, a body over the inspection bound) stays on
+// the legacy no-replay passthrough.
+const CODEX_CAPACITY_REPLAY_STATUS = new Set([503, 529]);
+
+function isCodexCapacityRejectionBody(decoded) {
+  let parsed;
+  try {
+    parsed = JSON.parse(decoded.toString('utf8'));
+  } catch {
+    return false;
+  }
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+    && (Object.hasOwn(parsed, 'error') || Object.hasOwn(parsed, 'detail'));
+}
+
+// Reads a codex 503/529 body under the auxiliary inspection budget and reports
+// whether it is a replayable capacity rejection. It ALWAYS consumes or cancels
+// the upstream body — the caller must not cancel it again (the reader lock
+// would make that throw). A read error (truncated/aborted body) is not a
+// complete rejection and is therefore not replayable.
+async function readCodexCapacityRejection(upstreamRes, ctx) {
+  if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
+    try { await upstreamRes.body?.cancel(); } catch { /* already errored/closed */ }
+    return false;
+  }
+  try {
+    const raw = await readBodyBounded(upstreamRes.body, CODEX_ERROR_INSPECTION_MAX_BYTES);
+    if (raw === null) return false;
+    const decoded = decodeBodyForInspection(
+      raw,
+      upstreamRes.headers.get('content-encoding'),
+      CODEX_ERROR_INSPECTION_MAX_BYTES,
+    );
+    return decoded != null && isCodexCapacityRejectionBody(decoded);
+  } catch {
+    return false;
+  } finally {
+    ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+  }
+}
+
 function createEncodedSseObserver(contentEncoding, reserveBytes, releaseBytes) {
   const encodings = String(contentEncoding || '')
     .split(',')
@@ -1644,7 +1691,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, upstreamFailureAvoidMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, upstreamFailureAvoidMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -3440,14 +3487,42 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // not a bad account.
     if (RETRYABLE_STATUS.has(upstreamRes.status)) {
       const code = upstreamRes.status;
-      await upstreamRes.body?.cancel();
 
       // A 5xx only proves the response failed, not that the upstream skipped
       // the request. Replaying a POST here can duplicate inference, tool side
       // effects, and billing. Complete 503/507 responses are still ambiguous:
       // the provider may have accepted the request before the error surfaced.
       // Only exact-session TUI continuation may recover an unsafe POST.
-      if (!replaySafe) {
+      //
+      // Narrow codex-mode exception (qjc fork, B1): a complete 503/529 whose
+      // body is a JSON error object, received before a single byte reached the
+      // client, is a capacity rejection issued BEFORE inference. The Codex CLI
+      // renders the passthrough as "model is at capacity" and never retries by
+      // itself, so that one shape is replayed through the same failover/backoff
+      // loop a replay-safe request uses — bounded by the existing retry budget
+      // and by TEAMCODEX_OVERLOAD_HOLD_MS (total hold per client request; 0
+      // disables the exception). No account state is mutated on this path.
+      let codexReplayable = false;
+      if (!replaySafe && ctx.provider === 'codex' && method === 'POST'
+          && isCodexResponsesPath(req.url) && CODEX_CAPACITY_REPLAY_STATUS.has(code)
+          && !res.headersSent && !res.writableEnded && !res.destroyed) {
+        codexReplayable = await readCodexCapacityRejection(upstreamRes, ctx);
+      } else {
+        await upstreamRes.body?.cancel();
+      }
+
+      const codexHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      let codexHeldMs = 0;
+      if (codexReplayable) {
+        if (ctx.codexOverloadHeldSince == null) ctx.codexOverloadHeldSince = Date.now();
+        codexHeldMs = Date.now() - ctx.codexOverloadHeldSince;
+      }
+      const codexHoldOpen = codexReplayable && codexHeldMs < codexHoldMs;
+
+      // Legacy unsafe-POST passthrough. Its shape (status, recovery header,
+      // message) is a wrapper recovery signal — keep it byte-identical, and
+      // reuse it when the codex replay runs out of budget or hold time.
+      const passThroughUnsafe = () => {
         console.log(`[TeamClaude] ${code} after ${method} dispatch on "${account.name}" — passing through without replay`);
         accountManager.noteUpstreamFailure(account, ctx.affinityKey, ctx.upstreamFailureAvoidMs, `HTTP ${code} after dispatch`);
         ctx.status = code;
@@ -3472,12 +3547,23 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             },
           }));
         }
+      };
+
+      if (!replaySafe && !codexHoldOpen) {
+        if (codexReplayable) {
+          console.log(`[TeamCodex] ${code} capacity on "${account.name}" — hold cap ${codexHoldMs}ms reached (held ${codexHeldMs}ms, ${ctx.overloadRetries} backoffs), passing through`);
+        }
+        passThroughUnsafe();
         return;
       }
 
       const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
       const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
       const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+
+      if (codexReplayable) {
+        console.log(`[TeamCodex] ${code} capacity on "${account.name}" — JSON error before any client bytes, retrying (${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+      }
 
       // (1) Per-request failover to an account not yet 5xx'd (or 429'd) this
       // request.
@@ -3504,6 +3590,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           backoffCap,
         );
         const waitMs = Math.max(retryAfterMs, backoffMs);
+        // codex: a wait that would overrun the hold cap only delays the same
+        // passthrough — surface it now instead of parking the client.
+        if (codexReplayable && codexHeldMs + waitMs > codexHoldMs) {
+          console.log(`[TeamCodex] ${code} capacity on "${account.name}" — backoff ${waitMs}ms would exceed hold cap ${codexHoldMs}ms (held ${codexHeldMs}ms), passing through`);
+          passThroughUnsafe();
+          return;
+        }
         ctx.overloadRetries += 1;
         const retryBudget = `${ctx.overloadRetries}/${maxOverload}`;
         console.log(`[TeamClaude] ${code} on every account — upstream overloaded, backing off ${waitMs}ms (retry ${ctx.overloadRetries}, ${retryBudget})`);
@@ -3519,6 +3612,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       // (3) Backoff budget spent — surface the 5xx rather than hold the client forever.
+      if (codexReplayable) {
+        console.log(`[TeamCodex] ${code} capacity on "${account.name}" — retry budget spent after ${ctx.overloadRetries} backoffs (held ${codexHeldMs}ms), passing through`);
+        passThroughUnsafe();
+        return;
+      }
       console.log(`[TeamClaude] ${code} on "${account.name}" — overload persisted after ${ctx.overloadRetries} backoffs, passing through`);
       ctx.status = code;
       if (logDir) {

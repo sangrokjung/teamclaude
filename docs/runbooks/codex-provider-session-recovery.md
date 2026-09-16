@@ -434,7 +434,7 @@ cat ~/.codex/state/teamcodex-runtime-deployer.json
 
 `busy`와 `fence-busy`는 정상 대기이며 진행 중 요청을 중단하지 않는다. `unapproved`는 디스크 source가 바뀌었지만 검증·승인 hash가 갱신되지 않았다는 뜻이다. `rollout-failed` 또는 `restart-unverified`는 같은 승인 hash의 자동 재시도를 잠갔다는 뜻이다. source를 다른 값으로 바꿨다가 되돌려도 잠금은 풀리지 않는다. 승인 파일을 제거한 상태를 deployer 로그의 `unapproved` 한 주기로 확인하고, 원인을 수정·검증·독립 검토한 다음 `save_hash()`로 새로 승인한다. hash를 자동 갱신하지 않는다.
 
-자동 rollout 검증 실패는 직전 healthy immutable artifact로 rollback한다. 수동 롤백은 먼저 deployer를 `bootout`하고 승인 파일을 제거한 뒤 `teamcodex-runtime-last-good.sha256`가 가리키는 artifact의 exact `src/index.js`를 launchd `ProgramArguments`로 복원하고 `com.qjc.teamcodex`만 재기동한다. working tree를 직접 실행하거나 unsafe POST replay를 활성화하지 않는다.
+자동 rollout 검증 실패는 직전 healthy immutable artifact로 rollback한다. 수동 롤백은 먼저 deployer를 `bootout`하고 승인 파일을 제거한 뒤 `teamcodex-runtime-last-good.sha256`가 가리키는 artifact의 exact `src/index.js`를 launchd `ProgramArguments`로 복원하고 `com.qjc.teamcodex`만 재기동한다. working tree를 직접 실행하거나 unsafe POST replay를 활성화하지 않는다(유일한 예외는 아래 "Capacity-rejection replay" 절의 완전한 JSON 503/529 한 가지뿐이다).
 
 ## Failure behavior
 
@@ -449,6 +449,24 @@ cat ~/.codex/state/teamcodex-runtime-deployer.json
 It exits non-zero without launching Codex when the binding is missing,
 malformed, or belongs to another provider.
 
+## Capacity-rejection replay exception (B1)
+
+The proxy itself replays exactly ONE unsafe-POST shape, inside `forwardRequest`
+(not the wrapper): a codex-mode `POST /codex/responses` that receives a
+COMPLETE HTTP 503 or 529 whose body is a JSON object carrying an `error` or
+`detail` key, before any byte was written to the client. A complete JSON error
+is a capacity rejection issued before inference, so a replay cannot duplicate
+work. It rides the existing 5xx failover/backoff loop
+(`TEAMCLAUDE_OVERLOAD_RETRIES`, `TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS`,
+`TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS`, honoring `retry-after`) and is additionally
+bounded by `TEAMCODEX_OVERLOAD_HOLD_MS` (default `90000`, total hold per client
+request; `0` disables the exception). When the retry budget or the hold cap is
+spent, the exact legacy passthrough is returned (`Upstream overloaded (HTTP
+503). Request was not replayed.` plus `X-TeamCodex-Recovery-Session`), so every
+wrapper recovery signal in this runbook is unchanged. HTML/text bodies,
+truncated bodies, 502/504/507, bodies over the inspection bound, and anything
+after client bytes are never replayed. No account state is mutated.
+
 ## Rollback
 
 The change is additive. Existing behavior remains available:
@@ -462,4 +480,4 @@ To disable only automatic continuation, restore the one-shot Codex branch in
 `runCommand`; manual `teamcodex codex resume` remains available. To roll back
 the entire convenience command, remove the `resume` dispatcher and
 `src/codex-session.js`. No config, account, token, database, or cmux state
-migration is required. Do not enable POST replay as a rollback.
+migration is required. Do not enable POST replay as a rollback (the capacity-rejection exception above is the only replayed shape; `TEAMCODEX_OVERLOAD_HOLD_MS=0` turns it off).
