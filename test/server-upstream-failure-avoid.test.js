@@ -228,6 +228,11 @@ test('codex: a gzip-encoded upstream stream that ends with an error terminal is 
 });
 
 test('codex: a single-account pool keeps serving the retry on its only account (never "no account")', async () => {
+  // This pins the soft-avoid fallback on the legacy passthrough. B1 (capacity-rejection
+  // replay, TEAMCODEX_OVERLOAD_HOLD_MS) would first retry the JSON 503 for up to the
+  // hold cap, so it is switched off for this test only.
+  const savedHold = process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+  process.env.TEAMCODEX_OVERLOAD_HOLD_MS = '0';
   const hits = [];
   const upstream = http.createServer((req, res) => {
     hits.push(tokenOf(req));
@@ -250,6 +255,8 @@ test('codex: a single-account pool keeps serving the retry on its only account (
     assert.deepEqual(hits, ['tok-a', 'tok-a']);
     assert.equal(am.accounts[0].inflight, 0, 'slots are released');
   } finally {
+    if (savedHold === undefined) delete process.env.TEAMCODEX_OVERLOAD_HOLD_MS;
+    else process.env.TEAMCODEX_OVERLOAD_HOLD_MS = savedHold;
     client.destroy();
     closeAll(proxy, upstream);
   }
