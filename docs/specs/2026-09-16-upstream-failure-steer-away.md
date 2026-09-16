@@ -37,3 +37,10 @@ Codex CLI가 `■ stream disconnected before completion: An error occurred while
 HEAD 테스트 스위트에는 `am.markDispatchFailureCooldown()` / `dispatchFailureCooldownUntil`을 요구하는 테스트 8개("… cools the failed account before a client retry", "dispatch failure cooldown temporarily excludes an account without persisting health state")가 있다. 이 API는 커밋 115e1e7 / 3f59067(하드 쿨다운: 선택·`_recoverSoonest`에서 제외, `getStatus().usable=false`)에서 왔고, 운영 아티팩트로 src를 되돌린 restore 커밋 74e60fc에서 소스만 사라지고 테스트만 남았다. 운영 src(119e2ead)와 master 모두 이 API가 없으므로 그 8개는 베이스 커밋 53dff95에서도 동일하게 실패한다(본 변경과 무관한 기존 불일치).
 
 본 변경이 하드 쿨다운 대신 **소프트 회피**를 택한 이유: 2026-09-16 hub 풀은 usable 1/7이었다. 하드 제외는 단일 usable 계정의 재시도를 프록시 429로 바꿔 놓지만, 소프트 회피는 대안이 있을 때만 옮기고 없으면 종전과 같이 같은 계정으로 재시도한다. 두 계약을 하나로 합치는 일(그 8개 테스트를 살릴지, 폐기할지)은 별도 결정 항목으로 남긴다.
+
+## 검증 기록 (2026-09-16 23:30~00:10 KST, 워커 studio2/3)
+
+- 새 테스트: `account-manager-avoid` 8개 + `server-upstream-failure-avoid` 4개 전부 통과(studio2, node 25.6). 계측 재현 2종(503 통과 후 같은 소켓 재요청 → 다른 계정, codex `error` 터미널 중계 후 재연결 → 다른 계정) 20ms 내 완료, 상류 히트 정확히 [tok-a, tok-b].
+- 전체 스위트(파일 단위, 파일당 240s alarm): base(53dff95, studio2) vs patched(1279277, studio3)의 FAIL 집합이 **한 건만 제외하고 동일**. 그 한 건(`server-429 :: stalled unsafe retry returns 502 …`)은 studio3(node 26.3)에서만 나타났고, 같은 호스트(studio2)에서 base·patched를 각 3회 돌리면 결과가 동일(26 ok / 3 notok, 기존 실패 3건만)해 호스트·타이밍 요인으로 판정. `warmup.test.js`는 base·patched 모두 alarm에 걸려 종료(기존 hang).
+- 기존 실패 85건은 HEAD 테스트가 운영 아티팩트 src에 없는 기능(auth-revoked 격리·provider-config·Grok·fleet 재개·hard dispatch cooldown 등)을 요구하는 lineage 불일치로, 본 변경과 무관.
+- 롤아웃 dry-run: 런타임 검증 OK, 롤백 아티팩트 OK, 스트림 카나리 3/3 PASS(타깃 해시 a0309895…).
