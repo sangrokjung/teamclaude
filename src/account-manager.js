@@ -225,6 +225,7 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      avoidUntil: null,       // soft steer-away deadline after an upstream failure (in-memory only)
       unsupportedModels: new Map(),
       // Concurrency: how many requests are in flight through this account right
       // now, and the per-account cap above which the selector treats it as
@@ -505,22 +506,32 @@ export class AccountManager {
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
       if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model)
-          && this._hasCapacity(a) && !(exclude && exclude.has(a))) {
+          && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
         return a;
       }
     }
 
     const capped = this._cappedSet(exclude, model);
-    const eff = ((exclude && exclude.size) || capped.size)
-      ? new Set([...(exclude || []), ...capped])
-      : null;
-    // eff === null → full sticky / warm-up path (cold start, nothing capped).
-    // eff set → getActiveAccount routes to _selectBest(eff), which already skips
-    // every excluded + capped account.
-    const account = eff ? this.getActiveAccount(eff, model) : this.getActiveAccount(null, model);
-    if (account && this._isAvailable(account, model) && this._hasCapacity(account)
-        && !(eff && eff.has(account))) {
+    const pick = extra => {
+      const eff = ((exclude && exclude.size) || capped.size || (extra && extra.size))
+        ? new Set([...(exclude || []), ...capped, ...(extra || [])])
+        : null;
+      // eff === null → full sticky / warm-up path (cold start, nothing capped).
+      // eff set → getActiveAccount routes to _selectBest(eff), which already skips
+      // every excluded + capped (+ avoided) account.
+      const account = eff ? this.getActiveAccount(eff, model) : this.getActiveAccount(null, model);
+      if (account && this._isAvailable(account, model) && this._hasCapacity(account)
+          && !(eff && eff.has(account))) return account;
+      return null;
+    };
+    // Softly steer away from accounts that just failed upstream (see
+    // noteUpstreamFailure). Passing them as an exclude keeps the sticky primary
+    // untouched (per-request failover semantics); when nothing else is
+    // acquirable they serve again, so a single-account pool never goes dark.
+    const avoided = this._avoidedSet(exclude);
+    const account = (avoided && pick(avoided)) || pick(null);
+    if (account) {
       account.inflight++;
       // (Re)write affinity ONLY when the connection has no still-usable home.
       // Reaching this fall-through path means we left the home account — but that
@@ -532,12 +543,64 @@ export class AccountManager {
       // (removed, unavailable, or exhausted — `_isAvailable` is false).
       if (affOk) {
         const home = this._affinity.get(affinityKey);
-        const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
+        const homeUsable = home && this.accounts[home.index] === home
+          && this._isAvailable(home, model) && !this._isAvoided(home);
         if (!homeUsable) this._affinity.set(affinityKey, account);
       }
       return account;
     }
     return null;
+  }
+
+  /**
+   * Note an upstream failure that was surfaced to the client WITHOUT replay:
+   * a 5xx / transport death / stream failure after an unsafe POST dispatch,
+   * or an upstream in-stream error terminal. The client is expected to retry
+   * by itself (Codex CLI reconnects up to 5 times; Claude Code retries an
+   * overloaded_error), but without this note that retry lands on the very
+   * same account: connection affinity pins the socket and the sticky primary
+   * pins new sockets — so an account-specific upstream fault fails all five
+   * retries in a row ("stream disconnected before completion", 2026-09-16).
+   *
+   * Effect: forget this connection's affinity home (if it is this account) and
+   * SOFTLY steer new acquisitions away from the account for `avoidMs`. Soft,
+   * because a 5xx is not proof of a bad account: when no alternative is
+   * acquirable the account keeps serving (single-account pools never go dark),
+   * in-flight requests are untouched, status/quota/caps are not mutated, and
+   * nothing is persisted. Returns true when a steer-away window was (re)armed.
+   */
+  noteUpstreamFailure(accountOrIndex, affinityKey = null, avoidMs = 0, reason = 'upstream failure') {
+    const account = this._resolve(accountOrIndex);
+    if (!account || !(avoidMs > 0)) return false;
+    const now = Date.now();
+    const alreadyAvoided = account.avoidUntil > now;
+    account.avoidUntil = Math.max(account.avoidUntil || 0, now + avoidMs);
+    if (affinityKey != null && (typeof affinityKey === 'object' || typeof affinityKey === 'function')
+        && this._affinity.get(affinityKey) === account) {
+      this._affinity.delete(affinityKey);
+    }
+    if (!alreadyAvoided) {
+      console.log(`[TeamClaude] ${reason} on "${account.name}" — steering new requests to other accounts for ${Math.round(avoidMs / 1000)}s`);
+    }
+    return true;
+  }
+
+  /** Is the account inside a steer-away window? Lazily clears an expired one. */
+  _isAvoided(account) {
+    if (!account || !account.avoidUntil) return false;
+    if (Date.now() < account.avoidUntil) return true;
+    account.avoidUntil = null;
+    return false;
+  }
+
+  /** Avoided accounts (not already excluded) as a Set of account objects, or null. */
+  _avoidedSet(exclude = null) {
+    let avoided = null;
+    for (const a of this.accounts) {
+      if (exclude && exclude.has(a)) continue;
+      if (this._isAvoided(a)) (avoided ||= new Set()).add(a);
+    }
+    return avoided;
   }
 
   /**
@@ -1924,6 +1987,7 @@ export class AccountManager {
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
+      avoidUntil: null,       // soft steer-away deadline after an upstream failure (in-memory only)
       unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),

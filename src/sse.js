@@ -82,6 +82,10 @@ export class SseFramer {
     this.limitExceeded = false;
     this.sawTerminal = false;
     this.sawResponseCompleted = false;
+    // Name of the terminal event that ended the stream ('error',
+    // 'response.failed', 'message_stop', '[DONE]', ...) so the relay can tell a
+    // failed completion from a successful one without re-parsing the stream.
+    this.terminalEvent = null;
     // Set when a frame exceeded maxBufferedBytes: framing is abandoned and
     // chunks pass straight through (terminal tracking falls back to a rolling
     // substring scan — see _scanRaw).
@@ -217,6 +221,7 @@ export class SseFramer {
         if (eventName === 'response.completed') this.sawResponseCompleted = true;
         if (TERMINAL_EVENTS.has(eventName)) {
           this.sawTerminal = true;
+          this.terminalEvent = eventName;
           return;
         }
         continue;
@@ -224,13 +229,14 @@ export class SseFramer {
       const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
       if (!dataLines.length) continue;
       const data = dataLines.join('\n').trim();
-      if (data === '[DONE]') { this.sawTerminal = true; return; }
+      if (data === '[DONE]') { this.sawTerminal = true; this.terminalEvent = '[DONE]'; return; }
       if (data.length > MAX_TERMINAL_DATA_PARSE || !data.startsWith('{')) continue;
       try {
         const type = JSON.parse(data)?.type;
         if (type === 'response.completed') this.sawResponseCompleted = true;
         if (TERMINAL_EVENTS.has(type)) {
           this.sawTerminal = true;
+          this.terminalEvent = type;
           return;
         }
       } catch { /* not JSON — not a terminal marker */ }
@@ -247,9 +253,13 @@ export class SseFramer {
     if (/\r?\n\r?\nevent:[ \t]?response\.completed[ \t]*\r?\n/.test(hay)) {
       this.sawResponseCompleted = true;
     }
-    if (/\r?\n\r?\nevent:[ \t]?(message_stop|error|response\.(completed|failed|incomplete))[ \t]*\r?\n/.test(hay)
-      || /\r?\ndata:[ \t]?\[DONE\]/.test(hay)) {
+    const terminal = /\r?\n\r?\nevent:[ \t]?(message_stop|error|response\.(completed|failed|incomplete))[ \t]*\r?\n/.exec(hay);
+    if (terminal) {
       this.sawTerminal = true;
+      this.terminalEvent = terminal[1];
+    } else if (/\r?\ndata:[ \t]?\[DONE\]/.test(hay)) {
+      this.sawTerminal = true;
+      this.terminalEvent = '[DONE]';
     }
     this._rawTail = hay.slice(-64);
   }

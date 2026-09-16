@@ -8,6 +8,7 @@
   "switchThreshold": 0.98,
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
+  "upstreamFailureAvoidMs": 30000,
   "overflowQueueTimeoutMs": 15000,
   "continuityMode": true,
   "continuityMaxWaitMs": 900000,
