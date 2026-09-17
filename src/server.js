@@ -192,6 +192,15 @@ const CODEX_PRESTREAM_STAGE_MAX_BYTES = 64 * 1024;
 const CODEX_PRE_OUTPUT_EVENTS = new Set([
   'response.created', 'response.queued', 'response.in_progress',
 ]);
+// Envelope/reasoning frames: the backend has opened an item or is emitting a
+// reasoning summary, but NOTHING user-visible has streamed yet. A capacity
+// `response.failed` frequently lands one frame after `response.output_item.added`
+// (measured 2026-09-17: 3-8s turns failing with out_tokens=0), so staging has to
+// survive this phase or B2 only ever catches the rarest stream shape. Closed
+// allowlist — an unknown event name, an unparseable `data:` payload, or a missing
+// `item.type`/`part.type` is OUTPUT (fail safe to live, never to ack).
+const CODEX_REASONING_PART_TYPES = new Set(['summary_text', 'reasoning_text']);
+const CODEX_REASONING_EVENT_PREFIX = 'response.reasoning';
 // Pre-output failure codes that mean capacity, not a rejection of THIS request.
 // An absent code counts as capacity too (the backend's generic "An error
 // occurred while processing your request" carries none).
@@ -204,6 +213,30 @@ const CODEX_PRESTREAM_FAILURE_EVENTS = new Set(['response.failed', 'error']);
 // are flushed and the stream goes live — no replay, upstream kept.
 const CODEX_PRESTREAM_STAGE_MIN_MS = 1000;
 const CODEX_PRESTREAM_CAP_MESSAGE = 'Codex pre-output staging cap reached';
+// Tighter cap for the reasoning phase (env CODEX_PRESTREAM_REASONING_MAX_MS,
+// floor 1000): measured from the FIRST staged envelope/reasoning frame.
+// Reasoning can run minutes while a capacity failure lands in seconds, and
+// holding reasoning back delays the visible "thinking" text, so the reasoning
+// phase gets its own short budget; on expiry the staged bytes flush and the
+// stream goes live (no replay, upstream kept) exactly like the total cap.
+const CODEX_PRESTREAM_REASONING_DEFAULT_MS = 20_000;
+const CODEX_PRESTREAM_REASONING_CAP_MESSAGE = 'Codex pre-output reasoning cap reached';
+// Per-account, per-reason throttle for the B2 diagnostics (gate skips and
+// "went live") so a busy pool cannot flood the log. Keyed by AccountManager so
+// each proxy instance (and each test server) has its own window.
+const CODEX_PRESTREAM_DIAG_THROTTLE_MS = 60_000;
+const codexPrestreamDiagSeen = new WeakMap();
+function codexPrestreamDiagAllowed(accountManager, account, reason) {
+  if (!accountManager) return true;
+  let seen = codexPrestreamDiagSeen.get(accountManager);
+  if (!seen) { seen = new Map(); codexPrestreamDiagSeen.set(accountManager, seen); }
+  const key = `${account?.name ?? '?'} ${reason}`;
+  const now = Date.now();
+  const last = seen.get(key);
+  if (last != null && now - last < CODEX_PRESTREAM_DIAG_THROTTLE_MS) return false;
+  seen.set(key, now);
+  return true;
+}
 // Encodings the stager can classify through a side decoder (the raw bytes are
 // what gets staged and forwarded; decoding is for classification only). A
 // missing/identity header is 'identity'; anything else or multiple encodings
@@ -222,9 +255,12 @@ export function codexPrestreamEncodingOf(contentEncoding) {
 
 // Classify ONE whole SSE frame (the text between blank-line boundaries) for
 // the pre-output stager. Exported for unit tests. Returns
-//   { kind: 'ack' | 'output' | 'failure', event, code }
-// `ack` = comment/ping or a pre-output acknowledgement (keep staging);
-// `output` = anything else (go live); `failure` = `response.failed` / `error`.
+//   { kind: 'ack' | 'output' | 'failure', event, code, phase }
+// `ack` = comment/ping, a pre-output acknowledgement, or an envelope/reasoning
+// frame that carries no user-visible content (keep staging); `output` =
+// anything else (go live); `failure` = `response.failed` / `error`.
+// `phase` is 'pre' for the acknowledgement phase and 'reasoning' for the
+// envelope/reasoning phase (which the tighter reasoning cap is measured from).
 export function classifyCodexSseFrame(block) {
   const eventLines = [...block.matchAll(/^event:[ \t]?(.*)$/gm)];
   const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
@@ -237,14 +273,29 @@ export function classifyCodexSseFrame(block) {
     }
     if (event == null && typeof parsed?.type === 'string') event = parsed.type;
   }
-  if (event == null && !dataLines.length) return { kind: 'ack', event: null, code: null };
-  if (event == null) return { kind: 'output', event: null, code: null };
-  if (CODEX_PRE_OUTPUT_EVENTS.has(event)) return { kind: 'ack', event, code: null };
+  if (event == null && !dataLines.length) return { kind: 'ack', event: null, code: null, phase: 'pre' };
+  if (event == null) return { kind: 'output', event: null, code: null, phase: null };
+  if (CODEX_PRE_OUTPUT_EVENTS.has(event)) return { kind: 'ack', event, code: null, phase: 'pre' };
   if (CODEX_PRESTREAM_FAILURE_EVENTS.has(event)) {
     const code = parsed?.response?.error?.code ?? parsed?.error?.code ?? parsed?.code ?? null;
-    return { kind: 'failure', event, code: typeof code === 'string' ? code : null };
+    return { kind: 'failure', event, code: typeof code === 'string' ? code : null, phase: null };
   }
-  return { kind: 'output', event, code: null };
+  // Envelope/reasoning phase — still nothing user-visible on the wire.
+  if (event.startsWith(CODEX_REASONING_EVENT_PREFIX)) {
+    return { kind: 'ack', event, code: null, phase: 'reasoning' };
+  }
+  if (event === 'response.output_item.added') {
+    return parsed?.item?.type === 'reasoning'
+      ? { kind: 'ack', event, code: null, phase: 'reasoning' }
+      : { kind: 'output', event, code: null, phase: null };
+  }
+  if (event === 'response.content_part.added') {
+    const partType = parsed?.part?.type;
+    return typeof partType === 'string' && CODEX_REASONING_PART_TYPES.has(partType)
+      ? { kind: 'ack', event, code: null, phase: 'reasoning' }
+      : { kind: 'output', event, code: null, phase: null };
+  }
+  return { kind: 'output', event, code: null, phase: null };
 }
 
 // A duck-typed web stream that first yields `head` (the staged bytes) and then
@@ -293,12 +344,19 @@ function resumeStagedStream(reader, head, tail, pendingRead = null) {
 // where failure = { kind: 'terminal'|'eof'|'error'|'timeout', event, code,
 // replayable }. `resume()` rebuilds the legacy passthrough (staged bytes +
 // the original ending); `cancel()` drops the upstream body for a replay.
-async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs, encoding = 'identity' }) {
+async function stageCodexPreOutput(webStream, {
+  idleTimeoutMs, maxBytes, maxMs, encoding = 'identity',
+  reasoningMaxMs = CODEX_PRESTREAM_REASONING_DEFAULT_MS,
+}) {
   const reader = webStream.getReader();
   const encoded = encoding !== 'identity';
   const rawFramer = encoded ? null : new SseFramer({ maxBufferedBytes: maxBytes });
   const staged = [];
   let stagedBytes = 0;
+  let framesStaged = 0;
+  // Set when the first envelope/reasoning frame is staged — the tighter
+  // reasoning budget is measured from there, not from the start of staging.
+  let reasoningStartedAt = null;
   const startedAt = Date.now();
   // The read that was in flight when the time cap fired: still owned by the
   // reader, so the resumed live stream consumes it first (no byte loss).
@@ -348,11 +406,15 @@ async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs, 
   const cleanup = () => { decoder?.destroy(); decodeFramer?.dispose(); };
 
   const head = () => (encoded ? Buffer.concat(staged) : Buffer.concat([...staged, rawFramer.pending]));
-  const live = (capped = false) => {
+  const live = (capped = false, reasoningCapped = false, event = null) => {
     cleanup();
     return {
       verdict: 'live',
       capped,
+      reasoningCapped,
+      event,
+      frames: framesStaged,
+      elapsedMs: Date.now() - startedAt,
       resume: () => resumeStagedStream(reader, head(), 'delegate', inflightRead),
     };
   };
@@ -374,30 +436,43 @@ async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs, 
       if (countBytes) stagedBytes += Buffer.byteLength(block) + 2;
       if (!block) continue;
       const frame = classifyCodexSseFrame(block);
-      if (frame.kind === 'output') return live();
+      framesStaged += 1;
+      if (frame.kind === 'output') return live(false, false, frame.event);
       if (frame.kind === 'failure') {
         const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
         return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
       }
+      if (frame.phase === 'reasoning' && reasoningStartedAt == null) reasoningStartedAt = Date.now();
       if (stagedBytes > maxBytes) return live(); // staging overflow: flush and go live
     }
     return null;
   };
 
   while (true) {
-    const remainingMs = maxMs - (Date.now() - startedAt);
-    if (remainingMs <= 0) return live(true);
+    const totalRemainingMs = maxMs - (Date.now() - startedAt);
+    // Once reasoning has started, whichever budget expires first ends staging.
+    const reasoningRemainingMs = reasoningStartedAt == null
+      ? Infinity
+      : reasoningMaxMs - (Date.now() - reasoningStartedAt);
+    const reasoningIsSooner = reasoningRemainingMs < totalRemainingMs;
+    const remainingMs = reasoningIsSooner ? reasoningRemainingMs : totalRemainingMs;
+    if (remainingMs <= 0) return live(!reasoningIsSooner, reasoningIsSooner);
     const capIsSooner = remainingMs <= idleTimeoutMs;
+    const capMessage = reasoningIsSooner
+      ? CODEX_PRESTREAM_REASONING_CAP_MESSAGE : CODEX_PRESTREAM_CAP_MESSAGE;
     let step;
     try {
       inflightRead = inflightRead ?? reader.read();
       step = await raceTimeout(
         inflightRead,
         Math.max(1, Math.min(idleTimeoutMs, remainingMs)),
-        capIsSooner ? CODEX_PRESTREAM_CAP_MESSAGE : `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
+        capIsSooner ? capMessage : `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
       );
       inflightRead = null;
     } catch (err) {
+      if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_REASONING_CAP_MESSAGE) {
+        return live(false, true); // reasoning cap: flush, go live, never replay
+      }
       if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_CAP_MESSAGE) {
         return live(true); // cap: flush what was staged, keep upstream, never replay
       }
@@ -3995,11 +4070,28 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         CODEX_PRESTREAM_STAGE_MIN_MS,
         envInt('CODEX_PRESTREAM_STAGE_MAX_MS', codexPrestreamHoldMs),
       );
-      if (ctx.provider === 'codex' && !replaySafe && method === 'POST'
-          && isCodexResponsesPath(req.url) && codexPrestreamEncoding != null
-          && upstreamRes.status >= 200 && upstreamRes.status < 300
-          && !res.headersSent && !res.destroyed && codexPrestreamHoldMs > 0
-          && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES)) {
+      const codexPrestreamReasoningMaxMs = Math.max(
+        CODEX_PRESTREAM_STAGE_MIN_MS,
+        envInt('CODEX_PRESTREAM_REASONING_MAX_MS', CODEX_PRESTREAM_REASONING_DEFAULT_MS),
+      );
+      // Why the gate did NOT stage — without this, a turn that fails in 3s and
+      // one that never entered B2 look identical in the log (2026-09-17).
+      const codexPrestreamSkip = ctx.provider !== 'codex' ? 'not-codex'
+        : (method !== 'POST' || replaySafe) ? 'not-post'
+          : !isCodexResponsesPath(req.url) ? 'not-responses-path'
+            : !(upstreamRes.status >= 200 && upstreamRes.status < 300) ? 'non-2xx'
+              : (res.headersSent || res.destroyed) ? 'headers-sent'
+                : codexPrestreamHoldMs <= 0 ? 'hold-disabled'
+                  : codexPrestreamEncoding == null ? 'unsupported-encoding'
+                    : null;
+      const codexPrestreamReserved = codexPrestreamSkip == null
+        && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
+      if (codexPrestreamSkip != null || !codexPrestreamReserved) {
+        const reason = codexPrestreamSkip ?? 'aux-budget';
+        if (codexPrestreamDiagAllowed(accountManager, account, reason)) {
+          console.log(`[TeamCodex] prestream skip: ${reason}`);
+        }
+      } else {
         let stage;
         try {
           stage = await stageCodexPreOutput(upstreamRes.body, {
@@ -4007,6 +4099,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             maxBytes: CODEX_PRESTREAM_STAGE_MAX_BYTES,
             maxMs: codexPrestreamMaxMs,
             encoding: codexPrestreamEncoding,
+            reasoningMaxMs: codexPrestreamReasoningMaxMs,
           });
         } finally {
           ctx.releaseAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
@@ -4071,6 +4164,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         }
         if (stage.capped) {
           console.log(`[TeamCodex] pre-output staging cap ${codexPrestreamMaxMs}ms reached on "${account.name}"${codexEncodingTag ? ` (${codexPrestreamEncoding})` : ''} — going live`);
+        } else if (stage.reasoningCapped) {
+          console.log(`[TeamCodex] pre-output reasoning cap ${codexPrestreamReasoningMaxMs}ms reached on "${account.name}"${codexEncodingTag} — going live`);
+        }
+        if (stage.verdict === 'live'
+            && codexPrestreamDiagAllowed(accountManager, account, 'live')) {
+          console.log(`[TeamCodex] prestream live on "${account.name}"${codexEncodingTag}: ${stage.event || 'none'} after ${stage.frames} frames, ${stage.elapsedMs}ms`);
         }
         // Live or passthrough: replay the staged bytes through the legacy
         // path so the client sees exactly what it always did, just later.
