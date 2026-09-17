@@ -143,28 +143,163 @@ function isCodexCapacityRejectionBody(decoded) {
 }
 
 // Reads a codex 503/529 body under the auxiliary inspection budget and reports
-// whether it is a replayable capacity rejection. It ALWAYS consumes or cancels
-// the upstream body — the caller must not cancel it again (the reader lock
-// would make that throw). A read error (truncated/aborted body) is not a
-// complete rejection and is therefore not replayable.
+// WHY it is not a replayable capacity rejection (`null` = replayable). It
+// ALWAYS consumes or cancels the upstream body — the caller must not cancel it
+// again (the reader lock would make that throw). A read error (truncated/
+// aborted body) is not a complete rejection and is therefore not replayable.
 async function readCodexCapacityRejection(upstreamRes, ctx) {
   if (!ctx.reserveAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES)) {
     try { await upstreamRes.body?.cancel(); } catch { /* already errored/closed */ }
-    return false;
+    return 'oversize-body';
   }
   try {
     const raw = await readBodyBounded(upstreamRes.body, CODEX_ERROR_INSPECTION_MAX_BYTES);
-    if (raw === null) return false;
+    if (raw === null) return 'oversize-body';
     const decoded = decodeBodyForInspection(
       raw,
       upstreamRes.headers.get('content-encoding'),
       CODEX_ERROR_INSPECTION_MAX_BYTES,
     );
-    return decoded != null && isCodexCapacityRejectionBody(decoded);
+    if (decoded == null) return 'non-json-body';
+    return isCodexCapacityRejectionBody(decoded) ? null : 'non-json-body';
   } catch {
-    return false;
+    return 'read-error';
   } finally {
     ctx.releaseAuxiliaryResponseBytes(CODEX_ERROR_INSPECTION_MAX_BYTES);
+  }
+}
+
+// Codex-mode pre-output stream replay (qjc fork, "B2"). Under load the Codex
+// backend also rejects capacity INSIDE an HTTP 200 SSE stream: it acknowledges
+// the request (`response.created` / `response.in_progress`) and then ends with
+// a `response.failed` (error code `server_is_overloaded` / `slow_down`) or an
+// `error` event before producing a single output item — or the stream simply
+// dies. codex-rs maps that to "Selected model is at capacity" and never
+// retries. Nothing output-bearing was produced, so the request can be replayed
+// on another account without duplicating inference or tool side effects.
+//
+// The relay therefore STAGES whole SSE frames while every frame so far is
+// non-output (bounded by CODEX_PRESTREAM_STAGE_MAX_BYTES); the first
+// output-bearing frame sends the client headers, flushes the staged frames and
+// hands the stream to the ordinary live passthrough unchanged. A pre-output
+// failure is replayed through the same failover/backoff loop B1 uses; when
+// the budget or hold cap is spent, or the failure is not a capacity one, the
+// client receives EXACTLY what legacy delivered (200 + staged frames + the
+// failure frame, via the same streamResponse path — so the terminal-event
+// hook, usage parsing and request logging all run as before).
+const CODEX_PRESTREAM_STAGE_MAX_BYTES = 64 * 1024;
+// Frames that only acknowledge the request — the backend has produced nothing.
+const CODEX_PRE_OUTPUT_EVENTS = new Set([
+  'response.created', 'response.queued', 'response.in_progress',
+]);
+// Pre-output failure codes that mean capacity, not a rejection of THIS request.
+// An absent code counts as capacity too (the backend's generic "An error
+// occurred while processing your request" carries none).
+const CODEX_PRESTREAM_REPLAYABLE_CODES = new Set(['server_is_overloaded', 'slow_down']);
+const CODEX_PRESTREAM_FAILURE_EVENTS = new Set(['response.failed', 'error']);
+
+// Classify ONE whole SSE frame (the text between blank-line boundaries) for
+// the pre-output stager. Exported for unit tests. Returns
+//   { kind: 'ack' | 'output' | 'failure', event, code }
+// `ack` = comment/ping or a pre-output acknowledgement (keep staging);
+// `output` = anything else (go live); `failure` = `response.failed` / `error`.
+export function classifyCodexSseFrame(block) {
+  const eventLines = [...block.matchAll(/^event:[ \t]?(.*)$/gm)];
+  const dataLines = [...block.matchAll(/^data:[ \t]?(.*)$/gm)].map(m => m[1]);
+  let event = eventLines.length ? eventLines[eventLines.length - 1][1].trim() : null;
+  let parsed = null;
+  if (dataLines.length) {
+    const data = dataLines.join('\n').trim();
+    if (data.startsWith('{')) {
+      try { parsed = JSON.parse(data); } catch { parsed = null; }
+    }
+    if (event == null && typeof parsed?.type === 'string') event = parsed.type;
+  }
+  if (event == null && !dataLines.length) return { kind: 'ack', event: null, code: null };
+  if (event == null) return { kind: 'output', event: null, code: null };
+  if (CODEX_PRE_OUTPUT_EVENTS.has(event)) return { kind: 'ack', event, code: null };
+  if (CODEX_PRESTREAM_FAILURE_EVENTS.has(event)) {
+    const code = parsed?.response?.error?.code ?? parsed?.error?.code ?? parsed?.code ?? null;
+    return { kind: 'failure', event, code: typeof code === 'string' ? code : null };
+  }
+  return { kind: 'output', event, code: null };
+}
+
+// A duck-typed web stream that first yields `head` (the staged bytes) and then
+// either delegates to the real reader (`tail === 'delegate'`), ends
+// (`tail === 'done'`), or rethrows the stored upstream error — so the legacy
+// streamResponse path replays a staged attempt byte-for-byte, including how
+// it ended. Only the reader methods streamResponse uses are provided.
+function resumeStagedStream(reader, head, tail) {
+  let headPending = head.length > 0;
+  const wrapped = {
+    async read() {
+      if (headPending) {
+        headPending = false;
+        return { done: false, value: head };
+      }
+      if (tail === 'delegate') return reader.read();
+      if (tail === 'done') return { done: true, value: undefined };
+      throw tail;
+    },
+    cancel(reason) { return reader.cancel(reason); },
+    releaseLock() { reader.releaseLock(); },
+  };
+  return { getReader: () => wrapped };
+}
+
+// Stage whole SSE frames until the first output-bearing frame, a pre-output
+// failure, or an abnormal end. Returns
+//   { verdict: 'live', resume }                       — go live, nothing failed
+//   { verdict: 'failed', failure, cancel, resume }    — pre-output failure
+// where failure = { kind: 'terminal'|'eof'|'error'|'timeout', event, code,
+// replayable }. `resume()` rebuilds the legacy passthrough (staged bytes +
+// the original ending); `cancel()` drops the upstream body for a replay.
+async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes }) {
+  const reader = webStream.getReader();
+  const framer = new SseFramer({ maxBufferedBytes: maxBytes });
+  const staged = [];
+  let stagedBytes = 0;
+  const head = () => Buffer.concat([...staged, framer.pending]);
+  const live = () => ({ verdict: 'live', resume: () => resumeStagedStream(reader, head(), 'delegate') });
+  const failed = (failure, tail) => ({
+    verdict: 'failed',
+    failure,
+    cancel: () => reader.cancel().catch(() => {}),
+    resume: () => resumeStagedStream(reader, head(), tail),
+  });
+  while (true) {
+    let step;
+    try {
+      step = await raceTimeout(
+        reader.read(),
+        idleTimeoutMs,
+        `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
+      );
+    } catch (err) {
+      const timedOut = err?.code === 'ETIMEDOUT' && /^Upstream SSE idle timeout/.test(err?.message || '');
+      return failed({ kind: timedOut ? 'timeout' : 'error', event: null, code: null, replayable: true }, err);
+    }
+    if (step.done) {
+      return failed({ kind: 'eof', event: null, code: null, replayable: true }, 'done');
+    }
+    const out = framer.push(step.value);
+    if (!out || out.length === 0) continue; // partial frame still buffering
+    staged.push(out);
+    if (framer.passthrough) return live(); // oversized frame: framing abandoned
+    // Walk the frames in order so the verdict is independent of how upstream
+    // chunked them: an overflow reached BEFORE a failure frame still goes live.
+    for (const block of out.toString('utf8').split(/\r?\n\r?\n/)) {
+      stagedBytes += Buffer.byteLength(block) + 2;
+      if (!block) continue;
+      const frame = classifyCodexSseFrame(block);
+      if (frame.kind === 'output') return live();
+      if (frame.kind === 'failure') {
+        const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
+        return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
+      }
+      if (stagedBytes > maxBytes) return live(); // staging overflow: flush and go live
+    }
   }
 }
 
@@ -3514,15 +3649,30 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // and by TEAMCODEX_OVERLOAD_HOLD_MS (total hold per client request; 0
       // disables the exception). No account state is mutated on this path.
       let codexReplayable = false;
+      // Why a codex POST 503/529 was NOT replayed — logged so a silent
+      // "passing through without replay" can be explained from the log alone.
+      let codexNotReplayable = null;
+      const codexCandidate = !replaySafe && ctx.provider === 'codex' && method === 'POST'
+        && CODEX_CAPACITY_REPLAY_STATUS.has(code);
       if (codexCapacityReplayEligible({
         replaySafe, provider: ctx.provider, method, url: req.url, status: code, res,
       })) {
-        codexReplayable = await readCodexCapacityRejection(upstreamRes, ctx);
+        codexNotReplayable = await readCodexCapacityRejection(upstreamRes, ctx);
+        codexReplayable = codexNotReplayable == null;
       } else {
+        if (codexCandidate) {
+          codexNotReplayable = !isCodexResponsesPath(req.url) ? 'not-responses-path'
+            : res.headersSent ? 'headers-sent'
+              : 'client-gone';
+        }
         await upstreamRes.body?.cancel();
       }
 
       const codexHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      if (codexReplayable && codexHoldMs === 0) codexNotReplayable = 'hold-disabled';
+      if (codexCandidate && codexNotReplayable) {
+        console.log(`[TeamCodex] ${code} not replayable: ${codexNotReplayable}`);
+      }
       let codexHeldMs = 0;
       if (codexReplayable) {
         if (ctx.codexOverloadHeldSince == null) ctx.codexOverloadHeldSince = Date.now();
@@ -3699,9 +3849,92 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const ensureHeaders = () => {
         if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       };
+      // Codex-mode pre-output staging (B2, see stageCodexPreOutput). Scope:
+      // POST /codex/responses, identity encoding, 2xx, nothing sent yet, and
+      // the hold cap enabled (TEAMCODEX_OVERLOAD_HOLD_MS=0 disables B1 and B2
+      // alike). streamRecovery stays anthropic-only — codex never gets the
+      // anthropic-shaped error injection.
+      let streamBody = upstreamRes.body;
+      const codexPrestreamHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      if (ctx.provider === 'codex' && !replaySafe && method === 'POST'
+          && isCodexResponsesPath(req.url) && parseStreamUsage
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && !res.headersSent && !res.destroyed && codexPrestreamHoldMs > 0
+          && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES)) {
+        let stage;
+        try {
+          stage = await stageCodexPreOutput(upstreamRes.body, {
+            idleTimeoutMs: ctx.streamIdleTimeoutMs,
+            maxBytes: CODEX_PRESTREAM_STAGE_MAX_BYTES,
+          });
+        } finally {
+          ctx.releaseAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
+        }
+        if (stage.verdict === 'failed') {
+          if (res.destroyed || ctx.abortSignal?.aborted) {
+            // Client left during staging: drop upstream, no further hits. The
+            // request's finally releases the slot.
+            await stage.cancel();
+            return;
+          }
+          const { failure } = stage;
+          const label = failure.code ? `${failure.kind} ${failure.code}` : failure.kind;
+          const replayable = failure.replayable && !res.headersSent;
+          let codexHeldMs = 0;
+          if (replayable) {
+            if (ctx.codexOverloadHeldSince == null) ctx.codexOverloadHeldSince = Date.now();
+            codexHeldMs = Date.now() - ctx.codexOverloadHeldSince;
+          }
+          const maxOverload = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
+          const backoffBase = Math.max(50, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS', 1000));
+          const backoffCap = Math.max(backoffBase, envInt('TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 10000));
+          // Same budget and hold cap as B1: (1) per-request failover to an
+          // account not yet tried, (2) bounded fleet backoff, (3) passthrough.
+          let plan = null;
+          let waitMs = 0;
+          if (replayable && codexHeldMs < codexPrestreamHoldMs) {
+            ctx.tried5xx.add(account);
+            const excludeStage = new Set([...ctx.tried429, ...ctx.tried5xx]);
+            if (retryCount < maxRetries && (hasUsable(excludeStage) || hasCapped(excludeStage))) {
+              plan = 'failover';
+            } else if (ctx.overloadRetries < maxOverload) {
+              waitMs = Math.min(backoffBase * 2 ** Math.min(ctx.overloadRetries, 30), backoffCap);
+              if (codexHeldMs + waitMs <= codexPrestreamHoldMs) plan = 'backoff';
+            }
+          }
+          if (plan) {
+            console.log(`[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — replaying (${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+            if (logDir) {
+              appendLogSection(`=== STREAM pre-output ${label} — replaying (${plan}) ===`);
+              flushRequestLog(logDir, reqId, logSections, hooks);
+            }
+            await stage.cancel(); // no account state mutated — capacity, not a bad credential
+            releaseHeld(); // free this account's slot before trying another / waiting
+            if (plan === 'failover') {
+              return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+            }
+            ctx.overloadRetries += 1;
+            console.log(`[TeamCodex] pre-output stream failure on every account — backing off ${waitMs}ms (retry ${ctx.overloadRetries}/${maxOverload}, held ${codexHeldMs}ms)`);
+            await sleepOrAbort(waitMs, ctx.abortSignal);
+            if (res.destroyed || ctx.abortSignal?.aborted) return;
+            ctx.tried5xx.clear();
+            return forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+          }
+          console.log(replayable
+            ? `[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — budget spent (${ctx.overloadRetries} backoffs, held ${codexHeldMs}ms), passing through`
+            : `[TeamCodex] pre-output stream failure on "${account.name}" (${label}) — not replayable, passing through`);
+          if (logDir) {
+            appendLogSection(`=== STREAM pre-output ${label} — passed through ===`);
+            flushRequestLog(logDir, reqId, logSections, hooks);
+          }
+        }
+        // Live or passthrough: replay the staged bytes through the legacy
+        // path so the client sees exactly what it always did, just later.
+        streamBody = stage.resume();
+      }
       if (!ctx.streamRecovery) ensureHeaders(); // legacy: headers first, bytes as they come
       const outcome = await streamResponse(
-        upstreamRes.body,
+        streamBody,
         res,
         account,
         accountManager,

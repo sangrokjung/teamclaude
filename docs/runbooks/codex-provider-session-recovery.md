@@ -465,7 +465,41 @@ spent, the exact legacy passthrough is returned (`Upstream overloaded (HTTP
 503). Request was not replayed.` plus `X-TeamCodex-Recovery-Session`), so every
 wrapper recovery signal in this runbook is unchanged. HTML/text bodies,
 truncated bodies, 502/504/507, bodies over the inspection bound, and anything
-after client bytes are never replayed. No account state is mutated.
+after client bytes are never replayed. No account state is mutated. When a
+codex POST 503/529 is not replayed the log says why:
+`[TeamCodex] 503 not replayable: <headers-sent|non-json-body|oversize-body|read-error|hold-disabled|not-responses-path|client-gone>`.
+
+## Pre-output stream replay exception (B2)
+
+The second and last unsafe-POST shape the proxy replays is a capacity failure
+delivered INSIDE an HTTP 200 SSE stream. Under load the backend acknowledges the
+request (`response.created`, `response.in_progress`, pings) and then ends with
+`response.failed` (error code `server_is_overloaded` / `slow_down`) or an
+`error` event before any output item — or the stream simply ends, errors, or
+idles out. codex-rs renders that as "Selected model is at capacity" and does not
+retry. Because nothing output-bearing was produced, the relay stages whole SSE
+frames (up to 64 KiB) while every frame is an acknowledgement, and on such a
+pre-output failure cancels the upstream body and replays the request through the
+same failover/backoff loop and hold cap as B1 (`TEAMCLAUDE_OVERLOAD_RETRIES`,
+`TEAMCLAUDE_OVERLOAD_BACKOFF_*`, `TEAMCODEX_OVERLOAD_HOLD_MS`; `0` disables
+B1 and B2 together). The client sees exactly one `response.created`, from the
+attempt that succeeded.
+
+Not replayed (legacy passthrough, byte-identical): a failure after any
+output-bearing frame (`response.output_*`, `response.content_part.*`,
+`response.reasoning*`, `response.function_call*`, `response.completed`, …), a
+`response.failed`/`error` whose code is a request rejection
+(`invalid_request`, `usage_limit_reached`, `unauthorized`, …), a stream whose
+acknowledgement frames exceed the 64 KiB staging bound, a compressed
+(`content-encoding`) stream, and any failure once the retry budget or hold cap
+is spent. In every passthrough the client receives the 200, the staged frames
+and the failure frame, and the `Upstream response.failed event … steering new
+requests to other accounts` soft-avoid fires once, as before. A client that
+disconnects during staging or the backoff cancels the upstream immediately; no
+further upstream hits occur. Log lines: `[TeamCodex] pre-output stream failure
+on "<acct>" (<terminal|eof|error|timeout>[ code]) — replaying (n/max, held ms)`
+and `… — budget spent (…), passing through` / `… — not replayable, passing
+through`.
 
 ## Rollback
 
