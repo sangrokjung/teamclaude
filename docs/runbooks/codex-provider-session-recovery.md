@@ -540,11 +540,13 @@ per 60 s per account per reason (keyed per proxy instance, so a busy pool cannot
 flood the log):
 
 - `[TeamCodex] prestream skip: <reason>` — the gate did not stage. Reasons:
-  `not-codex`, `not-post`, `not-responses-path`, `non-2xx`, `headers-sent`,
+  `not-post`, `not-responses-path`, `non-2xx`, `headers-sent`,
   `hold-disabled`, `unsupported-encoding`, `aux-budget` (the 64 KiB staging
-  reservation was refused by the shared response-byte budget). Note `not-codex`
-  fires in anthropic mode too, once per minute per account — it is the honest
-  answer to "why didn't B2 run", not a fault.
+  reservation was refused by the shared response-byte budget).
+
+Both lines are **codex-only**. Anthropic mode never enters B2, so it is skipped
+silently — there is no `not-codex` reason, and the Claude pool's log (port 3456)
+gains nothing from this change.
 - `[TeamCodex] prestream live on "<acct>"<, encoding>: <event-name> after <n> frames, <ms>ms`
   — staging ended and the stream went live; `<event-name>` is the frame that
   ended it (`none` when a cap, an overflow or a decoder error ended it instead,

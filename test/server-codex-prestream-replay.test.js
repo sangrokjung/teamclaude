@@ -877,3 +877,47 @@ test('codex prestream logs a skip diagnostic when the auxiliary byte budget is u
     'nothing was staged, so nothing went live',
   );
 }));
+
+// The diagnostics are codex-only: the Claude pool is a different product
+// surface and must not gain a `prestream skip` line on every stream.
+test('anthropic mode never logs a prestream diagnostic', () => withEnv(FAST_ENV, async () => {
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1"}}\n\n');
+    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    res.end();
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = new AccountManager([{
+    name: 'claude-a',
+    type: 'oauth',
+    accessToken: 'pooled-access-token-claude-a',
+    expiresAt: Date.now() + 3_600_000,
+  }]);
+  const proxy = createProxyServer(manager, {
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  try {
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 16, stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    assert.ok((await response.text()).includes('event: message_stop'));
+  } finally {
+    console.log = originalLog;
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.equal(
+    logs.filter(line => line.startsWith('[TeamCodex] prestream')).length, 0,
+    `anthropic mode must emit no B2 diagnostics, got ${JSON.stringify(logs)}`,
+  );
+}));

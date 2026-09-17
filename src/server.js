@@ -4075,8 +4075,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         envInt('CODEX_PRESTREAM_REASONING_MAX_MS', CODEX_PRESTREAM_REASONING_DEFAULT_MS),
       );
       // Why the gate did NOT stage — without this, a turn that fails in 3s and
-      // one that never entered B2 look identical in the log (2026-09-17).
-      const codexPrestreamSkip = ctx.provider !== 'codex' ? 'not-codex'
+      // one that never entered B2 look identical in the log (2026-09-17). The
+      // diagnostics are CODEX-ONLY: anthropic mode never enters B2, and saying
+      // so on every stream would put new noise in a different product surface
+      // (the Claude pool's log), so a non-codex provider is skipped silently and
+      // there is no `not-codex` reason at all.
+      const codexPrestreamEligible = ctx.provider === 'codex';
+      const codexPrestreamSkip = !codexPrestreamEligible ? null
         : (method !== 'POST' || replaySafe) ? 'not-post'
           : !isCodexResponsesPath(req.url) ? 'not-responses-path'
             : !(upstreamRes.status >= 200 && upstreamRes.status < 300) ? 'non-2xx'
@@ -4084,14 +4089,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
                 : codexPrestreamHoldMs <= 0 ? 'hold-disabled'
                   : codexPrestreamEncoding == null ? 'unsupported-encoding'
                     : null;
-      const codexPrestreamReserved = codexPrestreamSkip == null
+      const codexPrestreamReserved = codexPrestreamEligible && codexPrestreamSkip == null
         && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
-      if (codexPrestreamSkip != null || !codexPrestreamReserved) {
+      if (codexPrestreamEligible && (codexPrestreamSkip != null || !codexPrestreamReserved)) {
         const reason = codexPrestreamSkip ?? 'aux-budget';
         if (codexPrestreamDiagAllowed(accountManager, account, reason)) {
           console.log(`[TeamCodex] prestream skip: ${reason}`);
         }
-      } else {
+      } else if (codexPrestreamReserved) {
         let stage;
         try {
           stage = await stageCodexPreOutput(upstreamRes.body, {
