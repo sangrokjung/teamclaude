@@ -493,8 +493,12 @@ output-bearing frame (`response.output_*`, `response.content_part.*`,
 acknowledgement frames exceed the 64 KiB staging bound or keep trickling past
 `CODEX_PRESTREAM_STAGE_MAX_MS` (default = `TEAMCODEX_OVERLOAD_HOLD_MS`, floor
 1000 ms; at the cap the staged acknowledgements are flushed and the stream goes
-live, upstream kept), a compressed (`content-encoding`) stream, and any failure
-once the retry budget or hold cap is spent. In every passthrough the client receives the 200, the staged frames
+live, upstream kept), a stream with an unsupported or multiple
+`content-encoding` (supported: identity, gzip, x-gzip, deflate, br — the
+production backend streams gzip; an encoded stream is staged as raw bytes and
+decoded on the side only to classify, so the client's bytes and
+`content-encoding` are untouched), an encoded stream whose decoder cannot settle
+the frames, and any failure once the retry budget or hold cap is spent. In every passthrough the client receives the 200, the staged frames
 and the failure frame, and the `Upstream response.failed event … steering new
 requests to other accounts` soft-avoid fires once, as before. A client that
 disconnects during staging or the backoff cancels the upstream immediately; no

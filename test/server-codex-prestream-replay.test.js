@@ -10,7 +10,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { gzipSync } from 'node:zlib';
+import { gzipSync, gunzipSync, createGzip, constants as zlibConstants } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, classifyCodexSseFrame } from '../src/server.js';
 
@@ -124,6 +124,33 @@ function sse(res, frames, headers = {}) {
 }
 
 const count = (text, needle) => text.split(needle).length - 1;
+
+// The Codex backend streams gzip in production: emit each frame sync-flushed so
+// the proxy's side decoder sees whole frames as they arrive.
+function gzipFrames(res, frames) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+  const gzip = createGzip({ flush: zlibConstants.Z_SYNC_FLUSH });
+  gzip.pipe(res);
+  for (const frame of frames.slice(0, -1)) gzip.write(frame);
+  gzip.end(frames[frames.length - 1]);
+}
+
+// Raw client: no automatic decompression, so encoded bytes can be compared.
+function rawPost(proxyPort, path = '/codex/responses') {
+  return new Promise((resolve, reject) => {
+    const request = http.request({
+      host: '127.0.0.1', port: proxyPort, path, method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end(JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }));
+  });
+}
 
 async function postResponses(proxyPort, path = '/codex/responses') {
   const response = await fetch(`http://127.0.0.1:${proxyPort}${path}`, {
@@ -280,24 +307,118 @@ test('codex staging overflow goes live and is not replayed', () => withEnv(FAST_
   }
 }));
 
-// (e) a compressed stream is out of scope: legacy path, no staging, no replay.
-test('codex gzip-encoded stream keeps the legacy path (no staging, no replay)', () => withEnv(FAST_ENV, async () => {
+// (e) an unsupported / multiple content-encoding is out of scope: legacy path,
+// raw bytes untouched, no staging, no replay.
+test('codex stream with an unsupported content-encoding keeps the legacy path (no staging, no replay)', () => withEnv(FAST_ENV, async () => {
+  const payload = gzipSync(Buffer.from(CREATED + failedFrame('server_is_overloaded')));
   let hits = 0;
   const upstream = http.createServer(async (req, res) => {
     await drainRequest(req);
     hits += 1;
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
-    res.end(gzipSync(Buffer.from(CREATED + failedFrame('server_is_overloaded'))));
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip, br' });
+    res.end(payload);
   });
   const upstreamPort = await listen(upstream);
   const manager = codexManager(['codex-a', 'codex-b']);
   const proxy = codexProxy(manager, upstreamPort);
   const proxyPort = await listen(proxy);
   try {
-    const response = await postResponses(proxyPort);
+    const response = await rawPost(proxyPort);
     assert.equal(response.status, 200);
     assert.equal(hits, 1);
-    assert.equal(response.text, CREATED + failedFrame('server_is_overloaded'));
+    assert.equal(response.headers['content-encoding'], 'gzip, br');
+    assert.ok(response.buffer.equals(payload), 'raw bytes are relayed untouched');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g1) production shape: gzip stream, frames sync-flushed. A pre-output
+// response.failed is replayed on the other account; the client receives the
+// successful stream still gzip-encoded, with exactly one response.created.
+test('codex gzip pre-output response.failed is replayed onto another account, encoding preserved', () => withEnv(FAST_ENV, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) gzipFrames(res, [CREATED, IN_PROGRESS, failedFrame('server_is_overloaded')]);
+    else gzipFrames(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2);
+    assert.equal(response.headers['content-encoding'], 'gzip');
+    const text = gunzipSync(response.buffer).toString('utf8');
+    assert.equal(count(text, 'event: response.created'), 1, 'exactly one response.created');
+    assert.equal(count(text, 'event: response.failed'), 0);
+    assert.ok(text.includes(DELTA) && text.includes(COMPLETED));
+    assert.equal(failures(), 0);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g2) gzip failure after an output delta: legacy passthrough, bytes identical.
+test('codex gzip failure after an output delta keeps the legacy passthrough byte-for-byte', () => withEnv(FAST_ENV, async () => {
+  const payload = gzipSync(Buffer.from(CREATED + DELTA + failedFrame('server_is_overloaded')));
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.equal(response.headers['content-encoding'], 'gzip');
+    assert.ok(response.buffer.equals(payload), 'raw gzip bytes are relayed untouched');
+    assert.equal(failures(), 1);
+  } finally {
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// (g3) a gzip stream the decoder cannot settle goes live: raw bytes relayed,
+// nothing replayed.
+test('codex undecodable gzip stream goes live without a replay', () => withEnv(FAST_ENV, async () => {
+  const payload = Buffer.concat([
+    Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03]), // valid gzip header
+    Buffer.from('this is not a deflate stream at all '.repeat(16)),
+  ]);
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' });
+    res.end(payload);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const response = await rawPost(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1);
+    assert.ok(response.buffer.equals(payload), 'raw bytes are relayed untouched');
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
   } finally {
     await closeServer(proxy);
     await closeServer(upstream);

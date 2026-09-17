@@ -204,6 +204,21 @@ const CODEX_PRESTREAM_FAILURE_EVENTS = new Set(['response.failed', 'error']);
 // are flushed and the stream goes live — no replay, upstream kept.
 const CODEX_PRESTREAM_STAGE_MIN_MS = 1000;
 const CODEX_PRESTREAM_CAP_MESSAGE = 'Codex pre-output staging cap reached';
+// Encodings the stager can classify through a side decoder (the raw bytes are
+// what gets staged and forwarded; decoding is for classification only). A
+// missing/identity header is 'identity'; anything else or multiple encodings
+// returns null and keeps the legacy path. The production Codex backend streams
+// gzip, so identity-only staging never fired (2026-09-17 deployment).
+const CODEX_PRESTREAM_ENCODINGS = new Set(['identity', 'gzip', 'x-gzip', 'deflate', 'br']);
+export function codexPrestreamEncodingOf(contentEncoding) {
+  const encodings = String(contentEncoding || '')
+    .split(',')
+    .map(value => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (encodings.length === 0) return 'identity';
+  if (encodings.length !== 1) return null;
+  return CODEX_PRESTREAM_ENCODINGS.has(encodings[0]) ? encodings[0] : null;
+}
 
 // Classify ONE whole SSE frame (the text between blank-line boundaries) for
 // the pre-output stager. Exported for unit tests. Returns
@@ -265,33 +280,110 @@ function resumeStagedStream(reader, head, tail, pendingRead = null) {
 }
 
 // Stage whole SSE frames until the first output-bearing frame, a pre-output
-// failure, an abnormal end, or the total staging cap. Returns
+// failure, an abnormal end, or the total staging cap. `encoding` is the single
+// content-encoding (codexPrestreamEncodingOf): an encoded stream is staged as
+// its RAW bytes (byte fidelity for the client, content-encoding forwarded as
+// is) and decoded on the side purely to classify frames. The backend may not
+// sync-flush per frame, so a raw chunk that decodes to no whole frame simply
+// keeps staging (the time and byte caps bound it); frames that only settle at
+// EOF are judged then. Anything the decoder cannot settle (decoder error,
+// oversized frame) goes live without a replay. Returns
 //   { verdict: 'live', capped, resume }               — go live, nothing failed
 //   { verdict: 'failed', failure, cancel, resume }    — pre-output failure
 // where failure = { kind: 'terminal'|'eof'|'error'|'timeout', event, code,
 // replayable }. `resume()` rebuilds the legacy passthrough (staged bytes +
 // the original ending); `cancel()` drops the upstream body for a replay.
-async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs }) {
+async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs, encoding = 'identity' }) {
   const reader = webStream.getReader();
-  const framer = new SseFramer({ maxBufferedBytes: maxBytes });
+  const encoded = encoding !== 'identity';
+  const rawFramer = encoded ? null : new SseFramer({ maxBufferedBytes: maxBytes });
   const staged = [];
   let stagedBytes = 0;
   const startedAt = Date.now();
   // The read that was in flight when the time cap fired: still owned by the
   // reader, so the resumed live stream consumes it first (no byte loss).
   let inflightRead = null;
-  const head = () => Buffer.concat([...staged, framer.pending]);
-  const live = (capped = false) => ({
-    verdict: 'live',
-    capped,
-    resume: () => resumeStagedStream(reader, head(), 'delegate', inflightRead),
+
+  // Side decoder for an encoded stream: raw chunks in, decoded whole frames
+  // out (collected in decodedFrames). Never forwarded — classification only.
+  let decoder = null;
+  let decodeFramer = null;
+  let decodeFailed = false;
+  let flagDecodeFailed = () => {};
+  const decodeFailedP = new Promise(resolve => {
+    flagDecodeFailed = () => { decodeFailed = true; resolve(); };
   });
-  const failed = (failure, tail) => ({
-    verdict: 'failed',
-    failure,
-    cancel: () => reader.cancel().catch(() => {}),
-    resume: () => resumeStagedStream(reader, head(), tail),
+  const decodedFrames = [];
+  if (encoded) {
+    decoder = encoding === 'deflate' ? createInflate()
+      : encoding === 'br' ? createBrotliDecompress()
+        : createGunzip();
+    decodeFramer = new SseFramer({ maxBufferedBytes: maxBytes });
+    decoder.on('error', flagDecodeFailed);
+    decoder.on('data', chunk => {
+      if (decodeFailed) return;
+      const out = decodeFramer.push(chunk);
+      if (decodeFramer.passthrough) { flagDecodeFailed(); return; }
+      if (out?.length) decodedFrames.push(out);
+    });
+  }
+  // Write one raw chunk and wait until the decoder has processed it (zlib
+  // emits its output before the write callback; the extra tick covers a
+  // deferred 'data' emission), so frames it produced can be judged now.
+  const feedDecoder = chunk => Promise.race([
+    decodeFailedP,
+    new Promise(resolve => {
+      if (decodeFailed || decoder.destroyed || decoder.writableEnded) return resolve();
+      decoder.write(chunk, () => resolve());
+    }),
+  ]).then(() => new Promise(resolve => setImmediate(resolve)));
+  const finishDecoder = () => new Promise(resolve => {
+    if (decodeFailed || decoder.destroyed || decoder.writableEnded) return resolve();
+    decoder.once('end', resolve);
+    decoder.once('error', resolve);
+    decoder.once('close', resolve);
+    decoder.end();
   });
+  const takeDecodedText = () => decodedFrames.splice(0).map(frame => frame.toString('utf8')).join('');
+  const cleanup = () => { decoder?.destroy(); decodeFramer?.dispose(); };
+
+  const head = () => (encoded ? Buffer.concat(staged) : Buffer.concat([...staged, rawFramer.pending]));
+  const live = (capped = false) => {
+    cleanup();
+    return {
+      verdict: 'live',
+      capped,
+      resume: () => resumeStagedStream(reader, head(), 'delegate', inflightRead),
+    };
+  };
+  const failed = (failure, tail) => {
+    cleanup();
+    return {
+      verdict: 'failed',
+      failure,
+      cancel: () => reader.cancel().catch(() => {}),
+      resume: () => resumeStagedStream(reader, head(), tail),
+    };
+  };
+  // Walk whole frames in order so the verdict is independent of how upstream
+  // chunked them: an overflow reached BEFORE a failure frame still goes live.
+  // Returns a verdict, or null to keep staging. `countBytes` is the identity
+  // path (staged bytes ARE the frames); an encoded path counts raw bytes.
+  const judge = (text, countBytes) => {
+    for (const block of text.split(/\r?\n\r?\n/)) {
+      if (countBytes) stagedBytes += Buffer.byteLength(block) + 2;
+      if (!block) continue;
+      const frame = classifyCodexSseFrame(block);
+      if (frame.kind === 'output') return live();
+      if (frame.kind === 'failure') {
+        const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
+        return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
+      }
+      if (stagedBytes > maxBytes) return live(); // staging overflow: flush and go live
+    }
+    return null;
+  };
+
   while (true) {
     const remainingMs = maxMs - (Date.now() - startedAt);
     if (remainingMs <= 0) return live(true);
@@ -313,25 +405,32 @@ async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs }
       return failed({ kind: timedOut ? 'timeout' : 'error', event: null, code: null, replayable: true }, err);
     }
     if (step.done) {
+      if (encoded) {
+        // Frames may only decode at EOF (no sync flush upstream): settle them.
+        await finishDecoder();
+        if (decodeFailed) return live(); // undecodable: cannot judge, legacy bytes
+        const verdict = judge(takeDecodedText(), false);
+        if (verdict) return verdict;
+      }
       return failed({ kind: 'eof', event: null, code: null, replayable: true }, 'done');
     }
-    const out = framer.push(step.value);
+    if (encoded) {
+      const chunk = Buffer.from(step.value); // own copy: staged raw bytes outlive the reader's buffer
+      staged.push(chunk);
+      stagedBytes += chunk.length;
+      await feedDecoder(chunk);
+      if (decodeFailed) return live(); // decoder error / oversized frame: legacy
+      const verdict = judge(takeDecodedText(), false);
+      if (verdict) return verdict;
+      if (stagedBytes > maxBytes) return live(); // raw staging overflow
+      continue; // no whole frame settled yet: keep staging (caps bound it)
+    }
+    const out = rawFramer.push(step.value);
     if (!out || out.length === 0) continue; // partial frame still buffering
     staged.push(out);
-    if (framer.passthrough) return live(); // oversized frame: framing abandoned
-    // Walk the frames in order so the verdict is independent of how upstream
-    // chunked them: an overflow reached BEFORE a failure frame still goes live.
-    for (const block of out.toString('utf8').split(/\r?\n\r?\n/)) {
-      stagedBytes += Buffer.byteLength(block) + 2;
-      if (!block) continue;
-      const frame = classifyCodexSseFrame(block);
-      if (frame.kind === 'output') return live();
-      if (frame.kind === 'failure') {
-        const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
-        return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
-      }
-      if (stagedBytes > maxBytes) return live(); // staging overflow: flush and go live
-    }
+    if (rawFramer.passthrough) return live(); // oversized frame: framing abandoned
+    const verdict = judge(out.toString('utf8'), true);
+    if (verdict) return verdict;
   }
 }
 
@@ -3882,18 +3981,22 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       };
       // Codex-mode pre-output staging (B2, see stageCodexPreOutput). Scope:
-      // POST /codex/responses, identity encoding, 2xx, nothing sent yet, and
-      // the hold cap enabled (TEAMCODEX_OVERLOAD_HOLD_MS=0 disables B1 and B2
-      // alike). streamRecovery stays anthropic-only — codex never gets the
-      // anthropic-shaped error injection.
+      // POST /codex/responses, a single identity/gzip/x-gzip/deflate/br
+      // encoding (raw bytes staged, decoded on the side to classify), 2xx,
+      // nothing sent yet, and the hold cap enabled (TEAMCODEX_OVERLOAD_HOLD_MS=0
+      // disables B1 and B2 alike). streamRecovery stays anthropic-only — codex
+      // never gets the anthropic-shaped error injection.
       let streamBody = upstreamRes.body;
+      const codexPrestreamEncoding = codexPrestreamEncodingOf(upstreamRes.headers.get('content-encoding'));
+      const codexEncodingTag = codexPrestreamEncoding && codexPrestreamEncoding !== 'identity'
+        ? `, ${codexPrestreamEncoding}` : '';
       const codexPrestreamHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
       const codexPrestreamMaxMs = Math.max(
         CODEX_PRESTREAM_STAGE_MIN_MS,
         envInt('CODEX_PRESTREAM_STAGE_MAX_MS', codexPrestreamHoldMs),
       );
       if (ctx.provider === 'codex' && !replaySafe && method === 'POST'
-          && isCodexResponsesPath(req.url) && parseStreamUsage
+          && isCodexResponsesPath(req.url) && codexPrestreamEncoding != null
           && upstreamRes.status >= 200 && upstreamRes.status < 300
           && !res.headersSent && !res.destroyed && codexPrestreamHoldMs > 0
           && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES)) {
@@ -3903,6 +4006,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             idleTimeoutMs: ctx.streamIdleTimeoutMs,
             maxBytes: CODEX_PRESTREAM_STAGE_MAX_BYTES,
             maxMs: codexPrestreamMaxMs,
+            encoding: codexPrestreamEncoding,
           });
         } finally {
           ctx.releaseAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
@@ -3915,7 +4019,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             return;
           }
           const { failure } = stage;
-          const label = failure.code ? `${failure.kind} ${failure.code}` : failure.kind;
+          const label = `${failure.code ? `${failure.kind} ${failure.code}` : failure.kind}${codexEncodingTag}`;
           const replayable = failure.replayable && !res.headersSent;
           let codexHeldMs = 0;
           if (replayable) {
@@ -3966,7 +4070,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           }
         }
         if (stage.capped) {
-          console.log(`[TeamCodex] pre-output staging cap ${codexPrestreamMaxMs}ms reached on "${account.name}" — going live`);
+          console.log(`[TeamCodex] pre-output staging cap ${codexPrestreamMaxMs}ms reached on "${account.name}"${codexEncodingTag ? ` (${codexPrestreamEncoding})` : ''} — going live`);
         }
         // Live or passthrough: replay the staged bytes through the legacy
         // path so the client sees exactly what it always did, just later.
