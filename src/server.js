@@ -187,7 +187,29 @@ async function readCodexCapacityRejection(upstreamRes, ctx) {
 // client receives EXACTLY what legacy delivered (200 + staged frames + the
 // failure frame, via the same streamResponse path — so the terminal-event
 // hook, usage parsing and request logging all run as before).
-const CODEX_PRESTREAM_STAGE_MAX_BYTES = 64 * 1024;
+// Staging byte bound. A real session's FIRST frame is NOT small: `response.created`
+// echoes the request's `instructions` and the whole `tools` array back, so a session
+// with ~14 MCP servers and a large skill set emits a `response.created` of several
+// hundred KiB. At the original 64 KiB bound `SseFramer` abandoned framing on that
+// very first frame, the stager judged ZERO frames, and every such turn fell through
+// to the legacy passthrough — measured live 2026-09-17 right after deploy c4ad3c37 as
+// `[TeamCodex] prestream live on "<acct>": none after 0 frames, 3ms` on the exact
+// turns that died in 3-8s, while a small-tools probe of the same model staged
+// normally and was replayed to success. That bound, not the classifier, was the
+// last piece of "only real sessions fail fast".
+// Default 1 MiB, override with env CODEX_PRESTREAM_STAGE_MAX_BYTES, clamped to
+// [64 KiB, 16 MiB]. The reservation is taken from the shared response budget
+// (DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 256 MiB), so the cost is
+// (concurrently staging streams × this bound).
+const CODEX_PRESTREAM_STAGE_DEFAULT_BYTES = 1024 * 1024;
+const CODEX_PRESTREAM_STAGE_MIN_BYTES = 64 * 1024;
+const CODEX_PRESTREAM_STAGE_CEILING_BYTES = 16 * 1024 * 1024;
+function codexPrestreamStageMaxBytes() {
+  return Math.min(CODEX_PRESTREAM_STAGE_CEILING_BYTES, Math.max(
+    CODEX_PRESTREAM_STAGE_MIN_BYTES,
+    envInt('CODEX_PRESTREAM_STAGE_MAX_BYTES', CODEX_PRESTREAM_STAGE_DEFAULT_BYTES),
+  ));
+}
 // Frames that only acknowledge the request — the backend has produced nothing.
 const CODEX_PRE_OUTPUT_EVENTS = new Set([
   'response.created', 'response.queued', 'response.in_progress',
@@ -406,12 +428,21 @@ async function stageCodexPreOutput(webStream, {
   const cleanup = () => { decoder?.destroy(); decodeFramer?.dispose(); };
 
   const head = () => (encoded ? Buffer.concat(staged) : Buffer.concat([...staged, rawFramer.pending]));
-  const live = (capped = false, reasoningCapped = false, event = null) => {
+  // `reason` is WHY staging ended — logged verbatim so the next investigation
+  // does not have to re-derive it from a null event (2026-09-17: `none after 0
+  // frames` had exactly one possible cause and it still cost a live bisect):
+  //   'output'           an output-bearing frame (`event` names it)
+  //   'frame-overflow'   ONE frame exceeded maxBytes; SseFramer gave up framing
+  //   'staging-overflow' cumulative staged bytes exceeded maxBytes
+  //   'decode-failed'    the side decoder could not settle the frames
+  //   'cap' / 'reasoning-cap'  the total / reasoning time budget expired
+  const live = (reason, event = null) => {
     cleanup();
     return {
       verdict: 'live',
-      capped,
-      reasoningCapped,
+      reason,
+      capped: reason === 'cap',
+      reasoningCapped: reason === 'reasoning-cap',
       event,
       frames: framesStaged,
       elapsedMs: Date.now() - startedAt,
@@ -437,13 +468,13 @@ async function stageCodexPreOutput(webStream, {
       if (!block) continue;
       const frame = classifyCodexSseFrame(block);
       framesStaged += 1;
-      if (frame.kind === 'output') return live(false, false, frame.event);
+      if (frame.kind === 'output') return live('output', frame.event);
       if (frame.kind === 'failure') {
         const replayable = frame.code == null || CODEX_PRESTREAM_REPLAYABLE_CODES.has(frame.code);
         return failed({ kind: 'terminal', event: frame.event, code: frame.code, replayable }, 'delegate');
       }
       if (frame.phase === 'reasoning' && reasoningStartedAt == null) reasoningStartedAt = Date.now();
-      if (stagedBytes > maxBytes) return live(); // staging overflow: flush and go live
+      if (stagedBytes > maxBytes) return live('staging-overflow'); // flush and go live
     }
     return null;
   };
@@ -456,7 +487,7 @@ async function stageCodexPreOutput(webStream, {
       : reasoningMaxMs - (Date.now() - reasoningStartedAt);
     const reasoningIsSooner = reasoningRemainingMs < totalRemainingMs;
     const remainingMs = reasoningIsSooner ? reasoningRemainingMs : totalRemainingMs;
-    if (remainingMs <= 0) return live(!reasoningIsSooner, reasoningIsSooner);
+    if (remainingMs <= 0) return live(reasoningIsSooner ? 'reasoning-cap' : 'cap');
     const capIsSooner = remainingMs <= idleTimeoutMs;
     const capMessage = reasoningIsSooner
       ? CODEX_PRESTREAM_REASONING_CAP_MESSAGE : CODEX_PRESTREAM_CAP_MESSAGE;
@@ -471,10 +502,10 @@ async function stageCodexPreOutput(webStream, {
       inflightRead = null;
     } catch (err) {
       if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_REASONING_CAP_MESSAGE) {
-        return live(false, true); // reasoning cap: flush, go live, never replay
+        return live('reasoning-cap'); // flush, go live, never replay
       }
       if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_CAP_MESSAGE) {
-        return live(true); // cap: flush what was staged, keep upstream, never replay
+        return live('cap'); // flush what was staged, keep upstream, never replay
       }
       const timedOut = err?.code === 'ETIMEDOUT' && /^Upstream SSE idle timeout/.test(err?.message || '');
       return failed({ kind: timedOut ? 'timeout' : 'error', event: null, code: null, replayable: true }, err);
@@ -483,7 +514,7 @@ async function stageCodexPreOutput(webStream, {
       if (encoded) {
         // Frames may only decode at EOF (no sync flush upstream): settle them.
         await finishDecoder();
-        if (decodeFailed) return live(); // undecodable: cannot judge, legacy bytes
+        if (decodeFailed) return live('decode-failed'); // cannot judge: legacy bytes
         const verdict = judge(takeDecodedText(), false);
         if (verdict) return verdict;
       }
@@ -494,16 +525,16 @@ async function stageCodexPreOutput(webStream, {
       staged.push(chunk);
       stagedBytes += chunk.length;
       await feedDecoder(chunk);
-      if (decodeFailed) return live(); // decoder error / oversized frame: legacy
+      if (decodeFailed) return live('decode-failed'); // decoder error / oversized frame
       const verdict = judge(takeDecodedText(), false);
       if (verdict) return verdict;
-      if (stagedBytes > maxBytes) return live(); // raw staging overflow
+      if (stagedBytes > maxBytes) return live('staging-overflow'); // raw staging overflow
       continue; // no whole frame settled yet: keep staging (caps bound it)
     }
     const out = rawFramer.push(step.value);
     if (!out || out.length === 0) continue; // partial frame still buffering
     staged.push(out);
-    if (rawFramer.passthrough) return live(); // oversized frame: framing abandoned
+    if (rawFramer.passthrough) return live('frame-overflow'); // framing abandoned
     const verdict = judge(out.toString('utf8'), true);
     if (verdict) return verdict;
   }
@@ -4089,8 +4120,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
                 : codexPrestreamHoldMs <= 0 ? 'hold-disabled'
                   : codexPrestreamEncoding == null ? 'unsupported-encoding'
                     : null;
+      const codexPrestreamStageBytes = codexPrestreamStageMaxBytes();
       const codexPrestreamReserved = codexPrestreamEligible && codexPrestreamSkip == null
-        && ctx.reserveAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
+        && ctx.reserveAuxiliaryResponseBytes(codexPrestreamStageBytes);
       if (codexPrestreamEligible && (codexPrestreamSkip != null || !codexPrestreamReserved)) {
         const reason = codexPrestreamSkip ?? 'aux-budget';
         if (codexPrestreamDiagAllowed(accountManager, account, reason)) {
@@ -4101,13 +4133,13 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         try {
           stage = await stageCodexPreOutput(upstreamRes.body, {
             idleTimeoutMs: ctx.streamIdleTimeoutMs,
-            maxBytes: CODEX_PRESTREAM_STAGE_MAX_BYTES,
+            maxBytes: codexPrestreamStageBytes,
             maxMs: codexPrestreamMaxMs,
             encoding: codexPrestreamEncoding,
             reasoningMaxMs: codexPrestreamReasoningMaxMs,
           });
         } finally {
-          ctx.releaseAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
+          ctx.releaseAuxiliaryResponseBytes(codexPrestreamStageBytes);
         }
         if (stage.verdict === 'failed') {
           if (res.destroyed || ctx.abortSignal?.aborted) {
@@ -4173,8 +4205,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           console.log(`[TeamCodex] pre-output reasoning cap ${codexPrestreamReasoningMaxMs}ms reached on "${account.name}"${codexEncodingTag} — going live`);
         }
         if (stage.verdict === 'live'
-            && codexPrestreamDiagAllowed(accountManager, account, 'live')) {
-          console.log(`[TeamCodex] prestream live on "${account.name}"${codexEncodingTag}: ${stage.event || 'none'} after ${stage.frames} frames, ${stage.elapsedMs}ms`);
+            && codexPrestreamDiagAllowed(accountManager, account, `live:${stage.reason}`)) {
+          const why = stage.reason === 'output' ? `output:${stage.event || 'unknown'}` : stage.reason;
+          console.log(`[TeamCodex] prestream live on "${account.name}"${codexEncodingTag}: ${why} after ${stage.frames} frames, ${stage.elapsedMs}ms`);
         }
         // Live or passthrough: replay the staged bytes through the legacy
         // path so the client sees exactly what it always did, just later.

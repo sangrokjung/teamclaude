@@ -18,6 +18,7 @@ const ENV_KEYS = [
   'TEAMCLAUDE_OVERLOAD_RETRIES', 'TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS',
   'TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 'TEAMCODEX_OVERLOAD_HOLD_MS',
   'CODEX_PRESTREAM_STAGE_MAX_MS', 'CODEX_PRESTREAM_REASONING_MAX_MS',
+  'CODEX_PRESTREAM_STAGE_MAX_BYTES',
 ];
 // Fast, bounded defaults: 2 fleet backoffs of ~50ms, 5s hold cap.
 const FAST_ENV = {
@@ -134,6 +135,23 @@ function sse(res, frames, headers = {}) {
 }
 
 const count = (text, needle) => text.split(needle).length - 1;
+
+function captureConsole() {
+  const logs = [];
+  const original = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  return { logs, restore: () => { console.log = original; } };
+}
+
+// A production `response.created` echoes the request's instructions and tools,
+// so a real session's FIRST frame is hundreds of KiB (2026-09-17 live finding).
+const hugeCreatedFrame = bytes => {
+  const pad = 'y'.repeat(Math.max(0, bytes - 160));
+  return `event: response.created\ndata: ${JSON.stringify({
+    type: 'response.created',
+    response: { id: 'resp_1', status: 'in_progress', instructions: pad },
+  })}\n\n`;
+};
 
 // The Codex backend streams gzip in production: emit each frame sync-flushed so
 // the proxy's side decoder sees whole frames as they arrive.
@@ -292,7 +310,9 @@ test('codex failure after response.output_text.delta keeps the legacy passthroug
 
 // (d) staging overflow (> 64 KiB of acknowledgement frames) flushes and goes
 // live; a failure after that is not replayed.
-test('codex staging overflow goes live and is not replayed', () => withEnv(FAST_ENV, async () => {
+// Pin the bound so this exercises the cumulative-overflow path regardless of the
+// default (which moved 64 KiB → 1 MiB on 2026-09-17).
+test('codex staging overflow goes live and is not replayed', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_BYTES: '65536' }, async () => {
   const pad = 'x'.repeat(8 * 1024);
   const bigAck = `event: response.in_progress\ndata: ${JSON.stringify({ type: 'response.in_progress', pad })}\n\n`;
   let hits = 0;
@@ -919,5 +939,136 @@ test('anthropic mode never logs a prestream diagnostic', () => withEnv(FAST_ENV,
   assert.equal(
     logs.filter(line => line.startsWith('[TeamCodex] prestream')).length, 0,
     `anthropic mode must emit no B2 diagnostics, got ${JSON.stringify(logs)}`,
+  );
+}));
+
+// (a) The 2026-09-17 live finding: a real session's first `response.created`
+// echoes instructions + the whole tools array, so it blew the old 64 KiB bound,
+// SseFramer abandoned framing, and the stager judged ZERO frames — every such
+// turn fell through to legacy. At the 1 MiB default it stages and replays.
+test('codex 200 KiB first frame still stages: the pre-output failure is replayed', () => withEnv(FAST_ENV, async () => {
+  const bigCreated = hugeCreatedFrame(200 * 1024);
+  assert.ok(Buffer.byteLength(bigCreated) > 64 * 1024, 'must exceed the old 64 KiB bound');
+  assert.ok(Buffer.byteLength(bigCreated) < 1024 * 1024, 'must fit under the 1 MiB default');
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    if (hits === 1) sse(res, [bigCreated, IN_PROGRESS, REASONING_ITEM, failedFrame('server_is_overloaded')]);
+    else sse(res, [CREATED, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 2, 'a large first frame must not defeat staging');
+    assert.equal(count(response.text, 'event: response.created'), 1);
+    assert.equal(count(response.text, 'event: response.failed'), 0);
+    assert.ok(!response.text.includes('yyyy'), 'the staged oversized frame went with the failed attempt');
+    assert.ok(response.text.includes(DELTA) && response.text.includes(COMPLETED));
+    assert.equal(failures(), 0);
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.equal(
+    captured.logs.filter(line => line.includes('frame-overflow')).length, 0,
+    `no frame overflow expected, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// (b) A frame past the bound still degrades to raw passthrough — but now it SAYS
+// so, instead of the `none after 0 frames` that cost a live bisect.
+test('codex first frame above the staging bound goes live with a frame-overflow reason', () => withEnv(FAST_ENV, async () => {
+  const oversized = hugeCreatedFrame(1200 * 1024);
+  assert.ok(Buffer.byteLength(oversized) > 1024 * 1024, 'must exceed the 1 MiB default');
+  const frames = [oversized, IN_PROGRESS, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'framing was abandoned, so nothing is replayed');
+    assert.equal(response.text, frames.join(''), 'legacy bytes, unchanged');
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    captured.logs.some(line => line.startsWith('[TeamCodex] prestream live on "codex-a"')
+      && line.includes(': frame-overflow after ')),
+    `expected a frame-overflow diagnostic, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// (c) the bound is env-tunable: lowering it makes the (a) stream behave like (b).
+test('CODEX_PRESTREAM_STAGE_MAX_BYTES lowers the bound and the 200 KiB frame overflows', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_BYTES: '65536' }, async () => {
+  const frames = [hugeCreatedFrame(200 * 1024), IN_PROGRESS, failedFrame('server_is_overloaded')];
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    sse(res, frames);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    const response = await postResponses(proxyPort);
+    assert.equal(response.status, 200);
+    assert.equal(hits, 1, 'the lowered bound must defeat staging again');
+    assert.equal(response.text, frames.join(''));
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    captured.logs.some(line => line.includes(': frame-overflow after ')),
+    `expected a frame-overflow diagnostic, got ${JSON.stringify(captured.logs)}`,
+  );
+}));
+
+// The live diagnostic names WHY staging ended, not just "none".
+test('prestream live diagnostics name the reason (output / cap)', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_MS: '1000' }, async () => {
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    sse(res, [CREATED, IN_PROGRESS, DELTA, COMPLETED]);
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a']);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  const captured = captureConsole();
+  try {
+    assert.equal((await postResponses(proxyPort)).status, 200);
+  } finally {
+    captured.restore();
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+  assert.ok(
+    // 3 = created + in_progress + the delta that ended staging (the terminating
+    // frame is counted too — `frames` is "frames classified", not "frames held").
+    captured.logs.some(line => line.includes(': output:response.output_text.delta after 3 frames,')),
+    `expected an output: reason, got ${JSON.stringify(captured.logs)}`,
   );
 }));

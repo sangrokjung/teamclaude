@@ -478,7 +478,8 @@ request (`response.created`, `response.in_progress`, pings) and then ends with
 `error` event before any output item — or the stream simply ends, errors, or
 idles out. codex-rs renders that as "Selected model is at capacity" and does not
 retry. Because nothing output-bearing was produced, the relay stages whole SSE
-frames (up to 64 KiB) while every frame is an acknowledgement or an
+frames (up to `CODEX_PRESTREAM_STAGE_MAX_BYTES` — env, default 1 MiB, clamped to
+[64 KiB, 16 MiB]) while every frame is an acknowledgement or an
 envelope/reasoning frame, and on such a pre-output failure cancels the upstream
 body and replays the request through the
 same failover/backoff loop and hold cap as B1 (`TEAMCLAUDE_OVERLOAD_RETRIES`,
@@ -547,17 +548,32 @@ flood the log):
 Both lines are **codex-only**. Anthropic mode never enters B2, so it is skipped
 silently — there is no `not-codex` reason, and the Claude pool's log (port 3456)
 gains nothing from this change.
-- `[TeamCodex] prestream live on "<acct>"<, encoding>: <event-name> after <n> frames, <ms>ms`
-  — staging ended and the stream went live; `<event-name>` is the frame that
-  ended it (`none` when a cap, an overflow or a decoder error ended it instead,
-  in which case the matching cap line is logged just before).
+- `[TeamCodex] prestream live on "<acct>"<, encoding>: <reason> after <n> frames, <ms>ms`
+  — staging ended and the stream went live. `<reason>` is one of
+  `output:<event-name>` (an output-bearing frame, named), `frame-overflow` (ONE
+  frame exceeded the staging bound, so `SseFramer` abandoned framing),
+  `staging-overflow` (cumulative staged bytes exceeded it), `decode-failed`,
+  `cap`, `reasoning-cap`. `<n>` counts the terminating frame too.
 
 When a turn fails fast with `server_overloaded` and no `pre-output stream
 failure` line appears, read the `prestream skip` / `prestream live` line for the
-same account: a skip names the gate condition, and a `live` line whose
-`<event-name>` is `response.output_text.delta` or an `output_text` content part
+same account: a skip names the gate condition; `output:response.output_text.delta`
 means the failure genuinely arrived after user-visible output (correctly not
-replayed).
+replayed); and `frame-overflow` / `staging-overflow` mean the bound is too small
+for this workload — raise `CODEX_PRESTREAM_STAGE_MAX_BYTES`.
+
+**Sizing the bound (2026-09-17).** The default was 64 KiB until live diagnostics
+on deploy c4ad3c37 showed three proxied failures logging
+`prestream live on "<acct>": none after 0 frames, 3ms` (and `165ms`) — identity
+encoding, zero frames judged, i.e. the `frame-overflow` branch. The cause is that
+`response.created` echoes the request's `instructions` and its entire `tools`
+array, so a session with ~14 MCP servers and a large skill set (inputs up to
+~237K tokens) emits a first frame of several hundred KiB, while a minimal probe's
+first frame is tiny — which is why only real sessions died in 3-8 s and probes of
+the same model replayed and succeeded in 35-42 s. The default is now 1 MiB. Cost
+is (concurrently staging streams × the bound) against the 256 MiB shared response
+budget, so raising it further is cheap; a refused reservation degrades to
+`prestream skip: aux-budget`, not to an error.
 
 ## Rollback
 
