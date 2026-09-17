@@ -17,6 +17,7 @@ import { createProxyServer, classifyCodexSseFrame } from '../src/server.js';
 const ENV_KEYS = [
   'TEAMCLAUDE_OVERLOAD_RETRIES', 'TEAMCLAUDE_OVERLOAD_BACKOFF_BASE_MS',
   'TEAMCLAUDE_OVERLOAD_BACKOFF_CAP_MS', 'TEAMCODEX_OVERLOAD_HOLD_MS',
+  'CODEX_PRESTREAM_STAGE_MAX_MS',
 ];
 // Fast, bounded defaults: 2 fleet backoffs of ~50ms, 5s hold cap.
 const FAST_ENV = {
@@ -404,6 +405,58 @@ test('codex non-JSON 503 logs the not-replayable reason', () => withEnv(FAST_ENV
     assert.ok(lines.some(line => line === '[TeamCodex] 503 not replayable: non-json-body'), lines.join('\n'));
   } finally {
     console.log = originalLog;
+    await closeServer(proxy);
+    await closeServer(upstream);
+  }
+}));
+
+// Total staging cap: an upstream that keeps trickling small acknowledgements
+// under the idle timeout must not hold the client's headers past the cap. At
+// the cap the staged acks are flushed, the stream goes live and continues;
+// nothing is replayed and the upstream is kept.
+test('codex staging total-time cap goes live with the staged acks and never replays', () => withEnv({ ...FAST_ENV, CODEX_PRESTREAM_STAGE_MAX_MS: '1000' }, async () => {
+  let hits = 0;
+  const upstream = http.createServer(async (req, res) => {
+    await drainRequest(req);
+    hits += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(CREATED);
+    const started = Date.now();
+    const tick = setInterval(() => {
+      if (Date.now() - started >= 1600) {
+        clearInterval(tick);
+        res.write(DELTA);
+        res.end(COMPLETED);
+        return;
+      }
+      res.write(IN_PROGRESS); // every 25ms: far under the idle timeout
+    }, 25);
+    res.on('close', () => clearInterval(tick));
+  });
+  const upstreamPort = await listen(upstream);
+  const manager = codexManager(['codex-a', 'codex-b']);
+  const failures = countUpstreamFailures(manager);
+  const proxy = codexProxy(manager, upstreamPort);
+  const proxyPort = await listen(proxy);
+  try {
+    const startedAt = Date.now();
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/codex/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6', input: [], stream: true }),
+    });
+    const headersAfterMs = Date.now() - startedAt; // fetch resolves on headers
+    assert.equal(response.status, 200);
+    assert.ok(headersAfterMs >= 900 && headersAfterMs < 1500,
+      `headers arrived after ${headersAfterMs}ms (cap 1000ms, first upstream output at 1600ms)`);
+    const text = await response.text();
+    assert.equal(hits, 1);
+    assert.equal(count(text, 'event: response.created'), 1);
+    assert.ok(count(text, 'event: response.in_progress') >= 20, 'the acks staged before the cap were flushed');
+    assert.ok(text.includes(DELTA) && text.includes(COMPLETED), 'the stream continued live after the cap');
+    assert.equal(failures(), 0);
+    for (const account of manager.accounts) assert.equal(account.status, 'active');
+  } finally {
     await closeServer(proxy);
     await closeServer(upstream);
   }

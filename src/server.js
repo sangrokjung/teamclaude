@@ -197,6 +197,13 @@ const CODEX_PRE_OUTPUT_EVENTS = new Set([
 // occurred while processing your request" carries none).
 const CODEX_PRESTREAM_REPLAYABLE_CODES = new Set(['server_is_overloaded', 'slow_down']);
 const CODEX_PRESTREAM_FAILURE_EVENTS = new Set(['response.failed', 'error']);
+// Total staging time cap, measured from the start of ONE staging attempt (env
+// CODEX_PRESTREAM_STAGE_MAX_MS; default = the TEAMCODEX_OVERLOAD_HOLD_MS value,
+// floor 1000). The idle timeout alone cannot bound a backend that keeps
+// trickling small acknowledgements under it; past this cap the staged bytes
+// are flushed and the stream goes live — no replay, upstream kept.
+const CODEX_PRESTREAM_STAGE_MIN_MS = 1000;
+const CODEX_PRESTREAM_CAP_MESSAGE = 'Codex pre-output staging cap reached';
 
 // Classify ONE whole SSE frame (the text between blank-line boundaries) for
 // the pre-output stager. Exported for unit tests. Returns
@@ -230,7 +237,7 @@ export function classifyCodexSseFrame(block) {
 // (`tail === 'done'`), or rethrows the stored upstream error — so the legacy
 // streamResponse path replays a staged attempt byte-for-byte, including how
 // it ended. Only the reader methods streamResponse uses are provided.
-function resumeStagedStream(reader, head, tail) {
+function resumeStagedStream(reader, head, tail, pendingRead = null) {
   let headPending = head.length > 0;
   const wrapped = {
     async read() {
@@ -238,7 +245,16 @@ function resumeStagedStream(reader, head, tail) {
         headPending = false;
         return { done: false, value: head };
       }
-      if (tail === 'delegate') return reader.read();
+      if (tail === 'delegate') {
+        // A read still in flight when staging stopped (time cap) belongs to
+        // this stream now — consuming it here keeps its bytes.
+        if (pendingRead) {
+          const next = pendingRead;
+          pendingRead = null;
+          return next;
+        }
+        return reader.read();
+      }
       if (tail === 'done') return { done: true, value: undefined };
       throw tail;
     },
@@ -249,19 +265,27 @@ function resumeStagedStream(reader, head, tail) {
 }
 
 // Stage whole SSE frames until the first output-bearing frame, a pre-output
-// failure, or an abnormal end. Returns
-//   { verdict: 'live', resume }                       — go live, nothing failed
+// failure, an abnormal end, or the total staging cap. Returns
+//   { verdict: 'live', capped, resume }               — go live, nothing failed
 //   { verdict: 'failed', failure, cancel, resume }    — pre-output failure
 // where failure = { kind: 'terminal'|'eof'|'error'|'timeout', event, code,
 // replayable }. `resume()` rebuilds the legacy passthrough (staged bytes +
 // the original ending); `cancel()` drops the upstream body for a replay.
-async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes }) {
+async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes, maxMs }) {
   const reader = webStream.getReader();
   const framer = new SseFramer({ maxBufferedBytes: maxBytes });
   const staged = [];
   let stagedBytes = 0;
+  const startedAt = Date.now();
+  // The read that was in flight when the time cap fired: still owned by the
+  // reader, so the resumed live stream consumes it first (no byte loss).
+  let inflightRead = null;
   const head = () => Buffer.concat([...staged, framer.pending]);
-  const live = () => ({ verdict: 'live', resume: () => resumeStagedStream(reader, head(), 'delegate') });
+  const live = (capped = false) => ({
+    verdict: 'live',
+    capped,
+    resume: () => resumeStagedStream(reader, head(), 'delegate', inflightRead),
+  });
   const failed = (failure, tail) => ({
     verdict: 'failed',
     failure,
@@ -269,14 +293,22 @@ async function stageCodexPreOutput(webStream, { idleTimeoutMs, maxBytes }) {
     resume: () => resumeStagedStream(reader, head(), tail),
   });
   while (true) {
+    const remainingMs = maxMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) return live(true);
+    const capIsSooner = remainingMs <= idleTimeoutMs;
     let step;
     try {
+      inflightRead = inflightRead ?? reader.read();
       step = await raceTimeout(
-        reader.read(),
-        idleTimeoutMs,
-        `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
+        inflightRead,
+        Math.max(1, Math.min(idleTimeoutMs, remainingMs)),
+        capIsSooner ? CODEX_PRESTREAM_CAP_MESSAGE : `Upstream SSE idle timeout after ${idleTimeoutMs}ms`,
       );
+      inflightRead = null;
     } catch (err) {
+      if (err?.code === 'ETIMEDOUT' && err?.message === CODEX_PRESTREAM_CAP_MESSAGE) {
+        return live(true); // cap: flush what was staged, keep upstream, never replay
+      }
       const timedOut = err?.code === 'ETIMEDOUT' && /^Upstream SSE idle timeout/.test(err?.message || '');
       return failed({ kind: timedOut ? 'timeout' : 'error', event: null, code: null, replayable: true }, err);
     }
@@ -3856,6 +3888,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // anthropic-shaped error injection.
       let streamBody = upstreamRes.body;
       const codexPrestreamHoldMs = Math.max(0, envInt('TEAMCODEX_OVERLOAD_HOLD_MS', 90_000));
+      const codexPrestreamMaxMs = Math.max(
+        CODEX_PRESTREAM_STAGE_MIN_MS,
+        envInt('CODEX_PRESTREAM_STAGE_MAX_MS', codexPrestreamHoldMs),
+      );
       if (ctx.provider === 'codex' && !replaySafe && method === 'POST'
           && isCodexResponsesPath(req.url) && parseStreamUsage
           && upstreamRes.status >= 200 && upstreamRes.status < 300
@@ -3866,6 +3902,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           stage = await stageCodexPreOutput(upstreamRes.body, {
             idleTimeoutMs: ctx.streamIdleTimeoutMs,
             maxBytes: CODEX_PRESTREAM_STAGE_MAX_BYTES,
+            maxMs: codexPrestreamMaxMs,
           });
         } finally {
           ctx.releaseAuxiliaryResponseBytes(CODEX_PRESTREAM_STAGE_MAX_BYTES);
@@ -3927,6 +3964,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             appendLogSection(`=== STREAM pre-output ${label} — passed through ===`);
             flushRequestLog(logDir, reqId, logSections, hooks);
           }
+        }
+        if (stage.capped) {
+          console.log(`[TeamCodex] pre-output staging cap ${codexPrestreamMaxMs}ms reached on "${account.name}" — going live`);
         }
         // Live or passthrough: replay the staged bytes through the legacy
         // path so the client sees exactly what it always did, just later.

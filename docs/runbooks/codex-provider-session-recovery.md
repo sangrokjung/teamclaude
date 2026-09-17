@@ -490,9 +490,11 @@ output-bearing frame (`response.output_*`, `response.content_part.*`,
 `response.reasoning*`, `response.function_call*`, `response.completed`, …), a
 `response.failed`/`error` whose code is a request rejection
 (`invalid_request`, `usage_limit_reached`, `unauthorized`, …), a stream whose
-acknowledgement frames exceed the 64 KiB staging bound, a compressed
-(`content-encoding`) stream, and any failure once the retry budget or hold cap
-is spent. In every passthrough the client receives the 200, the staged frames
+acknowledgement frames exceed the 64 KiB staging bound or keep trickling past
+`CODEX_PRESTREAM_STAGE_MAX_MS` (default = `TEAMCODEX_OVERLOAD_HOLD_MS`, floor
+1000 ms; at the cap the staged acknowledgements are flushed and the stream goes
+live, upstream kept), a compressed (`content-encoding`) stream, and any failure
+once the retry budget or hold cap is spent. In every passthrough the client receives the 200, the staged frames
 and the failure frame, and the `Upstream response.failed event … steering new
 requests to other accounts` soft-avoid fires once, as before. A client that
 disconnects during staging or the backoff cancels the upstream immediately; no
