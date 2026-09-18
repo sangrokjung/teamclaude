@@ -1078,3 +1078,33 @@ test('TUI "e" toggle disables/enables the selected account and persists it', asy
   assert.equal(am.accounts[0].enabled, true, 'toggled back on');
   assert.equal(config.accounts[0].enabled, true);
 });
+
+test('account list scrolls the selected lower row into the visible terminal viewport', () => {
+  const { tui } = makeTUI(Array.from({ length: 8 }, (_, i) => `account-${i}`));
+  const originalColumns = process.stdout.columns;
+  const originalRows = process.stdout.rows;
+  const originalWrite = process.stdout.write;
+  let output = '';
+  try {
+    process.stdout.columns = 80;
+    process.stdout.rows = 8;
+    process.stdout.write = chunk => { output += String(chunk); return true; };
+    tui.running = true;
+    for (let i = 0; i < 7; i++) tui._keyNormal('down');
+    tui.render();
+    assert.match(output, /account-7/, 'the selected bottom account must be rendered after scrolling down');
+    assert.doesNotMatch(output, /account-0/, 'the viewport should have moved past the first account');
+    assert.match(output, /Activity/, 'the activity section remains visible while scrolling');
+    assert.match(stripAnsi(output), /quit/, 'the keyboard footer remains visible while scrolling');
+  } finally {
+    process.stdout.columns = originalColumns;
+    process.stdout.rows = originalRows;
+    process.stdout.write = originalWrite;
+  }
+});
+
+test('coalesced down-arrow escape sequences move the account cursor repeatedly', () => {
+  const { tui } = makeTUI(['account-0', 'account-1', 'account-2']);
+  tui._onData('\x1b[B\x1b[B');
+  assert.equal(tui.selIdx, 2);
+});

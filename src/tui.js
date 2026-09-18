@@ -240,10 +240,12 @@ export class TUI {
     this.mode = 'normal';    // normal | select (delete-confirm) | add | input | order
     this.selIdx = 0;         // cursor POSITION over the display list (render hint)
     this.selAcct = null;     // cursor ANCHOR: the selected account OBJECT (see _selected)
+    this.accountScroll = 0;
     this.orderAccount = null; // the account being moved while in 'order' mode
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputBuffer = '';
     this.frame = 0;
     this.running = false;
     this.timer = null;
@@ -319,13 +321,30 @@ export class TUI {
   // ── input handling ─────────────────────────────────
 
   _onData(d) {
-    if (d === '\x1b[A') return this._key('up');
-    if (d === '\x1b[B') return this._key('down');
-    if (d === '\x1b') return this._key('esc');
-    if (d === '\r' || d === '\n') return this._key('enter');
-    if (d === '\x03') return this._key('ctrl-c');
-    if (d === '\x7f' || d === '\x08') return this._key('bs');
-    if (d.length === 1 && d >= ' ') return this._key(d);
+    this.inputBuffer += d;
+    while (this.inputBuffer) {
+      if (this.inputBuffer.startsWith('\x1b[A')) {
+        this.inputBuffer = this.inputBuffer.slice(3);
+        this._key('up');
+        continue;
+      }
+      if (this.inputBuffer.startsWith('\x1b[B')) {
+        this.inputBuffer = this.inputBuffer.slice(3);
+        this._key('down');
+        continue;
+      }
+      if (this.inputBuffer.startsWith('\x1b[') && this.inputBuffer.length < 3) break;
+
+      const codePoint = this.inputBuffer.codePointAt(0);
+      if (codePoint == null) break;
+      const char = String.fromCodePoint(codePoint);
+      this.inputBuffer = this.inputBuffer.slice(char.length);
+      if (char === '\x1b') this._key('esc');
+      else if (char === '\r' || char === '\n') this._key('enter');
+      else if (char === '\x03') this._key('ctrl-c');
+      else if (char === '\x7f' || char === '\x08') this._key('bs');
+      else if (codePoint >= 0x20) this._key(char);
+    }
   }
 
   _key(k) {
@@ -854,6 +873,7 @@ export class TUI {
     }
 
     const lines = [];
+    const footerH = 2;
 
     // ── Header
     const left = bold(this.config.provider === 'codex' ? ' TeamCodex' : ' TeamClaude');
@@ -897,7 +917,20 @@ export class TUI {
       // re-sort the auto group), and the highlight must follow the account.
       this._selected();
       const display = this._displayList();
-      for (let pos = 0; pos < display.length; pos++) {
+      const accountHeaderH = 3;
+      const activityHeaderH = 2;
+      const visibleRows = Math.max(
+        1,
+        H - accountHeaderH - activityHeaderH - this.active.size - footerH,
+      );
+      const maxScroll = Math.max(0, display.length - visibleRows);
+      if (this.selIdx < this.accountScroll) this.accountScroll = this.selIdx;
+      else if (this.selIdx >= this.accountScroll + visibleRows) {
+        this.accountScroll = this.selIdx - visibleRows + 1;
+      }
+      this.accountScroll = Math.min(Math.max(0, this.accountScroll), maxScroll);
+      const end = Math.min(display.length, this.accountScroll + visibleRows);
+      for (let pos = this.accountScroll; pos < end; pos++) {
         lines.push(this._renderAcct(display[pos], pos, bw, showBoth, showThree));
       }
     }
@@ -919,7 +952,6 @@ export class TUI {
     }
 
     // Completed log
-    const footerH = 2;
     const space = Math.max(0, H - lines.length - footerH);
     for (let i = 0; i < space && i < this.log.length; i++) {
       lines.push(`   ${gray(this.log[i].t)}  ${this.log[i].msg}`);
