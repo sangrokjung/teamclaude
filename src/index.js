@@ -1019,6 +1019,7 @@ async function superviseServerCommand() {
   }
 
   function launchWorker() {
+    pendingRecycleReason = null; // a new worker's lifetime starts with no claimed reason
     if (stopping) return;
     workerReady = false;
     workerPort = null;
@@ -1211,9 +1212,15 @@ async function superviseServerCommand() {
         escalate.unref?.();
         return;
       }
-      pendingRecycleReason = 'health-check';
       console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and did not answer IPC within ${pingBudgetMs}ms (load1 ${load1.toFixed(1)} / ${cores} cores); restarting it.`);
-      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+      if (checkedWorker.exitCode == null) {
+        // Claim the reason only when this kill is what ends the worker. A
+        // worker that already exited on its own while the ping was pending
+        // has had its exit handler record `exit:N` / `signal:SIG`; a reason
+        // left here would be consumed by the NEXT worker's unrelated death.
+        pendingRecycleReason = 'health-check';
+        checkedWorker.kill('SIGKILL');
+      }
     } finally {
       recycleInFlight = false;
     }
