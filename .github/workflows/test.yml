@@ -20,6 +20,8 @@ jobs:
       # The repo has no package-lock.json (zero runtime deps; eslint is the only devDependency), so npm ci would fail.
       - run: npm install --no-audit --no-fund
       - run: npx eslint src/
+      # test/install-macos.test.js is macOS-only (launchctl, ~/Library paths) and fails on
+      # ubuntu runners; it is not in the green list. Run it locally on macOS.
       - name: Test files that pass at the 2026-09-22 baseline
         run: xargs node --test < .github/ci-green-files.txt
       - name: auth-revoked quarantine contract (account-manager.test.js)

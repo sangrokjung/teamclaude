@@ -7,7 +7,6 @@ test/codex-run.test.js
 test/codex-session.test.js
 test/codex.test.js
 test/config.test.js
-test/install-macos.test.js
 test/log-timestamps.test.js
 test/quota-reserve.test.js
 test/runtime-info.test.js
