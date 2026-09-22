@@ -174,6 +174,14 @@ function persistedAccount(snapshot, accountManager, account) {
     expiresAt: liveAccount.expiresAt,
     idToken: liveAccount.idToken,
     accountId: liveAccount.accountId,
+    // The live quarantine state is authoritative for what gets written: a TUI
+    // import/reauth that installed fresh credentials (lifting it in memory)
+    // must not carry a stale `authRevoked` from the snapshot or disk entry.
+    // `undefined` wins the upsert merge over the disk value and JSON drops it.
+    authRevoked: liveAccount.authRevoked === true ? true : undefined,
+    authRevokedAt: liveAccount.authRevoked === true
+      ? (liveAccount.authRevokedAt || configAccount.authRevokedAt)
+      : undefined,
   };
 }
 
@@ -596,6 +604,12 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
+          // A hand-installed credential is a new generation (an in-flight
+          // refresh result for the old one must be discarded), and fresh
+          // credentials lift the auth-revocation quarantine (persist=false:
+          // the upsert below writes the cleared flag).
+          amAcct._credentialGeneration = (amAcct._credentialGeneration || 0) + 1;
+          if (amAcct.authRevoked === true) this.am.setAuthRevoked(amAcct, false, false);
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
           if (amAcct.status === 'error') {

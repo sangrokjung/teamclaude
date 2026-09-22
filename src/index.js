@@ -1425,7 +1425,9 @@ async function proxyWorkerCommand() {
       const memIdx = findConfigAccount(config, account);
       if (memIdx >= 0) applyOAuthTokens(config.accounts[memIdx], diskAccount);
       if (conflict && diskAccount.accessToken) {
-        accountManager.updateAccountTokens(account, diskAccount, false);
+        accountManager.updateAccountTokens(account, diskAccount, false, {
+          clearAuthRevoked: false,
+        });
         console.log(`[TeamClaude] Kept newer disk credential for account "${account.name}"`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
@@ -1466,6 +1468,82 @@ async function proxyWorkerCommand() {
     console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
     throw err;
   }));
+  // Persist the auth-revocation quarantine the moment ensureTokenFresh's
+  // invalid_grant handler flips it, and clear it when fresh credentials lift
+  // it. Serialized per account: `revoked=true` then `revoked=false` for the
+  // same account must land in that order, and a write whose generation a later
+  // transition already superseded is dropped instead of resurrecting the older
+  // state. Same discipline as onTokenRefresh otherwise: re-read disk
+  // (atomicConfigUpdate), match by identity (findConfigAccount), then mirror
+  // the outcome into the long-lived in-memory config copy.
+  const authPersistenceChains = new WeakMap();
+  const persistAuthRevocationNow = async (account, revoked, previousTokens = null, generation = null) => {
+    const expectedGeneration = Number.isFinite(generation)
+      ? generation
+      : (account._authRevocationGeneration || 0);
+    const isCurrent = () => accountManager.accounts[account.index] === account
+      && (account._authRevocationGeneration || 0) === expectedGeneration
+      && (account.authRevoked === true) === (revoked === true);
+    if (!isCurrent()) return;
+
+    let credentialConflict = false;
+    const diskConfig = await atomicConfigUpdate(cfg => {
+      if (!isCurrent()) return;
+      const cfgIdx = findConfigAccount(cfg, account);
+      if (cfgIdx < 0) return;
+      const diskAccount = cfg.accounts[cfgIdx];
+      if (!revoked) {
+        delete diskAccount.authRevoked;
+        delete diskAccount.authRevokedAt;
+        return;
+      }
+      // The revoked grant is the credential the refresh STARTED from. If another
+      // process replaced the stored credential meanwhile, that credential is
+      // unverified from here: the disk entry is still marked (quarantine is the
+      // safe default) and it is NOT installed into the live account. A login or
+      // import that writes a fresh entry (dropping the flag) is what clears it.
+      const hasStoredCredential = diskAccount.accessToken != null || diskAccount.refreshToken != null;
+      credentialConflict = Boolean(previousTokens && hasStoredCredential
+        && !storedCredentialMatches(diskAccount, previousTokens));
+      diskAccount.authRevoked = true;
+      diskAccount.authRevokedAt = Math.max(
+        Number(diskAccount.authRevokedAt) || 0,
+        Number(account.authRevokedAt) || 0,
+        Date.now(),
+      );
+    });
+    if (!isCurrent()) return;
+    const diskIdx = findConfigAccount(diskConfig, account);
+    if (diskIdx < 0) return;
+    const diskAccount = diskConfig.accounts[diskIdx];
+    if (credentialConflict) {
+      console.log(`[TeamClaude] Auth quarantine for "${account.name}" persisted over a concurrently changed stored credential — run login/import again to replace it`);
+    }
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    const memAccount = config.accounts[memIdx];
+    if (diskAccount.authRevoked === true) {
+      memAccount.authRevoked = true;
+      memAccount.authRevokedAt = diskAccount.authRevokedAt;
+    } else {
+      delete memAccount.authRevoked;
+      delete memAccount.authRevokedAt;
+    }
+  };
+  const persistAuthRevocation = (account, revoked, previousTokens = null, generation = null) => {
+    const prior = authPersistenceChains.get(account) || Promise.resolve();
+    const current = prior.catch(() => {}).then(() => persistAuthRevocationNow(
+      account, revoked, previousTokens, generation,
+    )).catch(err => console.error(
+      `[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${err.message}`,
+    ));
+    authPersistenceChains.set(account, current);
+    current.finally(() => {
+      if (authPersistenceChains.get(account) === current) authPersistenceChains.delete(account);
+    });
+    return current;
+  };
+  accountManager.onAuthRevoked(persistAuthRevocation);
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -2938,6 +3016,7 @@ async function accountsCommand() {
     config = await atomicConfigUpdate(async cfg => {
       await Promise.all(cfg.accounts.map(async account => {
         if (account.type !== 'oauth' || !account.refreshToken
+          || account.authRevoked === true
           || !isTokenExpiringSoon(account.expiresAt)) return;
         try {
           const newTokens = account.provider === 'codex'
@@ -2953,6 +3032,8 @@ async function accountsCommand() {
   const profiles = await Promise.all(
     config.accounts.map(a => {
       if (a.type !== 'oauth' || !a.accessToken) return null;
+      // A quarantined account's token is known-dead upstream; don't spend it.
+      if (a.authRevoked === true) return null;
       if (a.provider === 'codex') {
         return {
           accountUuid: a.accountId || a.accountUuid,
@@ -3056,7 +3137,9 @@ async function accountsCommand() {
       continue;
     }
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
-    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
+    const status = a.authRevoked === true
+      ? 're-login required (refresh token revoked)'
+      : hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
@@ -3431,6 +3514,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   let action = 'Added';
+  let quarantineLifted = false;
   const savedConfig = await atomicConfigUpdate(cfg => {
     if (!name) {
       // First FREE account-N (not `count + 1`, which collides after a delete)
@@ -3454,6 +3538,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (idx >= 0) {
       action = 'Updated';
       const previous = cfg.accounts[idx];
+      // The fresh entry deliberately omits `authRevoked`/`authRevokedAt`: new
+      // credentials are the one thing that lifts the quarantine, and a running
+      // server picks the cleared flag up on its next config sync.
+      if (previous.authRevoked === true) quarantineLifted = true;
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
@@ -3466,6 +3554,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     }
   });
   console.log(`${action} account "${name}"`);
+  if (quarantineLifted) {
+    console.log(`Account "${name}" was quarantined (refresh token revoked) — the new credentials replace it and lift the quarantine`);
+  }
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
@@ -3615,11 +3706,28 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (mgr.provider === 'anthropic' && (mgr.subscriptionDisabled === true) !== wantLapsed) {
         accountManager.setSubscriptionDisabled(mgr, wantLapsed, false);
       }
+      // Auth-revocation flag, disk → live, one direction only: a flag on disk
+      // parks the live account (persist=false — it came FROM disk). Lifting is
+      // never inferred from a MISSING flag (a lost persistence write must not
+      // un-park a revoked chain); only a fresh credential installed below
+      // (updateAccountTokens, clearAuthRevoked) lifts it.
+      const wantRevoked = diskAcct.authRevoked === true;
+      if (mgr.provider === 'anthropic' && mgr.type === 'oauth'
+          && wantRevoked && mgr.authRevoked !== true) {
+        accountManager.setAuthRevoked(mgr, true, false);
+      }
       const memAcct = memConfig.accounts[memIdx];
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
         if (wantLapsed) memAcct.subscriptionDisabled = true; else delete memAcct.subscriptionDisabled;
+        if (wantRevoked) {
+          memAcct.authRevoked = true;
+          memAcct.authRevokedAt = diskAcct.authRevokedAt;
+        } else if (mgr.authRevoked !== true) {
+          delete memAcct.authRevoked;
+          delete memAcct.authRevokedAt;
+        }
         if (diskCancellation) memAcct.subscriptionCancellation = diskCancellation;
         else delete memAcct.subscriptionCancellation;
       }
@@ -3667,7 +3775,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
+        // A disk entry that still carries `authRevoked` is an unverified
+        // credential sync — install the tokens but keep the account parked.
+        accountManager.updateAccountTokens(mgr.index, freshCred, true, {
+          clearAuthRevoked: diskAcct.authRevoked !== true,
+        });
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
