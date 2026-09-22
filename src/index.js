@@ -4,7 +4,7 @@ import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
-import { homedir } from 'node:os';
+import { homedir, loadavg, cpus } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
@@ -36,9 +36,11 @@ import {
 } from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
+import { formatUptime } from './runtime-info.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
+import { installTimestampedConsole } from './log-timestamps.js';
 import {
   applySubscriptionCancellation,
   cancellationEndsAt,
@@ -58,6 +60,7 @@ import {
 } from './cmux-session-rescue.js';
 import {
   PROBE_BROKEN,
+  contentionPingBudget,
   createLoopStallMeter,
   healthProbeVerdict,
   unhealthyWorkerAction,
@@ -67,6 +70,10 @@ import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.j
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const LIFECYCLE_ID_ENV = 'TEAMCLAUDE_LIFECYCLE_ID';
+const SUPERVISOR_STARTED_AT_ENV = 'TEAMCLAUDE_SUPERVISOR_STARTED_AT';
+const WORKER_RESTARTS_ENV = 'TEAMCLAUDE_WORKER_RESTARTS';
+const WORKER_LAST_RESTART_AT_ENV = 'TEAMCLAUDE_WORKER_LAST_RESTART_AT';
+const WORKER_LAST_RESTART_REASON_ENV = 'TEAMCLAUDE_WORKER_LAST_RESTART_REASON';
 const DEPLOYMENT_DRAIN_PATH = '/teamclaude/deployment/drain';
 const LIFECYCLE_ID_HEADER = 'x-teamcodex-lifecycle-id';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
@@ -266,6 +273,9 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Both the supervisor and the forked worker (stdio inherited) enter here,
+  // so one call covers every daemon log line; a no-op on a TTY (TUI mirrors).
+  installTimestampedConsole();
   if (process.env[SUPERVISED_WORKER_ENV] === '1') {
     await proxyWorkerCommand();
     return;
@@ -351,6 +361,12 @@ async function superviseServerCommand() {
   let deploymentDrainTimer = null;
   let activePublicRequests = 0;
   let activeBufferedRequestBytes = 0;
+  const supervisorStartedAt = Date.now();
+  // Why the LAST worker went away and how many times it has, surfaced through
+  // /teamclaude/status so an operator can tell a health-check kill from an
+  // upstream crash without timestamps-free log archaeology.
+  const workerRestartLedger = { restarts: 0, lastAt: null, lastReason: null };
+  let pendingRecycleReason = null;
   let restartCount = 0;
   let restartTimer = null;
   let stableTimer = null;
@@ -1003,6 +1019,7 @@ async function superviseServerCommand() {
   }
 
   function launchWorker() {
+    pendingRecycleReason = null; // a new worker's lifetime starts with no claimed reason
     if (stopping) return;
     workerReady = false;
     workerPort = null;
@@ -1011,6 +1028,10 @@ async function superviseServerCommand() {
       [SUPERVISED_WORKER_ENV]: '1',
       [SUPERVISOR_PID_ENV]: String(process.pid),
       [LIFECYCLE_ID_ENV]: lifecycleId,
+      [SUPERVISOR_STARTED_AT_ENV]: String(supervisorStartedAt),
+      [WORKER_RESTARTS_ENV]: String(workerRestartLedger.restarts),
+      [WORKER_LAST_RESTART_AT_ENV]: workerRestartLedger.lastAt == null ? '' : String(workerRestartLedger.lastAt),
+      [WORKER_LAST_RESTART_REASON_ENV]: workerRestartLedger.lastReason || '',
     };
     const child = fork(process.argv[1], ['server'], {
       env: childEnv,
@@ -1106,6 +1127,11 @@ async function superviseServerCommand() {
         return;
       }
 
+      workerRestartLedger.restarts += 1;
+      workerRestartLedger.lastAt = Date.now();
+      workerRestartLedger.lastReason = pendingRecycleReason
+        || (signal ? `signal:${signal}` : `exit:${code}`);
+      pendingRecycleReason = null;
       restartCount += 1;
       const backoffMs = Math.min(100 * (2 ** (restartCount - 1)), 2_000);
       console.error(
@@ -1153,13 +1179,16 @@ async function superviseServerCommand() {
     recycleInFlight = true;
     try {
       const stallAtPing = loopStall.read();
-      const ipcAlive = await pingWorker(checkedWorker, workerPingTimeoutMs);
+      const load1 = loadavg()[0];
+      const cores = cpus().length || 1;
+      const pingBudgetMs = contentionPingBudget({ baseMs: workerPingTimeoutMs, load1, cores });
+      const ipcAlive = await pingWorker(checkedWorker, pingBudgetMs);
       if (stopping || checkedWorker !== worker) return;
       const action = unhealthyWorkerAction({
         broken,
         ipcAlive,
         selfStallMs: loopStall.read() - stallAtPing,
-        timeoutMs: workerPingTimeoutMs,
+        timeoutMs: pingBudgetMs,
         tickMs: loopStall.tickMs,
       });
       if (action === 'keep') {
@@ -1175,6 +1204,7 @@ async function superviseServerCommand() {
       workerPort = null;
       if (action === 'drain') {
         console.error(`[TeamClaude] Proxy worker listener is broken while its event loop runs; draining it (${workerRecycleGraceMs}ms grace).`);
+        pendingRecycleReason = 'listener-broken';
         checkedWorker.kill('SIGTERM');
         const escalate = setTimeout(() => {
           if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
@@ -1182,8 +1212,15 @@ async function superviseServerCommand() {
         escalate.unref?.();
         return;
       }
-      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and does not answer IPC; restarting it.`);
-      if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
+      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and did not answer IPC within ${pingBudgetMs}ms (load1 ${load1.toFixed(1)} / ${cores} cores); restarting it.`);
+      if (checkedWorker.exitCode == null) {
+        // Claim the reason only when this kill is what ends the worker. A
+        // worker that already exited on its own while the ping was pending
+        // has had its exit handler record `exit:N` / `signal:SIG`; a reason
+        // left here would be consumed by the NEXT worker's unrelated death.
+        pendingRecycleReason = 'health-check';
+        checkedWorker.kill('SIGKILL');
+      }
     } finally {
       recycleInFlight = false;
     }
@@ -1425,7 +1462,9 @@ async function proxyWorkerCommand() {
       const memIdx = findConfigAccount(config, account);
       if (memIdx >= 0) applyOAuthTokens(config.accounts[memIdx], diskAccount);
       if (conflict && diskAccount.accessToken) {
-        accountManager.updateAccountTokens(account, diskAccount, false);
+        accountManager.updateAccountTokens(account, diskAccount, false, {
+          clearAuthRevoked: false,
+        });
         console.log(`[TeamClaude] Kept newer disk credential for account "${account.name}"`);
       }
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
@@ -1466,6 +1505,82 @@ async function proxyWorkerCommand() {
     console.error(`[TeamClaude] Failed to persist subscription metadata for "${account.name}": ${err.message}`);
     throw err;
   }));
+  // Persist the auth-revocation quarantine the moment ensureTokenFresh's
+  // invalid_grant handler flips it, and clear it when fresh credentials lift
+  // it. Serialized per account: `revoked=true` then `revoked=false` for the
+  // same account must land in that order, and a write whose generation a later
+  // transition already superseded is dropped instead of resurrecting the older
+  // state. Same discipline as onTokenRefresh otherwise: re-read disk
+  // (atomicConfigUpdate), match by identity (findConfigAccount), then mirror
+  // the outcome into the long-lived in-memory config copy.
+  const authPersistenceChains = new WeakMap();
+  const persistAuthRevocationNow = async (account, revoked, previousTokens = null, generation = null) => {
+    const expectedGeneration = Number.isFinite(generation)
+      ? generation
+      : (account._authRevocationGeneration || 0);
+    const isCurrent = () => accountManager.accounts[account.index] === account
+      && (account._authRevocationGeneration || 0) === expectedGeneration
+      && (account.authRevoked === true) === (revoked === true);
+    if (!isCurrent()) return;
+
+    let credentialConflict = false;
+    const diskConfig = await atomicConfigUpdate(cfg => {
+      if (!isCurrent()) return;
+      const cfgIdx = findConfigAccount(cfg, account);
+      if (cfgIdx < 0) return;
+      const diskAccount = cfg.accounts[cfgIdx];
+      if (!revoked) {
+        delete diskAccount.authRevoked;
+        delete diskAccount.authRevokedAt;
+        return;
+      }
+      // The revoked grant is the credential the refresh STARTED from. If another
+      // process replaced the stored credential meanwhile, that credential is
+      // unverified from here: the disk entry is still marked (quarantine is the
+      // safe default) and it is NOT installed into the live account. A login or
+      // import that writes a fresh entry (dropping the flag) is what clears it.
+      const hasStoredCredential = diskAccount.accessToken != null || diskAccount.refreshToken != null;
+      credentialConflict = Boolean(previousTokens && hasStoredCredential
+        && !storedCredentialMatches(diskAccount, previousTokens));
+      diskAccount.authRevoked = true;
+      diskAccount.authRevokedAt = Math.max(
+        Number(diskAccount.authRevokedAt) || 0,
+        Number(account.authRevokedAt) || 0,
+        Date.now(),
+      );
+    });
+    if (!isCurrent()) return;
+    const diskIdx = findConfigAccount(diskConfig, account);
+    if (diskIdx < 0) return;
+    const diskAccount = diskConfig.accounts[diskIdx];
+    if (credentialConflict) {
+      console.log(`[TeamClaude] Auth quarantine for "${account.name}" persisted over a concurrently changed stored credential — run login/import again to replace it`);
+    }
+    const memIdx = findConfigAccount(config, account);
+    if (memIdx < 0) return;
+    const memAccount = config.accounts[memIdx];
+    if (diskAccount.authRevoked === true) {
+      memAccount.authRevoked = true;
+      memAccount.authRevokedAt = diskAccount.authRevokedAt;
+    } else {
+      delete memAccount.authRevoked;
+      delete memAccount.authRevokedAt;
+    }
+  };
+  const persistAuthRevocation = (account, revoked, previousTokens = null, generation = null) => {
+    const prior = authPersistenceChains.get(account) || Promise.resolve();
+    const current = prior.catch(() => {}).then(() => persistAuthRevocationNow(
+      account, revoked, previousTokens, generation,
+    )).catch(err => console.error(
+      `[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${err.message}`,
+    ));
+    authPersistenceChains.set(account, current);
+    current.finally(() => {
+      if (authPersistenceChains.get(account) === current) authPersistenceChains.delete(account);
+    });
+    return current;
+  };
+  accountManager.onAuthRevoked(persistAuthRevocation);
   const port = config.proxy.port;
   const useTUI = process.stdout.isTTY && process.stdin.isTTY;
 
@@ -2855,6 +2970,18 @@ async function statusCommand() {
       const m = h.memory;
       console.log(`Host:           CPU ${cpu} (load ${load} / ${h.cpu.cores} cores)   RAM ${formatBytes(m.usedBytes)}/${formatBytes(m.totalBytes)} (${m.usedPct}%)`);
     }
+    if (data.runtime) {
+      const r = data.runtime;
+      const build = r.artifact ? `artifact ${r.artifact}` : (r.version ? `v${r.version}` : 'unknown build');
+      let restarts = '';
+      if (r.workerRestarts != null) {
+        const last = r.lastWorkerRestartAt
+          ? ` (last ${r.lastWorkerRestartAt}${r.lastWorkerRestartReason ? `, ${r.lastWorkerRestartReason}` : ''})`
+          : '';
+        restarts = `   worker restarts ${r.workerRestarts}${last}`;
+      }
+      console.log(`Runtime:        ${build}   up ${formatUptime(r.uptimeMs)}${restarts}`);
+    }
     console.log(`Active account: ${data.currentAccount}`);
     // Absent from older running servers — only print when the payload has it.
     if (data.usableCount != null && data.totalCount != null) {
@@ -2938,6 +3065,7 @@ async function accountsCommand() {
     config = await atomicConfigUpdate(async cfg => {
       await Promise.all(cfg.accounts.map(async account => {
         if (account.type !== 'oauth' || !account.refreshToken
+          || account.authRevoked === true
           || !isTokenExpiringSoon(account.expiresAt)) return;
         try {
           const newTokens = account.provider === 'codex'
@@ -2953,6 +3081,8 @@ async function accountsCommand() {
   const profiles = await Promise.all(
     config.accounts.map(a => {
       if (a.type !== 'oauth' || !a.accessToken) return null;
+      // A quarantined account's token is known-dead upstream; don't spend it.
+      if (a.authRevoked === true) return null;
       if (a.provider === 'codex') {
         return {
           accountUuid: a.accountId || a.accountUuid,
@@ -3056,7 +3186,9 @@ async function accountsCommand() {
       continue;
     }
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
-    const status = hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
+    const status = a.authRevoked === true
+      ? 're-login required (refresh token revoked)'
+      : hasProfile ? `Claude ${tier}` : `unknown (${p?.error || 'no token'})`;
     const src = a.source ? `, ${a.source}` : '';
     console.log(`  [${i + 1}] ${a.name} (${status}${src})`);
     if (hasProfile && p.email && p.email !== a.name) console.log(`       Email: ${p.email}`);
@@ -3431,6 +3563,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   let action = 'Added';
+  let quarantineLifted = false;
   const savedConfig = await atomicConfigUpdate(cfg => {
     if (!name) {
       // First FREE account-N (not `count + 1`, which collides after a delete)
@@ -3454,6 +3587,10 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (idx >= 0) {
       action = 'Updated';
       const previous = cfg.accounts[idx];
+      // The fresh entry deliberately omits `authRevoked`/`authRevokedAt`: new
+      // credentials are the one thing that lifts the quarantine, and a running
+      // server picks the cleared flag up on its next config sync.
+      if (previous.authRevoked === true) quarantineLifted = true;
       if (previous.enabled !== undefined) account.enabled = previous.enabled;
       if (previous.priority !== undefined) account.priority = previous.priority;
       if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
@@ -3466,6 +3603,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     }
   });
   console.log(`${action} account "${name}"`);
+  if (quarantineLifted) {
+    console.log(`Account "${name}" was quarantined (refresh token revoked) — the new credentials replace it and lift the quarantine`);
+  }
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
@@ -3615,11 +3755,28 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (mgr.provider === 'anthropic' && (mgr.subscriptionDisabled === true) !== wantLapsed) {
         accountManager.setSubscriptionDisabled(mgr, wantLapsed, false);
       }
+      // Auth-revocation flag, disk → live, one direction only: a flag on disk
+      // parks the live account (persist=false — it came FROM disk). Lifting is
+      // never inferred from a MISSING flag (a lost persistence write must not
+      // un-park a revoked chain); only a fresh credential installed below
+      // (updateAccountTokens, clearAuthRevoked) lifts it.
+      const wantRevoked = diskAcct.authRevoked === true;
+      if (mgr.provider === 'anthropic' && mgr.type === 'oauth'
+          && wantRevoked && mgr.authRevoked !== true) {
+        accountManager.setAuthRevoked(mgr, true, false);
+      }
       const memAcct = memConfig.accounts[memIdx];
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
         if (wantLapsed) memAcct.subscriptionDisabled = true; else delete memAcct.subscriptionDisabled;
+        if (wantRevoked) {
+          memAcct.authRevoked = true;
+          memAcct.authRevokedAt = diskAcct.authRevokedAt;
+        } else if (mgr.authRevoked !== true) {
+          delete memAcct.authRevoked;
+          delete memAcct.authRevokedAt;
+        }
         if (diskCancellation) memAcct.subscriptionCancellation = diskCancellation;
         else delete memAcct.subscriptionCancellation;
       }
@@ -3667,7 +3824,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
         freshCred.expiresAt < mgr.expiresAt;
       if (changed && !diskIsStaler) {
-        accountManager.updateAccountTokens(mgr.index, freshCred);
+        // A disk entry that still carries `authRevoked` is an unverified
+        // credential sync — install the tokens but keep the account parked.
+        accountManager.updateAccountTokens(mgr.index, freshCred, true, {
+          clearAuthRevoked: diskAcct.authRevoked !== true,
+        });
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {

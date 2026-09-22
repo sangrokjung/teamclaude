@@ -14,6 +14,31 @@ const CODEX_MODEL_UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
 const CODEX_MODEL_UNSUPPORTED_MAX_ENTRIES = 64;
 const MODEL_WEEKLY_MAX_ENTRIES = 64;
 
+/**
+ * `invalid_grant` from the OAuth token endpoint means the refresh-token chain
+ * itself was revoked or expired upstream — retrying it can only fail again.
+ */
+function isInvalidGrantError(error) {
+  if (!error) return false;
+  if (typeof error.code === 'string' && error.code.toLowerCase() === 'invalid_grant') return true;
+  return /\binvalid_grant\b/i.test(String(error.message || error));
+}
+
+/**
+ * The durable auth-revocation quarantine is Anthropic OAuth-only. Other
+ * providers may reuse the same error string under a different credential
+ * contract (the codex path has its own `terminalAuthentication` handling).
+ */
+function supportsAuthRevocation(account) {
+  return account?.type === 'oauth' && account?.provider === 'anthropic';
+}
+
+function normalizeAuthRevokedAt(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0;
+  return normalizeExpiresAt(timestamp);
+}
+
 /** Coerce a per-account / global concurrency cap to a positive integer, else fallback. */
 function coerceMaxConcurrent(value, fallback) {
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
@@ -231,6 +256,11 @@ export class AccountManager {
       // momentarily full (so concurrent load spreads to other accounts).
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acct.maxConcurrent, this.maxConcurrentDefault),
+      // Every credential installation advances this local generation, even if
+      // its token strings happen to compare equal. A refresh request captures
+      // the generation before it leaves the process; its late success or
+      // invalid_grant must never overwrite or quarantine a newer installation.
+      _credentialGeneration: 0,
       // Last logged quota-reserve state. Initialized so the first _isAvailable
       // pass doesn't read undefined and log a spurious "rejoining rotation".
       _reserveHeld: false,
@@ -238,6 +268,11 @@ export class AccountManager {
       _accountWritePending: false,
       };
     });
+    // Restore the durable auth-revocation flag (config `authRevoked`) so a
+    // restart keeps a revoked refresh chain parked instead of retrying it.
+    // Runs after the literal above on purpose: it outranks the subscription
+    // flag's errorReason when both are set.
+    this.accounts.forEach((account, i) => this._restoreAuthRevokedFlag(account, accounts[i]));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     // Announce the reserve once at startup. A typo like `"session": 40` or
@@ -1004,6 +1039,9 @@ export class AccountManager {
     // never chosen for a new request. _recoverSoonest iterates accounts directly
     // (not via this), so it skips disabled accounts itself.
     if (account.enabled === false) return false;
+    // A revoked refresh chain cannot serve until fresh credentials arrive —
+    // gate it here too so an external status mutation cannot route to it.
+    if (account.authRevoked === true) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -1240,6 +1278,8 @@ export class AccountManager {
     for (const account of this.accounts) {
       // Never recover a manually-disabled account into rotation.
       if (account.enabled === false) continue;
+      // A revoked refresh chain is not a quota window either.
+      if (account.authRevoked === true) continue;
       // A lapsed subscription is a billing state, not a quota window — a reset
       // rollover must not revive it. The flag clears only via a 2xx on the
       // account, re-imported credentials, or `subscription <name> ok`.
@@ -1529,6 +1569,9 @@ export class AccountManager {
   async ensureTokenFresh(accountIndex, force = false) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth' || !account.refreshToken) return;
+    // The refresh chain was revoked upstream (invalid_grant): another POST to
+    // the token endpoint cannot succeed. Only fresh credentials lift this.
+    if (account.authRevoked === true) return;
 
     if (!force && !isTokenExpiringSoon(account.expiresAt)) return;
 
@@ -1540,6 +1583,7 @@ export class AccountManager {
         accessToken: account.credential,
         refreshToken: account.refreshToken,
         expiresAt: account.expiresAt,
+        credentialGeneration: account._credentialGeneration || 0,
       };
       console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
@@ -1549,7 +1593,8 @@ export class AccountManager {
         // Another live sync may have installed a newer rotated token while this
         // network request was in flight. Never let the late result from the old
         // refresh token replace that newer credential.
-        if (account.credential !== previousTokens.accessToken
+        if (account._credentialGeneration !== previousTokens.credentialGeneration
+          || account.credential !== previousTokens.accessToken
           || account.refreshToken !== previousTokens.refreshToken) {
           console.log(`[TeamClaude] Discarded stale token refresh for account "${account.name}"`);
           return;
@@ -1557,6 +1602,7 @@ export class AccountManager {
         account.credential = newTokens.accessToken;
         account.refreshToken = newTokens.refreshToken;
         account.expiresAt = newTokens.expiresAt;
+        account._credentialGeneration = (account._credentialGeneration || 0) + 1;
         if (newTokens.idToken) account.idToken = newTokens.idToken;
         if (newTokens.planType) account.planType = newTokens.planType;
         if (newTokens.accountId) {
@@ -1583,6 +1629,36 @@ export class AccountManager {
         }
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
+        if (supportsAuthRevocation(account) && isInvalidGrantError(err)) {
+          // The revoked grant is the credential this refresh STARTED from. A
+          // newer installation (re-import / login / TUI reauth) that landed
+          // while the request was in flight is not what failed — never park it.
+          if (account._credentialGeneration !== previousTokens.credentialGeneration
+              || account.credential !== previousTokens.accessToken
+              || account.refreshToken !== previousTokens.refreshToken) {
+            console.log(`[TeamClaude] Discarded stale auth revocation for account "${account.name}"`);
+            return;
+          }
+          const changed = account.authRevoked !== true;
+          this.setAuthRevoked(account, true, false, previousTokens);
+          delete account._refreshRetryAt;
+          // Persist inline (awaited) so the caller's `await ensureTokenFresh`
+          // resolves only once the quarantine is on disk; the hook is invoked
+          // directly rather than through setAuthRevoked(persist=true) for that.
+          if (changed && this.accounts[account.index] === account) {
+            try {
+              await this._onAuthRevoked?.(
+                account,
+                true,
+                previousTokens,
+                account._authRevocationGeneration,
+              );
+            } catch (persistError) {
+              console.error(`[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${persistError.message}`);
+            }
+          }
+          return;
+        }
         account._refreshRetryAt = Date.now() + REFRESH_SWEEP_RETRY_MS;
         // Only mark as error if the access token is actually expired;
         // a failed proactive refresh shouldn't kill a still-valid token.
@@ -1625,6 +1701,7 @@ export class AccountManager {
       const now = Date.now();
       const targets = this.accounts.filter(a =>
         a.type === 'oauth' && a.refreshToken
+        && a.authRevoked !== true
         && (!a._refreshRetryAt || now >= a._refreshRetryAt)
         && (a.status === 'error' || isTokenExpiringSoon(a.expiresAt)));
       for (const account of targets) {
@@ -1648,6 +1725,17 @@ export class AccountManager {
 
   onAccountFlag(callback) {
     this._onAccountFlag = callback;
+  }
+
+  /**
+   * Persistence hook for the auth-revocation quarantine:
+   * `(account, revoked, previousTokens, generation)`. Fired synchronously on
+   * every state CHANGE (never on a no-op re-set) with a monotonic per-account
+   * generation, so a persistence chain can drop a stale write that a later
+   * transition already superseded.
+   */
+  onAuthRevoked(callback) {
+    this._onAuthRevoked = callback;
   }
 
   onAccountMetadata(callback) {
@@ -1703,6 +1791,87 @@ export class AccountManager {
     account._subscriptionFlagPromise = write;
   }
 
+  /**
+   * Apply a persisted `authRevoked` flag to a freshly constructed/added live
+   * account. Anthropic OAuth-only (supportsAuthRevocation).
+   */
+  _restoreAuthRevokedFlag(account, acctData) {
+    if (!supportsAuthRevocation(account) || acctData?.authRevoked !== true) return;
+    account.authRevoked = true;
+    account.authRevokedAt = normalizeAuthRevokedAt(acctData.authRevokedAt);
+    account.status = 'error';
+    account.errorReason = 'auth-revoked';
+    // Not refresh-healable: a token-endpoint success cannot happen (the sweep
+    // skips the account). Note this flag does NOT by itself keep the 401
+    // cascade rollback away — that rollback proceeds only while the park's
+    // `_authParkSeq` stamp still matches. This restore runs on a freshly
+    // constructed account (no stamp), and `setAuthRevoked(true)` deletes
+    // the stamp on a live one, which is what excludes the quarantine.
+    account._errorFromRefresh = false;
+  }
+
+  /**
+   * Durable auth-revocation quarantine (an `invalid_grant` refresh failure).
+   * Parks the account under errorReason 'auth-revoked' and — through the
+   * onAuthRevoked hook — persists `authRevoked: true` (+ `authRevokedAt`) to
+   * config; clearing it re-admits the account and hands freed capacity to any
+   * queued waiter. `persist=false` applies a disk-sourced change without
+   * echoing it back. `previousTokens` (the credential the failed refresh
+   * started from) rides along so the persister can detect a newer disk
+   * credential installed in the meantime.
+   */
+  setAuthRevoked(ref, revoked, persist = true, previousTokens = null) {
+    const account = this._resolveRef(ref);
+    if (!account || !supportsAuthRevocation(account)) return null;
+    const next = revoked === true;
+    const had = account.authRevoked === true;
+    if (had !== next) {
+      account._authRevocationGeneration = (account._authRevocationGeneration || 0) + 1;
+    }
+    const generation = account._authRevocationGeneration || 0;
+    if (next) {
+      account.authRevoked = true;
+      // Stamp only on the transition — a no-op re-park (e.g. a disk sync
+      // confirming an existing quarantine) keeps the original revocation time.
+      if (!had) account.authRevokedAt = Date.now();
+      account.status = 'error';
+      account.errorReason = 'auth-revoked';
+      account._errorFromRefresh = false;
+      // Drop any 401-cascade park ownership stamp. The cascade rollback in
+      // server.js reverts a park only while `_authParkSeq` still matches the
+      // sequence it wrote, so clearing it takes this durable quarantine out
+      // of the rollback's reach — otherwise a cascade detected after the
+      // refresh failure would flip the label back to 'active'.
+      delete account._authParkSeq;
+    } else {
+      delete account.authRevoked;
+      delete account.authRevokedAt;
+      if (account.subscriptionDisabled === true) {
+        // The secondary park stays in force, now under its own label.
+        account.status = 'error';
+        account.errorReason = 'subscription-disabled';
+        account._errorFromRefresh = false;
+      } else if (account.status === 'error' && account.errorReason === 'auth-revoked') {
+        account.status = 'active';
+        delete account.errorReason;
+        delete account._errorFromRefresh;
+        this._drainWaiters();
+      }
+    }
+    if (persist && had !== next && this.accounts[account.index] === account) {
+      try {
+        const result = this._onAuthRevoked?.(account, next, previousTokens, generation);
+        if (result && typeof result.catch === 'function') {
+          result.catch(err => console.error(
+            `[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${err.message}`));
+        }
+      } catch (err) {
+        console.error(`[TeamClaude] Failed to persist auth quarantine for "${account.name}": ${err.message}`);
+      }
+    }
+    return account;
+  }
+
   setSubscriptionDisabled(ref, disabled, persist = true) {
     const account = this._resolveRef(ref);
     if (!account || account.provider !== 'anthropic') return null;
@@ -1711,7 +1880,9 @@ export class AccountManager {
     if (next) {
       account.subscriptionDisabled = true;
       account.status = 'error';
-      account.errorReason = 'subscription-disabled';
+      // A revoked refresh chain is the stronger fact: a lapsed subscription
+      // must not mask "re-login required".
+      account.errorReason = account.authRevoked === true ? 'auth-revoked' : 'subscription-disabled';
       account._errorFromRefresh = false;
     } else {
       delete account.subscriptionDisabled;
@@ -1842,7 +2013,7 @@ export class AccountManager {
     idToken,
     accountId,
     planType,
-  }, persist = true) {
+  }, persist = true, { clearAuthRevoked = true } = {}) {
     const account = this._resolve(accountIndex);
     if (!account || account.type !== 'oauth') return;
 
@@ -1850,10 +2021,12 @@ export class AccountManager {
       accessToken: account.credential,
       refreshToken: account.refreshToken,
       expiresAt: account.expiresAt,
+      credentialGeneration: account._credentialGeneration || 0,
     };
     account.credential = accessToken;
     if (refreshToken) account.refreshToken = refreshToken;
     account.expiresAt = expiresAt;
+    account._credentialGeneration = (account._credentialGeneration || 0) + 1;
     if (idToken) account.idToken = idToken;
     if (accountId) {
       account.accountId = accountId;
@@ -1862,10 +2035,16 @@ export class AccountManager {
     if (planType) account.planType = planType;
     const subscriptionEnded = account.errorReason === 'subscription-ended'
       && normalizeSubscriptionCancellation(account.subscriptionCancellation)?.status === 'ended';
+    // Fresh credentials are the ONLY thing that lifts an auth-revocation
+    // quarantine. `clearAuthRevoked: false` is for an unverified credential
+    // sync (disk still carries the flag): install the tokens, stay parked.
+    if (clearAuthRevoked && account.authRevoked === true) {
+      this.setAuthRevoked(account, false, persist, previousTokens);
+    }
     if (account.subscriptionDisabled === true) {
       this.setSubscriptionDisabled(account, false, persist);
     }
-    if (account.status === 'error' && !subscriptionEnded) {
+    if (account.status === 'error' && !subscriptionEnded && account.authRevoked !== true) {
       account.status = 'active';
       delete account.errorReason;
       delete account._errorFromRefresh;
@@ -1927,9 +2106,11 @@ export class AccountManager {
       unsupportedModels: new Map(),
       inflight: 0,
       maxConcurrent: coerceMaxConcurrent(acctData.maxConcurrent, this.maxConcurrentDefault),
+      _credentialGeneration: 0,
       _subscriptionFlagPromise: Promise.resolve(),
       _accountWritePending: false,
     });
+    this._restoreAuthRevokedFlag(this.accounts[index], acctData);
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
     // account sits idle.
@@ -2102,11 +2283,12 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
-      // A restored throttle must not overwrite the subscription-lapse park: a
-      // 'throttled' status would lazily heal to 'active' when the window
-      // passes, silently returning a lapsed account to rotation.
+      // A restored throttle must not overwrite the subscription-lapse or
+      // auth-revocation park: a 'throttled' status would lazily heal to
+      // 'active' when the window passes, silently returning a lapsed or
+      // revoked account to rotation.
       if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
-          && !a.subscriptionDisabled) {
+          && !a.subscriptionDisabled && a.authRevoked !== true) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -2125,6 +2307,9 @@ export class AccountManager {
     const throttled = account.rateLimitedUntil != null && Date.now() < account.rateLimitedUntil;
     return account.enabled !== false
       && account.status === 'active'
+      // Mirrors the _isAvailable gate: a revoked refresh chain is never usable,
+      // even if something external flipped the status label back to active.
+      && account.authRevoked !== true
       && !throttled
       && !this._isNearQuota(account)
       // Mirrors the _isAvailable gate so status/usableCount agree with routing.
@@ -2147,8 +2332,9 @@ export class AccountManager {
       // Why status is 'error' (null otherwise / when unknown): one of
       // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
       // 'auth-rejected'. In-memory only (same as status) — except
-      // 'subscription-disabled', which mirrors the persistent config flag
-      // `subscriptionDisabled` and therefore survives restarts.
+      // 'subscription-disabled' (mirrors the persistent config flag
+      // `subscriptionDisabled`) and the refresh-path 'auth-revoked' (mirrors
+      // the persistent `authRevoked` flag), which therefore survive restarts.
       errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
       planType: a.planType || null,
       subscription: subscriptionSnapshot(a),

@@ -305,3 +305,28 @@ test('a failed expired-token sweep backs off before another endpoint attempt', a
     globalThis.fetch = originalFetch;
   }
 });
+
+test('an auth-revoked account is not a sweep target and the token endpoint is not called again', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.accounts[0].expiresAt = Date.now() - HOUR;
+  let calls = 0;
+  const restore = fetchStub(async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 400,
+      text: async () => '{"error":"invalid_grant","error_description":"Refresh token expired"}',
+      body: { cancel: async () => {} },
+    };
+  });
+  try {
+    await am.ensureTokenFresh(0, true);
+    assert.equal(am.accounts[0].errorReason, 'auth-revoked');
+    assert.equal(am.accounts[0].authRevoked, true);
+    assert.equal(calls, 1);
+    assert.equal(await am.refreshLapsedTokens(), 0, 'quarantined account is skipped by the sweep');
+    assert.equal(calls, 1, 'no further POST to the token endpoint');
+  } finally {
+    restore();
+  }
+});

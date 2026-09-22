@@ -1838,7 +1838,7 @@ test('exhausted general Claude fleet creates one sanitized handoff and launches 
   assert.equal(codexCall.prompt.includes(codexCall.path), true);
 });
 
-test('overloaded terminal error with exhausted general quota hands off once', async () => {
+test('overloaded terminal error with exhausted general quota hands off once after the operator confirms', async () => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-overloaded-codex-'));
   const cwd = join(root, 'project');
   const transcriptRoot = join(root, 'transcripts');
@@ -1883,11 +1883,71 @@ test('overloaded terminal error with exhausted general quota hands off once', as
       codexCalls += 1;
       return { status: 0, signal: null };
     },
+    confirmCodexFallback: async () => true,
     log() {},
   });
 
   assert.equal(result.status, 0);
   assert.equal(codexCalls, 1);
+});
+
+test('exhausted general quota does not hand off without operator consent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-overloaded-no-consent-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const handoffRoot = join(root, 'handoffs');
+  await mkdir(cwd);
+  let codexCalls = 0;
+  const logs = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: true,
+      switchThreshold: 0.98,
+    },
+    cwd,
+    transcriptRoot,
+    handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.98),
+    spawnClaude(args) {
+      const child = fakeChild();
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        const records = [
+          JSON.stringify({
+            type: 'user',
+            cwd,
+            message: { role: 'user', content: 'Codex로 이어서 완료해' },
+          }),
+          overloadedRecord(cwd),
+        ];
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${records.join('\n')}\n`);
+      }, 10);
+      setTimeout(() => child.finish(9), 80);
+      return child;
+    },
+    launchCodex: async () => {
+      codexCalls += 1;
+      return { status: 0, signal: null };
+    },
+    confirmCodexFallback: async () => false,
+    log: message => logs.push(message),
+  });
+
+  assert.deepEqual(result, { status: 1, signal: null });
+  assert.equal(codexCalls, 0);
+  // writeHandoff creates handoffRoot; a refused hand-off must never reach it.
+  await assert.rejects(stat(handoffRoot), { code: 'ENOENT' });
+  assert.ok(logs.some(line => line.includes('Codex 전환이 승인되지 않아')));
+  assert.ok(logs.some(line => line.includes('teamclaude run --resume ')));
 });
 
 test('unknown or partial quota never triggers a Codex handoff', async () => {

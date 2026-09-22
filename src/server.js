@@ -16,6 +16,7 @@ import {
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
+import { runtimeInfo, readPackageVersion } from './runtime-info.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import {
   normalizeByokConfig,
@@ -246,6 +247,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     ? 'https://chatgpt.com/backend-api/codex'
     : 'https://api.anthropic.com');
   const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
+  const workerStartedAt = Date.now();
+  const packageVersion = readPackageVersion();
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   // How long a request may wait for a per-account concurrency slot to free when
@@ -880,6 +883,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
   async function warmupAccount(account, { force = false } = {}) {
     if (!probeTemplate || warmupClosed || account._warming) return;
+    // A revoked refresh chain must never be spent on a probe.
+    if (account.authRevoked === true) return;
     // Don't refresh from a background probe; skip an OAuth account that needs one.
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
     // Re-confirm it's still an available, unmeasured, idle candidate — unless
@@ -987,6 +992,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
     const targets = accountManager.accounts.filter(a =>
       (a.status !== 'error' || a.errorReason === 'subscription-disabled')
+      && a.authRevoked !== true
       && a.inflight === 0 && !a._warming);
     // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
     // background failure could mark an account 'error' before any real request
@@ -998,7 +1004,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(targets.map(a =>
       accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status/error below */ })));
     const alive = targets.filter(a =>
-      a.status !== 'error' || a.errorReason === 'subscription-disabled');
+      (a.status !== 'error' || a.errorReason === 'subscription-disabled')
+      && a.authRevoked !== true);
     // Renew both probe budgets — R is an explicit "measure everything now".
     for (const a of alive) { a._partialProbes = 0; a._mwProbes = 0; }
     const outcomes = await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
@@ -1019,7 +1026,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpModelWeekly() {
     if (!activeWarmup || warmupClosed || !probeTemplate || !probeTemplate._elicitsModelWeekly) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.authRevoked !== true
+      && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsModelWeekly(a));
     if (!targets.length) return;
     await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
@@ -1040,7 +1048,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpPartialQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      a.enabled !== false && a.authRevoked !== true
+      && a.status !== 'error' && a.inflight === 0 && !a._warming
       && accountManager.needsPartialRemeasure(a));
     if (!targets.length) return;
     // Revive lapsed tokens FIRST (same rationale as refreshQuotaAll): a partial
@@ -1067,7 +1076,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         || subscriptionRecheckIntervalMs <= 0) return;
     const now = Date.now();
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.subscriptionDisabled === true
+      a.enabled !== false && a.authRevoked !== true
+      && a.subscriptionDisabled === true
       && a.errorReason === 'subscription-disabled'
       && a.inflight === 0 && !a._warming
       && (!a._subscriptionRecheckAt || now >= a._subscriptionRecheckAt));
@@ -1418,6 +1428,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         res.end(JSON.stringify({
           ...accountManager.getStatus({ includeIdentity }),
           host: hostTracker.sample(),
+          runtime: runtimeInfo({ workerStartedAt, packageVersion }),
           ...(provider === 'codex'
             ? {
                 resetCredits: {
@@ -2952,7 +2963,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           ctx.authParked.push({ account, seq, ...before });
         }
         console.log(`[TeamClaude] 401 on "${account.name}" — auth failed, marking account error`);
-      } else if (account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
+      } else if (account.authRevoked !== true
+          && account.expiresAt && Date.now() < normalizeExpiresAt(account.expiresAt)) {
         // A 401 on a still-valid token is account-level rejection evidence.
         // It must override a refresh-failure label so the sweep cannot revive it.
         accountManager.markAuthenticationError(account, 'auth-revoked');

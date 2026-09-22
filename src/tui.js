@@ -1,6 +1,7 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
+import { runtimeInfo, readPackageVersion } from './runtime-info.js';
 import { subscriptionSnapshot } from './subscription.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
@@ -174,6 +175,14 @@ function persistedAccount(snapshot, accountManager, account) {
     expiresAt: liveAccount.expiresAt,
     idToken: liveAccount.idToken,
     accountId: liveAccount.accountId,
+    // The live quarantine state is authoritative for what gets written: a TUI
+    // import/reauth that installed fresh credentials (lifting it in memory)
+    // must not carry a stale `authRevoked` from the snapshot or disk entry.
+    // `undefined` wins the upsert merge over the disk value and JSON drops it.
+    authRevoked: liveAccount.authRevoked === true ? true : undefined,
+    authRevokedAt: liveAccount.authRevoked === true
+      ? (liveAccount.authRevokedAt || configAccount.authRevokedAt)
+      : undefined,
   };
 }
 
@@ -251,6 +260,8 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    const rt = runtimeInfo({ workerStartedAt: Date.now(), packageVersion: readPackageVersion() });
+    this._buildLabel = rt.artifact ? `build ${rt.artifact}` : (rt.version ? `v${rt.version}` : '');
     this._reauthPromise = null;
   }
 
@@ -596,6 +607,12 @@ export class TUI {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
+          // A hand-installed credential is a new generation (an in-flight
+          // refresh result for the old one must be discarded), and fresh
+          // credentials lift the auth-revocation quarantine (persist=false:
+          // the upsert below writes the cleared flag).
+          amAcct._credentialGeneration = (amAcct._credentialGeneration || 0) + 1;
+          if (amAcct.authRevoked === true) this.am.setAuthRevoked(amAcct, false, false);
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
           if (amAcct.status === 'error') {
@@ -888,7 +905,8 @@ export class TUI {
     // The host segment is optional: on a narrow terminal (W can be as low as 40)
     // the full header would exceed W — Math.max floors the gap at 1 but the line
     // itself would wrap and corrupt the fixed frame. Drop CPU/RAM before Port.
-    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} Port ${port} ${green('▲')} `;
+    const buildS = this._buildLabel ? `${dim(this._buildLabel)} ${dim('·')} ` : '';
+    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} ${buildS}Port ${port} ${green('▲')} `;
     if (vw(left) + vw(right) + 1 > W) right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
