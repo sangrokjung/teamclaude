@@ -40,6 +40,7 @@ import { formatUptime } from './runtime-info.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
+import { installTimestampedConsole } from './log-timestamps.js';
 import {
   applySubscriptionCancellation,
   cancellationEndsAt,
@@ -271,6 +272,9 @@ switch (command) {
 // ── server ──────────────────────────────────────────────────
 
 async function serverCommand() {
+  // Both the supervisor and the forked worker (stdio inherited) enter here,
+  // so one call covers every daemon log line; a no-op on a TTY (TUI mirrors).
+  installTimestampedConsole();
   if (process.env[SUPERVISED_WORKER_ENV] === '1') {
     await proxyWorkerCommand();
     return;
