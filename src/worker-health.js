@@ -118,3 +118,17 @@ export function createLoopStallMeter({
     },
   };
 }
+
+/**
+ * IPC ping budget under host contention. A worker whose event loop is merely
+ * starved (load1 well above the core count, swap thrash) answers late, not
+ * never; killing it destroys every in-flight turn and the replacement inherits
+ * the same starved host. Scale the wait by load-per-core, capped so a truly
+ * wedged worker is still recycled within a bounded time.
+ */
+export function contentionPingBudget({ baseMs, load1, cores, maxFactor = 4 }) {
+  if (!Number.isFinite(baseMs) || baseMs <= 0) return baseMs;
+  if (!Number.isFinite(load1) || !Number.isFinite(cores) || cores <= 0) return baseMs;
+  const factor = Math.min(maxFactor, Math.max(1, load1 / cores));
+  return Math.round(baseMs * factor);
+}

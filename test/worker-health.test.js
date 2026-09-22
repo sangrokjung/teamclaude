@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  contentionPingBudget,
   createLoopStallMeter,
   healthProbeVerdict,
   unhealthyWorkerAction,
@@ -128,4 +129,20 @@ test('the meter reports a stall that is still in progress, before its own tick r
   assert.equal(meter.read(), 2750);
   tick();
   assert.equal(meter.read(), 2750);
+});
+
+test('ping budget stays at base while load is at or below the core count', () => {
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 8, cores: 16 }), 5000);
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 16, cores: 16 }), 5000);
+});
+
+test('ping budget scales with load per core and caps at 4x', () => {
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 32, cores: 16 }), 10000);
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 40, cores: 16 }), 12500);
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 400, cores: 16 }), 20000);
+});
+
+test('ping budget ignores unusable load samples', () => {
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: NaN, cores: 16 }), 5000);
+  assert.equal(contentionPingBudget({ baseMs: 5000, load1: 40, cores: 0 }), 5000);
 });

@@ -4,7 +4,7 @@ import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
-import { homedir } from 'node:os';
+import { homedir, loadavg, cpus } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
@@ -60,6 +60,7 @@ import {
 } from './cmux-session-rescue.js';
 import {
   PROBE_BROKEN,
+  contentionPingBudget,
   createLoopStallMeter,
   healthProbeVerdict,
   unhealthyWorkerAction,
@@ -1177,13 +1178,16 @@ async function superviseServerCommand() {
     recycleInFlight = true;
     try {
       const stallAtPing = loopStall.read();
-      const ipcAlive = await pingWorker(checkedWorker, workerPingTimeoutMs);
+      const load1 = loadavg()[0];
+      const cores = cpus().length || 1;
+      const pingBudgetMs = contentionPingBudget({ baseMs: workerPingTimeoutMs, load1, cores });
+      const ipcAlive = await pingWorker(checkedWorker, pingBudgetMs);
       if (stopping || checkedWorker !== worker) return;
       const action = unhealthyWorkerAction({
         broken,
         ipcAlive,
         selfStallMs: loopStall.read() - stallAtPing,
-        timeoutMs: workerPingTimeoutMs,
+        timeoutMs: pingBudgetMs,
         tickMs: loopStall.tickMs,
       });
       if (action === 'keep') {
@@ -1208,7 +1212,7 @@ async function superviseServerCommand() {
         return;
       }
       pendingRecycleReason = 'health-check';
-      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and does not answer IPC; restarting it.`);
+      console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and did not answer IPC within ${pingBudgetMs}ms (load1 ${load1.toFixed(1)} / ${cores} cores); restarting it.`);
       if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
     } finally {
       recycleInFlight = false;
