@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # 리포에 package-lock.json이 없어 `npm ci`는 실패한다(런타임 의존성 0, devDependencies는 eslint뿐).
+      # The repo has no package-lock.json (zero runtime deps; eslint is the only devDependency), so npm ci would fail.
       - run: npm install --no-audit --no-fund
       - run: npx eslint src/
       - name: Test files that pass at the 2026-09-22 baseline
@@ -29,6 +29,7 @@ jobs:
     name: Full suite (informational until the pre-existing failures are triaged)
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
