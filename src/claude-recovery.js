@@ -9,6 +9,7 @@ import {
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -539,6 +540,25 @@ async function monitorChild({
   }
 }
 
+async function requestCodexFallbackConfirmation() {
+  if (!process.stdin.isTTY || !process.stderr.isTTY) return false;
+  const confirmation = `yes ${randomUUID().slice(0, 6)}`;
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await new Promise(resolve => {
+      rl.once('close', () => resolve(false));
+      rl.once('SIGINT', () => resolve(false));
+      rl.once('error', () => resolve(false));
+      rl.question(
+        `[TeamClaude] Claude를 사용할 수 없습니다. 최근 사용자 요청을 Codex(OpenAI)에 전달하고 작업을 계속하려면 "${confirmation}"를 입력하세요. [기본: 취소] `,
+        answer => resolve(answer.trim() === confirmation),
+      );
+    });
+  } finally {
+    rl.close();
+  }
+}
+
 export async function runClaudeWithRecovery({
   claudeArgs,
   childEnv,
@@ -553,6 +573,7 @@ export async function runClaudeWithRecovery({
   waitForConnectionRecovery,
   spawnClaude,
   launchCodex,
+  confirmCodexFallback = requestCodexFallbackConfirmation,
   log = message => console.error(message),
 }) {
   const selector = sessionSelector(claudeArgs);
@@ -589,6 +610,26 @@ export async function runClaudeWithRecovery({
   let loginRecoveryUsed = false;
   let suppressNextContinuationPrompt = false;
   let nextEnv = childEnv;
+
+  async function handoffWithConsent(child, transcriptPath) {
+    // The child must release the terminal before the parent asks for consent.
+    await stopChild(child);
+    let approved = false;
+    try {
+      approved = await confirmCodexFallback() === true;
+    } catch {
+      // An unavailable confirmation surface never grants consent.
+    }
+    if (!approved) {
+      log(`[TeamClaude] Codex 전환이 승인되지 않아 실행하지 않았습니다. Claude 재개: teamclaude run --resume ${sessionId}`);
+      return { status: 1, signal: null };
+    }
+    const handoff = await writeHandoff({
+      transcriptPath, sessionId, cwd, handoffRoot,
+    });
+    log(`[TeamClaude] 사용자 승인에 따라 세션 ${sessionId}을 Codex로 전달합니다.`);
+    return launchCodex(handoff);
+  }
 
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
@@ -673,18 +714,7 @@ export async function runClaudeWithRecovery({
         }
         if (config.codexFallbackOnExhaustion === true
             && (noAlternate || fleetExhausted)) {
-          const handoff = await writeHandoff({
-            transcriptPath,
-            sessionId,
-            cwd,
-            handoffRoot,
-          });
-          const reason = noAlternate
-            ? 'no alternate account is available'
-            : 'the Claude account fleet is quota exhausted';
-          log(`[TeamClaude] Claude login expired and ${reason}; handing session ${sessionId} to Codex.`);
-          await stopChild(child);
-          return launchCodex(handoff);
+          return handoffWithConsent(child, transcriptPath);
         }
         if (noAlternate) {
           log('[TeamClaude] Claude login expired; no alternate account is available. Run /login.');
@@ -846,15 +876,7 @@ export async function runClaudeWithRecovery({
 
     if (config.codexFallbackOnExhaustion === true
         && isClaudeFleetExhausted(status, config.switchThreshold ?? 0.98)) {
-      const handoff = await writeHandoff({
-        transcriptPath,
-        sessionId,
-        cwd,
-        handoffRoot,
-      });
-      log(`[TeamClaude] Claude general quota exhausted; handing session ${sessionId} to Codex.`);
-      await stopChild(child);
-      return launchCodex(handoff);
+      return handoffWithConsent(child, transcriptPath);
     }
 
     if (outcome.event.kind === 'usage_limit') {
