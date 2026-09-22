@@ -1802,7 +1802,11 @@ export class AccountManager {
     account.status = 'error';
     account.errorReason = 'auth-revoked';
     // Not refresh-healable: a token-endpoint success cannot happen (the sweep
-    // skips the account) and a 401 cascade rollback must not revert it.
+    // skips the account). Note this flag does NOT by itself keep the 401
+    // cascade rollback away — that rollback proceeds only while the park's
+    // `_authParkSeq` stamp still matches. This restore runs on a freshly
+    // constructed account (no stamp), and `setAuthRevoked(true)` deletes
+    // the stamp on a live one, which is what excludes the quarantine.
     account._errorFromRefresh = false;
   }
 
@@ -1833,6 +1837,12 @@ export class AccountManager {
       account.status = 'error';
       account.errorReason = 'auth-revoked';
       account._errorFromRefresh = false;
+      // Drop any 401-cascade park ownership stamp. The cascade rollback in
+      // server.js reverts a park only while `_authParkSeq` still matches the
+      // sequence it wrote, so clearing it takes this durable quarantine out
+      // of the rollback's reach — otherwise a cascade detected after the
+      // refresh failure would flip the label back to 'active'.
+      delete account._authParkSeq;
     } else {
       delete account.authRevoked;
       delete account.authRevokedAt;
