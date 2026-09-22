@@ -36,6 +36,7 @@ import {
 } from './codex-recovery.js';
 import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
+import { formatUptime } from './runtime-info.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
@@ -67,6 +68,10 @@ import { installClaudeWrapper, uninstallClaudeWrapper } from './claude-wrapper.j
 const SUPERVISED_WORKER_ENV = 'TEAMCLAUDE_SUPERVISED_WORKER';
 const SUPERVISOR_PID_ENV = 'TEAMCLAUDE_SUPERVISOR_PID';
 const LIFECYCLE_ID_ENV = 'TEAMCLAUDE_LIFECYCLE_ID';
+const SUPERVISOR_STARTED_AT_ENV = 'TEAMCLAUDE_SUPERVISOR_STARTED_AT';
+const WORKER_RESTARTS_ENV = 'TEAMCLAUDE_WORKER_RESTARTS';
+const WORKER_LAST_RESTART_AT_ENV = 'TEAMCLAUDE_WORKER_LAST_RESTART_AT';
+const WORKER_LAST_RESTART_REASON_ENV = 'TEAMCLAUDE_WORKER_LAST_RESTART_REASON';
 const DEPLOYMENT_DRAIN_PATH = '/teamclaude/deployment/drain';
 const LIFECYCLE_ID_HEADER = 'x-teamcodex-lifecycle-id';
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 256 * 1024 * 1024;
@@ -351,6 +356,12 @@ async function superviseServerCommand() {
   let deploymentDrainTimer = null;
   let activePublicRequests = 0;
   let activeBufferedRequestBytes = 0;
+  const supervisorStartedAt = Date.now();
+  // Why the LAST worker went away and how many times it has, surfaced through
+  // /teamclaude/status so an operator can tell a health-check kill from an
+  // upstream crash without timestamps-free log archaeology.
+  const workerRestartLedger = { restarts: 0, lastAt: null, lastReason: null };
+  let pendingRecycleReason = null;
   let restartCount = 0;
   let restartTimer = null;
   let stableTimer = null;
@@ -1011,6 +1022,10 @@ async function superviseServerCommand() {
       [SUPERVISED_WORKER_ENV]: '1',
       [SUPERVISOR_PID_ENV]: String(process.pid),
       [LIFECYCLE_ID_ENV]: lifecycleId,
+      [SUPERVISOR_STARTED_AT_ENV]: String(supervisorStartedAt),
+      [WORKER_RESTARTS_ENV]: String(workerRestartLedger.restarts),
+      [WORKER_LAST_RESTART_AT_ENV]: workerRestartLedger.lastAt == null ? '' : String(workerRestartLedger.lastAt),
+      [WORKER_LAST_RESTART_REASON_ENV]: workerRestartLedger.lastReason || '',
     };
     const child = fork(process.argv[1], ['server'], {
       env: childEnv,
@@ -1106,6 +1121,11 @@ async function superviseServerCommand() {
         return;
       }
 
+      workerRestartLedger.restarts += 1;
+      workerRestartLedger.lastAt = Date.now();
+      workerRestartLedger.lastReason = pendingRecycleReason
+        || (signal ? `signal:${signal}` : `exit:${code}`);
+      pendingRecycleReason = null;
       restartCount += 1;
       const backoffMs = Math.min(100 * (2 ** (restartCount - 1)), 2_000);
       console.error(
@@ -1175,6 +1195,7 @@ async function superviseServerCommand() {
       workerPort = null;
       if (action === 'drain') {
         console.error(`[TeamClaude] Proxy worker listener is broken while its event loop runs; draining it (${workerRecycleGraceMs}ms grace).`);
+        pendingRecycleReason = 'listener-broken';
         checkedWorker.kill('SIGTERM');
         const escalate = setTimeout(() => {
           if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
@@ -1182,6 +1203,7 @@ async function superviseServerCommand() {
         escalate.unref?.();
         return;
       }
+      pendingRecycleReason = 'health-check';
       console.error(`[TeamClaude] Proxy worker failed ${workerHealthFailureThreshold} health checks and does not answer IPC; restarting it.`);
       if (checkedWorker.exitCode == null) checkedWorker.kill('SIGKILL');
     } finally {
@@ -2932,6 +2954,18 @@ async function statusCommand() {
       const load = Array.isArray(h.cpu.loadavg) ? h.cpu.loadavg[0] : '-';
       const m = h.memory;
       console.log(`Host:           CPU ${cpu} (load ${load} / ${h.cpu.cores} cores)   RAM ${formatBytes(m.usedBytes)}/${formatBytes(m.totalBytes)} (${m.usedPct}%)`);
+    }
+    if (data.runtime) {
+      const r = data.runtime;
+      const build = r.artifact ? `artifact ${r.artifact}` : (r.version ? `v${r.version}` : 'unknown build');
+      let restarts = '';
+      if (r.workerRestarts != null) {
+        const last = r.lastWorkerRestartAt
+          ? ` (last ${r.lastWorkerRestartAt}${r.lastWorkerRestartReason ? `, ${r.lastWorkerRestartReason}` : ''})`
+          : '';
+        restarts = `   worker restarts ${r.workerRestarts}${last}`;
+      }
+      console.log(`Runtime:        ${build}   up ${formatUptime(r.uptimeMs)}${restarts}`);
     }
     console.log(`Active account: ${data.currentAccount}`);
     // Absent from older running servers — only print when the payload has it.

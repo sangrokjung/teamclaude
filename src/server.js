@@ -16,6 +16,7 @@ import {
 import { isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
+import { runtimeInfo, readPackageVersion } from './runtime-info.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import {
   normalizeByokConfig,
@@ -246,6 +247,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     ? 'https://chatgpt.com/backend-api/codex'
     : 'https://api.anthropic.com');
   const hostTracker = createHostTracker(); // host CPU/RAM for /teamclaude/status
+  const workerStartedAt = Date.now();
+  const packageVersion = readPackageVersion();
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   // How long a request may wait for a per-account concurrency slot to free when
@@ -1425,6 +1428,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         res.end(JSON.stringify({
           ...accountManager.getStatus({ includeIdentity }),
           host: hostTracker.sample(),
+          runtime: runtimeInfo({ workerStartedAt, packageVersion }),
           ...(provider === 'codex'
             ? {
                 resetCredits: {

@@ -127,3 +127,20 @@ test('status lists healthy accounts with quota lines', async () => {
   assert.match(res.stdout, /Session:\s+10\.0% used\s+Weekly: 20\.0% used/);
   assert.match(res.stdout, /b@example\.com/);
 });
+
+test('status prints a Runtime line when the payload carries runtime info', async () => {
+  const res = await runStatusAgainst({
+    ...basePayload([account('a0')]),
+    runtime: {
+      version: '1.3.0',
+      artifact: 'eeb99bae2f5d',
+      uptimeMs: 65 * 60_000,
+      workerRestarts: 2,
+      lastWorkerRestartAt: '2026-09-22T05:10:00.000Z',
+      lastWorkerRestartReason: 'health-check',
+    },
+  });
+
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /Runtime:\s+artifact eeb99bae2f5d\s+up 1h 05m\s+worker restarts 2 \(last 2026-09-22T05:10:00\.000Z, health-check\)/);
+});

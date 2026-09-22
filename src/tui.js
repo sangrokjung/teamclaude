@@ -1,6 +1,7 @@
 import { importCredentials, fetchProfile } from './oauth.js';
 import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
+import { runtimeInfo, readPackageVersion } from './runtime-info.js';
 import { subscriptionSnapshot } from './subscription.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
@@ -259,6 +260,8 @@ export class TUI {
     this.timer = null;
     this._origLog = null;
     this._origErr = null;
+    const rt = runtimeInfo({ workerStartedAt: Date.now(), packageVersion: readPackageVersion() });
+    this._buildLabel = rt.artifact ? `build ${rt.artifact}` : (rt.version ? `v${rt.version}` : '');
     this._reauthPromise = null;
   }
 
@@ -902,7 +905,8 @@ export class TUI {
     // The host segment is optional: on a narrow terminal (W can be as low as 40)
     // the full header would exceed W — Math.max floors the gap at 1 but the line
     // itself would wrap and corrupt the fixed frame. Drop CPU/RAM before Port.
-    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} Port ${port} ${green('▲')} `;
+    const buildS = this._buildLabel ? `${dim(this._buildLabel)} ${dim('·')} ` : '';
+    let right = `${cpuS} ${dim('·')} ${memS} ${dim('·')} ${buildS}Port ${port} ${green('▲')} `;
     if (vw(left) + vw(right) + 1 > W) right = `Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
