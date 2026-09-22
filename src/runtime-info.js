@@ -22,11 +22,12 @@ export function runtimeInfo({
   workerStartedAt,
   packageVersion = null,
 } = {}) {
+  // `entry` only feeds the artifact hash; the raw filesystem path is
+  // deliberately not part of the status payload.
   const artifact = ARTIFACT_RE.exec(entry)?.[1] ?? null;
   return {
     version: packageVersion ?? null,
     artifact: artifact ? artifact.slice(0, 12) : null,
-    entry,
     workerStartedAt: isoOrNull(workerStartedAt),
     supervisorStartedAt: isoOrNull(intOrNull(env.TEAMCLAUDE_SUPERVISOR_STARTED_AT)),
     uptimeMs: Math.max(0, now - workerStartedAt),

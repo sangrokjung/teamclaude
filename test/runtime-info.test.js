@@ -21,7 +21,6 @@ test('runtimeInfo derives the artifact hash prefix from a deployer entry path', 
   assert.deepEqual(info, {
     version: '1.3.0',
     artifact: 'eeb99bae2f5d',
-    entry: `/opt/runtime/artifacts/${sha}/src/index.js`,
     workerStartedAt: '2026-09-22T00:00:00.000Z',
     supervisorStartedAt: '2026-09-21T23:59:00.000Z',
     uptimeMs: 65 * 60_000,
