@@ -35,7 +35,8 @@ TeamClaude는 이 exact error code를 반환한 OAuth account만 `error`로 격�
 ## 복구
 
 - 조직 정책이 수정된 뒤 해당 account를 `teamclaude import` 또는 `teamclaude login`으로 다시 검증합니다.
-- 즉시 우회가 필요하면 `teamclaude disable <name>`으로 문제 account를 제외합니다.
+- 조직 접근 차단으로 격리된 account는 이미 로테이션에서 빠져 있으므로 `teamclaude disable`을 추가로 걸 필요가 없습니다. `disable`은 격리 해제와 별개로 남아서, 조직 정책이 풀려도 그 account를 계속 제외합니다.
+- `disable`한 account는 `teamclaude login`으로 다시 로그인하면 함께 다시 켜집니다. `teamclaude import`는 disable을 유지하고 경고만 출력하므로 `teamclaude enable <name>`을 따로 실행합니다.
 - API key 자동 전환이나 source Claude config 수정은 하지 않습니다.
 
 ## 재발 확인

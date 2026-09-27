@@ -39,6 +39,7 @@ import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
+import { carryOverAccountSettings } from './account-upsert.js';
 import {
   applySubscriptionCancellation,
   cancellationEndsAt,
@@ -3441,6 +3442,14 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
+function reportCarriedSettings(name, carried) {
+  if (carried?.reenabled) {
+    console.log(`Re-enabled "${name}" (it was disabled; logging in puts it back in rotation)`);
+  } else if (carried?.stillDisabled) {
+    console.error(`Warning: "${name}" is disabled and stays out of rotation (\`enable ${name}\` puts it back)`);
+  }
+}
+
 async function upsertOAuthAccount(name, creds, source = 'unknown') {
   // Fetch profile to auto-name and deduplicate by account UUID
   const profile = await fetchProfile(creds.accessToken);
@@ -3455,6 +3464,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
   let action = 'Added';
+  let carried = null;
   const savedConfig = await atomicConfigUpdate(cfg => {
     if (!name) {
       // First FREE account-N (not `count + 1`, which collides after a delete)
@@ -3477,19 +3487,14 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
     if (idx >= 0) {
       action = 'Updated';
-      const previous = cfg.accounts[idx];
-      if (previous.enabled !== undefined) account.enabled = previous.enabled;
-      if (previous.priority !== undefined) account.priority = previous.priority;
-      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
-      if (previous.subscriptionCancellation !== undefined) {
-        account.subscriptionCancellation = previous.subscriptionCancellation;
-      }
+      carried = carryOverAccountSettings(cfg.accounts[idx], account, source);
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
     }
   });
   console.log(`${action} account "${name}"`);
+  reportCarriedSettings(name, carried);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
@@ -3497,6 +3502,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
 async function upsertCodexAccount(name, creds, source = 'unknown') {
   if (!name) name = creds.email;
   let action = 'Added';
+  let carried = null;
   const savedConfig = await atomicConfigUpdate(cfg => {
     if (!name) {
       let n = 1;
@@ -3521,13 +3527,7 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
     if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
     if (idx >= 0) {
       action = 'Updated';
-      const previous = cfg.accounts[idx];
-      if (previous.enabled !== undefined) account.enabled = previous.enabled;
-      if (previous.priority !== undefined) account.priority = previous.priority;
-      if (previous.maxConcurrent !== undefined) account.maxConcurrent = previous.maxConcurrent;
-      if (previous.subscriptionCancellation !== undefined) {
-        account.subscriptionCancellation = previous.subscriptionCancellation;
-      }
+      carried = carryOverAccountSettings(cfg.accounts[idx], account, source);
       cfg.accounts[idx] = account;
     } else {
       cfg.accounts.push(account);
@@ -3535,6 +3535,7 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
     cfg.provider = 'codex';
   });
   console.log(`${action} Codex account "${name}"`);
+  reportCarriedSettings(name, carried);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
