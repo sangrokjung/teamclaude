@@ -828,6 +828,16 @@ test('model-only snapshot data cannot block a provisional Fable request', () => 
     'complete live model response clears its pending marker');
 });
 
+test('runtime-added account accepts model quota headers without restart', () => {
+  const am = new AccountManager([]);
+  const index = am.addAccount(makeAccounts(1)[0]);
+  assert.doesNotThrow(() => am.updateQuota(index, {
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  }));
+  assert.equal(am.isModelExhausted(index, 'claude-fable-5'), true);
+});
+
 test('importQuotaState never restores unifiedStatus (stale rejected must not classify future 429s)', () => {
   const now = Date.now();
   const am = new AccountManager(makeAccounts(1), 0.98);
