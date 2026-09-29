@@ -1748,7 +1748,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
-    setImmediate(() => { recheckSubscriptionDisabled(); });
+    // A restored template is already a known-accepted request shape. Probe
+    // provisional accounts immediately so stale quota cannot linger until the
+    // next client request or periodic warm-up interval.
+    setImmediate(() => {
+      warmupUnmeasured();
+      recheckSubscriptionDisabled();
+    });
     return true;
   };
 

@@ -218,6 +218,11 @@ export class AccountManager {
       // config with no priorities behaves exactly as before.
       priority: Number.isFinite(acct.priority) ? Math.floor(acct.priority) : null,
       quota: emptyQuota(),
+      // Restored quota is useful for continuity, but it may have changed in
+      // another Claude session while this proxy was down. Mark it provisional
+      // until a complete live rate-limit response revalidates the account.
+      _quotaNeedsRevalidation: false,
+      _quotaPendingWindows: new Set(),
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
@@ -857,6 +862,7 @@ export class AccountManager {
    * so candidacy converges. API-key accounts keep the any-data semantics.
    */
   _fullyMeasured(account) {
+    if (account._quotaNeedsRevalidation) return false;
     if (account.type === 'oauth') {
       // A window counts only when COMPLETE (utilization AND reset) — the same
       // semantics the ordering helpers use. Utilization without its reset
@@ -960,8 +966,9 @@ export class AccountManager {
 
   /**
    * Accounts eligible for an *active* warm-up probe: available (enabled, not
-   * throttled / exhausted / error), with no quota data yet, AND not already
-   * handling a request. The server sends each one a minimal upstream request to
+   * throttled / exhausted / error), with no complete quota data yet OR a
+   * provisional snapshot awaiting live revalidation, AND not already handling
+   * a request. The server sends each one a minimal upstream request to
    * populate its quota so the dashboard reflects the whole fleet shortly after a
    * (re)start, instead of waiting for client traffic to organically reach every
    * account.
@@ -971,12 +978,15 @@ export class AccountManager {
    * would just race that request and waste an upstream call. Cold start's very
    * first request holds its (still-unmeasured) account here, so the startup
    * fan-out probes only the genuinely idle rest of the fleet — never the account
-   * that request is already measuring. (An unmeasured account can't be near-quota,
-   * so no extra status carve-outs are needed beyond _isAvailable.)
+   * that request is already measuring. Provisional values are treated as
+   * untrusted by `_isNearQuota`, so stale 100% snapshots cannot suppress the
+   * recovery probe.
    */
   warmupCandidates() {
     return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
+      this._isAvailable(a)
+        && (a._quotaNeedsRevalidation || !this._fullyMeasured(a))
+        && a.inflight === 0
       // Convergence cap: against the real upstream one probe fully measures an
       // account (responses always carry both window families), but a
       // pathological upstream — a 2xx missing a family, header-less responses,
@@ -1058,9 +1068,11 @@ export class AccountManager {
     if (!ceilings) return false;
     const quota = account.quota;
     if (ceilings.session !== null
+      && !account._quotaPendingWindows?.has('unified5h')
       && Number.isFinite(quota.unified5h)
       && quota.unified5h >= ceilings.session) return true;
     if (ceilings.weekly !== null
+      && !account._quotaPendingWindows?.has('unified7d')
       && Number.isFinite(quota.unified7d)
       && quota.unified7d >= ceilings.weekly) return true;
     return false;
@@ -1141,6 +1153,7 @@ export class AccountManager {
   _isNearQuota(account, model = null) {
     const q = account.quota;
     const now = Date.now();
+    const pending = account._quotaPendingWindows;
 
     // Clear expired unified quotas. The reset timestamp is cleared even when the
     // matching utilization was never set (a partial/garbled header pair) — a
@@ -1204,17 +1217,20 @@ export class AccountManager {
       q.resetsAt = future.length ? new Date(Math.min(...future)).toISOString() : null;
     }
 
+    // Ignore only the windows still inherited from disk. A complete live
+    // exhausted window must block immediately, even if another is pending.
+
     // Unified quotas (Claude Max) — utilization is already 0-1
-    if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
-    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
+    if (!pending?.has('unified5h') && q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
+    if (!pending?.has('unified7d') && q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
 
     // Standard quotas (API key accounts)
-    if (q.tokensLimit != null && q.tokensRemaining != null) {
+    if (!pending?.has('tokens') && q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
       if (used >= this.switchThreshold) return true;
     }
 
-    if (q.requestsLimit != null && q.requestsRemaining != null) {
+    if (!pending?.has('requests') && q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
       if (used >= this.switchThreshold) return true;
     }
@@ -1223,6 +1239,7 @@ export class AccountManager {
   }
 
   _isModelNearQuota(account, model, now = Date.now()) {
+    if (account._quotaNeedsRevalidation) return false;
     const label = modelQuotaLabel(model);
     if (!label) return false;
     const win = account.quota.modelWeekly[label];
@@ -1371,6 +1388,29 @@ export class AccountManager {
     if (requestsReset) account.quota.requestsReset = requestsReset;
     if (tokensReset) account.quota.resetsAt = tokensReset;
     else if (requestsReset) account.quota.resetsAt = requestsReset;
+
+    if (account._quotaNeedsRevalidation) {
+      const pending = account._quotaPendingWindows;
+      const now = Date.now();
+      for (const [window, utilization, reset] of [
+        ['unified5h', u5h, Number(r5h) * 1000],
+        ['unified7d', u7d, Number(r7d) * 1000],
+      ]) {
+        if (Number.isFinite(utilization) && utilization >= 0
+            && Number.isFinite(reset) && reset > now) pending.delete(window);
+      }
+      for (const [window, limit, remaining, reset] of [
+        ['tokens', tokensLimit, tokensRemaining, tokensReset],
+        ['requests', requestsLimit, requestsRemaining, requestsReset],
+      ]) {
+        if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining)
+            && remaining >= 0 && new Date(reset).getTime() > now) pending.delete(window);
+      }
+      account._quotaNeedsRevalidation = pending.size > 0;
+      if (!account._quotaNeedsRevalidation) {
+        console.log(`[TeamClaude] Account "${account.name}" quota revalidated after restart`);
+      }
+    }
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -2070,19 +2110,25 @@ export class AccountManager {
    * account near-quota or throttled. Name matching is the fallback solely for
    * entries without a uuid (API-key accounts, whose identity key is the name).
    * Unknown entries are skipped (→ unmeasured, exactly the pre-restore state).
-   * Values may be slightly stale, but the proxy takes no traffic while it's
-   * down, and expired windows are lazily swept by _isNearQuota on first use —
-   * so a restore is strictly better than starting blind. A still-future
-   * rateLimitedUntil re-throttles the account; error/exhausted statuses are
-   * deliberately NOT restored (a bad token may have been fixed since).
+   * By default, values may be slightly stale but retain the historical restore
+   * behavior. Callers that accept traffic immediately after startup can pass
+   * `{ provisional: true }`: Anthropic quota remains visible but each window
+   * needs a complete live response before it can exclude an account. Stored
+   * throttles are not restored in that mode. Error/exhausted statuses are deliberately NOT restored.
    */
-  importQuotaState(saved) {
+  importQuotaState(saved, { provisional = false } = {}) {
     for (const s of Array.isArray(saved) ? saved : []) {
       if (!s || typeof s !== 'object') continue;
       const a = s.accountUuid
         ? this.accounts.find(x => x.accountUuid === s.accountUuid)
         : this.accounts.find(x => x.name === s.name);
       if (!a) continue;
+      const revalidate = provisional && a.provider === 'anthropic';
+      const hasPersistedQuota = s.quota && typeof s.quota === 'object'
+        && (s.quota.unified5h != null || s.quota.unified7d != null
+          || s.quota.tokensLimit != null || s.quota.requestsLimit != null
+          || (s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object'
+            && Object.keys(s.quota.modelWeekly).length > 0));
       if (s.quota && typeof s.quota === 'object') {
         // Merge over emptyQuota so a cache written by an older version (missing
         // newer fields like modelWeekly) still yields a complete quota object.
@@ -2102,10 +2148,21 @@ export class AccountManager {
         };
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
+      if (revalidate && hasPersistedQuota) {
+        a._quotaPendingWindows = new Set([
+          ...(a.quota.unified5h != null ? ['unified5h'] : []),
+          ...(a.quota.unified7d != null ? ['unified7d'] : []),
+          ...(a.quota.tokensLimit != null ? ['tokens'] : []),
+          ...(a.quota.requestsLimit != null ? ['requests'] : []),
+        ]);
+        a._quotaNeedsRevalidation = true;
+        a.rateLimitedUntil = null;
+        if (a.status === 'throttled') a.status = 'active';
+      }
       // A restored throttle must not overwrite the subscription-lapse park: a
       // 'throttled' status would lazily heal to 'active' when the window
       // passes, silently returning a lapsed account to rotation.
-      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
+      if (!revalidate && Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
           && !a.subscriptionDisabled) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
