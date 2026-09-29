@@ -32,6 +32,53 @@ function normalizeResetMs(value) {
   return timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp;
 }
 
+// Rate-limit headers are untrusted upstream input. Number.parseFloat/parseInt
+// accept prefixes (for example, "0.3garbage"), which could make a malformed
+// response look like a complete live revalidation and clear a stale snapshot.
+function parseStrictDecimal(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : NaN;
+  if (typeof value !== 'string') return NaN;
+  const text = value.trim();
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return NaN;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : NaN;
+}
+
+function parseUtilization(value) {
+  const number = parseStrictDecimal(value);
+  return number >= 0 && number <= 1 ? number : NaN;
+}
+
+function parseStrictInteger(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) ? value : NaN;
+  }
+  if (typeof value !== 'string' || !/^[0-9]+$/.test(value.trim())) return NaN;
+  const number = Number(value.trim());
+  return Number.isSafeInteger(number) ? number : NaN;
+}
+
+function parseEpochSeconds(value) {
+  const seconds = parseStrictInteger(value);
+  return seconds > 0 ? seconds * 1000 : NaN;
+}
+
+function parseStandardLimit(value) {
+  const number = parseStrictInteger(value);
+  return number > 0 ? number : NaN;
+}
+
+function parseStandardRemaining(value, limit) {
+  const number = parseStrictInteger(value);
+  return number >= 0 && (!Number.isFinite(limit) || number <= limit) ? number : NaN;
+}
+
+function parseStandardReset(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const text = value.trim();
+  return Number.isFinite(new Date(text).getTime()) ? text : null;
+}
+
 function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritative = true } = {}) {
   if (!kind) return false;
   const utilization = Number(usedPercent);
@@ -223,6 +270,10 @@ export class AccountManager {
       // until a complete live rate-limit response revalidates the account.
       _quotaNeedsRevalidation: false,
       _quotaPendingWindows: new Set(),
+      // Model windows are response-scoped. Keep a separate live marker so a
+      // complete Fable/Mythos response can enforce its own exhaustion while a
+      // different restored 5h/7d window is still awaiting revalidation.
+      _liveModelWeekly: new Set(),
       usage: {
         totalInputTokens: 0,
         totalOutputTokens: 0,
@@ -1239,13 +1290,19 @@ export class AccountManager {
   }
 
   _isModelNearQuota(account, model, now = Date.now()) {
-    if (account._quotaNeedsRevalidation) return false;
     const label = modelQuotaLabel(model);
     if (!label) return false;
+    // A restored model window is discarded at import. While another restored
+    // window is still provisional, only a complete model window observed on a
+    // live response may exclude this account for the requested tier.
+    if (account._quotaNeedsRevalidation
+        && !account._liveModelWeekly?.has(label)) return false;
     const win = account.quota.modelWeekly[label];
     return Number.isFinite(win?.utilization)
       && Number.isFinite(win?.reset)
       && win.reset > now
+      && win.utilization >= 0
+      && win.utilization <= 1
       && win.utilization >= this.switchThreshold;
   }
 
@@ -1301,15 +1358,17 @@ export class AccountManager {
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
-    if (!isNaN(u5h)) account.quota.unified5h = u5h;
-    if (!isNaN(u7d)) account.quota.unified7d = u7d;
+    const u5h = parseUtilization(headers['anthropic-ratelimit-unified-5h-utilization']);
+    const u7d = parseUtilization(headers['anthropic-ratelimit-unified-7d-utilization']);
+    if (Number.isFinite(u5h)) account.quota.unified5h = u5h;
+    if (Number.isFinite(u7d)) account.quota.unified7d = u7d;
 
     const r5h = headers['anthropic-ratelimit-unified-5h-reset'];
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
-    if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
-    if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+    const r5hMs = parseEpochSeconds(r5h);
+    const r7dMs = parseEpochSeconds(r7d);
+    if (Number.isFinite(r5hMs)) account.quota.unified5hReset = r5hMs;
+    if (Number.isFinite(r7dMs)) account.quota.unified7dReset = r7dMs;
 
     // Codex labels windows as primary/secondary, but those positions are not
     // stable: a weekly-only plan can report its 10080-minute window as primary.
@@ -1341,15 +1400,15 @@ export class AccountManager {
     // appear on responses to requests for that model tier, so the value sticks
     // around from the last such request. Matched generically so a renamed or
     // newly added window is picked up as-is.
+    const liveModelParts = new Map();
     for (const [key, value] of Object.entries(headers)) {
       const m = /^anthropic-ratelimit-unified-(7d_[a-z0-9_]{1,61})-(utilization|reset)$/.exec(key);
       if (!m) continue;
       let parsedValue;
       if (m[2] === 'utilization') {
-        parsedValue = parseFloat(value);
+        parsedValue = parseUtilization(value);
       } else {
-        const reset = parseInt(value, 10);
-        parsedValue = Number.isNaN(reset) ? NaN : reset * 1000;
+        parsedValue = parseEpochSeconds(value);
       }
       if (!Number.isFinite(parsedValue)) continue;
       const label = m[1];
@@ -1369,15 +1428,30 @@ export class AccountManager {
       }
       if (m[2] === 'utilization') win.utilization = parsedValue;
       else win.reset = parsedValue;
+      const parts = liveModelParts.get(label) || {};
+      parts[m[2]] = parsedValue;
+      liveModelParts.set(label, parts);
+    }
+    for (const [label, parts] of liveModelParts) {
+      if (Number.isFinite(parts.utilization)
+          && Number.isFinite(parts.reset)
+          && parts.reset > Date.now()) {
+        account._liveModelWeekly.add(label);
+        account._quotaPendingWindows.delete(`modelWeekly:${label}`);
+      }
     }
 
     // Standard rate limits (API key accounts)
-    const tokensLimit = parseInt(headers['anthropic-ratelimit-tokens-limit'], 10);
-    const tokensRemaining = parseInt(headers['anthropic-ratelimit-tokens-remaining'], 10);
-    const tokensReset = headers['anthropic-ratelimit-tokens-reset'];
-    const requestsLimit = parseInt(headers['anthropic-ratelimit-requests-limit'], 10);
-    const requestsRemaining = parseInt(headers['anthropic-ratelimit-requests-remaining'], 10);
-    const requestsReset = headers['anthropic-ratelimit-requests-reset'];
+    const tokensLimit = parseStandardLimit(headers['anthropic-ratelimit-tokens-limit']);
+    const tokensRemaining = parseStandardRemaining(
+      headers['anthropic-ratelimit-tokens-remaining'], tokensLimit,
+    );
+    const tokensReset = parseStandardReset(headers['anthropic-ratelimit-tokens-reset']);
+    const requestsLimit = parseStandardLimit(headers['anthropic-ratelimit-requests-limit']);
+    const requestsRemaining = parseStandardRemaining(
+      headers['anthropic-ratelimit-requests-remaining'], requestsLimit,
+    );
+    const requestsReset = parseStandardReset(headers['anthropic-ratelimit-requests-reset']);
 
     if (!isNaN(tokensLimit)) account.quota.tokensLimit = tokensLimit;
     if (!isNaN(tokensRemaining)) account.quota.tokensRemaining = tokensRemaining;
@@ -1393,10 +1467,10 @@ export class AccountManager {
       const pending = account._quotaPendingWindows;
       const now = Date.now();
       for (const [window, utilization, reset] of [
-        ['unified5h', u5h, Number(r5h) * 1000],
-        ['unified7d', u7d, Number(r7d) * 1000],
+        ['unified5h', u5h, r5hMs],
+        ['unified7d', u7d, r7dMs],
       ]) {
-        if (Number.isFinite(utilization) && utilization >= 0
+        if (Number.isFinite(utilization) && utilization >= 0 && utilization <= 1
             && Number.isFinite(reset) && reset > now) pending.delete(window);
       }
       for (const [window, limit, remaining, reset] of [
@@ -1404,7 +1478,8 @@ export class AccountManager {
         ['requests', requestsLimit, requestsRemaining, requestsReset],
       ]) {
         if (Number.isFinite(limit) && limit > 0 && Number.isFinite(remaining)
-            && remaining >= 0 && new Date(reset).getTime() > now) pending.delete(window);
+            && remaining >= 0 && remaining <= limit
+            && reset && new Date(reset).getTime() > now) pending.delete(window);
       }
       account._quotaNeedsRevalidation = pending.size > 0;
       if (!account._quotaNeedsRevalidation) {
@@ -2155,6 +2230,12 @@ export class AccountManager {
           ...(a.quota.tokensLimit != null ? ['tokens'] : []),
           ...(a.quota.requestsLimit != null ? ['requests'] : []),
         ]);
+        if (s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object') {
+          for (const label of Object.keys(s.quota.modelWeekly)) {
+            a._quotaPendingWindows.add(`modelWeekly:${label}`);
+          }
+        }
+        a._liveModelWeekly.clear();
         a._quotaNeedsRevalidation = true;
         a.rateLimitedUntil = null;
         if (a.status === 'throttled') a.status = 'active';

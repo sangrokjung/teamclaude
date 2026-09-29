@@ -438,7 +438,7 @@ test('a fresh model-scoped weekly limit blocks only the matching model family', 
     'anthropic-ratelimit-unified-7d-utilization': '0.50',
     'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
     // Fable weekly exhausted — the account still serves every other model.
-    'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1.0',
     'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
   });
   assert.equal(am._isAvailable(am.accounts[0]), true);
@@ -755,6 +755,53 @@ test('headerless response keeps a provisional account eligible until complete li
   assert.equal(am.accounts[0]._quotaNeedsRevalidation, false, 'complete live headers clear the marker');
 });
 
+test('malformed or out-of-range utilization cannot revalidate a snapshot window', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98, 0);
+  am.importQuotaState([{
+    name: 'acct-0',
+    quota: {
+      unified5h: 0.91,
+      unified5hReset: now + HOUR,
+      unified7d: 0.92,
+      unified7dReset: now + 24 * HOUR,
+    },
+  }], { provisional: true });
+
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.3garbage',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + HOUR) / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': '2',
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
+  });
+  assert.equal(am.accounts[0].quota.unified5h, 0.91, 'prefix parse is rejected');
+  assert.equal(am.accounts[0].quota.unified7d, 0.92, 'out-of-range utilization is rejected');
+  assert.equal(am.accounts[0]._quotaNeedsRevalidation, true,
+    'malformed windows cannot clear provisional state');
+});
+
+test('a complete live model window is enforced while another snapshot window is pending', () => {
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(1), 0.98, 0);
+  am.importQuotaState([{
+    name: 'acct-0',
+    quota: {
+      unified5h: 0.4,
+      unified5hReset: now + HOUR,
+      unified7d: 0.5,
+      unified7dReset: now + 24 * HOUR,
+    },
+  }], { provisional: true });
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((now + 24 * HOUR) / 1000)),
+  });
+  assert.equal(am.accounts[0]._quotaNeedsRevalidation, true,
+    'general snapshot windows are still pending');
+  assert.equal(am.isModelExhausted(0, 'claude-fable-5'), true,
+    'live model exhaustion is not hidden by another pending window');
+});
+
 test('model-only snapshot data cannot block a provisional Fable request', () => {
   const am = new AccountManager(makeAccounts(1), 0.98, 0);
   am.importQuotaState([{
@@ -768,6 +815,17 @@ test('model-only snapshot data cannot block a provisional Fable request', () => 
   assert.equal(am.accounts[0]._quotaNeedsRevalidation, true);
   assert.equal(am.isModelExhausted(am.accounts[0], 'claude-opus-4-8'), false,
     'discarded model-window snapshot is not a routing exclusion');
+  assert.equal(am.accounts[0]._quotaPendingWindows.has('modelWeekly:7d_oi'), true,
+    'discarded model window remains pending until a live model response');
+  am.updateQuota(0, {});
+  assert.equal(am.accounts[0]._quotaNeedsRevalidation, true,
+    'headerless response cannot clear model revalidation');
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.2',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+  });
+  assert.equal(am.accounts[0]._quotaNeedsRevalidation, false,
+    'complete live model response clears its pending marker');
 });
 
 test('importQuotaState never restores unifiedStatus (stale rejected must not classify future 429s)', () => {
