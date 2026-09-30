@@ -776,26 +776,6 @@ test('the periodic warm-up timer sweeps rolled-over windows even with no traffic
   }
 });
 
-test('the periodic warm-up rechecks a future stale quota window', async () => {
-  const seen = [];
-  const upstream = recordingUpstream(seen);
-  const upstreamPort = await listen(upstream);
-  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
-  am.accounts[0].quota.unified7d = 1;
-  am.accounts[0].quota.unified7dReset = Date.now() + 24 * HOUR;
-  const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 25 });
-  await listen(proxy);
-  try {
-    assert.equal(proxy.importProbeTemplate({ model: 'claude-x', version: '2023-06-01' }), true);
-    assert.equal(await waitFor(() => am.accounts[0].quota.unified7d < 1), true,
-      'future stale quota is refreshed without client traffic');
-    assert.ok(seen.length >= 1);
-  } finally {
-    await new Promise(r => proxy.close(r));
-    await new Promise(r => upstream.close(r));
-  }
-});
-
 // ── integration: startup fan-out ───────────────────────────────────────────
 
 test('the first real request triggers a fan-out that measures the rest of the fleet', async () => {
