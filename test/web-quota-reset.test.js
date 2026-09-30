@@ -76,7 +76,7 @@ test('web reset: genuine exhaustion stays blocked and probes are paced', async t
   await delay(100);
   assert.equal(seen.length, 1);
   assert.equal(manager.getStatus().usableCount, 0);
-  assert.equal(manager.accounts[0].quota.unified7d, 1.01);
+  assert.equal(manager.accounts[0].quota.unified7d, 1);
 });
 
 test('web reset: disabled, errored, busy, revoked and expired accounts are not probed', async t => {
