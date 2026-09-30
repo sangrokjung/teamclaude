@@ -300,7 +300,6 @@ test('continuity deadline recovers after the legacy overload retry limit', async
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 250,
-    continuityMinDispatchMs: 1,
     rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);
@@ -590,7 +589,6 @@ test('normal inference time before the first 429 does not consume the continuity
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 55,
-    continuityMinDispatchMs: 1,
     rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);

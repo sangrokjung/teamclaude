@@ -281,11 +281,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const continuityMaxSleepMs = Number.isFinite(config.continuityMaxSleepMs)
     ? Math.max(10, config.continuityMaxSleepMs)
     : 30_000;
-  // Leave at least a second for an unsafe retry, rather than dispatching at
-  // the deadline edge. Tiny-budget tests can explicitly lower this floor.
-  const continuityMinDispatchMs = Number.isFinite(config.continuityMinDispatchMs)
+  const configuredContinuityMinDispatchMs = Number.isFinite(config.continuityMinDispatchMs)
     ? Math.max(0, config.continuityMinDispatchMs)
     : 1000;
+  // Cap the unsafe retry floor at half the budget so short deadlines can recover.
+  const continuityMinDispatchMs = Math.min(
+    configuredContinuityMinDispatchMs,
+    Math.floor(continuityMaxWaitMs / 2),
+  );
   const continuityJitterMs = Number.isFinite(config.continuityJitterMs)
     ? Math.max(0, config.continuityJitterMs)
     : 500;
@@ -2293,6 +2296,7 @@ function nextModelFallback(ctx, req, body) {
     if (typeof target?.model !== 'string') return null;
     target.model = next;
     const newBody = Buffer.from(JSON.stringify(json));
+    // Keep last429 across rewrites: it preserves the last rejection and guards unsafe edge dispatch.
     if (req.headers['content-length'] != null) {
       req.headers['content-length'] = String(newBody.length);
     }
