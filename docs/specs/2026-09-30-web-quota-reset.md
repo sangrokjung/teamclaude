@@ -17,6 +17,7 @@ Intent: ../intents/2026-09-30-web-quota-reset.md
 - 저장된 template 모델의 modelWeekly 전용 소진도 재확인한다. 다른 모델 template로 그 제한을 임의 해제하지 않는다.
 - 미래 rateLimitedUntil은 존중하며 만료 후 다음 warm-up 주기에 재확인한다.
 - 복원된 모델 전용 template은 하위 모델의 새 template으로 교체되어도 재확인용으로 보존한다. 일반 quota는 최신 template으로 재측정한다.
+- 보존 template은 quota snapshot에도 함께 저장해 재시작 후에도 모델별 재확인을 이어간다.
 
 ## Plan / Test
 1. 로컬 HTTP fixture로 live/stored 100% → 외부 0% 재현 테스트를 먼저 작성한다.

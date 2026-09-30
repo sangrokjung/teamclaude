@@ -1760,11 +1760,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // re-measure (TUI R) returns -1 until the first genuine request. Restoring
   // the last run's template closes that gap; it is marked `_restored` so the
   // first freshly accepted shape replaces it (see commitProbeTemplate).
-  server.exportProbeTemplate = () => (probeTemplate ? { ...probeTemplate } : null);
+  server.exportProbeTemplate = () => (probeTemplate ? {
+    ...probeTemplate,
+    _staleRecheckTemplate: staleRecheckTemplate ? { ...staleRecheckTemplate } : null,
+  } : null);
   server.importProbeTemplate = (t) => {
     // Never clobber live evidence: a committed-in-this-process template wins.
     if (!activeWarmup || warmupClosed || probeTemplate) return false;
     if (!t || typeof t !== 'object' || typeof t.model !== 'string' || !t.model) return false;
+    const restoredStale = t._staleRecheckTemplate;
     probeTemplate = {
       model: t.model,
       version: typeof t.version === 'string' && t.version ? t.version : '2023-06-01',
@@ -1773,7 +1777,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
-    staleRecheckTemplate = modelQuotaLabel(probeTemplate.model) ? probeTemplate : null;
+    staleRecheckTemplate = restoredStale && typeof restoredStale === 'object'
+      && modelQuotaLabel(restoredStale.model)
+      ? { ...restoredStale, _restored: true }
+      : (modelQuotaLabel(probeTemplate.model) ? probeTemplate : null);
     setImmediate(() => {
       warmupUnmeasured();
       recheckSubscriptionDisabled();

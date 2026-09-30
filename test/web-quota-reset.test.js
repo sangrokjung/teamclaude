@@ -155,6 +155,8 @@ test('web reset: a lower-tier request cannot discard the restored Fable recheck 
   await waitFor(() => seen.filter(model => model === template.model).length >= 1);
   assert.equal(seen[0], 'claude-sonnet-5');
   assert.equal(seen.at(-1), template.model);
+  assert.equal(proxy.exportProbeTemplate().model, 'claude-sonnet-5');
+  assert.equal(proxy.exportProbeTemplate()._staleRecheckTemplate.model, template.model);
 });
 
 test('web reset: disabled, errored, busy, revoked and expired accounts are not probed', async t => {
