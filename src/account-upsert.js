@@ -26,3 +26,39 @@ export function carryOverAccountSettings(previous, account, source) {
   }
   return { reenabled, stillDisabled: account.enabled === false };
 }
+
+/**
+ * Insert or replace an OAuth account in `cfg` (mutated): the config half of
+ * `login`/`import`, kept free of I/O so it can be checked against a fixture.
+ * Matches the profile's account UUID first, then the name; an unnamed account
+ * without a profile email gets the first free `account-N` (not `count + 1`,
+ * which collides after a delete).
+ *
+ * @returns {{ action: 'Added'|'Updated', name: string, carried: object|null }}
+ */
+export function applyOAuthUpsert(cfg, { name, creds, profile, source }) {
+  if (!name) {
+    let n = 1;
+    do { name = `account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
+  }
+  const account = {
+    name,
+    type: 'oauth',
+    source,
+    accountUuid: profile?.accountUuid || null,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+  let idx = profile?.accountUuid
+    ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
+    : -1;
+  if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
+  if (idx < 0) {
+    cfg.accounts.push(account);
+    return { action: 'Added', name, carried: null };
+  }
+  const carried = carryOverAccountSettings(cfg.accounts[idx], account, source);
+  cfg.accounts[idx] = account;
+  return { action: 'Updated', name, carried };
+}
