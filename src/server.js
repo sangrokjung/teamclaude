@@ -473,6 +473,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     setImmediate(() => {
       warmupUnmeasured();
       recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
     });
     // Note: the already-measured accounts still missing their Fable window are
     // healed by the periodic top-up pass (topUpModelWeekly) and by an on-demand
@@ -1058,26 +1059,24 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
   }
 
-  async function recheckStaleNearQuota() {
-    if (!activeWarmup || warmupClosed || !probeTemplate) return;
-    const now = Date.now();
-    const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
-      && accountManager._isNearQuota(a)
-      && (!a._nearQuotaRecheckAt || now >= a._nearQuotaRecheckAt));
-    if (!targets.length) return;
-    for (const account of targets) account._nearQuotaRecheckAt = now + accountManager.probeRetryAfterMs;
-    await Promise.all(targets.map(async account => {
-      await accountManager.ensureTokenFresh(account).catch(() => {});
-      if (account.status === 'error') return false;
-      return warmupAccount(account, { force: true });
-    }));
-  }
-
   // Revalidate only the narrowly classified organization-access quarantine.
   // Other auth errors stay parked until re-import/login because a generic
   // probe must never revive revoked credentials. Each account is paced before
   // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  function recheckStaleNearQuota() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return;
+    const now = Date.now();
+    for (const account of accountManager.accounts) {
+      if (account.enabled === false || account.status === 'error' || account.authRevoked
+          || account.subscriptionDisabled || account.inflight !== 0 || account._warming
+          || (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt))
+          || now < (account._nearQuotaRecheckAt || 0)
+          || !accountManager._isNearQuota(account)) continue;
+      account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
+      void warmupAccount(account, { force: true });
+    }
+  }
+
   async function recheckSubscriptionDisabled() {
     if (!activeWarmup || warmupClosed || !probeTemplate
         || subscriptionRecheckIntervalMs <= 0) return;
@@ -1765,12 +1764,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
-    // A restored template is already a known-accepted request shape. Probe
-    // provisional accounts immediately so stale quota cannot linger until the
-    // next client request or periodic warm-up interval.
     setImmediate(() => {
       warmupUnmeasured();
       recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
     });
     return true;
   };
