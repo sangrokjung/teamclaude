@@ -1058,6 +1058,22 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
   }
 
+  async function recheckStaleNearQuota() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return;
+    const now = Date.now();
+    const targets = accountManager.accounts.filter(a =>
+      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      && accountManager._isNearQuota(a)
+      && (!a._nearQuotaRecheckAt || now >= a._nearQuotaRecheckAt));
+    if (!targets.length) return;
+    for (const account of targets) account._nearQuotaRecheckAt = now + accountManager.probeRetryAfterMs;
+    await Promise.all(targets.map(async account => {
+      await accountManager.ensureTokenFresh(account).catch(() => {});
+      if (account.status === 'error') return false;
+      return warmupAccount(account, { force: true });
+    }));
+  }
+
   // Revalidate only the narrowly classified organization-access quarantine.
   // Other auth errors stay parked until re-import/login because a generic
   // probe must never revive revoked credentials. Each account is paced before
@@ -1110,6 +1126,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       warmupUnmeasured();
       topUpPartialQuota(); // heal half-measured accounts (a window swept, the other survives)
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
+      recheckStaleNearQuota();
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
