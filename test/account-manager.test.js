@@ -857,6 +857,22 @@ test('model-only snapshot data cannot block a provisional Fable request', () => 
     'complete live model response clears its pending marker');
 });
 
+test('provisional windows require a live pair per window but may arrive in separate responses', () => {
+  const am = new AccountManager(makeAccounts(1));
+  const reset = Date.now() + HOUR;
+  am.importQuotaState([{ name: 'acct-0', quota: {
+    unified5h: 1, unified5hReset: reset, unified7d: 1, unified7dReset: reset,
+  } }], { provisional: true });
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+  am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-reset': String(Math.floor(reset / 1000)) });
+  assert.ok(am.accounts[0]._quotaPendingWindows.has('unified5h'));
+  for (const window of ['5h', '7d']) am.updateQuota(0, {
+    [`anthropic-ratelimit-unified-${window}-utilization`]: '0.1',
+    [`anthropic-ratelimit-unified-${window}-reset`]: String(Math.floor(reset / 1000)),
+  });
+  assert.equal(am.accounts[0]._quotaNeedsRevalidation, false);
+});
+
 test('runtime-added account accepts model quota headers without restart', () => {
   const am = new AccountManager([]);
   const index = am.addAccount(makeAccounts(1)[0]);

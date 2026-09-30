@@ -5,8 +5,9 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `592081f3bb64cb23ae60796c63752780ce49265e14fdf701b3293b1f45419ab3`
+- SHA-256: `a1bedae31ba9cdeb01a230831bc0341b7daef8d373453e1b5595f443eebf9493`
 - Source: `src/config.js`
+- 2026-10-01 갱신: Anthropic rejected 429 정규화, provisional throttle 보존, model revalidation label 저장 및 status pending 정보를 반영했다. 아래 Codex 모델 격리 발췌는 동일하며 최종 hash는 위 값이다. 교차 벤더 판정은 UNVERIFIED다.
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
   이후 두 소스가 바뀌면 이 문서와 `test/test_model_recovery_gate.py`의 핀을 함께 검토·갱신한다.

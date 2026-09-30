@@ -26,7 +26,10 @@ async function fixture(t, { count = 1, response = 0, config = {} } = {}) {
     let body = '';
     for await (const chunk of req) body += chunk;
     seen.push({ auth: req.headers.authorization, body: JSON.parse(body) });
-    res.writeHead(response >= 1 ? 429 : 200, headers(response));
+    const reply = typeof response === 'function' ? response(JSON.parse(body)) : {
+      status: response >= 1 ? 429 : 200, headers: headers(response),
+    };
+    res.writeHead(reply.status, reply.headers);
     res.end('{"ok":true}');
   });
   const port = await listen(upstream);
@@ -195,4 +198,124 @@ test('web reset: activeWarmup false and close stop background probes', async t =
   await delay(60);
   assert.equal(disabled.seen.length, 0);
   assert.equal(stopped.seen.length, 0);
+});
+
+test('web reset: provisional snapshot and over-limit rejected probe stay blocked', async t => {
+  const { manager, proxy, seen } = await fixture(t, { response: () => {
+    const h = headers(1.01);
+    delete h['anthropic-ratelimit-unified-7d_oi-utilization'];
+    delete h['anthropic-ratelimit-unified-7d_oi-reset'];
+    return { status: 429, headers: h };
+  } });
+  manager.importQuotaState(JSON.parse(JSON.stringify(manager.exportQuotaState())), { provisional: true });
+  proxy.importProbeTemplate({ ...template, model: 'claude-sonnet-5' });
+  await waitFor(() => manager.accounts[0].status === 'throttled');
+  assert.equal(manager.accounts[0].quota.unified7d, 1);
+  assert.equal(manager.getStatus().usableCount, 0);
+  assert.ok(manager.accounts[0].rateLimitedUntil > Date.now());
+  await delay(100);
+  assert.equal(seen.length, 1);
+});
+
+test('web reset: model-only rejected 1.01 probe preserves general capacity', async t => {
+  const { manager, proxy, seen } = await fixture(t, { response: () => ({
+    status: 429, headers: { ...headers(0.1),
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',
+    },
+  }) });
+  manager.importQuotaState(JSON.parse(JSON.stringify(manager.exportQuotaState())), { provisional: true });
+  proxy.importProbeTemplate(template);
+  await waitFor(() => manager.isModelExhausted(0, template.model));
+  assert.equal(manager.accounts[0].rateLimitedUntil, null);
+  assert.equal(manager.getActiveAccount(new Set(), 'claude-sonnet-5'), manager.accounts[0]);
+  await delay(100);
+  assert.equal(seen.length, 1, 'model recheck must converge and remain paced');
+});
+
+test('web reset: restored throttle controls retry-after instead of stale weekly quota', async t => {
+  const { manager, proxy, proxyPort, seen } = await fixture(t, { config: { continuity: false } });
+  manager.markRateLimited(0, 60);
+  const snapshot = JSON.parse(JSON.stringify(manager.exportQuotaState()));
+  manager.accounts[0].rateLimitedUntil = null;
+  manager.accounts[0].status = 'active';
+  manager.importQuotaState(snapshot, { provisional: true });
+  proxy.importProbeTemplate(template);
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'test' }] }),
+  });
+  assert.equal(response.status, 429);
+  assert.ok(Number(response.headers.get('retry-after')) <= 60);
+  await response.text();
+  await delay(100);
+  assert.equal(seen.length, 0);
+  manager.accounts[0].rateLimitedUntil = Date.now() - 1;
+  await waitFor(() => manager.getStatus().usableCount === 1);
+});
+
+for (const state of ['partial', 'model-topup', 'provisional']) {
+  test(`web reset: ${state} automatic probes honor every exclusion`, async t => {
+    const { manager, proxy, seen } = await fixture(t, { count: 7 });
+    for (const a of manager.accounts) {
+      manager.updateQuota(a, headers(0.1));
+      a.quota.modelWeekly = {};
+      if (state === 'partial') a.quota.unified5h = null;
+    }
+    if (state === 'provisional') manager.importQuotaState(manager.exportQuotaState(), { provisional: true });
+    Object.assign(manager.accounts[0], { enabled: false });
+    Object.assign(manager.accounts[1], { status: 'error' });
+    Object.assign(manager.accounts[2], { authRevoked: true });
+    Object.assign(manager.accounts[3], { subscriptionDisabled: true });
+    Object.assign(manager.accounts[4], { inflight: 1 });
+    Object.assign(manager.accounts[5], { expiresAt: Date.now() - 1 });
+    manager.markRateLimited(6, 60);
+    let refreshes = 0;
+    manager.ensureTokenFresh = async () => { refreshes++; };
+    proxy.importProbeTemplate({ ...template, _elicitsModelWeekly: true });
+    await delay(150);
+    assert.equal(seen.length, 0);
+    assert.equal(refreshes, 0);
+  });
+}
+
+test('web reset: real exported snapshot restores the model recheck path at startup', async t => {
+  const { manager, proxy, seen } = await fixture(t, { config: { warmupIntervalMs: 0 }, response: body => {
+    const h = headers(0);
+    if (body.model !== template.model) {
+      delete h['anthropic-ratelimit-unified-7d_oi-utilization'];
+      delete h['anthropic-ratelimit-unified-7d_oi-reset'];
+    }
+    return { status: 200, headers: h };
+  } });
+  const snapshot = JSON.parse(JSON.stringify(manager.exportQuotaState()));
+  assert.deepEqual(snapshot[0].quota.modelWeekly, {});
+  manager.importQuotaState(snapshot, { provisional: true });
+  proxy.importProbeTemplate({ model: 'claude-sonnet-5', version: template.version, _staleRecheckTemplate: template });
+  await waitFor(() => !manager.accounts[0]._quotaNeedsRevalidation);
+  assert.equal(seen[0].body.model, template.model);
+  assert.equal(manager.accounts[0].quota.modelWeekly['7d_oi'].utilization, 0);
+});
+
+test('web reset: a live model rejected 1.01 response leaves Sonnet available', async t => {
+  const { manager, proxyPort } = await fixture(t, {
+    config: { activeWarmup: false, continuityMode: false },
+    response: body => ({
+      status: body.model === template.model ? 429 : 200,
+      headers: body.model === template.model ? {
+        ...headers(0.1), 'anthropic-ratelimit-unified-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_oi-utilization': '1.01',
+      } : headers(0.1),
+    }),
+  });
+  manager.importQuotaState(manager.exportQuotaState(), { provisional: true });
+  for (const [model, status] of [[template.model, 429], ['claude-sonnet-5', 200]]) {
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'test' }] }),
+    });
+    await response.text();
+    assert.equal(response.status, status);
+    assert.equal(manager.accounts[0].rateLimitedUntil, null);
+  }
 });

@@ -44,8 +44,9 @@ function parseStrictDecimal(value) {
   return Number.isFinite(number) ? number : NaN;
 }
 
-function parseUtilization(value) {
+function parseUtilization(value, rejected429 = false) {
   const number = parseStrictDecimal(value);
+  if (rejected429 && number > 1) return 1;
   return number >= 0 && number <= 1 ? number : NaN;
 }
 
@@ -892,6 +893,14 @@ export class AccountManager {
       && (account._mwProbes || 0) < this.maxWarmupTries;
   }
 
+  needsModelWeeklyRecheck(account) {
+    const pending = [...(account._quotaPendingWindows || [])]
+      .some(window => window.startsWith('modelWeekly:'));
+    return account.type === 'oauth'
+      && (pending || this.needsModelWeekly(account))
+      && (account._mwProbes || 0) < this.maxWarmupTries;
+  }
+
   /**
    * A PARTIALLY-measured OAuth account: one unified window is present but the
    * other is missing, so it is neither fully measured nor a candidate for either
@@ -1208,13 +1217,13 @@ export class AccountManager {
   /**
    * Update an account's quota tracking from upstream response headers.
    */
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, { rejected429 = false } = {}) {
     const account = this._resolve(accountIndex);
     if (!account) return;
 
     // Unified rate limits (Claude Max)
-    const u5h = parseUtilization(headers['anthropic-ratelimit-unified-5h-utilization']);
-    const u7d = parseUtilization(headers['anthropic-ratelimit-unified-7d-utilization']);
+    const u5h = parseUtilization(headers['anthropic-ratelimit-unified-5h-utilization'], rejected429);
+    const u7d = parseUtilization(headers['anthropic-ratelimit-unified-7d-utilization'], rejected429);
     if (Number.isFinite(u5h)) account.quota.unified5h = u5h;
     if (Number.isFinite(u7d)) account.quota.unified7d = u7d;
 
@@ -1261,7 +1270,7 @@ export class AccountManager {
       if (!m) continue;
       let parsedValue;
       if (m[2] === 'utilization') {
-        parsedValue = parseUtilization(value);
+        parsedValue = parseUtilization(value, rejected429);
       } else {
         parsedValue = parseEpochSeconds(value);
       }
@@ -2023,16 +2032,21 @@ export class AccountManager {
    * organically re-measured every account.
    */
   exportQuotaState() {
-    return this.accounts.map(a => ({
-      accountUuid: a.accountUuid || null,
-      name: a.name,
-      quota: {
-        ...a.quota,
-        modelWeekly: {},
-      },
-      rateLimitedUntil: a.rateLimitedUntil,
-      usage: { ...a.usage },
-    }));
+    return this.accounts.map(a => {
+      const quotaPendingWindows = [...a._quotaPendingWindows];
+      for (const label of Object.keys(a.quota.modelWeekly)) {
+        const key = `modelWeekly:${label}`;
+        if (!quotaPendingWindows.includes(key)) quotaPendingWindows.push(key);
+      }
+      return {
+        accountUuid: a.accountUuid || null,
+        name: a.name,
+        quota: { ...a.quota, modelWeekly: {} },
+        quotaPendingWindows,
+        rateLimitedUntil: a.rateLimitedUntil,
+        usage: { ...a.usage },
+      };
+    });
   }
 
   /**
@@ -2047,7 +2061,7 @@ export class AccountManager {
    * behavior. Callers that accept traffic immediately after startup can pass
    * `{ provisional: true }`: Anthropic quota remains visible but each window
    * needs a complete live response before it can exclude an account. Stored
-   * throttles are not restored in that mode. Error/exhausted statuses are deliberately NOT restored.
+   * throttles remain binding until their deadline. Error/exhausted statuses are deliberately NOT restored.
    */
   importQuotaState(saved, { provisional = false } = {}) {
     for (const s of Array.isArray(saved) ? saved : []) {
@@ -2057,9 +2071,14 @@ export class AccountManager {
         : this.accounts.find(x => x.name === s.name);
       if (!a) continue;
       const revalidate = provisional && a.provider === 'anthropic';
+      const savedModelWindows = Array.isArray(s.quotaPendingWindows)
+        ? s.quotaPendingWindows.filter(w => typeof w === 'string'
+          && /^modelWeekly:7d_[a-z0-9_]{1,61}$/.test(w)).slice(0, MODEL_WEEKLY_MAX_ENTRIES)
+        : [];
       const hasPersistedQuota = s.quota && typeof s.quota === 'object'
         && (s.quota.unified5h != null || s.quota.unified7d != null
           || s.quota.tokensLimit != null || s.quota.requestsLimit != null
+          || savedModelWindows.length > 0
           || (s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object'
             && Object.keys(s.quota.modelWeekly).length > 0));
       if (s.quota && typeof s.quota === 'object') {
@@ -2087,6 +2106,7 @@ export class AccountManager {
           ...(a.quota.unified7d != null ? ['unified7d'] : []),
           ...(a.quota.tokensLimit != null ? ['tokens'] : []),
           ...(a.quota.requestsLimit != null ? ['requests'] : []),
+          ...savedModelWindows,
         ]);
         if (s.quota.modelWeekly && typeof s.quota.modelWeekly === 'object') {
           for (const label of Object.keys(s.quota.modelWeekly)) {
@@ -2095,14 +2115,12 @@ export class AccountManager {
         }
         a._liveModelWeekly.clear();
         a._quotaNeedsRevalidation = true;
-        a.rateLimitedUntil = null;
-        if (a.status === 'throttled') a.status = 'active';
       }
       // A restored throttle must not overwrite the subscription-lapse park: a
       // 'throttled' status would lazily heal to 'active' when the window
       // passes, silently returning a lapsed account to rotation.
-      if (!revalidate && Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
-          && !a.subscriptionDisabled && a.status !== 'error') {
+      if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
+          && !a.subscriptionDisabled && !a.authRevoked && a.status !== 'error') {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -2155,6 +2173,7 @@ export class AccountManager {
         modelWeekly: Object.fromEntries(
           Object.entries(a.quota.modelWeekly).map(([k, w]) => [k, { ...w }])),
       },
+      quotaPendingWindows: [...a._quotaPendingWindows],
       usage: { ...a.usage },
       inflight: a.inflight,
       maxConcurrent: a.maxConcurrent,

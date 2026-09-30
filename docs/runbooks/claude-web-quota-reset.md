@@ -12,6 +12,8 @@
 - 실행 중 웹 리셋은 `activeWarmup: true`, `warmupIntervalMs: 300000` 기본 설정에서 주기적으로 확인합니다. 계정별 재시도는 최소 1분, 기본 5분 간격입니다.
 - 모델 전용 제한은 해당 모델의 정상 template으로 확인합니다. 하위 모델 요청이 들어와도 이 template을 유지하고 snapshot에 함께 저장합니다.
 - 실제 429 제한은 유지하며, disabled/error/요청 처리 중/만료 임박 토큰/미래 throttle은 자동 probe에서 제외합니다.
+- 재시작으로 미래 throttle을 해제하지 않습니다. snapshot의 미검증 quota는 `quotaPendingWindows`로 표시하며, 실제 재측정 전에는 라우팅 차단·`retry-after` 계산에 사용하지 않습니다.
+- 429의 모델별 사용량이 1을 조금 넘더라도 실제 rejected 응답이면 소진으로 처리합니다. 해당 모델만 소진된 경우 다른 모델의 계정 용량은 유지합니다.
 
 5분은 보장된 복구 완료 시간이 아니라 측정 주기입니다. 토큰 갱신, 처리 중 요청, throttle, 상류 오류 또는 template 부재로 더 지연될 수 있습니다. `activeWarmup: false`는 자동 측정을 끄며 `warmupIntervalMs: 0`은 시작 시에만 측정합니다. 재시작 없이 계속 복구하려면 주기를 양수로 유지합니다.
 

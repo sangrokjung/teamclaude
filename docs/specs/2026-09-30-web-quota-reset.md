@@ -45,3 +45,10 @@ Opus는 복원된 Fable template이 하위 모델로 교체될 때 modelWeekly �
 - drain activeRequests=0 후 listener/launchd PID `10882` 일치, 총 17개 중 가용 0→2 복구, 두 계정 weekly=0 확인.
 - 운영 `POST /v1/messages` 실제 QA: HTTP 200, model `claude-opus-5-5`, text `OK`.
 - 후속 PR: https://github.com/sangrokjung/teamclaude/pull/44 (PR #41과 동일 base).
+
+### 기본 브랜치 후속 적대 검토 (2026-10-01)
+- Codex 대체 검토가 provisional+rejected 429, 미래 throttle 복원/자동 probe 우회, 실제 model snapshot 재시작, stale quota 기반 retry-after 결함을 발견해 수정했다.
+- rejected 429에서만 유효한 utilization 초과값을 1로 정규화하며 모델 소진은 모델 범위로 유지한다. 미래 throttle은 복원하고 일반 자동 probe의 공통 제외 조건을 적용했다. 수동 R과 구독 전용 복구는 별도 경로를 유지한다.
+- model quota 숫자 대신 재측정할 label을 snapshot에 보존한다. 보존 template을 startup probe와 model top-up에서 사용한다. public status의 `quotaPendingWindows`는 라우팅/대기시간 계산의 미검증 window를 나타낸다.
+- 핵심 회귀 HTTP/단위 테스트 107/107 통과. 확대 145건 실행에서는 55ms deadline을 쓰는 기존 model-fallback 2건이 dispatch timeout으로 502를 반환했다. 동일 model-fallback suite 단독 실행은 12/12 통과했다. 테스트의 429 기대를 502로 완화하거나 제품의 unsafe POST timeout 처리를 변경하지 않았다.
+- Claude Opus 재검토는 결과 JSON/오류 출력이 없는 장기 무응답으로 종료했다. Codex `reset_revision_adversarial`은 최신 수정에서 추가 HIGH/CRITICAL 기능 결함을 확정하지 못했으나 교차 벤더 승인이 아니므로 UNVERIFIED다. 최신 CI 및 Claude 검토 전 머지하지 않는다.
