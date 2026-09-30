@@ -16,6 +16,7 @@ Intent: ../intents/2026-09-30-web-quota-reset.md
 - account별 최소 1분, 기본 5분 간격으로 probe를 제한하고 종료 후 전송하지 않는다.
 - 저장된 template 모델의 modelWeekly 전용 소진도 재확인한다. 다른 모델 template로 그 제한을 임의 해제하지 않는다.
 - 미래 rateLimitedUntil은 존중하며 만료 후 다음 warm-up 주기에 재확인한다.
+- 복원된 모델 전용 template은 하위 모델의 새 template으로 교체되어도 재확인용으로 보존한다. 일반 quota는 최신 template으로 재측정한다.
 
 ## Plan / Test
 1. 로컬 HTTP fixture로 live/stored 100% → 외부 0% 재현 테스트를 먼저 작성한다.
@@ -31,4 +32,6 @@ PR #41 병합 완료(9560285). 기존 5개 웹 리셋 회귀와 provisional/부�
 
 추가 적대 조사에서 modelWeekly 전용 소진 누락과 미래 throttle 중 probe 가능성을 발견해 보완했다. 모델 일치·불일치 및 throttle 유지·만료 회귀를 추가했다.
 
-2026-09-30 추가 Claude Opus 검증은 실제 `All 17 accounts exhausted` 응답으로 실패했다. Codex 보조 검토는 참고 자료이며 교차 벤더 검증을 대신하지 않는다. 추가 변경의 상태는 UNVERIFIED이고 운영 적용 전 Claude 검증이 필요하다. 운영 3456에는 기존 수정도 아직 적용되지 않았다.
+2026-09-30 최초 Claude Opus 호출은 실제 `All 17 accounts exhausted` 응답으로 실패했다. Codex 보조 검토 후 격리 canary에서 실제 재측정으로 가용 계정 0→2 복귀를 확인했다. CLI wrapper가 canary 주소를 덮어써 같은 장애로 재호출되는 문제를 확인하고 기존 vendor 실행 파일과 인증으로 Opus 검증을 수행했다.
+
+Opus는 복원된 Fable template이 하위 모델로 교체될 때 modelWeekly 재확인이 사라지는 경로를 지적했다. 해당 template을 메모리에 별도 보존하고 회귀 테스트를 추가했다. 최신 교차 검증/운영 반영은 아래 실행 기록으로 갱신한다.

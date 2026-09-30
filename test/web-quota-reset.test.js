@@ -124,6 +124,39 @@ test('web reset: unrelated model template does not probe a model-only limit', as
   assert.equal(manager.isModelExhausted(0, 'claude-sonnet-5'), false);
 });
 
+test('web reset: a lower-tier request cannot discard the restored Fable recheck template', async t => {
+  const seen = [];
+  const upstream = http.createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const parsed = JSON.parse(body);
+    seen.push(parsed.model);
+    const h = headers(0);
+    if (parsed.model === 'claude-sonnet-5') {
+      delete h['anthropic-ratelimit-unified-7d_oi-utilization'];
+      delete h['anthropic-ratelimit-unified-7d_oi-reset'];
+    }
+    res.writeHead(200, h);
+    res.end('{"ok":true}');
+  });
+  const port = await listen(upstream);
+  const manager = new AccountManager([{ name: 'fixture-0', type: 'oauth', accessToken: 'token', expiresAt: Date.now() + 3600000 }]);
+  manager.updateQuota(0, headers(0));
+  const proxy = createProxyServer(manager, { upstream: `http://127.0.0.1:${port}`, warmupIntervalMs: 20 });
+  const proxyPort = await listen(proxy);
+  t.after(() => Promise.all([close(proxy), close(upstream)]));
+  proxy.importProbeTemplate(template);
+  const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1, messages: [{ role: 'user', content: 'lower tier' }] }),
+  });
+  await response.text();
+  manager.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 1, reset: Date.now() + 3600000 };
+  await waitFor(() => seen.filter(model => model === template.model).length >= 1);
+  assert.equal(seen[0], 'claude-sonnet-5');
+  assert.equal(seen.at(-1), template.model);
+});
+
 test('web reset: disabled, errored, busy, revoked and expired accounts are not probed', async t => {
   const { manager, proxy, seen } = await fixture(t, { count: 6 });
   Object.assign(manager.accounts[0], { enabled: false });
