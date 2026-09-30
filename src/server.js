@@ -1059,10 +1059,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
   }
 
-  // Revalidate only the narrowly classified organization-access quarantine.
-  // Other auth errors stay parked until re-import/login because a generic
-  // probe must never revive revoked credentials. Each account is paced before
-  // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  // External resets do not notify the proxy. Recheck blocked windows for the
+  // known-accepted template, while preserving live throttle deadlines.
   function recheckStaleNearQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const now = Date.now();
@@ -1070,13 +1068,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       if (account.enabled === false || account.status === 'error' || account.authRevoked
           || account.subscriptionDisabled || account.inflight !== 0 || account._warming
           || (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt))
+          || (account.status === 'throttled' && account.rateLimitedUntil
+            && account.rateLimitedUntil > now)
           || now < (account._nearQuotaRecheckAt || 0)
-          || !accountManager._isNearQuota(account)) continue;
+          || !accountManager._isNearQuota(account, probeTemplate.model)) continue;
       account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
       void warmupAccount(account, { force: true });
     }
   }
 
+  // Revalidate only the narrowly classified organization-access quarantine.
+  // Other auth errors stay parked until re-import/login. Pace each account
+  // before dispatch so overlapping triggers cannot duplicate probes.
   async function recheckSubscriptionDisabled() {
     if (!activeWarmup || warmupClosed || !probeTemplate
         || subscriptionRecheckIntervalMs <= 0) return;

@@ -79,6 +79,51 @@ test('web reset: genuine exhaustion stays blocked and probes are paced', async t
   assert.equal(manager.accounts[0].quota.unified7d, 1);
 });
 
+test('web reset: model-scoped exhaustion is rechecked with the restored model template', async t => {
+  const { manager, proxy, seen } = await fixture(t, { config: { warmupIntervalMs: 0 } });
+  manager.updateQuota(0, headers(0));
+  manager.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1,
+    reset: Date.now() + 3600_000,
+  };
+  proxy.importProbeTemplate(template);
+  await waitFor(() => manager.accounts[0].quota.modelWeekly['7d_oi']?.utilization === 0);
+  assert.equal(seen.length, 1);
+});
+
+test('web reset: a future account throttle is respected by stale-quota recheck', async t => {
+  const { manager, proxy, seen } = await fixture(t, { config: { warmupIntervalMs: 0 } });
+  manager.markRateLimited(0, 60);
+  proxy.importProbeTemplate(template);
+  await delay(100);
+  assert.equal(seen.length, 0);
+  assert.equal(manager.accounts[0].status, 'throttled');
+});
+
+test('web reset: stale quota recovers after the throttle expires', async t => {
+  const { manager, proxy, seen } = await fixture(t);
+  manager.markRateLimited(0, 60);
+  proxy.importProbeTemplate(template);
+  await delay(60);
+  assert.equal(seen.length, 0);
+  manager.accounts[0].rateLimitedUntil = Date.now() - 1;
+  await waitFor(() => manager.getStatus().usableCount === 1);
+  assert.equal(seen.length, 1);
+});
+
+test('web reset: unrelated model template does not probe a model-only limit', async t => {
+  const { manager, proxy, seen } = await fixture(t);
+  manager.updateQuota(0, headers(0));
+  manager.accounts[0].quota.modelWeekly['7d_oi'] = {
+    utilization: 1, reset: Date.now() + 3600_000,
+  };
+  proxy.importProbeTemplate({ ...template, model: 'claude-sonnet-5' });
+  await delay(100);
+  assert.equal(seen.length, 0);
+  assert.equal(manager.isModelExhausted(0, template.model), true);
+  assert.equal(manager.isModelExhausted(0, 'claude-sonnet-5'), false);
+});
+
 test('web reset: disabled, errored, busy, revoked and expired accounts are not probed', async t => {
   const { manager, proxy, seen } = await fixture(t, { count: 6 });
   Object.assign(manager.accounts[0], { enabled: false });
