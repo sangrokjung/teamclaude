@@ -39,7 +39,7 @@ import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import { reauthenticateAccount } from './reauth.js';
-import { carryOverAccountSettings } from './account-upsert.js';
+import { applyOAuthUpsert, carryOverAccountSettings } from './account-upsert.js';
 import {
   applySubscriptionCancellation,
   cancellationEndsAt,
@@ -3442,11 +3442,11 @@ Config: ${getConfigPath()}
 
 // ── shared account upsert ────────────────────────────────────
 
-function reportCarriedSettings(name, carried) {
+function reportCarriedSettings(name, carried, enableCommand) {
   if (carried?.reenabled) {
     console.log(`Re-enabled "${name}" (it was disabled; logging in puts it back in rotation)`);
   } else if (carried?.stillDisabled) {
-    console.error(`Warning: "${name}" is disabled and stays out of rotation (\`enable ${name}\` puts it back)`);
+    console.error(`Warning: "${name}" is disabled and stays out of rotation (\`${enableCommand}\` puts it back)`);
   }
 }
 
@@ -3463,38 +3463,13 @@ async function upsertOAuthAccount(name, creds, source = 'unknown') {
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
   }
-  let action = 'Added';
-  let carried = null;
+  let result;
   const savedConfig = await atomicConfigUpdate(cfg => {
-    if (!name) {
-      // First FREE account-N (not `count + 1`, which collides after a delete)
-      // against the fresh locked config, not the pre-login snapshot.
-      let n = 1;
-      do { name = `account-${n++}`; } while (cfg.accounts.some(a => a.name === name));
-    }
-    const account = {
-      name,
-      type: 'oauth',
-      source,
-      accountUuid: profile?.accountUuid || null,
-      accessToken: creds.accessToken,
-      refreshToken: creds.refreshToken,
-      expiresAt: creds.expiresAt,
-    };
-    let idx = profile?.accountUuid
-      ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
-      : -1;
-    if (idx < 0) idx = cfg.accounts.findIndex(a => a.name === name);
-    if (idx >= 0) {
-      action = 'Updated';
-      carried = carryOverAccountSettings(cfg.accounts[idx], account, source);
-      cfg.accounts[idx] = account;
-    } else {
-      cfg.accounts.push(account);
-    }
+    // Against the fresh locked config, not the pre-login snapshot.
+    result = applyOAuthUpsert(cfg, { name, creds, profile, source });
   });
-  console.log(`${action} account "${name}"`);
-  reportCarriedSettings(name, carried);
+  console.log(`${result.action} account "${result.name}"`);
+  reportCarriedSettings(result.name, result.carried, `teamclaude enable ${result.name}`);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
@@ -3535,7 +3510,7 @@ async function upsertCodexAccount(name, creds, source = 'unknown') {
     cfg.provider = 'codex';
   });
   console.log(`${action} Codex account "${name}"`);
-  reportCarriedSettings(name, carried);
+  reportCarriedSettings(name, carried, `teamclaude codex enable ${name}`);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
