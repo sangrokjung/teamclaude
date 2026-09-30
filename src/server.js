@@ -473,6 +473,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     setImmediate(() => {
       warmupUnmeasured();
       recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
     });
     // Note: the already-measured accounts still missing their Fable window are
     // healed by the periodic top-up pass (topUpModelWeekly) and by an on-demand
@@ -1062,6 +1063,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Other auth errors stay parked until re-import/login because a generic
   // probe must never revive revoked credentials. Each account is paced before
   // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  function recheckStaleNearQuota() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return;
+    const now = Date.now();
+    for (const account of accountManager.accounts) {
+      if (account.enabled === false || account.status === 'error' || account.authRevoked
+          || account.subscriptionDisabled || account.inflight !== 0 || account._warming
+          || (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt))
+          || now < (account._nearQuotaRecheckAt || 0)
+          || !accountManager._isNearQuota(account)) continue;
+      account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
+      void warmupAccount(account, { force: true });
+    }
+  }
+
   async function recheckSubscriptionDisabled() {
     if (!activeWarmup || warmupClosed || !probeTemplate
         || subscriptionRecheckIntervalMs <= 0) return;
@@ -1110,6 +1125,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       warmupUnmeasured();
       topUpPartialQuota(); // heal half-measured accounts (a window swept, the other survives)
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
+      recheckStaleNearQuota();
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
@@ -1748,7 +1764,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
-    setImmediate(() => { recheckSubscriptionDisabled(); });
+    setImmediate(() => {
+      warmupUnmeasured();
+      recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
+    });
     return true;
   };
 

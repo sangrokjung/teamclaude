@@ -1366,11 +1366,16 @@ async function proxyWorkerCommand() {
 
   // Restore the last run's quota snapshot so a restart doesn't blank the
   // dashboard (quota otherwise lives only in memory and is re-learned from
-  // traffic). Stale-safe: the proxy takes no traffic while down, expired
-  // windows are lazily swept, and a still-future throttle is re-applied.
+  // traffic). Anthropic snapshots need live revalidation because other
+  // sessions may change shared usage while this process is offline.
   const quotaCache = await readQuotaCache();
   if (quotaCache?.accounts) {
-    accountManager.importQuotaState(quotaCache.accounts);
+    // Anthropic quota headers describe shared subscription usage and may have
+    // changed in another Claude session while this proxy was offline. Keep the
+    // snapshot visible, but require a live response before it can exclude an
+    // account. Codex usage is refreshed through its own usage endpoint and
+    // retains the established restore semantics.
+    accountManager.importQuotaState(quotaCache.accounts, { provisional: !codexMode });
     // Restore the active-account marker too (identity by name) so the sticky
     // primary — and its warm prompt cache — carries across the restart.
     const cur = quotaCache.currentAccount
@@ -1763,7 +1768,7 @@ async function waitForExit(identity, timeoutMs) {
  */
 async function probeServer(
   port,
-  timeoutMs = 1500,
+  timeoutMs = 5000,
   expectedLifecycleId = null,
   proxyApiKey = null,
 ) {
@@ -1791,7 +1796,9 @@ async function probeServer(
   finally { clearTimeout(timer); }
 }
 
-function configuredStatusProbeTimeoutMs(fallbackMs = 1500) {
+// Allow the two status/identity round trips to survive brief host contention.
+// Process identity verification remains mandatory regardless of this budget.
+function configuredStatusProbeTimeoutMs(fallbackMs = 5000) {
   const configured = Number(process.env.TEAMCLAUDE_STATUS_PROBE_TIMEOUT_MS);
   if (!Number.isFinite(configured) || configured <= 0) return fallbackMs;
   return Math.min(30_000, Math.max(250, Math.floor(configured)));
@@ -1826,7 +1833,7 @@ async function findRunningServer(
   const state = await readServerState();
   const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
     ? Math.max(0, Math.floor(maxProbeWaitMs))
-    : 1500);
+    : 5000);
 
   // Try the port the server ACTUALLY bound (recorded in the state file) first —
   // it may differ from the current config port after the config was edited, and
