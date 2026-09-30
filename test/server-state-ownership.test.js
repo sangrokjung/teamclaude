@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdtemp, mkdir, rm, symlink, writeFile, readFile, access } from 'node:fs/promises';
+import { chmod, cp, mkdtemp, mkdir, rm, symlink, writeFile, readFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -174,3 +174,73 @@ test('lifecycle identity accepts a server launched through an absolute symlink e
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('lifecycle identity rejects a different installation even with the same package name', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamcodex-installed-lifecycle-'));
+  const installedSrc = join(dir, 'teamcodex', 'src');
+  await cp(dirname(cliPath), installedSrc, { recursive: true });
+  await writeFile(join(dir, 'teamcodex', 'package.json'), JSON.stringify({ type: 'module' }));
+  const installedEntry = join(installedSrc, 'index.js');
+  const port = await unusedPort();
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9', activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [installedEntry, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => status(port), 'installed proxy did not start');
+    await waitUntil(() => lifecycleStateReady(configPath, child.pid), 'installed state was not written');
+    const result = spawnSync(process.execPath, [cliPath, 'status'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /lifecycle identity unverified/);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [serverName, clientName] of [['index.js', 'teamclaude.js'], ['teamclaude.js', 'index.js']]) {
+  test(`${clientName} reloads accounts in a daemon started by ${serverName}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'teamclaude-entry-reload-'));
+    const port = await unusedPort();
+    const configPath = join(dir, 'config.json');
+    const statePath = join(dir, 'config.server.json');
+    await writeFile(configPath, JSON.stringify({
+      proxy: { port, apiKey: 'tc-test' },
+      upstream: 'http://127.0.0.1:9', activeWarmup: false,
+      accounts: [{ name: 'parked', type: 'apikey', apiKey: 'test-api-key', enabled: false }],
+    }));
+    const env = {
+      ...process.env,
+      TEAMCLAUDE_PROVIDER: 'anthropic',
+      TEAMCLAUDE_CONFIG: configPath,
+    };
+    const serverEntry = join(dirname(cliPath), serverName);
+    const clientEntry = join(dirname(cliPath), clientName);
+    const child = spawn(process.execPath, [serverEntry, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      await waitUntil(() => status(port), 'proxy did not start');
+      await waitUntil(() => lifecycleStateReady(configPath, child.pid), 'state was not written');
+      const before = JSON.parse(await readFile(statePath, 'utf8'));
+      const result = spawnSync(process.execPath, [clientEntry, 'enable', 'parked'], {
+        env, encoding: 'utf8', timeout: 10000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /Applied to the running server without restarting/);
+      await waitUntil(async () => {
+        const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`);
+        const body = await response.json();
+        return body.accounts[0]?.enabled === true;
+      }, 'account was saved but not applied to the live worker');
+      const after = JSON.parse(await readFile(statePath, 'utf8'));
+      assert.equal(after.pid, before.pid);
+      assert.equal(after.workerPid, before.workerPid);
+    } finally {
+      await stopChild(child);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
