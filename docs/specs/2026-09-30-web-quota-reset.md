@@ -6,7 +6,8 @@ Intent: ../intents/2026-09-30-web-quota-reset.md
 완전 측정된 소진 계정도 외부 리셋 후 최소 probe를 통해 자동 복귀한다.
 
 ## Non-goals
-기존 PR #41의 snapshot provisional 정책, 인증 수정, 실제 리셋권 소비, Codex 변경.
+인증 정책 변경, 실제 리셋권 소비, Codex reset 정책 변경, 별도 quota reserve 기능.
+기본 브랜치 이식은 PR #41의 snapshot provisional 정책과 PR #44의 재측정을 함께 포함한다.
 
 ## Acceptance
 - 정상 template 확보·복원 직후와 기존 warm-up 주기(기본 5분)에 소진 계정을 재측정한다.
