@@ -1779,7 +1779,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     };
     staleRecheckTemplate = restoredStale && typeof restoredStale === 'object'
       && modelQuotaLabel(restoredStale.model)
-      ? { ...restoredStale, _restored: true }
+      ? {
+          model: restoredStale.model,
+          version: typeof restoredStale.version === 'string' && restoredStale.version ? restoredStale.version : '2023-06-01',
+          beta: typeof restoredStale.beta === 'string' && restoredStale.beta ? restoredStale.beta : null,
+          system: restoredStale.system ?? null,
+          _elicitsModelWeekly: restoredStale._elicitsModelWeekly === true,
+          _restored: true,
+        }
       : (modelQuotaLabel(probeTemplate.model) ? probeTemplate : null);
     setImmediate(() => {
       warmupUnmeasured();

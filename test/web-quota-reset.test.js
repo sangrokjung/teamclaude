@@ -172,6 +172,20 @@ test('web reset: disabled, errored, busy, revoked and expired accounts are not p
   assert.equal(seen.length, 0);
 });
 
+test('web reset: model recheck template survives a serialized restart', async t => {
+  const { manager, proxy, seen } = await fixture(t, { config: { warmupIntervalMs: 0 } });
+  manager.updateQuota(0, headers(0));
+  manager.accounts[0].quota.modelWeekly['7d_oi'] = { utilization: 1, reset: Date.now() + 3600000 };
+  const snapshot = JSON.parse(JSON.stringify({
+    model: 'claude-sonnet-5', version: template.version,
+    _staleRecheckTemplate: template,
+  }));
+  proxy.importProbeTemplate(snapshot);
+  await waitFor(() => seen.length === 1);
+  assert.equal(seen[0].body.model, template.model);
+  await waitFor(() => manager.accounts[0].quota.modelWeekly['7d_oi']?.utilization === 0);
+});
+
 test('web reset: activeWarmup false and close stop background probes', async t => {
   const disabled = await fixture(t, { config: { activeWarmup: false } });
   assert.equal(disabled.proxy.importProbeTemplate(template), false);
