@@ -425,7 +425,6 @@ test('stalled unsafe retry returns 502 so a 429 retry cannot duplicate its side 
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 70,
-    continuityMinDispatchMs: 1,
     continuityMaxSleepMs: 10,
     continuityJitterMs: 0,
     upstreamResponseTimeoutMs: 120,
@@ -518,14 +517,18 @@ test('expired continuity deadline returns saved 429 without another unsafe upstr
   }
 });
 
-test('cooldown beyond continuity budget returns saved 429 without an unsafe edge dispatch', async (t) => {
+test('unsafe edge dispatch keeps its full upstream timeout and returns the upstream answer', async (t) => {
   const startedAt = Date.now();
   let now = startedAt;
   t.mock.method(Date, 'now', () => now);
   let upstreamHits = 0;
-  const upstream = http.createServer((_req, res) => {
+  let edgeBudgetMs;
+  const upstream = http.createServer(async (_req, res) => {
     upstreamHits++;
     if (upstreamHits > 1) {
+      edgeBudgetMs = startedAt + 35 - Date.now();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      now = startedAt + 93;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ accepted: true }));
       return;
@@ -548,6 +551,7 @@ test('cooldown beyond continuity budget returns saved 429 without an unsafe edge
     continuityMaxWaitMs: 35,
     continuityMaxSleepMs: 100,
     continuityJitterMs: 0,
+    upstreamResponseTimeoutMs: 1000,
     rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);
@@ -559,11 +563,13 @@ test('cooldown beyond continuity budget returns saved 429 without an unsafe edge
       body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
       signal: AbortSignal.timeout(1000),
     });
-    assert.equal(res.status, 429);
-    assert.deepEqual(await res.json(), { type: 'error', upstreamAttempt: 1 });
-    assert.equal(res.headers.get('x-upstream-attempt'), '1');
-    assert.equal(upstreamHits, 1, 'a cooldown that outlasts the deadline must not dispatch another POST');
-    assert.equal(tokenChecks, 2, 'the common guard must stop dispatch after token preparation');
+    assert.equal(res.status, 200,
+      'a dispatch that starts before the deadline must receive the upstream answer');
+    assert.deepEqual(await res.json(), { accepted: true });
+    assert.equal(res.headers.get('x-upstream-attempt'), null);
+    assert.equal(upstreamHits, 2, 'the edge dispatch must be admitted before the deadline');
+    assert.equal(edgeBudgetMs, 2, 'only 2ms of continuity budget must remain at dispatch');
+    assert.equal(tokenChecks, 2, 'the edge dispatch must follow token preparation');
     assert.equal(am.accounts[0].inflight, 0);
   } finally {
     proxy.close();

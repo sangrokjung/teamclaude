@@ -281,14 +281,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const continuityMaxSleepMs = Number.isFinite(config.continuityMaxSleepMs)
     ? Math.max(10, config.continuityMaxSleepMs)
     : 30_000;
-  const configuredContinuityMinDispatchMs = Number.isFinite(config.continuityMinDispatchMs)
-    ? Math.max(0, config.continuityMinDispatchMs)
-    : 1000;
-  // Cap the unsafe retry floor at half the budget so short deadlines can recover.
-  const continuityMinDispatchMs = Math.min(
-    configuredContinuityMinDispatchMs,
-    Math.floor(continuityMaxWaitMs / 2),
-  );
   const continuityJitterMs = Number.isFinite(config.continuityJitterMs)
     ? Math.max(0, config.continuityJitterMs)
     : 500;
@@ -338,7 +330,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     rateLimitFailovers,
     maxWaitMs: continuityMaxWaitMs,
     maxSleepMs: continuityMaxSleepMs,
-    minDispatchMs: continuityMinDispatchMs,
     deferMs(milliseconds) {
       const delay = Math.min(Math.max(10, milliseconds), continuityMaxSleepMs);
       globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + delay);
@@ -2296,7 +2287,6 @@ function nextModelFallback(ctx, req, body) {
     if (typeof target?.model !== 'string') return null;
     target.model = next;
     const newBody = Buffer.from(JSON.stringify(json));
-    // Keep last429 across rewrites: it preserves the last rejection and guards unsafe edge dispatch.
     if (req.headers['content-length'] != null) {
       req.headers['content-length'] = String(newBody.length);
     }
@@ -2785,9 +2775,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const continuityRemainingMs = ctx.continuityDeadlineAt == null
     ? null
     : Math.max(0, ctx.continuityDeadlineAt - Date.now());
-  if (continuityRemainingMs != null && (continuityRemainingMs <= 1
-      || (!replaySafe && ctx.last429 != null
-        && continuityRemainingMs < ctx.continuity.minDispatchMs))) {
+  if (continuityRemainingMs != null && continuityRemainingMs <= 1) {
     try {
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       if (sendSaved429(res, ctx)) return;
@@ -2797,7 +2785,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       logSections.release();
     }
   }
-  const continuityBoundedTimeout = continuityRemainingMs != null
+  // Unsafe requests may already have side effects, so give an admitted dispatch its full upstream timeout.
+  const continuityBoundedTimeout = replaySafe && continuityRemainingMs != null
     && continuityRemainingMs <= ctx.upstreamResponseTimeoutMs;
   const upstreamDeadline = createUpstreamDeadline(
     ctx.abortSignal,

@@ -850,7 +850,6 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `maxBufferedRequestBytes` | Total request-buffer memory budget used to cap admission before buffering; supervised requests count both supervisor and worker copies (optional, default `268435456` = 256 MiB) |
 | `continuityMaxWaitMs` | Total continuity deadline for internally recovering quota and transient/global 429 responses (optional, default `900000` = 15 minutes) |
 | `continuityMaxSleepMs` | Maximum interval between continuity recovery probes (optional, default `30000` = 30 seconds) |
-| `continuityMinDispatchMs` | Minimum remaining continuity budget to dispatch an unsafe retry after a saved 429; the effective floor is `min(configured value, floor(continuityMaxWaitMs / 2))` so short budgets can recover. Below this floor, return the saved 429 without dispatch (optional, default `1000` = 1 second; `0` retains the existing 1 ms cutoff). GET/HEAD/OPTIONS and already-dispatched unsafe timeouts are unchanged |
 | `rateLimitFailovers` | Alternate accounts tried before treating a non-quota 429 as global (optional, default `1`) |
 | `accounts[].enabled` | Set `false` to exclude the account from rotation (optional, default `true`) |
 | `accounts[].priority` | Explicit selection rank (lower = preferred first; optional — unset means automatic use-or-lose ordering) |
