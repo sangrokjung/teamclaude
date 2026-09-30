@@ -205,6 +205,7 @@ test('single-account bare 429 recovers on Fable without Opus fallback', async ()
     modelFallbacks: { 'claude-fable-5': ['claude-opus-4-8'] },
     continuityMode: true,
     continuityMaxWaitMs: 250,
+    continuityMinDispatchMs: 1,
     continuityMaxSleepMs: 10,
     continuityJitterMs: 0,
     rateLimitFailovers: 0,

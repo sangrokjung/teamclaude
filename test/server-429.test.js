@@ -300,6 +300,7 @@ test('continuity deadline recovers after the legacy overload retry limit', async
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 250,
+    continuityMinDispatchMs: 1,
     rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);
@@ -425,6 +426,7 @@ test('stalled unsafe retry returns 502 so a 429 retry cannot duplicate its side 
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 70,
+    continuityMinDispatchMs: 1,
     continuityMaxSleepMs: 10,
     continuityJitterMs: 0,
     upstreamResponseTimeoutMs: 120,
@@ -517,6 +519,59 @@ test('expired continuity deadline returns saved 429 without another unsafe upstr
   }
 });
 
+test('cooldown beyond continuity budget returns saved 429 without an unsafe edge dispatch', async (t) => {
+  const startedAt = Date.now();
+  let now = startedAt;
+  t.mock.method(Date, 'now', () => now);
+  let upstreamHits = 0;
+  const upstream = http.createServer((_req, res) => {
+    upstreamHits++;
+    if (upstreamHits > 1) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ accepted: true }));
+      return;
+    }
+    res.writeHead(429, {
+      'retry-after': '60',
+      'content-type': 'application/json',
+      'x-upstream-attempt': String(upstreamHits),
+    });
+    res.end(JSON.stringify({ type: 'error', upstreamAttempt: upstreamHits }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  let tokenChecks = 0;
+  am.ensureTokenFresh = async () => {
+    tokenChecks++;
+    if (tokenChecks === 2) now = startedAt + 33;
+  };
+  const proxy = startContinuityProxy(am, upstreamPort, {
+    continuityMaxWaitMs: 35,
+    continuityMaxSleepMs: 100,
+    continuityJitterMs: 0,
+    rateLimitFailovers: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(res.status, 429);
+    assert.deepEqual(await res.json(), { type: 'error', upstreamAttempt: 1 });
+    assert.equal(res.headers.get('x-upstream-attempt'), '1');
+    assert.equal(upstreamHits, 1, 'a cooldown that outlasts the deadline must not dispatch another POST');
+    assert.equal(tokenChecks, 2, 'the common guard must stop dispatch after token preparation');
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('normal inference time before the first 429 does not consume the continuity deadline', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
@@ -535,6 +590,7 @@ test('normal inference time before the first 429 does not consume the continuity
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
   const proxy = startContinuityProxy(am, upstreamPort, {
     continuityMaxWaitMs: 55,
+    continuityMinDispatchMs: 1,
     rateLimitFailovers: 0,
   });
   const proxyPort = await listen(proxy);

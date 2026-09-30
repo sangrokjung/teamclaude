@@ -281,6 +281,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const continuityMaxSleepMs = Number.isFinite(config.continuityMaxSleepMs)
     ? Math.max(10, config.continuityMaxSleepMs)
     : 30_000;
+  // Leave at least a second for an unsafe retry, rather than dispatching at
+  // the deadline edge. Tiny-budget tests can explicitly lower this floor.
+  const continuityMinDispatchMs = Number.isFinite(config.continuityMinDispatchMs)
+    ? Math.max(0, config.continuityMinDispatchMs)
+    : 1000;
   const continuityJitterMs = Number.isFinite(config.continuityJitterMs)
     ? Math.max(0, config.continuityJitterMs)
     : 500;
@@ -330,6 +335,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     rateLimitFailovers,
     maxWaitMs: continuityMaxWaitMs,
     maxSleepMs: continuityMaxSleepMs,
+    minDispatchMs: continuityMinDispatchMs,
     deferMs(milliseconds) {
       const delay = Math.min(Math.max(10, milliseconds), continuityMaxSleepMs);
       globalCooldownUntil = Math.max(globalCooldownUntil, Date.now() + delay);
@@ -2775,7 +2781,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const continuityRemainingMs = ctx.continuityDeadlineAt == null
     ? null
     : Math.max(0, ctx.continuityDeadlineAt - Date.now());
-  if (continuityRemainingMs != null && continuityRemainingMs <= 1) {
+  if (continuityRemainingMs != null && (continuityRemainingMs <= 1
+      || (!replaySafe && ctx.last429 != null
+        && continuityRemainingMs < ctx.continuity.minDispatchMs))) {
     try {
       if (ctx.abortSignal?.aborted || res.destroyed) return;
       if (sendSaved429(res, ctx)) return;

@@ -350,6 +350,7 @@ export function createDefaultConfig() {
     continuityMode: true,
     continuityMaxWaitMs: DEFAULT_CONTINUITY_MAX_WAIT_MS,
     continuityMaxSleepMs: 30000,
+    continuityMinDispatchMs: 1000,
     continuityJitterMs: 500,
     // Maximum buffered upstream response per request. Transactional SSE spills
     // to disk after 1 MiB; non-SSE and OAuth responses remain memory-bounded.
