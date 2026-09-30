@@ -172,7 +172,7 @@ TeamClaude와 TeamCodex는 클라이언트가 항상 동일한 로컬 주소를 
 - **모델 fallback** — 캐시에 기록된 general-available 계정이 모두 해당 모델에서 fresh-full이거나, labeled model-tier 429가 실시간으로 eligible 계정 전체에서 확인되면 대체 모델로 전환합니다. Claude Code advisor 요청은 root `tools[]`의 `advisor_*` 항목에 있는 중첩 모델을 기준으로 라우팅하며, fallback도 top-level executor가 아닌 해당 중첩 `model`만 바꿉니다. label 없는 global 429와 단순 local cap·동시성 queue는 모델을 바꾸지 않습니다.
 - **BYOK 표면 (fork 전용)** — `/byok` 경로 prefix를 켜면 "자기 키를 넣어 쓰는" 서드파티 클라이언트(에디터 플러그인, AI 브라우저, 자체 스크립트)도 이 풀을 쓸 수 있습니다. 프록시는 업스트림이 1차 클라이언트에게 요구하는 형태로 요청을 맞춰 주고 거부 대상 브라우저 헤더를 뗍니다. 그동안에도 `/v1/*`로 오는 Claude Code 트래픽은 바이트 단위로 그대로입니다. 설정하지 않으면 꺼진 상태이니 켜기 전에 이용약관 절을 읽으십시오.
 - **실시간 TUI** — 계정 상태, 세션·주간 사용량, 초기화 시간, CPU·RAM을 표시합니다.
-- **계정 수동 제어** — enable, disable, switch, priority 순서를 CLI와 TUI에서 변경할 수 있습니다.
+- **계정 수동 제어** — enable, disable, switch, priority 순서를 CLI와 TUI에서 변경할 수 있습니다. 비활성화한 계정은 `teamclaude login`으로 다시 로그인하면 함께 켜지고, `teamclaude import`로 파일에서 다시 가져오면 비활성 상태를 유지한 채 경고를 띄웁니다.
 - **재시작 후 상태 복원** — 사용량과 throttle 상태를 별도 quota 파일에 저장합니다.
 - **Active warm-up** — 실제 요청 형식을 재사용한 최소 요청으로 계정별 사용량을 빠르게 측정합니다.
 - **OAuth 자동 갱신** — 만료가 가까운 인증 정보를 갱신하고, 유휴·비활성 계정도 주기 스윕으로 갱신해 refresh 체인이 끊기지 않게 합니다.
