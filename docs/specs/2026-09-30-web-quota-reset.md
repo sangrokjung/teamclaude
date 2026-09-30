@@ -14,6 +14,10 @@ Intent: ../intents/2026-09-30-web-quota-reset.md
 - disabled/error/auth-revoked/subscription-disabled/inflight/이미 probe 중인 계정은 제외한다.
 - 기존 token refresh 소유권과 activeWarmup:false, startup-only 설정을 유지한다.
 - account별 최소 1분, 기본 5분 간격으로 probe를 제한하고 종료 후 전송하지 않는다.
+- 저장된 template 모델의 modelWeekly 전용 소진도 재확인한다. 다른 모델 template로 그 제한을 임의 해제하지 않는다.
+- 미래 rateLimitedUntil은 존중하며 만료 후 다음 warm-up 주기에 재확인한다.
+- 복원된 모델 전용 template은 하위 모델의 새 template으로 교체되어도 재확인용으로 보존한다. 일반 quota는 최신 template으로 재측정한다.
+- 보존 template은 quota snapshot에도 함께 저장해 재시작 후에도 모델별 재확인을 이어간다.
 
 ## Plan / Test
 1. 로컬 HTTP fixture로 live/stored 100% → 외부 0% 재현 테스트를 먼저 작성한다.
@@ -25,4 +29,18 @@ Intent: ../intents/2026-09-30-web-quota-reset.md
 운영 원본 파일을 백업하고 인증 drain 뒤 server.js만 교체한다. 문제가 있으면 백업본을 복원하고 같은 절차로 재시작한다.
 
 ## Verification
-진행 중.
+PR #41 병합 완료(9560285). 기존 5개 웹 리셋 회귀와 provisional/부분 측정 관련 표적 7개 통과.
+
+추가 적대 조사에서 modelWeekly 전용 소진 누락과 미래 throttle 중 probe 가능성을 발견해 보완했다. 모델 일치·불일치 및 throttle 유지·만료 회귀를 추가했다.
+
+2026-09-30 최초 Claude Opus 호출은 실제 `All 17 accounts exhausted` 응답으로 실패했다. Codex 보조 검토 후 격리 canary에서 실제 재측정으로 가용 계정 0→2 복귀를 확인했다. CLI wrapper가 canary 주소를 덮어써 같은 장애로 재호출되는 문제를 확인하고 기존 vendor 실행 파일과 인증으로 Opus 검증을 수행했다.
+
+Opus는 복원된 Fable template이 하위 모델로 교체될 때 modelWeekly 재확인이 사라지는 경로를 지적했다. 해당 template을 메모리에 별도 보존하고 회귀 테스트를 추가했다. 최신 교차 검증/운영 반영은 아래 실행 기록으로 갱신한다.
+
+### 최종 실행 기록 (2026-09-30)
+- 코드 HEAD `aab2ecc`: 웹 리셋 회귀 11/11, ESLint, 구문 검사, diff 검사 통과. 별도 build 단계 없음. 전체 suite PASS는 주장하지 않는다(기존 전체 실행 실패/timeout).
+- Claude Opus 실제 실행(`claude-opus-5-5`, exit 0, is_error=false): 모델 template 보존 및 운영 최소 후보 APPROVE, 마지막 영속화 보완도 APPROVE. 초기 실패 시 Codex 보조 검토를 사용했으나 최종 승인은 Claude가 수행했다.
+- 운영 설치본의 `src/server.js`만 백업 후 교체. SHA256 `66ea858be5a45b535e9b07d78625f7ba0f5f639de6582a62e16f415a4afd333a`. PR 전체 소스를 덮어쓰지 않고 기존 운영 기능을 유지했다.
+- drain activeRequests=0 후 listener/launchd PID `10882` 일치, 총 17개 중 가용 0→2 복구, 두 계정 weekly=0 확인.
+- 운영 `POST /v1/messages` 실제 QA: HTTP 200, model `claude-opus-5-5`, text `OK`.
+- 후속 PR: https://github.com/sangrokjung/teamclaude/pull/44 (PR #41과 동일 base).
