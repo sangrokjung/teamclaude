@@ -3257,7 +3257,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       logSections.release();
     }
   }
-  const continuityBoundedTimeout = continuityRemainingMs != null
+  // Unsafe requests may already have side effects, so give an admitted dispatch its full upstream timeout.
+  const continuityBoundedTimeout = replaySafe && continuityRemainingMs != null
     && continuityRemainingMs <= ctx.upstreamResponseTimeoutMs;
   const upstreamDeadline = createUpstreamDeadline(
     ctx.abortSignal,

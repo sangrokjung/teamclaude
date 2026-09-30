@@ -562,6 +562,66 @@ test('expired continuity deadline returns saved 429 without another unsafe upstr
   }
 });
 
+test('unsafe edge dispatch keeps its full upstream timeout and returns the upstream answer', async (t) => {
+  const startedAt = Date.now();
+  let now = startedAt;
+  t.mock.method(Date, 'now', () => now);
+  let upstreamHits = 0;
+  let edgeBudgetMs;
+  const upstream = http.createServer(async (_req, res) => {
+    upstreamHits++;
+    if (upstreamHits > 1) {
+      edgeBudgetMs = startedAt + 35 - Date.now();
+      await new Promise(resolve => setTimeout(resolve, 60));
+      now = startedAt + 93;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ accepted: true }));
+      return;
+    }
+    res.writeHead(429, {
+      'retry-after': '60',
+      'content-type': 'application/json',
+      'x-upstream-attempt': String(upstreamHits),
+    });
+    res.end(JSON.stringify({ type: 'error', upstreamAttempt: upstreamHits }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  let tokenChecks = 0;
+  am.ensureTokenFresh = async () => {
+    tokenChecks++;
+    if (tokenChecks === 2) now = startedAt + 33;
+  };
+  const proxy = startContinuityProxy(am, upstreamPort, {
+    continuityMaxWaitMs: 35,
+    continuityMaxSleepMs: 100,
+    continuityJitterMs: 0,
+    upstreamResponseTimeoutMs: 1000,
+    rateLimitFailovers: 0,
+  });
+  const proxyPort = await listen(proxy);
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [] }),
+      signal: AbortSignal.timeout(1000),
+    });
+    assert.equal(res.status, 200,
+      'a dispatch that starts before the deadline must receive the upstream answer');
+    assert.deepEqual(await res.json(), { accepted: true });
+    assert.equal(res.headers.get('x-upstream-attempt'), null);
+    assert.equal(upstreamHits, 2, 'the edge dispatch must be admitted before the deadline');
+    assert.equal(edgeBudgetMs, 2, 'only 2ms of continuity budget must remain at dispatch');
+    assert.equal(tokenChecks, 2, 'the edge dispatch must follow token preparation');
+    assert.equal(am.accounts[0].inflight, 0);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 test('continuity dispatch grace preserves a saved 429 before an unsafe retry starts', async () => {
   let upstreamHits = 0;
   const upstream = http.createServer((_req, res) => {
