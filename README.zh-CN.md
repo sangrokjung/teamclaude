@@ -164,7 +164,7 @@ AI 编程订阅的会话限额和每周限额按账户分别计算。某个账�
 - **模型 fallback** — 当缓存中的 general-available 账户对该模型全部 fresh-full，或实时 labeled model-tier 429 已覆盖所有 eligible 账户时切换到备用模型。Claude Code advisor 请求以 root `tools[]` 中 `advisor_*` 项的嵌套模型作为路由依据，fallback 也只改写该嵌套 `model`，不会改动 top-level executor；无 label 的 global 429、local cap 或并发 queue 都不会更换模型。
 - **BYOK 表面（本 fork 独有）** — 开启 `/byok` 路径前缀后，支持"自带 key"的第三方客户端（编辑器插件、AI 浏览器、你自己的脚本）也能使用这个池子。代理会把请求整形成上游对一方客户端所要求的形状，并去掉会被拒绝的浏览器上下文头，而走 `/v1/*` 的 Claude Code 流量字节完全不变。不配置就是关闭状态，启用前请先读使用条款一节。
 - **实时 TUI** — 显示账户状态、会话与每周用量、重置时间以及 CPU、内存。
-- **手动账户控制** — 通过 CLI 或 TUI 执行 enable、disable、switch 和 priority。
+- **手动账户控制** — 通过 CLI 或 TUI 执行 enable、disable、switch 和 priority。已禁用的账户用 `teamclaude login` 重新登录后会一并重新启用；用 `teamclaude import` 从文件重新导入时则保持禁用，并给出警告。
 - **重启后恢复状态** — 将用量和 throttle 状态保存在独立的 quota 文件中。
 - **Active warm-up** — 复用真实请求格式，以最小请求快速测量各账户的用量。
 - **OAuth 自动刷新** — 自动刷新即将过期的认证信息，并通过后台定期扫描刷新闲置和已禁用账户，避免 refresh 链失效。
