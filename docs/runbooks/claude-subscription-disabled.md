@@ -37,6 +37,8 @@ TeamClaude는 이 exact error code를 반환한 OAuth account만 `error`로 격�
 - 조직 정책이 수정된 뒤 해당 account를 `teamclaude import` 또는 `teamclaude login`으로 다시 검증합니다.
 - 조직 접근 차단으로 격리된 account는 이미 로테이션에서 빠져 있으므로 `teamclaude disable`을 추가로 걸 필요가 없습니다. `disable`은 격리 해제와 별개로 남아서, 조직 정책이 풀려도 그 account를 계속 제외합니다.
 - `disable`한 account는 `teamclaude login`으로 다시 로그인하면 함께 다시 켜집니다. `teamclaude import`는 disable을 유지하고 경고만 출력하므로 `teamclaude enable <name>`을 따로 실행합니다.
+- 기존 계정은 `teamclaude reauth <name>`으로 복구할 수 있습니다. 동일 계정 인증이 성공하면 기존 disable과 조직 차단 표시를 해제합니다. 취소·인증 불일치 시에는 유지하고, 로그인 중 새로 추가된 disable/격리는 덮어쓰지 않습니다.
+- `active` 표시만으로 복구 완료를 판단하지 않습니다. 새 토큰 저장과 서버 반영 후 실제 요청을 확인합니다. `refresh-failed`이면 해당 계정의 브라우저 재인증이 필요하며, 조직 권한이 여전히 거부되면 다시 격리됩니다.
 - API key 자동 전환이나 source Claude config 수정은 하지 않습니다.
 
 ## 재발 확인

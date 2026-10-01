@@ -44,6 +44,133 @@ const freshResult = {
   },
 };
 
+for (const parked of [
+  { enabled: false },
+  { subscriptionDisabled: true },
+  { enabled: false, subscriptionDisabled: true },
+]) {
+  test(`explicit reauth restores a parked account: ${JSON.stringify(parked)}`, async () => {
+    const config = fixture(parked);
+    config.accounts.push({ name: 'other', type: 'apikey', apiKey: 'fixture-only', enabled: false });
+    const otherBefore = structuredClone(config.accounts[1]);
+    const result = await reauthenticateAccount({
+      name: 'broken@example.com',
+      expectedAccountUuid: 'uuid-broken',
+      loadConfig: async () => structuredClone(config),
+      login: async () => freshResult.credentials,
+      fetchProfile: async () => freshResult.profile,
+      atomicUpdate: async updater => { updater(config); return config; },
+    });
+    assert.notEqual(result.updated.enabled, false);
+    assert.equal(result.updated.subscriptionDisabled, undefined);
+    assert.equal(result.updated.accessToken, 'new-access');
+    assert.equal(result.updated.priority, 2);
+    assert.equal(result.updated.maxConcurrent, 4);
+    assert.equal(result.updated.importFrom, undefined);
+    assert.deepEqual(config.accounts[1], otherBefore);
+    const am = new AccountManager([result.updated]);
+    assert.equal(am.getStatus().accounts[0].usable, true);
+    assert.equal(am.getActiveAccount().name, 'broken@example.com');
+  });
+}
+
+for (const newGate of [{ enabled: false }, { subscriptionDisabled: true }]) {
+  test(`reauth preserves a new gate applied during OAuth: ${JSON.stringify(newGate)}`, async () => {
+    const config = fixture();
+    let beforeWrite;
+    await assert.rejects(() => reauthenticateAccount({
+      name: 'broken@example.com',
+      expectedAccountUuid: 'uuid-broken',
+      loadConfig: async () => structuredClone(config),
+      login: async () => {
+        Object.assign(config.accounts[0], newGate);
+        beforeWrite = structuredClone(config);
+        return freshResult.credentials;
+      },
+      fetchProfile: async () => freshResult.profile,
+      atomicUpdate: async updater => { updater(config); return config; },
+    }), /during re-authentication/);
+    assert.deepEqual(config, beforeWrite);
+  });
+}
+
+for (const failure of ['cancelled', 'incomplete', 'wrong-account']) {
+  test(`parked account stays unchanged when reauth is ${failure}`, async () => {
+    const config = fixture({ enabled: false, subscriptionDisabled: true });
+    const before = structuredClone(config);
+    let writes = 0;
+    await assert.rejects(() => reauthenticateAccount({
+      name: 'broken@example.com',
+      expectedAccountUuid: 'uuid-broken',
+      loadConfig: async () => structuredClone(config),
+      login: async () => {
+        if (failure === 'cancelled') throw new Error('cancelled');
+        return failure === 'incomplete' ? {} : freshResult.credentials;
+      },
+      fetchProfile: async () => ({ accountUuid: 'wrong-account', email: 'other@example.com' }),
+      atomicUpdate: async updater => { writes++; updater(config); return config; },
+    }), /cancelled|incomplete|does not match/);
+    assert.equal(writes, 0);
+    assert.deepEqual(config, before);
+  });
+}
+
+for (const profileUuid of ['uuid-broken', 'uuid-other']) {
+  test(`Anthropic reauth CLI verifies parked account identity: ${profileUuid}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'teamclaude-parked-cli-'));
+    const configPath = join(dir, 'config.json');
+    const preload = join(dir, 'oauth-fixture.cjs');
+    const config = fixture({ enabled: false, subscriptionDisabled: true });
+    config.proxy = { port: 1 };
+    try {
+      await writeFile(configPath, JSON.stringify(config));
+      const before = await readFile(configPath);
+      await writeFile(preload, `
+        const cp = require('node:child_process');
+        const nativeFetch = globalThis.fetch;
+        cp.exec = (command) => {
+          const auth = new URL(JSON.parse(command.slice(command.indexOf(' ') + 1)));
+          const callback = new URL(auth.searchParams.get('redirect_uri'));
+          callback.searchParams.set('code', 'fixture-code');
+          callback.searchParams.set('state', auth.searchParams.get('state'));
+          nativeFetch(callback, { redirect: 'manual' }).catch(() => process.exit(2));
+        };
+        require('node:module').syncBuiltinESMExports();
+        globalThis.fetch = async (url) => {
+          if (String(url) === 'https://platform.claude.com/v1/oauth/token') {
+            return Response.json({ access_token: 'fixture-fresh', refresh_token: 'fixture-refresh', expires_in: 3600 });
+          }
+          if (String(url) === 'https://api.anthropic.com/api/oauth/profile') {
+            return Response.json({ account: { uuid: ${JSON.stringify(profileUuid)}, email: 'broken@example.com' } });
+          }
+          throw new Error('Unexpected network request in CLI fixture');
+        };
+      `);
+      const result = spawnSync(process.execPath, [
+        '--require', preload, entry, 'reauth', 'broken@example.com', '--account-uuid', 'uuid-broken',
+      ], {
+        encoding: 'utf8', timeout: 10000,
+        env: { ...anthropicEnv, TEAMCLAUDE_CONFIG: configPath },
+      });
+      if (profileUuid === 'uuid-other') {
+        assert.equal(result.status, 1, result.stderr);
+        assert.match(result.stderr, /does not match/);
+        assert.deepEqual(await readFile(configPath), before);
+      } else {
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /Re-authenticated account/);
+        const saved = JSON.parse(await readFile(configPath));
+        assert.equal(saved.accounts[0].accountUuid, 'uuid-broken');
+        assert.equal(saved.accounts[0].accessToken, 'fixture-fresh');
+        assert.notEqual(saved.accounts[0].enabled, false);
+        assert.equal(saved.accounts[0].subscriptionDisabled, undefined);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('reauth updates only the selected OAuth account and preserves routing settings', () => {
   const config = fixture();
   config.accounts.push({
@@ -184,6 +311,7 @@ test('teamcodex codex reauth runs isolated official login and updates only the p
         name: 'codex@example.com', provider: 'codex', type: 'oauth',
         accountUuid: 'codex-account', accountId: 'codex-account',
         accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: 100,
+        enabled: false,
         subscriptionCancellation: {
           status: 'scheduled', recordedAt: '2026-09-01T00:00:00.000Z', endsAt: null,
         },
@@ -216,6 +344,7 @@ test('teamcodex codex reauth runs isolated official login and updates only the p
     const saved = JSON.parse(await readFile(configPath, 'utf8'));
     assert.equal(saved.accounts[0].refreshToken, 'new-refresh');
     assert.equal(saved.accounts[0].accountId, 'codex-account');
+    assert.notEqual(saved.accounts[0].enabled, false);
     assert.deepEqual(saved.accounts[0].subscriptionCancellation, config.accounts[0].subscriptionCancellation);
     assert.deepEqual(saved.accounts[1], config.accounts[1]);
   } finally {
