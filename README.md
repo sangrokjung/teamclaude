@@ -745,10 +745,11 @@ teamcodex reauth user@example.com
 The command verifies that the returned identity matches the selected UUID (or
 the email on legacy name-only entries) and only then replaces that account's
 tokens. Codex uses the official CLI in a throwaway `CODEX_HOME`; Anthropic uses
-its OAuth flow. Cancellation, profile mismatch, a disabled
-account, or an account whose organization access is blocked leaves the config
-unchanged. A running proxy is reloaded without interrupting active connections
-when supported; otherwise the CLI tells you to run `teamcodex restart`.
+its OAuth flow. Successful explicit reauthentication clears an existing manual
+disable and organization-access quarantine. Cancellation, profile mismatch,
+incomplete credentials, or a new disable/quarantine applied during OAuth leaves
+the config unchanged. A running proxy is reloaded without interrupting active
+connections when supported; otherwise the CLI tells you to run `teamcodex restart`.
 If the account was originally imported from a credential file, a successful
 reauthentication detaches that stale `importFrom` source so reload/restart keeps
 the newly verified tokens.

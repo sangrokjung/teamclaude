@@ -49,10 +49,6 @@ export function findReauthTarget(config, {
       || (account.provider && account.provider !== resolvedProvider)) {
     throw new Error(`Account "${name}" is not a ${resolvedProvider} OAuth account`);
   }
-  if (account.enabled === false) throw new Error(`Account "${name}" is disabled`);
-  if (account.subscriptionDisabled === true) {
-    throw new Error(`Account "${name}" has organization access disabled`);
-  }
   return { index, account, provider: resolvedProvider };
 }
 
@@ -62,11 +58,18 @@ export function applyReauthToConfig(config, {
   provider = null,
   credentials,
   profile,
+  parkedBaseline = null,
 }) {
   const { index, account, provider: resolvedProvider } = findReauthTarget(
     config,
     { name, expectedAccountUuid, provider },
   );
+  if (account.enabled === false && !parkedBaseline?.disabled) {
+    throw new Error(`Account "${name}" was disabled during re-authentication`);
+  }
+  if (account.subscriptionDisabled === true && !parkedBaseline?.organizationDisabled) {
+    throw new Error(`Account "${name}" has organization access disabled during re-authentication`);
+  }
   assertCompleteCredentials(credentials);
   if (!profile || profile.error) {
     throw new Error(`Could not verify the logged-in account${profile?.error ? `: ${profile.error}` : ''}`);
@@ -93,6 +96,8 @@ export function applyReauthToConfig(config, {
     expiresAt: credentials.expiresAt,
     source: 'reauth',
   };
+  if (account.enabled === false) delete updated.enabled;
+  delete updated.subscriptionDisabled;
   for (const field of ['idToken', 'accountId', 'email', 'planType']) {
     if (credentials[field] != null) updated[field] = credentials[field];
   }
@@ -111,6 +116,10 @@ export async function reauthenticateAccount({
 }) {
   const initialConfig = await loadConfig();
   const target = findReauthTarget(initialConfig, { name, expectedAccountUuid, provider });
+  const parkedBaseline = {
+    disabled: target.account.enabled === false,
+    organizationDisabled: target.account.subscriptionDisabled === true,
+  };
   const credentials = await login();
   assertCompleteCredentials(credentials);
   const profile = target.provider === 'codex'
@@ -128,6 +137,7 @@ export async function reauthenticateAccount({
     provider,
     credentials,
     profile,
+    parkedBaseline,
   });
   let updated;
   const savedConfig = await atomicUpdate(config => {
@@ -137,6 +147,7 @@ export async function reauthenticateAccount({
       provider,
       credentials,
       profile,
+      parkedBaseline,
     });
   });
   return { updated, savedConfig };
