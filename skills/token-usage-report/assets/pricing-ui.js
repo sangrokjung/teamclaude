@@ -118,7 +118,7 @@
     });
     document.querySelectorAll('.ins-col').forEach((node, h) => {
       const rows = list(w.hourOfDay).filter(r => r.hour === h);
-      if (!rows.some(r => r.exposureHours > 0)) return;
+      if (!rows.some(r => r.exposureHours > 0 && r.requests > 0)) return;
       node.dataset.tip += ' · ' + costText(rows); node.setAttribute('aria-label', node.dataset.tip);
     });
     document.querySelectorAll('.ins-tc').forEach(node => {
@@ -127,7 +127,7 @@
     });
     document.querySelectorAll('.ins-cell[data-tip]').forEach(node => {
       const match = node.dataset.tip.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}):/);
-      if (match) { node.dataset.tip += ' · ' + costText(list(w.dailyHours).filter(r => r.date === match[1] && r.hour === Number(match[2]))); node.setAttribute('aria-label', node.dataset.tip); }
+      if (match && !node.classList.contains('no-record')) { node.dataset.tip += ' · ' + costText(list(w.dailyHours).filter(r => r.date === match[1] && r.hour === Number(match[2]))); node.setAttribute('aria-label', node.dataset.tip); }
     });
     const evidenceSessions = list(w.sessions).filter(x => matches(x, true)).sort((a, b) => metric(b) - metric(a));
     document.querySelectorAll('#insights tbody').forEach(body => {

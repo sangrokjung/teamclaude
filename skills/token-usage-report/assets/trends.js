@@ -1,6 +1,9 @@
 (() => {
   const originalDraw = window.draw;
   const periodMeta = {
+    '1': { title: '최근 1시간 추이', unit: '5분별', step: 300 },
+    '24': { title: '최근 24시간 추이', unit: '시간별', step: 3600 },
+    '168': { title: '최근 7일 추이', unit: '시간별', step: 3600 },
     '720': { title: '최근 30일 일별 추이', unit: '일별', step: 86400 },
     '8760': { title: '최근 1년 월별 추이', unit: '월별', step: 0 },
   };
@@ -10,6 +13,7 @@
   };
   const dateLabel = ts => new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', month: 'short', day: 'numeric' }).format(new Date(ts * 1000));
   const monthLabel = ts => new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: 'short' }).format(new Date(ts * 1000));
+  const label = ts => H === '8760' ? monthLabel(ts) : H === '720' ? dateLabel(ts) : kst(ts);
   const drawLong = w => {
     const meta = periodMeta[H];
     if (!meta) return originalDraw(w);
@@ -25,7 +29,10 @@
     cursor.setUTCHours(0, 0, 0, 0);
     if (H === '8760') cursor.setUTCDate(1);
     const points = [];
-    while (cursor.getTime() / 1000 - 9 * 3600 <= w.end) {
+    if (Number(H) < 720) {
+      for (let ts = Math.floor(w.start / meta.step) * meta.step; ts <= w.end; ts += meta.step) points.push(by.get(ts) || { ts, Claude: null, Codex: null });
+    }
+    while (Number(H) >= 720 && cursor.getTime() / 1000 - 9 * 3600 <= w.end) {
       const ts = cursor.getTime() / 1000 - 9 * 3600;
       const row = by.get(ts);
       points.push(row || { ts, Claude: null, Codex: null });
@@ -44,17 +51,17 @@
         if (!rows.some(row => row.ts === point.ts && row.vendor === vendor)) { open = false; return; }
         path += (open ? 'L' : 'M') + x(i) + ' ' + y(point[vendor]);
         open = true;
-        svg += '<circle cx="' + x(i) + '" cy="' + y(point[vendor]) + '" r="4" fill="' + C[vendor] + '"><title>' + esc((H === '8760' ? monthLabel(point.ts) : dateLabel(point.ts)) + ' · ' + vendor + ' · ' + Math.round(point[vendor]).toLocaleString('ko-KR') + ' 토큰') + '</title></circle>';
+        svg += '<circle cx="' + x(i) + '" cy="' + y(point[vendor]) + '" r="4" fill="' + C[vendor] + '"><title>' + esc(label(point.ts) + ' · ' + vendor + ' · ' + Math.round(point[vendor]).toLocaleString('ko-KR') + ' 토큰') + '</title></circle>';
       });
       svg += '<path d="' + path + '" fill="none" stroke="' + C[vendor] + '" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>';
     }
     const labels = points.length > 8 ? points.filter((_, i) => i % Math.ceil(points.length / 6) === 0) : points;
     labels.forEach(point => {
       const index = points.indexOf(point);
-      svg += '<text x="' + x(index) + '" y="' + (HH - 12) + '" text-anchor="middle" fill="var(--muted)" font-size="11">' + (H === '8760' ? monthLabel(point.ts) : dateLabel(point.ts)) + '</text>';
+      svg += '<text x="' + x(index) + '" y="' + (HH - 12) + '" text-anchor="middle" fill="var(--muted)" font-size="11">' + label(point.ts) + '</text>';
     });
     svg += '<text x="' + (p.l - 8) + '" y="' + (p.t + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' + format(max) + '</text><text x="' + (p.l - 8) + '" y="' + (HH - p.b + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">0</text></svg>';
-    const table = points.map(point => '<tr><td>' + (H === '8760' ? monthLabel(point.ts) : dateLabel(point.ts)) + '</td>' + ['Claude', 'Codex'].filter(vendor => V === 'all' || V === vendor).map(vendor => '<td class="num">' + (rows.some(row => row.ts === point.ts && row.vendor === vendor) ? format(point[vendor]) : '기록 없음') + '</td>').join('') + '</tr>').join('');
+    const table = points.map(point => '<tr><td>' + label(point.ts) + '</td>' + ['Claude', 'Codex'].filter(vendor => V === 'all' || V === vendor).map(vendor => '<td class="num">' + (rows.some(row => row.ts === point.ts && row.vendor === vendor) ? format(point[vendor]) : '기록 없음') + '</td>').join('') + '</tr>').join('');
     document.querySelector('#chart').innerHTML = svg + '<details><summary>추이 데이터 보기</summary><div class="tablewrap"><table><thead><tr><th>KST 기간</th>' + ['Claude', 'Codex'].filter(vendor => V === 'all' || V === vendor).map(vendor => '<th>' + vendor + '</th>').join('') + '</tr></thead><tbody>' + table + '</tbody></table></div></details>';
   };
   window.draw = w => drawLong(w);

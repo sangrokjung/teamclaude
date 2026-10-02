@@ -15,7 +15,7 @@ GROUPS = ('vendors', 'projects', 'sessions', 'models', 'categories', 'timeline',
 
 
 class TrendsTest(unittest.TestCase):
-    def test_codex_missing_cumulative_uses_delta_without_double_counting(self):
+    def test_codex_missing_cumulative_keeps_distinct_response_ids(self):
         old_home, old_codex_home, old_db, old_sessions, old_events, old_audit = a.HOME, a.CODEX_HOME, a.CODEX_STATE_DB, a.SESSIONS, a.EVENTS, a.AUDIT.copy()
         try:
             with tempfile.TemporaryDirectory() as directory:
@@ -33,10 +33,10 @@ class TrendsTest(unittest.TestCase):
                 conn.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?,?,?,?)', ('fixture', directory, str(rollout), '', '', 'fixture-model', 'cli', 'fixture', a.NOW-10, a.NOW))
                 conn.commit()
                 conn.close()
-                before = a.AUDIT['codex_response_missing_cumulative_fallback_to_delta']
+                before = a.AUDIT['codex_response_missing_cumulative']
                 a.scan_codex()
-                self.assertEqual(sum(e['total'] for e in a.EVENTS.values()), 10)
-                self.assertEqual(a.AUDIT['codex_response_missing_cumulative_fallback_to_delta']-before, 2)
+                self.assertEqual(sum(e['total'] for e in a.EVENTS.values()), 20)
+                self.assertEqual(a.AUDIT['codex_response_missing_cumulative']-before, 2)
         finally:
             a.HOME, a.CODEX_HOME, a.CODEX_STATE_DB, a.SESSIONS, a.EVENTS = old_home, old_codex_home, old_db, old_sessions, old_events
             a.AUDIT.clear()
@@ -140,6 +140,32 @@ class TrendsTest(unittest.TestCase):
 
     def test_classification_does_not_match_api_in_rapid(self):
         self.assertEqual(a.task_category('rapid'), '분류 미확정')
+
+    def test_codex_mixed_sources_and_first_request_without_database(self):
+        for cumulative in [999, None]:
+            with self.subTest(cumulative=cumulative), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                log = home / '.codex/sessions/mixed.jsonl'
+                log.parent.mkdir(parents=True)
+                stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                usage = dict(input_tokens=8, cached_input_tokens=3, output_tokens=2, total_tokens=10)
+                rows = [dict(type='session_meta', payload=dict(id='mixed', cwd='/synthetic/neutral')),
+                        dict(type='response_item', payload=dict(role='user', content=[dict(type='input_text', text='콘텐츠 영상 제작 PRIVATE_HINT_SENTINEL')]))]
+                for index in range(2):
+                    rows.append(dict(type='token_usage_record', timestamp=stamp, payload=dict(response_id='r' + str(index), usage=usage, thread_token_usage=dict(total_tokens=cumulative if index else 10))))
+                    rows.append(dict(type='event_msg', timestamp=stamp, payload=dict(type='token_count', info=dict(total_token_usage=dict(input_tokens=8*(index+1), output_tokens=2*(index+1), total_tokens=10*(index+1)), last_token_usage=usage))))
+                log.write_text('\n'.join(json.dumps(row) for row in rows))
+                main(['--home', str(home), '--output', directory + '/out'])
+                self.assertEqual(sum(e['total'] for e in a.EVENTS.values()), 20)
+                self.assertEqual(a.SESSIONS['codex:mixed']['category'], '콘텐츠 제작')
+                self.assertNotIn('PRIVATE_HINT_SENTINEL', (home / 'out/report.html').read_text())
+
+    def test_timestamp_fractional_precision(self):
+        base = '2026-10-02T12:00:00'
+        for digits in ['1', '12', '123', '1234', '12345', '123456', '123456789']:
+            value = a.timestamp(base + '.' + digits + 'Z')
+            expected = dt.datetime(2026, 10, 2, 12, 0, 0, int(digits[:6].ljust(6, '0')), tzinfo=dt.timezone.utc).timestamp()
+            self.assertEqual(value, expected)
 
     def test_codex_response_counter_reset_preserves_each_response(self):
         with tempfile.TemporaryDirectory() as directory:

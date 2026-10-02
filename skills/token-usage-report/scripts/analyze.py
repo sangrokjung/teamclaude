@@ -60,6 +60,7 @@ def coverage_metadata(events, chosen, hours):
 
 def timestamp(value):
     try:
+        value = re.sub(r'\.(\d+)(?=Z|[+-]\d\d:\d\d|$)', lambda m: '.' + m[1][:6].ljust(6, '0'), value)
         return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
     except (ValueError, TypeError, AttributeError):
         return 0
@@ -267,7 +268,7 @@ def scan_codex():
             AUDIT['codex_missing_rollouts'] += 1
             continue
         sid = 'codex:' + str(row['id'])
-        register_session(sid, 'Codex', row['cwd'], row['git_branch'], row['title'], row['model'], row['model_provider'])
+        hint = row['title']
         AUDIT['codex_files_scanned'] += 1
         previous = None
         records = {}
@@ -275,7 +276,7 @@ def scan_codex():
         model = row['model'] or 'unknown'
         with path.open(errors='replace') as stream:
             for line in stream:
-                if not any(word in line for word in ['"token_count"', '"token_usage_record"', '"turn_context"']):
+                if not any(word in line for word in ['"token_count"', '"token_usage_record"', '"turn_context"', '"user_message"', '"response_item"']):
                     continue
                 try:
                     item = json.loads(line)
@@ -289,6 +290,14 @@ def scan_codex():
                 if not isinstance(payload, dict):
                     AUDIT['malformed_codex_lines'] += 1
                     continue
+                if not hint:
+                    content = payload.get('message', '') if payload.get('type') == 'user_message' else ''
+                    if item.get('type') == 'response_item' and payload.get('role') == 'user':
+                        parts = payload.get('content', [])
+                        if isinstance(parts, list):
+                            content = ' '.join(p.get('text', '') for p in parts if isinstance(p, dict) and isinstance(p.get('text'), str))
+                    if isinstance(content, str) and content.strip() and not content.lstrip().startswith(('<', '# AGENTS')):
+                        hint = content[:1500]
                 if item.get('type') == 'turn_context':
                     model = payload.get('model') or model
                 elif item.get('type') == 'token_usage_record':
@@ -298,9 +307,9 @@ def scan_codex():
                         thread_usage = payload.get('thread_token_usage') or {}
                         cumulative = thread_usage.get('total_tokens') if isinstance(thread_usage, dict) else None
                         if not isinstance(cumulative, (int, float)) or not math.isfinite(cumulative):
-                            AUDIT['codex_response_missing_cumulative_fallback_to_delta'] += 1
-                            continue
-                        records[str(rkey)] = (cumulative, u, timestamp(item.get('timestamp')), 'codex:' + str(payload['thread_id']) if payload.get('thread_id') else sid, model)
+                            AUDIT['codex_response_missing_cumulative'] += 1
+                        if isinstance(u, dict):
+                            records[str(rkey)] = (u, timestamp(item.get('timestamp')), 'codex:' + str(payload['thread_id']) if payload.get('thread_id') else sid, model)
                 elif payload.get('type') == 'token_count':
                     info = payload.get('info') or {}
                     if not isinstance(info, dict):
@@ -325,29 +334,19 @@ def scan_codex():
                         delta = {k: max(0, numeric(u, k) - numeric(previous, k)) for k in u}
                     previous = u
                     counts.append((total, delta, ts, model))
-        records_by_total = collections.defaultdict(list)
-        for key, value in records.items():
-            records_by_total[value[0]].append((key, value))
-        consumed = set()
-        for total, delta, ts, model in counts:
-            candidates = [(key, value) for key, value in records_by_total[total] if key not in consumed]
-            record = min(candidates, key=lambda entry: abs(entry[1][2] - ts)) if candidates else None
-            if record:
-                key, (_, usage, ts, owner, model) = record
-                consumed.add(key)
-                if owner not in SESSIONS:
-                    owner = sid
-                key = 'codex-response:' + key
-                AUDIT['codex_response_records_used'] += 1
-            else:
-                usage, owner = delta, sid
-                key = 'codex-event:' + hashlib.sha256(json.dumps([sid, ts, total, delta], sort_keys=True).encode()).hexdigest()
-                AUDIT['codex_delta_records_used'] += 1
-            emit_codex(key, usage, ts, owner, model)
-        for key, (_, usage, ts, owner, model) in records.items():
-            if key not in consumed:
+        register_session(sid, 'Codex', row['cwd'], row['git_branch'], hint, row['model'], row['model_provider'])
+        if records:
+            if counts:
+                AUDIT['codex_mixed_source_files_response_only'] += 1
+                AUDIT['codex_counter_records_omitted_for_response_source'] += len(counts)
+            for key, (usage, ts, owner, model) in records.items():
                 emit_codex('codex-response:' + key, usage, ts, owner if owner in SESSIONS else sid, model)
-                AUDIT['codex_unpaired_response_records'] += 1
+                AUDIT['codex_response_records_used'] += 1
+        else:
+            for total, delta, ts, model in counts:
+                key = 'codex-event:' + hashlib.sha256(json.dumps([sid, ts, total, delta], sort_keys=True).encode()).hexdigest()
+                emit_codex(key, delta, ts, sid, model)
+                AUDIT['codex_delta_records_used'] += 1
     print('Codex scan complete', AUDIT['codex_files_scanned'], flush=True)
 
 
@@ -461,7 +460,8 @@ def collect():
             '작업 유형은 첫 요청·제목·브랜치·저장소 이름의 키워드 기반 추정. 원문 프롬프트·제목은 내보내지 않습니다.',
             '1h/24h/7d/30d/365d의 이동 구간. KST 30일=일별,365일=월별. 처음·마지막은 부분 기간입니다.',
             '빈 칸은 기록 없음이며 실제 미사용 0으로 확정하지 않습니다. 보존 범위 내에도 로그가 누락될 수 있습니다.',
-            '누적 total_tokens 없는 Codex 응답은 차분 경로를 사용하며 둘 다 없으면 집계에서 빠지고 audit에 기록됩니다.',
+            'Codex 파일에 response_id 사용량이 있으면 응답 기록만 집계합니다. 없을 때만 누적 차분을 사용합니다. 혼합 파일의 응답 기록 누락분은 추정 합산하지 않으며 실제보다 적을 수 있습니다.',
+            f'Codex 혼합 소스 파일 {AUDIT["codex_mixed_source_files_response_only"]}개에서 차분 {AUDIT["codex_counter_records_omitted_for_response_source"]}개를 제외했습니다. 이 경우 응답 기록에 남은 사용량만 반영합니다.',
             '가격은 저장된 API 정가 스냅샷 또는 직접 입력한 단가의 비교용 추정액이며 실제 청구액이 아닙니다.',
         ])
     return result, events

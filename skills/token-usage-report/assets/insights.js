@@ -38,6 +38,7 @@
     '.ins-heat .ins-hl{text-align:center}.ins-date{font-variant-numeric:tabular-nums;white-space:nowrap}',
     '.ins-cell{height:34px;border-radius:5px;display:flex;align-items:center;justify-content:center;background:rgb(var(--ins-rgb)/var(--a,0));border:1px solid var(--line)}',
     '.ins-cell.out{background:var(--line);color:var(--muted);border-color:transparent}.ins-cell.part{border:2px dashed var(--ins-peak)}',
+    '.ins-cell.no-record{background:transparent;color:var(--muted);border:1px dashed var(--muted)}',
     '.ins-legend{display:flex;flex-wrap:wrap;gap:8px 16px;margin-top:12px;color:var(--muted);font-size:.9375rem;align-items:center}',
     '.ins-sw{display:inline-block;width:18px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;border:1px solid var(--line)}',
     '#insights [tabindex]:focus-visible{outline:3px solid var(--claude);outline-offset:2px}',
@@ -77,8 +78,8 @@
   const agg = (rows, key) => {
     const m = new Map();
     for (const r of rows) {
-      const k = key(r), o = m.get(k) || { v: 0, e: 0 };
-      o.v += metric(r); o.e = Math.max(o.e, Number(r.exposureHours) || 0); m.set(k, o);
+      const k = key(r), o = m.get(k) || { v: 0, e: 0, requests: 0 };
+      o.v += metric(r); o.e = Math.max(o.e, Number(r.exposureHours) || 0); o.requests += Number(r.requests) || 0; m.set(k, o);
     }
     return m;
   };
@@ -98,22 +99,22 @@
     const max = Math.max(1, ...cats.map(x => x.v)), diff = Math.abs(tot - all);
     const check = diff > 0.5 ? '<span class="ins-warn">분류 합계가 전체와 ' + esc(n(diff)) + ' 토큰 다릅니다.</span>' : '분류 합계 ' + esc(n(tot)) + ' 토큰, 전체와 일치합니다.';
     const rows = cats.map(x => '<div class="ins-cat' + (x.k === U ? ' unk' : '') + '"><span class="ins-name">' + esc(x.k) + '</span><span class="ins-val">' + esc(pct(x.v, tot)) + ' · <span title="' + esc(n(x.v)) + ' 토큰">' + esc(f(x.v)) + '</span></span><div class="track"><div class="fill ins-fill" style="width:' + (x.v / max * 100) + '%;background:' + color(x.k) + '"></div></div><span class="ins-proj">상위 프로젝트: ' + (x.top.length ? x.top.map(([p, v]) => esc(p) + ' ' + esc(f(v))).join(' · ') : '없음') + '</span></div>').join('');
-    return '<article class="card"><div class="panel-head"><h2>어떤 작업에 토큰을 쓰나요?</h2><span class="ins-hint">세션 메타데이터 기반 추정 · 토큰 비중, 업무시간 아님</span></div><p class="ins-note">프로젝트·branch·작업 경로로 자동 분류한 추정치입니다. 근거가 부족한 세션은 숨기지 않고 회색 "분류 미확정"에 넣었습니다. ' + check + '</p>' + ('<div class="ins-categories">' + rows + '</div>') + '</article>';
+    return '<article class="card"><div class="panel-head"><h2>어떤 작업에 토큰을 쓰나요?</h2><span class="ins-hint">키워드 기반 추정 · 토큰 비중, 업무시간 아님</span></div><p class="ins-note">첫 요청·제목·프로젝트·브랜치 키워드로 자동 분류합니다. 근거가 부족한 세션은 회색 "분류 미확정"에 넣었습니다. ' + check + '</p>' + ('<div class="ins-categories">' + rows + '</div>') + '</article>';
   }
 
   function hourCard(w) {
     const hm = agg(list(w.hourOfDay || []), r => Number(r.hour));
     const hrs = Array.from({ length: 24 }, (_, h) => Object.assign({ h }, hm.get(h) || { v: 0, e: 0 }));
-    const obs = hrs.filter(x => x.e > 0), tot = obs.reduce((s, x) => s + x.v, 0), max = Math.max(1, ...obs.map(x => x.v));
+    const obs = hrs.filter(x => x.e > 0 && x.requests > 0), tot = obs.reduce((s, x) => s + x.v, 0), max = Math.max(1, ...obs.map(x => x.v));
     const top3 = obs.filter(x => x.v > 0).sort((a, b) => b.v - a.v).slice(0, 3), peak = top3.length ? top3[0].h : -1;
     const avg = x => (H === '168' && x.e > 0 ? ' · 관측 ' + x.e.toFixed(1) + '시간 기준 평균 ' + f(x.v / x.e) + '/h' : '');
-    const tipOf = x => span(x.h) + ' KST · ' + (x.e > 0 ? n(x.v) + ' 토큰 · 점유 ' + pct(x.v, tot) + avg(x) : '관측 없음 (0과 다름)');
+    const tipOf = x => span(x.h) + ' KST · ' + (x.e > 0 && x.requests > 0 ? n(x.v) + ' 토큰 · 점유 ' + pct(x.v, tot) + avg(x) : x.e > 0 ? '기록 없음 (0과 다름)' : '관측 창 밖');
     const meta = H === '8760' ? '1년 동안 같은 시각을 합산한 값이에요. 로그가 보관된 시점만 관측되며 빈 칸은 0 사용이 아닙니다.'
       : H === '720' ? '30일 동안 같은 시각을 합산한 값이에요. 로그가 보관된 시점만 관측되며 빈 칸은 0 사용이 아닙니다.'
       : H === '168' ? '7일 동안 같은 시각을 합산한 값이에요. 시간대별 평균은 토큰을 그 시각의 관측 시간으로 나눈 값입니다.'
       : H === '24' ? '각 시각 1회분의 합계로 읽으세요. 첫·마지막 시각은 일부만 관측됐을 수 있습니다.'
       : '1시간 창이라 관측한 두 시각에만 값이 있어요. 점선 칸은 0이 아니라 관측 없음입니다.';
-    const cols = hrs.map(x => '<div class="ins-col' + (x.h === peak ? ' peak' : '') + (x.e > 0 ? '' : ' none') + '"' + tipAttr(tipOf(x)) + '><div class="ins-colbar" style="height:' + (x.e > 0 ? Math.max(2, x.v / max * 160) : 0) + 'px"></div><span class="ins-hl">' + hh(x.h) + '</span></div>').join('');
+    const cols = hrs.map(x => '<div class="ins-col' + (x.h === peak ? ' peak' : '') + (x.e > 0 && x.requests > 0 ? '' : ' none') + '"' + tipAttr(tipOf(x)) + '><div class="ins-colbar" style="height:' + (x.e > 0 && x.requests > 0 ? Math.max(2, x.v / max * 160) : 0) + 'px"></div><span class="ins-hl">' + hh(x.h) + '</span></div>').join('');
     const cards = top3.map((x, i) => '<div class="ins-tc' + (i === 0 ? ' peak' : '') + '"><small>' + (i + 1) + '위 · ' + span(x.h) + '</small><b title="' + esc(n(x.v)) + ' 토큰">' + esc(n(x.v)) + '</b><small>점유 ' + esc(pct(x.v, tot)) + esc(avg(x)) + '</small></div>').join('');
     return '<article class="card"><div class="panel-head"><h2>24시간 중 언제 가장 많이 쓰나요?</h2><span class="ins-hint">KST 0~23시 · 기간 합계</span></div><p class="ins-note">' + esc(meta) + ' 토큰은 사람의 작업시간·비용·쿼터가 아닙니다.</p><div class="ins-scroll"><div class="ins-hours">' + cols + '</div></div>' + (cards ? '<div class="ins-top">' + cards + '</div>' : '<div class="empty">관측된 시간대 기록이 없습니다.</div>') + '</article>';
   }
@@ -129,13 +130,13 @@
       for (let h = 0; h < 24; h++) {
         const o = dm.get(d + '|' + h) || { v: 0, e: 0 };
         if (o.e <= 0) { grid += '<div class="ins-cell out" aria-hidden="true">-</div>'; continue; }
-        if (!rows.some(row => row.date === d && row.hour === h && row.requests > 0)) { grid += '<div class="ins-cell out" aria-label="' + d + ' ' + span(h) + ' 기록 없음">-</div>'; continue; }
+        if (!o.requests) { grid += '<div class="ins-cell no-record"' + tipAttr(d + ' ' + span(h) + ' 기록 없음 (0과 다름)') + '>·</div>'; continue; }
         const part = o.e < 0.999, m = Math.round(o.e * 60), a = (o.v > 0 ? 0.12 + 0.88 * o.v / max : 0.03).toFixed(3);
         grid += '<div class="ins-cell' + (part ? ' part' : '') + '" style="--a:' + a + '"' + tipAttr(d + ' ' + span(h) + ' KST · ' + n(o.v) + ' 토큰 · 관측 ' + m + '분' + (part ? ' (부분 관측)' : '')) + '></div>';
         trs += '<tr><td>' + esc(d) + '</td><td>' + span(h) + '</td><td class="num">' + esc(n(o.v)) + '</td><td class="num">' + m + '분</td><td>' + (part ? '부분 관측' : '관측 완료') + '</td></tr>';
       }
     }
-    const legend = '<div class="ins-legend"><span><i class="ins-sw" style="background:rgb(var(--ins-rgb)/.75)"></i>관측 완료 (진할수록 많음)</span><span><i class="ins-sw" style="border:2px dashed var(--ins-peak)"></i>부분 관측</span><span><i class="ins-sw" style="background:var(--line)"></i>관측 창 밖 (-)</span></div>';
+    const legend = '<div class="ins-legend"><span><i class="ins-sw" style="background:rgb(var(--ins-rgb)/.75)"></i>관측 완료 (진할수록 많음)</span><span><i class="ins-sw" style="border:2px dashed var(--ins-peak)"></i>부분 관측</span><span><i class="ins-sw" style="background:var(--line)"></i>관측 창 밖 (-)</span><span><i class="ins-sw" style="border:1px dashed var(--muted)"></i>기록 없음</span></div>';
     return '<article class="card"><div class="panel-head"><h2>날짜별로 보면 언제 몰렸나요?</h2><span class="ins-hint">KST 날짜 × 시각 · 기간 합계</span></div><p class="ins-note">칸에 마우스를 올리거나 Tab으로 이동하면 정확한 값과 관측 시간이 나와요.</p>' + (dates.length ? '<div class="ins-scroll"><div class="ins-heat">' + grid + '</div></div>' + legend + '<details><summary>히트맵 데이터를 표로 보기</summary><div class="tablewrap"><table><thead><tr><th>날짜</th><th>시각 (KST)</th><th class="num">토큰</th><th class="num">관측</th><th>상태</th></tr></thead><tbody>' + trs + '</tbody></table></div></details>' : '<div class="empty">날짜별 시간 데이터가 없습니다.</div>') + '</article>';
   }
 
