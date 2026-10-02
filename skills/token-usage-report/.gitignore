@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+report.html
+data.json
+events.jsonl
+token-report-output/
+!assets/report.html
+assets/*.woff2
