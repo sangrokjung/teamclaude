@@ -1370,7 +1370,7 @@ async function proxyWorkerCommand() {
   // windows are lazily swept, and a still-future throttle is re-applied.
   const quotaCache = await readQuotaCache();
   if (quotaCache?.accounts) {
-    accountManager.importQuotaState(quotaCache.accounts);
+    accountManager.importQuotaState(quotaCache.accounts, { provisional: !codexMode });
     // Restore the active-account marker too (identity by name) so the sticky
     // primary — and its warm prompt cache — carries across the restart.
     const cur = quotaCache.currentAccount

@@ -5,12 +5,18 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `9293a3f4702139660ca38dee9d8c015b50ea9039ad1701a76395826706492c77`
+- SHA-256: `a1bedae31ba9cdeb01a230831bc0341b7daef8d373453e1b5595f443eebf9493`
 - Source: `src/config.js`
+- 2026-10-01 갱신: Anthropic rejected 429 정규화, provisional throttle 보존, model revalidation label 저장 및 status pending 정보를 반영했다. 아래 Codex 모델 격리 발췌는 동일하며 최종 hash는 위 값이다. 교차 벤더 판정은 UNVERIFIED다.
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
   이후 두 소스가 바뀌면 이 문서와 `test/test_model_recovery_gate.py`의 핀을 함께 검토·갱신한다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
+- 2026-09-30 갱신: 웹 quota 리셋 복구 후보 `3475ddd`의 Anthropic provisional
+  snapshot 변경을 반영했다. 아래 Codex 모델 격리 구간과 config는 유지된다.
+  [CI 실행 36697113339](https://github.com/sangrokjung/teamclaude/actions/runs/36697113339)에서
+  Node 모델 복구 및 watchdog 검증이 통과했으며 전체 891건 중 유일한 실패는
+  이전 AccountManager SHA와의 불일치였다. 이 기록은 교차 벤더 검토 승인을 뜻하지 않는다.
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을
   포함하지 않으며, 최종 code/security reviewer는 원본 전체 파일을 직접 읽습니다.

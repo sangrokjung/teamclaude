@@ -425,6 +425,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     : 3;
   const WARMUP_PROBE_TIMEOUT_MS = 15_000;
   let probeTemplate = null;   // committed { model, version, beta, system } — only after a 2xx
+  let staleRecheckTemplate = null;
   let warmupInFlight = false; // guard against overlapping fan-outs
   let codexRefreshPromise = null;
   let warmupClosed = false;   // set on server close: stop scheduling, abort in-flight probes
@@ -470,9 +471,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (probeTemplate && !probeTemplate._restored
         && (probeTemplate._elicitsModelWeekly || !elicitsModelWeekly)) return;
     probeTemplate = { ...candidate, _elicitsModelWeekly: elicitsModelWeekly };
+    if (modelQuotaLabel(candidate.model)) {
+      staleRecheckTemplate = probeTemplate;
+    }
     setImmediate(() => {
       warmupUnmeasured();
       recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
     });
     // Note: the already-measured accounts still missing their Fable window are
     // healed by the periodic top-up pass (topUpModelWeekly) and by an on-demand
@@ -878,8 +883,23 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   //    capacity 429 could not.
   //  - Learns ONLY from a response upstream accepted (2xx) or an account-level
   //    quota 429 ('rejected') — a 4xx / non-exhaustion 429 / 5xx never mutates state.
-  async function warmupAccount(account, { force = false } = {}) {
-    if (!probeTemplate || warmupClosed || account._warming) return;
+  function automaticProbeEligible(account) {
+    return accountManager.accounts[account.index] === account
+      && account.enabled !== false && account.status !== 'error'
+      && !account.authRevoked && !account.subscriptionDisabled
+      && account.inflight === 0 && !account._warming
+      && !(account.rateLimitedUntil > Date.now())
+      && !(account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt));
+  }
+
+  function revalidationTemplate(account) {
+    return account._quotaNeedsRevalidation && staleRecheckTemplate
+      ? staleRecheckTemplate : probeTemplate;
+  }
+
+  async function warmupAccount(account, { force = false, automatic = false, template = probeTemplate } = {}) {
+    if (!template || warmupClosed || account._warming) return;
+    if (automatic && !automaticProbeEligible(account)) return;
     // Don't refresh from a background probe; skip an OAuth account that needs one.
     if (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt)) return;
     // Re-confirm it's still an available, unmeasured, idle candidate — unless
@@ -891,13 +911,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     account._warming = true;
     const probe = probeSignal();
     try {
-      const headers = { 'content-type': 'application/json', 'anthropic-version': probeTemplate.version };
-      if (probeTemplate.beta) headers['anthropic-beta'] = probeTemplate.beta;
+      const headers = { 'content-type': 'application/json', 'anthropic-version': template.version };
+      if (template.beta) headers['anthropic-beta'] = template.beta;
       if (account.type === 'oauth') headers['authorization'] = `Bearer ${account.credential}`;
       else headers['x-api-key'] = account.credential;
 
       const res = await fetch(`${upstream}/v1/messages`, {
-        method: 'POST', headers, body: buildProbeBody(probeTemplate), signal: probe.signal,
+        method: 'POST', headers, body: buildProbeBody(template), signal: probe.signal,
       });
       // A completed 2xx is authoritative proof that this organization can use
       // Claude Code again. Clear the durable quarantine before folding quota so
@@ -925,7 +945,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         && rl['anthropic-ratelimit-unified-status'] === 'rejected';
       if ((res.ok || accountExhausted429) && Object.keys(rl).length
           && accountManager.accounts[account.index] === account) {
-        accountManager.updateQuota(account, rl);
+        accountManager.updateQuota(account, rl, { rejected429: accountExhausted429 });
+        if (automatic && accountExhausted429) {
+          account._nearQuotaRecheckAt = Date.now() + Math.max(60_000, warmupIntervalMs);
+        }
+        if (accountExhausted429 && !accountManager.isModelExhausted(account, template.model)) {
+          const retryAfter = parseRetryAfterMs(res.headers.get('retry-after')) || 60_000;
+          accountManager.markRateLimited(account, Math.min(300, Math.max(1, Math.ceil(retryAfter / 1000))));
+        }
         // Convergence accounting: a probe that leaves the account fully
         // measured resets the fruitless-probe counter; one that leaves it
         // half-measured (a header family missing) counts toward the cap.
@@ -1017,12 +1044,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // that exact account is idle. Force-probes so the fully-measured guard doesn't
   // exclude them; still skips in-flight/disabled/error accounts.
   async function topUpModelWeekly() {
-    if (!activeWarmup || warmupClosed || !probeTemplate || !probeTemplate._elicitsModelWeekly) return;
+    const template = probeTemplate?._elicitsModelWeekly ? probeTemplate : staleRecheckTemplate;
+    if (!activeWarmup || warmupClosed || !template) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
-      && accountManager.needsModelWeekly(a));
+      automaticProbeEligible(a)
+      && accountManager.needsModelWeeklyRecheck(a));
     if (!targets.length) return;
-    await Promise.all(targets.map(a => warmupAccount(a, { force: true })));
+    await Promise.all(targets.map(a => warmupAccount(a, { force: true, automatic: true, template })));
   }
 
   // Partial-quota top-up: after a restart the lazy sweep clears an expired
@@ -1040,28 +1068,33 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function topUpPartialQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const targets = accountManager.accounts.filter(a =>
-      a.enabled !== false && a.status !== 'error' && a.inflight === 0 && !a._warming
+      automaticProbeEligible(a)
       && accountManager.needsPartialRemeasure(a));
     if (!targets.length) return;
-    // Revive lapsed tokens FIRST (same rationale as refreshQuotaAll): a partial
-    // account is typically weekly-exhausted → out of rotation → zero client
-    // traffic → its OAuth token lapses past the 8h lifetime, and warmupAccount
-    // deliberately skips expiring-token accounts (background probes never
-    // refresh). Without this step the re-probe silently never happens and the
-    // session/Fable blanks persist (measured 2026-07-22: 6 accounts stuck).
-    // A refresh failure marks the account 'error', which drops it from future
-    // targets — no retry loop; a success is one refresh per ~8h, negligible.
-    await Promise.all(targets.map(a =>
-      accountManager.ensureTokenFresh(a).catch(() => { /* surfaces via status */ })));
-    const alive = targets.filter(a => a.status !== 'error');
-    if (!alive.length) return;
-    await Promise.all(alive.map(a => warmupAccount(a, { force: true })));
+    await Promise.all(targets.map(a => warmupAccount(a, {
+      force: true, automatic: true, template: revalidationTemplate(a),
+    })));
+  }
+
+  // External resets do not notify the proxy. Recheck blocked windows for the
+  // known-accepted template, while preserving live throttle deadlines.
+  function recheckStaleNearQuota() {
+    if (!activeWarmup || warmupClosed || !probeTemplate) return;
+    const now = Date.now();
+    for (const account of accountManager.accounts) {
+      if (!automaticProbeEligible(account)
+          || now < (account._nearQuotaRecheckAt || 0)) continue;
+      const template = accountManager._isNearQuota(account, probeTemplate.model)
+        ? probeTemplate : staleRecheckTemplate;
+      if (!template || !accountManager._isNearQuota(account, template.model)) continue;
+      void warmupAccount(account, { force: true, automatic: true, template });
+      account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
+    }
   }
 
   // Revalidate only the narrowly classified organization-access quarantine.
-  // Other auth errors stay parked until re-import/login because a generic
-  // probe must never revive revoked credentials. Each account is paced before
-  // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  // Other auth errors stay parked until re-import/login. Pace each account
+  // before dispatch so overlapping triggers cannot duplicate probes.
   async function recheckSubscriptionDisabled() {
     if (!activeWarmup || warmupClosed || !probeTemplate
         || subscriptionRecheckIntervalMs <= 0) return;
@@ -1089,7 +1122,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     if (!activeWarmup || warmupClosed || !probeTemplate || warmupInFlight) return;
     warmupInFlight = true;
     try {
-      await Promise.all(accountManager.warmupCandidates().map(a => warmupAccount(a)));
+      await Promise.all(accountManager.warmupCandidates().map(a => warmupAccount(a, {
+        automatic: true, template: revalidationTemplate(a),
+      })));
     } finally {
       warmupInFlight = false;
     }
@@ -1110,6 +1145,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       warmupUnmeasured();
       topUpPartialQuota(); // heal half-measured accounts (a window swept, the other survives)
       topUpModelWeekly(); // heal fully-measured accounts still missing their Fable window
+      recheckStaleNearQuota();
     }, warmupIntervalMs);
     warmupTimer.unref(); // never keep the process alive just for warm-up
   }
@@ -1735,11 +1771,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // re-measure (TUI R) returns -1 until the first genuine request. Restoring
   // the last run's template closes that gap; it is marked `_restored` so the
   // first freshly accepted shape replaces it (see commitProbeTemplate).
-  server.exportProbeTemplate = () => (probeTemplate ? { ...probeTemplate } : null);
+  server.exportProbeTemplate = () => (probeTemplate ? {
+    ...probeTemplate,
+    _staleRecheckTemplate: staleRecheckTemplate ? { ...staleRecheckTemplate } : null,
+  } : null);
   server.importProbeTemplate = (t) => {
     // Never clobber live evidence: a committed-in-this-process template wins.
     if (!activeWarmup || warmupClosed || probeTemplate) return false;
     if (!t || typeof t !== 'object' || typeof t.model !== 'string' || !t.model) return false;
+    const restoredStale = t._staleRecheckTemplate;
     probeTemplate = {
       model: t.model,
       version: typeof t.version === 'string' && t.version ? t.version : '2023-06-01',
@@ -1748,7 +1788,22 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       _elicitsModelWeekly: t._elicitsModelWeekly === true,
       _restored: true,
     };
-    setImmediate(() => { recheckSubscriptionDisabled(); });
+    staleRecheckTemplate = restoredStale && typeof restoredStale === 'object'
+      && modelQuotaLabel(restoredStale.model)
+      ? {
+          model: restoredStale.model,
+          version: typeof restoredStale.version === 'string' && restoredStale.version ? restoredStale.version : '2023-06-01',
+          beta: typeof restoredStale.beta === 'string' && restoredStale.beta ? restoredStale.beta : null,
+          system: restoredStale.system ?? null,
+          _elicitsModelWeekly: restoredStale._elicitsModelWeekly === true,
+          _restored: true,
+        }
+      : (modelQuotaLabel(probeTemplate.model) ? probeTemplate : null);
+    setImmediate(() => {
+      warmupUnmeasured();
+      recheckSubscriptionDisabled();
+      recheckStaleNearQuota();
+    });
     return true;
   };
 
@@ -2850,7 +2905,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
-    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders);
+    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders, {
+      rejected429: upstreamRes.status === 429
+        && rateLimitHeaders['anthropic-ratelimit-unified-status'] === 'rejected',
+    });
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
@@ -4359,12 +4417,13 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
     let freeAt = 0;
     if (acct.rateLimitedUntil) freeAt = Math.max(freeAt, new Date(acct.rateLimitedUntil).getTime());
     const q = acct.quota || {};
-    if (q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
+    const pending = new Set(acct.quotaPendingWindows || []);
+    if (!pending.has('unified5h') && q.unified5h != null && q.unified5h >= threshold && q.unified5hReset)
       freeAt = Math.max(freeAt, q.unified5hReset);
-    if (q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
+    if (!pending.has('unified7d') && q.unified7d != null && q.unified7d >= threshold && q.unified7dReset)
       freeAt = Math.max(freeAt, q.unified7dReset);
     const modelWindow = modelLabel ? q.modelWeekly?.[modelLabel] : null;
-    if (modelWindow?.utilization != null && modelWindow.utilization >= threshold
+    if (!pending.has(`modelWeekly:${modelLabel}`) && modelWindow?.utilization != null && modelWindow.utilization >= threshold
         && modelWindow.reset)
       freeAt = Math.max(freeAt, modelWindow.reset);
     // Standard windows reset independently — use each window's OWN reset
@@ -4372,11 +4431,11 @@ function fleetRecovery(accounts, threshold = 0.98, model = null) {
     // split fields), so when both are binding the LATER one wins instead of
     // resetsAt's preference for the sooner token reset.
     const tokensReset = q.tokensReset || q.resetsAt;
-    if (q.tokensLimit != null && q.tokensRemaining != null && tokensReset
+    if (!pending.has('tokens') && q.tokensLimit != null && q.tokensRemaining != null && tokensReset
         && 1 - q.tokensRemaining / q.tokensLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(tokensReset).getTime());
     const requestsReset = q.requestsReset || q.resetsAt;
-    if (q.requestsLimit != null && q.requestsRemaining != null && requestsReset
+    if (!pending.has('requests') && q.requestsLimit != null && q.requestsRemaining != null && requestsReset
         && 1 - q.requestsRemaining / q.requestsLimit >= threshold)
       freeAt = Math.max(freeAt, new Date(requestsReset).getTime());
     if (freeAt > 0) consider(freeAt - now, acct.name, true);
