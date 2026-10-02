@@ -193,12 +193,18 @@
 }
 
 @media (max-width: 420px) {
+  #windows { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; overflow: visible; }
   #windows button,
   .trend-range button {
     min-width: 0;
     padding-inline: .55rem;
     font-size: .875rem;
   }
+  #windows button { border-bottom: 1px solid var(--trend-border); }
+  #cost-toolbar { flex-direction: column; align-items: stretch; }
+  #cost-toolbar > * { flex: 0 0 auto; }
+  #cost-toolbar label { white-space: nowrap; justify-content: space-between; }
+  #fx-rate { width: 7rem; min-width: 0; }
 
   #trend-panel svg,
   .trend-panel svg { min-height: 11rem; }
