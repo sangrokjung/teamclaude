@@ -18,4 +18,4 @@ Intent: [accepted 요청](../intents/2026-10-02-token-report-plugin.md). 등급 
 
 디자인 출처: 기존 격리 Codex 세션의 Refero 대시보드 검색 화면 및 21st Traffic Range Switcher(ID 29215) 참고 결과를 재사용했다. Refero 상세는 로그인 제한으로 미열람. 글꼴은 설치된 Pretendard 우선, 없으면 시스템 글꼴이며 외부 폰트 요청은 없다.
 
-적대 검토 R1: 공개/보안 APPROVE, 데이터 REQUEST_CHANGES 3건. 수정: Codex DB 없는 첫 요청 분류 추가, 모든 기간의 미관측 버킷 선 끊기와 시간대/히트맵 `기록 없음` 분리(0원 미표시), 응답 ID가 있는 파일은 응답 소스만 집계하고 혼합 파일·생략 차분 수를 노출. 누적값 불일치/일부 누적값 없음/첫 요청 비공개 fixture 및 Python3.10 소수초 정규화 회귀 추가. Python 10 tests와 Node 3 tests PASS. 최종 브라우저·교차 검증은 이 수정 이후 다시 수행한다.
+적대 검토 R1: 공개/보안 APPROVE, 데이터 REQUEST_CHANGES 3건. 수정: Codex DB 없는 첫 요청 분류 추가, 모든 기간의 미관측 버킷 선 끊기와 시간대/히트맵 `기록 없음` 분리(0원 미표시), 응답 ID가 있는 파일은 응답 소스만 집계하고 혼합 파일·생략 차분 수를 노출. 누적값 불일치/일부 누적값 없음/첫 요청 비공개 fixture 및 Python3.10 소수초 정규화 회귀 추가. Python 10 tests와 Node 3 tests PASS. 최종 Ego Lite 브라우저 QA 20 checks PASS(공유 합산·개인정보 제외·JSON 다운로드·누락 시간/히트맵·짧은 추이 선 끊기·5기간×3벤더·KRW·Escape/focus·375px dark/reduced-motion). 교차 검증은 Claude Opus 최종 데이터 APPROVE 및 공개/보안 APPROVE다.
