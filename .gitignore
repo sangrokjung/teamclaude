@@ -1,4 +1,6 @@
 node_modules/
+menubar/.build/
+menubar/cc-menubar
 config.json
 *.log
 artifacts/

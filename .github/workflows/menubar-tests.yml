@@ -1,0 +1,20 @@
+name: Menubar tests
+on:
+  push:
+    paths: ['menubar/**', 'scripts/subscription-monitor*', '.github/workflows/menubar-tests.yml']
+  pull_request:
+    paths: ['menubar/**', 'scripts/subscription-monitor*', '.github/workflows/menubar-tests.yml']
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift/Python tests and native snapshot
+        run: bash menubar/build.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: menubar-test-logs
+          path: menubar/.build/tests/*.log
+          if-no-files-found: ignore

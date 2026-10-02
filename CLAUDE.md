@@ -8,7 +8,7 @@ TeamClaude is a transparent HTTP proxy that sits between Claude Code and the Ant
 
 ## Commands
 
-There is **no build step**. Development is run directly against source.
+The Node proxy runs directly from source. The native macOS app lives in `menubar/`; see [menubar/README.md](menubar/README.md) for build, test and installation. This repository owns the proxy, TUI and menu-bar dashboard; no separate desktop dashboard is maintained here.
 
 ```bash
 node src/index.js <command>        # run any CLI command locally (server is the default)

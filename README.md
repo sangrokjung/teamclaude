@@ -131,6 +131,8 @@ Upstream has features this fork does not, so pick whichever fits your setup.
 
 ## Live dashboard
 
+This repository also owns the native macOS menu-bar app and its click-to-open usage dashboard in [menubar/](menubar/README.md). Build it with `npm run menubar:build`; no separate desktop dashboard, Electron or Tauri is required.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
 </p>
