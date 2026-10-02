@@ -1,5 +1,19 @@
 export default [
   {
+    files: ['scripts/subscription-monitor-browser.js'],
+    languageOptions: {
+      globals: {
+        sleep: 'readonly',
+        closeTab: 'readonly',
+        snapshot: 'readonly',
+        googleAccounts: 'readonly',
+        gmail: 'readonly',
+        listBrowserTabs: 'readonly',
+        openTab: 'readonly',
+      },
+    },
+  },
+  {
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'module',

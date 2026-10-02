@@ -32,4 +32,4 @@ Intent: [사용자 확정 범위](../intents/2026-10-02-menubar-integration.md)
 
 ## Verification
 
-아직 실행 전. 실제 결과는 연결된 plan에 기록한다.
+전체 메뉴바 러너·스냅샷·빌드와 실제 운영 메뉴 QA를 통과했다. 상세 실행 증거 및 남은 출하 확인은 [plan](../plans/2026-10-02-menubar-integration.md)에 기록한다.
