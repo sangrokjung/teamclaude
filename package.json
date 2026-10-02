@@ -18,7 +18,10 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "menubar:test": "bash menubar/run-tests.sh",
+    "menubar:build": "bash menubar/build.sh",
+    "menubar:install": "bash menubar/install.sh"
   },
   "keywords": [
     "claude",

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.qjc.cc-menubar</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__INSTALL_DIR__/cc-menubar</string>
+    </array>
+
+    <!-- 로그인 시 자동 시작 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 비정상 종료 시 자동 재시작 -->
+    <key>KeepAlive</key>
+    <true/>
+    <!-- 포화된 호스트에서 Standard 클래스 에이전트의 메인 스레드는 굶는다(실측: cpu 170~280ms에 벽시계 2.6~6.3초). 메뉴바 UI는 대화형으로 스케줄한다. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- 표준 출력/에러 로그 -->
+    <key>StandardOutPath</key>
+    <string>__INSTALL_DIR__/cc-menubar.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__INSTALL_DIR__/cc-menubar.error.log</string>
+
+    <!-- 환경변수 (필요 시 추가) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
