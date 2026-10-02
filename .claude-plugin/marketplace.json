@@ -1,0 +1,15 @@
+{
+  "name": "teamclaude",
+  "description": "TeamClaude 공식 플러그인 모음: 로컬 Claude·Codex 토큰 사용량 분석 리포트",
+  "owner": {
+    "name": "Sangrok Jung",
+    "url": "https://github.com/sangrokjung"
+  },
+  "plugins": [
+    {
+      "name": "teamclaude-token-usage-report",
+      "source": "./",
+      "description": "Local Claude and Codex token usage report with privacy-preserving sharing."
+    }
+  ]
+}

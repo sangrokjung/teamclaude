@@ -10,6 +10,8 @@
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
 
+서버 없이 로컬 사용량을 분석하는 [Token Usage Report 플러그인·스킬](skills/token-usage-report/README.md)을 제공합니다. 작업 분류, 24시간 패턴, 월간·연간 추이, USD/KRW 환산과 공유 요약을 확인하세요.
+
 <p align="center">
   <strong>하나의 로컬 프록시. 모든 코딩 계정. 끊기지 않는 세션.</strong>
 </p>

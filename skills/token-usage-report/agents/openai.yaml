@@ -1,0 +1,7 @@
+interface:
+  display_name: "Token Usage Report"
+  short_description: "Claude·Codex 토큰 사용량을 시각화합니다"
+  brand_color: "#213F95"
+  default_prompt: "Use $token-usage-report to create a local Claude and Codex token usage report with monthly and yearly trends."
+policy:
+  allow_implicit_invocation: true

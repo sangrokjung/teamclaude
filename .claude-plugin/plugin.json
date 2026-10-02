@@ -1,0 +1,13 @@
+{
+  "name": "teamclaude-token-usage-report",
+  "version": "1.0.0",
+  "description": "Local Claude Code and Codex token usage analysis with monthly/yearly trends and privacy-preserving share summaries.",
+  "author": {
+    "name": "Sangrok Jung",
+    "url": "https://github.com/sangrokjung"
+  },
+  "repository": "https://github.com/sangrokjung/teamclaude",
+  "license": "MIT",
+  "keywords": ["claude", "codex", "tokens", "analytics", "privacy", "dashboard"],
+  "skills": ["./skills/token-usage-report"]
+}

@@ -10,6 +10,8 @@
 
 <h1 align="center">TeamClaude · TeamCodex</h1>
 
+Analyze local Claude/Codex token usage without a server: [Token Usage Report plugin and skill](skills/token-usage-report/README.md) — task categories, 24-hour patterns, monthly/yearly trends, USD/KRW estimates, and share summaries.
+
 <p align="center">
   <strong>One local proxy. Every coding account. No interrupted sessions.</strong>
 </p>
