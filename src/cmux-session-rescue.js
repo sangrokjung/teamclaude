@@ -378,14 +378,18 @@ export async function rescueCmuxSessionsOnce({
         continue;
       }
       const afterStop = sessions(afterStopStore).find(item => item?.sessionId === key);
+      const afterStopState = afterStop
+        ? await unresolvedRecoverableApiErrorState(
+          afterStop.transcriptPath,
+          transcriptRoot,
+          afterStop.sessionId,
+        )
+        : null;
       if (!afterStop
           || !sameRegistrySession(afterStop, final)
           || !validSession(afterStopStore, afterStop)
-          || !await unresolvedRecoverableApiErrorState(
-            afterStop.transcriptPath,
-            transcriptRoot,
-            afterStop.sessionId,
-          )) continue;
+          || !afterStopState
+          || fleetRetryStillActive(afterStopState)) continue;
       if (finalInfo.processRole === 'teamclaude-child'
           || finalInfo.processRole === 'legacy-native') {
         const beforeLaunchInfo = await inspectProcess(final.pid, final.sessionId);
