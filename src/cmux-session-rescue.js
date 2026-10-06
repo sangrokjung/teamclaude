@@ -10,6 +10,7 @@ import {
   inspectClaudeProcess,
   inspectClaudeProcessTree,
   readPrivateJson,
+  releaseSessionClaim,
   resolveTrustedClaudePath,
   sameClaudeProcess,
   unresolvedRecoverableApiErrorState,
@@ -55,13 +56,7 @@ export function resolveRecoveryWindowId(tree, { surfaceId, workspaceId }) {
     : null;
 }
 
-async function defaultLaunchRecoveryWorkspace({
-  workspaceId,
-  surfaceId,
-  cwd,
-  sessionId,
-  command,
-}) {
+async function defaultResolveRecoveryWindow({ workspaceId, surfaceId }) {
   const cmuxBinary = await resolveCmuxBinary();
   const { stdout } = await execFileAsync(cmuxBinary, ['rpc', 'system.tree', '{}'], {
     timeout: 3000,
@@ -71,10 +66,26 @@ async function defaultLaunchRecoveryWorkspace({
   if (typeof windowId !== 'string') {
     throw new Error('Unable to resolve the cmux window for the blocked session.');
   }
+  return windowId;
+}
+
+async function defaultLaunchRecoveryWorkspace({
+  workspaceId,
+  surfaceId,
+  windowId = null,
+  cwd,
+  sessionId,
+  command,
+}) {
+  const cmuxBinary = await resolveCmuxBinary();
+  const resolvedWindowId = windowId || await defaultResolveRecoveryWindow({
+    workspaceId,
+    surfaceId,
+  });
   await execFileAsync(cmuxBinary, [
     'new-workspace',
     '--window',
-    windowId,
+    resolvedWindowId,
     '--name',
     `Recovered Claude ${sessionId.slice(0, 8)}`,
     '--cwd',
@@ -209,7 +220,9 @@ export async function rescueCmuxSessionsOnce({
   readStore = defaultReadStore,
   inspectProcess = inspectClaudeProcessTree,
   launchRecoveryWorkspace = defaultLaunchRecoveryWorkspace,
+  resolveRecoveryWindow = null,
   claimRecovery = claimSessionOnce,
+  releaseRecovery = releaseSessionClaim,
   stopProcess = stopExistingSessionProcess,
   stopInspectProcess = inspectClaudeProcess,
   trustedClaudePath = null,
@@ -317,39 +330,79 @@ export async function rescueCmuxSessionsOnce({
       configPath,
       continueLastPrompt: !['ambiguous_connection', 'ambiguous_dispatch'].includes(finalState.kind),
     });
+    let recoveryWindowId = null;
+    if (resolveRecoveryWindow
+        || launchRecoveryWorkspace === defaultLaunchRecoveryWorkspace) {
+      try {
+        recoveryWindowId = await (resolveRecoveryWindow || defaultResolveRecoveryWindow)({
+          workspaceId: final.workspaceId,
+          surfaceId: final.surfaceId,
+        });
+      } catch {
+        continue;
+      }
+    }
+    let claimOwned = false;
+    const releaseClaimForRetry = async () => {
+      if (!claimOwned) return;
+      const claimIdentity = typeof claimOwned === 'object' ? claimOwned : null;
+      claimOwned = false;
+      attempted.delete(key);
+      try {
+        await releaseRecovery(storePath, key, claimIdentity);
+      } catch {}
+    };
     try {
-      if (!await claimRecovery(storePath, key)) {
+      const claim = await claimRecovery(storePath, key);
+      if (!claim) {
         attempted.add(key);
         continue;
       }
+      claimOwned = claim;
       attempted.add(key);
       let claimedStore;
       try {
         claimedStore = await readStore(storePath);
       } catch {
+        await releaseClaimForRetry();
         continue;
       }
       const claimed = sessions(claimedStore).find(item => item?.sessionId === key);
       if (!claimed
           || !sameRegistrySession(claimed, final)
-          || !validSession(claimedStore, claimed)) continue;
+          || !validSession(claimedStore, claimed)) {
+        await releaseClaimForRetry();
+        continue;
+      }
       const claimedState = await unresolvedRecoverableApiErrorState(
         claimed.transcriptPath,
         transcriptRoot,
         claimed.sessionId,
       );
-      if (!claimedState || fleetRetryStillActive(claimedState)) continue;
+      if (!claimedState || fleetRetryStillActive(claimedState)) {
+        await releaseClaimForRetry();
+        continue;
+      }
       const claimedInfo = await inspectProcess(claimed.pid, claimed.sessionId);
       const claimedGone = processGone(claimedInfo, claimed.pid);
-      if (claimedGone !== finalGone) continue;
+      if (claimedGone !== finalGone) {
+        await releaseClaimForRetry();
+        continue;
+      }
       if (!claimedGone && !await sameClaudeProcess(
         claimed,
         claimedInfo,
         trustedClaudePath,
         finalInfo.processIdentity,
         finalInfo.launcherProcessIdentity,
-      )) continue;
-      if (!claimedGone && processStartedAfterRecoveryError(claimedInfo, claimedState)) continue;
+      )) {
+        await releaseClaimForRetry();
+        continue;
+      }
+      if (!claimedGone && processStartedAfterRecoveryError(claimedInfo, claimedState)) {
+        await releaseClaimForRetry();
+        continue;
+      }
       const recoveryParentPid = finalInfo.processRole === 'teamclaude-child'
         ? (finalInfo.launcherCommand?.pid ?? finalInfo.parentPid)
         : null;
@@ -357,6 +410,7 @@ export async function rescueCmuxSessionsOnce({
           || finalInfo.processRole === 'legacy-native')
           && Number.isInteger(finalInfo.pid)
           && !await stopProcess(finalInfo, recoveryParentPid, { inspectProcess: stopInspectProcess })) {
+        await releaseClaimForRetry();
         failed += 1;
         continue;
       }
@@ -366,44 +420,37 @@ export async function rescueCmuxSessionsOnce({
         if (afterStopInfo?.alive
             || processAlive(final.pid)
             || processAlive(recoveryParentPid)) {
+          await releaseClaimForRetry();
           failed += 1;
           continue;
         }
       }
-      let afterStopStore;
-      try {
-        afterStopStore = await readStore(storePath);
-      } catch {
-        failed += 1;
+      const afterStopState = await unresolvedRecoverableApiErrorState(
+        final.transcriptPath,
+        transcriptRoot,
+        final.sessionId,
+      );
+      if (!afterStopState || fleetRetryStillActive(afterStopState)) {
+        await releaseClaimForRetry();
         continue;
       }
-      const afterStop = sessions(afterStopStore).find(item => item?.sessionId === key);
-      const afterStopState = afterStop
-        ? await unresolvedRecoverableApiErrorState(
-          afterStop.transcriptPath,
-          transcriptRoot,
-          afterStop.sessionId,
-        )
-        : null;
-      if (!afterStop
-          || !sameRegistrySession(afterStop, final)
-          || !validSession(afterStopStore, afterStop)
-          || !afterStopState
-          || fleetRetryStillActive(afterStopState)) continue;
       if (finalInfo.processRole === 'teamclaude-child'
           || finalInfo.processRole === 'legacy-native') {
         const beforeLaunchInfo = await inspectProcess(final.pid, final.sessionId);
         if (beforeLaunchInfo?.alive || processAlive(final.pid)) {
+          await releaseClaimForRetry();
           failed += 1;
           continue;
         }
       } else if (finalGone && processAlive(final.pid)) {
+        await releaseClaimForRetry();
         failed += 1;
         continue;
       }
       await launchRecoveryWorkspace({
         workspaceId: final.workspaceId,
         surfaceId: final.surfaceId,
+        windowId: recoveryWindowId,
         cwd: final.cwd,
         sessionId: final.sessionId,
         command,
