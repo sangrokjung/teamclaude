@@ -832,6 +832,69 @@ test('passes the TeamClaude supervisor PID when rescuing its native child', asyn
   assert.equal(launches, 1);
 });
 
+test('accepts a recreated native child whose supervisor kept the session start time', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 - 2 * 60 * 60;
+  await writeFile(
+    fx.transcriptPath,
+    `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`,
+  );
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const supervisorPid = fx.session.pid;
+  const launcherCommand = {
+    pid: supervisorPid,
+    alive: true,
+    command: `${process.execPath} /tmp/teamcodex/src/index.js run -- --session-id ${SESSION_ID}`,
+    environmentValid: true,
+    executablePath: process.execPath,
+    cwd: fx.cwd,
+    launchArgv: [fx.executablePath],
+    processIdentity: `${supervisorPid}:supervisor`,
+    processStartedAt: fx.session.startedAt,
+    surfaceId: SURFACE_ID,
+    supervised: false,
+    teamClaudeBin: fx.executablePath,
+  };
+  const childInfo = {
+    ...processInfo(fx, {
+      pid: supervisorPid + 1,
+      processIdentity: `${supervisorPid + 1}:child`,
+      processStartedAt: errorAt / 1000 - 1,
+      executablePath: native,
+      launchArgv: [native, '--session-id', SESSION_ID],
+      command: `${native} --session-id ${SESSION_ID}`,
+      supervised: true,
+      processRole: 'teamclaude-child',
+      nativeExecutableTrusted: true,
+      parentPid: supervisorPid,
+      teamClaudeBin: fx.executablePath,
+      launcherCommand,
+      launcherProcessIdentity: launcherCommand.processIdentity,
+    }),
+  };
+  let stopped = false;
+  let launches = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    claimRecovery: async () => true,
+    inspectProcess: async () => (stopped ? { alive: false } : childInfo),
+    stopProcess: async () => {
+      stopped = true;
+      return true;
+    },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launches, 1);
+});
+
 test('fails closed when a fleet-exhausted transcript has no trustworthy timestamp', async t => {
   const fx = await fixture(t);
   const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 1));

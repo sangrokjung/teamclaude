@@ -340,7 +340,10 @@ export async function sameClaudeProcess(
 ) {
   const isTeamClaudeChild = info?.processRole === 'teamclaude-child';
   const isLegacyNative = info?.processRole === 'legacy-native';
-  const startDelta = session?.startedAt - info?.processStartedAt;
+  const processStartedAt = isTeamClaudeChild
+    ? (info.launcherCommand?.processStartedAt ?? info?.processStartedAt)
+    : info?.processStartedAt;
+  const startDelta = session?.startedAt - processStartedAt;
   if (!info?.alive
       || (info.environmentValid !== true && !isLegacyNative)
       || (info.supervised && !isTeamClaudeChild)
