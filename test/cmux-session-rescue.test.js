@@ -895,6 +895,66 @@ test('accepts a recreated native child whose supervisor kept the session start t
   assert.equal(launches, 1);
 });
 
+test('does not rescue a TeamClaude child recreated after the fleet error', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 - 2 * 60 * 60;
+  await writeFile(
+    fx.transcriptPath,
+    `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`,
+  );
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const supervisorPid = fx.session.pid;
+  const launcherCommand = {
+    pid: supervisorPid,
+    alive: true,
+    command: `${process.execPath} /tmp/teamcodex/src/index.js run -- --session-id ${SESSION_ID}`,
+    environmentValid: true,
+    executablePath: process.execPath,
+    cwd: fx.cwd,
+    launchArgv: [fx.executablePath],
+    processIdentity: `${supervisorPid}:supervisor`,
+    processStartedAt: fx.session.startedAt,
+    surfaceId: SURFACE_ID,
+    supervised: false,
+    teamClaudeBin: fx.executablePath,
+  };
+  const childInfo = {
+    ...processInfo(fx, {
+      pid: supervisorPid + 1,
+      processIdentity: `${supervisorPid + 1}:child`,
+      processStartedAt: errorAt / 1000 + 1,
+      executablePath: native,
+      launchArgv: [native, '--session-id', SESSION_ID],
+      command: `${native} --session-id ${SESSION_ID}`,
+      supervised: true,
+      processRole: 'teamclaude-child',
+      nativeExecutableTrusted: true,
+      parentPid: supervisorPid,
+      teamClaudeBin: fx.executablePath,
+      launcherCommand,
+      launcherProcessIdentity: launcherCommand.processIdentity,
+    }),
+  };
+  let stops = 0;
+  let launches = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => childInfo,
+    stopProcess: async () => { stops += 1; return true; },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
+  assert.equal(stops, 0);
+  assert.equal(launches, 0);
+});
+
 test('rescues a fleet-exhausted session after its TeamClaude supervisor exits', async t => {
   const fx = await fixture(t);
   fx.session.pid = 999999;
@@ -1076,6 +1136,43 @@ test('rechecks the transcript after claiming before launching a recovery workspa
   assert.equal(claims, 1);
   assert.equal(launches, 0);
   assert.equal(result.rescued, 0);
+});
+
+test('does not launch when the retry deadline moves forward after stopping', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(Date.now() - 5000).toISOString())}\n`);
+  let stopped = false;
+  let launches = 0;
+  const info = processInfo(fx, {
+    pid: fx.session.pid,
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    nativeExecutableTrusted: true,
+    launchArgv: null,
+    command: `${fx.executablePath} --resume ${SESSION_ID}`,
+  });
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    inspectProcess: async () => (stopped ? { alive: false } : info),
+    claimRecovery: async () => true,
+    stopProcess: async () => {
+      stopped = true;
+      await writeFile(
+        fx.transcriptPath,
+        `${fleetExhaustedRecord(fx.cwd, 600, new Date().toISOString())}\n`,
+      );
+      return true;
+    },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
+  assert.equal(launches, 0);
 });
 
 test('syncs and identity-checks the recovery claim directory before returning', async t => {
