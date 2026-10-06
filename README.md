@@ -544,6 +544,14 @@ prompt. This dedicated safe-reopen budget is independent of
 inference POST. Claude's optional feedback URL and `Request ID`
 diagnostic suffixes are recognized without treating ordinary prompt text as an
 API error. See [the ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md).
+When the proxy returns `All N accounts exhausted. Retry in Ns.`, the recovery
+parent does not retry early with the short generic backoff. It waits for the
+server-provided `Retry in` duration, then restarts the same session as
+`--resume <session-id> continue`. `claudeFleetExhaustionMaxRetries` controls
+how many fleet waits are allowed; `0` (the default) keeps waiting until the
+fleet recovers. Ctrl-C can cancel the parked launcher. When
+`codexFallbackOnExhaustion: true` has fresh evidence that the whole general
+quota fleet is exhausted, the existing Codex handoff still takes precedence.
 
 Existing Claude processes without a matching cmux registry record cannot acquire a recovery parent.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
@@ -866,6 +874,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
+| `claudeFleetExhaustionMaxRetries` | Maximum retries after the server reports that every Claude account is temporarily exhausted; `0` waits indefinitely until recovery (optional, default `0`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `claudeAmbiguousDispatchMaxResumes` | Dedicated same-session continuation budget for an exact structured post-dispatch 502. The proxy never replays the original POST; `0` disables launcher continuation, default `1`, and increasing it explicitly accepts duplicate inference/billing risk |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |

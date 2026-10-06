@@ -330,6 +330,7 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
   "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
   "autoResumeClaude": true,
+  "claudeFleetExhaustionMaxRetries": 0,
   "codexFallbackOnExhaustion": false,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,
@@ -348,6 +349,7 @@ Claude 配置文件为 `~/.config/teamclaude.json`，Codex 配置文件为
 | `continuityMaxSleepMs` | 连续性 probe 之间的最大间隔（默认 `30000` = 30 秒） |
 | `activeWarmup` | 通过最小请求预先测量账户用量 |
 | `autoResumeClaude` | 将 TeamClaude 启动的 Claude 会话在 timeout/429 后自动恢复为同一会话 |
+| `claudeFleetExhaustionMaxRetries` | 服务器报告所有 Claude 账户暂时耗尽后的最大重试次数；`0` 表示一直等待恢复 |
 | `codexFallbackOnExhaustion` | 仅在确认没有备用 Claude 账户或全部通用 quota 耗尽时转交 Codex |
 | `cmuxSessionRescue` | 检测现有 cmux Claude 会话的精确 `Login expired`，保留原 pane，并在同一 window 的新非聚焦 workspace 中恢复 |
 | `cmuxSessionRescueIntervalMs` | 检查现有 cmux 会话恢复的间隔（最小 500ms，默认 1000ms） |

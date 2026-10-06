@@ -110,7 +110,7 @@ async function waitForProcessExit(pid, timeoutMs) {
   return !processAlive(pid);
 }
 
-async function stopExistingSessionProcess(
+export async function stopExistingSessionProcess(
   info,
   parentPid,
   { inspectProcess = inspectClaudeProcess } = {},
@@ -131,20 +131,27 @@ async function stopExistingSessionProcess(
     }
     if (!current?.alive
         || current.processIdentity !== expected.get(pid)
-        || (pid === info?.pid && current.parentPid !== parentPid)) {
+        || (Number.isInteger(parentPid)
+          && pid === info?.pid
+          && current.parentPid !== parentPid)) {
       return false;
     }
     if (pid === parentPid && current.surfaceId !== info.surfaceId) return false;
+  }
+  const stopOrder = [...pids].sort((left, right) => (
+    left === parentPid ? -1 : right === parentPid ? 1 : 0
+  ));
+  for (const pid of stopOrder) {
     try {
       process.kill(pid, 'SIGTERM');
     } catch {}
   }
   let stopped = true;
-  for (const pid of pids) {
+  for (const pid of stopOrder) {
     if (!await waitForProcessExit(pid, 2500)) stopped = false;
   }
   if (!stopped) {
-    for (const pid of pids) {
+    for (const pid of stopOrder) {
       if (!processAlive(pid)) continue;
       let current;
       try {
@@ -158,7 +165,7 @@ async function stopExistingSessionProcess(
       } catch {}
     }
     stopped = true;
-    for (const pid of pids) {
+    for (const pid of stopOrder) {
       if (!await waitForProcessExit(pid, 750)) stopped = false;
     }
   }
@@ -321,22 +328,22 @@ export async function rescueCmuxSessionsOnce({
         finalInfo.processIdentity,
         finalInfo.launcherProcessIdentity,
       )) continue;
-      if (finalInfo.processRole === 'teamclaude-child'
+      const recoveryParentPid = finalInfo.processRole === 'teamclaude-child'
+        ? (finalInfo.launcherCommand?.pid ?? finalInfo.parentPid)
+        : null;
+      if ((finalInfo.processRole === 'teamclaude-child'
+          || finalInfo.processRole === 'legacy-native')
           && Number.isInteger(finalInfo.pid)
-          && !await stopProcess(finalInfo, final.pid, { inspectProcess: inspectClaudeProcess })) {
-        failed += 1;
-        continue;
-      }
-      if (finalInfo.processRole === 'legacy-native'
-          && Number.isInteger(finalInfo.pid)
-          && !await stopProcess(finalInfo, null, { inspectProcess: inspectClaudeProcess })) {
+          && !await stopProcess(finalInfo, recoveryParentPid, { inspectProcess: inspectClaudeProcess })) {
         failed += 1;
         continue;
       }
       if (finalInfo.processRole === 'teamclaude-child'
           || finalInfo.processRole === 'legacy-native') {
         const afterStopInfo = await inspectProcess(final.pid, final.sessionId);
-        if (afterStopInfo?.alive || processAlive(final.pid)) {
+        if (afterStopInfo?.alive
+            || processAlive(final.pid)
+            || processAlive(recoveryParentPid)) {
           failed += 1;
           continue;
         }

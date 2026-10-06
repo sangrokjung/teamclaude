@@ -18,6 +18,7 @@ import {
   createCmuxSessionRescuer,
   rescueCmuxSessionsOnce,
   resolveRecoveryWindowId,
+  stopExistingSessionProcess,
 } from '../src/cmux-session-rescue.js';
 import {
   claimSessionOnce,
@@ -545,6 +546,92 @@ test('accepts a legacy native Claude PID when the registry stores the child dire
     }, fx.executablePath),
     true,
   );
+});
+
+test('stops a legacy native process without requiring a parent identity', async t => {
+  const child = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
+  await once(child, 'spawn');
+  t.after(() => {
+    if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL');
+  });
+  const result = await stopExistingSessionProcess({
+    pid: child.pid,
+    processIdentity: 'legacy-process',
+    surfaceId: SURFACE_ID,
+  }, null, {
+    inspectProcess: async pid => ({
+      alive: pid === child.pid && child.exitCode == null && child.signalCode == null,
+      pid,
+      processIdentity: 'legacy-process',
+    }),
+  });
+  assert.equal(result, true);
+  if (child.exitCode == null && child.signalCode == null) await once(child, 'exit');
+});
+
+async function supervisedProcessFixture(t) {
+  const parent = spawn(process.execPath, ['-e', [
+    "const {spawn}=require('node:child_process');",
+    "const child=spawn('/bin/sleep',['30']);",
+    "console.log(child.pid);",
+    "setInterval(()=>{},1000);",
+  ].join('')], { stdio: ['ignore', 'pipe', 'ignore'] });
+  await once(parent, 'spawn');
+  const [line] = await once(parent.stdout, 'data');
+  const childPid = Number(String(line).trim());
+  assert.ok(Number.isInteger(childPid));
+  t.after(() => {
+    if (parent.exitCode == null && parent.signalCode == null) parent.kill('SIGKILL');
+    try { process.kill(childPid, 'SIGKILL'); } catch {}
+  });
+  return { parent, childPid };
+}
+
+test('validates both supervisor and native child before stopping either process', async t => {
+  const { parent, childPid } = await supervisedProcessFixture(t);
+  const parentPid = parent.pid;
+  const identities = new Map([[parentPid, 'supervisor-process'], [childPid, 'native-process']]);
+  const inspectProcess = async pid => ({
+    alive: (pid === parentPid ? parent.exitCode : null) == null
+      && (pid === childPid ? true : pid === parentPid),
+    pid,
+    processIdentity: identities.get(pid),
+    parentPid: pid === childPid ? parentPid : null,
+    surfaceId: SURFACE_ID,
+  });
+  const result = await stopExistingSessionProcess({
+    pid: childPid,
+    processIdentity: 'native-process',
+    parentPid,
+    surfaceId: SURFACE_ID,
+    launcherProcessIdentity: 'supervisor-process',
+  }, parentPid, { inspectProcess });
+  assert.equal(result, true);
+  if (parent.exitCode == null && parent.signalCode == null) await once(parent, 'exit');
+  assert.throws(() => process.kill(childPid, 0));
+});
+
+test('does not stop any process when supervisor identity validation fails', async t => {
+  const { parent, childPid } = await supervisedProcessFixture(t);
+  const parentPid = parent.pid;
+  const result = await stopExistingSessionProcess({
+    pid: childPid,
+    processIdentity: 'native-process',
+    parentPid,
+    surfaceId: SURFACE_ID,
+    launcherProcessIdentity: 'expected-supervisor',
+  }, parentPid, {
+    inspectProcess: async pid => ({
+      alive: true,
+      pid,
+      processIdentity: pid === childPid ? 'native-process' : 'different-supervisor',
+      parentPid: pid === childPid ? parentPid : null,
+      surfaceId: SURFACE_ID,
+    }),
+  });
+  assert.equal(result, false);
+  assert.equal(parent.exitCode, null);
+  assert.equal(childPid > 0, true);
 });
 
 test('does not rescue a fleet-exhausted transcript before its server retry deadline', async t => {
