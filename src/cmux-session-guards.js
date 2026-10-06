@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 
@@ -221,13 +221,37 @@ export async function claimSessionOnce(
         || !sameIdentity(currentClaim, claimInfo)) {
       throw new Error('Recovery claim identity changed.');
     }
-    return true;
+    return { dev: claimInfo.dev, ino: claimInfo.ino };
   } catch (err) {
     if (err.code === 'EEXIST') return false;
     throw err;
   } finally {
     await handle?.close();
     await directoryHandle.close();
+  }
+}
+
+export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
+  const claimDir = `${storePath}.recovery-claims`;
+  let directoryHandle;
+  try {
+    const directory = await openPrivateDirectory(claimDir);
+    directoryHandle = directory.handle;
+    const claimPath = join(claimDir, sessionId);
+    const claimInfo = await lstat(claimPath);
+    if (!ownedPrivate(claimInfo, 'isFile')) {
+      throw new Error('Untrusted recovery claim.');
+    }
+    if (expectedIdentity
+        && !sameIdentity(claimInfo, expectedIdentity)) return false;
+    await unlink(claimPath);
+    await directoryHandle.sync();
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  } finally {
+    await directoryHandle?.close();
   }
 }
 

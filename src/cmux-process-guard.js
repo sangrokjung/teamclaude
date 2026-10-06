@@ -38,6 +38,20 @@ function parseProcessTable(text) {
   return rows;
 }
 
+async function directChildRows(pid) {
+  const { stdout: childPids } = await execFileAsync('pgrep', ['-P', String(pid)], {
+    timeout: 1000,
+  });
+  const pids = childPids.split(/\s+/).filter(Boolean);
+  if (pids.length === 0) return [];
+  const { stdout } = await execFileAsync(
+    'ps',
+    ['-p', pids.join(','), '-o', 'pid=,ppid=,command='],
+    { timeout: 1500, env: { ...process.env, LC_ALL: 'C' } },
+  );
+  return parseProcessTable(stdout);
+}
+
 function escapedRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -48,6 +62,10 @@ function selectorFromCommand(command, sessionId) {
     new RegExp(`(?:^|\\s)(--resume|--session-id)(?:=|\\s+)${session}(?=\\s|$)`),
   );
   return match?.[1] || null;
+}
+
+function hasSessionSelector(command) {
+  return /(?:^|\s)(?:--resume|--session-id)(?:=|\s+)/.test(command);
 }
 
 const CLAUDE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
@@ -89,7 +107,8 @@ function childLooksLikeClaude(info, sessionId) {
     && info.supervised === true
     && info.agentLaunchKind === 'claude'
     && info.nativeExecutableTrusted === true
-    && typeof selectorFromCommand(info.command, sessionId) === 'string'
+    && (!hasSessionSelector(info.command)
+      || typeof selectorFromCommand(info.command, sessionId) === 'string')
     && typeof info.teamClaudeBin === 'string'
     && info.teamClaudeBin.length > 0;
 }
@@ -240,6 +259,31 @@ export async function inspectClaudeProcessTree(
   if (!isTeamClaudeSupervisor(supervisor)) return { alive: false };
   let table;
   try {
+    const directRows = await directChildRows(pid);
+    const prioritized = directRows.sort((left, right) => {
+      const leftPriority = selectorFromCommand(left.command, sessionId)
+        || /\/claude\/versions\//.test(left.command) ? 0 : 1;
+      const rightPriority = selectorFromCommand(right.command, sessionId)
+        || /\/claude\/versions\//.test(right.command) ? 0 : 1;
+      return leftPriority - rightPriority;
+    });
+    for (const row of prioritized) {
+      const child = await inspectProcess(row.pid);
+      if (childLooksLikeClaude(child, sessionId)
+          && child.parentPid === pid
+          && child.surfaceId === supervisor.surfaceId
+          && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
+        return {
+          ...child,
+          processRole: 'teamclaude-child',
+          launcherCommand: supervisor,
+          launcherProcessIdentity: supervisor.processIdentity,
+        };
+      }
+    }
+    if (directRows.length === 0) throw new Error('No direct child.');
+  } catch {}
+  try {
     const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
       timeout: 2500,
       env: { ...process.env, LC_ALL: 'C' },
@@ -254,25 +298,32 @@ export async function inspectClaudeProcessTree(
     list.push(row);
     childrenByParent.set(row.ppid, list);
   }
-  const queue = [...(childrenByParent.get(pid) || [])];
+  let queue = [...(childrenByParent.get(pid) || [])];
   const seen = new Set();
   while (queue.length > 0 && seen.size < 64) {
     const row = queue.shift();
     if (seen.has(row.pid)) continue;
     seen.add(row.pid);
-    const child = await inspectProcess(row.pid);
-    if (childLooksLikeClaude(child, sessionId)
-        && child.parentPid === pid
-        && child.surfaceId === supervisor.surfaceId
-        && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
-      return {
-        ...child,
-        processRole: 'teamclaude-child',
-        launcherCommand: supervisor,
-        launcherProcessIdentity: supervisor.processIdentity,
-      };
+    if (selectorFromCommand(row.command, sessionId)) {
+      const child = await inspectProcess(row.pid);
+      if (childLooksLikeClaude(child, sessionId)
+          && child.parentPid === pid
+          && child.surfaceId === supervisor.surfaceId
+          && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
+        return {
+          ...child,
+          processRole: 'teamclaude-child',
+          launcherCommand: supervisor,
+          launcherProcessIdentity: supervisor.processIdentity,
+        };
+      }
     }
-    queue.push(...(childrenByParent.get(row.pid) || []));
+    const descendants = childrenByParent.get(row.pid) || [];
+    if (descendants.length > 0) {
+      const matching = descendants.filter(child => selectorFromCommand(child.command, sessionId));
+      const remaining = descendants.filter(child => !selectorFromCommand(child.command, sessionId));
+      queue = [...matching, ...queue, ...remaining];
+    }
   }
   return { alive: false };
 }
@@ -302,7 +353,9 @@ function selectorMatches(info, sessionId) {
     `^${executable}\\s+--(?:resume|session-id)(?:=|\\s+)${session}(?=\\s|$)`,
   );
   if (info.processRole === 'teamclaude-child' || info.processRole === 'legacy-native') {
-    if (!selectorFromCommand(info.command, sessionId)) return false;
+    if (hasSessionSelector(info.command) && !selectorFromCommand(info.command, sessionId)) {
+      return false;
+    }
     if (info.processRole === 'legacy-native' && !Array.isArray(info.launchArgv)) return true;
   } else if (!renderedPrefix.test(info.command)) {
     return false;
