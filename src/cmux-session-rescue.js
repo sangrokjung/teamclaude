@@ -1,20 +1,37 @@
 import { execFile } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   buildResumeCommand,
   claimSessionOnce,
-  hasUnresolvedRecoverableApiError,
   inspectClaudeProcess,
+  inspectClaudeProcessTree,
   readPrivateJson,
   resolveTrustedClaudePath,
   sameClaudeProcess,
-  unresolvedRecoverableApiErrorKind,
+  unresolvedRecoverableApiErrorState,
   validSession,
 } from './cmux-session-guards.js';
 
 const execFileAsync = promisify(execFile);
+
+const CMUX_BINARY_CANDIDATES = [
+  '/opt/homebrew/bin/cmux',
+  '/usr/local/bin/cmux',
+  '/Applications/cmux.app/Contents/Resources/bin/cmux',
+];
+
+async function resolveCmuxBinary() {
+  for (const candidate of CMUX_BINARY_CANDIDATES) {
+    if (await access(candidate, constants.X_OK).then(() => true, () => false)) {
+      return candidate;
+    }
+  }
+  throw new Error('Unable to resolve the cmux executable.');
+}
 
 function sessions(store) {
   return store?.sessions && typeof store.sessions === 'object'
@@ -45,7 +62,8 @@ async function defaultLaunchRecoveryWorkspace({
   sessionId,
   command,
 }) {
-  const { stdout } = await execFileAsync('cmux', ['rpc', 'system.tree', '{}'], {
+  const cmuxBinary = await resolveCmuxBinary();
+  const { stdout } = await execFileAsync(cmuxBinary, ['rpc', 'system.tree', '{}'], {
     timeout: 3000,
   });
   const tree = JSON.parse(stdout);
@@ -53,7 +71,7 @@ async function defaultLaunchRecoveryWorkspace({
   if (typeof windowId !== 'string') {
     throw new Error('Unable to resolve the cmux window for the blocked session.');
   }
-  await execFileAsync('cmux', [
+  await execFileAsync(cmuxBinary, [
     'new-workspace',
     '--window',
     windowId,
@@ -74,6 +92,96 @@ async function defaultReadStore(path) {
   return readPrivateJson(path);
 }
 
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !processAlive(pid);
+}
+
+async function stopExistingSessionProcess(
+  info,
+  parentPid,
+  { inspectProcess = inspectClaudeProcess } = {},
+) {
+  const pids = [info?.pid, parentPid].filter(
+    (pid, index, values) => Number.isInteger(pid) && pid > 0 && values.indexOf(pid) === index,
+  );
+  const expected = new Map([[info?.pid, info?.processIdentity]]);
+  if (Number.isInteger(parentPid)) {
+    expected.set(parentPid, info?.launcherProcessIdentity);
+  }
+  for (const pid of pids) {
+    let current;
+    try {
+      current = await inspectProcess(pid);
+    } catch {
+      return false;
+    }
+    if (!current?.alive
+        || current.processIdentity !== expected.get(pid)
+        || (pid === info?.pid && current.parentPid !== parentPid)) {
+      return false;
+    }
+    if (pid === parentPid && current.surfaceId !== info.surfaceId) return false;
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {}
+  }
+  let stopped = true;
+  for (const pid of pids) {
+    if (!await waitForProcessExit(pid, 2500)) stopped = false;
+  }
+  if (!stopped) {
+    for (const pid of pids) {
+      if (!processAlive(pid)) continue;
+      let current;
+      try {
+        current = await inspectProcess(pid);
+      } catch {
+        return false;
+      }
+      if (!current?.alive || current.processIdentity !== expected.get(pid)) return false;
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
+    stopped = true;
+    for (const pid of pids) {
+      if (!await waitForProcessExit(pid, 750)) stopped = false;
+    }
+  }
+  return stopped;
+}
+
+function fleetRetryStillActive(state, now = Date.now()) {
+  if (state?.kind !== 'fleet_exhausted') return false;
+  if (!Number.isSafeInteger(state.retryAfterSeconds)
+      || state.retryAfterSeconds <= 0
+      || !Number.isSafeInteger(state.timestampMs)
+      || state.timestampMs < 0) return true;
+  const deadline = state.timestampMs + state.retryAfterSeconds * 1000;
+  if (!Number.isSafeInteger(deadline)) return true;
+  return now < deadline;
+}
+
+function sameRegistrySession(left, right) {
+  return left?.sessionId === right?.sessionId
+    && left?.pid === right?.pid
+    && left?.workspaceId === right?.workspaceId;
+}
+
 export async function rescueCmuxSessionsOnce({
   storePath,
   transcriptRoot,
@@ -82,9 +190,10 @@ export async function rescueCmuxSessionsOnce({
   configPath = null,
   attempted = new Set(),
   readStore = defaultReadStore,
-  inspectProcess = inspectClaudeProcess,
+  inspectProcess = inspectClaudeProcessTree,
   launchRecoveryWorkspace = defaultLaunchRecoveryWorkspace,
   claimRecovery = claimSessionOnce,
+  stopProcess = stopExistingSessionProcess,
   trustedClaudePath = null,
 }) {
   let store;
@@ -94,7 +203,7 @@ export async function rescueCmuxSessionsOnce({
     return { scanned: 0, candidates: 0, rescued: 0, failed: 0 };
   }
 
-  if (!trustedClaudePath && inspectProcess === inspectClaudeProcess) {
+  if (!trustedClaudePath && inspectProcess === inspectClaudeProcessTree) {
     try {
       trustedClaudePath = await resolveTrustedClaudePath();
     } catch {
@@ -108,12 +217,14 @@ export async function rescueCmuxSessionsOnce({
   const currentSessions = sessions(store);
   for (const session of currentSessions) {
     if (!validSession(store, session)) continue;
-    if (!await hasUnresolvedRecoverableApiError(
+    const initialState = await unresolvedRecoverableApiErrorState(
       session.transcriptPath,
       transcriptRoot,
       session.sessionId,
-    )) continue;
+    );
+    if (!initialState) continue;
     candidates += 1;
+    if (fleetRetryStillActive(initialState)) continue;
     const key = session.sessionId;
     if (attempted.has(key)) continue;
 
@@ -128,20 +239,22 @@ export async function rescueCmuxSessionsOnce({
         || fresh.pid !== session.pid
         || fresh.workspaceId !== session.workspaceId
         || !validSession(freshStore, fresh)) continue;
-    if (!await hasUnresolvedRecoverableApiError(
+    const freshState = await unresolvedRecoverableApiErrorState(
       fresh.transcriptPath,
       transcriptRoot,
       fresh.sessionId,
-    )) continue;
+    );
+    if (!freshState || fleetRetryStillActive(freshState)) continue;
 
-    const first = await inspectProcess(fresh.pid);
+    const first = await inspectProcess(fresh.pid, fresh.sessionId);
     if (!await sameClaudeProcess(fresh, first, trustedClaudePath)) continue;
-    const second = await inspectProcess(fresh.pid);
+    const second = await inspectProcess(fresh.pid, fresh.sessionId);
     if (!await sameClaudeProcess(
       fresh,
       second,
       trustedClaudePath,
       first.processIdentity,
+      first.launcherProcessIdentity,
     )) continue;
 
     let finalStore;
@@ -155,18 +268,19 @@ export async function rescueCmuxSessionsOnce({
         || final.pid !== fresh.pid
         || final.workspaceId !== fresh.workspaceId
         || !validSession(finalStore, final)) continue;
-    const finalFailureKind = await unresolvedRecoverableApiErrorKind(
+    const finalState = await unresolvedRecoverableApiErrorState(
       final.transcriptPath,
       transcriptRoot,
       final.sessionId,
     );
-    if (!finalFailureKind) continue;
-    const finalInfo = await inspectProcess(final.pid);
+    if (!finalState || fleetRetryStillActive(finalState)) continue;
+    const finalInfo = await inspectProcess(final.pid, final.sessionId);
     if (!await sameClaudeProcess(
       final,
       finalInfo,
       trustedClaudePath,
       first.processIdentity,
+      first.launcherProcessIdentity,
     )) continue;
 
     const command = buildResumeCommand({
@@ -175,7 +289,7 @@ export async function rescueCmuxSessionsOnce({
       nodePath,
       scriptPath,
       configPath,
-      continueLastPrompt: !['ambiguous_connection', 'ambiguous_dispatch'].includes(finalFailureKind),
+      continueLastPrompt: !['ambiguous_connection', 'ambiguous_dispatch'].includes(finalState.kind),
     });
     try {
       if (!await claimRecovery(storePath, key)) {
@@ -183,6 +297,74 @@ export async function rescueCmuxSessionsOnce({
         continue;
       }
       attempted.add(key);
+      let claimedStore;
+      try {
+        claimedStore = await readStore(storePath);
+      } catch {
+        continue;
+      }
+      const claimed = sessions(claimedStore).find(item => item?.sessionId === key);
+      if (!claimed
+          || !sameRegistrySession(claimed, final)
+          || !validSession(claimedStore, claimed)) continue;
+      const claimedState = await unresolvedRecoverableApiErrorState(
+        claimed.transcriptPath,
+        transcriptRoot,
+        claimed.sessionId,
+      );
+      if (!claimedState || fleetRetryStillActive(claimedState)) continue;
+      const claimedInfo = await inspectProcess(claimed.pid, claimed.sessionId);
+      if (!await sameClaudeProcess(
+        claimed,
+        claimedInfo,
+        trustedClaudePath,
+        finalInfo.processIdentity,
+        finalInfo.launcherProcessIdentity,
+      )) continue;
+      if (finalInfo.processRole === 'teamclaude-child'
+          && Number.isInteger(finalInfo.pid)
+          && !await stopProcess(finalInfo, final.pid, { inspectProcess: inspectClaudeProcess })) {
+        failed += 1;
+        continue;
+      }
+      if (finalInfo.processRole === 'legacy-native'
+          && Number.isInteger(finalInfo.pid)
+          && !await stopProcess(finalInfo, null, { inspectProcess: inspectClaudeProcess })) {
+        failed += 1;
+        continue;
+      }
+      if (finalInfo.processRole === 'teamclaude-child'
+          || finalInfo.processRole === 'legacy-native') {
+        const afterStopInfo = await inspectProcess(final.pid, final.sessionId);
+        if (afterStopInfo?.alive || processAlive(final.pid)) {
+          failed += 1;
+          continue;
+        }
+      }
+      let afterStopStore;
+      try {
+        afterStopStore = await readStore(storePath);
+      } catch {
+        failed += 1;
+        continue;
+      }
+      const afterStop = sessions(afterStopStore).find(item => item?.sessionId === key);
+      if (!afterStop
+          || !sameRegistrySession(afterStop, final)
+          || !validSession(afterStopStore, afterStop)
+          || !await unresolvedRecoverableApiErrorState(
+            afterStop.transcriptPath,
+            transcriptRoot,
+            afterStop.sessionId,
+          )) continue;
+      if (finalInfo.processRole === 'teamclaude-child'
+          || finalInfo.processRole === 'legacy-native') {
+        const beforeLaunchInfo = await inspectProcess(final.pid, final.sessionId);
+        if (beforeLaunchInfo?.alive || processAlive(final.pid)) {
+          failed += 1;
+          continue;
+        }
+      }
       await launchRecoveryWorkspace({
         workspaceId: final.workspaceId,
         surfaceId: final.surfaceId,

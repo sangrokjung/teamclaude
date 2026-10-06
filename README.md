@@ -545,10 +545,10 @@ inference POST. Claude's optional feedback URL and `Request ID`
 diagnostic suffixes are recognized without treating ordinary prompt text as an
 API error. See [the ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md).
 
-Existing Claude processes cannot acquire a recovery parent retroactively.
+Existing Claude processes without a matching cmux registry record cannot acquire a recovery parent.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
-cmux's session registry for an unresolved `Login expired`, connection-loss, or
-ambiguous-dispatch 502 API event. It continues
+cmux's session registry for an unresolved `Login expired`, connection-loss,
+ambiguous-dispatch 502, or fleet-exhaustion API event. It continues
 only owner-private registry/transcript files whose active session ID, exact
 process selector and start time, trusted Claude executable, cmux surface,
 working directory, and transcript root all still match. The verified live
@@ -557,7 +557,8 @@ the recorded workspace. Stale, redirected, or already supervised records fail
 closed. After a final registry and process recheck, TeamClaude durably claims
 the session and opens one non-focused workspace in the same cmux window. The
 same session is not replayed after a supervisor restart, even when the workspace
-launch result was uncertain. The blocked legacy pane remains untouched. This
+launch result was uncertain. Fleet exhaustion is rescued only after the transcript's
+server-provided retry deadline. The blocked legacy pane remains untouched. This
 option is off by default because it adds a recovery workspace for each affected
 legacy session.
 
@@ -874,6 +875,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `codexResetCreditsReserve` | Keep this many credits per account unredeemed by the automatic policy (optional, default `0`). The local operator endpoint `POST /teamclaude/codex/reset-credit?account=<name>` (loopback + proxy API key) ignores policy, cooldown and reserve |
 | `codexResetCreditsTimeoutMs` | Timeout for one redemption POST (optional, default `10000`). A timeout, network error or 5xx is treated as *indeterminate*: the account is re-polled and no other account is tried for that request, because the credit may already be gone |
 | `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on exact `Login expired`, connection-loss, or ambiguous-dispatch 502 events; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on `Login expired`, connection-loss, ambiguous-dispatch 502, or fleet exhaustion; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. Fleet exhaustion waits for the transcript's server retry deadline. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)
