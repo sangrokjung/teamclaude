@@ -895,6 +895,32 @@ test('accepts a recreated native child whose supervisor kept the session start t
   assert.equal(launches, 1);
 });
 
+test('rescues a fleet-exhausted session after its TeamClaude supervisor exits', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const errorAt = Date.now() - 5000;
+  await writeFile(
+    fx.transcriptPath,
+    `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`,
+  );
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  let launches = 0;
+  let stops = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    inspectProcess: async () => ({ alive: false }),
+    claimRecovery: async () => true,
+    stopProcess: async () => { stops += 1; return true; },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launches, 1);
+  assert.equal(stops, 0);
+});
+
 test('fails closed when a fleet-exhausted transcript has no trustworthy timestamp', async t => {
   const fx = await fixture(t);
   const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 1));

@@ -189,6 +189,10 @@ function processStartedAfterRecoveryError(info, state) {
     && info.processStartedAt * 1000 > state.timestampMs;
 }
 
+function processGone(info, pid) {
+  return !info?.alive && !processAlive(pid);
+}
+
 function sameRegistrySession(left, right) {
   return left?.sessionId === right?.sessionId
     && left?.pid === right?.pid
@@ -261,17 +265,20 @@ export async function rescueCmuxSessionsOnce({
     if (!freshState || fleetRetryStillActive(freshState)) continue;
 
     const first = await inspectProcess(fresh.pid, fresh.sessionId);
-    if (!await sameClaudeProcess(fresh, first, trustedClaudePath)) continue;
-    if (processStartedAfterRecoveryError(first, freshState)) continue;
+    const firstGone = processGone(first, fresh.pid);
+    if (!firstGone && !await sameClaudeProcess(fresh, first, trustedClaudePath)) continue;
+    if (!firstGone && processStartedAfterRecoveryError(first, freshState)) continue;
     const second = await inspectProcess(fresh.pid, fresh.sessionId);
-    if (!await sameClaudeProcess(
+    const secondGone = processGone(second, fresh.pid);
+    if (firstGone !== secondGone) continue;
+    if (!secondGone && !await sameClaudeProcess(
       fresh,
       second,
       trustedClaudePath,
       first.processIdentity,
       first.launcherProcessIdentity,
     )) continue;
-    if (processStartedAfterRecoveryError(second, freshState)) continue;
+    if (!secondGone && processStartedAfterRecoveryError(second, freshState)) continue;
 
     let finalStore;
     try {
@@ -291,14 +298,16 @@ export async function rescueCmuxSessionsOnce({
     );
     if (!finalState || fleetRetryStillActive(finalState)) continue;
     const finalInfo = await inspectProcess(final.pid, final.sessionId);
-    if (!await sameClaudeProcess(
+    const finalGone = processGone(finalInfo, final.pid);
+    if (finalGone !== secondGone) continue;
+    if (!finalGone && !await sameClaudeProcess(
       final,
       finalInfo,
       trustedClaudePath,
       first.processIdentity,
       first.launcherProcessIdentity,
     )) continue;
-    if (processStartedAfterRecoveryError(finalInfo, finalState)) continue;
+    if (!finalGone && processStartedAfterRecoveryError(finalInfo, finalState)) continue;
 
     const command = buildResumeCommand({
       cwd: final.cwd,
@@ -331,14 +340,16 @@ export async function rescueCmuxSessionsOnce({
       );
       if (!claimedState || fleetRetryStillActive(claimedState)) continue;
       const claimedInfo = await inspectProcess(claimed.pid, claimed.sessionId);
-      if (!await sameClaudeProcess(
+      const claimedGone = processGone(claimedInfo, claimed.pid);
+      if (claimedGone !== finalGone) continue;
+      if (!claimedGone && !await sameClaudeProcess(
         claimed,
         claimedInfo,
         trustedClaudePath,
         finalInfo.processIdentity,
         finalInfo.launcherProcessIdentity,
       )) continue;
-      if (processStartedAfterRecoveryError(claimedInfo, claimedState)) continue;
+      if (!claimedGone && processStartedAfterRecoveryError(claimedInfo, claimedState)) continue;
       const recoveryParentPid = finalInfo.processRole === 'teamclaude-child'
         ? (finalInfo.launcherCommand?.pid ?? finalInfo.parentPid)
         : null;
@@ -382,6 +393,9 @@ export async function rescueCmuxSessionsOnce({
           failed += 1;
           continue;
         }
+      } else if (finalGone && processAlive(final.pid)) {
+        failed += 1;
+        continue;
       }
       await launchRecoveryWorkspace({
         workspaceId: final.workspaceId,
