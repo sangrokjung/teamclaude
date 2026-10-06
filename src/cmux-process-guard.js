@@ -192,15 +192,29 @@ export async function inspectClaudeProcess(pid) {
   }
 }
 
-export async function inspectClaudeProcessTree(pid, sessionId) {
+export async function inspectClaudeProcessTree(
+  pid,
+  sessionId,
+  { inspectProcess = inspectClaudeProcess } = {},
+) {
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
     return { alive: false };
   }
-  const inspected = await inspectClaudeProcess(pid);
+  const inspected = await inspectProcess(pid);
   let supervisor = inspected;
   let directChild = null;
   if (!isTeamClaudeSupervisor(supervisor)
       && legacyNativeLooksLikeClaude(inspected, sessionId)) {
+    if (Number.isInteger(inspected.parentPid)) {
+      const parent = await inspectProcess(inspected.parentPid);
+      if (isTeamClaudeSupervisor(parent)
+          && parent.surfaceId === inspected.surfaceId
+          && (!parent.teamClaudeBin
+            || !inspected.teamClaudeBin
+            || parent.teamClaudeBin === inspected.teamClaudeBin)) {
+        return { alive: false };
+      }
+    }
     return {
       ...inspected,
       processRole: 'legacy-native',
@@ -209,7 +223,7 @@ export async function inspectClaudeProcessTree(pid, sessionId) {
   if (!isTeamClaudeSupervisor(supervisor)
       && childLooksLikeClaude(inspected, sessionId)
       && Number.isInteger(inspected.parentPid)) {
-    supervisor = await inspectClaudeProcess(inspected.parentPid);
+    supervisor = await inspectProcess(inspected.parentPid);
     directChild = inspected;
   }
   if (directChild
@@ -246,7 +260,7 @@ export async function inspectClaudeProcessTree(pid, sessionId) {
     const row = queue.shift();
     if (seen.has(row.pid)) continue;
     seen.add(row.pid);
-    const child = await inspectClaudeProcess(row.pid);
+    const child = await inspectProcess(row.pid);
     if (childLooksLikeClaude(child, sessionId)
         && child.parentPid === pid
         && child.surfaceId === supervisor.surfaceId

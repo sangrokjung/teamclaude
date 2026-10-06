@@ -23,6 +23,7 @@ import {
 import {
   claimSessionOnce,
   inspectClaudeProcess,
+  inspectClaudeProcessTree,
   sameClaudeProcess,
 } from '../src/cmux-session-guards.js';
 
@@ -447,6 +448,34 @@ test('accepts a legacy native Claude PID when the registry stores the child dire
   );
 });
 
+test('does not adopt a legacy native child that still has a TeamClaude supervisor', async () => {
+  const supervisorPid = 54321;
+  const childPid = 54322;
+  const supervisor = {
+    alive: true,
+    command: '/tmp/teamcodex/src/index.js run -- --session-id ' + SESSION_ID,
+    environmentValid: true,
+    launchArgv: ['/tmp/teamclaude'],
+    teamClaudeBin: '/tmp/teamclaude',
+    supervised: false,
+    surfaceId: SURFACE_ID,
+  };
+  const child = {
+    alive: true,
+    command: `/Users/sangrok/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    legacyEnvironmentValid: true,
+    nativeExecutableTrusted: true,
+    supervised: false,
+    surfaceId: SURFACE_ID,
+    parentPid: supervisorPid,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+  const result = await inspectClaudeProcessTree(childPid, SESSION_ID, {
+    inspectProcess: async pid => pid === childPid ? child : supervisor,
+  });
+  assert.equal(result.alive, false);
+});
+
 test('stops a legacy native process without requiring a parent identity', async t => {
   const child = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
   await once(child, 'spawn');
@@ -547,6 +576,159 @@ test('does not rescue a fleet-exhausted transcript before its server retry deadl
   });
   assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
   assert.equal(launches, 0);
+});
+
+test('does not rescue a process that started after the fleet error', async t => {
+  const fx = await fixture(t);
+  const errorTimestamp = new Date(Date.now() - 5000).toISOString();
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, errorTimestamp)}\n`);
+  fx.session.startedAt = Date.now() / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const processStartedAt = Date.now() / 1000;
+  let stopped = false;
+  let launches = 0;
+  const info = processInfo(fx, {
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    launchArgv: null,
+    nativeExecutableTrusted: true,
+    command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    processStartedAt,
+  });
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => (stopped ? { alive: false } : info),
+    stopProcess: async () => {
+      stopped = true;
+      return true;
+    },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
+  assert.equal(launches, 0);
+});
+
+test('runs the full legacy rescue path and passes the stop inspector through', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const errorAt = Date.now() - 5000;
+  await writeFile(
+    fx.transcriptPath,
+    `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`,
+  );
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  let stopped = false;
+  let stopOptions = null;
+  let receivedStopInfo = null;
+  let receivedParentPid = 'unset';
+  let launches = 0;
+  const info = processInfo(fx, {
+    pid: fx.session.pid,
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    launchArgv: null,
+    nativeExecutableTrusted: true,
+    command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    processStartedAt: fx.session.startedAt - 1.5,
+  });
+  const stopInspectProcess = async () => ({ alive: false });
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    claimRecovery: async () => true,
+    inspectProcess: async () => (stopped ? { alive: false } : info),
+    stopInspectProcess,
+    stopProcess: async (receivedInfo, parentPid, options) => {
+      receivedStopInfo = receivedInfo;
+      receivedParentPid = parentPid;
+      stopOptions = options;
+      stopped = true;
+      return true;
+    },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(launches, 1);
+  assert.equal(receivedStopInfo.processRole, 'legacy-native');
+  assert.equal(receivedParentPid, null);
+  assert.equal(stopOptions.inspectProcess, stopInspectProcess);
+});
+
+test('passes the TeamClaude supervisor PID when rescuing its native child', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  const errorAt = Date.now() - 5000;
+  fx.session.startedAt = errorAt / 1000 + 1;
+  await writeFile(
+    fx.transcriptPath,
+    `${fleetExhaustedRecord(fx.cwd, 1, new Date(errorAt).toISOString())}\n`,
+  );
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  const supervisorPid = fx.session.pid;
+  const childPid = supervisorPid + 1;
+  const launcherCommand = {
+    pid: supervisorPid,
+    alive: true,
+    command: `${process.execPath} /tmp/teamcodex/src/index.js run -- --session-id ${SESSION_ID}`,
+    environmentValid: true,
+    executablePath: process.execPath,
+    cwd: fx.cwd,
+    launchArgv: [fx.executablePath],
+    processIdentity: `${supervisorPid}:supervisor`,
+    surfaceId: SURFACE_ID,
+    supervised: false,
+    teamClaudeBin: fx.executablePath,
+  };
+  const childInfo = {
+    ...processInfo(fx, {
+      pid: childPid,
+      processIdentity: `${childPid}:child`,
+      processStartedAt: fx.session.startedAt - 1.5,
+      executablePath: native,
+      launchArgv: [native, '--session-id', SESSION_ID],
+      command: `${native} --session-id ${SESSION_ID}`,
+      supervised: true,
+      processRole: 'teamclaude-child',
+      nativeExecutableTrusted: true,
+      parentPid: supervisorPid,
+      teamClaudeBin: fx.executablePath,
+      launcherCommand,
+      launcherProcessIdentity: launcherCommand.processIdentity,
+    }),
+  };
+  let stopped = false;
+  let receivedParentPid = null;
+  let launches = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => (stopped ? { alive: false } : childInfo),
+    stopProcess: async (info, parentPid) => {
+      assert.equal(info.processRole, 'teamclaude-child');
+      receivedParentPid = parentPid;
+      stopped = true;
+      return true;
+    },
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 1, failed: 0 });
+  assert.equal(receivedParentPid, supervisorPid);
+  assert.equal(launches, 1);
 });
 
 test('fails closed when a fleet-exhausted transcript has no trustworthy timestamp', async t => {
