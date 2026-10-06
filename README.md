@@ -504,8 +504,9 @@ interactive session does not wait indefinitely at the prompt for a person.
 When the proxy returns `All N accounts exhausted. Retry in Ns.`, the recovery
 parent does not retry early with the short generic backoff. It waits for the
 server-provided `Retry in` duration, then restarts the same session as
-`--resume <session-id> continue`. This restart counts toward
-`claudeAutoResumeMaxRetries`, and Ctrl-C can cancel the parked launcher. When
+`--resume <session-id> continue`. `claudeFleetExhaustionMaxRetries` controls
+how many fleet waits are allowed; `0` (the default) keeps waiting until the
+fleet recovers. Ctrl-C can cancel the parked launcher. When
 `codexFallbackOnExhaustion: true` has fresh evidence that the whole general
 quota fleet is exhausted, the existing Codex handoff still takes precedence.
 
@@ -728,6 +729,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and restart the same session after terminal timeout/rate/overload errors (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
+| `claudeFleetExhaustionMaxRetries` | Maximum retries after the server reports that every Claude account is temporarily exhausted; `0` waits indefinitely until recovery (optional, default `0`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
 | `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions already blocked on `Login expired` or fleet exhaustion; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. Fleet exhaustion waits for the transcript's server retry deadline. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |

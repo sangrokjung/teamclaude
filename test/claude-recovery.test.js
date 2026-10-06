@@ -501,6 +501,63 @@ test('fleet exhaustion bounds the server delay before resuming the same session'
   ]);
 });
 
+test('fleet exhaustion keeps retrying when the fleet retry budget is unlimited', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-unlimited-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+  const logs = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 0,
+      claudeFleetExhaustionMaxRetries: 0,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    log: message => logs.push(message),
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const sessionId = args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        if (calls.length < 3) {
+          await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 3)}\n`);
+        } else {
+          await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+          child.finish(0);
+        }
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('unlimited fleet recovery should stay on Claude');
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [3000, 3000]);
+  assert.equal(calls.length, 3);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
+  assert.deepEqual(calls[2], ['--resume', sessionId, 'continue']);
+  assert.match(logs[0], /1\/unlimited/);
+  assert.match(logs[1], /2\/unlimited/);
+});
+
 test('fleet exhaustion resolved by a later transcript write does not wait or resume', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-resolved-'));
   t.after(() => rm(root, { recursive: true, force: true }));

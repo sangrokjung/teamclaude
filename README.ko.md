@@ -203,7 +203,8 @@ teamclaude run
 프록시가 `All N accounts exhausted. Retry in Ns.`를 반환하면 recovery parent는
 짧은 일반 backoff로 조기 재시도하지 않습니다. 서버가 알려준 `Retry in` 시간만큼
 기다린 뒤 같은 세션을 `--resume <session-id> continue`로 다시 실행합니다. 이 재개는
-`claudeAutoResumeMaxRetries` 횟수에 포함되며, 대기 중 `Ctrl-C`로 중단할 수 있습니다.
+`claudeFleetExhaustionMaxRetries`로 제한할 수 있으며 기본값 `0`은 제한 해제까지
+계속 대기한다는 뜻입니다. 대기 중 `Ctrl-C`로 중단할 수 있습니다.
 `codexFallbackOnExhaustion: true`이고 전체 일반 quota 소진이 확인된 경우에는 기존
 Codex 인계가 우선합니다.
 
@@ -415,6 +416,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
   "continuityMaxSleepMs": 30000,
   "activeWarmup": true,
   "autoResumeClaude": true,
+  "claudeFleetExhaustionMaxRetries": 0,
   "codexFallbackOnExhaustion": false,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,

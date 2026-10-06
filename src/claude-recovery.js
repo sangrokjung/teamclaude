@@ -657,6 +657,9 @@ export async function runClaudeWithRecovery({
   const maxRetries = Number.isFinite(config.claudeAutoResumeMaxRetries)
     ? Math.max(0, Math.floor(config.claudeAutoResumeMaxRetries))
     : 3;
+  const maxFleetExhaustionRetries = Number.isFinite(config.claudeFleetExhaustionMaxRetries)
+    ? Math.max(0, Math.floor(config.claudeFleetExhaustionMaxRetries))
+    : 0;
   const backoffMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
     ? Math.max(0, Math.floor(config.claudeAutoResumeBackoffMs))
     : 2000;
@@ -670,6 +673,7 @@ export async function runClaudeWithRecovery({
     ? Math.max(0, Math.floor(config.claudeSafeguardMaxResumes))
     : 1;
   let retries = 0;
+  let fleetExhaustionRetries = 0;
   let ambiguousRecoveries = 0;
   let safetyDenialRecoveries = 0;
   let safeguardRecoveries = 0;
@@ -947,12 +951,16 @@ export async function runClaudeWithRecovery({
     if (outcome.event.kind === 'fleet_exhausted'
         && config.autoResumeClaude === true
         && sessionId
-        && retries < maxRetries) {
-      retries += 1;
+        && (maxFleetExhaustionRetries === 0
+          || fleetExhaustionRetries < maxFleetExhaustionRetries)) {
+      fleetExhaustionRetries += 1;
       const retryAfterSeconds = outcome.event.retryAfterSeconds;
       const waitMs = Math.min(retryAfterSeconds * 1000, MAX_FLEET_WAIT_MS);
       const waitSeconds = Math.ceil(waitMs / 1000);
-      log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retries}/${maxRetries}).`);
+      const retryBudget = maxFleetExhaustionRetries === 0
+        ? `${fleetExhaustionRetries}/unlimited`
+        : `${fleetExhaustionRetries}/${maxFleetExhaustionRetries}`;
+      log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
       await stopChild(child);
       await wait(waitMs);
       if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {

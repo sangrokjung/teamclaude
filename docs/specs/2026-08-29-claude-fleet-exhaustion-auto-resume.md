@@ -22,7 +22,7 @@ TeamClaude proxy가 모든 Claude 계정의 제한 해제까지 남은 시간을
 3. `autoResumeClaude: true`이고 exact session과 retry budget이 남았을 때만 Claude child를 종료하고 서버 지시 시간만큼 기다립니다.
 4. 대기 후 같은 session에 literal `continue`를 보내 원래 prompt를 다시 실행합니다. 이 replay는 upstream이 완결된 429 거부를 반환한 경우에만 허용됩니다.
 5. `codexFallbackOnExhaustion: true`이고 fresh general quota evidence로 전체 소진이 확인되면 기존처럼 대기보다 Codex handoff를 우선합니다.
-6. 대기 횟수는 기존 `claudeAutoResumeMaxRetries` budget을 사용합니다.
+6. fleet exhaustion 대기는 `claudeFleetExhaustionMaxRetries` budget을 사용하며 기본값 `0`은 제한 해제까지 계속 대기합니다. timeout·일반 오류의 `claudeAutoResumeMaxRetries` budget은 유지합니다.
 7. 인접한 login/usage-limit 계정 회전은 account 이름이 아니라 이전·현재 UUID와 `CLAUDE_CODE_OAUTH_TOKEN` recovery marker가 모두 일치할 때만 재개합니다.
 8. Codex handoff의 transcript metadata는 단일 행 branch allowlist를 통과한 값만 기록하고, 개행·Markdown·시크릿 후보가 섞이면 `unknown`으로 처리합니다.
 9. cmux rescue는 fleet 오류의 transcript timestamp와 서버 retry hint가 아직 유효하면 process를 종료하거나 새 workspace를 만들지 않습니다. claim·종료 중 transcript, registry, parent·child process identity가 바뀌면 새 실행을 취소합니다.
