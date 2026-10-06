@@ -183,6 +183,12 @@ function fleetRetryStillActive(state, now = Date.now()) {
   return now < deadline;
 }
 
+function processStartedAfterRecoveryError(info, state) {
+  return Number.isFinite(info?.processStartedAt)
+    && Number.isFinite(state?.timestampMs)
+    && info.processStartedAt * 1000 > state.timestampMs;
+}
+
 function sameRegistrySession(left, right) {
   return left?.sessionId === right?.sessionId
     && left?.pid === right?.pid
@@ -201,6 +207,7 @@ export async function rescueCmuxSessionsOnce({
   launchRecoveryWorkspace = defaultLaunchRecoveryWorkspace,
   claimRecovery = claimSessionOnce,
   stopProcess = stopExistingSessionProcess,
+  stopInspectProcess = inspectClaudeProcess,
   trustedClaudePath = null,
 }) {
   let store;
@@ -255,6 +262,7 @@ export async function rescueCmuxSessionsOnce({
 
     const first = await inspectProcess(fresh.pid, fresh.sessionId);
     if (!await sameClaudeProcess(fresh, first, trustedClaudePath)) continue;
+    if (processStartedAfterRecoveryError(first, freshState)) continue;
     const second = await inspectProcess(fresh.pid, fresh.sessionId);
     if (!await sameClaudeProcess(
       fresh,
@@ -263,6 +271,7 @@ export async function rescueCmuxSessionsOnce({
       first.processIdentity,
       first.launcherProcessIdentity,
     )) continue;
+    if (processStartedAfterRecoveryError(second, freshState)) continue;
 
     let finalStore;
     try {
@@ -289,6 +298,7 @@ export async function rescueCmuxSessionsOnce({
       first.processIdentity,
       first.launcherProcessIdentity,
     )) continue;
+    if (processStartedAfterRecoveryError(finalInfo, finalState)) continue;
 
     const command = buildResumeCommand({
       cwd: final.cwd,
@@ -328,13 +338,14 @@ export async function rescueCmuxSessionsOnce({
         finalInfo.processIdentity,
         finalInfo.launcherProcessIdentity,
       )) continue;
+      if (processStartedAfterRecoveryError(claimedInfo, claimedState)) continue;
       const recoveryParentPid = finalInfo.processRole === 'teamclaude-child'
         ? (finalInfo.launcherCommand?.pid ?? finalInfo.parentPid)
         : null;
       if ((finalInfo.processRole === 'teamclaude-child'
           || finalInfo.processRole === 'legacy-native')
           && Number.isInteger(finalInfo.pid)
-          && !await stopProcess(finalInfo, recoveryParentPid, { inspectProcess: inspectClaudeProcess })) {
+          && !await stopProcess(finalInfo, recoveryParentPid, { inspectProcess: stopInspectProcess })) {
         failed += 1;
         continue;
       }

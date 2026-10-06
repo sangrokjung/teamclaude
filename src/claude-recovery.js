@@ -971,6 +971,11 @@ export async function runClaudeWithRecovery({
       continue;
     }
 
+    if (outcome.event.kind === 'fleet_exhausted') {
+      log(`[TeamClaude] Fleet exhaustion resume budget exhausted (${fleetExhaustionRetries}/${maxFleetExhaustionRetries}); preserving session ${sessionId} for manual continuation.`);
+      return childExit(child);
+    }
+
     if (outcome.event.kind === 'usage_limit') {
       log('[TeamClaude] Claude usage limit detected; account rotation was not confirmed, so the same account will not be restarted.');
       if (usageChildStopped) return { status: child.exitCode ?? 1, signal: null };

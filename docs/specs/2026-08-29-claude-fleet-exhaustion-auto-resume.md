@@ -43,7 +43,7 @@ TeamClaude proxy가 모든 Claude 계정의 제한 해제까지 남은 시간을
 ## Risks
 
 - 잘못 넓은 문구 매칭은 prompt text나 unrelated rate limit를 장기 대기로 오인할 수 있습니다. `isApiErrorMessage`, rate-limit error type, TeamClaude fleet-exhaustion 문장을 함께 요구합니다.
-- 서버가 긴 reset을 반환하면 launcher parent도 오래 살아 있습니다. 이는 요청된 자동 재개 동작이며 사용자는 Ctrl-C로 중단할 수 있고, 반복 횟수는 기존 retry budget으로 제한됩니다.
+- 서버가 긴 reset을 반환하면 launcher parent도 오래 살아 있습니다. 이는 요청된 자동 재개 동작이며 사용자는 Ctrl-C로 중단할 수 있습니다. 기본 fleet retry budget `0`은 제한 해제까지 계속 대기하고, 양의 값은 해당 횟수에서 세션을 보존합니다.
 - 장기 대기 후 다른 process가 같은 session을 수동 재개할 수 있습니다. claim 후 transcript·registry·process identity를 재확인해 새 workspace 생성을 취소하고, registry에 없는 process는 계속 입양하지 않습니다.
 
 ## Verification
