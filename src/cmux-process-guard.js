@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, realpath } from 'node:fs/promises';
-import { delimiter, join } from 'node:path';
+import { homedir } from 'node:os';
+import { delimiter, join, relative } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -21,9 +22,84 @@ function decodeLaunchArgv(value) {
   }
   const decoded = Buffer.from(value, 'base64').toString('utf8');
   const argv = decoded.split('\0');
+  if (argv.at(-1) === '') argv.pop();
   return argv.length > 0 && argv.every(arg => !arg.includes('\0'))
     ? argv
     : null;
+}
+
+function parseProcessTable(text) {
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match) continue;
+    rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] });
+  }
+  return rows;
+}
+
+function escapedRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function selectorFromCommand(command, sessionId) {
+  const session = escapedRegExp(sessionId);
+  const match = command.match(
+    new RegExp(`(?:^|\\s)(--resume|--session-id)(?:=|\\s+)${session}(?=\\s|$)`),
+  );
+  return match?.[1] || null;
+}
+
+const CLAUDE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const MAX_PROCESS_START_DRIFT_SECONDS = 7 * 24 * 60 * 60;
+
+async function trustedNativeClaudeExecutable(path) {
+  if (typeof path !== 'string' || path.length === 0) return false;
+  try {
+    const [resolved, root] = await Promise.all([
+      realpath(path),
+      realpath(join(homedir(), '.local', 'share', 'claude', 'versions')),
+    ]);
+    const rel = relative(root, resolved);
+    return rel !== ''
+      && !rel.startsWith('..')
+      && !rel.includes('/')
+      && CLAUDE_VERSION_RE.test(rel)
+      && (await access(resolved, constants.X_OK).then(() => true, () => false));
+  } catch {
+    return false;
+  }
+}
+
+function isTeamClaudeSupervisor(info) {
+  return info?.alive
+    && info.supervised !== true
+    && /\/teamcodex\/src\/index\.js\s+run(?:\s|$)/.test(info.command)
+    && info.environmentValid === true
+    && Array.isArray(info.launchArgv)
+    && typeof info.launchArgv[0] === 'string'
+    && info.launchArgv[0].length > 0
+    && typeof info.teamClaudeBin === 'string'
+    && info.teamClaudeBin.length > 0;
+}
+
+function childLooksLikeClaude(info, sessionId) {
+  return info?.alive
+    && info.environmentValid === true
+    && info.supervised === true
+    && info.agentLaunchKind === 'claude'
+    && info.nativeExecutableTrusted === true
+    && typeof selectorFromCommand(info.command, sessionId) === 'string'
+    && typeof info.teamClaudeBin === 'string'
+    && info.teamClaudeBin.length > 0;
+}
+
+function legacyNativeLooksLikeClaude(info, sessionId) {
+  return info?.alive
+    && info.legacyEnvironmentValid === true
+    && info.supervised !== true
+    && info.nativeExecutableTrusted === true
+    && typeof selectorFromCommand(info.command, sessionId) === 'string';
 }
 
 export async function inspectClaudeProcess(pid) {
@@ -32,7 +108,7 @@ export async function inspectClaudeProcess(pid) {
     const [
       { stdout: command },
       { stdout: environment },
-      { stdout: cwdOutput },
+      { stdout: parentPidOutput },
       { stdout: startedAt },
     ] = await Promise.all([
       execFileAsync('ps', ['ww', '-p', String(pid), '-o', 'command='], {
@@ -41,11 +117,13 @@ export async function inspectClaudeProcess(pid) {
       execFileAsync('ps', ['eww', '-p', String(pid), '-o', 'command='], {
         timeout: 1500,
       }),
-      execFileAsync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+      execFileAsync('ps', ['-p', String(pid), '-o', 'ppid='], {
         timeout: 1500,
+        env: { ...process.env, LC_ALL: 'C' },
       }),
       execFileAsync('ps', ['-p', String(pid), '-o', 'lstart='], {
         timeout: 1500,
+        env: { ...process.env, LC_ALL: 'C' },
       }),
     ]);
     const processCommand = command.trim();
@@ -62,44 +140,145 @@ export async function inspectClaudeProcess(pid) {
       environmentText,
       'TEAMCLAUDE_SESSION_SUPERVISED',
     );
+    const teamClaudeBinValues = environmentValues(
+      environmentText,
+      'TEAMCLAUDE_CLAUDE_BIN',
+    );
+    const parentPid = parentPidOutput.trim();
+    const agentLaunchKindValues = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_KIND');
     const executablePath = processCommand.split(/\s+/)[0] || '';
-    const cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || '';
+    const launchCwd = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_CWD')[0] || '';
+    let cwd = environmentValues(environmentText, 'PWD')[0] || launchCwd;
+    try {
+      const { stdout: cwdOutput } = await execFileAsync(
+        'lsof',
+        ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
+        { timeout: 1500 },
+      );
+      cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || cwd;
+    } catch {}
     const launchArgv = launchArgvValues.length === 1
       ? decodeLaunchArgv(launchArgvValues[0])
       : null;
     return {
       alive: true,
+      pid: Number(pid),
       command: processCommand,
       cwd,
+      launchCwd,
       environmentValid: surfaceValues.length === 1
         && launchArgvValues.length === 1
         && supervisedValues.length <= 1
         && Array.isArray(launchArgv),
+      legacyEnvironmentValid: surfaceValues.length === 1
+        && supervisedValues.length === 0
+        && launchArgvValues.length <= 1
+        && (launchArgvValues.length === 0 || Array.isArray(launchArgv)),
       executablePath,
       launchArgv,
+      parentPid: /^\d+$/.test(parentPid)
+        ? Number(parentPid)
+        : null,
+      teamClaudeBin: teamClaudeBinValues.length === 1 ? teamClaudeBinValues[0] : null,
+      agentLaunchKind: agentLaunchKindValues.length === 1 ? agentLaunchKindValues[0] : null,
       processIdentity: `${pid}:${startedAt.trim()}`,
       processStartedAt: new Date(startedAt.trim()).getTime() / 1000,
       surfaceId: surfaceValues.length === 1 ? surfaceValues[0] : null,
       supervised: supervisedValues[0] === '1',
+      nativeExecutableTrusted: await trustedNativeClaudeExecutable(executablePath),
     };
   } catch {
     return { alive: false };
   }
 }
 
+export async function inspectClaudeProcessTree(pid, sessionId) {
+  if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
+    return { alive: false };
+  }
+  const inspected = await inspectClaudeProcess(pid);
+  let supervisor = inspected;
+  let directChild = null;
+  if (!isTeamClaudeSupervisor(supervisor)
+      && legacyNativeLooksLikeClaude(inspected, sessionId)) {
+    return {
+      ...inspected,
+      processRole: 'legacy-native',
+    };
+  }
+  if (!isTeamClaudeSupervisor(supervisor)
+      && childLooksLikeClaude(inspected, sessionId)
+      && Number.isInteger(inspected.parentPid)) {
+    supervisor = await inspectClaudeProcess(inspected.parentPid);
+    directChild = inspected;
+  }
+  if (directChild
+      && isTeamClaudeSupervisor(supervisor)
+      && directChild.surfaceId === supervisor.surfaceId
+      && directChild.teamClaudeBin === supervisor.teamClaudeBin) {
+    return {
+      ...directChild,
+      processRole: 'teamclaude-child',
+      launcherCommand: supervisor,
+      launcherProcessIdentity: supervisor.processIdentity,
+    };
+  }
+  if (!isTeamClaudeSupervisor(supervisor)) return { alive: false };
+  let table;
+  try {
+    const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
+      timeout: 2500,
+      env: { ...process.env, LC_ALL: 'C' },
+    });
+    table = parseProcessTable(stdout);
+  } catch {
+    return { alive: false };
+  }
+  const childrenByParent = new Map();
+  for (const row of table) {
+    const list = childrenByParent.get(row.ppid) || [];
+    list.push(row);
+    childrenByParent.set(row.ppid, list);
+  }
+  const queue = [...(childrenByParent.get(pid) || [])];
+  const seen = new Set();
+  while (queue.length > 0 && seen.size < 64) {
+    const row = queue.shift();
+    if (seen.has(row.pid)) continue;
+    seen.add(row.pid);
+    const child = await inspectClaudeProcess(row.pid);
+    if (childLooksLikeClaude(child, sessionId)
+        && child.parentPid === pid
+        && child.surfaceId === supervisor.surfaceId
+        && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
+      return {
+        ...child,
+        processRole: 'teamclaude-child',
+        launcherCommand: supervisor,
+        launcherProcessIdentity: supervisor.processIdentity,
+      };
+    }
+    queue.push(...(childrenByParent.get(row.pid) || []));
+  }
+  return { alive: false };
+}
+
 function exactSelectorInArgv(argv, sessionId) {
+  let count = 0;
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index];
-    if ((argument === '--resume' || argument === '--session-id')
-        && argv[index + 1] === sessionId) {
-      return true;
-    }
-    if (argument === `--resume=${sessionId}`
-        || argument === `--session-id=${sessionId}`) {
-      return true;
+    if (argument === '--resume' || argument === '--session-id') {
+      if (argv[index + 1] !== sessionId) return false;
+      count += 1;
+      index += 1;
+    } else if (argument.startsWith('--resume=') || argument.startsWith('--session-id=')) {
+      if (argument !== `--resume=${sessionId}` && argument !== `--session-id=${sessionId}`) {
+        return false;
+      }
+      count += 1;
     }
   }
-  return false;
+  return count === 1;
 }
 
 function selectorMatches(info, sessionId) {
@@ -108,9 +287,21 @@ function selectorMatches(info, sessionId) {
   const renderedPrefix = new RegExp(
     `^${executable}\\s+--(?:resume|session-id)(?:=|\\s+)${session}(?=\\s|$)`,
   );
-  if (!renderedPrefix.test(info.command)) return false;
+  if (info.processRole === 'teamclaude-child' || info.processRole === 'legacy-native') {
+    if (!selectorFromCommand(info.command, sessionId)) return false;
+    if (info.processRole === 'legacy-native' && !Array.isArray(info.launchArgv)) return true;
+  } else if (!renderedPrefix.test(info.command)) {
+    return false;
+  }
 
   const argvHasSelector = exactSelectorInArgv(info.launchArgv, sessionId);
+  if (!argvHasSelector) {
+    if (info.processRole !== 'teamclaude-child' && info.processRole !== 'legacy-native') return false;
+    if (info.launchArgv.slice(1).some(argument => argument === '--resume'
+        || argument === '--session-id'
+        || argument.startsWith('--resume=')
+        || argument.startsWith('--session-id='))) return false;
+  }
   for (let index = 1; index < info.launchArgv.length; index += 1) {
     const argument = info.launchArgv[index];
     if (argument.includes('CMUX_SURFACE_ID=')) return false;
@@ -119,7 +310,9 @@ function selectorMatches(info, sessionId) {
       || info.launchArgv[index - 1] === '--session-id';
     const isJoinedSelector = argument === `--resume=${sessionId}`
       || argument === `--session-id=${sessionId}`;
-    if (!argvHasSelector || (!isSelectorValue && !isJoinedSelector)) return false;
+    if (!argvHasSelector || (!isSelectorValue && !isJoinedSelector)) {
+      return false;
+    }
   }
   return true;
 }
@@ -129,19 +322,27 @@ export async function sameClaudeProcess(
   info,
   trustedClaudePath = null,
   expectedIdentity = null,
+  expectedLauncherIdentity = null,
 ) {
+  const isTeamClaudeChild = info?.processRole === 'teamclaude-child';
+  const isLegacyNative = info?.processRole === 'legacy-native';
   const startDelta = session?.startedAt - info?.processStartedAt;
   if (!info?.alive
-      || info.environmentValid !== true
-      || info.supervised
+      || (info.environmentValid !== true && !isLegacyNative)
+      || (info.supervised && !isTeamClaudeChild)
       || info.surfaceId !== session.surfaceId
       || typeof info.processIdentity !== 'string'
       || !info.processIdentity
       || (expectedIdentity && info.processIdentity !== expectedIdentity)
-      || !Array.isArray(info.launchArgv)
+      || (expectedLauncherIdentity
+        && info.launcherProcessIdentity !== expectedLauncherIdentity)
+      || (isTeamClaudeChild
+        && (!isTeamClaudeSupervisor(info.launcherCommand)
+          || info.teamClaudeBin !== info.launcherCommand.teamClaudeBin))
+      || (!Array.isArray(info.launchArgv) && !isLegacyNative)
       || !selectorMatches(info, session.sessionId)
       || !Number.isFinite(startDelta)
-      || startDelta < -2
+      || startDelta < -MAX_PROCESS_START_DRIFT_SECONDS
       || startDelta > 60) {
     return false;
   }
@@ -155,25 +356,69 @@ export async function sameClaudeProcess(
       sessionCwd,
     ] = await Promise.all([
       realpath(info.executablePath),
-      realpath(info.launchArgv[0]),
+      realpath(info.launchArgv?.[0] || info.executablePath),
       realpath(session.launchCommand.executablePath),
       realpath(trustedClaudePath || session.launchCommand.executablePath),
       realpath(info.cwd),
-      realpath(session.cwd),
+      realpath(session.launchCommand.workingDirectory || session.cwd),
     ]);
-    return processExecutable === trustedExecutable
-      && processLaunchExecutable === trustedExecutable
+    if (isLegacyNative) {
+      return info.legacyEnvironmentValid === true
+        && info.nativeExecutableTrusted === true
+        && (processExecutable === processLaunchExecutable
+          || processLaunchExecutable === launchExecutable)
+        && processCwd === sessionCwd;
+    }
+    if (processExecutable === trustedExecutable
+        && processLaunchExecutable === trustedExecutable
+        && launchExecutable === trustedExecutable
+        && processCwd === sessionCwd) {
+      return true;
+    }
+    if (!isTeamClaudeChild
+        && info.nativeExecutableTrusted === true
+        && processCwd === sessionCwd
+        && (processExecutable === processLaunchExecutable
+          || processLaunchExecutable === launchExecutable)
+        && (processExecutable === launchExecutable || isLegacyNative)
+        && (processExecutable === launchExecutable || launchExecutable === trustedExecutable)) {
+      return true;
+    }
+    if (!isTeamClaudeChild || !isTeamClaudeSupervisor(info.launcherCommand)) return false;
+    const [launcherExecutable, launcherCwd, sessionLauncherExecutable] = await Promise.all([
+      realpath(info.launcherCommand.executablePath),
+      realpath(info.launcherCommand.cwd),
+      realpath(session.launchCommand.executablePath),
+    ]);
+    const launcherUsesTrustedWrapper = Array.isArray(info.launcherCommand.launchArgv)
+      && info.launcherCommand.launchArgv.length > 0
+      && await realpath(info.launcherCommand.launchArgv[0]) === sessionLauncherExecutable;
+    const launcherUsesInheritedWrapper = info.launcherCommand.environmentValid !== true
+      && launcherCwd === sessionCwd;
+    return info.nativeExecutableTrusted === true
+      && launcherExecutable !== trustedExecutable
+      && (launcherUsesTrustedWrapper || launcherUsesInheritedWrapper)
+      && processExecutable !== trustedExecutable
+      && (processLaunchExecutable === processExecutable
+        || processLaunchExecutable === launchExecutable)
       && launchExecutable === trustedExecutable
-      && processCwd === sessionCwd;
+      && processCwd === sessionCwd
+      && (session.pid === info.pid || info.parentPid === session.pid)
+      && info.launcherProcessIdentity === info.launcherCommand.processIdentity;
   } catch {
     return false;
   }
 }
 
 export async function resolveTrustedClaudePath() {
-  for (const directory of (process.env.PATH || '').split(delimiter)) {
-    if (!directory) continue;
-    const candidate = join(directory, 'claude');
+  const candidates = [
+    ...((process.env.PATH || '').split(delimiter)
+      .filter(Boolean)
+      .map(directory => join(directory, 'claude'))),
+    join(homedir(), '.local', 'bin', 'claude'),
+    join(homedir(), 'bin', 'claude'),
+  ];
+  for (const candidate of new Set(candidates)) {
     try {
       await access(candidate, constants.X_OK);
       return await realpath(candidate);

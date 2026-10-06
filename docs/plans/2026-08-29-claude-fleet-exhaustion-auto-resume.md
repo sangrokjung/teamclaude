@@ -4,7 +4,7 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
 
 ## Scope
 
-- 변경: `src/claude-recovery.js`, `test/claude-recovery.test.js`, README, 이 spec/plan
+- 변경: `src/claude-recovery.js`, `src/cmux-process-guard.js`, `src/cmux-session-guards.js`, `src/cmux-session-rescue.js`, 관련 테스트, README, 이 spec/plan
 - 비변경: Claude source config/hooks, proxy 429 계산, account selection, config schema, OAuth flow
 
 ## Tasks
@@ -17,6 +17,7 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
 6. [x] README와 이 plan의 Verification을 최종 실행 결과로 동기화합니다.
 7. [x] provider 환경을 격리하고 부하 게이트 전체 suite를 다시 통과시킵니다.
 8. [x] 추가 content block 및 late transcript race를 적대적으로 재현·수정하고 fresh review를 완료합니다.
+9. [x] cmux supervisor PID에서 native Claude child를 검증하고, retry deadline·claim 이후 transcript·stop 이후 registry를 재확인합니다.
 
 ## Verification
 
@@ -27,6 +28,8 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
 | Regression | `npm test` | 기존 Claude/proxy/Codex 동작 통과 |
 | Static | `npm run lint` | exit 0 |
 | Adversarial | spec/diff/evidence checker | blocking finding 없음 |
+
+이번 보강의 cmux acceptance는 supervisor PID와 native child의 parent·surface·selector·실행 파일 신원을 모두 일치시킬 때만 통과합니다. 서버 retry deadline이 남아 있거나 claim 후 transcript가 대화로 진행되면 process 종료와 workspace 생성을 취소합니다. stop 직후와 workspace 생성 직전에는 PID가 살아 있는지와 process tree를 모두 재검사해 PID 재사용도 차단합니다. 이번 보강 후 `node --test --test-concurrency=1 test/cmux-session-rescue.test.js`는 33/33 통과했습니다.
 
 ## Results
 

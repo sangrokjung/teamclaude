@@ -91,6 +91,8 @@ Upstream has features this fork does not, so pick whichever fits your setup.
 
 ## Live dashboard
 
+This repository also owns the native macOS menu-bar app and its click-to-open usage dashboard in [menubar/](menubar/README.md). Build it with `npm run menubar:build`; no separate desktop dashboard, Electron or Tauri is required.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="TeamCodex terminal dashboard with three demo accounts" width="100%">
 </p>
@@ -507,9 +509,9 @@ server-provided `Retry in` duration, then restarts the same session as
 `codexFallbackOnExhaustion: true` has fresh evidence that the whole general
 quota fleet is exhausted, the existing Codex handoff still takes precedence.
 
-Existing Claude processes cannot acquire a recovery parent retroactively.
+Existing Claude processes without a matching cmux registry record cannot acquire a recovery parent.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
-cmux's session registry for an unresolved `Login expired` event. It continues
+cmux's session registry for an unresolved `Login expired` or fleet-exhaustion event. It continues
 only owner-private registry/transcript files whose active session ID, exact
 process selector and start time, trusted Claude executable, cmux surface,
 working directory, and transcript root all still match. The verified live
@@ -518,7 +520,8 @@ the recorded workspace. Stale, redirected, or already supervised records fail
 closed. After a final registry and process recheck, TeamClaude durably claims
 the session and opens one non-focused workspace in the same cmux window. The
 same session is not replayed after a supervisor restart, even when the workspace
-launch result was uncertain. The blocked legacy pane remains untouched. This
+launch result was uncertain. Fleet exhaustion is rescued only after the transcript's
+server-provided retry deadline. The blocked legacy pane remains untouched. This
 option is off by default because it adds a recovery workspace for each affected
 legacy session.
 
@@ -727,7 +730,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
-| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions already blocked on `Login expired`; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions already blocked on `Login expired` or fleet exhaustion; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. Fleet exhaustion waits for the transcript's server retry deadline. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 | `workerHealthTimeoutMs` | Supervisor HTTP health-probe deadline (optional, default `5000`). A timeout during supervisor self-stall is inconclusive rather than evidence against the worker |
 | `workerHealthFailureThreshold` | Consecutive conclusive health failures before IPC corroboration/recycle (optional, default `3`) |

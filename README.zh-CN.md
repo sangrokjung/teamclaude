@@ -80,6 +80,8 @@ Fork 谱系：[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude
 
 ## 实时仪表盘
 
+本仓库同时管理原生 macOS 菜单栏应用及点击展开的用量面板，源码位于 [menubar/](menubar/README.md)。使用 `npm run menubar:build` 构建，无需独立桌面应用、Electron 或 Tauri。
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="显示三个演示账户的 TeamCodex 终端仪表盘" width="100%">
 </p>

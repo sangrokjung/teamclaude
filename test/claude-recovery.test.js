@@ -552,6 +552,56 @@ test('fleet exhaustion resolved by a later transcript write does not wait or res
   assert.equal(waits, 0);
 });
 
+test('fleet exhaustion does not duplicate a manual resume that advances the transcript during the wait', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-manual-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let transcriptPath = null;
+  let spawns = 0;
+  let waits = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {
+      waits += 1;
+      await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      spawns += 1;
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      const dir = join(transcriptRoot, 'project');
+      transcriptPath = join(dir, `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(dir, { recursive: true });
+        await writeFile(transcriptPath, `${fleetExhaustedRecord(cwd, 604800)}\n`);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('a manually resumed session must not switch providers');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, null);
+  assert.equal(spawns, 1);
+  assert.equal(waits, 1);
+});
+
 test('ambiguous-dispatch classification rejects prompt text and near-miss API errors', () => {
   const base = JSON.parse(ambiguousDispatchRecord('/tmp/project'));
   const core = 'API Error: 502 Upstream connection failed after dispatch. Request was not replayed.';

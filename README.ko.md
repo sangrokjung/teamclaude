@@ -112,6 +112,15 @@ port는 각 머신이 소유합니다. 자세한 절차는
 
 ## 실시간 대시보드
 
+이 저장소는 프록시·터미널 TUI·macOS 네이티브 메뉴바를 함께 관리합니다.
+메뉴바를 클릭하면 계정과 사용량 대시보드가 열립니다. 별도 데스크톱 앱은 필요하지 않습니다.
+소스와 설치 방법은 [menubar/README.md](menubar/README.md)를 참고하세요.
+
+```bash
+npm run menubar:build
+npm run menubar:install -- --binary "$PWD/menubar/.build/cc-menubar"
+```
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/sangrokjung/teamclaude/refs/heads/qjc/resilient-routing/docs/assets/teamcodex-dashboard.png" alt="데모 계정 3개가 표시된 TeamCodex 터미널 대시보드" width="100%">
 </p>
@@ -425,7 +434,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `activeWarmup` | 최소 요청으로 계정 사용량을 선측정 |
 | `autoResumeClaude` | TeamClaude로 시작한 Claude 세션의 timeout/429를 같은 세션으로 자동 재개 |
 | `codexFallbackOnExhaustion` | 대체 Claude 계정이 없거나 전체 일반 quota 소진이 확인된 경우에만 Codex로 인계 |
-| `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
+| `cmuxSessionRescue` | 기존 cmux Claude 세션의 미해결 `Login expired`·fleet exhaustion을 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
@@ -435,9 +444,11 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 
 `cmuxSessionRescue`는 소유자 전용 registry/transcript, 정확한 session
 selector와 프로세스 시작 시각, 신뢰된 Claude 실행 파일, 실제 cmux
-surface→workspace topology가 모두 일치할 때만 동작합니다. 세션별 claim을
-디스크에 먼저 기록하므로 supervisor가 재시작되거나 workspace 생성 결과가
-불확실해도 같은 세션을 중복 실행하지 않습니다.
+surface→workspace topology가 모두 일치할 때만 동작합니다. fleet exhaustion은
+transcript timestamp와 서버의 `Retry in` deadline이 지난 뒤에만 재개합니다.
+세션별 claim을 디스크에 먼저 기록하고 claim·종료 직후 transcript와
+parent·child process identity를 다시 확인하므로 supervisor가 재시작되거나
+workspace 생성 결과가 불확실해도 같은 세션을 중복 실행하지 않습니다.
 
 버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
 
