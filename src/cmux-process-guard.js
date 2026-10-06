@@ -113,6 +113,53 @@ function childLooksLikeClaude(info, sessionId) {
     && info.teamClaudeBin.length > 0;
 }
 
+function childBelongsToSupervisor(child, supervisor, supervisorPid) {
+  return child?.parentPid === supervisorPid
+    && child.surfaceId === supervisor.surfaceId
+    && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin);
+}
+
+function selectorlessNativeRows(rows) {
+  return rows.filter(row => /\/claude\/versions\//.test(row.command)
+    && !hasSessionSelector(row.command));
+}
+
+async function selectDirectClaudeChild(
+  rows,
+  supervisor,
+  supervisorPid,
+  sessionId,
+  inspectProcess,
+  knownChild = null,
+) {
+  const rowByPid = new Map();
+  for (const row of rows) {
+    if (Number.isInteger(row?.pid) && row.pid > 0) rowByPid.set(row.pid, row);
+  }
+  if (knownChild?.pid) rowByPid.set(knownChild.pid, { pid: knownChild.pid });
+
+  const candidates = [];
+  for (const row of rowByPid.values()) {
+    const child = row.pid === knownChild?.pid
+      ? knownChild
+      : await inspectProcess(row.pid);
+    if (childLooksLikeClaude(child, sessionId)
+        && childBelongsToSupervisor(child, supervisor, supervisorPid)) {
+      candidates.push(child);
+    }
+  }
+
+  const selected = candidates.filter(child => (
+    typeof selectorFromCommand(child.command, sessionId) === 'string'
+  ));
+  if (selected.length > 1) return { ambiguous: true, child: null };
+  if (selected.length === 1) return { ambiguous: false, child: selected[0] };
+
+  const selectorless = candidates.filter(child => !hasSessionSelector(child.command));
+  if (selectorless.length > 1) return { ambiguous: true, child: null };
+  return { ambiguous: false, child: selectorless[0] || null };
+}
+
 function legacyNativeLooksLikeClaude(info, sessionId) {
   return info?.alive
     && info.legacyEnvironmentValid === true
@@ -214,7 +261,10 @@ export async function inspectClaudeProcess(pid) {
 export async function inspectClaudeProcessTree(
   pid,
   sessionId,
-  { inspectProcess = inspectClaudeProcess } = {},
+  {
+    inspectProcess = inspectClaudeProcess,
+    listDirectChildren = directChildRows,
+  } = {},
 ) {
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
     return { alive: false };
@@ -247,8 +297,26 @@ export async function inspectClaudeProcessTree(
   }
   if (directChild
       && isTeamClaudeSupervisor(supervisor)
-      && directChild.surfaceId === supervisor.surfaceId
-      && directChild.teamClaudeBin === supervisor.teamClaudeBin) {
+      && childBelongsToSupervisor(directChild, supervisor, directChild.parentPid)) {
+    if (!hasSessionSelector(directChild.command)) {
+      let directRows;
+      try {
+        directRows = await listDirectChildren(directChild.parentPid);
+      } catch {
+        return { alive: false };
+      }
+      const selected = await selectDirectClaudeChild(
+        directRows,
+        supervisor,
+        directChild.parentPid,
+        sessionId,
+        inspectProcess,
+        directChild,
+      );
+      if (selected.ambiguous || selected.child?.pid !== directChild.pid) {
+        return { alive: false };
+      }
+    }
     return {
       ...directChild,
       processRole: 'teamclaude-child',
@@ -259,27 +327,25 @@ export async function inspectClaudeProcessTree(
   if (!isTeamClaudeSupervisor(supervisor)) return { alive: false };
   let table;
   try {
-    const directRows = await directChildRows(pid);
-    const prioritized = directRows.sort((left, right) => {
-      const leftPriority = selectorFromCommand(left.command, sessionId)
-        || /\/claude\/versions\//.test(left.command) ? 0 : 1;
-      const rightPriority = selectorFromCommand(right.command, sessionId)
-        || /\/claude\/versions\//.test(right.command) ? 0 : 1;
-      return leftPriority - rightPriority;
-    });
-    for (const row of prioritized) {
-      const child = await inspectProcess(row.pid);
-      if (childLooksLikeClaude(child, sessionId)
-          && child.parentPid === pid
-          && child.surfaceId === supervisor.surfaceId
-          && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
-        return {
-          ...child,
-          processRole: 'teamclaude-child',
-          launcherCommand: supervisor,
-          launcherProcessIdentity: supervisor.processIdentity,
-        };
-      }
+    const directRows = await listDirectChildren(pid);
+    if (selectorlessNativeRows(directRows).length > 1) {
+      return { alive: false };
+    }
+    const selected = await selectDirectClaudeChild(
+      directRows,
+      supervisor,
+      pid,
+      sessionId,
+      inspectProcess,
+    );
+    if (selected.ambiguous) return { alive: false };
+    if (selected.child) {
+      return {
+        ...selected.child,
+        processRole: 'teamclaude-child',
+        launcherCommand: supervisor,
+        launcherProcessIdentity: supervisor.processIdentity,
+      };
     }
     if (directRows.length === 0) throw new Error('No direct child.');
   } catch {}

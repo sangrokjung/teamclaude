@@ -547,6 +547,76 @@ test('does not adopt a legacy native child that still has a TeamClaude superviso
   assert.equal(result.alive, false);
 });
 
+function supervisorProcessInfo(pid) {
+  return {
+    alive: true,
+    pid,
+    command: '/tmp/teamcodex/src/index.js run -- --session-id ' + SESSION_ID,
+    environmentValid: true,
+    launchArgv: ['/tmp/teamclaude'],
+    processIdentity: `${pid}:supervisor`,
+    surfaceId: SURFACE_ID,
+    supervised: false,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+}
+
+function selectorlessChildInfo(pid, parentPid, version = '2.1.289') {
+  const executablePath = `/Users/sangrok/.local/share/claude/versions/${version}`;
+  return {
+    alive: true,
+    pid,
+    command: `${executablePath} -c`,
+    environmentValid: true,
+    launchArgv: [executablePath, '-c'],
+    processIdentity: `${pid}:child`,
+    surfaceId: SURFACE_ID,
+    supervised: true,
+    agentLaunchKind: 'claude',
+    nativeExecutableTrusted: true,
+    parentPid,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+}
+
+test('fails closed when a supervisor has multiple selectorless Claude children', async () => {
+  const supervisorPid = 54321;
+  const childA = selectorlessChildInfo(54322, supervisorPid, '2.1.289');
+  const childB = selectorlessChildInfo(54323, supervisorPid, '2.1.290');
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [childA.pid, childA],
+    [childB.pid, childB],
+  ]);
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [
+      { pid: childA.pid, command: childA.command },
+      { pid: childB.pid, command: childB.command },
+    ],
+  });
+  assert.equal(result.alive, false);
+});
+
+test('fails closed when the registry points at one of multiple selectorless Claude children', async () => {
+  const supervisorPid = 54331;
+  const childA = selectorlessChildInfo(54332, supervisorPid, '2.1.289');
+  const childB = selectorlessChildInfo(54333, supervisorPid, '2.1.290');
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [childA.pid, childA],
+    [childB.pid, childB],
+  ]);
+  const result = await inspectClaudeProcessTree(childA.pid, SESSION_ID, {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [
+      { pid: childA.pid, command: childA.command },
+      { pid: childB.pid, command: childB.command },
+    ],
+  });
+  assert.equal(result.alive, false);
+});
+
 test('stops a legacy native process without requiring a parent identity', async t => {
   const child = spawn('/bin/sleep', ['30'], { stdio: 'ignore' });
   await once(child, 'spawn');
