@@ -609,3 +609,14 @@ test('reauth records the Claude plan from the verified profile (usage-limit grac
   });
   assert.equal(result.planType, 'pro');
 });
+
+test('reauth drops a stale Claude plan when the verified profile reports none', () => {
+  const config = fixture();
+  config.accounts[0].planType = 'pro';
+  const result = applyReauthToConfig(config, {
+    name: 'broken@example.com',
+    expectedAccountUuid: 'uuid-broken',
+    ...freshResult,
+  });
+  assert.equal(result.planType, undefined);
+});
