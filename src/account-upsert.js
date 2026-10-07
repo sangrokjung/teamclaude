@@ -50,6 +50,11 @@ export function applyOAuthUpsert(cfg, { name, creds, profile, source }) {
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
+  // Plan tier drives the usage-limit grace cadence (Pro: once a week).
+  const planType = profile?.hasClaudeMax ? 'max'
+    : profile?.hasClaudePro ? 'pro'
+      : typeof creds.planType === 'string' && creds.planType ? creds.planType.toLowerCase() : null;
+  if (planType) account.planType = planType;
   let idx = profile?.accountUuid
     ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
     : -1;

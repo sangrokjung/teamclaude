@@ -541,6 +541,7 @@ export class AccountManager {
     // Grace draws on the weekly limit, so require a measured, still-open weekly
     // window under threshold — an unmeasured one could already be spent.
     if (!Number.isFinite(q.unified7d) || q.unified7d >= this.switchThreshold) return false;
+    if (!Number.isFinite(q.unified7dReset) || q.unified7dReset <= Date.now()) return false;
     return !(Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil);
   }
 
@@ -1447,7 +1448,7 @@ export class AccountManager {
     // Pro gets grace once a week, so a refusal holds until the weekly reset.
     // Unknown plans stay on the 5-hour cadence: a refused request costs no
     // quota, while a weekly hold would switch grace off for Max accounts.
-    const plan = String(account.subscriptionType || account.planType || '').toLowerCase();
+    const plan = String(account.planType || '').toLowerCase();
     account._graceSpentUntil = plan === 'pro' && q.unified7dReset
       ? q.unified7dReset
       : q.unified5hReset || Date.now() + 5 * 3600_000;
