@@ -20,11 +20,6 @@ export async function importCredentials(filePath) {
     expiresAt: data.expiresAt,
     subscriptionType: data.subscriptionType,
     rateLimitTier: data.rateLimitTier,
-    // Normalized plan label the account pipeline already carries (constructor,
-    // disk sync, re-import); drives the usage-limit grace cadence.
-    planType: typeof data.subscriptionType === 'string' && data.subscriptionType
-      ? data.subscriptionType.toLowerCase()
-      : undefined,
   };
 }
 

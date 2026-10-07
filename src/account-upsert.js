@@ -36,17 +36,6 @@ export function carryOverAccountSettings(previous, account, source) {
  *
  * @returns {{ action: 'Added'|'Updated', name: string, carried: object|null }}
  */
-/**
- * Claude plan tier for an account: the OAuth profile first, else the imported
- * credential's normalized `planType` (from `subscriptionType`). Drives the
- * usage-limit grace cadence (Pro: once a week). Null when unknown.
- */
-export function claudePlanType(creds, profile) {
-  if (profile?.hasClaudeMax) return 'max';
-  if (profile?.hasClaudePro) return 'pro';
-  return typeof creds?.planType === 'string' && creds.planType ? creds.planType.toLowerCase() : null;
-}
-
 export function applyOAuthUpsert(cfg, { name, creds, profile, source }) {
   if (!name) {
     let n = 1;
@@ -61,8 +50,6 @@ export function applyOAuthUpsert(cfg, { name, creds, profile, source }) {
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
   };
-  const planType = claudePlanType(creds, profile);
-  if (planType) account.planType = planType;
   let idx = profile?.accountUuid
     ? cfg.accounts.findIndex(a => a.accountUuid === profile.accountUuid)
     : -1;

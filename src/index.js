@@ -3604,10 +3604,6 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       // learned it after the live account was constructed.
       if (typeof diskAcct.planType === 'string' && diskAcct.planType && mgr.planType !== diskAcct.planType) {
         mgr.planType = diskAcct.planType;
-      } else if (mgr.provider === 'anthropic' && !diskAcct.planType && mgr.planType) {
-        // A Claude reauth that found no plan cleared it on disk; drop the stale
-        // live label too (it drives the usage-limit grace cadence).
-        mgr.planType = null;
       }
       // Mirror the applied state into the in-memory config copy too. Otherwise a
       // later TUI saveConfig (for any unrelated op) would spread the pre-sync
@@ -3627,10 +3623,6 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         if (wantLapsed) memAcct.subscriptionDisabled = true; else delete memAcct.subscriptionDisabled;
         if (diskCancellation) memAcct.subscriptionCancellation = diskCancellation;
         else delete memAcct.subscriptionCancellation;
-        if (mgr.provider === 'anthropic') {
-          if (diskAcct.planType) memAcct.planType = diskAcct.planType;
-          else delete memAcct.planType;
-        }
       }
     }
 

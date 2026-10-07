@@ -3,11 +3,6 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { importCredentials } from '../src/oauth.js';
-import { applyOAuthUpsert, claudePlanType } from '../src/account-upsert.js';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 // Usage-limit grace: when an account hits its 5-hour limit, Anthropic grants a
 // fixed allotment from the weekly limit so the in-progress task can finish
@@ -198,44 +193,13 @@ test('a weekly window without a live reset gets no grace', async () => {
   assert.equal(await am.acquireAccount(), null);
 });
 
-test('the Claude plan reaches the live account through import and upsert', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'grace-plan-'));
-  try {
-    const file = join(dir, 'creds.json');
-    await writeFile(file, JSON.stringify({ claudeAiOauth: {
-      accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() + HOUR, subscriptionType: 'Pro',
-    } }));
-    assert.equal((await importCredentials(file)).planType, 'pro');
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-  const cfg = { accounts: [] };
-  applyOAuthUpsert(cfg, { name: 'p', creds: { accessToken: 'a' }, profile: { hasClaudePro: true }, source: 'login' });
-  applyOAuthUpsert(cfg, { name: 'm', creds: { accessToken: 'b' }, profile: { hasClaudeMax: true }, source: 'login' });
-  applyOAuthUpsert(cfg, { name: 'u', creds: { accessToken: 'c' }, profile: null, source: 'login' });
-  assert.deepEqual(cfg.accounts.map(a => a.planType), ['pro', 'max', undefined]);
-  const am = new AccountManager(cfg.accounts);
-  assert.deepEqual(am.accounts.map(a => a.planType), ['pro', 'max', null]);
-});
-
-test('claudePlanType: profile wins, then the imported plan, else null', () => {
-  assert.equal(claudePlanType({ planType: 'pro' }, { hasClaudeMax: true }), 'max');
-  assert.equal(claudePlanType({}, { hasClaudePro: true }), 'pro');
-  assert.equal(claudePlanType({ planType: 'Pro' }, null), 'pro');
-  assert.equal(claudePlanType({}, { error: 'x' }), null);
-  assert.equal(claudePlanType(null, null), null);
-});
-
-test('a known Pro account holds a refused grace until the weekly reset', async () => {
-  const am = new AccountManager(makeAccounts(2).map((a, i) => (i === 0 ? { ...a, planType: 'pro' } : a)));
-  const [pro, max] = am.accounts;
-  const r7d = Date.now() + 72 * HOUR;
-  for (const a of am.accounts) {
-    am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r7d }));
-    am.noteGraceRefused(a);
-  }
-  assert.equal(pro._graceSpentUntil, r7d - (r7d % 1000));
-  assert.ok(max._graceSpentUntil < r7d, 'unknown plan keeps the 5-hour cadence');
+test('a refusal holds until the 5h reset on every plan (no plan label tracked)', () => {
+  const am = new AccountManager(makeAccounts(1, { planType: 'pro' }));
+  const [a] = am.accounts;
+  const r5h = Date.now() + HOUR;
+  sessionCapped(am, a);
+  am.noteGraceRefused(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r5h }));
+  assert.equal(a._graceSpentUntil, Math.floor(r5h / 1000) * 1000);
 });
 
 test('a concurrent Fable rejection on the shared quota does not refuse Opus grace', () => {

@@ -1452,19 +1452,14 @@ export class AccountManager {
     const ownU5h = headers ? parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']) : NaN;
     const u5h = Number.isFinite(ownU5h) ? ownU5h : q.unified5h;
     if (u5h == null || u5h < this.switchThreshold) return;
-    // Pro gets grace once a week, so a refusal holds until the weekly reset.
-    // Unknown plans stay on the 5-hour cadence: a refused request costs no
-    // quota, while a weekly hold would switch grace off for Max accounts.
-    const ownReset = name => {
-      const s = headers ? parseInt(headers[`anthropic-ratelimit-unified-${name}-reset`], 10) : NaN;
-      return Number.isFinite(s) ? s * 1000 : null;
-    };
-    const reset5h = ownReset('5h') ?? q.unified5hReset;
-    const reset7d = ownReset('7d') ?? q.unified7dReset;
-    const plan = String(account.planType || '').toLowerCase();
-    account._graceSpentUntil = plan === 'pro' && reset7d
-      ? reset7d
-      : reset5h || Date.now() + 5 * 3600_000;
+    // Hold for this window on every plan. Pro gets grace only once a week, so a
+    // Pro account is re-offered (and refused again) once per 5-hour window; a
+    // refused request spends no quota, and no plan label has to be tracked.
+    const ownReset = headers
+      ? parseInt(headers['anthropic-ratelimit-unified-5h-reset'], 10) * 1000
+      : NaN;
+    account._graceSpentUntil = Number.isFinite(ownReset) ? ownReset
+      : q.unified5hReset || Date.now() + 5 * 3600_000;
   }
 
   /** Is this account exhausted only for the requested model tier? */

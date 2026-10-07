@@ -1,5 +1,3 @@
-import { claudePlanType } from './account-upsert.js';
-
 function matchingTargetIndexes(accounts, name, expectedAccountUuid) {
   if (expectedAccountUuid) {
     return accounts.map((account, index) => ({ account, index }))
@@ -102,13 +100,6 @@ export function applyReauthToConfig(config, {
   delete updated.subscriptionDisabled;
   for (const field of ['idToken', 'accountId', 'email', 'planType']) {
     if (credentials[field] != null) updated[field] = credentials[field];
-  }
-  if (resolvedProvider !== 'codex') {
-    // Re-derive from the verified login; an unknown plan drops a stale label
-    // (the safe 5-hour grace cadence) instead of keeping an old 'pro'.
-    const planType = claudePlanType(credentials, profile);
-    if (planType) updated.planType = planType;
-    else delete updated.planType;
   }
   config.accounts[index] = updated;
   return updated;
@@ -238,13 +229,6 @@ export function reauthenticateTuiAccount(tui, account) {
       });
       for (const field of ['idToken', 'accountId', 'email', 'planType']) {
         if (credentials[field] != null) configAccount[field] = credentials[field];
-      }
-      if (account.provider !== 'codex') {
-        // Unknown plan clears a stale label (safe 5-hour grace cadence).
-        const planType = claudePlanType(credentials, profile);
-        if (planType) configAccount.planType = planType;
-        else delete configAccount.planType;
-        account.planType = planType;
       }
 
       tui.am.updateAccountTokens(account, credentials, false);

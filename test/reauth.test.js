@@ -598,25 +598,3 @@ test('confirmed Codex subscription end is not presented as a re-authentication e
   assert.doesNotMatch(tui._renderAcct(am.accounts[0], 0, 10, true, false), /reauth/);
   assert.doesNotMatch(tui._renderFooter(), /재인증 필요/);
 });
-
-test('reauth records the Claude plan from the verified profile (usage-limit grace cadence)', () => {
-  const config = fixture();
-  const result = applyReauthToConfig(config, {
-    name: 'broken@example.com',
-    expectedAccountUuid: 'uuid-broken',
-    credentials: freshResult.credentials,
-    profile: { ...freshResult.profile, hasClaudePro: true },
-  });
-  assert.equal(result.planType, 'pro');
-});
-
-test('reauth drops a stale Claude plan when the verified profile reports none', () => {
-  const config = fixture();
-  config.accounts[0].planType = 'pro';
-  const result = applyReauthToConfig(config, {
-    name: 'broken@example.com',
-    expectedAccountUuid: 'uuid-broken',
-    ...freshResult,
-  });
-  assert.equal(result.planType, undefined);
-});
