@@ -173,6 +173,28 @@ test('anyUsable sees a grace account so failover does not dead-end early', () =>
   assert.equal(am.anyUsable(new Set([am.accounts[0]])), false);
 });
 
+test('an unmeasured weekly window gets no grace', async () => {
+  const am = new AccountManager(makeAccounts(1));
+  am.updateQuota(am.accounts[0], {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  assert.equal(await am.acquireAccount(), null);
+});
+
+test('a known Pro account holds a refused grace until the weekly reset', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  const [pro, max] = am.accounts;
+  pro.subscriptionType = 'pro';
+  const r7d = Date.now() + 72 * HOUR;
+  for (const a of am.accounts) {
+    am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r7d }));
+    am.noteGraceRefused(a);
+  }
+  assert.equal(pro._graceSpentUntil, r7d - (r7d % 1000));
+  assert.ok(max._graceSpentUntil < r7d, 'unknown plan keeps the 5-hour cadence');
+});
+
 test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
   const am = new AccountManager(makeAccounts(2));
   sessionCapped(am, am.accounts[0]); // allowed, not rejected
