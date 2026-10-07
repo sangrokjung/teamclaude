@@ -1455,10 +1455,16 @@ export class AccountManager {
     // Pro gets grace once a week, so a refusal holds until the weekly reset.
     // Unknown plans stay on the 5-hour cadence: a refused request costs no
     // quota, while a weekly hold would switch grace off for Max accounts.
+    const ownReset = name => {
+      const s = headers ? parseInt(headers[`anthropic-ratelimit-unified-${name}-reset`], 10) : NaN;
+      return Number.isFinite(s) ? s * 1000 : null;
+    };
+    const reset5h = ownReset('5h') ?? q.unified5hReset;
+    const reset7d = ownReset('7d') ?? q.unified7dReset;
     const plan = String(account.planType || '').toLowerCase();
-    account._graceSpentUntil = plan === 'pro' && q.unified7dReset
-      ? q.unified7dReset
-      : q.unified5hReset || Date.now() + 5 * 3600_000;
+    account._graceSpentUntil = plan === 'pro' && reset7d
+      ? reset7d
+      : reset5h || Date.now() + 5 * 3600_000;
   }
 
   /** Is this account exhausted only for the requested model tier? */

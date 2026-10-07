@@ -248,8 +248,11 @@ test('a concurrent Fable rejection on the shared quota does not refuse Opus grac
   am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }));
   am.noteGraceRefused(a, opusHeaders);
   assert.equal(a._graceSpentUntil, undefined);
-  am.noteGraceRefused(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }));
-  assert.ok(a._graceSpentUntil > Date.now());
+  const ownReset = Date.now() + 2 * HOUR;
+  // Shared reset now differs (another response rolled it); the refusal must use its own.
+  a.quota.unified5hReset = Date.now() + 4 * HOUR;
+  am.noteGraceRefused(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r5h: ownReset }));
+  assert.equal(a._graceSpentUntil, Math.floor(ownReset / 1000) * 1000);
 });
 
 test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
