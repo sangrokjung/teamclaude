@@ -545,6 +545,38 @@ export class AccountManager {
     return !(Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil);
   }
 
+  /**
+   * Session reserve (config `sessionReserve`): once EVERY usable account's
+   * 5-hour window is at or above `switchThreshold - reserve`, the rest of the
+   * fleet's session quota is kept for work already in progress (server.js then
+   * answers new user turns locally). Returns the soonest 5-hour reset (ms) while
+   * the fleet is inside the reserve, else null. Unmeasured and non-unified
+   * (API-key) accounts count as headroom; an account that can serve nothing
+   * (weekly spent, throttled, disabled, error) does not take part, and a fleet
+   * with no usable account at all is left to the normal 429 path. Anthropic
+   * accounts only. Fails open: a reserve that would leave no floor (reserve ≥
+   * switchThreshold) or an in-reserve account without a known future 5-hour
+   * reset disables the gate rather than blocking for a guessed duration.
+   */
+  sessionReserveUntil(reserve, model = null) {
+    if (!(reserve > 0) || !(reserve < this.switchThreshold)) return null;
+    const floor = this.switchThreshold - reserve;
+    const now = Date.now();
+    let soonest = null;
+    let any = false;
+    for (const a of this.accounts) {
+      if (a.provider === 'codex') continue;
+      if (!this._isAvailable(a, model) && !this._isGraceEligible(a, model)) continue;
+      any = true;
+      const u5h = a.quota.unified5h;
+      if (!(u5h != null && u5h >= floor)) return null;
+      const reset = a.quota.unified5hReset;
+      if (!(Number.isFinite(reset) && reset > now)) return null;
+      if (soonest == null || reset < soonest) soonest = reset;
+    }
+    return any ? soonest : null;
+  }
+
   /** Best grace account: the connection's home first (the task being finished), then the most weekly headroom. */
   _graceCandidate(exclude = null, model = null, affinityKey = null) {
     const ok = a => a && !(exclude && exclude.has(a))

@@ -295,6 +295,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Anthropic-only: the Codex backend's in-stream error contract differs, so
   // codex mode keeps the legacy passthrough. `streamRecovery: false` opts out.
   const streamRecovery = provider === 'anthropic' && config.streamRecovery !== false;
+  // Session reserve: the last slice of the fleet's 5-hour quota, kept for work
+  // already in progress (see AccountManager.sessionReserveUntil). Anthropic
+  // only; 0 (or an invalid value) disables it.
+  const sessionReserve = provider === 'anthropic'
+    ? (config.sessionReserve === undefined ? 0.05
+      : Number.isFinite(config.sessionReserve) && config.sessionReserve > 0 && config.sessionReserve < 1
+        ? config.sessionReserve : 0)
+    : 0;
+  let sessionReserveLogged = false;
   const maxResponseBytes = Number.isFinite(config.maxResponseBytes) && config.maxResponseBytes > 0
     ? Math.floor(config.maxResponseBytes)
     : DEFAULT_MAX_RESPONSE_BYTES;
@@ -1621,6 +1630,34 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           ctx.model = requestModel.model;
           ctx.advisorToolIndex = requestModel.advisorToolIndex;
 
+          // Session reserve: keep the fleet's last 5-hour slice for work in
+          // progress — a new user turn waits for the reset, a tool-loop
+          // continuation still flows (it is what must not stop mid-change).
+          const reserveUntil = sessionReserve > 0 && ctx.byok !== true
+            && req.method === 'POST' && req.url.split('?')[0] === '/v1/messages'
+            ? accountManager.sessionReserveUntil(sessionReserve, ctx.model)
+            : null;
+          if (reserveUntil != null && isNewUserTurn(requestModel.json)) {
+            const retryAfter = Math.max(1, Math.ceil((reserveUntil - Date.now()) / 1000));
+            if (!sessionReserveLogged) {
+              sessionReserveLogged = true;
+              console.log(`[TeamClaude] Session reserve active — every account is within ${Math.round(sessionReserve * 100)}% of its 5-hour limit; holding new turns for ${retryAfter}s, tool-loop continuations still flow`);
+            }
+            ctx.status = 429;
+            ctx.account = '(session reserve)';
+            res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'rate_limit_error',
+                message: `Every account is near its 5-hour limit; the remaining session reserve is kept for work already in progress. New requests resume in about ${Math.ceil(retryAfter / 60)} min.`,
+              },
+            }));
+            return;
+          }
+          if (reserveUntil == null) sessionReserveLogged = false;
+          requestModel.json = null; // don't hold the parsed body for the request's lifetime
+
           // Tie an abort signal to client disconnect so a request that's only
           // WAITING in the overflow queue is cancelled if the client goes away —
           // otherwise it would acquire a slot later and be dispatched upstream,
@@ -2187,6 +2224,30 @@ function parseRetryAfterMs(value, nowMs = Date.now()) {
   return Number.isFinite(dateMs) ? Math.max(0, dateMs - nowMs) : 0;
 }
 
+/**
+ * Does this /v1/messages body start a new user turn (the last user message is
+ * typed content) rather than continue an agent loop (it carries a tool_result)?
+ * Fails open (false) on anything unparseable, so the session-reserve gate never
+ * blocks a request it cannot classify.
+ */
+export function isNewUserTurn(body) {
+  let json = body;
+  if (Buffer.isBuffer(body)) {
+    try {
+      json = JSON.parse(body.toString());
+    } catch {
+      return false;
+    }
+  }
+  const messages = json?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  if (last?.role !== 'user') return false;
+  if (typeof last.content === 'string') return true;
+  if (!Array.isArray(last.content)) return false;
+  return !last.content.some(block => block?.type === 'tool_result');
+}
+
 function extractRequestModel(body) {
   try {
     const json = JSON.parse(body.toString());
@@ -2197,14 +2258,15 @@ function extractRequestModel(body) {
         && typeof tool.model === 'string' && tool.model.length > 0)
       : -1;
     if (advisorToolIndex >= 0) {
-      return { model: json.tools[advisorToolIndex].model, advisorToolIndex };
+      return { model: json.tools[advisorToolIndex].model, advisorToolIndex, json };
     }
     return {
       model: typeof json?.model === 'string' ? json.model : null,
       advisorToolIndex: null,
+      json,
     };
   } catch {
-    return { model: null, advisorToolIndex: null };
+    return { model: null, advisorToolIndex: null, json: null };
   }
 }
 

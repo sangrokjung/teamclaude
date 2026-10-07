@@ -16,6 +16,7 @@
   "tokenRefreshIntervalMs": 300000,
   "streamRecovery": true,
   "usageLimitGrace": true,
+  "sessionReserve": 0.05,
   "maxResponseBytes": 67108864,
   "upstreamResponseTimeoutMs": 300000,
   "streamIdleTimeoutMs": 300000,
