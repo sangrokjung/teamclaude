@@ -68,6 +68,17 @@ test('sessionReserveUntil: grace-only accounts count as in reserve; unmeasured o
   assert.ok(am.sessionReserveUntil(0.05) > Date.now());
 });
 
+test('sessionReserveUntil: fails open on an unknown reset or a reserve with no floor', () => {
+  const am = new AccountManager(makeAccounts(1));
+  measure(am, am.accounts[0], 0.96);
+  assert.ok(am.sessionReserveUntil(0.05) > Date.now());
+  am.accounts[0].quota.unified5hReset = null; // partial headers / old snapshot
+  assert.equal(am.sessionReserveUntil(0.05), null, 'no guessed 5h block without a reset');
+  const am2 = new AccountManager(makeAccounts(1));
+  measure(am2, am2.accounts[0], 0);
+  assert.equal(am2.sessionReserveUntil(0.99), null, 'reserve >= switchThreshold disables');
+});
+
 test('sessionReserveUntil: an unusable fleet is not a reserve decision', () => {
   const am = new AccountManager(makeAccounts(1));
   measure(am, am.accounts[0], 1, Date.now() + HOUR, 1); // weekly spent too

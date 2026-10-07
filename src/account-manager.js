@@ -554,11 +554,14 @@ export class AccountManager {
    * (API-key) accounts count as headroom; an account that can serve nothing
    * (weekly spent, throttled, disabled, error) does not take part, and a fleet
    * with no usable account at all is left to the normal 429 path. Anthropic
-   * accounts only.
+   * accounts only. Fails open: a reserve that would leave no floor (reserve ≥
+   * switchThreshold) or an in-reserve account without a known future 5-hour
+   * reset disables the gate rather than blocking for a guessed duration.
    */
   sessionReserveUntil(reserve, model = null) {
-    if (!(reserve > 0)) return null;
+    if (!(reserve > 0) || !(reserve < this.switchThreshold)) return null;
     const floor = this.switchThreshold - reserve;
+    const now = Date.now();
     let soonest = null;
     let any = false;
     for (const a of this.accounts) {
@@ -568,10 +571,10 @@ export class AccountManager {
       const u5h = a.quota.unified5h;
       if (!(u5h != null && u5h >= floor)) return null;
       const reset = a.quota.unified5hReset;
-      if (Number.isFinite(reset) && (soonest == null || reset < soonest)) soonest = reset;
+      if (!(Number.isFinite(reset) && reset > now)) return null;
+      if (soonest == null || reset < soonest) soonest = reset;
     }
-    if (!any) return null;
-    return soonest ?? Date.now() + 5 * 3600_000;
+    return any ? soonest : null;
   }
 
   /** Best grace account: the connection's home first (the task being finished), then the most weekly headroom. */
