@@ -255,6 +255,20 @@ test('a concurrent Fable rejection on the shared quota does not refuse Opus grac
   assert.equal(a._graceSpentUntil, Math.floor(ownReset / 1000) * 1000);
 });
 
+// server.js only calls noteGraceRefused inside `if (isExhausted(account))`.
+// A concurrent 200 that overwrites the shared status with `allowed` must not
+// skip that call while the account is still session-capped.
+test('a session-capped account stays exhausted when a concurrent response overwrote the shared status', () => {
+  const am = new AccountManager(makeAccounts(1));
+  const [a] = am.accounts;
+  am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' })); // this request's 429
+  am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.41, status: 'allowed' })); // concurrent 200
+  assert.equal(a.quota.unifiedStatus, 'allowed');
+  assert.equal(am.isExhausted(a), true);
+  am.noteGraceRefused(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }));
+  assert.ok(a._graceSpentUntil > Date.now());
+});
+
 test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
   const am = new AccountManager(makeAccounts(2));
   sessionCapped(am, am.accounts[0]); // allowed, not rejected
