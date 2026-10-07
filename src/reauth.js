@@ -1,3 +1,5 @@
+import { claudePlanType } from './account-upsert.js';
+
 function matchingTargetIndexes(accounts, name, expectedAccountUuid) {
   if (expectedAccountUuid) {
     return accounts.map((account, index) => ({ account, index }))
@@ -100,6 +102,10 @@ export function applyReauthToConfig(config, {
   delete updated.subscriptionDisabled;
   for (const field of ['idToken', 'accountId', 'email', 'planType']) {
     if (credentials[field] != null) updated[field] = credentials[field];
+  }
+  if (resolvedProvider !== 'codex') {
+    const planType = claudePlanType(credentials, profile);
+    if (planType) updated.planType = planType;
   }
   config.accounts[index] = updated;
   return updated;
@@ -229,6 +235,11 @@ export function reauthenticateTuiAccount(tui, account) {
       });
       for (const field of ['idToken', 'accountId', 'email', 'planType']) {
         if (credentials[field] != null) configAccount[field] = credentials[field];
+      }
+      const planType = account.provider === 'codex' ? null : claudePlanType(credentials, profile);
+      if (planType) {
+        configAccount.planType = planType;
+        account.planType = planType;
       }
 
       tui.am.updateAccountTokens(account, credentials, false);

@@ -4,7 +4,7 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { importCredentials } from '../src/oauth.js';
-import { applyOAuthUpsert } from '../src/account-upsert.js';
+import { applyOAuthUpsert, claudePlanType } from '../src/account-upsert.js';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -216,6 +216,14 @@ test('the Claude plan reaches the live account through import and upsert', async
   assert.deepEqual(cfg.accounts.map(a => a.planType), ['pro', 'max', undefined]);
   const am = new AccountManager(cfg.accounts);
   assert.deepEqual(am.accounts.map(a => a.planType), ['pro', 'max', null]);
+});
+
+test('claudePlanType: profile wins, then the imported plan, else null', () => {
+  assert.equal(claudePlanType({ planType: 'pro' }, { hasClaudeMax: true }), 'max');
+  assert.equal(claudePlanType({}, { hasClaudePro: true }), 'pro');
+  assert.equal(claudePlanType({ planType: 'Pro' }, null), 'pro');
+  assert.equal(claudePlanType({}, { error: 'x' }), null);
+  assert.equal(claudePlanType(null, null), null);
 });
 
 test('a known Pro account holds a refused grace until the weekly reset', async () => {

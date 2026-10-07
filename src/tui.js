@@ -3,6 +3,7 @@ import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
+import { claudePlanType } from './account-upsert.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -546,6 +547,8 @@ export class TUI {
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
       };
+      const planType = claudePlanType(creds, profile);
+      if (planType) entry.planType = planType;
 
       // Deduplicate: match by UUID first, then by name
       let idx = profile?.accountUuid
@@ -579,6 +582,7 @@ export class TUI {
           amAcct.expiresAt = creds.expiresAt;
           amAcct.accountUuid = entry.accountUuid;
           amAcct.name = name;
+          if (entry.planType) amAcct.planType = entry.planType;
           if (amAcct.status === 'error') {
             amAcct.status = 'active';
             delete amAcct._errorFromRefresh;
