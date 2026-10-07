@@ -200,6 +200,9 @@ export class AccountManager {
     // header-less) recovers without a restart, while a truly pathological one
     // costs at most one probe per window.
     this.probeRetryAfterMs = 15 * 60 * 1000;
+    // Usage-limit grace lane (config `usageLimitGrace`, default on): see
+    // _graceCandidate. Anthropic accounts only.
+    this.usageLimitGrace = true;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
     this._accountFlagWrites = new Set();
@@ -385,16 +388,28 @@ export class AccountManager {
     return capped;
   }
 
-  /** Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.) */
+  /**
+   * Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.)
+   * Grace-eligible accounts count too, under the same rule _tryAcquire uses to
+   * hand them out: only while no normal account is merely capped (that request
+   * queues for the normal slot instead).
+   */
   anyUsable(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      || (this._cappedSet(exclude, model).size === 0 && this._anyGrace(exclude, model, true));
   }
 
-  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) */
+  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) Includes capped grace accounts. */
   anyCapped(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      || this._anyGrace(exclude, model, false);
+  }
+
+  _anyGrace(exclude, model, withCapacity) {
+    return this.accounts.some(a => !(exclude && exclude.has(a))
+      && this._isGraceEligible(a, model) && this._hasCapacity(a) === withCapacity);
   }
 
   /**
@@ -483,7 +498,67 @@ export class AccountManager {
       }
       return account;
     }
+    // Nothing normally usable. If no available account is merely at its cap
+    // (a freed slot will serve the request — queue for it instead), fall back
+    // to the usage-limit grace lane.
+    if (capped.size === 0) {
+      const grace = this._graceCandidate(exclude, model, affOk ? affinityKey : null);
+      if (grace) {
+        grace.inflight++;
+        if (affOk) {
+          const home = this._affinity.get(affinityKey);
+          const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
+          if (!homeUsable) this._affinity.set(affinityKey, grace);
+        }
+        console.log(`[TeamClaude] Account "${grace.name}" hit its 5-hour limit — forwarding under usage-limit grace`);
+        return grace;
+      }
+    }
     return null;
+  }
+
+  /**
+   * Usage-limit grace: when an account reaches its 5-hour limit, Anthropic
+   * grants a fixed allotment from the weekly limit so the in-progress task can
+   * finish (Pro: once a week; Max/Team Premium: at every 5-hour limit). Only
+   * the server knows whether a request is covered, so once no account is
+   * normally usable the proxy still forwards to an account that is capped ONLY
+   * by its 5-hour window, instead of answering 429 itself. A refusal comes
+   * back as an ordinary `rejected` 429 — updateQuota then marks the grace spent
+   * until that 5-hour window resets, so it is offered at most once per window.
+   */
+  _isGraceEligible(account, model = null) {
+    if (!this.usageLimitGrace || !account) return false;
+    if (account.enabled === false || account.provider === 'codex') return false;
+    if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) return false;
+    if (this._isModelUnsupported(account, model)) return false;
+    if (!this._isNearQuota(account, model)) return false; // normally usable — not grace
+    if (this._isModelNearQuota(account, model)) return false;
+    const q = account.quota;
+    if (!(q.unified5h != null && q.unified5h >= this.switchThreshold)) return false;
+    // Grace draws on the weekly limit, so require a measured, still-open weekly
+    // window under threshold — an unmeasured one could already be spent.
+    if (!Number.isFinite(q.unified7d) || q.unified7d >= this.switchThreshold) return false;
+    if (!Number.isFinite(q.unified7dReset) || q.unified7dReset <= Date.now()) return false;
+    return !(Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil);
+  }
+
+  /** Best grace account: the connection's home first (the task being finished), then the most weekly headroom. */
+  _graceCandidate(exclude = null, model = null, affinityKey = null) {
+    const ok = a => a && !(exclude && exclude.has(a))
+      && this._isGraceEligible(a, model) && this._hasCapacity(a);
+    if (affinityKey) {
+      const home = this._affinity.get(affinityKey);
+      if (home && this.accounts[home.index] === home && ok(home)) return home;
+    }
+    let best = null;
+    for (const a of this.accounts) {
+      if (!ok(a)) continue;
+      if (!best || (a.quota.unified7d ?? 0) < (best.quota.unified7d ?? 0)) best = a;
+    }
+    return best;
   }
 
   /**
@@ -1355,6 +1430,36 @@ export class AccountManager {
     if (account.quota.unifiedStatus === 'rejected') return true;
     // Otherwise rely on measured utilization (unified or standard headers).
     return this._isNearQuota(account);
+  }
+
+  /**
+   * Record a server refusal of the usage-limit grace: a `rejected` account-level
+   * 429 while session-capped means the grace was already used or the plan does
+   * not offer it, so stop offering it on this account until the 5-hour window
+   * resets (see _isGraceEligible). Called by server.js only AFTER the 429 was
+   * classified as account-level — a model-scoped rejection (e.g. the Fable
+   * weekly window) must not cost the account its grace for other models.
+   */
+  noteGraceRefused(accountIndex, headers = null) {
+    const account = this._resolve(accountIndex);
+    if (!account) return;
+    // Judge THIS response's own headers when given: the shared quota fields can
+    // be overwritten meanwhile by a concurrent response on the same account
+    // (e.g. a Fable model-weekly rejection), which must not refuse Opus grace.
+    const q = account.quota;
+    const status = headers ? headers['anthropic-ratelimit-unified-status'] : q.unifiedStatus;
+    if (status !== 'rejected') return;
+    const ownU5h = headers ? parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']) : NaN;
+    const u5h = Number.isFinite(ownU5h) ? ownU5h : q.unified5h;
+    if (u5h == null || u5h < this.switchThreshold) return;
+    // Hold for this window on every plan. Pro gets grace only once a week, so a
+    // Pro account is re-offered (and refused again) once per 5-hour window; a
+    // refused request spends no quota, and no plan label has to be tracked.
+    const ownReset = headers
+      ? parseInt(headers['anthropic-ratelimit-unified-5h-reset'], 10) * 1000
+      : NaN;
+    account._graceSpentUntil = Number.isFinite(ownReset) ? ownReset
+      : q.unified5hReset || Date.now() + 5 * 3600_000;
   }
 
   /** Is this account exhausted only for the requested model tier? */

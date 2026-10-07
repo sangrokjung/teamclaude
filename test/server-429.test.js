@@ -662,6 +662,8 @@ test('continuity mode waits for quota reset instead of returning all-accounts-ex
   });
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  // Grace lane off: this pins the no-grace path (usage-limit-grace.test.js covers grace).
+  am.usageLimitGrace = false;
   am.accounts[0].quota.unified5h = 0.99;
   am.accounts[0].quota.unified5hReset = Date.now() + 35;
   const proxy = startContinuityProxy(am, upstreamPort, { continuityMaxWaitMs: 250 });
@@ -691,6 +693,8 @@ test('continuity deadline bounds a permanently utilization-exhausted fleet', asy
   });
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  // Grace lane off: this pins the no-grace path (usage-limit-grace.test.js covers grace).
+  am.usageLimitGrace = false;
   am.accounts[0].quota.unified5h = 0.99;
   am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
   const proxy = startContinuityProxy(am, upstreamPort, { continuityMaxWaitMs: 55 });
@@ -723,6 +727,8 @@ test('zero continuity deadline bounds no-capacity waits by the legacy retry coun
   const previousRetries = process.env.TEAMCLAUDE_OVERLOAD_RETRIES;
   process.env.TEAMCLAUDE_OVERLOAD_RETRIES = '2';
   const am = new AccountManager(makeAccountsForServer(1), 0.98);
+  // Grace lane off: this pins the no-grace path (usage-limit-grace.test.js covers grace).
+  am.usageLimitGrace = false;
   am.accounts[0].quota.unified5h = 0.99;
   am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
   const proxy = startContinuityProxy(am, 0, { continuityMaxWaitMs: 0 });
@@ -875,6 +881,8 @@ test('all-exhausted-by-utilization → 429 retry-after tracks the real reset, no
   // Both over the 5h threshold with a reset ~1h out, measured purely from quota
   // state — no upstream 429 needed: acquireAccount returns null and the request
   // never leaves the proxy.
+  // Grace lane off: this pins the no-grace path (usage-limit-grace.test.js covers grace).
+  am.usageLimitGrace = false;
   const resetMs = Date.now() + 3600_000;
   for (const acct of am.accounts) {
     acct.quota.unified5h = 0.995;

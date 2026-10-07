@@ -1363,6 +1363,7 @@ async function proxyWorkerCommand() {
     ? config.overflowQueueMaxDepth
     : 256;
   const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault, overflowQueueMaxDepth);
+  accountManager.usageLimitGrace = config.usageLimitGrace !== false;
 
   // Restore the last run's quota snapshot so a restart doesn't blank the
   // dashboard (quota otherwise lives only in memory and is re-learned from

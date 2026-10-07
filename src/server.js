@@ -3239,6 +3239,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }
 
       if (accountManager.isExhausted(account)) {
+        accountManager.noteGraceRefused(account, rateLimitHeaders);
         // Account policy: redeem a reset credit on THIS account and retry it
         // here, before throttling/switching. (The fleet policy waits for the
         // acquisition dead end instead, so rotation to a healthy account wins.)
