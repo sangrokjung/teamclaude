@@ -1637,7 +1637,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             && req.method === 'POST' && req.url.split('?')[0] === '/v1/messages'
             ? accountManager.sessionReserveUntil(sessionReserve, ctx.model)
             : null;
-          if (reserveUntil != null && isNewUserTurn(body)) {
+          if (reserveUntil != null && isNewUserTurn(requestModel.json)) {
             const retryAfter = Math.max(1, Math.ceil((reserveUntil - Date.now()) / 1000));
             if (!sessionReserveLogged) {
               sessionReserveLogged = true;
@@ -1656,6 +1656,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             return;
           }
           if (reserveUntil == null) sessionReserveLogged = false;
+          requestModel.json = null; // don't hold the parsed body for the request's lifetime
 
           // Tie an abort signal to client disconnect so a request that's only
           // WAITING in the overflow queue is cancelled if the client goes away —
@@ -2230,11 +2231,13 @@ function parseRetryAfterMs(value, nowMs = Date.now()) {
  * blocks a request it cannot classify.
  */
 export function isNewUserTurn(body) {
-  let json;
-  try {
-    json = JSON.parse(body.toString());
-  } catch {
-    return false;
+  let json = body;
+  if (Buffer.isBuffer(body)) {
+    try {
+      json = JSON.parse(body.toString());
+    } catch {
+      return false;
+    }
   }
   const messages = json?.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
@@ -2255,14 +2258,15 @@ function extractRequestModel(body) {
         && typeof tool.model === 'string' && tool.model.length > 0)
       : -1;
     if (advisorToolIndex >= 0) {
-      return { model: json.tools[advisorToolIndex].model, advisorToolIndex };
+      return { model: json.tools[advisorToolIndex].model, advisorToolIndex, json };
     }
     return {
       model: typeof json?.model === 'string' ? json.model : null,
       advisorToolIndex: null,
+      json,
     };
   } catch {
-    return { model: null, advisorToolIndex: null };
+    return { model: null, advisorToolIndex: null, json: null };
   }
 }
 

@@ -44,6 +44,8 @@ test('isNewUserTurn: typed text starts a turn, a tool_result continues one', () 
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] },
   ])), false);
   assert.equal(isNewUserTurn(Buffer.from('not json')), false, 'fail open');
+  assert.equal(isNewUserTurn({ messages: [{ role: 'user', content: 'hi' }] }), true, 'already-parsed body');
+  assert.equal(isNewUserTurn(null), false, 'unparseable body (parsed as null)');
   assert.equal(isNewUserTurn(body([])), false);
   assert.equal(isNewUserTurn(body([{ role: 'assistant', content: 'prefill' }])), false);
 });
