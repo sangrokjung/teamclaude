@@ -79,6 +79,8 @@ test('overflow queue times out to null when no slot ever frees', async () => {
 
 test('all accounts exhausted by quota returns null immediately (does not queue)', async () => {
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  // Grace lane off: this pins the no-grace path (usage-limit-grace.test.js covers grace).
+  am.usageLimitGrace = false;
   measureAll(am, 0.99); // both over threshold → unavailable (not merely capped)
 
   const start = Date.now();

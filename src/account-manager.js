@@ -200,6 +200,9 @@ export class AccountManager {
     // header-less) recovers without a restart, while a truly pathological one
     // costs at most one probe per window.
     this.probeRetryAfterMs = 15 * 60 * 1000;
+    // Usage-limit grace lane (config `usageLimitGrace`, default on): see
+    // _graceCandidate. Anthropic accounts only.
+    this.usageLimitGrace = true;
     this._warmupCursor = 0;  // round-robin pointer used during warm-up
     this._waiters = [];      // overflow queue: requests waiting for a free slot
     this._accountFlagWrites = new Set();
@@ -483,7 +486,64 @@ export class AccountManager {
       }
       return account;
     }
+    // Nothing normally usable. If no available account is merely at its cap
+    // (a freed slot will serve the request — queue for it instead), fall back
+    // to the usage-limit grace lane.
+    if (capped.size === 0) {
+      const grace = this._graceCandidate(exclude, model, affOk ? affinityKey : null);
+      if (grace) {
+        grace.inflight++;
+        if (affOk) {
+          const home = this._affinity.get(affinityKey);
+          const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
+          if (!homeUsable) this._affinity.set(affinityKey, grace);
+        }
+        console.log(`[TeamClaude] Account "${grace.name}" hit its 5-hour limit — forwarding under usage-limit grace`);
+        return grace;
+      }
+    }
     return null;
+  }
+
+  /**
+   * Usage-limit grace: when an account reaches its 5-hour limit, Anthropic
+   * grants a fixed allotment from the weekly limit so the in-progress task can
+   * finish (Pro: once a week; Max/Team Premium: at every 5-hour limit). Only
+   * the server knows whether a request is covered, so once no account is
+   * normally usable the proxy still forwards to an account that is capped ONLY
+   * by its 5-hour window, instead of answering 429 itself. A refusal comes
+   * back as an ordinary `rejected` 429 — updateQuota then marks the grace spent
+   * until that 5-hour window resets, so it is offered at most once per window.
+   */
+  _isGraceEligible(account, model = null) {
+    if (!this.usageLimitGrace || !account) return false;
+    if (account.enabled === false || account.provider === 'codex') return false;
+    if (account.status === 'exhausted' || account.status === 'error') return false;
+    if (account.status === 'throttled' && account.rateLimitedUntil
+        && Date.now() < account.rateLimitedUntil) return false;
+    if (this._isModelUnsupported(account, model)) return false;
+    if (!this._isNearQuota(account, model)) return false; // normally usable — not grace
+    if (this._isModelNearQuota(account, model)) return false;
+    const q = account.quota;
+    if (!(q.unified5h != null && q.unified5h >= this.switchThreshold)) return false;
+    if (q.unified7d != null && q.unified7d >= this.switchThreshold) return false;
+    if (Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil) return false;
+    return this._hasCapacity(account);
+  }
+
+  /** Best grace account: the connection's home first (the task being finished), then the most weekly headroom. */
+  _graceCandidate(exclude = null, model = null, affinityKey = null) {
+    const ok = a => a && !(exclude && exclude.has(a)) && this._isGraceEligible(a, model);
+    if (affinityKey) {
+      const home = this._affinity.get(affinityKey);
+      if (home && this.accounts[home.index] === home && ok(home)) return home;
+    }
+    let best = null;
+    for (const a of this.accounts) {
+      if (!ok(a)) continue;
+      if (!best || (a.quota.unified7d ?? 0) < (best.quota.unified7d ?? 0)) best = a;
+    }
+    return best;
   }
 
   /**
@@ -1175,6 +1235,13 @@ export class AccountManager {
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     const codexReached = headers['x-codex-rate-limit-reached-type'];
     account.quota.unifiedStatus = uStatus || (codexReached ? 'rejected' : null);
+    // A rejection while session-capped means the server refused the 5-hour
+    // grace (already used, or not offered by the plan): stop offering it on
+    // this account until the window resets. See _isGraceEligible.
+    if (uStatus === 'rejected' && account.quota.unified5h != null
+        && account.quota.unified5h >= this.switchThreshold) {
+      account._graceSpentUntil = account.quota.unified5hReset || Date.now() + 5 * 3600_000;
+    }
 
     // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
     // for the top model tier ("Fable" in Claude's usage UI). These headers only

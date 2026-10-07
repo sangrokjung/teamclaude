@@ -1,0 +1,233 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+
+// Usage-limit grace: when an account hits its 5-hour limit, Anthropic grants a
+// fixed allotment from the weekly limit so the in-progress task can finish
+// (Pro: once a week; Max/Team Premium: every 5-hour limit). The server decides
+// whether a request is covered, so once every account is session-capped the
+// proxy must still forward to a session-only-capped account instead of
+// answering 429 itself.
+
+const HOUR = 3600_000;
+
+function makeAccounts(n, extra = {}) {
+  return Array.from({ length: n }, (_, i) => ({
+    name: `acct-${i}`,
+    type: 'oauth',
+    accessToken: `tok-${i}`,
+    refreshToken: `r-${i}`,
+    expiresAt: Date.now() + HOUR,
+    ...extra,
+  }));
+}
+
+function quotaHeaders({ u5h, u7d, status = 'allowed', r5h = Date.now() + HOUR, r7d = Date.now() + 72 * HOUR }) {
+  return {
+    'anthropic-ratelimit-unified-5h-utilization': String(u5h),
+    'anthropic-ratelimit-unified-7d-utilization': String(u7d),
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor(r5h / 1000)),
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor(r7d / 1000)),
+    'anthropic-ratelimit-unified-status': status,
+  };
+}
+
+function sessionCapped(am, account, u7d = 0.4) {
+  am.updateQuota(account, quotaHeaders({ u5h: 1, u7d }));
+}
+
+test('every account session-capped → acquireAccount still returns a grace account', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) sessionCapped(am, a);
+  assert.equal(am.anyUsable(), false);
+  const got = await am.acquireAccount();
+  assert.ok(got, 'grace lane must hand out an account');
+  assert.equal(got.inflight, 1);
+  am.releaseAccount(got);
+});
+
+test('a normally usable account wins over the grace lane', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  sessionCapped(am, am.accounts[0]);
+  am.updateQuota(am.accounts[1], quotaHeaders({ u5h: 0.2, u7d: 0.3 }));
+  const got = await am.acquireAccount();
+  assert.equal(got, am.accounts[1]);
+});
+
+test('grace prefers the connection home account (the task being finished)', async () => {
+  const am = new AccountManager(makeAccounts(3));
+  const conn = {};
+  for (const a of am.accounts) am.updateQuota(a, quotaHeaders({ u5h: 0.2, u7d: 0.3 }));
+  const home = await am.acquireAccount(null, 0, null, conn);
+  am.releaseAccount(home);
+  // Lower weekly use elsewhere must not pull the task off its home account.
+  for (const a of am.accounts) sessionCapped(am, a, a === home ? 0.8 : 0.1);
+  const got = await am.acquireAccount(null, 0, null, conn);
+  assert.equal(got, home);
+});
+
+test('without a home, grace picks the account with the most weekly headroom', async () => {
+  const am = new AccountManager(makeAccounts(3));
+  sessionCapped(am, am.accounts[0], 0.7);
+  sessionCapped(am, am.accounts[1], 0.2);
+  sessionCapped(am, am.accounts[2], 0.5);
+  const got = await am.acquireAccount();
+  assert.equal(got, am.accounts[1]);
+});
+
+test('weekly-exhausted accounts get no grace', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 1 }));
+  assert.equal(await am.acquireAccount(), null);
+});
+
+test('a rejected session-capped response spends grace until the 5h window resets', async () => {
+  const am = new AccountManager(makeAccounts(1));
+  const [a] = am.accounts;
+  const r5h = Date.now() + HOUR;
+  am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r5h }));
+  assert.equal(await am.acquireAccount(), null, 'server refused grace — do not retry it');
+  // Window rolls over → fresh 5h budget, account is usable normally again.
+  a.quota.unified5hReset = Date.now() - 1;
+  assert.equal(await am.acquireAccount(), a);
+});
+
+test('a still-running throttle blocks the grace lane', async () => {
+  const am = new AccountManager(makeAccounts(1));
+  const [a] = am.accounts;
+  sessionCapped(am, a);
+  am.markRateLimited(a, 60);
+  assert.equal(await am.acquireAccount(), null);
+});
+
+test('excluded accounts are not reused through the grace lane', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) sessionCapped(am, a);
+  const got = await am.acquireAccount(new Set([am.accounts[0]]));
+  assert.equal(got, am.accounts[1]);
+  am.releaseAccount(got);
+  assert.equal(await am.acquireAccount(new Set(am.accounts)), null);
+});
+
+test('grace respects the concurrency cap', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 300_000, 1);
+  sessionCapped(am, am.accounts[0]);
+  const first = await am.acquireAccount();
+  assert.ok(first);
+  assert.equal(await am.acquireAccount(), null);
+  am.releaseAccount(first);
+});
+
+test('a capped normal account queues instead of spending grace', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 300_000, 1);
+  am.updateQuota(am.accounts[0], quotaHeaders({ u5h: 0.2, u7d: 0.3 }));
+  sessionCapped(am, am.accounts[1]);
+  const held = await am.acquireAccount();
+  assert.equal(held, am.accounts[0]);
+  // Normal account is merely at its cap: the next request must wait for it,
+  // not burn the session-capped account's weekly grace.
+  assert.equal(am._tryAcquire(), null);
+  am.releaseAccount(held);
+});
+
+test('usageLimitGrace=false disables the grace lane', async () => {
+  const am = new AccountManager(makeAccounts(1));
+  am.usageLimitGrace = false;
+  sessionCapped(am, am.accounts[0]);
+  assert.equal(await am.acquireAccount(), null);
+});
+
+test('codex accounts never use the grace lane', async () => {
+  const am = new AccountManager(makeAccounts(1, { provider: 'codex' }));
+  sessionCapped(am, am.accounts[0]);
+  assert.equal(await am.acquireAccount(), null);
+});
+
+function listen(server) {
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+
+function post(port, path = '/v1/messages') {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 1, messages: [] });
+    const req = http.request({
+      host: '127.0.0.1', port, path, method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+    }, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+test('proxy forwards to a session-capped account and relays the grace response', async () => {
+  let hits = 0;
+  const upstream = http.createServer((req, res) => {
+    hits += 1;
+    req.resume();
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      ...quotaHeaders({ u5h: 1, u7d: 0.45 }),
+      'anthropic-ratelimit-unified-grace-5h-utilization': '0.1',
+    });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) sessionCapped(am, a);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  const port = await listen(proxy);
+  try {
+    const r = await post(port);
+    assert.equal(r.status, 200);
+    assert.equal(hits, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('proxy fails over then surfaces 429 once grace is refused fleet-wide', async () => {
+  let hits = 0;
+  const upstream = http.createServer((req, res) => {
+    hits += 1;
+    req.resume();
+    res.writeHead(429, {
+      'content-type': 'application/json',
+      'retry-after': '60',
+      ...quotaHeaders({ u5h: 1, u7d: 0.45, status: 'rejected' }),
+    });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) sessionCapped(am, a);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  const port = await listen(proxy);
+  try {
+    const r = await post(port);
+    assert.equal(r.status, 429);
+    assert.equal(hits, 2, 'each account offered grace exactly once');
+    const again = await post(port);
+    assert.equal(again.status, 429);
+    assert.equal(hits, 2, 'refused grace is not retried within the same 5h window');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
