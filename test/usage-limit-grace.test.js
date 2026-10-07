@@ -132,6 +132,10 @@ test('a capped normal account queues instead of spending grace', async () => {
   // Normal account is merely at its cap: the next request must wait for it,
   // not burn the session-capped account's weekly grace.
   assert.equal(am._tryAcquire(), null);
+  // The capacity checks must agree with that selection: nothing immediately
+  // usable, but a capped slot to wait on (keeps continuity FIFO waits intact).
+  assert.equal(am.anyUsable(), false);
+  assert.equal(am.anyCapped(), true);
   am.releaseAccount(held);
 });
 
@@ -225,6 +229,39 @@ test('proxy forwards to a session-capped account and relays the grace response',
     const r = await post(port);
     assert.equal(r.status, 200);
     assert.equal(hits, 1);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('with continuity mode on (the default), grace forwards immediately instead of waiting for the 5h reset', async () => {
+  let hits = 0;
+  const upstream = http.createServer((req, res) => {
+    hits += 1;
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json', ...quotaHeaders({ u5h: 1, u7d: 0.45 }) });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1));
+  sessionCapped(am, am.accounts[0]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: true,
+    continuityMaxWaitMs: 2000,
+    continuityMaxSleepMs: 10,
+    continuityJitterMs: 0,
+  });
+  const port = await listen(proxy);
+  try {
+    const started = Date.now();
+    const r = await post(port);
+    assert.equal(r.status, 200);
+    assert.equal(hits, 1);
+    assert.ok(Date.now() - started < 1000, 'must not sleep toward the 1h reset');
   } finally {
     proxy.close();
     upstream.close();

@@ -390,13 +390,14 @@ export class AccountManager {
 
   /**
    * Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.)
-   * Grace-eligible accounts count too: _tryAcquire hands them out once nothing
-   * is normally usable, so "is there anywhere left to send this?" must see them.
+   * Grace-eligible accounts count too, under the same rule _tryAcquire uses to
+   * hand them out: only while no normal account is merely capped (that request
+   * queues for the normal slot instead).
    */
   anyUsable(exclude = null, model = null) {
     return this.accounts.some(a =>
       this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)))
-      || this._anyGrace(exclude, model, true);
+      || (this._cappedSet(exclude, model).size === 0 && this._anyGrace(exclude, model, true));
   }
 
   /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) Includes capped grace accounts. */
