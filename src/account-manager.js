@@ -1440,11 +1440,18 @@ export class AccountManager {
    * classified as account-level — a model-scoped rejection (e.g. the Fable
    * weekly window) must not cost the account its grace for other models.
    */
-  noteGraceRefused(accountIndex) {
+  noteGraceRefused(accountIndex, headers = null) {
     const account = this._resolve(accountIndex);
-    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    if (!account) return;
+    // Judge THIS response's own headers when given: the shared quota fields can
+    // be overwritten meanwhile by a concurrent response on the same account
+    // (e.g. a Fable model-weekly rejection), which must not refuse Opus grace.
     const q = account.quota;
-    if (q.unified5h == null || q.unified5h < this.switchThreshold) return;
+    const status = headers ? headers['anthropic-ratelimit-unified-status'] : q.unifiedStatus;
+    if (status !== 'rejected') return;
+    const ownU5h = headers ? parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']) : NaN;
+    const u5h = Number.isFinite(ownU5h) ? ownU5h : q.unified5h;
+    if (u5h == null || u5h < this.switchThreshold) return;
     // Pro gets grace once a week, so a refusal holds until the weekly reset.
     // Unknown plans stay on the 5-hour cadence: a refused request costs no
     // quota, while a weekly hold would switch grace off for Max accounts.

@@ -238,6 +238,20 @@ test('a known Pro account holds a refused grace until the weekly reset', async (
   assert.ok(max._graceSpentUntil < r7d, 'unknown plan keeps the 5-hour cadence');
 });
 
+test('a concurrent Fable rejection on the shared quota does not refuse Opus grace', () => {
+  const am = new AccountManager(makeAccounts(1));
+  const [a] = am.accounts;
+  sessionCapped(am, a);
+  // Opus's own 429 arrives without a rejection; meanwhile a Fable response on
+  // the same account folded `rejected` into the shared quota.
+  const opusHeaders = quotaHeaders({ u5h: 1, u7d: 0.4, status: 'allowed' });
+  am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }));
+  am.noteGraceRefused(a, opusHeaders);
+  assert.equal(a._graceSpentUntil, undefined);
+  am.noteGraceRefused(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }));
+  assert.ok(a._graceSpentUntil > Date.now());
+});
+
 test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
   const am = new AccountManager(makeAccounts(2));
   sessionCapped(am, am.accounts[0]); // allowed, not rejected
