@@ -88,6 +88,9 @@ test('a rejected session-capped response spends grace until the 5h window resets
   const [a] = am.accounts;
   const r5h = Date.now() + HOUR;
   am.updateQuota(a, quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected', r5h }));
+  assert.ok(am._tryAcquire(), 'updateQuota alone must not spend grace (could be model-scoped)');
+  am.releaseAccount(a);
+  am.noteGraceRefused(a);
   assert.equal(await am.acquireAccount(), null, 'server refused grace — do not retry it');
   // Window rolls over → fresh 5h budget, account is usable normally again.
   a.quota.unified5hReset = Date.now() - 1;
@@ -145,13 +148,23 @@ test('codex accounts never use the grace lane', async () => {
   assert.equal(await am.acquireAccount(), null);
 });
 
+test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
+  const am = new AccountManager(makeAccounts(2));
+  sessionCapped(am, am.accounts[0]); // allowed, not rejected
+  am.updateQuota(am.accounts[1], quotaHeaders({ u5h: 0.5, u7d: 0.4, status: 'rejected' }));
+  am.noteGraceRefused(am.accounts[0]);
+  am.noteGraceRefused(am.accounts[1]);
+  assert.equal(am.accounts[0]._graceSpentUntil, undefined);
+  assert.equal(am.accounts[1]._graceSpentUntil, undefined);
+});
+
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-function post(port, path = '/v1/messages') {
+function post(port, model = 'claude-opus-4-8', path = '/v1/messages') {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ model: 'claude-opus-4-8', max_tokens: 1, messages: [] });
+    const body = JSON.stringify({ model, max_tokens: 1, messages: [] });
     const req = http.request({
       host: '127.0.0.1', port, path, method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
@@ -226,6 +239,55 @@ test('proxy fails over then surfaces 429 once grace is refused fleet-wide', asyn
     const again = await post(port);
     assert.equal(again.status, 429);
     assert.equal(hits, 2, 'refused grace is not retried within the same 5h window');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// A Fable rejection on its model-scoped weekly window is not a refusal of the
+// account's 5-hour grace: Opus on the same session-capped account must still
+// be forwarded.
+test('a model-scoped (Fable weekly) rejection does not spend grace for other models', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      const { model } = JSON.parse(raw);
+      seen.push(model);
+      if (/fable/.test(model)) {
+        res.writeHead(429, {
+          'content-type': 'application/json',
+          'retry-after': '60',
+          ...quotaHeaders({ u5h: 1, u7d: 0.4, status: 'rejected' }),
+          'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+          'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 72 * HOUR) / 1000)),
+        });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json', ...quotaHeaders({ u5h: 1, u7d: 0.41 }) });
+        res.end(JSON.stringify({ ok: true }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1));
+  sessionCapped(am, am.accounts[0]);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  const port = await listen(proxy);
+  try {
+    const fable = await post(port, 'claude-fable-5');
+    assert.equal(fable.status, 429);
+    const opus = await post(port, 'claude-opus-4-8');
+    assert.equal(opus.status, 200);
+    assert.deepEqual(seen, ['claude-fable-5', 'claude-opus-4-8']);
+    assert.equal(am.accounts[0]._graceSpentUntil, undefined);
   } finally {
     proxy.close();
     upstream.close();

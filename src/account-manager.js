@@ -1235,13 +1235,6 @@ export class AccountManager {
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     const codexReached = headers['x-codex-rate-limit-reached-type'];
     account.quota.unifiedStatus = uStatus || (codexReached ? 'rejected' : null);
-    // A rejection while session-capped means the server refused the 5-hour
-    // grace (already used, or not offered by the plan): stop offering it on
-    // this account until the window resets. See _isGraceEligible.
-    if (uStatus === 'rejected' && account.quota.unified5h != null
-        && account.quota.unified5h >= this.switchThreshold) {
-      account._graceSpentUntil = account.quota.unified5hReset || Date.now() + 5 * 3600_000;
-    }
 
     // Model-scoped weekly windows (7d_<label>), e.g. `7d_oi` — the weekly limit
     // for the top model tier ("Fable" in Claude's usage UI). These headers only
@@ -1422,6 +1415,22 @@ export class AccountManager {
     if (account.quota.unifiedStatus === 'rejected') return true;
     // Otherwise rely on measured utilization (unified or standard headers).
     return this._isNearQuota(account);
+  }
+
+  /**
+   * Record a server refusal of the usage-limit grace: a `rejected` account-level
+   * 429 while session-capped means the grace was already used or the plan does
+   * not offer it, so stop offering it on this account until the 5-hour window
+   * resets (see _isGraceEligible). Called by server.js only AFTER the 429 was
+   * classified as account-level — a model-scoped rejection (e.g. the Fable
+   * weekly window) must not cost the account its grace for other models.
+   */
+  noteGraceRefused(accountIndex) {
+    const account = this._resolve(accountIndex);
+    if (!account || account.quota.unifiedStatus !== 'rejected') return;
+    const q = account.quota;
+    if (q.unified5h == null || q.unified5h < this.switchThreshold) return;
+    account._graceSpentUntil = q.unified5hReset || Date.now() + 5 * 3600_000;
   }
 
   /** Is this account exhausted only for the requested model tier? */
