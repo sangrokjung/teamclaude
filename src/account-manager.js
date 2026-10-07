@@ -388,16 +388,27 @@ export class AccountManager {
     return capped;
   }
 
-  /** Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.) */
+  /**
+   * Is there an available account with a free slot (not excluded)? Non-mutating. (`exclude` = Set of account objects.)
+   * Grace-eligible accounts count too: _tryAcquire hands them out once nothing
+   * is normally usable, so "is there anywhere left to send this?" must see them.
+   */
   anyUsable(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      || this._anyGrace(exclude, model, true);
   }
 
-  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) */
+  /** Is there an available-but-capped account (not excluded)? A freed slot could serve it. (`exclude` = Set of account objects.) Includes capped grace accounts. */
   anyCapped(exclude = null, model = null) {
     return this.accounts.some(a =>
-      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)));
+      this._isAvailable(a, model) && !this._hasCapacity(a) && !(exclude && exclude.has(a)))
+      || this._anyGrace(exclude, model, false);
+  }
+
+  _anyGrace(exclude, model, withCapacity) {
+    return this.accounts.some(a => !(exclude && exclude.has(a))
+      && this._isGraceEligible(a, model) && this._hasCapacity(a) === withCapacity);
   }
 
   /**
@@ -527,13 +538,13 @@ export class AccountManager {
     const q = account.quota;
     if (!(q.unified5h != null && q.unified5h >= this.switchThreshold)) return false;
     if (q.unified7d != null && q.unified7d >= this.switchThreshold) return false;
-    if (Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil) return false;
-    return this._hasCapacity(account);
+    return !(Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil);
   }
 
   /** Best grace account: the connection's home first (the task being finished), then the most weekly headroom. */
   _graceCandidate(exclude = null, model = null, affinityKey = null) {
-    const ok = a => a && !(exclude && exclude.has(a)) && this._isGraceEligible(a, model);
+    const ok = a => a && !(exclude && exclude.has(a))
+      && this._isGraceEligible(a, model) && this._hasCapacity(a);
     if (affinityKey) {
       const home = this._affinity.get(affinityKey);
       if (home && this.accounts[home.index] === home && ok(home)) return home;

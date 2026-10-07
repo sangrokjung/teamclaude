@@ -41,7 +41,7 @@ function sessionCapped(am, account, u7d = 0.4) {
 test('every account session-capped → acquireAccount still returns a grace account', async () => {
   const am = new AccountManager(makeAccounts(2));
   for (const a of am.accounts) sessionCapped(am, a);
-  assert.equal(am.anyUsable(), false);
+  assert.ok(am.accounts.every(a => !am._isAvailable(a)), 'nothing is normally usable');
   const got = await am.acquireAccount();
   assert.ok(got, 'grace lane must hand out an account');
   assert.equal(got.inflight, 1);
@@ -146,6 +146,27 @@ test('codex accounts never use the grace lane', async () => {
   const am = new AccountManager(makeAccounts(1, { provider: 'codex' }));
   sessionCapped(am, am.accounts[0]);
   assert.equal(await am.acquireAccount(), null);
+});
+
+test('a request waiting on a busy grace account gets it once the slot frees', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 300_000, 1);
+  const [a] = am.accounts;
+  sessionCapped(am, a);
+  const first = await am.acquireAccount();
+  assert.equal(first, a);
+  assert.equal(am.anyCapped(), true, 'a busy grace account is capacity a freed slot will serve');
+  const pending = am.acquireAccount(null, 1000);
+  setTimeout(() => am.releaseAccount(first), 10);
+  assert.equal(await pending, a);
+  am.releaseAccount(a);
+});
+
+test('anyUsable sees a grace account so failover does not dead-end early', () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const acc of am.accounts) sessionCapped(am, acc);
+  assert.equal(am.anyUsable(new Set([am.accounts[0]])), true);
+  am.usageLimitGrace = false;
+  assert.equal(am.anyUsable(new Set([am.accounts[0]])), false);
 });
 
 test('noteGraceRefused ignores non-rejected and below-threshold accounts', () => {
@@ -288,6 +309,50 @@ test('a model-scoped (Fable weekly) rejection does not spend grace for other mod
     assert.equal(opus.status, 200);
     assert.deepEqual(seen, ['claude-fable-5', 'claude-opus-4-8']);
     assert.equal(am.accounts[0]._graceSpentUntil, undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a Fable weekly rejection on one grace account fails over to another grace account', async () => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const auth = req.headers.authorization || '';
+      seen.push(auth);
+      if (auth.includes('tok-0')) {
+        res.writeHead(429, {
+          'content-type': 'application/json',
+          'retry-after': '60',
+          ...quotaHeaders({ u5h: 1, u7d: 0.2, status: 'rejected' }),
+          'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+          'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 72 * HOUR) / 1000)),
+        });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json', ...quotaHeaders({ u5h: 1, u7d: 0.5 }) });
+        res.end(JSON.stringify({ ok: true }));
+      }
+    });
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2));
+  sessionCapped(am, am.accounts[0], 0.2); // most weekly headroom → tried first
+  sessionCapped(am, am.accounts[1], 0.5);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: false,
+  });
+  const port = await listen(proxy);
+  try {
+    const r = await post(port, 'claude-fable-5');
+    assert.equal(r.status, 200);
+    assert.equal(seen.length, 2);
+    assert.ok(seen[0].includes('tok-0') && seen[1].includes('tok-1'));
   } finally {
     proxy.close();
     upstream.close();
