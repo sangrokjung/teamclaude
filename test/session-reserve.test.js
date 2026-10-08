@@ -24,6 +24,13 @@ function makeAccounts(n, extra = {}) {
   }));
 }
 
+// Most cases below exercise the reserve itself, so the server grace that would
+// otherwise stand in for it is switched off (see the grace-aware tests).
+function noGrace(am) {
+  am.usageLimitGrace = false;
+  return am;
+}
+
 function measure(am, account, u5h, r5h = Date.now() + HOUR, u7d = 0.3) {
   am.updateQuota(account, {
     'anthropic-ratelimit-unified-5h-utilization': String(u5h),
@@ -51,7 +58,7 @@ test('isNewUserTurn: typed text starts a turn, a tool_result continues one', () 
 });
 
 test('sessionReserveUntil: in reserve only when every usable account is inside it', () => {
-  const am = new AccountManager(makeAccounts(2));
+  const am = noGrace(new AccountManager(makeAccounts(2)));
   const r0 = Date.now() + 2 * HOUR;
   const r1 = Date.now() + HOUR;
   measure(am, am.accounts[0], 0.95, r0);
@@ -62,16 +69,34 @@ test('sessionReserveUntil: in reserve only when every usable account is inside i
   assert.equal(am.sessionReserveUntil(0), null, 'reserve 0 disables');
 });
 
-test('sessionReserveUntil: grace-only accounts count as in reserve; unmeasured ones as headroom', () => {
-  const am = new AccountManager(makeAccounts(2));
-  measure(am, am.accounts[0], 1);
+test('sessionReserveUntil: unmeasured accounts count as headroom', () => {
+  const am = noGrace(new AccountManager(makeAccounts(2)));
+  measure(am, am.accounts[0], 0.97);
   assert.equal(am.sessionReserveUntil(0.05), null, 'unmeasured account has headroom');
-  measure(am, am.accounts[1], 0.99);
+  measure(am, am.accounts[1], 0.96);
   assert.ok(am.sessionReserveUntil(0.05) > Date.now());
 });
 
+test('sessionReserveUntil: grace-aware — runs to 100% while the server grace still covers in-progress work', () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) measure(am, a, 0.96);
+  assert.equal(am.sessionReserveUntil(0.05), null, 'grace still offered: nothing held back');
+  am.accounts[0]._graceSpentUntil = Date.now() + HOUR; // refused this window
+  assert.equal(am.sessionReserveUntil(0.05), null, 'one account still has grace');
+  am.accounts[1]._graceSpentUntil = Date.now() + HOUR;
+  assert.ok(am.sessionReserveUntil(0.05) > Date.now(), 'no grace left anywhere: reserve applies');
+  const am2 = new AccountManager(makeAccounts(1));
+  measure(am2, am2.accounts[0], 0.96, Date.now() + HOUR, 0.97);
+  assert.equal(am2.sessionReserveUntil(0.05), null, 'weekly still open under threshold');
+  am2.accounts[0].quota.unified7dReset = null; // unmeasured weekly window could already be spent
+  assert.ok(am2.sessionReserveUntil(0.05) > Date.now());
+  const am3 = new AccountManager(makeAccounts(1));
+  measure(am3, am3.accounts[0], 1);
+  assert.equal(am3.sessionReserveUntil(0.05), null, 'a grace-only fleet is served by the grace lane');
+});
+
 test('sessionReserveUntil: fails open on an unknown reset or a reserve with no floor', () => {
-  const am = new AccountManager(makeAccounts(1));
+  const am = noGrace(new AccountManager(makeAccounts(1)));
   measure(am, am.accounts[0], 0.96);
   assert.ok(am.sessionReserveUntil(0.05) > Date.now());
   am.accounts[0].quota.unified5hReset = null; // partial headers / old snapshot
@@ -143,7 +168,7 @@ async function withProxy(am, overrides, fn) {
 }
 
 test('in reserve: a new turn is answered locally with the reset time, a continuation is forwarded', async () => {
-  const am = new AccountManager(makeAccounts(2));
+  const am = noGrace(new AccountManager(makeAccounts(2)));
   for (const a of am.accounts) measure(am, a, 0.95);
   await withProxy(am, {}, async (port, hits) => {
     const blocked = await post(port, NEW_TURN);
@@ -160,6 +185,15 @@ test('in reserve: a new turn is answered locally with the reset time, a continua
   });
 });
 
+test('with server grace available a new turn is forwarded even at 96%', async () => {
+  const am = new AccountManager(makeAccounts(2));
+  for (const a of am.accounts) measure(am, a, 0.96);
+  await withProxy(am, {}, async (port, hits) => {
+    assert.equal((await post(port, NEW_TURN)).status, 200);
+    assert.equal(hits(), 1);
+  });
+});
+
 test('outside the reserve a new turn is forwarded', async () => {
   const am = new AccountManager(makeAccounts(2));
   measure(am, am.accounts[0], 0.95);
@@ -171,7 +205,7 @@ test('outside the reserve a new turn is forwarded', async () => {
 });
 
 test('sessionReserve: 0 turns the gate off', async () => {
-  const am = new AccountManager(makeAccounts(1));
+  const am = noGrace(new AccountManager(makeAccounts(1)));
   measure(am, am.accounts[0], 0.95);
   await withProxy(am, { sessionReserve: 0 }, async (port, hits) => {
     assert.equal((await post(port, NEW_TURN)).status, 200);
