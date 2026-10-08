@@ -538,8 +538,18 @@ export class AccountManager {
     if (this._isModelNearQuota(account, model)) return false;
     const q = account.quota;
     if (!(q.unified5h != null && q.unified5h >= this.switchThreshold)) return false;
-    // Grace draws on the weekly limit, so require a measured, still-open weekly
-    // window under threshold — an unmeasured one could already be spent.
+    return this._graceStillOffered(account);
+  }
+
+  /**
+   * Would the server still grant grace on this account once its 5-hour window
+   * fills? Grace draws on the weekly limit, so require a measured, still-open
+   * weekly window under threshold — an unmeasured one could already be spent —
+   * and no refusal recorded for the current 5-hour window.
+   */
+  _graceStillOffered(account) {
+    if (!this.usageLimitGrace || account.provider === 'codex') return false;
+    const q = account.quota;
     if (!Number.isFinite(q.unified7d) || q.unified7d >= this.switchThreshold) return false;
     if (!Number.isFinite(q.unified7dReset) || q.unified7dReset <= Date.now()) return false;
     return !(Number.isFinite(account._graceSpentUntil) && Date.now() < account._graceSpentUntil);
@@ -557,6 +567,11 @@ export class AccountManager {
    * accounts only. Fails open: a reserve that would leave no floor (reserve ≥
    * switchThreshold) or an in-reserve account without a known future 5-hour
    * reset disables the gate rather than blocking for a guessed duration.
+   * Grace-aware: while any in-reserve account would still get the server's
+   * usage-limit grace when it fills, that grace already lets in-progress work
+   * finish, so nothing is held back and the fleet runs to 100%. The reserve
+   * only applies once no account has grace left (weekly nearly spent, grace
+   * refused this window, or `usageLimitGrace` off).
    */
   sessionReserveUntil(reserve, model = null) {
     if (!(reserve > 0) || !(reserve < this.switchThreshold)) return null;
@@ -572,6 +587,7 @@ export class AccountManager {
       if (!(u5h != null && u5h >= floor)) return null;
       const reset = a.quota.unified5hReset;
       if (!(Number.isFinite(reset) && reset > now)) return null;
+      if (this._graceStillOffered(a)) return null;
       if (soonest == null || reset < soonest) soonest = reset;
     }
     return any ? soonest : null;
