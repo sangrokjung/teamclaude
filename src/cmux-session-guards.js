@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 
@@ -71,7 +71,19 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
-async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverableKinds) {
+function recordTimestampMs(record) {
+  const value = record?.timestamp;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+  if (typeof value === 'string' && value.length > 0) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds) {
   try {
     const original = await lstat(path);
     if (!original.isFile()) return false;
@@ -97,7 +109,13 @@ async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverab
           continue;
         }
         const event = classifyClaudeApiErrorRecord(record);
-        if (event && recoverableKinds.has(event.kind)) blocked = event.kind;
+        if (event && recoverableKinds.has(event.kind)) {
+          blocked = {
+            kind: event.kind,
+            retryAfterSeconds: event.retryAfterSeconds ?? null,
+            timestampMs: recordTimestampMs(record),
+          };
+        }
         else if (blocked && isConversationRecord(record)) blocked = null;
       }
       return blocked;
@@ -107,6 +125,10 @@ async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverab
   } catch {
     return false;
   }
+}
+
+async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverableKinds) {
+  return (await unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds))?.kind || false;
 }
 
 export function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId) {
@@ -119,7 +141,16 @@ export function unresolvedRecoverableApiErrorKind(path, transcriptRoot, sessionI
     path,
     transcriptRoot,
     sessionId,
-    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch']),
+    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch', 'fleet_exhausted']),
+  );
+}
+
+export function unresolvedRecoverableApiErrorState(path, transcriptRoot, sessionId) {
+  return unresolvedApiError(
+    path,
+    transcriptRoot,
+    sessionId,
+    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch', 'fleet_exhausted']),
   );
 }
 
@@ -148,6 +179,7 @@ export function validSession(store, session) {
 
 export {
   inspectClaudeProcess,
+  inspectClaudeProcessTree,
   resolveTrustedClaudePath,
   sameClaudeProcess,
 } from './cmux-process-guard.js';
@@ -189,13 +221,37 @@ export async function claimSessionOnce(
         || !sameIdentity(currentClaim, claimInfo)) {
       throw new Error('Recovery claim identity changed.');
     }
-    return true;
+    return { dev: claimInfo.dev, ino: claimInfo.ino };
   } catch (err) {
     if (err.code === 'EEXIST') return false;
     throw err;
   } finally {
     await handle?.close();
     await directoryHandle.close();
+  }
+}
+
+export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
+  const claimDir = `${storePath}.recovery-claims`;
+  let directoryHandle;
+  try {
+    const directory = await openPrivateDirectory(claimDir);
+    directoryHandle = directory.handle;
+    const claimPath = join(claimDir, sessionId);
+    const claimInfo = await lstat(claimPath);
+    if (!ownedPrivate(claimInfo, 'isFile')) {
+      throw new Error('Untrusted recovery claim.');
+    }
+    if (expectedIdentity
+        && !sameIdentity(claimInfo, expectedIdentity)) return false;
+    await unlink(claimPath);
+    await directoryHandle.sync();
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  } finally {
+    await directoryHandle?.close();
   }
 }
 
