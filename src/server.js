@@ -222,6 +222,30 @@ function splitSseEvents(pending, bytes) {
   const rest = start === joined.length ? EMPTY_BYTES : Buffer.from(joined.subarray(start));
   return { events, rest };
 }
+
+const SESSION_ID_HEADER = 'x-claude-code-session-id';
+const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const DEFAULT_SESSION_AFFINITY_MAX_KEYS = 10_000;
+
+/**
+ * Stable affinity key objects per Claude Code session id. The account manager
+ * keys affinity in a WeakMap, so each id maps to one object; the Map keeps the
+ * most recently used ids and drops the oldest past `maxKeys`.
+ */
+export function createSessionAffinityKeys(maxKeys = DEFAULT_SESSION_AFFINITY_MAX_KEYS) {
+  const keys = new Map();
+  return {
+    get size() { return keys.size; },
+    keyFor(sessionId) {
+      const key = keys.get(sessionId) ?? { sessionId };
+      keys.delete(sessionId);
+      keys.set(sessionId, key);
+      if (keys.size > maxKeys) keys.delete(keys.keys().next().value);
+      return key;
+    },
+  };
+}
+
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_STREAM_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
@@ -273,6 +297,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // for a session's sequential turns). Soft — overflow still spreads. Set
   // `sessionAffinity: false` to route purely by use-or-lose every request instead.
   const sessionAffinity = config.sessionAffinity !== false;
+  // Claude Code sends its session id on every request, so a session keeps its
+  // account even after the keep-alive socket closes between turns.
+  const sessionAffinityKeys = createSessionAffinityKeys();
+  const affinityKeyFor = req => {
+    if (!sessionAffinity) return null;
+    const sessionId = req.headers[SESSION_ID_HEADER];
+    return typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)
+      ? sessionAffinityKeys.keyFor(sessionId)
+      : req.socket;
+  };
   // Continuity mode keeps Claude Code requests inside the proxy while capacity
   // or upstream rate limits recover, instead of surfacing a terminal-stopping
   // 429. Unit tests can leave it off; the CLI server enables it by default.
@@ -1616,7 +1650,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: sessionAffinity ? req.socket : null, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false };
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
