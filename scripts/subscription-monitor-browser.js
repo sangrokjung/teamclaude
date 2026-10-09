@@ -165,6 +165,7 @@ function subscriptionRawEndDate(raw,provider) {
   } catch{return null;}
 }
 // Aside REPL 전용. 허용 계정은 부모가 주입하며 자격증명은 전달받지 않는다.
+// eslint-disable-next-line no-unused-vars -- invoked by code appended in subscription-monitor.py
 async function collectSubscriptionMail(allowedEmails) {
   const allowed = new Set(allowedEmails.map(x => x.toLowerCase()));
   const output = [];
