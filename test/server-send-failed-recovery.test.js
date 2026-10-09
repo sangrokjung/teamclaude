@@ -265,3 +265,37 @@ test('a 401 on an API-key account parked send-failed ends as a real auth park, n
     upstream.close();
   }
 });
+
+test('a malformed 2xx from the codex usage endpoint still lifts a send-failed park', async () => {
+  let hits = 0;
+  const upstream = http.createServer((req, res) => {
+    if (req.url !== '/backend-api/wham/usage') {
+      res.writeHead(404).end();
+      return;
+    }
+    hits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('<html>not json');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{
+    name: 'c', provider: 'codex', type: 'oauth', accessToken: 'access-c',
+  }], 0.98);
+  am.markSendFailure(am.accounts[0], Date.now() - 10);
+  const proxy = createProxyServer(am, {
+    provider: 'codex',
+    upstream: `http://127.0.0.1:${upstreamPort}/backend-api/codex`,
+    activeWarmup: false,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    await proxy.refreshQuotaAll();
+    assert.ok(hits >= 1);
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.accounts[0].errorReason, undefined);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

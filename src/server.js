@@ -593,13 +593,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           terminalAuth: res.status === 401 || res.status === 403,
         };
       }
+      // A 2xx from the backend proves connectivity on its own, so a
+      // transport-only park lifts before the body is parsed: an empty or
+      // malformed payload must not keep the account excluded.
+      if (accountManager.accounts[account.index] === account) {
+        accountManager.clearSendFailure(account, { evidenceSince: polledAt });
+      }
       const payload = await res.json();
       if (accountManager.accounts[account.index] !== account) {
         return { applied: false, authOk: false, terminalAuth: false };
       }
-      // A 2xx from the backend proves connectivity on its own, whether or not
-      // the quota payload parses, so a transport-only park lifts here too.
-      accountManager.clearSendFailure(account, { evidenceSince: polledAt });
       const applied = accountManager.updateCodexUsage(account, payload);
       if (applied) {
         accountManager.markAccountSuccess(account);
