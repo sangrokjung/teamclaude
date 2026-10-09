@@ -2587,7 +2587,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
     }
-    const canEventuallyRecover = accts.some(a => a.enabled !== false && a.status !== 'error');
+    // A send-failed park is a short cooldown, so a fleet made only of those
+    // still recovers: waiting is correct, a quota-shaped 429 is not.
+    const canEventuallyRecover = accts.some(a => a.enabled !== false
+      && (a.status !== 'error' || accountManager.isInSendFailureCooldown(a)));
     const modelQuarantined = fleetModelQuarantined();
     if (modelQuarantined) break;
     if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
@@ -2597,6 +2600,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const recovery = capped
       ? null
       : fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    const sendFailedMs = capped ? null : accountManager.soonestSendFailureRecoveryMs(accts);
+    if (recovery && sendFailedMs != null && (recovery.soonestMs == null || sendFailedMs < recovery.soonestMs)) {
+      recovery.soonestMs = sendFailedMs;
+      recovery.retryAfter = Math.max(1, Math.ceil(sendFailedMs / 1000));
+      recovery.soonestKnown = true;
+    }
     const retryAfter = capped ? 1 : recovery.retryAfter;
     const deadlineMode = ctx.continuity.maxWaitMs > 0;
     const maxCapacityWaits = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
@@ -2694,6 +2703,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A fleet-wide model quarantine (unsupported-model 400 contract) is not a
     // usage limit: keep its own retry-after and the generic body.
     const quarantineRetryAfter = modelQuarantineRetryAfter(accts, ctx.model);
+    // When the soonest capacity is a send-failed cooldown, the dead end is a
+    // connectivity outage, not a usage limit: say so with a retryable 503.
+    const sendFailedMs = quarantineRetryAfter == null
+      ? accountManager.soonestSendFailureRecoveryMs(accts)
+      : null;
+    if (sendFailedMs != null && !hasUsable(null) && !hasCapped(null)
+        && (recovery.soonestMs == null || sendFailedMs <= recovery.soonestMs)) {
+      const cooldownRetryAfter = Math.max(1, Math.ceil(sendFailedMs / 1000));
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(cooldownRetryAfter) });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'overloaded_error',
+          message: `Upstream connection failures on all ${accts.length} accounts; retry in ${cooldownRetryAfter}s.`,
+        },
+      }));
+      return;
+    }
     const retryAfter = quarantineRetryAfter ?? recovery.retryAfter;
     // Codex-native exhaustion body. The Codex CLI cannot read the generic
     // rate_limit_error above ("exceeded retry limit, last status: 429"); it DOES

@@ -1904,6 +1904,21 @@ export class AccountManager {
     return account;
   }
 
+  isInSendFailureCooldown(account) {
+    return account?.status === 'error' && account.errorReason === 'send-failed'
+      && account._errorFromSendFailure === true;
+  }
+
+  /** Milliseconds until the first enabled send-failed cooldown lapses, or null. */
+  soonestSendFailureRecoveryMs(accounts = this.accounts, now = Date.now()) {
+    let soonest = Infinity;
+    for (const account of accounts) {
+      if (account.enabled === false || !this.isInSendFailureCooldown(account)) continue;
+      soonest = Math.min(soonest, Math.max(0, (account._sendFailedUntil ?? now) - now));
+    }
+    return soonest === Infinity ? null : soonest;
+  }
+
   /**
    * Park an account after a request-path failure that produced no auth
    * evidence. Only an 'active' account is parked: an error, throttle or

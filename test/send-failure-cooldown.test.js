@@ -148,3 +148,69 @@ test('markAccountSuccess no longer drops the send-failed tag (cooldown must stil
   acct._sendFailedUntil = Date.now() - 1;
   assert.equal(am._isAvailable(acct), true);
 });
+
+test('a pool entirely in send-failed cooldown waits for the cooldown instead of answering a quota 429', async () => {
+  let hits = 0;
+  const upstream = http.createServer((req, res) => {
+    hits++;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  const now = Date.now();
+  for (const acct of am.accounts) am.markSendFailure(acct, now - SEND_FAILED_COOLDOWN_MS + 300);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+    continuityMode: true,
+    continuityMaxWaitMs: 5_000,
+    continuityMaxSleepMs: 2_000,
+    continuityJitterMs: 0,
+  });
+  const proxyPort = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+  try {
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, text);
+    assert.equal(hits, 1);
+    assert.ok(Date.now() - started < 4_000, 'waited for the ~300ms cooldown, not a 60s quota guess');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('without continuity, a send-failed-only pool answers a retryable 503, not a usage-limit 429', async () => {
+  const upstream = http.createServer((req, res) => { res.writeHead(200); res.end('{}'); });
+  const upstreamPort = await new Promise(r => upstream.listen(0, '127.0.0.1', () => r(upstream.address().port)));
+  const am = new AccountManager(makeAccounts(2), 0.98);
+  for (const acct of am.accounts) am.markSendFailure(acct);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    const body = await res.text();
+    assert.equal(res.status, 503, body);
+    assert.doesNotMatch(body, /usage_limit_reached|exhausted/);
+    const retryAfter = Number(res.headers.get('retry-after'));
+    assert.ok(retryAfter >= 1 && retryAfter <= SEND_FAILED_COOLDOWN_MS / 1000, `retry-after=${retryAfter}`);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
