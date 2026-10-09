@@ -874,3 +874,32 @@ test('run preserves fallback when no general-available Fable candidate remains',
     assert.deepEqual(JSON.parse(result.stdout.trim()).args, ['--model', 'claude-opus-4-8[1m]']);
   });
 });
+
+// The child learns which pool supervises it, so a nested `claude` reaching the
+// installed wrapper can tell an Anthropic re-entry from a Codex one.
+test('run marks the supervised child with its provider', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-run-provider-'));
+  let server;
+  try {
+    server = await startStatusServer(dir, { accounts: [] });
+    const fakeClaude = join(dir, 'claude');
+    const configPath = join(dir, 'config.json');
+    await writeFile(fakeClaude, `#!/usr/bin/env node
+console.log(JSON.stringify({ provider: process.env.TEAMCLAUDE_PROVIDER ?? null }));
+`);
+    await chmod(fakeClaude, 0o755);
+    await writeFile(configPath, JSON.stringify({ proxy: { port: server.port } }));
+    const env = { ...process.env, PATH: `${dir}:${process.env.PATH}`, TEAMCLAUDE_CONFIG: configPath };
+    delete env.TEAMCLAUDE_PROVIDER;
+    delete env.TEAMCLAUDE_SESSION_SUPERVISED;
+    delete env.TEAMCLAUDE_CLAUDE_BIN;
+
+    const result = spawnSync(process.execPath, [entry, 'run'], { encoding: 'utf8', env });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout.trim()).provider, 'anthropic');
+  } finally {
+    if (server) await stopStatusServer(server);
+    await rm(dir, { recursive: true, force: true });
+  }
+});

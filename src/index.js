@@ -6,6 +6,7 @@ import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -1717,9 +1718,15 @@ function sameProcessIdentity(recorded, current) {
 
 function commandReferencesRuntime(command) {
   if (typeof command !== 'string') return false;
-  return command.split(/\s+/).some(commandPart => {
-    const candidate = commandPart.replace(/^'|'$|^"|"$/g, '');
-    try { return realpathSync(candidate) === RUNTIME_ENTRY_PATH; }
+  return command.split(/\s+/).some(token => {
+    const candidate = token.replace(/^['"]|['"]$/g, '');
+    try {
+      const resolved = realpathSync(candidate);
+      const sourceDir = dirname(fileURLToPath(import.meta.url));
+      return resolved === RUNTIME_ENTRY_PATH
+        || resolved === realpathSync(join(sourceDir, 'index.js'))
+        || resolved === realpathSync(join(sourceDir, 'teamclaude.js'));
+    }
     catch { return candidate === process.argv[1] || candidate === RUNTIME_ENTRY_PATH; }
   });
 }
@@ -2682,6 +2689,7 @@ async function runCommand(clientArgsOverride = null) {
     ? childEnv.TEAMCLAUDE_CLAUDE_BIN
     : 'claude';
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
+  childEnv.TEAMCLAUDE_PROVIDER = isCodexMode(config) ? 'codex' : 'anthropic';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
@@ -3235,7 +3243,7 @@ async function removeCommand() {
 /** Ask the supervised worker to live-sync account changes without a restart. */
 async function noteRunningServerReload(config) {
   try {
-    const running = await findRunningServer(config);
+    const running = await findRunningServer(config, configuredStatusProbeTimeoutMs(30_000));
     if (!running) return false;
     const state = await readServerState();
     const workerPid = running.lifecycleVerified && running.identity

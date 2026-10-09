@@ -23,6 +23,7 @@ import {
   CLAUDE_WRAPPER_SIGNATURE,
   findNewestClaudeVendor,
   installClaudeWrapper,
+  renderClaudeWrapper,
   uninstallClaudeWrapper,
 } from '../src/claude-wrapper.js';
 
@@ -797,5 +798,43 @@ test('CLI dispatch installs and uninstalls in either provider mode and prints pa
     assert.equal(uninstall.stderr, '');
   } finally {
     await cleanup(fixture);
+  }
+});
+
+// The installed wrapper skips launch preparation only for a same-provider
+// re-entry; a Codex-supervised environment is scrubbed and relaunched.
+test('rendered wrapper re-enters only for an Anthropic-supervised child', async t => {
+  if (spawnSync('zsh', ['-c', 'true']).error) {
+    t.skip('zsh is not installed');
+    return;
+  }
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-wrapper-provider-'));
+  try {
+    const report = name => `#!/bin/sh
+printf '%s|%s|%s|%s\\n' ${name} "\${TEAMCLAUDE_PROVIDER:-}" "\${TEAMCLAUDE_SESSION_SUPERVISED:-}" "\${TEAMCLAUDE_CONFIG:-}"
+`;
+    const vendor = join(dir, 'vendor');
+    const teamcodex = join(dir, 'teamcodex');
+    await writeFile(vendor, report('vendor'));
+    await writeFile(teamcodex, report('teamcodex'));
+    await chmod(vendor, 0o755);
+    await chmod(teamcodex, 0o755);
+    const wrapper = join(dir, 'claude');
+    await writeFile(wrapper, renderClaudeWrapper({ teamcodexBin: teamcodex, vendorShimPath: vendor }));
+    await chmod(wrapper, 0o755);
+    const run = extra => {
+      const env = { PATH: process.env.PATH, ...extra };
+      const r = spawnSync(wrapper, [], { encoding: 'utf8', env });
+      assert.equal(r.status, 0, r.stderr);
+      return r.stdout.trim();
+    };
+
+    assert.equal(run({ TEAMCLAUDE_PROVIDER: 'anthropic', TEAMCLAUDE_SESSION_SUPERVISED: '1', TEAMCLAUDE_CONFIG: 'c' }),
+      'vendor|anthropic|1|c');
+    assert.equal(run({ TEAMCLAUDE_PROVIDER: 'codex', TEAMCLAUDE_SESSION_SUPERVISED: '1', TEAMCLAUDE_CONFIG: 'c' }),
+      'teamcodex|anthropic||');
+    assert.equal(run({ TEAMCLAUDE_SESSION_SUPERVISED: '1' }), 'teamcodex|anthropic|1|');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
