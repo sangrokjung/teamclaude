@@ -5,13 +5,15 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `1435dba0b9a0cf451e7435cbf900525c1f0d1ee0c0a59e2c75dc658033ab48f5`
+- SHA-256: `01a066e08e7d2d6a49a12d62c72620b753a6435c60736b8d6a258eb3acf252f0`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
   이후 두 소스가 바뀌면 이 문서와 `test/test_model_recovery_gate.py`의 핀을 함께 검토·갱신한다.
 - 2026-10-07 갱신: 사용량 유예 차선(`usageLimitGrace`) 추가로 `src/account-manager.js`만 바뀌었다.
   아래 발췌 구간은 바뀐 소스와 줄 단위로 그대로 일치함을 대조했고, 모델 복구 로직은 변경 없다.
+- 2026-10-09 갱신: 전송 실패 쿨다운(`markSendFailure`·`clearSendFailure` 등) 추가로 `src/account-manager.js`만 바뀌었다.
+  아래 발췌 구간(`// ...` 생략 포함)은 바뀐 소스와 줄 단위·순서대로 일치함을 대조했고, 모델 복구 로직은 변경 없다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을
