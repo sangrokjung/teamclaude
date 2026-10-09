@@ -17,6 +17,25 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function resolveSessionIdWithDeadline(
+  resolveSessionId,
+  context,
+  timeoutMs,
+  exitPromise = null,
+) {
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 5000;
+  if (timeout === 0) return null;
+  const resolution = Promise.resolve()
+    .then(() => resolveSessionId(context))
+    .catch(() => null);
+  const races = [
+    resolution,
+    delay(timeout).then(() => null),
+  ];
+  if (exitPromise) races.push(exitPromise.then(() => null));
+  return Promise.race(races);
+}
+
 async function delayLong(ms) {
   let remaining = ms;
   while (remaining > 0) {
@@ -315,28 +334,28 @@ function sessionSelector(args) {
       const value = args[i + 1] || '';
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i].startsWith('--session-id=')) {
       const value = args[i].slice('--session-id='.length);
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i] === '--resume' || args[i] === '-r') {
       const value = args[i + 1] || '';
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: value.length === 0 };
     }
     if (args[i].startsWith('--resume=')) {
       const value = args[i].slice('--resume='.length);
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i] === '--continue' || args[i] === '-c') {
-      return { kind: 'ambiguous', sessionId: null };
+      return { kind: 'ambiguous', sessionId: null, resolverSafe: true };
     }
   }
   return { kind: 'new', sessionId: null };
@@ -498,6 +517,7 @@ async function stopChild(child) {
 
 async function monitorChild({
   child,
+  exitPromise = null,
   transcriptRoot,
   transcriptPath,
   sessionId,
@@ -505,7 +525,7 @@ async function monitorChild({
   offset,
   pollIntervalMs,
 }) {
-  const exited = childExit(child).then(result => ({ type: 'exit', result }));
+  const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
   let currentOffset = offset;
@@ -637,21 +657,24 @@ export async function runClaudeWithRecovery({
   recoverLoginExpired,
   recoverLimit,
   waitForConnectionRecovery,
+  resolveSessionId,
+  sessionResolveTimeoutMs = 5000,
+  sessionResolvePollIntervalMs = 50,
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
   wait = delayLong,
 }) {
   const selector = sessionSelector(claudeArgs);
-  if (selector.kind === 'ambiguous') {
-    return childExit(spawnClaude(claudeArgs, childEnv));
-  }
-
   let sessionId = selector.sessionId;
   let nextArgs = [...claudeArgs];
   if (selector.kind === 'new') {
     sessionId = randomUUID();
     nextArgs = ['--session-id', sessionId, ...nextArgs];
+  } else if (selector.kind === 'ambiguous') {
+    if (selector.resolverSafe !== true || typeof resolveSessionId !== 'function') {
+      return childExit(spawnClaude(claudeArgs, childEnv));
+    }
   }
 
   const maxRetries = Number.isFinite(config.claudeAutoResumeMaxRetries)
@@ -683,7 +706,7 @@ export async function runClaudeWithRecovery({
 
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
-    const offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    let offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
     // Defense in depth: a post-dispatch failure is never allowed to turn the
     // following UI reopen into another inference POST, even if a caller or a
     // future branch accidentally appends the literal continuation prompt.
@@ -695,9 +718,38 @@ export async function runClaudeWithRecovery({
       ? nextArgs.slice(0, 2)
       : nextArgs;
     suppressNextContinuationPrompt = false;
-    const child = spawnClaude(launchArgs, nextEnv);
+    let child;
+    let exitPromise;
+    try {
+      child = spawnClaude(launchArgs, nextEnv);
+      exitPromise = childExit(child);
+    } catch (error) {
+      return { status: 1, signal: null, error };
+    }
+    if (selector.kind === 'ambiguous' && selector.resolverSafe === true && !sessionId) {
+      const deadline = Date.now() + Math.max(0, sessionResolveTimeoutMs);
+      while (Date.now() < deadline
+          && child.exitCode == null
+          && child.signalCode == null) {
+        const remaining = deadline - Date.now();
+        sessionId = await resolveSessionIdWithDeadline(
+          resolveSessionId,
+          { child, args: launchArgs, cwd },
+          remaining,
+          exitPromise,
+        );
+        if (UUID_RE.test(sessionId || '')) break;
+        sessionId = null;
+        if (Date.now() >= deadline) break;
+        await delay(Math.min(Math.max(1, sessionResolvePollIntervalMs), deadline - Date.now()));
+      }
+      if (!sessionId) return exitPromise;
+      transcriptPath = await findTranscript(transcriptRoot, sessionId);
+      offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    }
     const outcome = await monitorChild({
       child,
+      exitPromise,
       transcriptRoot,
       transcriptPath,
       sessionId,

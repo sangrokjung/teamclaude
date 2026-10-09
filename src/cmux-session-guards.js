@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
+import { inspectClaudeProcess as defaultInspectClaudeProcess } from './cmux-process-guard.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
@@ -175,6 +176,62 @@ export function validSession(store, session) {
     && session.launchCommand?.launcher === 'claude'
     && typeof session.launchCommand.executablePath === 'string'
     && activeSessionId(store, session.surfaceId) === session.sessionId;
+}
+export async function resolveCmuxSessionId({
+  storePath,
+  surfaceId,
+  pid,
+  cwd,
+  inspectProcess = defaultInspectClaudeProcess,
+  startTimeToleranceSeconds = 5,
+}) {
+  if (typeof storePath !== 'string'
+      || !SURFACE_RE.test(surfaceId || '')
+      || !Number.isInteger(pid)
+      || pid <= 0
+      || typeof cwd !== 'string') {
+    return null;
+  }
+  let store;
+  try {
+    store = await readPrivateJson(storePath);
+  } catch {
+    return null;
+  }
+  const sessionId = activeSessionId(store, surfaceId);
+  const session = sessionId && store?.sessions?.[sessionId];
+  if (!validSession(store, session)
+      || session.surfaceId !== surfaceId
+      || session.pid !== pid
+      || session.launchCommand?.launcher !== 'claude') return null;
+  let processInfo;
+  try {
+    processInfo = await inspectProcess(pid);
+  } catch {
+    return null;
+  }
+  const [callerCwd, launchCwd, processCwd] = await Promise.all([
+    realpath(cwd).catch(() => null),
+    realpath(session.launchCommand.workingDirectory).catch(() => null),
+    realpath(processInfo?.cwd || '').catch(() => null),
+  ]);
+  const tolerance = Number.isFinite(startTimeToleranceSeconds)
+    ? Math.max(0, startTimeToleranceSeconds)
+    : 5;
+  return processInfo?.alive === true
+    && processInfo.pid === pid
+    && processInfo.surfaceId === surfaceId
+    && processInfo.agentLaunchKind === 'claude'
+    && processInfo.supervised === false
+    && processInfo.environmentValid === true
+    && callerCwd !== null
+    && callerCwd === launchCwd
+    && launchCwd === processCwd
+    && Number.isFinite(processInfo.processStartedAt)
+    && Number.isFinite(session.pidStartSeconds)
+    && Math.abs(processInfo.processStartedAt - session.pidStartSeconds) <= tolerance
+    ? session.sessionId
+    : null;
 }
 
 export {

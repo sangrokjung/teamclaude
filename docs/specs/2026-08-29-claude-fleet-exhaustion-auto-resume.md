@@ -26,6 +26,7 @@ TeamClaude proxy가 모든 Claude 계정의 제한 해제까지 남은 시간을
 7. 인접한 login/usage-limit 계정 회전은 account 이름이 아니라 이전·현재 UUID와 `CLAUDE_CODE_OAUTH_TOKEN` recovery marker가 모두 일치할 때만 재개합니다.
 8. Codex handoff의 transcript metadata는 단일 행 branch allowlist를 통과한 값만 기록하고, 개행·Markdown·시크릿 후보가 섞이면 `unknown`으로 처리합니다.
 9. cmux rescue는 fleet 오류의 transcript timestamp와 서버 retry hint가 아직 유효하면 process를 종료하거나 새 workspace를 만들지 않습니다. claim·종료 중 transcript, registry, parent·child process identity가 바뀌면 새 실행을 취소합니다.
+10. cmux에서 ID 없는 `-r`/`--resume` picker와 `--continue`만 현재 surface의 active session으로 연결합니다. named resume, malformed `--session-id`, 일반 환경의 ambiguous selector는 기존 passthrough을 유지합니다. 연결은 registry의 active surface·PID·`pidStartSeconds`·launcher 작업 디렉터리와 현재 supervisor process identity를 모두 대조하며, 기존 transcript 끝을 새 child의 시작 offset으로 삼아 과거 오류를 재처리하지 않습니다.
 
 ## Acceptance criteria
 
@@ -38,6 +39,7 @@ TeamClaude proxy가 모든 Claude 계정의 제한 해제까지 남은 시간을
 - cmux에 저장된 TeamClaude supervisor PID에서 공식 Claude native child를 찾아도, parent·child identity와 launch surface가 모두 일치할 때만 제한 해제 후 한 번 재개합니다.
 - retry deadline 전 cmux scan은 후보만 기록하고 process 종료·workspace 생성은 하지 않습니다.
 - 설정된 최대 대기 상한을 넘는 retry hint는 상한까지만 기다립니다.
+- ID 없는 cmux 실행의 picker가 늦거나 resolver가 멈춰도 resolver deadline 이후 child를 그대로 반환하며, 다른 cwd·PID 재사용·오래된 transcript 오류를 자동 재개하지 않습니다.
 - targeted test, 전체 suite, lint가 통과하고 실제 CLI fixture에서 같은 session 재실행을 관찰합니다.
 
 ## Risks
