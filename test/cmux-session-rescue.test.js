@@ -1507,3 +1507,32 @@ test('rejects process identity or active mapping changes before workspace launch
     assert.equal(launches, 0);
   });
 });
+
+// A legacy native process without launch-argv metadata is judged on its ps
+// command alone; it must never throw out of the rescue loop.
+test('legacy native process without launch argv is matched by command and never throws', async t => {
+  const fx = await fixture(t);
+  const native = join(fx.root, 'native-claude');
+  await writeFile(native, '#!/bin/sh\n', { mode: 0o755 });
+  fx.session.launchCommand.executablePath = native;
+  const base = {
+    processRole: 'legacy-native',
+    environmentValid: false,
+    legacyEnvironmentValid: true,
+    executablePath: native,
+    launchArgv: null,
+    nativeExecutableTrusted: true,
+  };
+  for (const command of [
+    `${native} --resume ${SESSION_ID}`,
+    `${native} --session-id ${SESSION_ID}`,
+    `${native} --settings '{}'`,
+  ]) {
+    assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command }), fx.executablePath), true, command);
+  }
+  const other = '00000000-0000-4000-8000-000000000000';
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { ...base, command: `${native} --resume ${other}` }), fx.executablePath),
+    false,
+  );
+});
