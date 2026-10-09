@@ -148,9 +148,11 @@ test('continuity mode does not internally replay a broken partial SSE POST', asy
 
   try {
     const r = await streamPost(proxyPort);
-    assert.equal(r.status, 529);
+    // An unsafe POST streams progressively, so the break is surfaced in-stream.
+    assert.equal(r.status, 200);
     assert.equal(r.cleanEnd, true);
-    assert.equal(JSON.parse(r.body).error.type, 'overloaded_error');
+    assert.equal(lastErrorEvent(r.body)?.error.type, 'overloaded_error');
+    assert.ok(!r.body.includes('complete answer'), 'no second upstream attempt leaked into the response');
     assert.equal(requests, 1, 'an upstream-accepted POST must not be replayed internally');
     assert.ok(am.accounts.every(a => a.status === 'active'));
   } finally {
@@ -342,10 +344,9 @@ test('transactional SSE rejects a response above the configured spool ceiling', 
   const proxyPort = await listen(proxy);
 
   try {
+    // Only replay-safe requests are held in an SSE transaction.
     const res = await fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'x', messages: [] }),
+      method: 'GET',
       signal: AbortSignal.timeout(1000),
     });
     const body = await res.json();
@@ -617,8 +618,8 @@ test('stalled SSE response hits the idle deadline and releases its slot', async 
       body: JSON.stringify({ model: 'x', messages: [] }),
       signal: AbortSignal.timeout(1000),
     });
-    assert.equal(res.status, 529);
-    assert.equal((await res.json()).error?.type, 'overloaded_error');
+    assert.equal(res.status, 200);
+    assert.equal(lastErrorEvent(await res.text())?.error.type, 'overloaded_error');
     assert.equal(requests, 1, 'an idle POST must not be replayed internally');
     for (let i = 0; i < 20 && !upstreamClosed; i++) await delay(10);
     assert.equal(upstreamClosed, true, 'the idle deadline must cancel the upstream reader');
@@ -660,10 +661,10 @@ test('SSE ping traffic cannot outlive the total stream deadline', async () => {
       body: JSON.stringify({ model: 'x', messages: [] }),
       signal: AbortSignal.timeout(750),
     });
-    const body = await res.json();
+    const body = await res.text();
     const elapsed = Date.now() - started;
-    assert.equal(res.status, 529);
-    assert.equal(body.error?.type, 'overloaded_error');
+    assert.equal(res.status, 200);
+    assert.equal(lastErrorEvent(body)?.error.type, 'overloaded_error');
     assert.equal(requests, 1, 'a timed-out POST must not be replayed internally');
     assert.ok(elapsed >= 100 && elapsed < 500,
       `total stream deadline should fire near 120ms, took ${elapsed}ms`);
@@ -934,5 +935,41 @@ test('SSE request logging is capped without truncating the client stream', async
     proxy.close();
     upstream.close();
     await rm(logDir, { recursive: true, force: true });
+  }
+});
+
+// An unsafe POST is never replayed internally, so holding its whole SSE
+// generation in a continuity transaction buys no recovery and only hides
+// progress and heartbeats from the client until it times out.
+test('continuity mode streams an unsafe SSE POST progressively', async () => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const upstream = http.createServer(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+    await gate;
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const proxy = startProxy(am, upstreamPort, { continuityMode: true });
+  const proxyPort = await listen(proxy);
+
+  try {
+    let firstDataBeforeEnd = false;
+    let upstreamFinished = false;
+    const pending = streamPost(proxyPort, {
+      onFirstData: () => { firstDataBeforeEnd = !upstreamFinished; release(); },
+    });
+    const timer = setTimeout(() => { upstreamFinished = true; release(); }, 1500);
+    const r = await pending;
+    clearTimeout(timer);
+    assert.equal(firstDataBeforeEnd, true, 'message_start reached the client while upstream was still generating');
+    assert.equal(r.status, 200);
+    assert.equal(r.cleanEnd, true);
+    assert.match(r.body, /message_stop/);
+  } finally {
+    proxy.close();
+    upstream.close();
   }
 });

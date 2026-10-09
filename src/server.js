@@ -3789,10 +3789,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
             releaseBytes: ctx.releaseAuxiliaryResponseBytes,
           }
         : null;
-      // With recovery on, response headers are DEFERRED until the first whole
-      // SSE frame arrives: an upstream that dies before producing anything
-      // leaves the client response untouched and fully replayable on another
-      // account — a transparent failover beats asking the client to retry.
+      // Defer headers only until the first whole frame. Unsafe requests cannot
+      // be replayed internally, so buffering their entire generation only hides
+      // progress and heartbeats from the client until it times out.
       const ensureHeaders = () => {
         if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
       };
@@ -3804,7 +3803,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         accountManager,
         streamLog,
         ctx.streamRecovery,
-        ctx.streamRecovery && ctx.continuity.enabled,
+        ctx.streamRecovery && ctx.continuity.enabled && replaySafe,
         ensureHeaders,
         ctx.maxResponseBytes,
         ctx.streamIdleTimeoutMs,
