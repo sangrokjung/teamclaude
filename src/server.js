@@ -61,6 +61,30 @@ function connectionHeaderNames(value) {
   );
 }
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'ECONNABORTED', 'EPIPE',
+  'ENETUNREACH', 'ENETDOWN', 'EHOSTUNREACH', 'EHOSTDOWN',
+  'ENOTFOUND', 'EAI_AGAIN', 'EADDRNOTAVAIL',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
+]);
+const TRANSIENT_NETWORK_MESSAGES = [
+  'fetch failed',
+  'terminated',
+  'socket hang up',
+  'Client network socket disconnected',
+];
+
+export function isTransientNetworkError(err) {
+  if (!(err instanceof Error)) return false;
+  const message = err.message || '';
+  if (TRANSIENT_NETWORK_MESSAGES.some(text => message.includes(text))) return true;
+  if (TRANSIENT_NETWORK_CODES.has(err.code) || TRANSIENT_NETWORK_CODES.has(err.cause?.code)) {
+    return true;
+  }
+  const nested = Array.isArray(err.errors) ? err.errors : [];
+  return nested.length > 0 && nested.every(inner => TRANSIENT_NETWORK_CODES.has(inner?.code));
+}
+
 function requestUpstreamRaw(url, { method, headers, body, signal }) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -590,6 +614,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         authorization: `Bearer ${account.credential}`,
       };
       if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+      const polledAt = Date.now();
       const res = await fetch(codexUsageEndpoint(), { headers, signal: probe.signal });
       if (!res.ok) {
         await res.body?.cancel();
@@ -601,6 +626,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           authOk: false,
           terminalAuth: res.status === 401 || res.status === 403,
         };
+      }
+      // A 2xx from the backend proves connectivity on its own, so a
+      // transport-only park lifts before the body is parsed: an empty or
+      // malformed payload must not keep the account excluded.
+      if (accountManager.accounts[account.index] === account) {
+        accountManager.clearSendFailure(account, { evidenceSince: polledAt });
       }
       const payload = await res.json();
       if (accountManager.accounts[account.index] !== account) {
@@ -2466,7 +2497,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Both fleet-wide "everyone failed auth" checks below must see that, or a
   // request nobody will authenticate falls into the continuity capacity wait
   // (and finally a 429) instead of surfacing its 401 promptly.
-  const authFailedForRequest = a => a.status === 'error' || ctx.auth401.has(a);
+  // A send-failed park is a network cooldown, not an auth verdict: counting
+  // it here told operators to re-login during a pure connectivity outage.
+  const authFailedForRequest = a => ctx.auth401.has(a)
+    || (a.status === 'error' && a.errorReason !== 'send-failed');
   const fleetModelQuarantined = () => {
     const candidates = accountManager.accounts.filter(candidate =>
       candidate.enabled !== false
@@ -2587,7 +2621,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return forwardRequest(req, res, fallback.body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
       }
     }
-    const canEventuallyRecover = accts.some(a => a.enabled !== false && a.status !== 'error');
+    // A send-failed park is a short cooldown, so a fleet made only of those
+    // still recovers: waiting is correct, a quota-shaped 429 is not.
+    const canEventuallyRecover = accts.some(a => a.enabled !== false
+      && (a.status !== 'error' || accountManager.isInSendFailureCooldown(a)));
     const modelQuarantined = fleetModelQuarantined();
     if (modelQuarantined) break;
     if (allAuthFailed || !ctx.continuity.enabled || !canEventuallyRecover) break;
@@ -2597,6 +2634,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const recovery = capped
       ? null
       : fleetRecovery(status.accounts, accountManager.switchThreshold, ctx.model);
+    const sendFailedMs = capped ? null : accountManager.soonestSendFailureRecoveryMs(accts);
+    if (recovery && sendFailedMs != null && (recovery.soonestMs == null || sendFailedMs < recovery.soonestMs)) {
+      recovery.soonestMs = sendFailedMs;
+      recovery.retryAfter = Math.max(1, Math.ceil(sendFailedMs / 1000));
+      recovery.soonestKnown = true;
+    }
     const retryAfter = capped ? 1 : recovery.retryAfter;
     const deadlineMode = ctx.continuity.maxWaitMs > 0;
     const maxCapacityWaits = Math.max(0, envInt('TEAMCLAUDE_OVERLOAD_RETRIES', 6));
@@ -2694,6 +2737,25 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A fleet-wide model quarantine (unsupported-model 400 contract) is not a
     // usage limit: keep its own retry-after and the generic body.
     const quarantineRetryAfter = modelQuarantineRetryAfter(accts, ctx.model);
+    // When the soonest capacity is a send-failed cooldown, the dead end is a
+    // connectivity outage, not a usage limit: say so with a retryable 503.
+    const sendFailedMs = quarantineRetryAfter == null
+      ? accountManager.soonestSendFailureRecoveryMs(accts)
+      : null;
+    if (sendFailedMs != null && !hasUsable(null) && !hasCapped(null)
+        && (recovery.soonestMs == null || sendFailedMs <= recovery.soonestMs)) {
+      const cooldownRetryAfter = Math.max(1, Math.ceil(sendFailedMs / 1000));
+      ctx.status = 503;
+      res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(cooldownRetryAfter) });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'overloaded_error',
+          message: `Upstream connection failures on all ${accts.length} accounts; retry in ${cooldownRetryAfter}s.`,
+        },
+      }));
+      return;
+    }
     const retryAfter = quarantineRetryAfter ?? recovery.retryAfter;
     // Codex-native exhaustion body. The Codex CLI cannot read the generic
     // rate_limit_error above ("exceeded retry limit, last status: 429"); it DOES
@@ -2901,6 +2963,19 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       : fetch(upstreamUrl, { ...requestOptions, redirect: 'manual' });
     ctx.preferredAccountUuid = null;
     const upstreamRes = await upstreamRequest;
+    // Reaching here means the request was actually SENT and a response came
+    // back — the request never even reaching the backend is exactly what
+    // `send-failed` means, so this is proof the earlier park on THIS account
+    // was transient, not a credential problem. EXCLUDING 401/403: those are
+    // handled below as credential-rejection evidence in their own right (a
+    // concurrent request on the same account could have parked it for
+    // auth-revoked/subscription-disabled moments ago; clearing here before
+    // that handling runs could briefly reactivate it on THIS response's own
+    // say-so even when this very response turns out to be another rejection).
+    if (account._errorFromSendFailure
+      && upstreamRes.status !== 401 && upstreamRes.status !== 403) {
+      accountManager.clearSendFailure(account, { evidenceSince: dispatchedAt });
+    }
     const contentType = upstreamRes.headers.get('content-type');
     let isStreaming = isEventStream(contentType);
     // The Codex backend can omit Content-Type on successful Responses SSE.
@@ -2956,6 +3031,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // account (it stays unmeasured/active), yielding repeated 401s.
     if (upstreamRes.status === 401) {
       await upstreamRes.body?.cancel();
+      // A 401 is a credential verdict and outranks a transport cooldown: lift
+      // the send-failed park so the handling below judges this account as it
+      // would any active one, instead of skipping it and letting the cooldown
+      // revive a rejected credential. The cooldown was set by another request
+      // after this one was sent, so every exit below that does NOT park the
+      // account for auth puts it back (refresh retry, request-scoped cascade).
+      const priorSendFailure = accountManager.snapshotSendFailure(account);
+      accountManager.clearSendFailure(account);
 
       if (account.type === 'oauth' && account.refreshToken
           && !ctx.authRetried.has(account)
@@ -2963,10 +3046,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.authRetried.add(account);
         console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
         await raceAbort(accountManager.ensureTokenFresh(account, true), ctx.abortSignal);
-        if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone during refresh
+        if (res.destroyed || ctx.abortSignal?.aborted) { // client gone during refresh
+          accountManager.restoreSendFailure(account, priorSendFailure);
+          return;
+        }
         // ensureTokenFresh only marks 'error' for an expired token; a successful
         // (or non-fatal) refresh leaves status intact → retry the same account.
         if (account.status !== 'error') {
+          accountManager.restoreSendFailure(account, priorSendFailure);
           if (logDir) {
             appendLogSection(`=== RESPONSE 401 — forced token refresh, retrying ===`);
             flushRequestLog(logDir, reqId, logSections, hooks);
@@ -3021,6 +3108,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           // markAuthenticationError drops the usage-poll cause tag; put it back
           // so the poll-quarantine healing rules keep applying to this account.
           if (parked.errorFromUsagePoll !== undefined) target._errorFromUsagePoll = parked.errorFromUsagePoll;
+          accountManager.restoreSendFailure(target, parked.sendFailure);
           delete target._authParkSeq;
           restored.push(target.name);
         }
@@ -3037,6 +3125,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           errorReason: account.errorReason ?? null,
           errorFromRefresh: account._errorFromRefresh,
           errorFromUsagePoll: account._errorFromUsagePoll,
+          sendFailure: priorSendFailure,
         };
         accountManager.markAuthenticationError(account, 'auth-revoked');
         // Claim the park only if it actually landed the way the rollback
@@ -3054,6 +3143,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // It must override a refresh-failure label so the sweep cannot revive it.
         accountManager.markAuthenticationError(account, 'auth-revoked');
       }
+      accountManager.restoreSendFailure(account, priorSendFailure);
       await accountManager.waitForAccountFlag(account).catch(err => {
         console.error(`[TeamClaude] Failed to persist subscription state for "${account.name}": ${err.message}`);
       });
@@ -3886,15 +3976,12 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // error as `cause` (code UND_ERR_SOCKET/ECONNRESET), not a top-level code.
     // Buffered non-SSE bodies also reach this path; the method gate below
     // decides whether transport recovery is safe without poisoning the account.
-    const TRANSIENT_CODES = new Set([
-      'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT',
-      'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET',
-    ]);
-    const isTransient = err instanceof Error &&
-      (err.message.includes('fetch failed') ||
-        err.message.includes('terminated') ||
-        TRANSIENT_CODES.has(err.code) ||
-        TRANSIENT_CODES.has(err.cause?.code));
+    // Codex mode dispatches with raw http.request, which rejects with the
+    // native socket error un-wrapped. When every address family fails, Node
+    // throws an AggregateError with an EMPTY message and the per-family codes
+    // in `errors[]` — the 2026-10-08 outage produced 568 of these, all of
+    // which slipped past this check and parked the whole pool.
+    const isTransient = isTransientNetworkError(err);
 
     // Transient network errors are ambiguous once dispatch starts: upstream may
     // have accepted an unsafe request even when no response reached us. Keep
@@ -3936,14 +4023,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
 
     if (replaySafe && retryCount < maxRetries && !res.headersSent) {
-      // Preserve a prior refresh-failure label, but label a new request-path
-      // send failure so a later token rotation cannot blindly revive it.
-      if (account.status !== 'error') {
-        account._errorFromRefresh = false;
-        account.errorReason = 'send-failed';
-      }
-      account.status = 'error';
-      account.errorReason = 'send-failed';
+      // Network-level failures are classified transient above and never park.
+      // What reaches here is an unclassified send failure: it still carries
+      // no auth evidence, so it parks as a short cooldown (markSendFailure)
+      // that lapses on its own, and never overwrites a stricter park.
+      accountManager.markSendFailure(account);
       releaseHeld(); // this account errored; fail over to another
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
     }

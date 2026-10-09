@@ -847,3 +847,107 @@ test('subscription-disabled flag changes are idempotent and fresh credentials cl
   assert.equal(am.accounts[0].subscriptionDisabled, undefined);
   assert.equal(am.accounts[0].errorReason, undefined);
 });
+
+test('clearSendFailure heals the same park with only transport-level evidence (no inference/poll needed)', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+
+  acct.status = 'error';
+  acct.errorReason = 'send-failed';
+  acct._errorFromRefresh = false;
+  acct._errorFromSendFailure = true;
+
+  // This is the lighter-weight evidence tier server.js uses right after
+  // `await upstreamRequest` succeeds (any status, either provider) — proof
+  // the request merely reached the backend, not that it fully completed.
+  am.clearSendFailure(acct);
+
+  assert.equal(acct.status, 'active');
+  assert.equal(acct.errorReason, undefined);
+  assert.equal(acct._errorFromSendFailure, undefined);
+});
+
+test('clearSendFailure never touches an auth-backed park (no stale send-failed tag present)', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+
+  am.markAuthenticationError(acct, 'auth-revoked');
+  am.clearSendFailure(acct);
+
+  assert.equal(acct.status, 'error');
+  assert.equal(acct.errorReason, 'auth-revoked');
+});
+
+test('a stale send-failed tag surviving onto a subscription-disabled park cannot revive it (redundant errorReason guard)', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+
+  // Simulate the race the reviewer flagged: the account was already parked
+  // send-failed (tag present), then a STRICTER park (subscription-disabled)
+  // lands on top of it without the test manually clearing the stale tag —
+  // this is exactly the scenario the redundant errorReason check defends
+  // against even if some future park site forgets to delete the tag.
+  acct.status = 'error';
+  acct.errorReason = 'send-failed';
+  acct._errorFromSendFailure = true;
+  am.setSubscriptionDisabled(acct, true);
+  assert.equal(acct.errorReason, 'subscription-disabled');
+  acct._errorFromSendFailure = true; // force the stale-tag condition back on
+
+  am.clearSendFailure(acct);
+  assert.equal(acct.status, 'error', 'errorReason mismatch must block the heal');
+  assert.equal(acct.errorReason, 'subscription-disabled');
+
+  am.markAccountSuccess(acct);
+  assert.equal(acct.status, 'error', 'markAccountSuccess must not revive a subscription-disabled park either');
+  assert.equal(acct.errorReason, 'subscription-disabled');
+});
+
+test('setSubscriptionDisabled and setSubscriptionCancellation(ended) drop a stale send-failed tag on park', () => {
+  const am = new AccountManager(
+    [{ ...makeAccounts(1)[0], provider: 'anthropic' }],
+    0.98,
+  );
+  const acct = am.accounts[0];
+  acct.status = 'error';
+  acct.errorReason = 'send-failed';
+  acct._errorFromSendFailure = true;
+
+  am.setSubscriptionDisabled(acct, true);
+  assert.equal(acct._errorFromSendFailure, undefined);
+
+  const codexAm = new AccountManager(
+    [{ ...makeAccounts(1)[0], provider: 'codex' }],
+    0.98,
+  );
+  const codexAcct = codexAm.accounts[0];
+  codexAcct.status = 'error';
+  codexAcct.errorReason = 'send-failed';
+  codexAcct._errorFromSendFailure = true;
+
+  codexAm.setSubscriptionCancellation(codexAcct, {
+    status: 'ended',
+    recordedAt: new Date().toISOString(),
+    endedAt: new Date().toISOString(),
+    evidence: 'auth-failure-after-cancellation',
+  });
+  assert.equal(codexAcct.errorReason, 'subscription-ended');
+  assert.equal(codexAcct._errorFromSendFailure, undefined);
+});
+
+test('a genuine auth-revoked park is not healed by markAccountSuccess, and outranks a stale send-failed tag', () => {
+  const am = new AccountManager(makeAccounts(1), 0.98);
+  const acct = am.accounts[0];
+
+  // The account was already parked for a real credential problem.
+  am.markAuthenticationError(acct, 'auth-revoked');
+  assert.equal(acct.status, 'error');
+  assert.equal(acct.errorReason, 'auth-revoked');
+  assert.equal(acct._errorFromSendFailure, undefined, 'markAuthenticationError must drop any stale send-failed tag');
+
+  // A success elsewhere (e.g. a stray usage poll) must not revive it —
+  // only the stricter heal paths (re-import or a cause-scoped refresh) may.
+  am.markAccountSuccess(acct);
+  assert.equal(acct.status, 'error');
+  assert.equal(acct.errorReason, 'auth-revoked');
+});

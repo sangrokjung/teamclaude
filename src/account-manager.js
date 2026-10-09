@@ -8,6 +8,7 @@ import {
 } from './subscription.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
+export const SEND_FAILED_COOLDOWN_MS = 30 * 1000;
 const CODEX_SESSION_WINDOW_MINUTES = 5 * 60;
 const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 const CODEX_MODEL_UNSUPPORTED_TTL_MS = 30 * 60 * 1000;
@@ -1082,6 +1083,16 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${account.name}" rate limit expired, marking active`);
     }
 
+    // A transport-only park carries no auth evidence, so it is a cooldown like
+    // a throttle: it lapses on its own instead of waiting for a restart. This
+    // is the path that heals anthropic accounts, which have no usage poll.
+    if (account.status === 'error' && account.errorReason === 'send-failed'
+      && account._errorFromSendFailure === true
+      && Date.now() >= (account._sendFailedUntil ?? 0)) {
+      this.clearSendFailure(account);
+      console.log(`[TeamClaude] Account "${account.name}" send-failure cooldown expired, marking active`);
+    }
+
     if (account.status === 'exhausted' || account.status === 'error') return false;
     if (this._isModelUnsupported(account, model)) return false;
     if (this._isNearQuota(account, model)) return false;
@@ -1723,6 +1734,10 @@ export class AccountManager {
       account.status = 'error';
       account.errorReason = 'subscription-disabled';
       account._errorFromRefresh = false;
+      // Same stale-tag hazard as markAuthenticationError: a prior
+      // send-failed park's tag must not survive onto this stricter park.
+      delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
     } else {
       delete account.subscriptionDisabled;
       if (account.status === 'error' && account.errorReason === 'subscription-disabled') {
@@ -1751,11 +1766,14 @@ export class AccountManager {
       account.status = 'error';
       account.errorReason = 'subscription-ended';
       account._errorFromRefresh = false;
+      delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
     } else if (account.errorReason === 'subscription-ended') {
       account.status = 'active';
       delete account.errorReason;
       delete account._errorFromRefresh;
       delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
       this._drainWaiters();
     }
     if (persist && changed && this.accounts[account.index] === account) {
@@ -1787,6 +1805,10 @@ export class AccountManager {
       account.status = 'error';
       account.errorReason = 'subscription-ended';
       account._errorFromRefresh = false;
+      // Same stale-tag hazard as the generic park below: a prior send-failed
+      // park's tag must not survive onto this stricter subscription park.
+      delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
       return account;
     }
     const canInferEnded = account.provider === 'codex' && cancellation?.status === 'scheduled'
@@ -1798,15 +1820,20 @@ export class AccountManager {
         endedAt: new Date(now).toISOString(),
         evidence: 'auth-failure-after-cancellation',
       }, persist);
+      delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
       return account;
     }
     account.status = 'error';
     account.errorReason = reason;
     account._errorFromRefresh = reason === 'refresh-failed';
     // A park entered here is request/refresh-path evidence. Drop any stale
-    // poll-quarantine tag so a later usage-poll success cannot heal it — the
-    // usage-poll watchdog re-tags its own parks right after calling this.
+    // poll-quarantine or send-failure tag so a later usage-poll/send success
+    // cannot heal it — the usage-poll watchdog re-tags its own parks right
+    // after calling this, and a genuine auth failure always outranks a prior
+    // transport-only park.
     delete account._errorFromUsagePoll;
+    delete account._errorFromSendFailure;
     return account;
   }
 
@@ -1842,6 +1869,92 @@ export class AccountManager {
     account.lastSuccessfulAt = new Date(now).toISOString();
     return account;
   }
+
+  /**
+   * Clear a pure transport-failure park the instant evidence contradicts it.
+   * Unlike markAccountSuccess (gated to codex inference/usage-poll success —
+   * a stronger, provider-specific evidence tier), this needs only the
+   * lightest possible proof: ANY response reaching the proxy from this
+   * account — any status code, either provider — proves the account's
+   * connectivity and credential are fine right now, because `send-failed`
+   * means the request never even reached the backend to be accepted or
+   * rejected. Scoped strictly to the `_errorFromSendFailure` tag, which
+   * every park site drops before installing a stricter, credential-backed
+   * park — so this can never revive a real auth failure. errorReason must
+   * also still read 'send-failed' as a second, redundant guard: that way a
+   * future park site that forgets the delete still can't be misread as a
+   * healable transport-only failure.
+   */
+  clearSendFailure(ref, { evidenceSince = Infinity } = {}) {
+    const account = this._resolveRef(ref);
+    if (!account) return null;
+    // `evidenceSince` is when the proving request was sent: a park recorded
+    // after that moment is newer than the evidence and must stand.
+    if (account.status === 'error' && account.errorReason === 'send-failed'
+      && account._errorFromSendFailure === true
+      && (account._sendFailedAt ?? 0) < evidenceSince) {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+      delete account._errorFromSendFailure;
+      delete account._sendFailedUntil;
+      delete account._sendFailedAt;
+      this._drainWaiters();
+    }
+    return account;
+  }
+
+  isInSendFailureCooldown(account) {
+    return account?.status === 'error' && account.errorReason === 'send-failed'
+      && account._errorFromSendFailure === true;
+  }
+
+  snapshotSendFailure(ref) {
+    const account = this._resolveRef(ref);
+    if (!this.isInSendFailureCooldown(account)) return null;
+    return { at: account._sendFailedAt ?? 0, until: account._sendFailedUntil ?? 0 };
+  }
+
+  /** Put back a send-failed cooldown lifted for a check that ended without a park of its own. */
+  restoreSendFailure(ref, snapshot, now = Date.now()) {
+    const account = this._resolveRef(ref);
+    if (!account || !snapshot || account.status !== 'active' || snapshot.until <= now) return account ?? null;
+    account.status = 'error';
+    account.errorReason = 'send-failed';
+    account._errorFromRefresh = false;
+    account._errorFromSendFailure = true;
+    account._sendFailedAt = snapshot.at;
+    account._sendFailedUntil = snapshot.until;
+    return account;
+  }
+
+  /** Milliseconds until the first enabled send-failed cooldown lapses, or null. */
+  soonestSendFailureRecoveryMs(accounts = this.accounts, now = Date.now()) {
+    let soonest = Infinity;
+    for (const account of accounts) {
+      if (account.enabled === false || !this.isInSendFailureCooldown(account)) continue;
+      soonest = Math.min(soonest, Math.max(0, (account._sendFailedUntil ?? now) - now));
+    }
+    return soonest === Infinity ? null : soonest;
+  }
+
+  /**
+   * Park an account after a request-path failure that produced no auth
+   * evidence. Only an 'active' account is parked: an error, throttle or
+   * exhaustion set concurrently by another path is stricter and stays.
+   */
+  markSendFailure(ref, now = Date.now()) {
+    const account = this._resolveRef(ref);
+    if (!account || account.status !== 'active') return account ?? null;
+    account.status = 'error';
+    account.errorReason = 'send-failed';
+    account._errorFromRefresh = false;
+    account._errorFromSendFailure = true;
+    account._sendFailedAt = now;
+    account._sendFailedUntil = now + SEND_FAILED_COOLDOWN_MS;
+    return account;
+  }
+
   /**
    * Update a specific account's OAuth tokens (e.g. after intercepting a token refresh).
    */
@@ -1880,6 +1993,7 @@ export class AccountManager {
       delete account.errorReason;
       delete account._errorFromRefresh;
       delete account._errorFromUsagePoll;
+      delete account._errorFromSendFailure;
     }
     delete account._refreshRetryAt;
     // Fresh external credentials are a fresh evidence baseline: a stale
