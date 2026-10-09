@@ -364,31 +364,23 @@ export async function inspectClaudeProcessTree(
     list.push(row);
     childrenByParent.set(row.ppid, list);
   }
-  let queue = [...(childrenByParent.get(pid) || [])];
-  const seen = new Set();
-  while (queue.length > 0 && seen.size < 64) {
-    const row = queue.shift();
-    if (seen.has(row.pid)) continue;
-    seen.add(row.pid);
-    if (selectorFromCommand(row.command, sessionId)) {
-      const child = await inspectProcess(row.pid);
-      if (childLooksLikeClaude(child, sessionId)
-          && child.parentPid === pid
-          && child.surfaceId === supervisor.surfaceId
-          && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
-        return {
-          ...child,
-          processRole: 'teamclaude-child',
-          launcherCommand: supervisor,
-          launcherProcessIdentity: supervisor.processIdentity,
-        };
-      }
-    }
-    const descendants = childrenByParent.get(row.pid) || [];
-    if (descendants.length > 0) {
-      const matching = descendants.filter(child => selectorFromCommand(child.command, sessionId));
-      const remaining = descendants.filter(child => !selectorFromCommand(child.command, sessionId));
-      queue = [...matching, ...queue, ...remaining];
+  // Only a DIRECT child of the supervisor is adopted: `run` spawns the native
+  // Claude binary itself, so a deeper chain (shell, wrapper) is not a session
+  // this supervisor launched and recovering it would act on an unverified PID.
+  const directChildren = (childrenByParent.get(pid) || []).slice(0, 64);
+  for (const row of directChildren) {
+    if (!selectorFromCommand(row.command, sessionId)) continue;
+    const child = await inspectProcess(row.pid);
+    if (childLooksLikeClaude(child, sessionId)
+        && child.parentPid === pid
+        && child.surfaceId === supervisor.surfaceId
+        && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin)) {
+      return {
+        ...child,
+        processRole: 'teamclaude-child',
+        launcherCommand: supervisor,
+        launcherProcessIdentity: supervisor.processIdentity,
+      };
     }
   }
   return { alive: false };
