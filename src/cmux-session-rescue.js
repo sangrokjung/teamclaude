@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   buildResumeCommand,
@@ -25,13 +25,23 @@ const CMUX_BINARY_CANDIDATES = [
   '/Applications/cmux.app/Contents/Resources/bin/cmux',
 ];
 
-async function resolveCmuxBinary() {
-  for (const candidate of CMUX_BINARY_CANDIDATES) {
-    if (await access(candidate, constants.X_OK).then(() => true, () => false)) {
-      return candidate;
+// The rescue loop runs from background contexts with a minimal PATH, and a
+// PATH lookup would let any earlier `cmux` on PATH receive surface commands.
+// So only known absolute install locations are probed; a non-standard install
+// names its binary explicitly with TEAMCLAUDE_CMUX_BIN (absolute, executable).
+export async function resolveCmuxBinary(env = process.env) {
+  const isExecutable = path => access(path, constants.X_OK).then(() => true, () => false);
+  const override = env.TEAMCLAUDE_CMUX_BIN;
+  if (override !== undefined && override !== '') {
+    if (!isAbsolute(override) || !(await isExecutable(override))) {
+      throw new Error('TEAMCLAUDE_CMUX_BIN must be an absolute path to an executable cmux.');
     }
+    return override;
   }
-  throw new Error('Unable to resolve the cmux executable.');
+  for (const candidate of CMUX_BINARY_CANDIDATES) {
+    if (await isExecutable(candidate)) return candidate;
+  }
+  throw new Error('Unable to resolve the cmux executable (set TEAMCLAUDE_CMUX_BIN for a non-standard install).');
 }
 
 function sessions(store) {
