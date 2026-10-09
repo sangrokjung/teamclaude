@@ -299,3 +299,42 @@ test('a malformed 2xx from the codex usage endpoint still lifts a send-failed pa
     upstream.close();
   }
 });
+
+test('a request-scoped 401 cascade does not wipe a newer send-failed cooldown from another request', async () => {
+  const { server: upstream, release, received } = heldUpstream((req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error' } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([
+    { name: 'a', type: 'apikey', apiKey: 'test-key-a', priority: 0 },
+    { name: 'b', type: 'apikey', apiKey: 'test-key-b', priority: 1 },
+  ], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false,
+  });
+  const proxyPort = await listen(proxy);
+  try {
+    const reqPromise = fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'x', messages: [] }),
+    });
+    await received;
+    const first = am.accounts.find(a => a.inflight > 0);
+    const other = am.accounts.find(a => a !== first);
+    am.markSendFailure(first, Date.now() + 1);
+    release();
+    const res = await reqPromise;
+    await res.text();
+    assert.equal(res.status, 401);
+    assert.equal(first.errorReason, 'send-failed', 'the cascade must hand the newer cooldown back, not leave the account active');
+    assert.equal(first._errorFromSendFailure, true);
+    assert.notEqual(other.status, 'error', 'a request-scoped cascade leaves the other account in rotation');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});

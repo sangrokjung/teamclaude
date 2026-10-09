@@ -1909,6 +1909,25 @@ export class AccountManager {
       && account._errorFromSendFailure === true;
   }
 
+  snapshotSendFailure(ref) {
+    const account = this._resolveRef(ref);
+    if (!this.isInSendFailureCooldown(account)) return null;
+    return { at: account._sendFailedAt ?? 0, until: account._sendFailedUntil ?? 0 };
+  }
+
+  /** Put back a send-failed cooldown lifted for a check that ended without a park of its own. */
+  restoreSendFailure(ref, snapshot, now = Date.now()) {
+    const account = this._resolveRef(ref);
+    if (!account || !snapshot || account.status !== 'active' || snapshot.until <= now) return account ?? null;
+    account.status = 'error';
+    account.errorReason = 'send-failed';
+    account._errorFromRefresh = false;
+    account._errorFromSendFailure = true;
+    account._sendFailedAt = snapshot.at;
+    account._sendFailedUntil = snapshot.until;
+    return account;
+  }
+
   /** Milliseconds until the first enabled send-failed cooldown lapses, or null. */
   soonestSendFailureRecoveryMs(accounts = this.accounts, now = Date.now()) {
     let soonest = Infinity;

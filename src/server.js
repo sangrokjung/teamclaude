@@ -3000,7 +3000,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // A 401 is a credential verdict and outranks a transport cooldown: lift
       // the send-failed park so the handling below judges this account as it
       // would any active one, instead of skipping it and letting the cooldown
-      // revive a rejected credential.
+      // revive a rejected credential. The cooldown was set by another request
+      // after this one was sent, so every exit below that does NOT park the
+      // account for auth puts it back (refresh retry, request-scoped cascade).
+      const priorSendFailure = accountManager.snapshotSendFailure(account);
       accountManager.clearSendFailure(account);
 
       if (account.type === 'oauth' && account.refreshToken
@@ -3009,10 +3012,14 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.authRetried.add(account);
         console.log(`[TeamClaude] 401 on "${account.name}" — forcing token refresh and retrying`);
         await raceAbort(accountManager.ensureTokenFresh(account, true), ctx.abortSignal);
-        if (res.destroyed || ctx.abortSignal?.aborted) return; // client gone during refresh
+        if (res.destroyed || ctx.abortSignal?.aborted) { // client gone during refresh
+          accountManager.restoreSendFailure(account, priorSendFailure);
+          return;
+        }
         // ensureTokenFresh only marks 'error' for an expired token; a successful
         // (or non-fatal) refresh leaves status intact → retry the same account.
         if (account.status !== 'error') {
+          accountManager.restoreSendFailure(account, priorSendFailure);
           if (logDir) {
             appendLogSection(`=== RESPONSE 401 — forced token refresh, retrying ===`);
             flushRequestLog(logDir, reqId, logSections, hooks);
@@ -3067,6 +3074,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           // markAuthenticationError drops the usage-poll cause tag; put it back
           // so the poll-quarantine healing rules keep applying to this account.
           if (parked.errorFromUsagePoll !== undefined) target._errorFromUsagePoll = parked.errorFromUsagePoll;
+          accountManager.restoreSendFailure(target, parked.sendFailure);
           delete target._authParkSeq;
           restored.push(target.name);
         }
@@ -3083,6 +3091,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           errorReason: account.errorReason ?? null,
           errorFromRefresh: account._errorFromRefresh,
           errorFromUsagePoll: account._errorFromUsagePoll,
+          sendFailure: priorSendFailure,
         };
         accountManager.markAuthenticationError(account, 'auth-revoked');
         // Claim the park only if it actually landed the way the rollback
@@ -3100,6 +3109,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         // It must override a refresh-failure label so the sweep cannot revive it.
         accountManager.markAuthenticationError(account, 'auth-revoked');
       }
+      accountManager.restoreSendFailure(account, priorSendFailure);
       await accountManager.waitForAccountFlag(account).catch(err => {
         console.error(`[TeamClaude] Failed to persist subscription state for "${account.name}": ${err.message}`);
       });
