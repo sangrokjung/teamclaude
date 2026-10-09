@@ -1536,3 +1536,37 @@ test('legacy native process without launch argv is matched by command and never 
     false,
   );
 });
+
+// A fleet-exhausted session is parked and later relaunched with --resume, so
+// its process can start hours or days after the registry entry. That window is
+// only safe because identity is still pinned by the exact session selector,
+// the surface, and the expected process identity.
+test('a later relaunch is adopted only while selector, surface and identity still match', async t => {
+  const fx = await fixture(t);
+  const later = fx.session.startedAt + 3 * 24 * 60 * 60;
+  const relaunched = processInfo(fx, { processStartedAt: later });
+  assert.equal(await sameClaudeProcess(fx.session, relaunched, fx.executablePath), true, 'resumed days later');
+
+  const other = '00000000-0000-4000-8000-000000000000';
+  const wrongSelector = processInfo(fx, {
+    processStartedAt: later,
+    command: relaunched.command.replace(SESSION_ID, other),
+    launchArgv: relaunched.launchArgv.map(a => a.replace(SESSION_ID, other)),
+  });
+  assert.equal(await sameClaudeProcess(fx.session, wrongSelector, fx.executablePath), false, 'another session');
+  assert.equal(
+    await sameClaudeProcess(fx.session, { ...relaunched, surfaceId: 'other-surface' }, fx.executablePath),
+    false,
+    'another surface',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, relaunched, fx.executablePath, 'expected-identity-that-differs'),
+    false,
+    'a pinned process identity that differs',
+  );
+  assert.equal(
+    await sameClaudeProcess(fx.session, processInfo(fx, { processStartedAt: fx.session.startedAt + 8 * 24 * 60 * 60 }), fx.executablePath),
+    false,
+    'beyond the 7-day window',
+  );
+});
