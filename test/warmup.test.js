@@ -1069,3 +1069,58 @@ test('importProbeTemplate rejects garbage and never clobbers live evidence', asy
     proxy.close();
   }
 });
+
+// A near-quota reading persisted from a previous run (or spent outside this
+// proxy) must not pin an account out of rotation until its window resets:
+// restoring a template re-probes near-quota accounts once, so a quota that has
+// since recovered is seen without waiting for client traffic.
+test('a restored template re-measures stale near-quota accounts once', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const full = {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+  };
+  am.updateQuota(0, full);
+  am.updateQuota(1, RL_HEADERS());
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+
+  try {
+    assert.equal(am._isNearQuota(am.accounts[0]), true, 'a0 starts near quota');
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' }), true);
+    assert.ok(await waitFor(() => !am._isNearQuota(am.accounts[0])), 'a0 was re-measured below the threshold');
+    assert.equal(seen.filter(s => s.auth === 'Bearer tok-0').length, 1, 'exactly one recheck probe for a0');
+    assert.equal(seen.filter(s => s.auth === 'Bearer tok-1').length, 0, 'a healthy account is not probed');
+    assert.ok(am.accounts[0]._nearQuotaRecheckAt > Date.now(), 'the recheck is rate-limited');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The model-tier (Fable) template that last elicited a model-weekly window is
+// persisted next to the main template, so a restart can still recheck an
+// account that is near its model-scoped weekly limit.
+test('exportProbeTemplate persists the model-tier recheck template', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9', warmupIntervalMs: 0 });
+  try {
+    assert.equal(proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: 'b', system: 'sys', _elicitsModelWeekly: true },
+    }), true);
+    const out = proxy.exportProbeTemplate();
+    assert.equal(out.model, 'claude-opus-4-8');
+    assert.equal(out._staleRecheckTemplate?.model, 'claude-fable-5');
+    assert.equal(out._staleRecheckTemplate?.beta, 'b');
+  } finally {
+    proxy.close();
+  }
+});
