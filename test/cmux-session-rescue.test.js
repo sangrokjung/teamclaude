@@ -25,6 +25,7 @@ import {
   inspectClaudeProcess,
   inspectClaudeProcessTree,
   readPrivateJson,
+  resolveCmuxSessionId,
   releaseSessionClaim,
   sameClaudeProcess,
 } from '../src/cmux-session-guards.js';
@@ -89,6 +90,7 @@ async function fixture(t) {
     workspaceId: '44444444-4444-4444-8444-444444444444',
     pid: 12345,
     startedAt: 1785420000,
+    pidStartSeconds: 1785419997,
     cwd,
     transcriptPath,
     isRestorable: true,
@@ -160,6 +162,84 @@ test('adopts active unresolved Login expired session once', async t => {
     launched[0].command,
     `cd -- '${fx.cwd.replaceAll("'", "'\"'\"'")}' && TEAMCLAUDE_CONFIG='/tmp/teamclaude config.json' '/usr/local/bin/node' '/opt/teamclaude/src/index.js' run -- --resume '${SESSION_ID}' continue`,
   );
+});
+
+test('resolves an ID-less Claude launch only from the matching owner session', async t => {
+  const fx = await fixture(t);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: fx.session.cwd,
+    inspectProcess: async () => ({
+      alive: true,
+      pid: fx.session.pid,
+      cwd: fx.session.launchCommand.workingDirectory,
+      surfaceId: fx.session.surfaceId,
+      agentLaunchKind: 'claude',
+      supervised: false,
+      environmentValid: true,
+      processStartedAt: fx.session.pidStartSeconds,
+    }),
+  }), SESSION_ID);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid + 1,
+    cwd: fx.session.cwd,
+    inspectProcess: async () => ({ alive: false }),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: fx.session.cwd,
+    inspectProcess: async () => ({
+      alive: true,
+      pid: fx.session.pid,
+      cwd: fx.session.launchCommand.workingDirectory,
+      surfaceId: OTHER_SESSION_ID,
+      agentLaunchKind: 'claude',
+      supervised: false,
+      environmentValid: true,
+      processStartedAt: fx.session.pidStartSeconds,
+    }),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: join(fx.root, 'other'),
+    inspectProcess: async () => ({
+      alive: true,
+      pid: fx.session.pid,
+      cwd: fx.session.launchCommand.workingDirectory,
+      surfaceId: fx.session.surfaceId,
+      agentLaunchKind: 'claude',
+      supervised: false,
+      environmentValid: true,
+      processStartedAt: fx.session.pidStartSeconds,
+    }),
+  }), null);
+  const withoutPidStart = structuredClone(fx.store);
+  delete withoutPidStart.sessions[SESSION_ID].pidStartSeconds;
+  await writeFile(fx.storePath, JSON.stringify(withoutPidStart));
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: fx.session.cwd,
+    inspectProcess: async () => ({
+      alive: true,
+      pid: fx.session.pid,
+      cwd: fx.session.launchCommand.workingDirectory,
+      surfaceId: fx.session.surfaceId,
+      agentLaunchKind: 'claude',
+      supervised: false,
+      environmentValid: true,
+      processStartedAt: fx.session.pidStartSeconds,
+    }),
+  }), null);
 });
 
 test('resolves the recovery window before stopping the old process', async t => {

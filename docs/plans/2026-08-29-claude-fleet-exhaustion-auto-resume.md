@@ -18,6 +18,7 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
 7. [x] provider 환경을 격리하고 부하 게이트 전체 suite를 다시 통과시킵니다.
 8. [x] 추가 content block 및 late transcript race를 적대적으로 재현·수정하고 fresh review를 완료합니다.
 9. [x] cmux supervisor PID에서 native Claude child를 검증하고, retry deadline·claim 이후 transcript를 재확인하며, stop 이후에는 사전 캡처한 복구 metadata를 사용합니다.
+10. [x] ID 없는 cmux selector의 active session binding, caller/launcher cwd canonical 비교, PID start identity, resolver deadline, transcript start offset을 회귀 테스트로 고정합니다.
 
 ## Verification
 
@@ -105,3 +106,12 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
   제출됐으나 Chrome/load gate 폐쇄로 실행되지 않았고, turn 종료 전 대기 job을
   취소했습니다. 이번 변경 전 600/600 결과는 유지하되, 이번 content/race 보강
   이후 full suite는 미완료 evidence로 구분합니다.
+
+## Latest verification (2026-10-10)
+
+- ID-less cmux selector, stale transcript offset, hung resolver, ambiguous selector passthrough, active registry binding 테스트 9/9 통과.
+- `real run waits for a fleet-exhaustion retry hint before resuming Claude` 통합 fixture 통과.
+- scoped ESLint와 `git diff --check` 통과.
+- 실제 registry의 surface/PID `13889` resolver가 session `d55ec3b1-0301-4c60-bc24-603b6dd3faa3`를 반환하고, 다른 caller cwd는 null을 반환했습니다.
+- qgate targeted suite ticket `1791558994039413000-21003`는 시스템 부하로 아직 대기 중입니다.
+- Claude Opus 추가 검증은 장시간 조사 후 중단되어 `UNVERIFIED`입니다. Codex fallback 적대 검토는 `REQUEST_CHANGES`를 냈고 cwd·PID 시작 신원 경계를 보완해 위 테스트를 추가했습니다.

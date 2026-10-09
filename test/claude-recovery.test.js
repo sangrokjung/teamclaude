@@ -558,6 +558,131 @@ test('fleet exhaustion keeps retrying when the fleet retry budget is unlimited',
   assert.match(logs[1], /2\/unlimited/);
 });
 
+test('cmux-owned ID-less resume resolves its exact session before fleet recovery', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-idless-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeFleetExhaustionMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    sessionResolveTimeoutMs: 100,
+    resolveSessionId: async ({ args, cwd: resolvedCwd }) => {
+      assert.deepEqual(args, ['-r']);
+      assert.equal(resolvedCwd, cwd);
+      return sessionId;
+    },
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      calls.push([...args]);
+      const child = fakeChild();
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        if (calls.length === 1) {
+          await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 1)}\n`);
+          setTimeout(() => child.finish(9), 20);
+        } else {
+          await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+          child.finish(0);
+        }
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('cmux fleet recovery must stay on Claude');
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [1000]);
+  assert.deepEqual(calls, [
+    ['-r'],
+    ['--resume', sessionId, 'continue'],
+  ]);
+});
+
+test('resolved ID-less resume ignores a pre-existing fleet error in the transcript', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-offset-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '22222222-2222-4222-8222-222222222222';
+  const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+  await mkdir(cwd);
+  await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+  await writeFile(transcriptPath, `${fleetExhaustedRecord(cwd, 600)}\n`);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeFleetExhaustionMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    resolveSessionId: async () => sessionId,
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      setTimeout(() => child.finish(9), 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('historical errors must not trigger handoff');
+    },
+  });
+
+  assert.equal(result.status, 9);
+  assert.deepEqual(calls, [['-r']]);
+});
+
+test('hung cmux session resolution cannot hold a child past its deadline', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-timeout-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  await mkdir(cwd);
+  const startedAt = Date.now();
+  const calls = [];
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true },
+    cwd,
+    transcriptRoot: join(root, 'transcripts'),
+    sessionResolveTimeoutMs: 20,
+    sessionResolvePollIntervalMs: 5,
+    resolveSessionId: () => new Promise(() => {}),
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      setTimeout(() => child.finish(0), 10);
+      return child;
+    },
+    launchCodex: async () => ({ status: 1, signal: null }),
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(calls, [['-r']]);
+  assert.ok(Date.now() - startedAt < 150);
+});
+
 test('fleet exhaustion budget exhaustion does not fall through to generic resume', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-budget-'));
   t.after(() => rm(root, { recursive: true, force: true }));
