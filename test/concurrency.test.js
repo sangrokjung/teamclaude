@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, createSessionAffinityKeys } from '../src/server.js';
 
 const HOUR = 3600_000;
 
@@ -612,6 +612,91 @@ test('a keep-alive connection pins its sequential requests to one account (affin
 
   upstream.close();
   proxy.close();
+});
+
+test('a Claude Code session header keeps requests on one account across new connections', async () => {
+  const served = [];
+  const upstream = http.createServer((req, res) => {
+    served.push((req.headers['authorization'] || '').replace('Bearer ', ''));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+
+  const now = Date.now();
+  const am = new AccountManager(makeAccounts(2), 0.98, 1, 3);
+  measureAll(am, 0.1, 2 * HOUR);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+
+  // agent:false → every call opens a fresh socket, as after a keep-alive timeout.
+  const call = headers => new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port, path: '/v1/messages', method: 'POST', agent: false, headers }, res => {
+      res.resume(); res.on('end', resolve); res.on('error', reject);
+    });
+    r.on('error', reject);
+    r.end('{}');
+  });
+  const session = { 'x-claude-code-session-id': '259c09b3-071c-46f5-a4c3-2e069497c59f' };
+
+  try {
+    await call(session);
+    const first = served[0];
+    const other = am.accounts.find(a => a.accessToken !== first);
+    am.updateQuota(other.index, {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((now + 60_000) / 1000)),
+    });
+    await new Promise(r => setTimeout(r, 5));
+
+    await call({});
+    assert.notEqual(served[1], first, 'setup: a header-less new connection follows the better account');
+
+    await call(session);
+    await call(session);
+    assert.equal(served[2], first, 'the session returns to its home on a new connection');
+    assert.equal(served[3], first, 'and stays there');
+  } finally {
+    upstream.close();
+    proxy.close();
+  }
+});
+
+test('a malformed session header is ignored and the request still succeeds', async () => {
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  measureAll(am);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    for (const bad of ['x'.repeat(200), 'has space', '../etc']) {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-claude-code-session-id': bad }, body: '{}',
+      });
+      assert.equal(res.status, 200, `header ${JSON.stringify(bad.slice(0, 12))} must not break the request`);
+      await res.arrayBuffer();
+    }
+  } finally {
+    upstream.close();
+    proxy.close();
+  }
+});
+
+test('session affinity keys are reused per id and bounded by least-recent use', () => {
+  const keys = createSessionAffinityKeys(2);
+  const a = keys.keyFor('a');
+  assert.equal(keys.keyFor('a'), a, 'same id → same key object');
+  keys.keyFor('b');
+  keys.keyFor('a');          // a is now most recent
+  keys.keyFor('c');          // evicts b, the least recently used
+  assert.equal(keys.size, 2);
+  assert.equal(keys.keyFor('a'), a, 'recently used key survives eviction');
+  assert.notEqual(keys.keyFor('b'), undefined);
+  assert.equal(keys.size, 2, 'never grows past the bound');
 });
 
 test('an account removed just before dispatch is not used; the request re-selects a live account', async () => {
