@@ -603,23 +603,44 @@ async function monitorChild({
   }
 }
 
-async function transcriptHasConversationAfter(path, offset) {
+const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
+const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
+
+// Scan what was appended after `offset` in bounded chunks: a session can keep
+// writing for days while parked, so the tail must never be read in one buffer.
+// A line too large to hold is a real conversation record (API error records are
+// small), so it counts as activity — the safe side against a duplicate resume.
+export async function transcriptHasConversationAfter(path, offset) {
   if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
   const info = await stat(path).catch(() => null);
   if (!info || info.size <= offset) return false;
   const handle = await open(path, 'r').catch(() => null);
   if (!handle) return false;
+  const isConversationLine = line => {
+    if (line.length === 0) return false;
+    try {
+      return isConversationRecord(JSON.parse(line.toString('utf8')));
+    } catch {
+      return false;
+    }
+  };
   try {
-    const buffer = Buffer.alloc(info.size - offset);
-    await handle.read(buffer, 0, buffer.length, offset);
-    return buffer.toString('utf8').split('\n').some(line => {
-      if (!line) return false;
-      try {
-        return isConversationRecord(JSON.parse(line));
-      } catch {
-        return false;
+    let pending = Buffer.alloc(0);
+    let position = offset;
+    const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+    while (position < info.size) {
+      const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, info.size - position), position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      let data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+        if (isConversationLine(data.subarray(0, newline))) return true;
+        data = data.subarray(newline + 1);
       }
-    });
+      if (data.length > TRANSCRIPT_MAX_LINE_BYTES) return true;
+      pending = Buffer.from(data);
+    }
+    return isConversationLine(pending);
   } finally {
     await handle.close();
   }

@@ -18,6 +18,7 @@ import {
   classifyClaudeApiErrorRecord,
   isClaudeFleetExhausted,
   runClaudeWithRecovery,
+  transcriptHasConversationAfter,
 } from '../src/claude-recovery.js';
 import { buildClaudeRecoveryEnv } from '../src/claude-auth.js';
 
@@ -3574,4 +3575,34 @@ test('Login expired rejects a renamed account that keeps the same UUID marker', 
 
   assert.equal(result.status, 9);
   assert.equal(calls.length, 1);
+});
+
+test('transcript activity scan is chunked and bounded after the recorded offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-scan-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = fleetExhaustedRecord(root);
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+
+  // Only API error records after the offset: no conversation activity.
+  await writeFile(path, head + `${errorLine}\n`.repeat(3000));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
+
+  // A real record straddling the 1 MiB chunk boundary is still parsed whole.
+  const pad = JSON.stringify({ type: 'assistant', isApiErrorMessage: true, message: { content: 'x'.repeat(1024 * 1024 - 200) } });
+  await writeFile(path, `${head}${pad}\n${userLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A final record without a trailing newline counts.
+  await writeFile(path, `${head}${errorLine}\n${userLine}`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // A line larger than the per-line cap counts as activity without being buffered whole.
+  await writeFile(path, head + 'y'.repeat(17 * 1024 * 1024));
+  assert.equal(await transcriptHasConversationAfter(path, head.length), true);
+
+  // Content before the offset is never considered.
+  await writeFile(path, `${head}${errorLine}\n`);
+  assert.equal(await transcriptHasConversationAfter(path, head.length), false);
 });
