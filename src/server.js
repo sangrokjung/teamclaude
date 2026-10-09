@@ -18,6 +18,7 @@ import { modelQuotaLabel } from './account-manager.js';
 import { createHostTracker } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import {
+  CLAUDE_CODE_SYSTEM_MARKER,
   normalizeByokConfig,
   matchByokSurface,
   hasUnsafeSegments,
@@ -1765,7 +1766,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
             // A BYOK request carries a synthesized shape, so it must never be
             // promoted to the fleet warm-up template — that would replay a
             // third-party client's prompt across every account's probe.
-            if (ctx.advisorToolIndex == null && ctx.byok !== true
+            if (ctx.advisorToolIndex == null && ctx.byok !== true && !ctx.quotaProbeRepaired
                 && (!probeTemplate || probeTemplate._restored
                   || (!probeTemplate._elicitsModelWeekly && ctx.sawModelWeekly))) {
               const candidate = stageProbeTemplate(req, body);
@@ -2901,6 +2902,22 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 
   // Build upstream request headers
   const isOAuth = account.type === 'oauth';
+  let upstreamBody = body;
+  // Claude Code's background quota_check omits its own required system marker.
+  // Keep this compatibility repair scoped to that exact OAuth CLI probe.
+  if (ctx.provider === 'anthropic' && isOAuth && !ctx.byok
+      && req.method === 'POST' && req.url.split('?', 1)[0] === '/v1/messages'
+      && /^claude-cli\//.test(req.headers['user-agent'] || '') && body.length < 4096) {
+    try {
+      const probe = JSON.parse(body.toString());
+      if (probe.system == null && probe.stream !== true && probe.max_tokens === 1
+          && probe.messages?.length === 1 && probe.messages[0].role === 'user'
+          && probe.messages[0].content === 'quota') {
+        upstreamBody = Buffer.from(JSON.stringify({ ...probe, system: CLAUDE_CODE_SYSTEM_MARKER }));
+        ctx.quotaProbeRepaired = true;
+      }
+    } catch { /* malformed input remains upstream's validation responsibility */ }
+  }
   const headers = {};
   const connectionHeaders = connectionHeaderNames(req.headers.connection);
   for (const [key, value] of Object.entries(req.headers)) {
@@ -2915,6 +2932,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (lk === 'accept-encoding') continue;
     headers[key] = value;
   }
+
+  if (upstreamBody !== body) headers['content-length'] = String(upstreamBody.length);
 
   if (ctx.provider === 'codex') {
     headers['authorization'] = `Bearer ${account.credential}`;
@@ -2968,7 +2987,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       `=== REQUEST (account: pool-${account.index}, retry: ${retryCount}) ===\n${method} ${formatRequestUrlForLog(upstreamUrl, metadataOnlyLog)}\n${formatHeaders(headers, metadataOnlyLog)}`,
     );
     if (!metadataOnlyLog && body.length > 0) {
-      appendLogSection(formatLogBody('=== REQUEST BODY', body));
+      appendLogSection(formatLogBody('=== REQUEST BODY', upstreamBody));
     }
   }
 
@@ -2996,7 +3015,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const requestOptions = {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : upstreamBody,
       signal: upstreamDeadline.signal,
     };
     const dispatchedAt = Date.now();
