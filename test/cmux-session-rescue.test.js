@@ -1570,3 +1570,46 @@ test('a later relaunch is adopted only while selector, surface and identity stil
     'beyond the 7-day window',
   );
 });
+
+// The supervisor is recognised by its run entry point wherever it is
+// installed, not by one fixed package directory name.
+test('supervisor detection follows the run entry point across install paths', async () => {
+  const supervisorPid = 54321;
+  const childPid = 54322;
+  const child = {
+    alive: true,
+    command: `/Users/example/.local/share/claude/versions/2.1.289 --resume ${SESSION_ID}`,
+    legacyEnvironmentValid: true,
+    nativeExecutableTrusted: true,
+    supervised: false,
+    surfaceId: SURFACE_ID,
+    parentPid: supervisorPid,
+    teamClaudeBin: '/tmp/teamclaude',
+  };
+  const adopted = async command => (await inspectClaudeProcessTree(childPid, SESSION_ID, {
+    inspectProcess: async pid => pid === childPid ? child : {
+      alive: true,
+      command,
+      environmentValid: true,
+      launchArgv: ['/tmp/teamclaude'],
+      teamClaudeBin: '/tmp/teamclaude',
+      supervised: false,
+      surfaceId: SURFACE_ID,
+    },
+  })).alive;
+  for (const command of [
+    '/usr/bin/node /tmp/teamcodex/src/index.js run -- x',
+    '/usr/bin/node /opt/teamclaude/src/index.js run -- x',
+    '/usr/bin/node /srv/checkout/src/teamclaude.js run',
+    '/opt/homebrew/bin/node /usr/local/lib/node_modules/@karpeleslab/teamclaude/src/index.js run',
+  ]) {
+    assert.equal(await adopted(command), false, `a supervised child is not a legacy native: ${command}`);
+  }
+  for (const command of [
+    '/usr/bin/node /opt/teamclaude/src/index.js status',
+    '/usr/bin/node /srv/other/index.js run',
+    '/usr/bin/node /srv/checkout/src/index.jsx run',
+  ]) {
+    assert.equal(await adopted(command), true, `not a supervisor: ${command}`);
+  }
+});

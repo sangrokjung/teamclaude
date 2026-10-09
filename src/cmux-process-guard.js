@@ -92,7 +92,7 @@ async function trustedNativeClaudeExecutable(path) {
 function isTeamClaudeSupervisor(info) {
   return info?.alive
     && info.supervised !== true
-    && /\/teamcodex\/src\/index\.js\s+run(?:\s|$)/.test(info.command)
+    && /\/src\/(?:index|teamclaude)\.js\s+run(?:\s|$)/.test(info.command)
     && info.environmentValid === true
     && Array.isArray(info.launchArgv)
     && typeof info.launchArgv[0] === 'string'
