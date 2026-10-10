@@ -126,26 +126,41 @@ export function maskSecrets(text) {
 // ── ps snapshot ─────────────────────────────────────────────
 
 const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{1,2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/;
+// Rows that can themselves deliver a stop signal. Ranked ahead of everything
+// else so the row cap can never hide the likely sender.
+const SIGNAL_SENDER = /(?:^|[\s/])(?:launchctl|kill|pkill|killall)(?:\s|$)|kickstart/i;
 
 /**
  * Parse `ps -axo pid=,ppid=,lstart=,command=` output, keep PS_MATCH rows and
  * render them as `pid= ppid= start="…" cmd=…` with the command masked and cut
- * to its first 160 characters.
+ * to its first 160 characters. Signal senders come first, then newest first.
  */
 export function filterPsSnapshot(output, { maxLines = DEFAULT_MAX_ROWS } = {}) {
-  const lines = [];
-  let total = 0;
+  const rows = [];
   for (const raw of String(output).split('\n')) {
     const m = PS_ROW.exec(raw);
     if (!m) continue;
     const [, pid, ppid, lstart, command] = m;
     if (!PS_MATCH.test(command)) continue;
-    total += 1;
-    if (lines.length >= maxLines) continue;
-    const cmd = maskSecrets(command.trim()).slice(0, MAX_COMMAND_CHARS);
-    lines.push(`pid=${pid} ppid=${ppid} start="${lstart.replace(/\s+/g, ' ')}" cmd=${cmd}`);
+    const startMs = Date.parse(lstart);
+    rows.push({
+      pid: Number(pid),
+      ppid,
+      start: lstart.replace(/\s+/g, ' '),
+      startMs: Number.isFinite(startMs) ? startMs : -Infinity,
+      sender: SIGNAL_SENDER.test(command),
+      command,
+    });
   }
-  return { lines, total };
+  const ranked = [...rows].sort((a, b) =>
+    (Number(b.sender) - Number(a.sender))
+    || (b.startMs - a.startMs || 0)
+    || (b.pid - a.pid));
+  const lines = ranked.slice(0, Math.max(0, maxLines)).map(row => {
+    const cmd = maskSecrets(row.command.trim()).slice(0, MAX_COMMAND_CHARS);
+    return `pid=${row.pid} ppid=${row.ppid} start="${row.start}" cmd=${cmd}`;
+  });
+  return { lines, total: rows.length };
 }
 
 export function clampSnapshotTimeout(ms) {
@@ -210,4 +225,29 @@ export function captureProcessSnapshot({
       else fail(`ps exited ${signal || code}`);
     });
   });
+}
+
+/**
+ * Capture a snapshot and log it line by line. Never rejects: a failed or slow
+ * capture becomes one "unavailable" line instead of disturbing the caller.
+ */
+export async function logProcessSnapshot({
+  label,
+  log = console.error,
+  capture = captureProcessSnapshot,
+} = {}) {
+  let result;
+  try {
+    result = await capture();
+  } catch (err) {
+    result = { ok: false, error: err?.message || String(err) };
+  }
+  if (!result?.ok) {
+    log(`[TeamClaude] ps snapshot after ${label} unavailable: ${result?.error || 'unknown error'}`);
+    return;
+  }
+  log(`[TeamClaude] ps snapshot after ${label}: ${result.total} matching process(es)`);
+  for (const line of result.lines) log(`[TeamClaude]   ps ${line}`);
+  const hidden = result.total - result.lines.length;
+  if (hidden > 0) log(`[TeamClaude]   ps ... ${hidden} more not shown`);
 }

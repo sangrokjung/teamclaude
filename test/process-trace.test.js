@@ -13,6 +13,7 @@ import {
   filterPsSnapshot,
   clampSnapshotTimeout,
   captureProcessSnapshot,
+  logProcessSnapshot,
   PS_MATCH,
 } from '../src/process-trace.js';
 
@@ -195,11 +196,29 @@ test('PS_MATCH selects launchctl/kickstart/teamclaude/teamcodex/kill commands on
 test('filterPsSnapshot keeps matching rows as pid/ppid/start/cmd and masks secrets', () => {
   const { lines, total } = filterPsSnapshot(PS_SAMPLE);
   assert.equal(total, 3);
+  // Signal senders (launchctl/kickstart/kill family) first, then newest first.
   assert.deepEqual(lines, [
-    'pid=500 ppid=1 start="Sat Oct 10 21:39:58 2026" cmd=/usr/local/bin/node /usr/local/lib/node_modules/teamcodex/src/index.js server',
-    'pid=777 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=launchctl kickstart -k gui/501/com.example.teamclaude',
     'pid=779 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=/usr/bin/pkill -f something',
+    'pid=777 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=launchctl kickstart -k gui/501/com.example.teamclaude',
+    'pid=500 ppid=1 start="Sat Oct 10 21:39:58 2026" cmd=/usr/local/bin/node /usr/local/lib/node_modules/teamcodex/src/index.js server',
   ]);
+});
+
+test('filterPsSnapshot keeps signal senders when the row cap bites', () => {
+  const noise = Array.from({ length: 80 }, (_, i) =>
+    `  ${100 + i}     1 Sat Oct 10 21:41:00 2026     /usr/bin/python3 /opt/teamclaude-tools/job${i}.py`);
+  const raw = [
+    '   50     1 Mon Oct  5 09:00:00 2026     /bin/zsh -c launchctl kickstart -k gui/501/com.example.teamclaude',
+    ...noise,
+    '   60     1 Mon Oct  5 09:00:00 2026     /bin/kill -TERM 500',
+  ].join('\n');
+  const { lines, total } = filterPsSnapshot(raw, { maxLines: 5 });
+  assert.equal(total, 82);
+  assert.equal(lines.length, 5);
+  assert.match(lines[0], /^pid=60 /);
+  assert.match(lines[1], /^pid=50 /);
+  // The rest are the newest noise rows.
+  assert.match(lines[2], /^pid=179 /);
 });
 
 test('filterPsSnapshot masks before matching output and truncates the command to 160 chars', () => {
@@ -207,10 +226,11 @@ test('filterPsSnapshot masks before matching output and truncates the command to
   const raw = `  42     1 Sat Oct 10 21:40:01 2026     ${longCmd}\n`
     + '  43     1 Sat Oct 10 21:40:01 2026     teamcodex --token sk-ant-oat01-SECRETSECRET123\n';
   const { lines } = filterPsSnapshot(raw);
-  const cmd0 = lines[0].split(' cmd=')[1];
+  const byPid = pid => lines.find(line => line.startsWith(`pid=${pid} `));
+  const cmd0 = byPid(42).split(' cmd=')[1];
   assert.equal(cmd0.length, 160);
   assert.ok(longCmd.startsWith(cmd0));
-  assert.ok(lines[1].endsWith('cmd=teamcodex --token sk-ant-***'), lines[1]);
+  assert.ok(byPid(43).endsWith('cmd=teamcodex --token sk-ant-***'), byPid(43));
 });
 
 test('filterPsSnapshot caps the number of rows', () => {
@@ -299,4 +319,39 @@ test('captureProcessSnapshot against the real ps settles within the bound', asyn
 
 test('timestamped lines match the documented prefix shape', () => {
   assert.match(prefixLines('x', formatLocalTimestamp()), STAMP_RE);
+});
+
+// ── snapshot logging glue ───────────────────────────────────
+
+test('logProcessSnapshot logs a header plus one line per matching process', async () => {
+  const logged = [];
+  await logProcessSnapshot({
+    label: 'SIGTERM',
+    log: line => logged.push(line),
+    capture: async () => ({ ok: true, lines: ['pid=1 a', 'pid=2 b'], total: 5 }),
+  });
+  assert.deepEqual(logged, [
+    '[TeamClaude] ps snapshot after SIGTERM: 5 matching process(es)',
+    '[TeamClaude]   ps pid=1 a',
+    '[TeamClaude]   ps pid=2 b',
+    '[TeamClaude]   ps ... 3 more not shown',
+  ]);
+});
+
+test('logProcessSnapshot reports an unavailable snapshot and swallows capture errors', async () => {
+  const logged = [];
+  await logProcessSnapshot({
+    label: 'SIGINT',
+    log: line => logged.push(line),
+    capture: async () => ({ ok: false, error: 'timed out after 1000ms', lines: [], total: 0 }),
+  });
+  await logProcessSnapshot({
+    label: 'SIGINT',
+    log: line => logged.push(line),
+    capture: () => { throw new Error('boom'); },
+  });
+  assert.deepEqual(logged, [
+    '[TeamClaude] ps snapshot after SIGINT unavailable: timed out after 1000ms',
+    '[TeamClaude] ps snapshot after SIGINT unavailable: boom',
+  ]);
 });
