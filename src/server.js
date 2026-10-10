@@ -1142,10 +1142,15 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Other auth errors stay parked until re-import/login because a generic
   // probe must never revive revoked credentials. Each account is paced before
   // dispatch so overlapping timer/template triggers cannot duplicate probes.
+  // Bounded per pass so a fleet that is near quota all at once cannot fan out
+  // one upstream probe per account in a single tick; the rest wait their turn.
+  const STALE_RECHECKS_PER_PASS = 4;
   function recheckStaleNearQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const now = Date.now();
+    let started = 0;
     for (const account of accountManager.accounts) {
+      if (started >= STALE_RECHECKS_PER_PASS) break;
       if (account.enabled === false || account.status === 'error' || account.authRevoked
           || account.subscriptionDisabled || account.inflight !== 0 || account._warming
           || (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt))
@@ -1156,6 +1161,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         ? probeTemplate : staleRecheckTemplate;
       if (!template || !accountManager._isNearQuota(account, template.model)) continue;
       account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
+      started += 1;
       void warmupAccount(account, { force: true, template });
     }
   }
