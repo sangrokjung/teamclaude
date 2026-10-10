@@ -3631,3 +3631,33 @@ test('transcript activity scan sees a record appended right as it starts at the 
   await appendFile(path, `${userLine}\n`);
   assert.equal(await scan, true);
 });
+
+// When the scan cannot give a trustworthy answer the session must be preserved
+// (treated as active), never resumed blind: a truncated, rotated or unreadable
+// transcript all count as activity.
+test('transcript activity scan fails closed on truncation, rotation and unreadable files', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-closed-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  await writeFile(path, errorLine.repeat(10));
+  const offset = errorLine.length * 10;
+  const original = await stat(path);
+  const identity = { dev: original.dev, ino: original.ino };
+
+  // Unchanged file with only error records: no activity (the normal resume path).
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), false);
+
+  // Truncated below the recorded offset.
+  await writeFile(path, errorLine);
+  assert.equal(await transcriptHasConversationAfter(path, offset), true, 'truncated');
+
+  // Rotated: same path, different file, even if it is long enough.
+  await rm(path);
+  await writeFile(path, errorLine.repeat(20));
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'rotated');
+
+  // Unreadable (missing) transcript.
+  await rm(path);
+  assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'missing');
+});

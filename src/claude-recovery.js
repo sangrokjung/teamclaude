@@ -509,6 +509,7 @@ async function monitorChild({
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
   let currentOffset = offset;
+  let currentIdentity = null;
   let pending = '';
   let unresolvedEvent = null;
   const failureSettleMs = Number.isFinite(pollIntervalMs)
@@ -545,6 +546,7 @@ async function monitorChild({
       }
     }
     currentOffset = info.size;
+    currentIdentity = { dev: info.dev, ino: info.ino };
     const lines = (pending + chunk.toString('utf8')).split('\n');
     pending = final ? '' : lines.pop();
     for (const line of lines) {
@@ -570,6 +572,7 @@ async function monitorChild({
       transcriptPath: currentPath,
       sessionId: currentSessionId,
       offset: currentOffset,
+      identity: currentIdentity,
     };
   }
 
@@ -610,12 +613,24 @@ const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 // writing for days while parked, so the tail must never be read in one buffer.
 // A line too large to hold is a real conversation record (API error records are
 // small), so it counts as activity — the safe side against a duplicate resume.
-export async function transcriptHasConversationAfter(path, offset) {
-  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
+//
+// Anything that prevents a trustworthy answer counts as activity too, so the
+// caller preserves the session instead of resuming it blind: an unreadable
+// transcript, one that shrank below the recorded offset (truncated/rewritten),
+// or a different file than the one the offset was taken from (rotated).
+export async function transcriptHasConversationAfter(path, offset, expectedIdentity = null) {
+  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return true;
   // No size shortcut before opening: a record appended between a size check
   // and the read would be missed. The read loop below re-checks at EOF.
   const handle = await open(path, 'r').catch(() => null);
-  if (!handle) return false;
+  if (!handle) return true;
+  const opened = await handle.stat().catch(() => null);
+  if (!opened || opened.size < offset
+      || (expectedIdentity
+        && (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino))) {
+    await handle.close();
+    return true;
+  }
   const isConversationLine = line => {
     if (line.length === 0) return false;
     try {
@@ -992,7 +1007,7 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
       await stopChild(child);
       await wait(waitMs);
-      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
+      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset, outcome.identity)) {
         log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
         return childExit(child);
       }
