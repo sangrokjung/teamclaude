@@ -3619,3 +3619,15 @@ test('transcript activity scan keeps reading records appended while it scans', a
   await appendFile(path, `${userLine}\n`);
   assert.equal(await scan, true, 'a conversation record appended after the scan began is seen');
 });
+
+test('transcript activity scan sees a record appended right as it starts at the offset', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-start-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  await writeFile(path, head);
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true);
+});

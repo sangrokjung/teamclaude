@@ -612,8 +612,8 @@ const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 // small), so it counts as activity — the safe side against a duplicate resume.
 export async function transcriptHasConversationAfter(path, offset) {
   if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
-  const info = await stat(path).catch(() => null);
-  if (!info || info.size <= offset) return false;
+  // No size shortcut before opening: a record appended between a size check
+  // and the read would be missed. The read loop below re-checks at EOF.
   const handle = await open(path, 'r').catch(() => null);
   if (!handle) return false;
   const isConversationLine = line => {
