@@ -25,6 +25,8 @@ const NOFOLLOW = constants.O_NOFOLLOW || 0;
 const DIRECTORY = constants.O_DIRECTORY || 0;
 const execFileAsync = promisify(execFile);
 const SESSION_LEASE_LOCK_BUSY = Symbol('session-lease-lock-busy');
+let cachedProcessStartSeconds = null;
+let processStartLookup = null;
 
 function ownedPrivate(info, expectedType) {
   if (!info[expectedType]()) return false;
@@ -361,6 +363,24 @@ async function inspectProcessStartSeconds(pid) {
   }
 }
 
+async function inspectOwnProcessStart(inspectProcessStart) {
+  if (inspectProcessStart !== inspectProcessStartSeconds) {
+    return inspectProcessStart(process.pid);
+  }
+  if (Number.isFinite(cachedProcessStartSeconds)) return cachedProcessStartSeconds;
+  if (!processStartLookup) {
+    processStartLookup = inspectProcessStartSeconds(process.pid)
+      .then(value => {
+        if (Number.isFinite(value)) cachedProcessStartSeconds = value;
+        return value;
+      })
+      .finally(() => {
+        processStartLookup = null;
+      });
+  }
+  return processStartLookup;
+}
+
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -509,7 +529,7 @@ export async function claimSessionLease(
     await openPrivateDirectory(leaseDir);
   const leasePath = join(leaseDir, sessionId);
   try {
-    const ownStart = await inspectProcessStart(process.pid);
+    const ownStart = await inspectOwnProcessStart(inspectProcessStart);
     if (!Number.isFinite(ownStart)) {
       throw new Error('Unable to establish the recovery lease owner identity.');
     }

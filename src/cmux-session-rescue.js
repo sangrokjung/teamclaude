@@ -376,14 +376,15 @@ export async function rescueCmuxSessionsOnce({
       }
     };
     const releaseClaimForRetry = async () => {
-      if (!await releaseLeaseForRetry()) return false;
-      if (!claimOwned) return;
+      const leaseReleased = await releaseLeaseForRetry();
+      if (!claimOwned) return leaseReleased;
       const claimIdentity = typeof claimOwned === 'object' ? claimOwned : null;
       claimOwned = false;
       attempted.delete(key);
       try {
         await releaseRecovery(storePath, key, claimIdentity);
       } catch {}
+      return leaseReleased;
     };
     try {
       const lease = await claimLease(storePath, key);

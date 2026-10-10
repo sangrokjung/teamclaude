@@ -3931,6 +3931,54 @@ test('nonrecoverable login expiry releases the recovery lease before preserving 
   assert.equal(releasedWhileLive, true);
 });
 
+test('launcher retains lease identity across an inconclusive release', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-lease-retry-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let childRef = null;
+  let releases = 0;
+  let releasedWhileLive = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      if (releases < 2) return null;
+      releasedWhileLive = childRef?.exitCode == null && childRef?.signalCode == null;
+      childRef?.finish(0);
+      return true;
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      childRef = child;
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1] || args[1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+        );
+      }, 10);
+      return child;
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(releases, 2);
+  assert.equal(releasedWhileLive, true);
+});
+
 test('fleet exhaustion resolved by a later transcript write does not wait or resume', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-resolved-'));
   t.after(() => rm(root, { recursive: true, force: true }));

@@ -215,6 +215,13 @@ test('resolves an ID-less Claude launch only from the matching owner session', a
     storePath: fx.storePath,
     surfaceId: fx.session.surfaceId,
     pid: fx.session.pid,
+    cwd: join(fx.root, 'other-caller'),
+    inspectProcess: async () => resolverProcessInfo(fx),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
     cwd: fx.session.launchCommand.workingDirectory,
     inspectProcess: async () => resolverProcessInfo(fx, {
       command: '/usr/bin/claude --resume named-session',

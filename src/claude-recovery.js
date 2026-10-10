@@ -740,19 +740,81 @@ export async function runClaudeWithRecovery({
   let nextEnv = childEnv;
   let fleetRecoveryClaim = null;
   let fleetRecoveryClaimSessionId = null;
-  const releaseFleetRecoveryClaim = async () => {
-    if (!fleetRecoveryClaim || !fleetRecoveryClaimSessionId
-        || typeof releaseRecoveryLease !== 'function') return;
-    const claim = fleetRecoveryClaim;
-    const claimedSessionId = fleetRecoveryClaimSessionId;
+  let fleetRecoveryReleasePromise = null;
+  let fleetRecoveryReleaseRetryTimer = null;
+  let fleetRecoveryReleaseRetryRounds = 0;
+  let fleetRecoveryReleasePending = false;
+  const clearFleetRecoveryClaim = (claim, claimedSessionId) => {
+    if (fleetRecoveryClaim !== claim || fleetRecoveryClaimSessionId !== claimedSessionId) {
+      return false;
+    }
     fleetRecoveryClaim = null;
     fleetRecoveryClaimSessionId = null;
-    try {
-      await releaseRecoveryLease(claimedSessionId, claim);
-    } catch {}
+    fleetRecoveryReleasePending = false;
+    fleetRecoveryReleaseRetryRounds = 0;
+    if (fleetRecoveryReleaseRetryTimer) {
+      clearTimeout(fleetRecoveryReleaseRetryTimer);
+      fleetRecoveryReleaseRetryTimer = null;
+    }
+    return true;
+  };
+  const scheduleFleetRecoveryReleaseRetry = () => {
+    if (fleetRecoveryReleaseRetryTimer
+        || !fleetRecoveryReleasePending
+        || fleetRecoveryReleaseRetryRounds >= 3) return;
+    fleetRecoveryReleaseRetryRounds += 1;
+    fleetRecoveryReleaseRetryTimer = setTimeout(() => {
+      fleetRecoveryReleaseRetryTimer = null;
+      void releaseFleetRecoveryClaim({ scheduleRetry: true });
+    }, 250 * 2 ** (fleetRecoveryReleaseRetryRounds - 1));
+    fleetRecoveryReleaseRetryTimer.unref?.();
+  };
+  const releaseFleetRecoveryClaim = async ({ scheduleRetry = true } = {}) => {
+    if (!fleetRecoveryClaim || !fleetRecoveryClaimSessionId
+        || typeof releaseRecoveryLease !== 'function') return true;
+    if (fleetRecoveryReleasePromise) return fleetRecoveryReleasePromise;
+    if (fleetRecoveryReleaseRetryTimer) {
+      clearTimeout(fleetRecoveryReleaseRetryTimer);
+      fleetRecoveryReleaseRetryTimer = null;
+    }
+    const claim = fleetRecoveryClaim;
+    const claimedSessionId = fleetRecoveryClaimSessionId;
+    fleetRecoveryReleasePending = true;
+    const release = async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        let result = null;
+        try {
+          result = await releaseRecoveryLease(claimedSessionId, claim);
+        } catch {}
+        // `null` means the lease release was inconclusive (for example, the
+        // kernel mutex was busy). Keep the identity until a definitive result
+        // arrives so a later recovery cannot race this actor's lease.
+        if (result !== null) {
+          clearFleetRecoveryClaim(claim, claimedSessionId);
+          return result;
+        }
+        if (attempt < 2) await delay(25 * 2 ** attempt);
+      }
+      if (scheduleRetry && fleetRecoveryClaim === claim
+          && fleetRecoveryClaimSessionId === claimedSessionId) {
+        scheduleFleetRecoveryReleaseRetry();
+      }
+      return null;
+    };
+    fleetRecoveryReleasePromise = release().finally(() => {
+      fleetRecoveryReleasePromise = null;
+    });
+    return fleetRecoveryReleasePromise;
   };
   const acquireFleetRecoveryClaim = async session => {
-    if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) return true;
+    if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) {
+      if (fleetRecoveryReleasePending) {
+        await releaseFleetRecoveryClaim({ scheduleRetry: false });
+        if (fleetRecoveryReleasePending) return false;
+      } else {
+        return true;
+      }
+    }
     if (typeof claimRecoveryLease !== 'function') return true;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
