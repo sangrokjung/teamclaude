@@ -758,6 +758,39 @@ test('does not rescue a process that started after the fleet error', async t => 
   assert.equal(launches, 0);
 });
 
+// A claim covers one recoverable error event: the same event is never
+// launched twice (even with a fresh in-memory attempt set, as after a
+// supervisor restart), but a NEW fleet exhaustion in the same session is
+// rescued again instead of being blocked forever by the first claim.
+test('recovery claims are per error event: a later exhaustion of the same session is rescued again', async t => {
+  const fx = await fixture(t);
+  fx.session.pid = 999999;
+  const firstErrorAt = Date.now() - 5000;
+  fx.session.startedAt = firstErrorAt / 1000 + 1;
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(firstErrorAt).toISOString())}\n`);
+  let launches = 0;
+  const run = () => rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    trustedClaudePath: fx.executablePath,
+    inspectProcess: async () => ({ alive: false }),
+    stopProcess: async () => true,
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  });
+
+  assert.equal((await run()).rescued, 1, 'first event rescued');
+  assert.equal((await run()).rescued, 0, 'the same event is not launched twice');
+  assert.equal(launches, 1);
+
+  const secondErrorAt = Date.now() - 3000;
+  await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(secondErrorAt).toISOString())}\n`);
+  assert.equal((await run()).rescued, 1, 'a new exhaustion event is rescued again');
+  assert.equal(launches, 2);
+});
+
 test('runs the full legacy rescue path and passes the stop inspector through', async t => {
   const fx = await fixture(t);
   fx.session.pid = 999999;

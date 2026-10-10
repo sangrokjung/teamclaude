@@ -120,6 +120,9 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
             retryAfterSeconds: event.retryAfterSeconds ?? null,
             // Without a usable record timestamp the transcript mtime anchors
             // the retry deadline, so recovery is bounded instead of parked.
+            // The record's own timestamp identifies this error event; it is
+            // what keys a recovery claim (null when the record has none).
+            eventTimestampMs: recordTimestampMs(record),
             timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
           };
         }

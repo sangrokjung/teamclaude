@@ -205,6 +205,17 @@ export async function stopExistingSessionProcess(
   return stopped;
 }
 
+// A recovery claim covers one recoverable error EVENT, not the whole session:
+// a session that is rescued and later exhausts the fleet again records a new
+// error and must be rescuable again, while the same event is never launched
+// twice (even across supervisor restarts). Records without their own
+// timestamp keep the conservative per-session key.
+function recoveryClaimKey(sessionId, state) {
+  return Number.isSafeInteger(state?.eventTimestampMs) && state.eventTimestampMs > 0
+    ? `${sessionId}@${state.eventTimestampMs}`
+    : sessionId;
+}
+
 function fleetRetryStillActive(state, now = Date.now()) {
   if (state?.kind !== 'fleet_exhausted') return false;
   if (!Number.isSafeInteger(state.retryAfterSeconds)
@@ -278,7 +289,7 @@ export async function rescueCmuxSessionsOnce({
     if (!initialState) continue;
     candidates += 1;
     if (fleetRetryStillActive(initialState)) continue;
-    const key = session.sessionId;
+    const key = recoveryClaimKey(session.sessionId, initialState);
     if (attempted.has(key)) continue;
 
     let freshStore;
@@ -297,7 +308,8 @@ export async function rescueCmuxSessionsOnce({
       transcriptRoot,
       fresh.sessionId,
     );
-    if (!freshState || fleetRetryStillActive(freshState)) continue;
+    if (!freshState || fleetRetryStillActive(freshState)
+        || recoveryClaimKey(session.sessionId, freshState) !== key) continue;
 
     const first = await inspectProcess(fresh.pid, fresh.sessionId);
     const firstGone = processGone(first, fresh.pid);
@@ -331,7 +343,8 @@ export async function rescueCmuxSessionsOnce({
       transcriptRoot,
       final.sessionId,
     );
-    if (!finalState || fleetRetryStillActive(finalState)) continue;
+    if (!finalState || fleetRetryStillActive(finalState)
+        || recoveryClaimKey(session.sessionId, finalState) !== key) continue;
     const finalInfo = await inspectProcess(final.pid, final.sessionId);
     const finalGone = processGone(finalInfo, final.pid);
     if (finalGone !== secondGone) continue;
@@ -389,7 +402,7 @@ export async function rescueCmuxSessionsOnce({
         await releaseClaimForRetry();
         continue;
       }
-      const claimed = sessions(claimedStore).find(item => item?.sessionId === key);
+      const claimed = sessions(claimedStore).find(item => item?.sessionId === session.sessionId);
       if (!claimed
           || !sameRegistrySession(claimed, final)
           || !validSession(claimedStore, claimed)) {
@@ -401,7 +414,8 @@ export async function rescueCmuxSessionsOnce({
         transcriptRoot,
         claimed.sessionId,
       );
-      if (!claimedState || fleetRetryStillActive(claimedState)) {
+      if (!claimedState || fleetRetryStillActive(claimedState)
+          || recoveryClaimKey(session.sessionId, claimedState) !== key) {
         await releaseClaimForRetry();
         continue;
       }
@@ -452,7 +466,8 @@ export async function rescueCmuxSessionsOnce({
         transcriptRoot,
         final.sessionId,
       );
-      if (!afterStopState || fleetRetryStillActive(afterStopState)) {
+      if (!afterStopState || fleetRetryStillActive(afterStopState)
+          || recoveryClaimKey(session.sessionId, afterStopState) !== key) {
         await releaseClaimForRetry();
         continue;
       }
