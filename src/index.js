@@ -27,6 +27,13 @@ import { formatBytes } from './system-metrics.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
 import {
+  installTimestampedConsole,
+  formatSignalTrace,
+  formatSupervisorExitTrace,
+  formatWorkerShutdownTrace,
+  logProcessSnapshot,
+} from './process-trace.js';
+import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
@@ -162,7 +169,16 @@ switch (command) {
 
 // ── server ──────────────────────────────────────────────────
 
+// Daemon (non-TUI) output: the worker picks its TUI with exactly this
+// predicate, and the supervisor shares the worker's stdio. In daemon mode every
+// log line gets a local timestamp and stop signals are traced; TUI output is
+// left untouched.
+function isDaemonOutput() {
+  return !(process.stdout.isTTY && process.stdin.isTTY);
+}
+
 async function serverCommand() {
+  if (isDaemonOutput()) installTimestampedConsole();
   if (process.env[SUPERVISED_WORKER_ENV] === '1') {
     await proxyWorkerCommand();
     return;
@@ -233,6 +249,8 @@ async function superviseServerCommand() {
   let forceTimer = null;
   let sessionRescuer = null;
   let finish;
+  const traceEnabled = isDaemonOutput();
+  let exitReason = null;
 
   function rejectPublicRequest(req, res, statusCode, headers, payload) {
     req.pause();
@@ -342,6 +360,39 @@ async function superviseServerCommand() {
       try { worker.kill('SIGKILL'); } catch {}
     }
   });
+  if (traceEnabled) {
+    process.once('exit', code => {
+      console.error(formatSupervisorExitTrace({
+        reason: exitReason,
+        code,
+        pid: process.pid,
+        uptimeSec: process.uptime(),
+      }));
+    });
+  }
+
+  // Log a stop signal the moment it lands: who we are, who our parent is, how
+  // long we have been up and how much traffic the stop will cut.
+  function traceStopSignal(signal) {
+    if (!traceEnabled) return;
+    console.error(formatSignalTrace({
+      role: 'Supervisor',
+      signal,
+      pid: process.pid,
+      ppid: process.ppid,
+      uptimeSec: process.uptime(),
+      inflight: activePublicRequests,
+      workerPid: worker?.pid,
+    }));
+  }
+
+  function onStopSignal(signal) {
+    traceStopSignal(signal);
+    requestShutdown({ reason: `signal:${signal}` });
+    // Fire-and-forget, bounded to 1s and unref'd: it is recorded only if it
+    // finishes before the process exits, and never delays the shutdown above.
+    if (traceEnabled) logProcessSnapshot({ label: signal });
+  }
 
   function bufferRequest(req, reserveRequestBytes) {
     return new Promise((resolve, reject) => {
@@ -739,7 +790,7 @@ async function superviseServerCommand() {
     child.on('message', message => {
       if (child !== worker) return;
       if (message?.type === 'teamcodex:shutdown') {
-        requestShutdown({ workerWillExit: true });
+        requestShutdown({ workerWillExit: true, reason: 'worker-requested-shutdown' });
         return;
       }
       if (message?.type === 'teamcodex:capacity'
@@ -806,6 +857,7 @@ async function superviseServerCommand() {
         return;
       }
       if (!hasBeenReady && !becameReady) {
+        exitReason = `worker-exited-before-ready:${signal || `exit ${code}`}`;
         closePublicListener(true);
         finish(code ?? 1);
         return;
@@ -860,9 +912,10 @@ async function superviseServerCommand() {
     healthReq.once('error', () => finishCheck(false));
   }
 
-  function requestShutdown({ workerWillExit = false } = {}) {
+  function requestShutdown({ workerWillExit = false, reason = 'shutdown-requested' } = {}) {
     if (stopping) return;
     stopping = true;
+    exitReason = reason;
     workerReady = false;
     workerPort = null;
     clearTimeout(restartTimer);
@@ -894,6 +947,7 @@ async function superviseServerCommand() {
     // later server error (EMFILE, ENOBUFS under load) would be reported as
     // "port already in use" and exit the supervisor mid-stream.
     const onListenError = err => {
+      exitReason = `listen-error:${err?.code || 'unknown'}`;
       handleServerListenError(err, port);
     };
     listener.once('error', onListenError);
@@ -903,8 +957,19 @@ async function superviseServerCommand() {
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
     });
-    process.once('SIGINT', () => requestShutdown());
-    process.once('SIGTERM', () => requestShutdown());
+    // `once` on purpose (unchanged): a second SIGINT/SIGTERM falls through to
+    // the default disposition and kills a stuck shutdown.
+    process.once('SIGINT', () => onStopSignal('SIGINT'));
+    process.once('SIGTERM', () => onStopSignal('SIGTERM'));
+    if (traceEnabled) {
+      process.once('SIGHUP', () => {
+        traceStopSignal('SIGHUP');
+        // Keep SIGHUP's default (terminating) disposition: this once-listener
+        // is already detached, so re-raising behaves exactly like an untraced
+        // SIGHUP. Only re-raise when nothing else claimed the signal since.
+        if (process.listenerCount('SIGHUP') === 0) process.kill(process.pid, 'SIGHUP');
+      });
+    }
   });
 
   await clearServerState();
@@ -1163,9 +1228,22 @@ async function proxyWorkerCommand() {
     }
   });
 
+  // 'signal' = a SIGINT/SIGTERM was delivered to the worker (normally the
+  // supervisor's own SIGTERM while the IPC channel is still up);
+  // 'ipc-disconnect' = the supervisor channel closed and the worker raised
+  // SIGTERM on itself (see the 'disconnect' handler below).
+  let stopSource = 'signal';
   if (!tui) {
     let shuttingDown = false;
-    const shutdown = () => {
+    const shutdown = signal => {
+      console.error(formatWorkerShutdownTrace({
+        signal,
+        source: stopSource,
+        pid: process.pid,
+        ppid: process.ppid,
+        supervisorPid: process.env[SUPERVISOR_PID_ENV],
+        ipcConnected: process.connected,
+      }));
       if (shuttingDown) return;
       shuttingDown = true;
       console.log('\n[TeamClaude] Shutting down...');
@@ -1180,10 +1258,13 @@ async function proxyWorkerCommand() {
       });
       server.closeIdleConnections?.();
     };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   }
-  process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
+  process.once('disconnect', () => {
+    stopSource = 'ipc-disconnect';
+    process.kill(process.pid, 'SIGTERM');
+  });
 }
 
 // ── server lifecycle: discover / stop / restart ─────────────
