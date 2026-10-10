@@ -1339,7 +1339,9 @@ test('active recovery bounds a failed local proxy start by the same deadline', a
       foreignServer.listening ? closeServer(foreignServer) : Promise.resolve(),
       controlServer.listening ? closeServer(controlServer) : Promise.resolve(),
     ]);
-    await rm(root, { recursive: true, force: true });
+    // The failed local proxy start can still be flushing files into this
+    // HOME when the test ends; retry instead of racing it (ENOTEMPTY).
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   await writeFile(join(bin, 'claude'), `#!/usr/bin/env node

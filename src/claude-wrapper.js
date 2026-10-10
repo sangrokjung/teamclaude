@@ -179,6 +179,14 @@ export function renderClaudeWrapper({ teamcodexBin, vendorShimPath }) {
   return `#!/bin/zsh
 # ${CLAUDE_WRAPPER_SIGNATURE}
 export TEAMCLAUDE_CLAUDE_BIN=${shellQuote(vendorShimPath)}
+# A Codex supervisor has not prepared an Anthropic child environment.
+if [[ "\${TEAMCLAUDE_PROVIDER:-}" == 'codex' ]]; then
+  unset TEAMCLAUDE_SESSION_SUPERVISED TEAMCLAUDE_CONFIG
+# Only same-provider re-entry may skip the TeamClaude launch preparation.
+elif [[ "\${TEAMCLAUDE_PROVIDER:-}" == 'anthropic' && "\${TEAMCLAUDE_SESSION_SUPERVISED:-}" == '1' ]]; then
+  exec "$TEAMCLAUDE_CLAUDE_BIN" "$@"
+fi
+export TEAMCLAUDE_PROVIDER='anthropic'
 exec ${shellQuote(teamcodexBin)} run -- "$@"
 `;
 }

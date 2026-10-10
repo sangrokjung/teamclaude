@@ -6,6 +6,7 @@ import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -1717,9 +1718,15 @@ function sameProcessIdentity(recorded, current) {
 
 function commandReferencesRuntime(command) {
   if (typeof command !== 'string') return false;
-  return command.split(/\s+/).some(commandPart => {
-    const candidate = commandPart.replace(/^'|'$|^"|"$/g, '');
-    try { return realpathSync(candidate) === RUNTIME_ENTRY_PATH; }
+  return command.split(/\s+/).some(token => {
+    const candidate = token.replace(/^['"]|['"]$/g, '');
+    try {
+      const resolved = realpathSync(candidate);
+      const sourceDir = dirname(fileURLToPath(import.meta.url));
+      return resolved === RUNTIME_ENTRY_PATH
+        || resolved === realpathSync(join(sourceDir, 'index.js'))
+        || resolved === realpathSync(join(sourceDir, 'teamclaude.js'));
+    }
     catch { return candidate === process.argv[1] || candidate === RUNTIME_ENTRY_PATH; }
   });
 }
@@ -1845,9 +1852,11 @@ async function findRunningServer(
 ) {
   const configPort = config?.proxy?.port;
   const state = await readServerState();
-  const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
-    ? Math.max(0, Math.floor(maxProbeWaitMs))
-    : 1500);
+  const waitMs = Number.isFinite(maxProbeWaitMs) ? Math.max(0, Math.floor(maxProbeWaitMs)) : 1500;
+  const probeDeadline = Date.now() + waitMs;
+  // A caller granting a longer budget (account reload under load) gets it per
+  // probe too; otherwise a slow status answer would read as "no server".
+  const perProbeMs = Math.max(configuredStatusProbeTimeoutMs(), waitMs);
 
   // Try the port the server ACTUALLY bound (recorded in the state file) first —
   // it may differ from the current config port after the config was edited, and
@@ -1861,7 +1870,7 @@ async function findRunningServer(
     if (remainingMs <= 0) break;
     if (!(await probeServer(
       port,
-      Math.min(configuredStatusProbeTimeoutMs(), remainingMs),
+      Math.min(perProbeMs, remainingMs),
     ))) continue;
     const lsofOwnerPid = lsofPid(port);
     const ownerPid = lsofOwnerPid || (
@@ -1873,7 +1882,7 @@ async function findRunningServer(
     const stateIdentityVerified = verified.ok && lifecycleRemainingMs > 0
       && await probeServer(
         port,
-        Math.min(configuredStatusProbeTimeoutMs(), lifecycleRemainingMs),
+        Math.min(perProbeMs, lifecycleRemainingMs),
         state.lifecycle.id,
         config?.proxy?.apiKey,
       );
@@ -2682,6 +2691,7 @@ async function runCommand(clientArgsOverride = null) {
     ? childEnv.TEAMCLAUDE_CLAUDE_BIN
     : 'claude';
   childEnv.TEAMCLAUDE_SESSION_SUPERVISED = '1';
+  childEnv.TEAMCLAUDE_PROVIDER = isCodexMode(config) ? 'codex' : 'anthropic';
   if (isCodexMode(config)) {
     delete childEnv.OPENAI_API_KEY;
     delete childEnv.CODEX_API_KEY;
@@ -3235,7 +3245,7 @@ async function removeCommand() {
 /** Ask the supervised worker to live-sync account changes without a restart. */
 async function noteRunningServerReload(config) {
   try {
-    const running = await findRunningServer(config);
+    const running = await findRunningServer(config, configuredStatusProbeTimeoutMs(30_000));
     if (!running) return false;
     const state = await readServerState();
     const workerPid = running.lifecycleVerified && running.identity

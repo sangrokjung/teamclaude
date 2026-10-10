@@ -1,4 +1,9 @@
 export default [
+  // Browser report assets are classic <script> files that share globals across
+  // tags, not Node modules; this Node-oriented config cannot lint them
+  // meaningfully. test/report-assets-syntax.test.js keeps every asset
+  // syntactically valid instead.
+  { ignores: ['skills/token-usage-report/assets/**'] },
   {
     files: ['scripts/subscription-monitor-browser.js'],
     languageOptions: {

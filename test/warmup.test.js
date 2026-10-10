@@ -1069,3 +1069,188 @@ test('importProbeTemplate rejects garbage and never clobbers live evidence', asy
     proxy.close();
   }
 });
+
+// A near-quota reading persisted from a previous run (or spent outside this
+// proxy) must not pin an account out of rotation until its window resets:
+// restoring a template re-probes near-quota accounts once, so a quota that has
+// since recovered is seen without waiting for client traffic.
+test('a restored template re-measures stale near-quota accounts once', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  const full = {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+  };
+  am.updateQuota(0, full);
+  am.updateQuota(1, RL_HEADERS());
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+
+  try {
+    assert.equal(am._isNearQuota(am.accounts[0]), true, 'a0 starts near quota');
+    assert.equal(proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' }), true);
+    assert.ok(await waitFor(() => !am._isNearQuota(am.accounts[0])), 'a0 was re-measured below the threshold');
+    assert.equal(seen.filter(s => s.auth === 'Bearer tok-0').length, 1, 'exactly one recheck probe for a0');
+    assert.equal(seen.filter(s => s.auth === 'Bearer tok-1').length, 0, 'a healthy account is not probed');
+    assert.ok(am.accounts[0]._nearQuotaRecheckAt > Date.now(), 'the recheck is rate-limited');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The model-tier (Fable) template that last elicited a model-weekly window is
+// persisted next to the main template, so a restart can still recheck an
+// account that is near its model-scoped weekly limit.
+test('exportProbeTemplate persists the model-tier recheck template', async () => {
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://127.0.0.1:9', warmupIntervalMs: 0 });
+  try {
+    assert.equal(proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: 'b', system: 'sys', _elicitsModelWeekly: true },
+    }), true);
+    const out = proxy.exportProbeTemplate();
+    assert.equal(out.model, 'claude-opus-4-8');
+    assert.equal(out._staleRecheckTemplate?.model, 'claude-fable-5');
+    assert.equal(out._staleRecheckTemplate?.beta, 'b');
+  } finally {
+    proxy.close();
+  }
+});
+
+// An account full on BOTH its general and its model-tier (Fable) window is
+// rechecked with the model-tier template: that response carries the general
+// windows too, so one probe refreshes both instead of leaving Fable stale.
+test('an account near both general and model-tier quota is rechecked with the model-tier template', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.updateQuota(0, {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+  });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    assert.equal(proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: null, system: 'sys' },
+    }), true);
+    assert.ok(await waitFor(() => seen.length >= 1), 'a recheck probe was sent');
+    assert.equal(JSON.parse(seen[0].body).model, 'claude-fable-5');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a general-only near-quota account is rechecked with the general template', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.updateQuota(0, {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.2',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+  });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: null, system: 'sys' },
+    });
+    assert.ok(await waitFor(() => seen.length >= 1), 'a recheck probe was sent');
+    assert.equal(JSON.parse(seen[0].body).model, 'claude-opus-4-8', 'no Fable request for a general-only shortage');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The cap must not starve the tail of the fleet: rechecks rotate through
+// every near-quota account and drain without waiting for another timer tick.
+test('stale near-quota rechecks eventually cover every account, each once', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(10), 0.98, 0, 3);
+  const full = { ...RL_HEADERS(), 'anthropic-ratelimit-unified-5h-utilization': '1' };
+  for (let i = 0; i < 10; i++) am.updateQuota(i, full);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' });
+    assert.ok(await waitFor(() => seen.length >= 10, 3000), `only ${seen.length} of 10 accounts were rechecked`);
+    await new Promise(r => setTimeout(r, 100));
+    const perAccount = new Map();
+    for (const s of seen) perAccount.set(s.auth, (perAccount.get(s.auth) || 0) + 1);
+    assert.equal(perAccount.size, 10);
+    assert.ok([...perAccount.values()].every(n => n === 1), 'each account rechecked once');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+// The cap is global: repeated warm-up passes while earlier probes are still
+// waiting on upstream must not stack more batches on top of them.
+test('stale near-quota rechecks never exceed four in flight across repeated passes', async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const release = [];
+  const upstream = http.createServer(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise(r => release.push(r));
+    inFlight -= 1;
+    res.writeHead(200, RL_HEADERS());
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(12), 0.98, 0, 3);
+  const full = { ...RL_HEADERS(), 'anthropic-ratelimit-unified-5h-utilization': '1' };
+  for (let i = 0; i < 12; i++) am.updateQuota(i, full);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 20,
+  });
+  await listen(proxy);
+  try {
+    proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' });
+    // Many warm-up ticks pass while every probe is held upstream.
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal(peak, 4, `peak concurrent recheck probes was ${peak}`);
+  } finally {
+    for (const r of release) r();
+    proxy.close();
+    upstream.closeAllConnections?.();
+    upstream.close();
+  }
+});
