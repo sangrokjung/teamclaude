@@ -208,9 +208,11 @@ export async function stopExistingSessionProcess(
 // A recovery claim covers one recoverable error EVENT, not the whole session:
 // a session that is rescued and later exhausts the fleet again records a new
 // error and must be rescuable again, while the same event is never launched
-// twice (even across supervisor restarts). Records without their own
-// timestamp keep the conservative per-session key.
+// twice (even across supervisor restarts). The event is the record's uuid, or
+// its timestamp when it has no uuid; a record with neither keeps the
+// conservative per-session key.
 function recoveryClaimKey(sessionId, state) {
+  if (typeof state?.eventId === 'string' && state.eventId) return `${sessionId}@${state.eventId}`;
   return Number.isSafeInteger(state?.eventTimestampMs) && state.eventTimestampMs > 0
     ? `${sessionId}@${state.eventTimestampMs}`
     : sessionId;

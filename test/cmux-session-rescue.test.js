@@ -789,6 +789,17 @@ test('recovery claims are per error event: a later exhaustion of the same sessio
   await writeFile(fx.transcriptPath, `${fleetExhaustedRecord(fx.cwd, 1, new Date(secondErrorAt).toISOString())}\n`);
   assert.equal((await run()).rescued, 1, 'a new exhaustion event is rescued again');
   assert.equal(launches, 2);
+
+  // Two distinct error records written in the same millisecond are still two
+  // events: the record uuid tells them apart.
+  const sameAt = new Date(Date.now() - 2000).toISOString();
+  const withUuid = uuid => JSON.stringify({ ...JSON.parse(fleetExhaustedRecord(fx.cwd, 1, sameAt)), uuid });
+  await writeFile(fx.transcriptPath, `${withUuid('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')}\n`);
+  assert.equal((await run()).rescued, 1, 'first same-millisecond event');
+  await writeFile(fx.transcriptPath, `${withUuid('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')}\n`);
+  assert.equal((await run()).rescued, 1, 'second same-millisecond event with another uuid');
+  assert.equal((await run()).rescued, 0, 'and that event is not launched twice');
+  assert.equal(launches, 4);
 });
 
 test('runs the full legacy rescue path and passes the stop inspector through', async t => {

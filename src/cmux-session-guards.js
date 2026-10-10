@@ -123,6 +123,9 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
             // The record's own timestamp identifies this error event; it is
             // what keys a recovery claim (null when the record has none).
             eventTimestampMs: recordTimestampMs(record),
+            // Claude Code gives every transcript record a unique uuid; it
+            // distinguishes two errors written in the same millisecond.
+            eventId: typeof record.uuid === 'string' && UUID_RE.test(record.uuid) ? record.uuid : null,
             timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
           };
         }
