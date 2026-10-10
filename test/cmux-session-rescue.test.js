@@ -1630,3 +1630,72 @@ test('cmux binary resolution never consults PATH and honours only an absolute ov
   const result = await resolveCmuxBinary({ PATH: dir }).catch(err => err);
   assert.notEqual(result, bin);
 });
+
+// Between the identity check and the signal, a process may exit and its PID be
+// reused. Each PID is re-verified right before SIGTERM, and a PID whose
+// identity no longer matches is never signalled.
+test('stop re-verifies each PID immediately before signalling it', async t => {
+  const childPid = 70001;
+  const parentPid = 70002;
+  const info = {
+    pid: childPid,
+    processIdentity: 'child-identity',
+    launcherProcessIdentity: 'parent-identity',
+    surfaceId: SURFACE_ID,
+  };
+  let reused = false;
+  const inspectProcess = async pid => {
+    if (pid === parentPid) return { alive: true, processIdentity: 'parent-identity', surfaceId: SURFACE_ID };
+    return reused
+      ? { alive: true, processIdentity: 'unrelated-process', parentPid: 1 }
+      : { alive: true, processIdentity: 'child-identity', parentPid };
+  };
+  const signalled = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (signal === 0 || signal === undefined) {
+      const error = new Error('ESRCH');
+      error.code = 'ESRCH';
+      throw error;
+    }
+    signalled.push([pid, signal]);
+    // Killing the launcher lets the child exit and its PID be reused.
+    if (pid === parentPid) reused = true;
+    return true;
+  });
+
+  await stopExistingSessionProcess(info, parentPid, { inspectProcess });
+  assert.deepEqual(signalled, [[parentPid, 'SIGTERM']], 'the reused child PID was not signalled');
+});
+
+test('stop sends nothing when a PID changes identity or cannot be re-inspected before signalling', async t => {
+  const childPid = 70011;
+  const parentPid = 70012;
+  const info = { pid: childPid, processIdentity: 'c', launcherProcessIdentity: 'p', surfaceId: SURFACE_ID };
+  const signalled = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (signal === 0 || signal === undefined) {
+      const error = new Error('ESRCH');
+      error.code = 'ESRCH';
+      throw error;
+    }
+    signalled.push([pid, signal]);
+    return true;
+  });
+  for (const failure of ['reused', 'throws']) {
+    signalled.length = 0;
+    let checks = 0;
+    const inspectProcess = async pid => {
+      checks += 1;
+      // The first two inspections are the initial verification of both PIDs.
+      if (checks > 2) {
+        if (failure === 'throws') throw new Error('ps failed');
+        return { alive: true, processIdentity: 'other', parentPid: 1, surfaceId: SURFACE_ID };
+      }
+      return pid === parentPid
+        ? { alive: true, processIdentity: 'p', surfaceId: SURFACE_ID }
+        : { alive: true, processIdentity: 'c', parentPid };
+    };
+    await stopExistingSessionProcess(info, parentPid, { inspectProcess });
+    assert.deepEqual(signalled, [], failure);
+  }
+});

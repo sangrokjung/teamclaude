@@ -162,7 +162,19 @@ export async function stopExistingSessionProcess(
   const stopOrder = [...pids].sort((left, right) => (
     left === parentPid ? -1 : right === parentPid ? 1 : 0
   ));
+  // Stopping the launcher can let the child exit and its PID be reused, so
+  // each PID is re-verified right before it is signalled. The identity carries
+  // the process start time, so a reused PID never matches.
+  const stillExpected = async pid => {
+    try {
+      const current = await inspectProcess(pid);
+      return current?.alive === true && current.processIdentity === expected.get(pid);
+    } catch {
+      return false;
+    }
+  };
   for (const pid of stopOrder) {
+    if (!await stillExpected(pid)) continue;
     try {
       process.kill(pid, 'SIGTERM');
     } catch {}
