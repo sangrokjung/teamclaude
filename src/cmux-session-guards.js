@@ -2,7 +2,10 @@ import { constants } from 'node:fs';
 import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
-import { inspectClaudeProcess as defaultInspectClaudeProcess } from './cmux-process-guard.js';
+import {
+  inspectClaudeProcess as defaultInspectClaudeProcess,
+  isTeamClaudeSupervisor,
+} from './cmux-process-guard.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
@@ -175,6 +178,7 @@ export function validSession(store, session) {
     && typeof session.transcriptPath === 'string'
     && session.launchCommand?.launcher === 'claude'
     && typeof session.launchCommand.executablePath === 'string'
+    && typeof session.launchCommand.workingDirectory === 'string'
     && activeSessionId(store, session.surfaceId) === session.sessionId;
 }
 export async function resolveCmuxSessionId({
@@ -210,10 +214,14 @@ export async function resolveCmuxSessionId({
   } catch {
     return null;
   }
-  const [callerCwd, launchCwd, processCwd] = await Promise.all([
+  const [callerCwd, launchCwd, processCwd, processLaunchCwd,
+    processLaunchExecutable, sessionExecutable] = await Promise.all([
     realpath(cwd).catch(() => null),
     realpath(session.launchCommand.workingDirectory).catch(() => null),
     realpath(processInfo?.cwd || '').catch(() => null),
+    realpath(processInfo?.launchCwd || '').catch(() => null),
+    realpath(processInfo?.launchArgv?.[0] || '').catch(() => null),
+    realpath(session.launchCommand.executablePath).catch(() => null),
   ]);
   const tolerance = Number.isFinite(startTimeToleranceSeconds)
     ? Math.max(0, startTimeToleranceSeconds)
@@ -224,9 +232,15 @@ export async function resolveCmuxSessionId({
     && processInfo.agentLaunchKind === 'claude'
     && processInfo.supervised === false
     && processInfo.environmentValid === true
+    && isTeamClaudeSupervisor(processInfo)
+    && Array.isArray(processInfo.launchArgv)
+    && processInfo.launchArgv.length > 0
     && callerCwd !== null
     && callerCwd === launchCwd
     && launchCwd === processCwd
+    && launchCwd === processLaunchCwd
+    && processLaunchExecutable !== null
+    && processLaunchExecutable === sessionExecutable
     && Number.isFinite(processInfo.processStartedAt)
     && Number.isFinite(session.pidStartSeconds)
     && Math.abs(processInfo.processStartedAt - session.pidStartSeconds) <= tolerance

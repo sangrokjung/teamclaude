@@ -115,3 +115,11 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
 - 실제 registry의 surface/PID `13889` resolver가 session `d55ec3b1-0301-4c60-bc24-603b6dd3faa3`를 반환하고, 다른 caller cwd는 null을 반환했습니다.
 - qgate targeted suite ticket `1791558994039413000-21003`는 시스템 부하로 아직 대기 중입니다.
 - Claude Opus 추가 검증은 장시간 조사 후 중단되어 `UNVERIFIED`입니다. Codex fallback 적대 검토는 `REQUEST_CHANGES`를 냈고 cwd·PID 시작 신원 경계를 보완해 위 테스트를 추가했습니다.
+- REQUEST_CHANGES 보완 후 깨끗한 환경에서 `test/claude-recovery.test.js` 118/118,
+  `test/cmux-session-rescue.test.js` 52/52, `test/run-recovery.test.js` 22/22를
+  각각 exit 0으로 완주했습니다. selector 경계, supervisor launch identity,
+  늦게 발견된 transcript baseline 회귀를 포함합니다.
+- 보완 후 `node --check` 4개 파일, scoped ESLint, `git diff --check`가 통과했습니다.
+- 전체 `npm test` ticket `1791641961794006000-19883`은 909개 중 887개까지 진행된 뒤
+  load1 69.75 보호기에서 rc 75로 종료됐습니다. 이는 테스트 assertion 실패가 아니라
+  qgate의 머신 부하 차단이며, 관련 변경 suite는 위의 직렬 실행으로 완주했습니다.

@@ -346,7 +346,14 @@ function sessionSelector(args) {
       const value = args[i + 1] || '';
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null, resolverSafe: value.length === 0 };
+        : {
+            kind: 'ambiguous',
+            sessionId: null,
+            // A following option means the selector is omitted, while a
+            // non-option token is a named/malformed selector and must pass
+            // through unchanged.
+            resolverSafe: value.length === 0 || value.startsWith('-'),
+          };
     }
     if (args[i].startsWith('--resume=')) {
       const value = args[i].slice('--resume='.length);
@@ -523,6 +530,8 @@ async function monitorChild({
   sessionId,
   cwd,
   offset,
+  transcriptKnownAbsent = false,
+  launchStartedAtMs = 0,
   pollIntervalMs,
 }) {
   const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
@@ -539,7 +548,13 @@ async function monitorChild({
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
-      currentOffset = 0;
+      if (currentPath) {
+        const discovered = await stat(currentPath).catch(() => null);
+        const createdForLaunch = transcriptKnownAbsent
+          && Number.isFinite(discovered?.birthtimeMs)
+          && discovered.birthtimeMs >= launchStartedAtMs;
+        currentOffset = createdForLaunch ? 0 : (discovered?.size ?? 0);
+      }
     }
     if (!currentPath) return unresolvedEvent;
 
@@ -706,7 +721,9 @@ export async function runClaudeWithRecovery({
 
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
+    const transcriptKnownAbsent = !transcriptPath;
     let offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    const launchStartedAtMs = Date.now();
     // Defense in depth: a post-dispatch failure is never allowed to turn the
     // following UI reopen into another inference POST, even if a caller or a
     // future branch accidentally appends the literal continuation prompt.
@@ -745,7 +762,15 @@ export async function runClaudeWithRecovery({
       }
       if (!sessionId) return exitPromise;
       transcriptPath = await findTranscript(transcriptRoot, sessionId);
-      offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+      if (transcriptPath) {
+        const discovered = await stat(transcriptPath).catch(() => null);
+        const createdForLaunch = transcriptKnownAbsent
+          && Number.isFinite(discovered?.birthtimeMs)
+          && discovered.birthtimeMs >= launchStartedAtMs;
+        offset = createdForLaunch ? 0 : (discovered?.size ?? 0);
+      } else {
+        offset = 0;
+      }
     }
     const outcome = await monitorChild({
       child,
@@ -755,6 +780,8 @@ export async function runClaudeWithRecovery({
       sessionId,
       cwd,
       offset,
+      transcriptKnownAbsent,
+      launchStartedAtMs,
       pollIntervalMs,
     });
     if (outcome.type === 'exit') return outcome.result;

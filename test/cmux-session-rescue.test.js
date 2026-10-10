@@ -125,6 +125,7 @@ async function fixture(t) {
 function processInfo(fx, overrides = {}) {
   return {
     alive: true,
+    pid: fx.session.pid,
     cwd: fx.cwd,
     environmentValid: true,
     executablePath: fx.executablePath,
@@ -133,7 +134,20 @@ function processInfo(fx, overrides = {}) {
     processStartedAt: fx.session.startedAt - 3,
     command: `${fx.executablePath} --session-id ${SESSION_ID}`,
     surfaceId: SURFACE_ID,
+    agentLaunchKind: 'claude',
     supervised: false,
+    ...overrides,
+  };
+}
+
+function resolverProcessInfo(fx, overrides = {}) {
+  return {
+    ...processInfo(fx),
+    cwd: fx.session.launchCommand.workingDirectory,
+    command: '/opt/teamcodex/src/index.js run -- --resume named-session',
+    launchCwd: fx.session.launchCommand.workingDirectory,
+    launchArgv: [fx.session.launchCommand.executablePath],
+    teamClaudeBin: '/usr/local/bin/claude-vendor',
     ...overrides,
   };
 }
@@ -166,21 +180,17 @@ test('adopts active unresolved Login expired session once', async t => {
 
 test('resolves an ID-less Claude launch only from the matching owner session', async t => {
   const fx = await fixture(t);
+  // Claude's live cwd can differ from the launcher cwd after an in-session
+  // directory change; ownership is bound to launch cwd and process identity.
+  fx.session.cwd = join(fx.root, 'session-current-cwd');
+  await mkdir(fx.session.cwd);
+  await writeFile(fx.storePath, JSON.stringify(fx.store));
   assert.equal(await resolveCmuxSessionId({
     storePath: fx.storePath,
     surfaceId: fx.session.surfaceId,
     pid: fx.session.pid,
-    cwd: fx.session.cwd,
-    inspectProcess: async () => ({
-      alive: true,
-      pid: fx.session.pid,
-      cwd: fx.session.launchCommand.workingDirectory,
-      surfaceId: fx.session.surfaceId,
-      agentLaunchKind: 'claude',
-      supervised: false,
-      environmentValid: true,
-      processStartedAt: fx.session.pidStartSeconds,
-    }),
+    cwd: fx.session.launchCommand.workingDirectory,
+    inspectProcess: async () => resolverProcessInfo(fx),
   }), SESSION_ID);
   assert.equal(await resolveCmuxSessionId({
     storePath: fx.storePath,
@@ -189,37 +199,47 @@ test('resolves an ID-less Claude launch only from the matching owner session', a
     cwd: fx.session.cwd,
     inspectProcess: async () => ({ alive: false }),
   }), null);
+
   assert.equal(await resolveCmuxSessionId({
     storePath: fx.storePath,
     surfaceId: fx.session.surfaceId,
     pid: fx.session.pid,
-    cwd: fx.session.cwd,
-    inspectProcess: async () => ({
-      alive: true,
-      pid: fx.session.pid,
-      cwd: fx.session.launchCommand.workingDirectory,
-      surfaceId: OTHER_SESSION_ID,
-      agentLaunchKind: 'claude',
-      supervised: false,
-      environmentValid: true,
-      processStartedAt: fx.session.pidStartSeconds,
+    cwd: fx.session.launchCommand.workingDirectory,
+    inspectProcess: async () => resolverProcessInfo(fx, {
+      launchCwd: join(fx.root, 'other'),
     }),
   }), null);
   assert.equal(await resolveCmuxSessionId({
     storePath: fx.storePath,
     surfaceId: fx.session.surfaceId,
     pid: fx.session.pid,
-    cwd: join(fx.root, 'other'),
-    inspectProcess: async () => ({
-      alive: true,
-      pid: fx.session.pid,
-      cwd: fx.session.launchCommand.workingDirectory,
-      surfaceId: fx.session.surfaceId,
-      agentLaunchKind: 'claude',
-      supervised: false,
-      environmentValid: true,
-      processStartedAt: fx.session.pidStartSeconds,
+    cwd: fx.session.launchCommand.workingDirectory,
+    inspectProcess: async () => resolverProcessInfo(fx, {
+      command: '/usr/bin/claude --resume named-session',
     }),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: fx.session.launchCommand.workingDirectory,
+    inspectProcess: async () => resolverProcessInfo(fx, {
+      launchArgv: ['/tmp/other-claude'],
+    }),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: fx.session.cwd,
+    inspectProcess: async () => resolverProcessInfo(fx, { surfaceId: OTHER_SESSION_ID }),
+  }), null);
+  assert.equal(await resolveCmuxSessionId({
+    storePath: fx.storePath,
+    surfaceId: fx.session.surfaceId,
+    pid: fx.session.pid,
+    cwd: join(fx.root, 'other'),
+    inspectProcess: async () => resolverProcessInfo(fx),
   }), null);
   const withoutPidStart = structuredClone(fx.store);
   delete withoutPidStart.sessions[SESSION_ID].pidStartSeconds;
@@ -229,16 +249,7 @@ test('resolves an ID-less Claude launch only from the matching owner session', a
     surfaceId: fx.session.surfaceId,
     pid: fx.session.pid,
     cwd: fx.session.cwd,
-    inspectProcess: async () => ({
-      alive: true,
-      pid: fx.session.pid,
-      cwd: fx.session.launchCommand.workingDirectory,
-      surfaceId: fx.session.surfaceId,
-      agentLaunchKind: 'claude',
-      supervised: false,
-      environmentValid: true,
-      processStartedAt: fx.session.pidStartSeconds,
-    }),
+    inspectProcess: async () => resolverProcessInfo(fx),
   }), null);
 });
 

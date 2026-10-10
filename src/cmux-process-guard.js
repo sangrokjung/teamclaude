@@ -89,7 +89,7 @@ async function trustedNativeClaudeExecutable(path) {
   }
 }
 
-function isTeamClaudeSupervisor(info) {
+export function isTeamClaudeSupervisor(info) {
   return info?.alive
     && info.supervised !== true
     && /\/teamcodex\/src\/index\.js\s+run(?:\s|$)/.test(info.command)
