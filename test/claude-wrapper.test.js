@@ -834,6 +834,12 @@ printf '%s|%s|%s|%s\\n' ${name} "\${TEAMCLAUDE_PROVIDER:-}" "\${TEAMCLAUDE_SESSI
     assert.equal(run({ TEAMCLAUDE_PROVIDER: 'codex', TEAMCLAUDE_SESSION_SUPERVISED: '1', TEAMCLAUDE_CONFIG: 'c' }),
       'teamcodex|anthropic||');
     assert.equal(run({ TEAMCLAUDE_SESSION_SUPERVISED: '1' }), 'teamcodex|anthropic|1|');
+    // A user's own Anthropic config survives every non-Codex path. Under a
+    // Codex supervisor TEAMCLAUDE_CONFIG names the Codex pool's file, so it is
+    // dropped there: the relaunch is always an Anthropic run.
+    assert.equal(run({ TEAMCLAUDE_CONFIG: '/tmp/custom.json' }), 'teamcodex|anthropic||/tmp/custom.json');
+    assert.equal(run({ TEAMCLAUDE_PROVIDER: 'anthropic', TEAMCLAUDE_CONFIG: '/tmp/custom.json' }),
+      'teamcodex|anthropic||/tmp/custom.json');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
