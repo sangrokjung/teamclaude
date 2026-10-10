@@ -628,9 +628,17 @@ export async function transcriptHasConversationAfter(path, offset) {
     let pending = Buffer.alloc(0);
     let position = offset;
     const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
-    while (position < info.size) {
-      const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, info.size - position), position);
-      if (bytesRead === 0) break;
+    // Read to the live end of file rather than the size seen at the start:
+    // Claude may append a record while the scan runs, and missing it would
+    // resume a turn that already continued. Stop only when a re-stat at EOF
+    // shows nothing new.
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        const now = await handle.stat().catch(() => null);
+        if (!now || now.size <= position) break;
+        continue;
+      }
       position += bytesRead;
       let data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
       for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {

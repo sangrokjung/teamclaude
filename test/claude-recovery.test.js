@@ -3606,3 +3606,16 @@ test('transcript activity scan is chunked and bounded after the recorded offset'
   await writeFile(path, `${head}${errorLine}\n`);
   assert.equal(await transcriptHasConversationAfter(path, head.length), false);
 });
+
+test('transcript activity scan keeps reading records appended while it scans', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-append-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const userLine = JSON.stringify({ type: 'user', cwd: root, message: { role: 'user', content: 'continue' } });
+  const head = `${userLine}\n`;
+  // Several MiB of API-error records keep the scan busy across many reads.
+  await writeFile(path, head + `${fleetExhaustedRecord(root)}\n`.repeat(20000));
+  const scan = transcriptHasConversationAfter(path, head.length);
+  await appendFile(path, `${userLine}\n`);
+  assert.equal(await scan, true, 'a conversation record appended after the scan began is seen');
+});
