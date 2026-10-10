@@ -1852,9 +1852,11 @@ async function findRunningServer(
 ) {
   const configPort = config?.proxy?.port;
   const state = await readServerState();
-  const probeDeadline = Date.now() + (Number.isFinite(maxProbeWaitMs)
-    ? Math.max(0, Math.floor(maxProbeWaitMs))
-    : 1500);
+  const waitMs = Number.isFinite(maxProbeWaitMs) ? Math.max(0, Math.floor(maxProbeWaitMs)) : 1500;
+  const probeDeadline = Date.now() + waitMs;
+  // A caller granting a longer budget (account reload under load) gets it per
+  // probe too; otherwise a slow status answer would read as "no server".
+  const perProbeMs = Math.max(configuredStatusProbeTimeoutMs(), waitMs);
 
   // Try the port the server ACTUALLY bound (recorded in the state file) first —
   // it may differ from the current config port after the config was edited, and
@@ -1868,7 +1870,7 @@ async function findRunningServer(
     if (remainingMs <= 0) break;
     if (!(await probeServer(
       port,
-      Math.min(configuredStatusProbeTimeoutMs(), remainingMs),
+      Math.min(perProbeMs, remainingMs),
     ))) continue;
     const lsofOwnerPid = lsofPid(port);
     const ownerPid = lsofOwnerPid || (
@@ -1880,7 +1882,7 @@ async function findRunningServer(
     const stateIdentityVerified = verified.ok && lifecycleRemainingMs > 0
       && await probeServer(
         port,
-        Math.min(configuredStatusProbeTimeoutMs(), lifecycleRemainingMs),
+        Math.min(perProbeMs, lifecycleRemainingMs),
         state.lifecycle.id,
         config?.proxy?.apiKey,
       );
