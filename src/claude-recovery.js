@@ -529,7 +529,11 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
-    if (info.size < currentOffset) {
+    // A shrunk file (truncation) or a different file at the same path
+    // (rotation) cannot continue the old offset: read it from the start.
+    if (info.size < currentOffset
+        || (currentIdentity
+          && (info.dev !== currentIdentity.dev || info.ino !== currentIdentity.ino))) {
       currentOffset = 0;
       pending = '';
     }
