@@ -58,7 +58,11 @@ import {
   createCmuxSessionRescuer,
   defaultCmuxRescuePaths,
 } from './cmux-session-rescue.js';
-import { resolveCmuxSessionId } from './cmux-session-guards.js';
+import {
+  claimSessionOnce,
+  releaseSessionClaim,
+  resolveCmuxSessionId,
+} from './cmux-session-guards.js';
 import {
   PROBE_BROKEN,
   createLoopStallMeter,
@@ -2788,6 +2792,7 @@ async function runCommand(clientArgsOverride = null) {
       && typeof process.env.CMUX_SURFACE_ID === 'string'
       && process.env.CMUX_SURFACE_ID.length > 0
       && Number.isInteger(Number(process.env.CMUX_CLAUDE_PID))
+      && Number(process.env.CMUX_CLAUDE_PID) === process.pid
       ? () => resolveCmuxSessionId({
         storePath: cmuxRescuePaths.storePath,
         surfaceId: process.env.CMUX_SURFACE_ID,
@@ -2815,6 +2820,16 @@ async function runCommand(clientArgsOverride = null) {
       recoverLimit: ({ childEnv: recoveryEnv }) =>
         recoverExpiredClaudeLogin(runtimeConfig, recoveryEnv),
       resolveSessionId: cmuxSessionResolver,
+      claimRecovery: cmuxSessionResolver
+        ? sessionId => claimSessionOnce(cmuxRescuePaths.storePath, sessionId)
+        : null,
+      releaseRecovery: cmuxSessionResolver
+        ? (sessionId, identity) => releaseSessionClaim(
+          cmuxRescuePaths.storePath,
+          sessionId,
+          identity,
+        )
+        : null,
       waitForConnectionRecovery: async ({ childEnv: recoveryEnv }) => {
         const recovered = await waitForClaudeProxyRecovery(runtimeConfig);
         runtimeConfig.proxy.port = recovered.port;

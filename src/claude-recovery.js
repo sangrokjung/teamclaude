@@ -293,6 +293,14 @@ async function findTranscript(root, sessionId) {
   return files.find(path => basename(path) === target) || null;
 }
 
+async function snapshotTranscriptSizes(root) {
+  const entries = await Promise.all((await transcriptFiles(root)).map(async path => [
+    path,
+    (await stat(path).catch(() => null))?.size,
+  ]));
+  return new Map(entries.filter(([, size]) => Number.isFinite(size)));
+}
+
 async function readTail(path, maxBytes = 256 * 1024) {
   const info = await stat(path);
   const start = Math.max(0, info.size - maxBytes);
@@ -532,6 +540,7 @@ async function monitorChild({
   offset,
   transcriptKnownAbsent = false,
   launchStartedAtMs = 0,
+  transcriptSizesBeforeLaunch = null,
   pollIntervalMs,
 }) {
   const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
@@ -553,7 +562,10 @@ async function monitorChild({
         const createdForLaunch = transcriptKnownAbsent
           && Number.isFinite(discovered?.birthtimeMs)
           && discovered.birthtimeMs >= launchStartedAtMs;
-        currentOffset = createdForLaunch ? 0 : (discovered?.size ?? 0);
+        const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
+        currentOffset = Number.isFinite(priorSize)
+          ? (discovered.size < priorSize ? 0 : priorSize)
+          : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       }
     }
     if (!currentPath) return unresolvedEvent;
@@ -675,6 +687,8 @@ export async function runClaudeWithRecovery({
   resolveSessionId,
   sessionResolveTimeoutMs = 5000,
   sessionResolvePollIntervalMs = 50,
+  claimRecovery,
+  releaseRecovery,
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
@@ -718,11 +732,41 @@ export async function runClaudeWithRecovery({
   let loginRecoveryUsed = false;
   let suppressNextContinuationPrompt = false;
   let nextEnv = childEnv;
+  let fleetRecoveryClaim = null;
+  let fleetRecoveryClaimSessionId = null;
+  const releaseFleetRecoveryClaim = async () => {
+    if (!fleetRecoveryClaim || !fleetRecoveryClaimSessionId
+        || typeof releaseRecovery !== 'function') return;
+    const claim = fleetRecoveryClaim;
+    const claimedSessionId = fleetRecoveryClaimSessionId;
+    fleetRecoveryClaim = null;
+    fleetRecoveryClaimSessionId = null;
+    try {
+      await releaseRecovery(claimedSessionId, claim);
+    } catch {}
+  };
+  const acquireFleetRecoveryClaim = async session => {
+    if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) return true;
+    if (typeof claimRecovery !== 'function') return true;
+    try {
+      const claim = await claimRecovery(session);
+      if (!claim) return false;
+      fleetRecoveryClaim = claim;
+      fleetRecoveryClaimSessionId = session;
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
     const transcriptKnownAbsent = !transcriptPath;
     let offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    const transcriptSizesBeforeLaunch = selector.kind === 'ambiguous'
+      && selector.resolverSafe === true
+      ? await snapshotTranscriptSizes(transcriptRoot)
+      : null;
     const launchStartedAtMs = Date.now();
     // Defense in depth: a post-dispatch failure is never allowed to turn the
     // following UI reopen into another inference POST, even if a caller or a
@@ -741,6 +785,7 @@ export async function runClaudeWithRecovery({
       child = spawnClaude(launchArgs, nextEnv);
       exitPromise = childExit(child);
     } catch (error) {
+      await releaseFleetRecoveryClaim();
       return { status: 1, signal: null, error };
     }
     if (selector.kind === 'ambiguous' && selector.resolverSafe === true && !sessionId) {
@@ -767,7 +812,10 @@ export async function runClaudeWithRecovery({
         const createdForLaunch = transcriptKnownAbsent
           && Number.isFinite(discovered?.birthtimeMs)
           && discovered.birthtimeMs >= launchStartedAtMs;
-        offset = createdForLaunch ? 0 : (discovered?.size ?? 0);
+        const priorSize = transcriptSizesBeforeLaunch?.get(transcriptPath);
+        offset = Number.isFinite(priorSize)
+          ? (discovered.size < priorSize ? 0 : priorSize)
+          : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       } else {
         offset = 0;
       }
@@ -782,12 +830,20 @@ export async function runClaudeWithRecovery({
       offset,
       transcriptKnownAbsent,
       launchStartedAtMs,
+      transcriptSizesBeforeLaunch,
       pollIntervalMs,
     });
-    if (outcome.type === 'exit') return outcome.result;
+    if (outcome.type === 'exit') {
+      await releaseFleetRecoveryClaim();
+      return outcome.result;
+    }
 
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
+    if (fleetRecoveryClaimSessionId
+        && outcome.event.kind !== 'fleet_exhausted') {
+      await releaseFleetRecoveryClaim();
+    }
     if (outcome.event.kind === 'ambiguous_connection'
         || outcome.event.kind === 'ambiguous_dispatch') {
       suppressNextContinuationPrompt = true;
@@ -1040,9 +1096,15 @@ export async function runClaudeWithRecovery({
         ? `${fleetExhaustionRetries}/unlimited`
         : `${fleetExhaustionRetries}/${maxFleetExhaustionRetries}`;
       log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
+      if (!(await acquireFleetRecoveryClaim(sessionId))) {
+        log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
+        await stopChild(child);
+        return childExit(child);
+      }
       await stopChild(child);
       await wait(waitMs);
       if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
+        await releaseFleetRecoveryClaim();
         log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
         return childExit(child);
       }
