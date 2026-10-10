@@ -227,6 +227,7 @@ export async function rescueCmuxSessionsOnce({
   releaseRecovery = releaseSessionClaim,
   claimLease = claimSessionLease,
   releaseLease = releaseSessionLease,
+  pendingLeases = new Map(),
   stopProcess = stopExistingSessionProcess,
   stopInspectProcess = inspectClaudeProcess,
   trustedClaudePath = null,
@@ -246,6 +247,13 @@ export async function rescueCmuxSessionsOnce({
     }
   }
 
+  for (const [sessionId, identity] of pendingLeases) {
+    try {
+      const released = await releaseLease(storePath, sessionId, identity);
+      if (released !== null) pendingLeases.delete(sessionId);
+    } catch {}
+  }
+
   let candidates = 0;
   let rescued = 0;
   let failed = 0;
@@ -261,7 +269,7 @@ export async function rescueCmuxSessionsOnce({
     candidates += 1;
     if (fleetRetryStillActive(initialState)) continue;
     const key = session.sessionId;
-    if (attempted.has(key)) continue;
+    if (attempted.has(key) || pendingLeases.has(key)) continue;
 
     let freshStore;
     try {
@@ -349,15 +357,26 @@ export async function rescueCmuxSessionsOnce({
     let claimOwned = false;
     let leaseOwned = false;
     const releaseLeaseForRetry = async () => {
-      if (!leaseOwned) return;
+      if (!leaseOwned) return true;
       const leaseIdentity = typeof leaseOwned === 'object' ? leaseOwned : null;
-      leaseOwned = false;
       try {
-        await releaseLease(storePath, key, leaseIdentity);
-      } catch {}
+        const released = await releaseLease(storePath, key, leaseIdentity);
+        if (released !== null) {
+          leaseOwned = false;
+          pendingLeases.delete(key);
+        } else {
+          pendingLeases.set(key, leaseIdentity);
+        }
+        return released !== null;
+      } catch {
+        // Keep the identity marked as owned when release is inconclusive. A
+        // later scan must not clear attempted and race this actor's lease.
+        pendingLeases.set(key, leaseIdentity);
+        return false;
+      }
     };
     const releaseClaimForRetry = async () => {
-      await releaseLeaseForRetry();
+      if (!await releaseLeaseForRetry()) return false;
       if (!claimOwned) return;
       const claimIdentity = typeof claimOwned === 'object' ? claimOwned : null;
       claimOwned = false;
@@ -375,6 +394,7 @@ export async function rescueCmuxSessionsOnce({
         continue;
       }
       leaseOwned = lease;
+      pendingLeases.set(key, lease);
       const claim = await claimRecovery(storePath, key);
       if (!claim) {
         await releaseLeaseForRetry();
@@ -501,13 +521,14 @@ export function createCmuxSessionRescuer({
   let timer = null;
   let scanPromise = null;
   const attempted = new Set();
+  const pendingLeases = new Map();
 
   const scanNow = () => {
     if (!enabled || !ready()) {
       return Promise.resolve({ scanned: 0, candidates: 0, rescued: 0, failed: 0 });
     }
     if (scanPromise) return scanPromise;
-    scanPromise = rescueCmuxSessionsOnce({ ...options, attempted })
+    scanPromise = rescueCmuxSessionsOnce({ ...options, attempted, pendingLeases })
       .then(result => {
         if (result.rescued > 0) {
           log(`[TeamClaude] Continued ${result.rescued} blocked Claude session(s) in new supervised cmux workspaces.`);

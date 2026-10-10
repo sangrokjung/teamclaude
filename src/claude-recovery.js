@@ -559,12 +559,16 @@ async function monitorChild({
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
       if (currentPath) {
         const discovered = await stat(currentPath).catch(() => null);
+        if (!discovered) {
+          currentPath = null;
+          return unresolvedEvent;
+        }
         const createdForLaunch = transcriptKnownAbsent
           && Number.isFinite(discovered?.birthtimeMs)
           && discovered.birthtimeMs >= launchStartedAtMs;
         const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
         currentOffset = Number.isFinite(priorSize)
-          ? (discovered.size < priorSize ? 0 : priorSize)
+          ? ((discovered?.size ?? priorSize) < priorSize ? 0 : priorSize)
           : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       }
     }
@@ -750,28 +754,54 @@ export async function runClaudeWithRecovery({
   const acquireFleetRecoveryClaim = async session => {
     if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) return true;
     if (typeof claimRecoveryLease !== 'function') return true;
-    try {
-      const claim = await claimRecoveryLease(session);
-      if (!claim) return false;
-      fleetRecoveryClaim = claim;
-      fleetRecoveryClaimSessionId = session;
-      return true;
-    } catch {
-      return false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const claim = await claimRecoveryLease(session);
+        if (claim) {
+          fleetRecoveryClaim = claim;
+          fleetRecoveryClaimSessionId = session;
+          return true;
+        }
+        if (claim === false) return false;
+      } catch {
+        // A transient inspection or mutex failure is retried below. A stable
+        // owner still wins each attempt and eventually makes us preserve the
+        // live child without stopping it.
+      }
+      if (attempt < 2) await delay(25 * 2 ** attempt);
     }
+    return false;
+  };
+  const leaseProtectedRecoveryKinds = new Set([
+    'login_expired',
+    'connection_lost',
+    'ambiguous_connection',
+    'ambiguous_dispatch',
+    'fleet_exhausted',
+  ]);
+  const preserveChild = async currentChild => {
+    // The transient lease protects an actual automatic resume only. Once the
+    // launcher decides to preserve the live child for manual continuation,
+    // release it before waiting so the cmux rescuer can take over if needed.
+    await releaseFleetRecoveryClaim();
+    return childExit(currentChild);
   };
 
   try {
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
+    const launchStartedAtMs = Date.now();
+    const initialTranscriptInfo = transcriptPath
+      ? await stat(transcriptPath).catch(() => null)
+      : null;
+    if (transcriptPath && !initialTranscriptInfo) transcriptPath = null;
     const transcriptKnownAbsent = !transcriptPath;
-    let offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    let offset = initialTranscriptInfo?.size ?? 0;
     const transcriptSizesBeforeLaunch = selector.kind === 'ambiguous'
       && selector.resolverSafe === true
       && !sessionId
       ? await snapshotTranscriptSizes(transcriptRoot)
       : null;
-    const launchStartedAtMs = Date.now();
     // Defense in depth: a post-dispatch failure is never allowed to turn the
     // following UI reopen into another inference POST, even if a caller or a
     // future branch accidentally appends the literal continuation prompt.
@@ -813,13 +843,18 @@ export async function runClaudeWithRecovery({
       transcriptPath = await findTranscript(transcriptRoot, sessionId);
       if (transcriptPath) {
         const discovered = await stat(transcriptPath).catch(() => null);
-        const createdForLaunch = transcriptKnownAbsent
-          && Number.isFinite(discovered?.birthtimeMs)
-          && discovered.birthtimeMs >= launchStartedAtMs;
-        const priorSize = transcriptSizesBeforeLaunch?.get(transcriptPath);
+        if (!discovered) {
+          transcriptPath = null;
+          offset = 0;
+        } else {
+          const createdForLaunch = transcriptKnownAbsent
+            && Number.isFinite(discovered.birthtimeMs)
+            && discovered.birthtimeMs >= launchStartedAtMs;
+          const priorSize = transcriptSizesBeforeLaunch?.get(transcriptPath);
           offset = Number.isFinite(priorSize)
-          ? ((discovered?.size ?? 0) < priorSize ? 0 : priorSize)
-          : (createdForLaunch ? 0 : (discovered?.size ?? 0));
+            ? (discovered.size < priorSize ? 0 : priorSize)
+            : (createdForLaunch ? 0 : discovered.size);
+        }
       } else {
         offset = 0;
       }
@@ -844,9 +879,10 @@ export async function runClaudeWithRecovery({
 
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
-    if (fleetRecoveryClaimSessionId
-        && outcome.event.kind !== 'fleet_exhausted') {
-      await releaseFleetRecoveryClaim();
+    if (sessionId && leaseProtectedRecoveryKinds.has(outcome.event.kind)
+        && !(await acquireFleetRecoveryClaim(sessionId))) {
+      log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
+      return await preserveChild(child);
     }
     if (outcome.event.kind === 'ambiguous_connection'
         || outcome.event.kind === 'ambiguous_dispatch') {
@@ -923,7 +959,7 @@ export async function runClaudeWithRecovery({
         } else {
           log('[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
         }
-        return childExit(child);
+        return await preserveChild(child);
       }
 
       log(`[TeamClaude] Claude login expired; switched account and resuming session ${sessionId}.`);
@@ -935,7 +971,7 @@ export async function runClaudeWithRecovery({
 
     if (outcome.event.kind === 'model_refusal_fallback') {
       log(`[TeamClaude] Claude handled a Fable safeguard refusal with its in-session Opus fallback; no launcher retry was sent for session ${sessionId}.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'safety_denial') {
@@ -956,7 +992,7 @@ export async function runClaudeWithRecovery({
         continue;
       }
       log(`[TeamClaude] Auto-mode safety-denial resume budget exhausted (${safetyDenialRecoveries}/${maxSafetyDenialResumes}); preserving the session for manual continuation.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'safeguard_refusal') {
@@ -977,7 +1013,7 @@ export async function runClaudeWithRecovery({
         continue;
       }
       log(`[TeamClaude] Fable safeguard resume budget exhausted (${safeguardRecoveries}/${maxSafeguardResumes}); preserving the blocked session for user revision.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'connection_lost') {
@@ -988,6 +1024,7 @@ export async function runClaudeWithRecovery({
         retries += 1;
         log(`[TeamClaude] Local proxy connection lost; waiting to resume session ${sessionId} (${retries}/${maxRetries}).`);
         if (!(await waitForRecoveredConnection())) {
+          await releaseFleetRecoveryClaim();
           return { status: 1, signal: null };
         }
         log(`[TeamClaude] Local proxy connection restored; resuming session ${sessionId}.`);
@@ -997,9 +1034,10 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] Connection-refused retry budget exhausted (${retries}/${maxRetries}); preserving session ${sessionId} for manual continuation.`);
       if (child.exitCode == null && child.signalCode == null) {
         await stopChild(child);
+        await releaseFleetRecoveryClaim();
         return { status: 1, signal: null };
       }
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'ambiguous_connection'
@@ -1014,6 +1052,7 @@ export async function runClaudeWithRecovery({
           : 'Upstream connection failed after dispatch; proxy did not replay the request';
         log(`[TeamClaude] ${failure}. Waiting to reopen session ${sessionId} without resending the last prompt (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}).`);
         if (!(await waitForRecoveredConnection())) {
+          await releaseFleetRecoveryClaim();
           return { status: 1, signal: null };
         }
         if (backoffMs > 0) {
@@ -1026,9 +1065,10 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] Ambiguous-request safe-reopen budget exhausted (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}); preserving session ${sessionId} without resending the last prompt.`);
       if (child.exitCode == null && child.signalCode == null) {
         await stopChild(child);
+        await releaseFleetRecoveryClaim();
         return { status: 1, signal: null };
       }
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'usage_limit'
@@ -1102,15 +1142,14 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
       if (!(await acquireFleetRecoveryClaim(sessionId))) {
         log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
-        await stopChild(child);
-        return childExit(child);
+        return await preserveChild(child);
       }
       await stopChild(child);
       await wait(waitMs);
       if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
         await releaseFleetRecoveryClaim();
         log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
-        return childExit(child);
+        return await childExit(child);
       }
       nextArgs = ['--resume', sessionId, 'continue'];
       continue;
@@ -1118,13 +1157,16 @@ export async function runClaudeWithRecovery({
 
     if (outcome.event.kind === 'fleet_exhausted') {
       log(`[TeamClaude] Fleet exhaustion resume budget exhausted (${fleetExhaustionRetries}/${maxFleetExhaustionRetries}); preserving session ${sessionId} for manual continuation.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'usage_limit') {
       log('[TeamClaude] Claude usage limit detected; account rotation was not confirmed, so the same account will not be restarted.');
-      if (usageChildStopped) return { status: child.exitCode ?? 1, signal: null };
-      return childExit(child);
+      if (usageChildStopped) {
+        await releaseFleetRecoveryClaim();
+        return { status: child.exitCode ?? 1, signal: null };
+      }
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'timeout'
@@ -1150,7 +1192,7 @@ export async function runClaudeWithRecovery({
       nextArgs = ['--resume', sessionId, 'continue'];
       continue;
     }
-    return childExit(child);
+    return await preserveChild(child);
   }
   } finally {
     await releaseFleetRecoveryClaim();

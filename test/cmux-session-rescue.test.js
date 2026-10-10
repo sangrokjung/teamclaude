@@ -1457,12 +1457,121 @@ test('transient actor lease is separate from permanent replay claim', async t =>
   await releaseSessionLease(fx.storePath, SESSION_ID, laterLease);
 });
 
+test('retries an inconclusive rescuer lease release on the next scan', async t => {
+  const fx = await fixture(t);
+  const pendingLeases = new Map([[SESSION_ID, { dev: 7, ino: 9 }]]);
+  let releaseCalls = 0;
+  let launches = 0;
+  const options = {
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    pendingLeases,
+    releaseLease: async () => {
+      releaseCalls += 1;
+      return releaseCalls === 1 ? null : true;
+    },
+    inspectProcess: async () => processInfo(fx),
+    claimLease: async () => ({ dev: 11, ino: 12 }),
+    launchRecoveryWorkspace: async () => { launches += 1; },
+  };
+
+  const first = await rescueCmuxSessionsOnce(options);
+  assert.equal(first.rescued, 0);
+  assert.equal(launches, 0);
+  assert.equal(pendingLeases.has(SESSION_ID), true);
+
+  const second = await rescueCmuxSessionsOnce(options);
+  assert.equal(second.rescued, 1);
+  assert.equal(launches, 1);
+  assert.equal(pendingLeases.has(SESSION_ID), false);
+});
+
+test('lease creation records the same process-start clock used for owner checks', async t => {
+  const fx = await fixture(t);
+  let inspections = 0;
+  const inspectProcessStart = async () => {
+    inspections += 1;
+    return 123.5;
+  };
+  const lease = await claimSessionLease(fx.storePath, SESSION_ID, { inspectProcessStart });
+  const owner = await readPrivateJson(
+    join(`${fx.storePath}.recovery-leases`, SESSION_ID),
+  );
+  assert.equal(owner.processStartSeconds, 123.5);
+  assert.equal(inspections, 1);
+  await releaseSessionLease(fx.storePath, SESSION_ID, lease);
+});
+
 test('stale transient lease is reclaimed only after its owner is gone', async t => {
   const fx = await fixture(t);
   const leaseDir = `${fx.storePath}.recovery-leases`;
   await mkdir(leaseDir, { mode: 0o700 });
   await writeFile(
     join(leaseDir, SESSION_ID),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    { mode: 0o600 },
+  );
+
+  const lease = await claimSessionLease(fx.storePath, SESSION_ID);
+  assert.equal(typeof lease.dev, 'number');
+  assert.equal(await releaseSessionLease(fx.storePath, SESSION_ID, lease), true);
+});
+
+test('a live lease owner is retained when process start inspection fails', async t => {
+  const fx = await fixture(t);
+  const leaseDir = `${fx.storePath}.recovery-leases`;
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(
+    join(leaseDir, SESSION_ID),
+    JSON.stringify({ version: 1, pid: process.ppid, processStartSeconds: 1 }),
+    { mode: 0o600 },
+  );
+
+  const lease = await claimSessionLease(fx.storePath, SESSION_ID, {
+    inspectProcessStart: async pid => (pid === process.pid ? 123 : null),
+  });
+  assert.equal(lease, false);
+  const retained = await open(join(leaseDir, SESSION_ID), 'r');
+  await retained.close();
+});
+
+test('concurrent stale lease reclaim has one winner and preserves the winner lease', async t => {
+  const fx = await fixture(t);
+  const leaseDir = `${fx.storePath}.recovery-leases`;
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(
+    join(leaseDir, SESSION_ID),
+    JSON.stringify({ version: 1, pid: process.pid, processStartSeconds: 1 }),
+    { mode: 0o600 },
+  );
+
+  const inspectProcessStart = async () => 123;
+  const [first, second] = await Promise.all([
+    claimSessionLease(fx.storePath, SESSION_ID, { inspectProcessStart }),
+    claimSessionLease(fx.storePath, SESSION_ID, { inspectProcessStart }),
+  ]);
+  const winners = [first, second].filter(Boolean);
+  assert.equal(winners.length, 1);
+  assert.equal(
+    await claimSessionLease(fx.storePath, SESSION_ID, { inspectProcessStart }),
+    false,
+  );
+  assert.equal(await releaseSessionLease(fx.storePath, SESSION_ID, winners[0]), true);
+});
+
+test('a crashed reclaim claimant does not strand the transient lease', async t => {
+  const fx = await fixture(t);
+  const leaseDir = `${fx.storePath}.recovery-leases`;
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(
+    join(leaseDir, SESSION_ID),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    { mode: 0o600 },
+  );
+  await writeFile(
+    join(leaseDir, `${SESSION_ID}.reclaim-lock`),
     JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
     { mode: 0o600 },
   );

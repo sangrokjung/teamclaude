@@ -3670,6 +3670,8 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
   const waits = [];
   const logs = [];
   let leaseReleases = 0;
+  let releasedAfterChildExit = false;
+  let latestChild = null;
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
@@ -3686,11 +3688,16 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
     pollIntervalMs: 5,
     fetchStatus: async () => statusWithQuota(0.5),
     claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
-    releaseRecoveryLease: async () => { leaseReleases += 1; },
+    releaseRecoveryLease: async () => {
+      leaseReleases += 1;
+      releasedAfterChildExit = latestChild?.exitCode != null
+        || latestChild?.signalCode != null;
+    },
     wait: async milliseconds => { waits.push(milliseconds); },
     log: message => logs.push(message),
     spawnClaude(args) {
       const child = fakeChild();
+      latestChild = child;
       calls.push([...args]);
       const sessionSelectorIndex = args.indexOf('--session-id');
       const sessionId = sessionSelectorIndex >= 0 ? args[sessionSelectorIndex + 1] : args[1];
@@ -3712,10 +3719,216 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
   assert.deepEqual(waits, [3000]);
   assert.equal(calls.length, 2);
   assert.equal(leaseReleases, 1);
+  assert.equal(releasedAfterChildExit, true);
   assert.ok(
     logs.some(message => /Fleet exhaustion resume budget exhausted/.test(message)),
     JSON.stringify({ calls, waits, logs }),
   );
+});
+
+test('fleet lease remains held across a later connection failure until that child exits', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-lease-chain-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  let claims = 0;
+  let releases = 0;
+  let releasedAfterExit = false;
+  let latestChild = null;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeFleetExhaustionMaxRetries: 2,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {},
+    waitForConnectionRecovery: async () => {
+      throw new Error('proxy remains unavailable');
+    },
+    claimRecoveryLease: async () => {
+      claims += 1;
+      return { dev: 1, ino: claims };
+    },
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      releasedAfterExit = latestChild?.exitCode != null || latestChild?.signalCode != null;
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      latestChild = child;
+      calls.push([...args]);
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        const record = calls.length === 1
+          ? fleetExhaustedRecord(cwd, 1)
+          : connectionRefusedRecord(cwd);
+        await appendFile(transcriptPath, `${record}\n`);
+        if (calls.length === 1) child.finish(9);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => ({ status: 1, signal: null }),
+    log() {},
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(claims, 1);
+  assert.equal(releases, 1);
+  assert.equal(releasedAfterExit, true);
+});
+
+test('first connection failure also claims the cmux recovery lease before retrying', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-connection-lease-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let claims = 0;
+  let calls = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      claims += 1;
+      return { dev: 1, ino: claims };
+    },
+    releaseRecoveryLease: async () => {},
+    waitForConnectionRecovery: async () => {
+      throw new Error('proxy remains unavailable');
+    },
+    spawnClaude(args) {
+      calls += 1;
+      const child = fakeChild();
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        await appendFile(transcriptPath, `${connectionRefusedRecord(cwd)}\n`);
+        child.finish(calls === 1 ? 9 : 0);
+      }, 10);
+      return child;
+    },
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(calls, 1);
+  assert.equal(claims, 1);
+});
+
+test('lease acquisition failure preserves the live Claude child', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-lease-error-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let killed = false;
+  let spawned = 0;
+  let childRef = null;
+  let claimObservedLiveChild = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      claimObservedLiveChild ||= childRef?.exitCode == null && childRef?.signalCode == null;
+      setImmediate(() => childRef?.finish(0));
+      throw new Error('ps timeout');
+    },
+    spawnClaude(args) {
+      spawned += 1;
+      const child = fakeChild(signal => { killed = signal; });
+      childRef = child;
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        await appendFile(transcriptPath, `${connectionRefusedRecord(cwd)}\n`);
+      }, 10);
+      return child;
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(killed, false);
+  assert.equal(spawned, 1);
+  assert.equal(claimObservedLiveChild, true);
+});
+
+test('nonrecoverable login expiry releases the recovery lease before preserving the child', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-lease-release-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let childRef = null;
+  let releases = 0;
+  let releasedWhileLive = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      releasedWhileLive = childRef?.exitCode == null && childRef?.signalCode == null;
+      childRef?.finish(0);
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      childRef = child;
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1] || args[1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+        );
+      }, 10);
+      return child;
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(releases, 1);
+  assert.equal(releasedWhileLive, true);
 });
 
 test('fleet exhaustion resolved by a later transcript write does not wait or resume', async t => {
