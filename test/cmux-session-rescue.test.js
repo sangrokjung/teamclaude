@@ -1714,3 +1714,39 @@ test('a claim swapped in between the check and the removal is restored, not dele
   assert.equal(released, false);
   assert.equal(await readFile(claimPath, 'utf8'), 'another recovery\n', 'the other claim survives');
 });
+
+// A selectorless child is only the session's process when it is the sole
+// Claude child of the supervisor. A sibling that names ANOTHER session makes
+// the selectorless one ambiguous, entered either from the supervisor or from
+// the registry's child PID.
+test('fails closed when a selectorless child has a sibling naming another session', async () => {
+  const supervisorPid = 54341;
+  const other = '00000000-0000-4000-8000-000000000000';
+  const selectorless = selectorlessChildInfo(54342, supervisorPid, '2.1.289');
+  const foreign = {
+    ...selectorlessChildInfo(54343, supervisorPid, '2.1.290'),
+    command: `${selectorlessChildInfo(54343, supervisorPid, '2.1.290').command} --resume ${other}`,
+  };
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [selectorless.pid, selectorless],
+    [foreign.pid, foreign],
+  ]);
+  const options = {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [
+      { pid: selectorless.pid, command: selectorless.command },
+      { pid: foreign.pid, command: foreign.command },
+    ],
+  };
+  for (const entryPid of [supervisorPid, selectorless.pid]) {
+    const result = await inspectClaudeProcessTree(entryPid, SESSION_ID, options);
+    assert.equal(result.alive, false, `entered from ${entryPid}`);
+  }
+  // Without the foreign sibling the selectorless child is still adopted.
+  const alone = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    ...options,
+    listDirectChildren: async () => [{ pid: selectorless.pid, command: selectorless.command }],
+  });
+  assert.equal(alone.pid, selectorless.pid);
+});

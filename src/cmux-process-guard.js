@@ -139,6 +139,7 @@ async function selectDirectClaudeChild(
   if (knownChild?.pid) rowByPid.set(knownChild.pid, { pid: knownChild.pid });
 
   const candidates = [];
+  let foreignSelector = false;
   for (const row of rowByPid.values()) {
     const child = row.pid === knownChild?.pid
       ? knownChild
@@ -146,6 +147,11 @@ async function selectDirectClaudeChild(
     if (childLooksLikeClaude(child, sessionId)
         && childBelongsToSupervisor(child, supervisor, supervisorPid)) {
       candidates.push(child);
+    } else if (child?.alive
+        && hasSessionSelector(child.command)
+        && typeof selectorFromCommand(child.command, sessionId) !== 'string'
+        && childBelongsToSupervisor(child, supervisor, supervisorPid)) {
+      foreignSelector = true;
     }
   }
 
@@ -156,7 +162,11 @@ async function selectDirectClaudeChild(
   if (selected.length === 1) return { ambiguous: false, child: selected[0] };
 
   const selectorless = candidates.filter(child => !hasSessionSelector(child.command));
-  if (selectorless.length > 1) return { ambiguous: true, child: null };
+  // A sibling naming another session means the supervisor runs more than this
+  // session, so a selectorless child cannot be tied to it.
+  if (selectorless.length > 1 || (selectorless.length === 1 && foreignSelector)) {
+    return { ambiguous: true, child: null };
+  }
   return { ambiguous: false, child: selectorless[0] || null };
 }
 
