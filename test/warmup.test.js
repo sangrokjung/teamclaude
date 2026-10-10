@@ -1125,6 +1125,69 @@ test('exportProbeTemplate persists the model-tier recheck template', async () =>
   }
 });
 
+// An account full on BOTH its general and its model-tier (Fable) window is
+// rechecked with the model-tier template: that response carries the general
+// windows too, so one probe refreshes both instead of leaving Fable stale.
+test('an account near both general and model-tier quota is rechecked with the model-tier template', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.updateQuota(0, {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+  });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    assert.equal(proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: null, system: 'sys' },
+    }), true);
+    assert.ok(await waitFor(() => seen.length >= 1), 'a recheck probe was sent');
+    assert.equal(JSON.parse(seen[0].body).model, 'claude-fable-5');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('a general-only near-quota account is rechecked with the general template', async () => {
+  const seen = [];
+  const upstream = recordingUpstream(seen);
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(1), 0.98, 0, 3);
+  am.updateQuota(0, {
+    ...RL_HEADERS(),
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-7d_oi-utilization': '0.2',
+    'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+  });
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: 'k' },
+    upstream: `http://127.0.0.1:${upstreamPort}`,
+    warmupIntervalMs: 0,
+  });
+  await listen(proxy);
+  try {
+    proxy.importProbeTemplate({
+      model: 'claude-opus-4-8', version: '2023-06-01', beta: null, system: 'sys',
+      _staleRecheckTemplate: { model: 'claude-fable-5', version: '2023-06-01', beta: null, system: 'sys' },
+    });
+    assert.ok(await waitFor(() => seen.length >= 1), 'a recheck probe was sent');
+    assert.equal(JSON.parse(seen[0].body).model, 'claude-opus-4-8', 'no Fable request for a general-only shortage');
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
 // The cap must not starve the tail of the fleet: rechecks rotate through
 // every near-quota account and drain without waiting for another timer tick.
 test('stale near-quota rechecks eventually cover every account, each once', async () => {

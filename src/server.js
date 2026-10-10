@@ -1166,8 +1166,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           || (account.status === 'throttled' && account.rateLimitedUntil
             && account.rateLimitedUntil > now)
           || now < (account._nearQuotaRecheckAt || 0)) continue;
-      const template = accountManager._isNearQuota(account, probeTemplate.model)
-        ? probeTemplate : staleRecheckTemplate;
+      // Use the model-tier template only when that model window itself is
+      // near: its response carries the general windows too, so one probe
+      // refreshes both, while a general-only shortage spends no Fable request.
+      const modelWindowNear = Boolean(staleRecheckTemplate)
+        && accountManager._isModelNearQuota(account, staleRecheckTemplate.model);
+      const template = modelWindowNear
+        || (staleRecheckTemplate && !accountManager._isNearQuota(account, probeTemplate.model))
+        ? staleRecheckTemplate : probeTemplate;
       if (!template || !accountManager._isNearQuota(account, template.model)) continue;
       account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
       staleRecheckCursor = (index + 1) % accounts.length;
