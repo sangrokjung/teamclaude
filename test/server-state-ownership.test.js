@@ -174,3 +174,33 @@ test('lifecycle identity accepts a server launched through an absolute symlink e
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// The launchd daemon starts the proxy through the `teamclaude` bin
+// (src/teamclaude.js) while CLI commands run through src/index.js; the
+// lifecycle identity must accept either entry of the same runtime, or `stop`
+// refuses to signal its own server.
+test('stop verifies and stops a server launched through the teamclaude.js entry', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-entry-lifecycle-'));
+  const entry = fileURLToPath(new URL('../src/teamclaude.js', import.meta.url));
+  const port = await unusedPort();
+  const configPath = join(dir, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9', activeWarmup: false,
+    accounts: [{ name: 'api-test', type: 'apikey', apiKey: 'test-api-key' }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  delete env.TEAMCLAUDE_PROVIDER;
+  const child = spawn(process.execPath, [entry, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    await waitUntil(() => lifecycleStateReady(configPath, child.pid), 'proxy did not write lifecycle state', 15000);
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    const result = spawnSync(process.execPath, [cliPath, 'stop'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    await Promise.race([exited, new Promise((_, reject) => setTimeout(() => reject(new Error('server kept running')), 8000))]);
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
