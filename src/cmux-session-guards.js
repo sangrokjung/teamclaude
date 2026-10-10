@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { link, lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 
@@ -71,7 +72,23 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
-async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverableKinds) {
+// Only a positive, safe-integer millisecond timestamp anchors a retry
+// deadline. Anything else (missing, negative, fractional, out of range) yields
+// null so the caller falls back to the transcript mtime instead of waiting on
+// a deadline it can never compute.
+function recordTimestampMs(record) {
+  const value = record?.timestamp;
+  let ms = null;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    ms = value > 1e12 ? value : value * 1000;
+  } else if (typeof value === 'string' && value.length > 0) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) ms = parsed;
+  }
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
+}
+
+async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds) {
   try {
     const original = await lstat(path);
     if (!original.isFile()) return false;
@@ -85,7 +102,22 @@ async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverab
     const { handle, info } = await openPrivateFile(resolvedPath);
     try {
       if (await realpath(path) !== resolvedPath) return false;
-      const start = Math.max(0, info.size - 256 * 1024);
+      // Read the last 256 KiB, widened back to the preceding newline so the
+      // first record in the window is whole (bounded at 16 MiB); a record cut
+      // in half would otherwise be dropped and an unresolved error missed.
+      let start = Math.max(0, info.size - 256 * 1024);
+      const floor = Math.max(0, start - 16 * 1024 * 1024);
+      const probe = Buffer.alloc(64 * 1024);
+      while (start > floor) {
+        const from = Math.max(floor, start - probe.length);
+        const { bytesRead } = await handle.read(probe, 0, start - from, from);
+        const newline = probe.subarray(0, bytesRead).lastIndexOf(10);
+        if (newline !== -1) {
+          start = from + newline + 1;
+          break;
+        }
+        start = from;
+      }
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);
       let blocked = null;
@@ -97,7 +129,21 @@ async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverab
           continue;
         }
         const event = classifyClaudeApiErrorRecord(record);
-        if (event && recoverableKinds.has(event.kind)) blocked = event.kind;
+        if (event && recoverableKinds.has(event.kind)) {
+          blocked = {
+            kind: event.kind,
+            retryAfterSeconds: event.retryAfterSeconds ?? null,
+            // Without a usable record timestamp the transcript mtime anchors
+            // the retry deadline, so recovery is bounded instead of parked.
+            // The record's own timestamp identifies this error event; it is
+            // what keys a recovery claim (null when the record has none).
+            eventTimestampMs: recordTimestampMs(record),
+            // Claude Code gives every transcript record a unique uuid; it
+            // distinguishes two errors written in the same millisecond.
+            eventId: typeof record.uuid === 'string' && UUID_RE.test(record.uuid) ? record.uuid : null,
+            timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
+          };
+        }
         else if (blocked && isConversationRecord(record)) blocked = null;
       }
       return blocked;
@@ -107,6 +153,10 @@ async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverab
   } catch {
     return false;
   }
+}
+
+async function unresolvedApiErrorKind(path, transcriptRoot, sessionId, recoverableKinds) {
+  return (await unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds))?.kind || false;
 }
 
 export function hasUnresolvedLoginExpired(path, transcriptRoot, sessionId) {
@@ -119,7 +169,16 @@ export function unresolvedRecoverableApiErrorKind(path, transcriptRoot, sessionI
     path,
     transcriptRoot,
     sessionId,
-    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch']),
+    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch', 'fleet_exhausted']),
+  );
+}
+
+export function unresolvedRecoverableApiErrorState(path, transcriptRoot, sessionId) {
+  return unresolvedApiError(
+    path,
+    transcriptRoot,
+    sessionId,
+    new Set(['login_expired', 'connection_lost', 'ambiguous_connection', 'ambiguous_dispatch', 'fleet_exhausted']),
   );
 }
 
@@ -148,6 +207,7 @@ export function validSession(store, session) {
 
 export {
   inspectClaudeProcess,
+  inspectClaudeProcessTree,
   resolveTrustedClaudePath,
   sameClaudeProcess,
 } from './cmux-process-guard.js';
@@ -189,13 +249,60 @@ export async function claimSessionOnce(
         || !sameIdentity(currentClaim, claimInfo)) {
       throw new Error('Recovery claim identity changed.');
     }
-    return true;
+    return { dev: claimInfo.dev, ino: claimInfo.ino };
   } catch (err) {
     if (err.code === 'EEXIST') return false;
     throw err;
   } finally {
     await handle?.close();
     await directoryHandle.close();
+  }
+}
+
+export async function releaseSessionClaim(
+  storePath,
+  sessionId,
+  expectedIdentity = null,
+  { afterCheck = null } = {},
+) {
+  const claimDir = `${storePath}.recovery-claims`;
+  let directoryHandle;
+  try {
+    const directory = await openPrivateDirectory(claimDir);
+    directoryHandle = directory.handle;
+    const claimPath = join(claimDir, sessionId);
+    const claimInfo = await lstat(claimPath);
+    if (!ownedPrivate(claimInfo, 'isFile')) {
+      throw new Error('Untrusted recovery claim.');
+    }
+    if (expectedIdentity
+        && !sameIdentity(claimInfo, expectedIdentity)) return false;
+    await afterCheck?.();
+    // Detach the claim with an atomic rename and verify what was detached: a
+    // claim swapped in after the check above is put back instead of deleted.
+    const detached = join(claimDir, `.${sessionId}.releasing-${randomUUID()}`);
+    await rename(claimPath, detached);
+    const detachedInfo = await lstat(detached);
+    if (!ownedPrivate(detachedInfo, 'isFile')
+        || (expectedIdentity && !sameIdentity(detachedInfo, expectedIdentity))) {
+      try {
+        await link(detached, claimPath);
+      } catch (err) {
+        // A newer claim already took the name; the detached one is superseded.
+        if (err.code !== 'EEXIST') throw err;
+      }
+      await unlink(detached);
+      await directoryHandle.sync();
+      return false;
+    }
+    await unlink(detached);
+    await directoryHandle.sync();
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  } finally {
+    await directoryHandle?.close();
   }
 }
 

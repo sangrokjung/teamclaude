@@ -379,6 +379,7 @@ export function createDefaultConfig() {
     launchModel: null,
     autoResumeClaude: true,
     claudeAutoResumeMaxRetries: 3,
+    claudeFleetExhaustionMaxRetries: 0,
     claudeAutoResumeBackoffMs: 2000,
     codexFallbackOnExhaustion: false,
     // Codex mode: redeem the account's ChatGPT rate-limit reset credits (the

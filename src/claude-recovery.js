@@ -17,6 +17,15 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function delayLong(ms) {
+  let remaining = ms;
+  while (remaining > 0) {
+    const slice = Math.min(remaining, 0x7fffffff);
+    await delay(slice);
+    remaining -= slice;
+  }
+}
+
 function confirmedAccountRotation(recovery, childEnv) {
   if (recovery?.rotated !== true
       || typeof recovery.previousAccountUuid !== 'string'
@@ -80,6 +89,10 @@ function textBlocks(content) {
 }
 
 const FABLE_USAGE_CREDITS_MESSAGE = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+const MAX_RETRY_AFTER_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
+const MAX_FLEET_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
+const FLEET_EXHAUSTED_RE = /^API Error: Server is temporarily limiting requests \(not your usage limit\) · All [1-9]\d* accounts exhausted\. Retry(?: |\r?\n {2})in ([1-9]\d*)s\.$/;
+const FLEET_EXHAUSTED_SUFFIX_RE = /All [1-9]\d* accounts exhausted\. Retry\s+in [1-9]\d*s\.$/;
 const AUTO_MODE_UNAVAILABLE_MESSAGE = 'claude-sonnet-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again. If it keeps failing, continue with other tasks that don\'t require this action and come back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.';
 const SAFEGUARD_REFUSAL_CORE = "Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't respond to this message with Fable 5. Double press esc to edit your last message, or try a different model with /model. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/15363606";
 const ANSI_ESCAPE_RE = /\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~])/g;
@@ -172,6 +185,36 @@ export function classifyClaudeApiErrorRecord(record) {
       && record.apiErrorStatus === 429
       && normalizedMessage === FABLE_USAGE_CREDITS_MESSAGE) {
     return { kind: 'usage_limit', record };
+  }
+  const fleetExhausted = message.match(FLEET_EXHAUSTED_RE);
+  const contentBlock = record.message?.content?.length === 1
+    ? record.message.content[0]
+    : null;
+  const isStructuredFleetError = record.type === 'assistant'
+    && record.message?.role === 'assistant'
+    && contentBlock?.type === 'text'
+    && typeof contentBlock.text === 'string';
+  const isRateLimitError = record.error === 'rate_limit'
+    || record.error === 'rate_limit_error'
+    || record.error === 'overloaded_error';
+  if (isStructuredFleetError
+      && isRateLimitError
+      && record.apiErrorStatus === 429
+      && fleetExhausted) {
+    const retryAfterSeconds = Number(fleetExhausted[1]);
+    if (Number.isSafeInteger(retryAfterSeconds)
+        && retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
+      return { kind: 'fleet_exhausted', retryAfterSeconds, record };
+    }
+  }
+  const fleetSuffix = FLEET_EXHAUSTED_SUFFIX_RE.test(message)
+    || FLEET_EXHAUSTED_SUFFIX_RE.test(message.trim());
+  if ((fleetExhausted && !isStructuredFleetError)
+      || (!fleetExhausted && fleetSuffix)) {
+    return { kind: 'limit', noAutoResume: true, record };
+  }
+  if (fleetExhausted) {
+    return { kind: 'limit', noAutoResume: true, record };
   }
   if (isStructuredAssistantError
       && record.isApiErrorMessage === true
@@ -318,6 +361,18 @@ function redactSecrets(text) {
     );
 }
 
+function sanitizeBranch(value) {
+  if (typeof value !== 'string') return null;
+  if (/[\r\n\u2028\u2029]/.test(value)) return null;
+  const sanitized = redactSecrets(value)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 256);
+  return sanitized && /^[A-Za-z0-9._/-]+$/.test(sanitized)
+    ? sanitized
+    : null;
+}
+
 async function writeHandoff({
   transcriptPath,
   sessionId,
@@ -327,6 +382,7 @@ async function writeHandoff({
   const raw = await readTail(transcriptPath, 1024 * 1024);
   const messages = [];
   let branch = null;
+  let branchInvalid = false;
   for (const line of raw.split('\n')) {
     let record;
     try {
@@ -334,7 +390,15 @@ async function writeHandoff({
     } catch {
       continue;
     }
-    if (record.gitBranch) branch = record.gitBranch;
+    if (Object.hasOwn(record, 'gitBranch')) {
+      const sanitizedBranch = sanitizeBranch(record.gitBranch);
+      if (branchInvalid || !sanitizedBranch) {
+        branch = null;
+        branchInvalid = true;
+      } else {
+        branch = sanitizedBranch;
+      }
+    }
     if (record.isMeta || record.isApiErrorMessage) continue;
     if (record.type !== 'user') continue;
     const text = textBlocks(record.message?.content).join('\n').trim();
@@ -445,6 +509,7 @@ async function monitorChild({
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
   let currentOffset = offset;
+  let currentIdentity = null;
   let pending = '';
   let unresolvedEvent = null;
   const failureSettleMs = Number.isFinite(pollIntervalMs)
@@ -464,7 +529,11 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
-    if (info.size < currentOffset) {
+    // A shrunk file (truncation) or a different file at the same path
+    // (rotation) cannot continue the old offset: read it from the start.
+    if (info.size < currentOffset
+        || (currentIdentity
+          && (info.dev !== currentIdentity.dev || info.ino !== currentIdentity.ino))) {
       currentOffset = 0;
       pending = '';
     }
@@ -481,6 +550,7 @@ async function monitorChild({
       }
     }
     currentOffset = info.size;
+    currentIdentity = { dev: info.dev, ino: info.ino };
     const lines = (pending + chunk.toString('utf8')).split('\n');
     pending = final ? '' : lines.pop();
     for (const line of lines) {
@@ -506,6 +576,7 @@ async function monitorChild({
       transcriptPath: currentPath,
       sessionId: currentSessionId,
       offset: currentOffset,
+      identity: currentIdentity,
     };
   }
 
@@ -539,6 +610,77 @@ async function monitorChild({
   }
 }
 
+const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
+const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
+
+// Scan what was appended after `offset` in bounded chunks: a session can keep
+// writing for days while parked, so the tail must never be read in one buffer.
+// A line too large to hold is a real conversation record (API error records are
+// small), so it counts as activity — the safe side against a duplicate resume.
+//
+// Anything that prevents a trustworthy answer counts as activity too, so the
+// caller preserves the session instead of resuming it blind: an unreadable
+// transcript, one that shrank below the recorded offset (truncated/rewritten),
+// or a different file than the one the offset was taken from (rotated).
+export async function transcriptHasConversationAfter(path, offset, expectedIdentity = null) {
+  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return true;
+  // No size shortcut before opening: a record appended between a size check
+  // and the read would be missed. The read loop below re-checks at EOF.
+  const handle = await open(path, 'r').catch(() => null);
+  if (!handle) return true;
+  const opened = await handle.stat().catch(() => null);
+  if (!opened || opened.size < offset
+      || (expectedIdentity
+        && (opened.dev !== expectedIdentity.dev || opened.ino !== expectedIdentity.ino))) {
+    await handle.close();
+    return true;
+  }
+  const isConversationLine = line => {
+    if (line.length === 0) return false;
+    try {
+      return isConversationRecord(JSON.parse(line.toString('utf8')));
+    } catch {
+      return false;
+    }
+  };
+  try {
+    let pending = Buffer.alloc(0);
+    let position = offset;
+    const chunk = Buffer.alloc(TRANSCRIPT_SCAN_CHUNK_BYTES);
+    // Read to the live end of file rather than the size seen at the start:
+    // Claude may append a record while the scan runs, and missing it would
+    // resume a turn that already continued. Stop only when a re-stat at EOF
+    // shows nothing new.
+    for (;;) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) {
+        // At EOF the path must still name the file being read and must not
+        // have shrunk: a rotation or truncation during the scan means records
+        // may live elsewhere, so the answer is "active" (preserve the session).
+        const [now, atPath] = await Promise.all([
+          handle.stat().catch(() => null),
+          stat(path).catch(() => null),
+        ]);
+        if (!now || !atPath || now.size < position
+            || atPath.dev !== opened.dev || atPath.ino !== opened.ino) return true;
+        if (now.size === position) break;
+        continue;
+      }
+      position += bytesRead;
+      let data = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+      for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
+        if (isConversationLine(data.subarray(0, newline))) return true;
+        data = data.subarray(newline + 1);
+      }
+      if (data.length > TRANSCRIPT_MAX_LINE_BYTES) return true;
+      pending = Buffer.from(data);
+    }
+    return isConversationLine(pending);
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function runClaudeWithRecovery({
   claudeArgs,
   childEnv,
@@ -554,6 +696,7 @@ export async function runClaudeWithRecovery({
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
+  wait = delayLong,
 }) {
   const selector = sessionSelector(claudeArgs);
   if (selector.kind === 'ambiguous') {
@@ -570,6 +713,9 @@ export async function runClaudeWithRecovery({
   const maxRetries = Number.isFinite(config.claudeAutoResumeMaxRetries)
     ? Math.max(0, Math.floor(config.claudeAutoResumeMaxRetries))
     : 3;
+  const maxFleetExhaustionRetries = Number.isFinite(config.claudeFleetExhaustionMaxRetries)
+    ? Math.max(0, Math.floor(config.claudeFleetExhaustionMaxRetries))
+    : 0;
   const backoffMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
     ? Math.max(0, Math.floor(config.claudeAutoResumeBackoffMs))
     : 2000;
@@ -583,6 +729,7 @@ export async function runClaudeWithRecovery({
     ? Math.max(0, Math.floor(config.claudeSafeguardMaxResumes))
     : 1;
   let retries = 0;
+  let fleetExhaustionRetries = 0;
   let ambiguousRecoveries = 0;
   let safetyDenialRecoveries = 0;
   let safeguardRecoveries = 0;
@@ -857,6 +1004,34 @@ export async function runClaudeWithRecovery({
       return launchCodex(handoff);
     }
 
+    if (outcome.event.kind === 'fleet_exhausted'
+        && config.autoResumeClaude === true
+        && sessionId
+        && (maxFleetExhaustionRetries === 0
+          || fleetExhaustionRetries < maxFleetExhaustionRetries)) {
+      fleetExhaustionRetries += 1;
+      const retryAfterSeconds = outcome.event.retryAfterSeconds;
+      const waitMs = Math.min(retryAfterSeconds * 1000, MAX_FLEET_WAIT_MS);
+      const waitSeconds = Math.ceil(waitMs / 1000);
+      const retryBudget = maxFleetExhaustionRetries === 0
+        ? `${fleetExhaustionRetries}/unlimited`
+        : `${fleetExhaustionRetries}/${maxFleetExhaustionRetries}`;
+      log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
+      await stopChild(child);
+      await wait(waitMs);
+      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset, outcome.identity)) {
+        log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
+        return childExit(child);
+      }
+      nextArgs = ['--resume', sessionId, 'continue'];
+      continue;
+    }
+
+    if (outcome.event.kind === 'fleet_exhausted') {
+      log(`[TeamClaude] Fleet exhaustion resume budget exhausted (${fleetExhaustionRetries}/${maxFleetExhaustionRetries}); preserving session ${sessionId} for manual continuation.`);
+      return childExit(child);
+    }
+
     if (outcome.event.kind === 'usage_limit') {
       log('[TeamClaude] Claude usage limit detected; account rotation was not confirmed, so the same account will not be restarted.');
       if (usageChildStopped) return { status: child.exitCode ?? 1, signal: null };
@@ -875,7 +1050,10 @@ export async function runClaudeWithRecovery({
       continue;
     }
 
-    if (config.autoResumeClaude === true && sessionId && retries < maxRetries) {
+    if (config.autoResumeClaude === true
+        && outcome.event.noAutoResume !== true
+        && sessionId
+        && retries < maxRetries) {
       retries += 1;
       log(`[TeamClaude] Claude ${outcome.event.kind} detected; resuming session automatically (${retries}/${maxRetries}).`);
       await stopChild(child);
