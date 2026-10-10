@@ -11,6 +11,7 @@ import {
   rename,
   rm,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -29,6 +30,7 @@ import {
   readPrivateJson,
   releaseSessionClaim,
   sameClaudeProcess,
+  unresolvedRecoverableApiErrorState,
 } from '../src/cmux-session-guards.js';
 
 const SESSION_ID = '11111111-1111-4111-8111-111111111111';
@@ -1749,4 +1751,20 @@ test('fails closed when a selectorless child has a sibling naming another sessio
     listDirectChildren: async () => [{ pid: selectorless.pid, command: selectorless.command }],
   });
   assert.equal(alone.pid, selectorless.pid);
+});
+
+// A fleet-exhaustion record without a usable timestamp must still yield a
+// bounded retry deadline: the transcript's modification time stands in, so
+// automatic recovery is never parked forever.
+test('a fleet-exhaustion record without a timestamp falls back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+  delete record.timestamp;
+  await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+  const past = new Date(Date.now() - 3600_000);
+  await utimes(fx.transcriptPath, past, past);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state.kind, 'fleet_exhausted');
+  assert.ok(Number.isFinite(state.timestampMs), 'a deadline anchor exists');
+  assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, 'anchored at the transcript mtime');
 });

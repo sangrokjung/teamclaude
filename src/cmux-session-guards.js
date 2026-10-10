@@ -114,7 +114,9 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
           blocked = {
             kind: event.kind,
             retryAfterSeconds: event.retryAfterSeconds ?? null,
-            timestampMs: recordTimestampMs(record),
+            // Without a usable record timestamp the transcript mtime anchors
+            // the retry deadline, so recovery is bounded instead of parked.
+            timestampMs: recordTimestampMs(record) ?? Math.floor(info.mtimeMs),
           };
         }
         else if (blocked && isConversationRecord(record)) blocked = null;
