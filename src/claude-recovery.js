@@ -650,8 +650,16 @@ export async function transcriptHasConversationAfter(path, offset, expectedIdent
     for (;;) {
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
       if (bytesRead === 0) {
-        const now = await handle.stat().catch(() => null);
-        if (!now || now.size <= position) break;
+        // At EOF the path must still name the file being read and must not
+        // have shrunk: a rotation or truncation during the scan means records
+        // may live elsewhere, so the answer is "active" (preserve the session).
+        const [now, atPath] = await Promise.all([
+          handle.stat().catch(() => null),
+          stat(path).catch(() => null),
+        ]);
+        if (!now || !atPath || now.size < position
+            || atPath.dev !== opened.dev || atPath.ino !== opened.ino) return true;
+        if (now.size === position) break;
         continue;
       }
       position += bytesRead;

@@ -3666,3 +3666,24 @@ test('transcript activity scan fails closed on truncation, rotation and unreadab
   await rm(path);
   assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'missing');
 });
+
+test('transcript activity scan fails closed when the file rotates or shrinks mid-scan', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-transcript-race-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 's.jsonl');
+  const errorLine = `${fleetExhaustedRecord(root)}\n`;
+  const body = errorLine.repeat(20000);
+
+  // Rotation while the scan is reading the old inode.
+  await writeFile(path, body);
+  let scan = transcriptHasConversationAfter(path, 0);
+  await rename(path, `${path}.old`);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'rotated mid-scan');
+
+  // Truncation below the recorded offset, whenever it lands during the scan.
+  await writeFile(path, body);
+  scan = transcriptHasConversationAfter(path, errorLine.length * 10000);
+  await writeFile(path, errorLine);
+  assert.equal(await scan, true, 'shrunk mid-scan');
+});
