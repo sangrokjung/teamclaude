@@ -224,14 +224,17 @@ export async function inspectClaudeProcess(pid) {
     const agentLaunchKindValues = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_KIND');
     const executablePath = processCommand.split(/\s+/)[0] || '';
     const launchCwd = environmentValues(environmentText, 'CMUX_AGENT_LAUNCH_CWD')[0] || '';
-    let cwd = environmentValues(environmentText, 'PWD')[0] || launchCwd;
+    // Only the kernel's view of the cwd counts; PWD and the launch cwd in the
+    // environment can be stale or set by anyone, so an unreadable cwd stays
+    // null and identity checks that compare it fail closed.
+    let cwd = null;
     try {
       const { stdout: cwdOutput } = await execFileAsync(
         'lsof',
         ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
         { timeout: 1500 },
       );
-      cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || cwd;
+      cwd = cwdOutput.split('\n').find(line => line.startsWith('n'))?.slice(1) || null;
     } catch {}
     const launchArgv = launchArgvValues.length === 1
       ? decodeLaunchArgv(launchArgvValues[0])

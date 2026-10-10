@@ -72,16 +72,20 @@ function pathInside(path, root) {
   return rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
 
+// Only a positive, safe-integer millisecond timestamp anchors a retry
+// deadline. Anything else (missing, negative, fractional, out of range) yields
+// null so the caller falls back to the transcript mtime instead of waiting on
+// a deadline it can never compute.
 function recordTimestampMs(record) {
   const value = record?.timestamp;
+  let ms = null;
   if (typeof value === 'number' && Number.isFinite(value)) {
-    return value > 1e12 ? value : value * 1000;
-  }
-  if (typeof value === 'string' && value.length > 0) {
+    ms = value > 1e12 ? value : value * 1000;
+  } else if (typeof value === 'string' && value.length > 0) {
     const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return parsed;
+    if (Number.isFinite(parsed)) ms = parsed;
   }
-  return null;
+  return Number.isSafeInteger(ms) && ms > 0 ? ms : null;
 }
 
 async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKinds) {

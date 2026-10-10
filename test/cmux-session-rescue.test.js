@@ -1768,3 +1768,21 @@ test('a fleet-exhaustion record without a timestamp falls back to the transcript
   assert.ok(Number.isFinite(state.timestampMs), 'a deadline anchor exists');
   assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, 'anchored at the transcript mtime');
 });
+
+test('malformed fleet-exhaustion timestamps fall back to the transcript mtime', async t => {
+  const fx = await fixture(t);
+  const past = new Date(Date.now() - 3600_000);
+  for (const timestamp of [-1, 1791600000000.5, Number.MAX_VALUE, 0, 'not a date']) {
+    const record = JSON.parse(fleetExhaustedRecord(fx.cwd, 60));
+    record.timestamp = timestamp;
+    await writeFile(fx.transcriptPath, `${JSON.stringify(record)}\n`);
+    await utimes(fx.transcriptPath, past, past);
+    const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+    assert.ok(Math.abs(state.timestampMs - past.getTime()) < 2000, `timestamp ${timestamp}`);
+  }
+});
+
+test('a process whose cwd could not be read is never treated as the session process', async t => {
+  const fx = await fixture(t);
+  assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { cwd: null }), fx.executablePath), false);
+});
