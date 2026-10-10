@@ -6,6 +6,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile,
@@ -3652,9 +3653,13 @@ test('transcript activity scan fails closed on truncation, rotation and unreadab
   await writeFile(path, errorLine);
   assert.equal(await transcriptHasConversationAfter(path, offset), true, 'truncated');
 
-  // Rotated: same path, different file, even if it is long enough.
-  await rm(path);
-  await writeFile(path, errorLine.repeat(20));
+  // Rotated: same path, different file, even if it is long enough. The old
+  // file is kept under another name so its inode cannot be reused (Linux can
+  // hand a just-freed inode straight to the next file).
+  await rename(path, `${path}.old`);
+  await writeFile(`${path}.new`, errorLine.repeat(20));
+  await rename(`${path}.new`, path);
+  assert.notEqual((await stat(path)).ino, identity.ino);
   assert.equal(await transcriptHasConversationAfter(path, offset, identity), true, 'rotated');
 
   // Unreadable (missing) transcript.
