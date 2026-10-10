@@ -125,3 +125,4 @@ Spec: `docs/specs/2026-08-29-claude-fleet-exhaustion-auto-resume.md`
   qgate의 머신 부하 차단이며, 관련 변경 suite는 위의 직렬 실행으로 완주했습니다.
 
 - 2026-10-11 적대 검증 보완: cmux rescuer와 launcher가 동일한 `recovery-claims` inode를 공유해 fleet 429 대기 중 이중 `--resume`를 막습니다. launcher가 claim을 얻지 못하면 기존 세션을 보존하고 rescuer 단일 경로에 맡깁니다. ID 없는 selector resolver는 spawn 전 transcript 크기 baseline을 유지해 resolver가 session ID를 늦게 확정해도 그 사이 기록된 fleet 오류를 놓치지 않습니다. cmux resolver는 `CMUX_CLAUDE_PID`가 현재 launcher PID와 일치할 때만 활성화됩니다. RED→GREEN 회귀 테스트와 120/120·52/52·22/22 핵심 suite, syntax·scoped ESLint·diff-check를 통과했습니다.
+- 2026-10-11 후속 적대 검증 보완: 영구 replay claim(`recovery-claims`)과 현재 복구 주체를 조정하는 transient lease(`recovery-leases`)를 분리했습니다. rescuer는 두 계층을 모두 검증하고, launcher는 lease만 사용하므로 성공한 과거 rescue claim이 같은 세션의 후속 launcher를 막지 않습니다. lease에는 PID·프로세스 시작시각을 기록하고 dead/PID-reuse owner만 회수하며, launcher는 `finally`에서 모든 종료 경로의 lease를 해제합니다. 관련 suite는 174/174·54/54로 통과했습니다.

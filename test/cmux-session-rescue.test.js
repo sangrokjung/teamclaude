@@ -22,11 +22,13 @@ import {
 } from '../src/cmux-session-rescue.js';
 import {
   claimSessionOnce,
+  claimSessionLease,
   inspectClaudeProcess,
   inspectClaudeProcessTree,
   readPrivateJson,
   resolveCmuxSessionId,
   releaseSessionClaim,
+  releaseSessionLease,
   sameClaudeProcess,
 } from '../src/cmux-session-guards.js';
 
@@ -1439,6 +1441,35 @@ test('releases only the recovery claim inode it acquired', async t => {
   assert.equal(await releaseSessionClaim(fx.storePath, SESSION_ID, claim), false);
   const replacement = await open(claimPath, 'r');
   await replacement.close();
+});
+
+test('transient actor lease is separate from permanent replay claim', async t => {
+  const fx = await fixture(t);
+  const lease = await claimSessionLease(fx.storePath, SESSION_ID);
+  assert.equal(typeof lease.dev, 'number');
+  assert.equal(await claimSessionLease(fx.storePath, SESSION_ID), false);
+  assert.equal(await releaseSessionLease(fx.storePath, SESSION_ID, lease), true);
+  assert.equal(await releaseSessionLease(fx.storePath, SESSION_ID, lease), false);
+
+  await claimSessionOnce(fx.storePath, SESSION_ID);
+  const laterLease = await claimSessionLease(fx.storePath, SESSION_ID);
+  assert.equal(typeof laterLease.dev, 'number');
+  await releaseSessionLease(fx.storePath, SESSION_ID, laterLease);
+});
+
+test('stale transient lease is reclaimed only after its owner is gone', async t => {
+  const fx = await fixture(t);
+  const leaseDir = `${fx.storePath}.recovery-leases`;
+  await mkdir(leaseDir, { mode: 0o700 });
+  await writeFile(
+    join(leaseDir, SESSION_ID),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    { mode: 0o600 },
+  );
+
+  const lease = await claimSessionLease(fx.storePath, SESSION_ID);
+  assert.equal(typeof lease.dev, 'number');
+  assert.equal(await releaseSessionLease(fx.storePath, SESSION_ID, lease), true);
 });
 
 test('coalesces concurrent rescue scans and never adopts the same process twice', async t => {

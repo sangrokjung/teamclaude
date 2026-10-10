@@ -689,6 +689,8 @@ export async function runClaudeWithRecovery({
   sessionResolvePollIntervalMs = 50,
   claimRecovery,
   releaseRecovery,
+  claimRecoveryLease = claimRecovery,
+  releaseRecoveryLease = releaseRecovery,
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
@@ -736,20 +738,20 @@ export async function runClaudeWithRecovery({
   let fleetRecoveryClaimSessionId = null;
   const releaseFleetRecoveryClaim = async () => {
     if (!fleetRecoveryClaim || !fleetRecoveryClaimSessionId
-        || typeof releaseRecovery !== 'function') return;
+        || typeof releaseRecoveryLease !== 'function') return;
     const claim = fleetRecoveryClaim;
     const claimedSessionId = fleetRecoveryClaimSessionId;
     fleetRecoveryClaim = null;
     fleetRecoveryClaimSessionId = null;
     try {
-      await releaseRecovery(claimedSessionId, claim);
+      await releaseRecoveryLease(claimedSessionId, claim);
     } catch {}
   };
   const acquireFleetRecoveryClaim = async session => {
     if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) return true;
-    if (typeof claimRecovery !== 'function') return true;
+    if (typeof claimRecoveryLease !== 'function') return true;
     try {
-      const claim = await claimRecovery(session);
+      const claim = await claimRecoveryLease(session);
       if (!claim) return false;
       fleetRecoveryClaim = claim;
       fleetRecoveryClaimSessionId = session;
@@ -759,12 +761,14 @@ export async function runClaudeWithRecovery({
     }
   };
 
+  try {
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
     const transcriptKnownAbsent = !transcriptPath;
     let offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
     const transcriptSizesBeforeLaunch = selector.kind === 'ambiguous'
       && selector.resolverSafe === true
+      && !sessionId
       ? await snapshotTranscriptSizes(transcriptRoot)
       : null;
     const launchStartedAtMs = Date.now();
@@ -813,8 +817,8 @@ export async function runClaudeWithRecovery({
           && Number.isFinite(discovered?.birthtimeMs)
           && discovered.birthtimeMs >= launchStartedAtMs;
         const priorSize = transcriptSizesBeforeLaunch?.get(transcriptPath);
-        offset = Number.isFinite(priorSize)
-          ? (discovered.size < priorSize ? 0 : priorSize)
+          offset = Number.isFinite(priorSize)
+          ? ((discovered?.size ?? 0) < priorSize ? 0 : priorSize)
           : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       } else {
         offset = 0;
@@ -1147,5 +1151,8 @@ export async function runClaudeWithRecovery({
       continue;
     }
     return childExit(child);
+  }
+  } finally {
+    await releaseFleetRecoveryClaim();
   }
 }

@@ -1,6 +1,8 @@
 import { constants } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
+import { promisify } from 'node:util';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 import {
   inspectClaudeProcess as defaultInspectClaudeProcess,
@@ -11,6 +13,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const SURFACE_RE = /^(?:surface:\d+|[0-9a-f-]{36})$/i;
 const NOFOLLOW = constants.O_NOFOLLOW || 0;
 const DIRECTORY = constants.O_DIRECTORY || 0;
+const execFileAsync = promisify(execFile);
 
 function ownedPrivate(info, expectedType) {
   if (!info[expectedType]()) return false;
@@ -20,6 +23,10 @@ function ownedPrivate(info, expectedType) {
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertSessionId(sessionId) {
+  if (!UUID_RE.test(sessionId || '')) throw new Error('Invalid recovery session id.');
 }
 
 async function openPrivateFile(path) {
@@ -260,6 +267,7 @@ export async function claimSessionOnce(
   sessionId,
   { syncDirectory = handle => handle.sync() } = {},
 ) {
+  assertSessionId(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   await mkdir(claimDir, { recursive: true, mode: 0o700 });
   const { handle: directoryHandle, info: directoryInfo } =
@@ -303,6 +311,7 @@ export async function claimSessionOnce(
 }
 
 export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
+  assertSessionId(sessionId);
   const claimDir = `${storePath}.recovery-claims`;
   let directoryHandle;
   try {
@@ -321,6 +330,152 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
   } catch (err) {
     if (err.code === 'ENOENT') return false;
     throw err;
+  } finally {
+    await directoryHandle?.close();
+  }
+}
+
+function processStartSeconds() {
+  return (Date.now() - process.uptime() * 1000) / 1000;
+}
+
+async function inspectProcessStartSeconds(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const { stdout } = await execFileAsync(
+      'ps',
+      ['-p', String(pid), '-o', 'lstart='],
+      { timeout: 1500, env: { ...process.env, LC_ALL: 'C' } },
+    );
+    const value = new Date(stdout.trim()).getTime() / 1000;
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+async function leaseOwnerAlive(owner) {
+  if (!Number.isInteger(owner?.pid) || owner.pid <= 0
+      || !Number.isFinite(owner.processStartSeconds)) return false;
+  if (!processAlive(owner.pid)) return false;
+  const actualStart = await inspectProcessStartSeconds(owner.pid);
+  return Number.isFinite(actualStart)
+    && Math.abs(actualStart - owner.processStartSeconds) <= 2;
+}
+
+async function readLeaseOwner(path) {
+  const { handle } = await openPrivateFile(path);
+  try {
+    const value = JSON.parse(await handle.readFile({ encoding: 'utf8' }));
+    if (!value || typeof value !== 'object' || value.version !== 1) {
+      throw new Error('Invalid recovery lease.');
+    }
+    return value;
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * A transient cross-process lease. It deliberately lives in a different
+ * directory from the permanent replay claim so a successful cmux rescue does
+ * not suppress a later launcher retry in the same session.
+ */
+export async function claimSessionLease(
+  storePath,
+  sessionId,
+  {
+    syncDirectory = handle => handle.sync(),
+  } = {},
+) {
+  assertSessionId(sessionId);
+  const leaseDir = `${storePath}.recovery-leases`;
+  await mkdir(leaseDir, { recursive: true, mode: 0o700 });
+  const { handle: directoryHandle, info: directoryInfo } =
+    await openPrivateDirectory(leaseDir);
+  const leasePath = join(leaseDir, sessionId);
+  try {
+    try {
+      const owner = await readLeaseOwner(leasePath);
+      if (owner && await leaseOwnerAlive(owner)) return false;
+      const stale = await lstat(leasePath);
+      if (!ownedPrivate(stale, 'isFile')) throw new Error('Untrusted recovery lease.');
+      await unlink(leasePath);
+      await syncDirectory(directoryHandle);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    let handle;
+    try {
+      handle = await open(
+        leasePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW,
+        0o600,
+      );
+      await handle.writeFile(JSON.stringify({
+        version: 1,
+        pid: process.pid,
+        processStartSeconds: processStartSeconds(),
+        createdAt: Date.now(),
+      }));
+      await handle.sync();
+      await syncDirectory(directoryHandle);
+      const [currentDirectory, currentLease, leaseInfo] = await Promise.all([
+        lstat(leaseDir),
+        lstat(leasePath),
+        handle.stat(),
+      ]);
+      if (!ownedPrivate(currentDirectory, 'isDirectory')
+          || !sameIdentity(currentDirectory, directoryInfo)
+          || !ownedPrivate(currentLease, 'isFile')
+          || !sameIdentity(currentLease, leaseInfo)) {
+        throw new Error('Recovery lease identity changed.');
+      }
+      return {
+        dev: leaseInfo.dev,
+        ino: leaseInfo.ino,
+        pid: process.pid,
+        processStartSeconds: processStartSeconds(),
+      };
+    } catch (error) {
+      if (error.code === 'EEXIST') return false;
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  } finally {
+    await directoryHandle.close();
+  }
+}
+
+export async function releaseSessionLease(storePath, sessionId, expectedIdentity = null) {
+  assertSessionId(sessionId);
+  const leaseDir = `${storePath}.recovery-leases`;
+  let directoryHandle;
+  try {
+    const directory = await openPrivateDirectory(leaseDir);
+    directoryHandle = directory.handle;
+    const leasePath = join(leaseDir, sessionId);
+    const leaseInfo = await lstat(leasePath);
+    if (!ownedPrivate(leaseInfo, 'isFile')) throw new Error('Untrusted recovery lease.');
+    if (expectedIdentity && !sameIdentity(leaseInfo, expectedIdentity)) return false;
+    await unlink(leasePath);
+    await directoryHandle.sync();
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
   } finally {
     await directoryHandle?.close();
   }

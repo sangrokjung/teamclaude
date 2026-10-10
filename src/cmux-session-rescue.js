@@ -6,10 +6,12 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import {
   buildResumeCommand,
+  claimSessionLease,
   claimSessionOnce,
   inspectClaudeProcess,
   inspectClaudeProcessTree,
   readPrivateJson,
+  releaseSessionLease,
   releaseSessionClaim,
   resolveTrustedClaudePath,
   sameClaudeProcess,
@@ -223,6 +225,8 @@ export async function rescueCmuxSessionsOnce({
   resolveRecoveryWindow = null,
   claimRecovery = claimSessionOnce,
   releaseRecovery = releaseSessionClaim,
+  claimLease = claimSessionLease,
+  releaseLease = releaseSessionLease,
   stopProcess = stopExistingSessionProcess,
   stopInspectProcess = inspectClaudeProcess,
   trustedClaudePath = null,
@@ -343,7 +347,17 @@ export async function rescueCmuxSessionsOnce({
       }
     }
     let claimOwned = false;
+    let leaseOwned = false;
+    const releaseLeaseForRetry = async () => {
+      if (!leaseOwned) return;
+      const leaseIdentity = typeof leaseOwned === 'object' ? leaseOwned : null;
+      leaseOwned = false;
+      try {
+        await releaseLease(storePath, key, leaseIdentity);
+      } catch {}
+    };
     const releaseClaimForRetry = async () => {
+      await releaseLeaseForRetry();
       if (!claimOwned) return;
       const claimIdentity = typeof claimOwned === 'object' ? claimOwned : null;
       claimOwned = false;
@@ -353,8 +367,17 @@ export async function rescueCmuxSessionsOnce({
       } catch {}
     };
     try {
+      const lease = await claimLease(storePath, key);
+      if (!lease) {
+        // Another actor owns the transient lease. Do not poison this
+        // rescuer's attempted set; a later scan may retry after that actor
+        // exits without completing recovery.
+        continue;
+      }
+      leaseOwned = lease;
       const claim = await claimRecovery(storePath, key);
       if (!claim) {
+        await releaseLeaseForRetry();
         attempted.add(key);
         continue;
       }
@@ -456,7 +479,12 @@ export async function rescueCmuxSessionsOnce({
         command,
       });
       rescued += 1;
+      await releaseLeaseForRetry();
+      claimOwned = false;
     } catch {
+      // Keep the permanent replay claim when workspace launch is ambiguous;
+      // only the transient actor lease must be released.
+      await releaseLeaseForRetry();
       failed += 1;
     }
   }

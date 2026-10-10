@@ -3669,6 +3669,7 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
   const calls = [];
   const waits = [];
   const logs = [];
+  let leaseReleases = 0;
 
   const result = await runClaudeWithRecovery({
     claudeArgs: [],
@@ -3684,6 +3685,8 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
     transcriptRoot,
     pollIntervalMs: 5,
     fetchStatus: async () => statusWithQuota(0.5),
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => { leaseReleases += 1; },
     wait: async milliseconds => { waits.push(milliseconds); },
     log: message => logs.push(message),
     spawnClaude(args) {
@@ -3708,6 +3711,7 @@ test('fleet exhaustion budget exhaustion does not fall through to generic resume
   assert.equal(result.status, 9);
   assert.deepEqual(waits, [3000]);
   assert.equal(calls.length, 2);
+  assert.equal(leaseReleases, 1);
   assert.ok(
     logs.some(message => /Fleet exhaustion resume budget exhausted/.test(message)),
     JSON.stringify({ calls, waits, logs }),
