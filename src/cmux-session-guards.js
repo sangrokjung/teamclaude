@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, join, relative } from 'node:path';
 import { classifyClaudeApiErrorRecord } from './claude-recovery.js';
 
@@ -231,7 +232,12 @@ export async function claimSessionOnce(
   }
 }
 
-export async function releaseSessionClaim(storePath, sessionId, expectedIdentity = null) {
+export async function releaseSessionClaim(
+  storePath,
+  sessionId,
+  expectedIdentity = null,
+  { afterCheck = null } = {},
+) {
   const claimDir = `${storePath}.recovery-claims`;
   let directoryHandle;
   try {
@@ -244,7 +250,25 @@ export async function releaseSessionClaim(storePath, sessionId, expectedIdentity
     }
     if (expectedIdentity
         && !sameIdentity(claimInfo, expectedIdentity)) return false;
-    await unlink(claimPath);
+    await afterCheck?.();
+    // Detach the claim with an atomic rename and verify what was detached: a
+    // claim swapped in after the check above is put back instead of deleted.
+    const detached = join(claimDir, `.${sessionId}.releasing-${randomUUID()}`);
+    await rename(claimPath, detached);
+    const detachedInfo = await lstat(detached);
+    if (!ownedPrivate(detachedInfo, 'isFile')
+        || (expectedIdentity && !sameIdentity(detachedInfo, expectedIdentity))) {
+      try {
+        await link(detached, claimPath);
+      } catch (err) {
+        // A newer claim already took the name; the detached one is superseded.
+        if (err.code !== 'EEXIST') throw err;
+      }
+      await unlink(detached);
+      await directoryHandle.sync();
+      return false;
+    }
+    await unlink(detached);
     await directoryHandle.sync();
     return true;
   } catch (err) {

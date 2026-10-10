@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   rename,
   rm,
   symlink,
@@ -1698,4 +1699,18 @@ test('stop sends nothing when a PID changes identity or cannot be re-inspected b
     await stopExistingSessionProcess(info, parentPid, { inspectProcess });
     assert.deepEqual(signalled, [], failure);
   }
+});
+
+test('a claim swapped in between the check and the removal is restored, not deleted', async t => {
+  const fx = await fixture(t);
+  const claimPath = join(`${fx.storePath}.recovery-claims`, SESSION_ID);
+  const claim = await claimSessionOnce(fx.storePath, SESSION_ID);
+  const released = await releaseSessionClaim(fx.storePath, SESSION_ID, claim, {
+    afterCheck: async () => {
+      await rename(claimPath, `${claimPath}.old`);
+      await writeFile(claimPath, 'another recovery\n', { mode: 0o600 });
+    },
+  });
+  assert.equal(released, false);
+  assert.equal(await readFile(claimPath, 'utf8'), 'another recovery\n', 'the other claim survives');
 });
