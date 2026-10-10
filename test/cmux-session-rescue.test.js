@@ -1826,6 +1826,20 @@ test('malformed fleet-exhaustion timestamps fall back to the transcript mtime', 
   }
 });
 
+// The unresolved-error scan reads a bounded tail; an error record that straddles
+// the start of that window must still be read whole, not dropped as a partial
+// line (non-conversation records after it do not resolve it).
+test('an error record straddling the tail window is still seen as unresolved', async t => {
+  const fx = await fixture(t);
+  const error = fleetExhaustedRecord(fx.cwd, 60);
+  const filler = `${JSON.stringify({ type: 'system', subtype: 'note', content: 'x'.repeat(200) })}\n`;
+  // Put the error record so it begins before the last 256 KiB and ends inside it.
+  const fillerCount = Math.floor((256 * 1024 - Math.floor(error.length / 2)) / filler.length);
+  await writeFile(fx.transcriptPath, `${error}\n${filler.repeat(fillerCount)}`);
+  const state = await unresolvedRecoverableApiErrorState(fx.transcriptPath, fx.transcriptRoot, SESSION_ID);
+  assert.equal(state?.kind, 'fleet_exhausted');
+});
+
 test('a process whose cwd could not be read is never treated as the session process', async t => {
   const fx = await fixture(t);
   assert.equal(await sameClaudeProcess(fx.session, processInfo(fx, { cwd: null }), fx.executablePath), false);

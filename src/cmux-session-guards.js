@@ -102,7 +102,22 @@ async function unresolvedApiError(path, transcriptRoot, sessionId, recoverableKi
     const { handle, info } = await openPrivateFile(resolvedPath);
     try {
       if (await realpath(path) !== resolvedPath) return false;
-      const start = Math.max(0, info.size - 256 * 1024);
+      // Read the last 256 KiB, widened back to the preceding newline so the
+      // first record in the window is whole (bounded at 16 MiB); a record cut
+      // in half would otherwise be dropped and an unresolved error missed.
+      let start = Math.max(0, info.size - 256 * 1024);
+      const floor = Math.max(0, start - 16 * 1024 * 1024);
+      const probe = Buffer.alloc(64 * 1024);
+      while (start > floor) {
+        const from = Math.max(floor, start - probe.length);
+        const { bytesRead } = await handle.read(probe, 0, start - from, from);
+        const newline = probe.subarray(0, bytesRead).lastIndexOf(10);
+        if (newline !== -1) {
+          start = from + newline + 1;
+          break;
+        }
+        start = from;
+      }
       const buffer = Buffer.alloc(info.size - start);
       await handle.read(buffer, 0, buffer.length, start);
       let blocked = null;
