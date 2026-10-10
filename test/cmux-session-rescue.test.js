@@ -1761,6 +1761,28 @@ test('a claim swapped in between the check and the removal is restored, not dele
   assert.equal(await readFile(claimPath, 'utf8'), 'another recovery\n', 'the other claim survives');
 });
 
+// The ps fallback must consider every direct child of the supervisor, not
+// only the first few: the session's child may sit anywhere in the table.
+test('the ps fallback finds the session child beyond the first 64 direct children', async () => {
+  const supervisorPid = 54401;
+  const target = { ...selectorlessChildInfo(54401 + 70, supervisorPid) };
+  target.command = `${target.command} --resume ${SESSION_ID}`;
+  target.launchArgv = [...target.launchArgv, '--resume', SESSION_ID];
+  const other = '00000000-0000-4000-8000-000000000000';
+  const table = [];
+  for (let i = 1; i < 70; i += 1) {
+    table.push({ pid: supervisorPid + i, ppid: supervisorPid, command: `/usr/bin/sleep --resume ${other}` });
+  }
+  table.push({ pid: target.pid, ppid: supervisorPid, command: target.command });
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => (pid === supervisorPid ? supervisorProcessInfo(supervisorPid)
+      : pid === target.pid ? target : { alive: false }),
+    listDirectChildren: async () => { throw new Error('ps -p argument list too long'); },
+    listProcessTable: async () => table,
+  });
+  assert.equal(result.pid, target.pid);
+});
+
 // A selectorless child is only the session's process when it is the sole
 // Claude child of the supervisor. A sibling that names ANOTHER session makes
 // the selectorless one ambiguous, entered either from the supervisor or from

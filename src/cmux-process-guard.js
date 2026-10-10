@@ -271,12 +271,21 @@ export async function inspectClaudeProcess(pid) {
   }
 }
 
+async function processTableRows() {
+  const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
+    timeout: 2500,
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  return parseProcessTable(stdout);
+}
+
 export async function inspectClaudeProcessTree(
   pid,
   sessionId,
   {
     inspectProcess = inspectClaudeProcess,
     listDirectChildren = directChildRows,
+    listProcessTable = processTableRows,
   } = {},
 ) {
   if (typeof sessionId !== 'string' || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
@@ -363,11 +372,7 @@ export async function inspectClaudeProcessTree(
     if (directRows.length === 0) throw new Error('No direct child.');
   } catch {}
   try {
-    const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,ppid=,command='], {
-      timeout: 2500,
-      env: { ...process.env, LC_ALL: 'C' },
-    });
-    table = parseProcessTable(stdout);
+    table = await listProcessTable();
   } catch {
     return { alive: false };
   }
@@ -380,7 +385,9 @@ export async function inspectClaudeProcessTree(
   // Only a DIRECT child of the supervisor is adopted: `run` spawns the native
   // Claude binary itself, so a deeper chain (shell, wrapper) is not a session
   // this supervisor launched and recovering it would act on an unverified PID.
-  const directChildren = (childrenByParent.get(pid) || []).slice(0, 64);
+  // Every direct child is considered (no count cap): only rows that carry the
+  // exact session selector are inspected, so a large process table stays cheap.
+  const directChildren = childrenByParent.get(pid) || [];
   for (const row of directChildren) {
     if (!selectorFromCommand(row.command, sessionId)) continue;
     const child = await inspectProcess(row.pid);
