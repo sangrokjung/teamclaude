@@ -69,7 +69,9 @@ async function message(proc) {
 for (const mode of ['null', 'throw']) {
   test(`live owner survives process inspection ${mode}`, async t => {
     const fx = await fixture(t);
-    const original = JSON.stringify({ version: 1, pid: process.ppid, processStartSeconds: 1 });
+    const original = JSON.stringify({
+      version: 1, pid: process.ppid, processStartSeconds: 1, nonce: 'live-owner',
+    });
     await writeFile(fx.path, original, { mode: 0o600 });
     const lease = await claimSessionLease(fx.store, SESSION, {
       inspectProcessStart: async pid => {
@@ -94,7 +96,7 @@ test('failed self inspection cannot publish a lease', async t => {
 test('PID reuse with a different start time can be reclaimed', async t => {
   const fx = await fixture(t);
   await writeFile(fx.path, JSON.stringify({
-    version: 1, pid: process.pid, processStartSeconds: 1,
+    version: 1, pid: process.pid, processStartSeconds: 1, nonce: 'stale-pid-reuse',
   }), { mode: 0o600 });
   const lease = await claimSessionLease(fx.store, SESSION);
   assert.ok(lease);
@@ -110,6 +112,19 @@ test('release cannot delete a replacement lease or release without identity', as
   assert.equal(await releaseSessionLease(fx.store, SESSION, lease), false);
   assert.equal(await releaseSessionLease(fx.store, SESSION), false);
   assert.equal(await releaseSessionLease(fx.store, SESSION, replacement), true);
+});
+
+test('release refuses an in-place lease owner replacement', async t => {
+  const fx = await fixture(t);
+  const lease = await claimSessionLease(fx.store, SESSION);
+  await writeFile(fx.path, JSON.stringify({
+    version: 1,
+    pid: 99999999,
+    processStartSeconds: 1,
+    nonce: 'replacement-owner',
+  }), { mode: 0o600 });
+  assert.equal(await releaseSessionLease(fx.store, SESSION, lease), false);
+  assert.equal(JSON.parse(await readFile(fx.path, 'utf8')).nonce, 'replacement-owner');
 });
 
 test('malformed legacy lease is quarantined and the recovery attempt fails closed', async t => {
@@ -147,7 +162,7 @@ test('unsupported lease versions fail closed after quarantine', async t => {
 test('two real processes reclaim a stale lease with exactly one winner', async t => {
   const fx = await fixture(t);
   await writeFile(fx.path, JSON.stringify({
-    version: 1, pid: 99999999, processStartSeconds: 1,
+    version: 1, pid: 99999999, processStartSeconds: 1, nonce: 'stale-owner',
   }), { mode: 0o600 });
   const a = child(t, fx);
   const b = child(t, fx);
@@ -168,6 +183,7 @@ test('SIGKILL during claim releases the kernel mutex for the next claimant', asy
     version: 1,
     pid: owner.pid,
     processStartSeconds: 1,
+    nonce: 'crashed-owner',
   }), { mode: 0o600 });
   const locked = message(owner);
   owner.send('go');

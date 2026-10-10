@@ -413,7 +413,8 @@ async function readLeaseOwner(path) {
     const value = JSON.parse(await handle.readFile({ encoding: 'utf8' }));
     if (!value || typeof value !== 'object' || value.version !== 1
         || !Number.isInteger(value.pid) || value.pid <= 0
-        || !Number.isFinite(value.processStartSeconds)) {
+        || !Number.isFinite(value.processStartSeconds)
+        || typeof value.nonce !== 'string' || value.nonce.length === 0) {
       throw new Error('Invalid recovery lease.');
     }
     return {
@@ -559,6 +560,7 @@ export async function claimSessionLease(
         version: 1,
         pid: process.pid,
         processStartSeconds: ownStart,
+        nonce: randomUUID(),
         createdAt: Date.now(),
       });
       await syncDirectory(directoryHandle);
@@ -572,7 +574,14 @@ export async function claimSessionLease(
           || !sameIdentity(currentLease, leaseInfo)) {
         throw new Error('Recovery lease identity changed.');
       }
-      return { dev: leaseInfo.dev, ino: leaseInfo.ino, pid: process.pid, processStartSeconds: ownStart };
+      const owner = await readLeaseOwner(leasePath);
+      return {
+        dev: leaseInfo.dev,
+        ino: leaseInfo.ino,
+        pid: process.pid,
+        processStartSeconds: ownStart,
+        nonce: owner.value.nonce,
+      };
     }, SESSION_LEASE_CLAIM_RETRIES);
     return result === SESSION_LEASE_LOCK_BUSY ? null : result;
   } finally {
@@ -590,9 +599,11 @@ export async function releaseSessionLease(storePath, sessionId, expectedIdentity
     directoryHandle = directory.handle;
     const result = await withSessionLeaseLock(leaseDir, sessionId, async () => {
       const leasePath = join(leaseDir, sessionId);
-      const leaseInfo = await lstat(leasePath);
-      if (!ownedPrivate(leaseInfo, 'isFile')) throw new Error('Untrusted recovery lease.');
-      if (!sameIdentity(leaseInfo, expectedIdentity)) return false;
+      const owner = await readLeaseOwner(leasePath);
+      if (!sameIdentity(owner.identity, expectedIdentity)
+          || owner.value.pid !== expectedIdentity.pid
+          || owner.value.processStartSeconds !== expectedIdentity.processStartSeconds
+          || owner.value.nonce !== expectedIdentity.nonce) return false;
       await unlink(leasePath);
       await directoryHandle.sync();
       return true;

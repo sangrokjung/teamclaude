@@ -1517,7 +1517,7 @@ test('stale transient lease is reclaimed only after its owner is gone', async t 
   await mkdir(leaseDir, { mode: 0o700 });
   await writeFile(
     join(leaseDir, SESSION_ID),
-    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1, nonce: 'stale-owner' }),
     { mode: 0o600 },
   );
 
@@ -1532,7 +1532,7 @@ test('a live lease owner is retained when process start inspection fails', async
   await mkdir(leaseDir, { mode: 0o700 });
   await writeFile(
     join(leaseDir, SESSION_ID),
-    JSON.stringify({ version: 1, pid: process.ppid, processStartSeconds: 1 }),
+    JSON.stringify({ version: 1, pid: process.ppid, processStartSeconds: 1, nonce: 'live-owner' }),
     { mode: 0o600 },
   );
 
@@ -1550,7 +1550,7 @@ test('concurrent stale lease reclaim has one winner and preserves the winner lea
   await mkdir(leaseDir, { mode: 0o700 });
   await writeFile(
     join(leaseDir, SESSION_ID),
-    JSON.stringify({ version: 1, pid: process.pid, processStartSeconds: 1 }),
+    JSON.stringify({ version: 1, pid: process.pid, processStartSeconds: 1, nonce: 'stale-owner' }),
     { mode: 0o600 },
   );
 
@@ -1574,12 +1574,12 @@ test('a crashed reclaim claimant does not strand the transient lease', async t =
   await mkdir(leaseDir, { mode: 0o700 });
   await writeFile(
     join(leaseDir, SESSION_ID),
-    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1, nonce: 'stale-owner' }),
     { mode: 0o600 },
   );
   await writeFile(
     join(leaseDir, `${SESSION_ID}.reclaim-lock`),
-    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1 }),
+    JSON.stringify({ version: 1, pid: 99999999, processStartSeconds: 1, nonce: 'stale-lock' }),
     { mode: 0o600 },
   );
 
@@ -1636,6 +1636,43 @@ test('does not replay an ambiguous recovery workspace launch', async t => {
   assert.equal(launches, 1);
   assert.deepEqual(first, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
   assert.deepEqual(second, { scanned: 1, candidates: 1, rescued: 0, failed: 0 });
+});
+
+test('releases a permanent claim when a pre-launch verification throws', async t => {
+  const fx = await fixture(t);
+  const attempted = new Set();
+  let claimReleases = 0;
+  const result = await rescueCmuxSessionsOnce({
+    storePath: fx.storePath,
+    transcriptRoot: fx.transcriptRoot,
+    nodePath: '/usr/local/bin/node',
+    scriptPath: '/opt/teamclaude/src/index.js',
+    attempted,
+    inspectProcess: async () => processInfo(fx, {
+      processRole: 'legacy-native',
+      legacyEnvironmentValid: true,
+      nativeExecutableTrusted: true,
+      launchArgv: null,
+      command: `${fx.executablePath} --resume ${SESSION_ID}`,
+    }),
+    claimLease: async () => ({ dev: 1, ino: 1 }),
+    releaseLease: async () => true,
+    claimRecovery: async () => ({ dev: 2, ino: 2 }),
+    releaseRecovery: async () => {
+      claimReleases += 1;
+      return true;
+    },
+    stopProcess: async () => {
+      throw new Error('transient pre-launch verification failure');
+    },
+    launchRecoveryWorkspace: async () => {
+      throw new Error('launch must not be reached');
+    },
+  });
+
+  assert.deepEqual(result, { scanned: 1, candidates: 1, rescued: 0, failed: 1 });
+  assert.equal(claimReleases, 1);
+  assert.equal(attempted.has(SESSION_ID), false);
 });
 
 test('does not replay a claimed session after the supervisor restarts', async t => {

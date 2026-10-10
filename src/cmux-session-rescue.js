@@ -386,6 +386,7 @@ export async function rescueCmuxSessionsOnce({
       } catch {}
       return leaseReleased;
     };
+    let launchStarted = false;
     try {
       const lease = await claimLease(storePath, key);
       if (!lease) {
@@ -491,6 +492,7 @@ export async function rescueCmuxSessionsOnce({
         failed += 1;
         continue;
       }
+      launchStarted = true;
       await launchRecoveryWorkspace({
         workspaceId: final.workspaceId,
         surfaceId: final.surfaceId,
@@ -504,8 +506,13 @@ export async function rescueCmuxSessionsOnce({
       claimOwned = false;
     } catch {
       // Keep the permanent replay claim when workspace launch is ambiguous;
-      // only the transient actor lease must be released.
-      await releaseLeaseForRetry();
+      // before launch there is no replay ambiguity, so release both claims
+      // and allow a later scan to retry the stopped session.
+      if (launchStarted) {
+        await releaseLeaseForRetry();
+      } else {
+        await releaseClaimForRetry();
+      }
       failed += 1;
     }
   }

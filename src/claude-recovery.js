@@ -759,14 +759,12 @@ export async function runClaudeWithRecovery({
     return true;
   };
   const scheduleFleetRecoveryReleaseRetry = () => {
-    if (fleetRecoveryReleaseRetryTimer
-        || !fleetRecoveryReleasePending
-        || fleetRecoveryReleaseRetryRounds >= 3) return;
+    if (fleetRecoveryReleaseRetryTimer || !fleetRecoveryReleasePending) return;
     fleetRecoveryReleaseRetryRounds += 1;
     fleetRecoveryReleaseRetryTimer = setTimeout(() => {
       fleetRecoveryReleaseRetryTimer = null;
       void releaseFleetRecoveryClaim({ scheduleRetry: true });
-    }, 250 * 2 ** (fleetRecoveryReleaseRetryRounds - 1));
+    }, Math.min(250 * 2 ** (fleetRecoveryReleaseRetryRounds - 1), 30_000));
     fleetRecoveryReleaseRetryTimer.unref?.();
   };
   const releaseFleetRecoveryClaim = async ({ scheduleRetry = true } = {}) => {
