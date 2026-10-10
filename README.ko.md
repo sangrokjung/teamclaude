@@ -246,6 +246,13 @@ rate-limit은 이 강제 계정 회전을 호출하지 않습니다.
 supervised Claude 세션 안에서 실행한 `teamclaude stop` / `restart`는 자기 연결을
 끊지 않도록 거부됩니다. 이미 직접 `claude`로 시작한 기존 프로세스에는 recovery
 launcher를 소급 적용할 수 없으므로 다음 세션부터 `teamclaude run`을 사용하세요.
+프록시가 `All N accounts exhausted. Retry in Ns.`를 반환하면 recovery parent는
+짧은 일반 backoff로 조기 재시도하지 않습니다. 서버가 알려준 `Retry in` 시간만큼
+기다린 뒤 같은 세션을 `--resume <session-id> continue`로 다시 실행합니다. 이 재개는
+`claudeFleetExhaustionMaxRetries`로 제한할 수 있으며 기본값 `0`은 제한 해제까지
+계속 대기한다는 뜻입니다. 대기 중 `Ctrl-C`로 중단할 수 있습니다.
+`codexFallbackOnExhaustion: true`이고 전체 일반 quota 소진이 확인된 경우에는 기존
+Codex 인계가 우선합니다.
 
 Anthropic이 한 OAuth 계정에 구조화된 `oauth_not_allowed_for_organization`
 403을 반환하면 TeamClaude는 해당 계정만 인증 오류로 격리하고, 완결된 거부
@@ -524,6 +531,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
   "activeWarmup": true,
   "autoResumeClaude": true,
   "claudeAmbiguousDispatchMaxResumes": 1,
+  "claudeFleetExhaustionMaxRetries": 0,
   "codexFallbackOnExhaustion": false,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,
@@ -550,6 +558,7 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 | `codexResetCreditsReserve` | 자동 정책이 남겨 두는 계정별 리셋권 수 (기본 `0`). 로컬 운영 엔드포인트 `POST /teamclaude/codex/reset-credit?account=<name>`(loopback + proxy API key)은 정책·쿨다운·reserve를 무시하고 즉시 사용 |
 | `codexResetCreditsTimeoutMs` | 리셋권 사용 POST 1회의 타임아웃 (기본 `10000`). 타임아웃·네트워크 오류·5xx는 *불확정*으로 취급해 그 계정을 다시 폴링하고 같은 요청에서 다른 계정을 시도하지 않습니다(리셋권이 이미 소모됐을 수 있음) |
 | `cmuxSessionRescue` | 기존 cmux Claude 세션의 정확한 `Login expired`, 연결 손실, ambiguous-dispatch 502를 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
+| `cmuxSessionRescue` | 기존 cmux Claude 세션의 미해결 `Login expired`, 연결 손실, ambiguous-dispatch 502 또는 fleet exhaustion을 감지해 원래 pane을 보존하고 같은 window의 새 비포커스 workspace에서 재개 |
 | `cmuxSessionRescueIntervalMs` | 기존 cmux 세션 복구 검사 간격(최소 500ms, 기본 1000ms) |
 | `accounts[].enabled` | `false`이면 계정을 회전에서 제외 |
 | `accounts[].priority` | 낮을수록 먼저 사용하는 고정 순위 |
@@ -559,9 +568,11 @@ Claude 설정 파일은 `~/.config/teamclaude.json`, Codex 설정 파일은
 
 `cmuxSessionRescue`는 소유자 전용 registry/transcript, 정확한 session
 selector와 프로세스 시작 시각, 신뢰된 Claude 실행 파일, 실제 cmux
-surface→workspace topology가 모두 일치할 때만 동작합니다. 세션별 claim을
-디스크에 먼저 기록하므로 supervisor가 재시작되거나 workspace 생성 결과가
-불확실해도 같은 세션을 중복 실행하지 않습니다.
+surface→workspace topology가 모두 일치할 때만 동작합니다. fleet exhaustion은
+transcript timestamp와 서버의 `Retry in` deadline이 지난 뒤에만 재개합니다.
+세션별 claim을 디스크에 먼저 기록하고 claim·종료 직후 transcript와
+parent·child process identity를 다시 확인하므로 supervisor가 재시작되거나
+workspace 생성 결과가 불확실해도 같은 세션을 중복 실행하지 않습니다.
 
 버퍼·타임아웃 상한 등 전체 설정 키는 [영문 README](README.md#configuration)를 참조하세요.
 

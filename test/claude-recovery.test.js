@@ -72,6 +72,24 @@ function usageCreditsRecord(cwd) {
   });
 }
 
+function fleetExhaustedRecord(cwd, retryAfterSeconds = 3) {
+  return JSON.stringify({
+    type: 'assistant',
+    cwd,
+    timestamp: new Date().toISOString(),
+    isApiErrorMessage: true,
+    error: 'rate_limit_error',
+    apiErrorStatus: 429,
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: `API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in ${retryAfterSeconds}s.`,
+      }],
+    },
+  });
+}
+
 function recoveryToken(accountUuid) {
   return `teamclaude-local-recovery:${Buffer.from(accountUuid).toString('base64url')}`;
 }
@@ -2952,4 +2970,1112 @@ test('ambiguous Claude session selectors never monitor or recover another sessio
       assert.equal(codexCalls, 0);
     });
   }
+});
+test('classifies Claude fleet exhaustion and preserves the server retry delay', () => {
+  const record = JSON.parse(fleetExhaustedRecord('/tmp/project', 2235));
+  const classified = classifyClaudeApiErrorRecord(record);
+
+  assert.equal(classified?.kind, 'fleet_exhausted');
+  assert.equal(classified?.retryAfterSeconds, 2235);
+
+  const cases = [
+    fleetExhaustedRecord('/tmp/project', 0),
+    fleetExhaustedRecord('/tmp/project', 9007199254741),
+    JSON.stringify({
+      ...record,
+      apiErrorStatus: 503,
+    }),
+    JSON.stringify({
+      ...record,
+      isApiErrorMessage: false,
+    }),
+    JSON.stringify({
+      ...record,
+      type: 'user',
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        ...record.message,
+        role: 'user',
+      },
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'All 16 accounts exhausted. Retry in 2235s.',
+        }],
+      },
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'API Error:  Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in 2235s.',
+        }],
+      },
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'Please print API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in 2235s.',
+        }],
+      },
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: ' API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in 2235s.',
+        }],
+      },
+    }),
+    JSON.stringify({
+      ...record,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: 'API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in 2235s. ',
+        }],
+      },
+    }),
+  ];
+  for (const serialized of cases) {
+    assert.notEqual(
+      classifyClaudeApiErrorRecord(JSON.parse(serialized))?.kind,
+      'fleet_exhausted',
+    );
+  }
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[5]))?.kind,
+    'limit',
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[6]))?.kind,
+    'limit',
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[7]))?.noAutoResume,
+    true,
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[2]))?.noAutoResume,
+    true,
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[8]))?.noAutoResume,
+    true,
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[9]))?.noAutoResume,
+    true,
+  );
+  assert.equal(
+    classifyClaudeApiErrorRecord(JSON.parse(cases[10]))?.noAutoResume,
+    true,
+  );
+});
+
+test('classifies the wrapped 13671-second fleet error reported by Claude', () => {
+  const classified = classifyClaudeApiErrorRecord({
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'rate_limit_error',
+    apiErrorStatus: 429,
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: 'API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry\n  in 13671s.',
+      }],
+    },
+  });
+
+  assert.equal(classified?.kind, 'fleet_exhausted');
+  assert.equal(classified?.retryAfterSeconds, 13671);
+});
+
+test('rejects fleet errors whose wrapped Retry indentation is not exactly two spaces', () => {
+  for (const indentation of [' ', '   ']) {
+    const classified = classifyClaudeApiErrorRecord({
+      type: 'assistant',
+      isApiErrorMessage: true,
+      error: 'rate_limit_error',
+      apiErrorStatus: 429,
+      message: {
+        role: 'assistant',
+        content: [{
+          type: 'text',
+          text: `API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry\n${indentation}in 3s.`,
+        }],
+      },
+    });
+    assert.notEqual(classified?.kind, 'fleet_exhausted', `indentation=${indentation.length}`);
+    assert.equal(classified?.noAutoResume, true, `indentation=${indentation.length}`);
+  }
+});
+
+test('rejects fleet errors with additional or split content blocks', () => {
+  const text = 'API Error: Server is temporarily limiting requests (not your usage limit) · All 16 accounts exhausted. Retry in 3s.';
+  const contents = [
+    [{ type: 'text', text }, { type: 'tool_use', id: 'tool-1', name: 'noop', input: {} }],
+    [{ type: 'text', text }, null],
+    [
+      { type: 'text', text: text.slice(0, text.indexOf(' in 3s.')) },
+      { type: 'text', text: text.slice(text.indexOf('in 3s.')) },
+    ],
+  ];
+  for (const content of contents) {
+    const classified = classifyClaudeApiErrorRecord({
+      type: 'assistant',
+      isApiErrorMessage: true,
+      error: 'rate_limit_error',
+      apiErrorStatus: 429,
+      message: { role: 'assistant', content },
+    });
+    assert.notEqual(classified?.kind, 'fleet_exhausted');
+    assert.equal(classified?.noAutoResume, true);
+  }
+});
+
+test('near-miss fleet errors never auto-resume the session', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-near-miss-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    spawnClaude(args) {
+      calls.push([...args]);
+      const child = fakeChild();
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        const record = JSON.parse(fleetExhaustedRecord(cwd, 1));
+        record.message.content[0].text = 'All 16 accounts exhausted. Retry in 1s.';
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
+      }, 10);
+      setTimeout(() => child.finish(9), 60);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('near-miss fleet errors must not launch Codex');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(calls.length, 1);
+});
+
+test('fleet-exhaustion text with a non-429 status never auto-resumes', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-status-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    spawnClaude(args) {
+      calls.push([...args]);
+      const child = fakeChild();
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        const record = JSON.parse(fleetExhaustedRecord(cwd, 1));
+        record.apiErrorStatus = 503;
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${JSON.stringify(record)}\n`);
+      }, 10);
+      setTimeout(() => child.finish(9), 60);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('a non-429 fleet message must not launch Codex');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(calls.length, 1);
+});
+
+test('fleet exhaustion bounds the server delay before resuming the same session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-exhausted-'));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+  const sequence = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => {
+      waits.push(milliseconds);
+      sequence.push(`wait:${milliseconds}`);
+    },
+    spawnClaude(args) {
+      const child = fakeChild(signal => sequence.push(`kill:${signal}`));
+      calls.push([...args]);
+      sequence.push(`spawn:${calls.length}`);
+      if (calls.length === 1) {
+        const sessionId = args[args.indexOf('--session-id') + 1];
+        setTimeout(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 604801)}\n`);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('fleet exhaustion should wait and resume Claude when Codex fallback is disabled');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [604800000]);
+  assert.equal(calls.length, 2);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
+  assert.deepEqual(sequence, [
+    'spawn:1',
+    'kill:SIGTERM',
+    'wait:604800000',
+    'spawn:2',
+  ]);
+});
+
+test('fleet exhaustion keeps retrying when the fleet retry budget is unlimited', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-unlimited-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+  const logs = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 0,
+      claudeFleetExhaustionMaxRetries: 0,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    log: message => logs.push(message),
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const sessionId = args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        if (calls.length < 3) {
+          await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 3)}\n`);
+        } else {
+          await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+          child.finish(0);
+        }
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('unlimited fleet recovery should stay on Claude');
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [3000, 3000]);
+  assert.equal(calls.length, 3);
+  const sessionId = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionId, 'continue']);
+  assert.deepEqual(calls[2], ['--resume', sessionId, 'continue']);
+  assert.match(logs[0], /1\/unlimited/);
+  assert.match(logs[1], /2\/unlimited/);
+});
+
+test('fleet exhaustion does not resume when the cmux recovery claim is already owned', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-claim-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 0,
+      claudeFleetExhaustionMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {},
+    claimRecovery: async () => false,
+    releaseRecovery: async () => {},
+    spawnClaude(args) {
+      const child = fakeChild();
+      calls.push([...args]);
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      const transcriptPath = join(transcriptRoot, 'project', sessionId + '.jsonl');
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        await appendFile(transcriptPath, fleetExhaustedRecord(cwd, 1) + '\n');
+        child.finish(9);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('a competing cmux rescue must own the recovery');
+    },
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(calls.length, 1);
+});
+
+test('cmux-owned ID-less resume resolves its exact session before fleet recovery', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-idless-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  await mkdir(cwd);
+  await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+  await writeFile(join(transcriptRoot, 'project', `${sessionId}.jsonl`), '');
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeFleetExhaustionMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    sessionResolveTimeoutMs: 100,
+    resolveSessionId: async ({ args, cwd: resolvedCwd }) => {
+      assert.deepEqual(args, ['-r']);
+      assert.equal(resolvedCwd, cwd);
+      return sessionId;
+    },
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      calls.push([...args]);
+      const child = fakeChild();
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        if (calls.length === 1) {
+          await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 1)}\n`);
+          setTimeout(() => child.finish(9), 20);
+        } else {
+          await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+          child.finish(0);
+        }
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('cmux fleet recovery must stay on Claude');
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [1000]);
+  assert.deepEqual(calls, [
+    ['-r'],
+    ['--resume', sessionId, 'continue'],
+  ]);
+});
+
+test('resolved ID-less resume ignores a pre-existing fleet error in the transcript', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-offset-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '22222222-2222-4222-8222-222222222222';
+  const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+  await mkdir(cwd);
+  await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+  await writeFile(transcriptPath, `${fleetExhaustedRecord(cwd, 600)}\n`);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeFleetExhaustionMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    resolveSessionId: async () => sessionId,
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      setTimeout(() => child.finish(9), 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('historical errors must not trigger handoff');
+    },
+  });
+
+  assert.equal(result.status, 9);
+  assert.deepEqual(calls, [['-r']]);
+});
+
+test('late transcript discovery scans a new transcript for fleet errors', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-late-transcript-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '33333333-3333-4333-8333-333333333333';
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeFleetExhaustionMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    resolveSessionId: async () => sessionId,
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${sessionId}.jsonl`), `${fleetExhaustedRecord(cwd, 1)}\n`);
+        setTimeout(() => child.finish(9), 20);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('fleet recovery must not hand off to Codex');
+    },
+  });
+
+  assert.equal(result.status, 9);
+  assert.equal(calls.length, 2);
+});
+
+test('ID-less resolution preserves transcript bytes written before session binding', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-preexisting-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const sessionId = '44444444-4444-4444-8444-444444444444';
+  const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+  await mkdir(cwd);
+  await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+  await writeFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+  const calls = [];
+  let resolved = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeFleetExhaustionMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    wait: async () => {},
+    resolveSessionId: async () => {
+      if (!resolved) {
+        resolved = true;
+        await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 1)}\n`);
+      }
+      return sessionId;
+    },
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      if (calls.length === 1) {
+        setTimeout(() => child.finish(9), 20);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('late pre-binding fleet error must remain on Claude');
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 2);
+});
+
+test('hung cmux session resolution cannot hold a child past its deadline', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-cmux-timeout-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  await mkdir(cwd);
+  const startedAt = Date.now();
+  const calls = [];
+  const result = await runClaudeWithRecovery({
+    claudeArgs: ['-r'],
+    childEnv: {},
+    config: { autoResumeClaude: true },
+    cwd,
+    transcriptRoot: join(root, 'transcripts'),
+    sessionResolveTimeoutMs: 20,
+    sessionResolvePollIntervalMs: 5,
+    resolveSessionId: () => new Promise(() => {}),
+    spawnClaude(args) {
+      calls.push(args);
+      const child = fakeChild();
+      setTimeout(() => child.finish(0), 10);
+      return child;
+    },
+    launchCodex: async () => ({ status: 1, signal: null }),
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(calls, [['-r']]);
+  assert.ok(Date.now() - startedAt < 150);
+});
+
+test('cmux resolver only receives ID-less and continuation selectors', async t => {
+  const cases = [
+    { args: ['-r'], safe: true },
+    { args: ['--resume'], safe: true },
+    { args: ['--resume', '--model', 'claude-sonnet-5'], safe: true },
+    { args: ['--continue'], safe: true },
+    { args: ['-c'], safe: true },
+    { args: ['--resume', 'work-name'], safe: false },
+    { args: ['--resume=not-a-uuid'], safe: false },
+    { args: ['--session-id', 'not-a-uuid'], safe: false },
+  ];
+
+  for (const { args, safe } of cases) {
+    await t.test(args.join(' '), async t => {
+      const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-selector-boundary-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const cwd = join(root, 'project');
+      await mkdir(cwd);
+      const calls = [];
+      let resolverCalls = 0;
+      const result = await runClaudeWithRecovery({
+        claudeArgs: args,
+        childEnv: {},
+        config: { autoResumeClaude: true },
+        cwd,
+        transcriptRoot: join(root, 'transcripts'),
+        sessionResolveTimeoutMs: 100,
+        resolveSessionId: async () => {
+          resolverCalls += 1;
+          return '44444444-4444-4444-8444-444444444444';
+        },
+        spawnClaude(launchArgs) {
+          calls.push([...launchArgs]);
+          const child = fakeChild();
+          setTimeout(() => child.finish(0), 20);
+          return child;
+        },
+      });
+
+      assert.equal(result.status, 0);
+      assert.equal(resolverCalls, safe ? 1 : 0);
+      assert.deepEqual(calls, [args]);
+    });
+  }
+});
+
+test('fleet exhaustion budget exhaustion does not fall through to generic resume', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-budget-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+  const logs = [];
+  let leaseReleases = 0;
+  let releasedAfterChildExit = false;
+  let latestChild = null;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 2,
+      claudeFleetExhaustionMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => {
+      leaseReleases += 1;
+      releasedAfterChildExit = latestChild?.exitCode != null
+        || latestChild?.signalCode != null;
+    },
+    wait: async milliseconds => { waits.push(milliseconds); },
+    log: message => logs.push(message),
+    spawnClaude(args) {
+      const child = fakeChild();
+      latestChild = child;
+      calls.push([...args]);
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0 ? args[sessionSelectorIndex + 1] : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        const record = fleetExhaustedRecord(cwd, 3);
+        await appendFile(transcriptPath, `${record}\n`);
+        if (calls.length > 1) setTimeout(() => child.finish(9), 80);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('finite fleet budget should preserve Claude after the wait budget is exhausted');
+    },
+  });
+
+  assert.equal(result.status, 9);
+  assert.deepEqual(waits, [3000]);
+  assert.equal(calls.length, 2);
+  assert.equal(leaseReleases, 1);
+  assert.equal(releasedAfterChildExit, true);
+  assert.ok(
+    logs.some(message => /Fleet exhaustion resume budget exhausted/.test(message)),
+    JSON.stringify({ calls, waits, logs }),
+  );
+});
+
+test('fleet lease remains held across a later connection failure until that child exits', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-lease-chain-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  let claims = 0;
+  let releases = 0;
+  let releasedAfterExit = false;
+  let latestChild = null;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeFleetExhaustionMaxRetries: 2,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {},
+    waitForConnectionRecovery: async () => {
+      throw new Error('proxy remains unavailable');
+    },
+    claimRecoveryLease: async () => {
+      claims += 1;
+      return { dev: 1, ino: claims };
+    },
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      releasedAfterExit = latestChild?.exitCode != null || latestChild?.signalCode != null;
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      latestChild = child;
+      calls.push([...args]);
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        const record = calls.length === 1
+          ? fleetExhaustedRecord(cwd, 1)
+          : connectionRefusedRecord(cwd);
+        await appendFile(transcriptPath, `${record}\n`);
+        if (calls.length === 1) child.finish(9);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => ({ status: 1, signal: null }),
+    log() {},
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(claims, 1);
+  assert.equal(releases, 1);
+  assert.equal(releasedAfterExit, true);
+});
+
+test('first connection failure also claims the cmux recovery lease before retrying', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-connection-lease-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let claims = 0;
+  let calls = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      claims += 1;
+      return { dev: 1, ino: claims };
+    },
+    releaseRecoveryLease: async () => {},
+    waitForConnectionRecovery: async () => {
+      throw new Error('proxy remains unavailable');
+    },
+    spawnClaude(args) {
+      calls += 1;
+      const child = fakeChild();
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        await appendFile(transcriptPath, `${connectionRefusedRecord(cwd)}\n`);
+        child.finish(calls === 1 ? 9 : 0);
+      }, 10);
+      return child;
+    },
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(calls, 1);
+  assert.equal(claims, 1);
+});
+
+test('lease acquisition failure preserves the live Claude child', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-lease-error-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let killed = false;
+  let spawned = 0;
+  let childRef = null;
+  let claimObservedLiveChild = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => {
+      claimObservedLiveChild ||= childRef?.exitCode == null && childRef?.signalCode == null;
+      setImmediate(() => childRef?.finish(0));
+      throw new Error('ps timeout');
+    },
+    spawnClaude(args) {
+      spawned += 1;
+      const child = fakeChild(signal => { killed = signal; });
+      childRef = child;
+      const sessionSelectorIndex = args.indexOf('--session-id');
+      const sessionId = sessionSelectorIndex >= 0
+        ? args[sessionSelectorIndex + 1]
+        : args[1];
+      const transcriptPath = join(transcriptRoot, 'project', `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(join(transcriptRoot, 'project'), { recursive: true });
+        await appendFile(transcriptPath, `${connectionRefusedRecord(cwd)}\n`);
+      }, 10);
+      return child;
+    },
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(killed, false);
+  assert.equal(spawned, 1);
+  assert.equal(claimObservedLiveChild, true);
+});
+
+test('nonrecoverable login expiry releases the recovery lease before preserving the child', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-login-lease-release-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let childRef = null;
+  let releases = 0;
+  let releasedWhileLive = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      releasedWhileLive = childRef?.exitCode == null && childRef?.signalCode == null;
+      childRef?.finish(0);
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      childRef = child;
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1] || args[1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+        );
+      }, 10);
+      return child;
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(releases, 1);
+  assert.equal(releasedWhileLive, true);
+});
+
+test('launcher retains lease identity across an inconclusive release', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-lease-retry-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let childRef = null;
+  let releases = 0;
+  let releasedWhileLive = false;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: { autoResumeClaude: true, claudeAutoResumeMaxRetries: 1 },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    claimRecoveryLease: async () => ({ dev: 1, ino: 1 }),
+    releaseRecoveryLease: async () => {
+      releases += 1;
+      if (releases < 2) return null;
+      releasedWhileLive = childRef?.exitCode == null && childRef?.signalCode == null;
+      childRef?.finish(0);
+      return true;
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      childRef = child;
+      const selector = args.includes('--session-id') ? '--session-id' : '--resume';
+      const sessionId = args[args.indexOf(selector) + 1] || args[1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, `${sessionId}.jsonl`),
+          `${authenticationRecord(cwd, 'Login expired · Please run /login')}\n`,
+        );
+      }, 10);
+      return child;
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(releases, 2);
+  assert.equal(releasedWhileLive, true);
+});
+
+test('fleet exhaustion resolved by a later transcript write does not wait or resume', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-resolved-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let spawns = 0;
+  let waits = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { waits += 1; },
+    spawnClaude(args) {
+      const child = fakeChild();
+      spawns += 1;
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      const dir = join(transcriptRoot, 'project');
+      const transcriptPath = join(dir, `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(dir, { recursive: true });
+        await appendFile(transcriptPath, `${fleetExhaustedRecord(cwd, 604800)}\n`);
+      }, 10);
+      setTimeout(async () => {
+        await mkdir(dir, { recursive: true });
+        await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+      }, 70);
+      setTimeout(() => child.finish(0), 200);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('a resolved fleet error must not switch providers');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(spawns, 1);
+  assert.equal(waits, 0);
+});
+
+test('fleet exhaustion does not duplicate a manual resume that advances the transcript during the wait', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-fleet-manual-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  let transcriptPath = null;
+  let spawns = 0;
+  let waits = 0;
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => {
+      waits += 1;
+      await appendFile(transcriptPath, `${normalAssistantRecord(cwd)}\n`);
+    },
+    spawnClaude(args) {
+      const child = fakeChild();
+      spawns += 1;
+      const sessionId = args[args.indexOf('--session-id') + 1];
+      const dir = join(transcriptRoot, 'project');
+      transcriptPath = join(dir, `${sessionId}.jsonl`);
+      setTimeout(async () => {
+        await mkdir(dir, { recursive: true });
+        await writeFile(transcriptPath, `${fleetExhaustedRecord(cwd, 604800)}\n`);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('a manually resumed session must not switch providers');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, null);
+  assert.equal(spawns, 1);
+  assert.equal(waits, 1);
 });

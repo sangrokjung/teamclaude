@@ -544,11 +544,19 @@ prompt. This dedicated safe-reopen budget is independent of
 inference POST. Claude's optional feedback URL and `Request ID`
 diagnostic suffixes are recognized without treating ordinary prompt text as an
 API error. See [the ambiguous-dispatch 502 runbook](docs/runbooks/ambiguous-dispatch-502.md).
+When the proxy returns `All N accounts exhausted. Retry in Ns.`, the recovery
+parent does not retry early with the short generic backoff. It waits for the
+server-provided `Retry in` duration, then restarts the same session as
+`--resume <session-id> continue`. `claudeFleetExhaustionMaxRetries` controls
+how many fleet waits are allowed; `0` (the default) keeps waiting until the
+fleet recovers. Ctrl-C can cancel the parked launcher. When
+`codexFallbackOnExhaustion: true` has fresh evidence that the whole general
+quota fleet is exhausted, the existing Codex handoff still takes precedence.
 
-Existing Claude processes cannot acquire a recovery parent retroactively.
+Existing Claude processes without a matching cmux registry record cannot acquire a recovery parent.
 On cmux, `cmuxSessionRescue: true` lets the stable TeamClaude supervisor watch
-cmux's session registry for an unresolved `Login expired`, connection-loss, or
-ambiguous-dispatch 502 API event. It continues
+cmux's session registry for an unresolved `Login expired`, connection-loss,
+ambiguous-dispatch 502, or fleet-exhaustion API event. It continues
 only owner-private registry/transcript files whose active session ID, exact
 process selector and start time, trusted Claude executable, cmux surface,
 working directory, and transcript root all still match. The verified live
@@ -557,7 +565,8 @@ the recorded workspace. Stale, redirected, or already supervised records fail
 closed. After a final registry and process recheck, TeamClaude durably claims
 the session and opens one non-focused workspace in the same cmux window. The
 same session is not replayed after a supervisor restart, even when the workspace
-launch result was uncertain. The blocked legacy pane remains untouched. This
+launch result was uncertain. Fleet exhaustion is rescued only after the transcript's
+server-provided retry deadline. The blocked legacy pane remains untouched. This
 option is off by default because it adds a recovery workspace for each affected
 legacy session.
 
@@ -865,6 +874,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `launchModel` | Fork only — preferred Claude Code model for `teamclaude run`; launch directly on the first `modelFallbacks` target only when every generally available account is freshly measured full for that model (optional, default `null`) |
 | `autoResumeClaude` | Watch the launched Claude transcript and resume the same session after terminal timeout/rate/overload errors or a local proxy/tunnel connection loss (optional, default `true`) |
 | `claudeAutoResumeMaxRetries` | Maximum same-session automatic resumes before leaving Claude interactive for manual control (optional, default `3`) |
+| `claudeFleetExhaustionMaxRetries` | Maximum retries after the server reports that every Claude account is temporarily exhausted; `0` waits indefinitely until recovery (optional, default `0`) |
 | `claudeAutoResumeBackoffMs` | Initial automatic-resume delay; retries use capped exponential backoff (optional, default `2000`) |
 | `claudeAmbiguousDispatchMaxResumes` | Dedicated same-session continuation budget for an exact structured post-dispatch 502. The proxy never replays the original POST; `0` disables launcher continuation, default `1`, and increasing it explicitly accepts duplicate inference/billing risk |
 | `codexFallbackOnExhaustion` | After a terminal Claude error, stop Claude and launch TeamCodex with a sanitized handoff only when expired-login rotation confirms no alternate account or every enabled account has fresh general-quota exhaustion evidence; transient rotation failures do not switch providers (optional, default `false`) |
@@ -874,6 +884,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `codexResetCreditsReserve` | Keep this many credits per account unredeemed by the automatic policy (optional, default `0`). The local operator endpoint `POST /teamclaude/codex/reset-credit?account=<name>` (loopback + proxy API key) ignores policy, cooldown and reserve |
 | `codexResetCreditsTimeoutMs` | Timeout for one redemption POST (optional, default `10000`). A timeout, network error or 5xx is treated as *indeterminate*: the account is re-polled and no other account is tried for that request, because the credit may already be gone |
 | `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on exact `Login expired`, connection-loss, or ambiguous-dispatch 502 events; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
+| `cmuxSessionRescue` | Opt in to fail-closed adoption of active cmux Claude sessions blocked on `Login expired`, connection-loss, ambiguous-dispatch 502, or fleet exhaustion; owner-private files, exact session selector/start identity, trusted executable, and live surface→workspace topology must match. Fleet exhaustion waits for the transcript's server retry deadline. A durable per-session claim prevents replay across supervisor restarts, and recovery uses a new non-focused workspace without replacing the legacy pane (optional, default `false`) |
 | `cmuxSessionRescueIntervalMs` | Poll interval for existing cmux session rescue; values below 500 ms are clamped (optional, default `1000`) |
 
 ### Model fallbacks (fork)

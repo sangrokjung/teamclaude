@@ -17,6 +17,34 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function resolveSessionIdWithDeadline(
+  resolveSessionId,
+  context,
+  timeoutMs,
+  exitPromise = null,
+) {
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : 5000;
+  if (timeout === 0) return null;
+  const resolution = Promise.resolve()
+    .then(() => resolveSessionId(context))
+    .catch(() => null);
+  const races = [
+    resolution,
+    delay(timeout).then(() => null),
+  ];
+  if (exitPromise) races.push(exitPromise.then(() => null));
+  return Promise.race(races);
+}
+
+async function delayLong(ms) {
+  let remaining = ms;
+  while (remaining > 0) {
+    const slice = Math.min(remaining, 0x7fffffff);
+    await delay(slice);
+    remaining -= slice;
+  }
+}
+
 function confirmedAccountRotation(recovery, childEnv) {
   if (recovery?.rotated !== true
       || typeof recovery.previousAccountUuid !== 'string'
@@ -80,6 +108,10 @@ function textBlocks(content) {
 }
 
 const FABLE_USAGE_CREDITS_MESSAGE = "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.";
+const MAX_RETRY_AFTER_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
+const MAX_FLEET_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
+const FLEET_EXHAUSTED_RE = /^API Error: Server is temporarily limiting requests \(not your usage limit\) · All [1-9]\d* accounts exhausted\. Retry(?: |\r?\n {2})in ([1-9]\d*)s\.$/;
+const FLEET_EXHAUSTED_SUFFIX_RE = /All [1-9]\d* accounts exhausted\. Retry\s+in [1-9]\d*s\.$/;
 const AUTO_MODE_UNAVAILABLE_MESSAGE = 'claude-sonnet-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again. If it keeps failing, continue with other tasks that don\'t require this action and come back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.';
 const SAFEGUARD_REFUSAL_CORE = "Fable 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate coding, cybersecurity, and biology tasks. Claude Code can't respond to this message with Fable 5. Double press esc to edit your last message, or try a different model with /model. Send feedback with /feedback or learn more: https://support.claude.com/en/articles/15363606";
 const ANSI_ESCAPE_RE = /\x1B(?:\][^\x07]*(?:\x07|\x1B\\)|\[[0-?]*[ -/]*[@-~])/g;
@@ -173,6 +205,36 @@ export function classifyClaudeApiErrorRecord(record) {
       && normalizedMessage === FABLE_USAGE_CREDITS_MESSAGE) {
     return { kind: 'usage_limit', record };
   }
+  const fleetExhausted = message.match(FLEET_EXHAUSTED_RE);
+  const contentBlock = record.message?.content?.length === 1
+    ? record.message.content[0]
+    : null;
+  const isStructuredFleetError = record.type === 'assistant'
+    && record.message?.role === 'assistant'
+    && contentBlock?.type === 'text'
+    && typeof contentBlock.text === 'string';
+  const isRateLimitError = record.error === 'rate_limit'
+    || record.error === 'rate_limit_error'
+    || record.error === 'overloaded_error';
+  if (isStructuredFleetError
+      && isRateLimitError
+      && record.apiErrorStatus === 429
+      && fleetExhausted) {
+    const retryAfterSeconds = Number(fleetExhausted[1]);
+    if (Number.isSafeInteger(retryAfterSeconds)
+        && retryAfterSeconds <= MAX_RETRY_AFTER_SECONDS) {
+      return { kind: 'fleet_exhausted', retryAfterSeconds, record };
+    }
+  }
+  const fleetSuffix = FLEET_EXHAUSTED_SUFFIX_RE.test(message)
+    || FLEET_EXHAUSTED_SUFFIX_RE.test(message.trim());
+  if ((fleetExhausted && !isStructuredFleetError)
+      || (!fleetExhausted && fleetSuffix)) {
+    return { kind: 'limit', noAutoResume: true, record };
+  }
+  if (fleetExhausted) {
+    return { kind: 'limit', noAutoResume: true, record };
+  }
   if (isStructuredAssistantError
       && record.isApiErrorMessage === true
       && (record.error === 'invalid_request' || record.error === 'invalid_request_error')
@@ -231,6 +293,14 @@ async function findTranscript(root, sessionId) {
   return files.find(path => basename(path) === target) || null;
 }
 
+async function snapshotTranscriptSizes(root) {
+  const entries = await Promise.all((await transcriptFiles(root)).map(async path => [
+    path,
+    (await stat(path).catch(() => null))?.size,
+  ]));
+  return new Map(entries.filter(([, size]) => Number.isFinite(size)));
+}
+
 async function readTail(path, maxBytes = 256 * 1024) {
   const info = await stat(path);
   const start = Math.max(0, info.size - maxBytes);
@@ -272,28 +342,35 @@ function sessionSelector(args) {
       const value = args[i + 1] || '';
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i].startsWith('--session-id=')) {
       const value = args[i].slice('--session-id='.length);
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i] === '--resume' || args[i] === '-r') {
       const value = args[i + 1] || '';
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : {
+            kind: 'ambiguous',
+            sessionId: null,
+            // A following option means the selector is omitted, while a
+            // non-option token is a named/malformed selector and must pass
+            // through unchanged.
+            resolverSafe: value.length === 0 || value.startsWith('-'),
+          };
     }
     if (args[i].startsWith('--resume=')) {
       const value = args[i].slice('--resume='.length);
       return UUID_RE.test(value)
         ? { kind: 'exact', sessionId: value }
-        : { kind: 'ambiguous', sessionId: null };
+        : { kind: 'ambiguous', sessionId: null, resolverSafe: false };
     }
     if (args[i] === '--continue' || args[i] === '-c') {
-      return { kind: 'ambiguous', sessionId: null };
+      return { kind: 'ambiguous', sessionId: null, resolverSafe: true };
     }
   }
   return { kind: 'new', sessionId: null };
@@ -318,6 +395,18 @@ function redactSecrets(text) {
     );
 }
 
+function sanitizeBranch(value) {
+  if (typeof value !== 'string') return null;
+  if (/[\r\n\u2028\u2029]/.test(value)) return null;
+  const sanitized = redactSecrets(value)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 256);
+  return sanitized && /^[A-Za-z0-9._/-]+$/.test(sanitized)
+    ? sanitized
+    : null;
+}
+
 async function writeHandoff({
   transcriptPath,
   sessionId,
@@ -327,6 +416,7 @@ async function writeHandoff({
   const raw = await readTail(transcriptPath, 1024 * 1024);
   const messages = [];
   let branch = null;
+  let branchInvalid = false;
   for (const line of raw.split('\n')) {
     let record;
     try {
@@ -334,7 +424,15 @@ async function writeHandoff({
     } catch {
       continue;
     }
-    if (record.gitBranch) branch = record.gitBranch;
+    if (Object.hasOwn(record, 'gitBranch')) {
+      const sanitizedBranch = sanitizeBranch(record.gitBranch);
+      if (branchInvalid || !sanitizedBranch) {
+        branch = null;
+        branchInvalid = true;
+      } else {
+        branch = sanitizedBranch;
+      }
+    }
     if (record.isMeta || record.isApiErrorMessage) continue;
     if (record.type !== 'user') continue;
     const text = textBlocks(record.message?.content).join('\n').trim();
@@ -434,14 +532,18 @@ async function stopChild(child) {
 
 async function monitorChild({
   child,
+  exitPromise = null,
   transcriptRoot,
   transcriptPath,
   sessionId,
   cwd,
   offset,
+  transcriptKnownAbsent = false,
+  launchStartedAtMs = 0,
+  transcriptSizesBeforeLaunch = null,
   pollIntervalMs,
 }) {
-  const exited = childExit(child).then(result => ({ type: 'exit', result }));
+  const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
   let currentOffset = offset;
@@ -455,7 +557,20 @@ async function monitorChild({
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
-      currentOffset = 0;
+      if (currentPath) {
+        const discovered = await stat(currentPath).catch(() => null);
+        if (!discovered) {
+          currentPath = null;
+          return unresolvedEvent;
+        }
+        const createdForLaunch = transcriptKnownAbsent
+          && Number.isFinite(discovered?.birthtimeMs)
+          && discovered.birthtimeMs >= launchStartedAtMs;
+        const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
+        currentOffset = Number.isFinite(priorSize)
+          ? ((discovered?.size ?? priorSize) < priorSize ? 0 : priorSize)
+          : (createdForLaunch ? 0 : (discovered?.size ?? 0));
+      }
     }
     if (!currentPath) return unresolvedEvent;
 
@@ -539,6 +654,28 @@ async function monitorChild({
   }
 }
 
+async function transcriptHasConversationAfter(path, offset) {
+  if (typeof path !== 'string' || !Number.isFinite(offset) || offset < 0) return false;
+  const info = await stat(path).catch(() => null);
+  if (!info || info.size <= offset) return false;
+  const handle = await open(path, 'r').catch(() => null);
+  if (!handle) return false;
+  try {
+    const buffer = Buffer.alloc(info.size - offset);
+    await handle.read(buffer, 0, buffer.length, offset);
+    return buffer.toString('utf8').split('\n').some(line => {
+      if (!line) return false;
+      try {
+        return isConversationRecord(JSON.parse(line));
+      } catch {
+        return false;
+      }
+    });
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function runClaudeWithRecovery({
   claudeArgs,
   childEnv,
@@ -551,25 +688,36 @@ export async function runClaudeWithRecovery({
   recoverLoginExpired,
   recoverLimit,
   waitForConnectionRecovery,
+  resolveSessionId,
+  sessionResolveTimeoutMs = 5000,
+  sessionResolvePollIntervalMs = 50,
+  claimRecovery,
+  releaseRecovery,
+  claimRecoveryLease = claimRecovery,
+  releaseRecoveryLease = releaseRecovery,
   spawnClaude,
   launchCodex,
   log = message => console.error(message),
+  wait = delayLong,
 }) {
   const selector = sessionSelector(claudeArgs);
-  if (selector.kind === 'ambiguous') {
-    return childExit(spawnClaude(claudeArgs, childEnv));
-  }
-
   let sessionId = selector.sessionId;
   let nextArgs = [...claudeArgs];
   if (selector.kind === 'new') {
     sessionId = randomUUID();
     nextArgs = ['--session-id', sessionId, ...nextArgs];
+  } else if (selector.kind === 'ambiguous') {
+    if (selector.resolverSafe !== true || typeof resolveSessionId !== 'function') {
+      return childExit(spawnClaude(claudeArgs, childEnv));
+    }
   }
 
   const maxRetries = Number.isFinite(config.claudeAutoResumeMaxRetries)
     ? Math.max(0, Math.floor(config.claudeAutoResumeMaxRetries))
     : 3;
+  const maxFleetExhaustionRetries = Number.isFinite(config.claudeFleetExhaustionMaxRetries)
+    ? Math.max(0, Math.floor(config.claudeFleetExhaustionMaxRetries))
+    : 0;
   const backoffMs = Number.isFinite(config.claudeAutoResumeBackoffMs)
     ? Math.max(0, Math.floor(config.claudeAutoResumeBackoffMs))
     : 2000;
@@ -583,16 +731,137 @@ export async function runClaudeWithRecovery({
     ? Math.max(0, Math.floor(config.claudeSafeguardMaxResumes))
     : 1;
   let retries = 0;
+  let fleetExhaustionRetries = 0;
   let ambiguousRecoveries = 0;
   let safetyDenialRecoveries = 0;
   let safeguardRecoveries = 0;
   let loginRecoveryUsed = false;
   let suppressNextContinuationPrompt = false;
   let nextEnv = childEnv;
+  let fleetRecoveryClaim = null;
+  let fleetRecoveryClaimSessionId = null;
+  let fleetRecoveryReleasePromise = null;
+  let fleetRecoveryReleaseRetryTimer = null;
+  let fleetRecoveryReleaseRetryRounds = 0;
+  let fleetRecoveryReleasePending = false;
+  const clearFleetRecoveryClaim = (claim, claimedSessionId) => {
+    if (fleetRecoveryClaim !== claim || fleetRecoveryClaimSessionId !== claimedSessionId) {
+      return false;
+    }
+    fleetRecoveryClaim = null;
+    fleetRecoveryClaimSessionId = null;
+    fleetRecoveryReleasePending = false;
+    fleetRecoveryReleaseRetryRounds = 0;
+    if (fleetRecoveryReleaseRetryTimer) {
+      clearTimeout(fleetRecoveryReleaseRetryTimer);
+      fleetRecoveryReleaseRetryTimer = null;
+    }
+    return true;
+  };
+  const scheduleFleetRecoveryReleaseRetry = () => {
+    if (fleetRecoveryReleaseRetryTimer || !fleetRecoveryReleasePending) return;
+    fleetRecoveryReleaseRetryRounds += 1;
+    fleetRecoveryReleaseRetryTimer = setTimeout(() => {
+      fleetRecoveryReleaseRetryTimer = null;
+      void releaseFleetRecoveryClaim({ scheduleRetry: true });
+    }, Math.min(250 * 2 ** (fleetRecoveryReleaseRetryRounds - 1), 30_000));
+    fleetRecoveryReleaseRetryTimer.unref?.();
+  };
+  const releaseFleetRecoveryClaim = async ({ scheduleRetry = true } = {}) => {
+    if (!fleetRecoveryClaim || !fleetRecoveryClaimSessionId
+        || typeof releaseRecoveryLease !== 'function') return true;
+    if (fleetRecoveryReleasePromise) return fleetRecoveryReleasePromise;
+    if (fleetRecoveryReleaseRetryTimer) {
+      clearTimeout(fleetRecoveryReleaseRetryTimer);
+      fleetRecoveryReleaseRetryTimer = null;
+    }
+    const claim = fleetRecoveryClaim;
+    const claimedSessionId = fleetRecoveryClaimSessionId;
+    fleetRecoveryReleasePending = true;
+    const release = async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        let result = null;
+        try {
+          result = await releaseRecoveryLease(claimedSessionId, claim);
+        } catch {}
+        // `null` means the lease release was inconclusive (for example, the
+        // kernel mutex was busy). Keep the identity until a definitive result
+        // arrives so a later recovery cannot race this actor's lease.
+        if (result !== null) {
+          clearFleetRecoveryClaim(claim, claimedSessionId);
+          return result;
+        }
+        if (attempt < 2) await delay(25 * 2 ** attempt);
+      }
+      if (scheduleRetry && fleetRecoveryClaim === claim
+          && fleetRecoveryClaimSessionId === claimedSessionId) {
+        scheduleFleetRecoveryReleaseRetry();
+      }
+      return null;
+    };
+    fleetRecoveryReleasePromise = release().finally(() => {
+      fleetRecoveryReleasePromise = null;
+    });
+    return fleetRecoveryReleasePromise;
+  };
+  const acquireFleetRecoveryClaim = async session => {
+    if (fleetRecoveryClaimSessionId === session && fleetRecoveryClaim) {
+      if (fleetRecoveryReleasePending) {
+        await releaseFleetRecoveryClaim({ scheduleRetry: false });
+        if (fleetRecoveryReleasePending) return false;
+      } else {
+        return true;
+      }
+    }
+    if (typeof claimRecoveryLease !== 'function') return true;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const claim = await claimRecoveryLease(session);
+        if (claim) {
+          fleetRecoveryClaim = claim;
+          fleetRecoveryClaimSessionId = session;
+          return true;
+        }
+        if (claim === false) return false;
+      } catch {
+        // A transient inspection or mutex failure is retried below. A stable
+        // owner still wins each attempt and eventually makes us preserve the
+        // live child without stopping it.
+      }
+      if (attempt < 2) await delay(25 * 2 ** attempt);
+    }
+    return false;
+  };
+  const leaseProtectedRecoveryKinds = new Set([
+    'login_expired',
+    'connection_lost',
+    'ambiguous_connection',
+    'ambiguous_dispatch',
+    'fleet_exhausted',
+  ]);
+  const preserveChild = async currentChild => {
+    // The transient lease protects an actual automatic resume only. Once the
+    // launcher decides to preserve the live child for manual continuation,
+    // release it before waiting so the cmux rescuer can take over if needed.
+    await releaseFleetRecoveryClaim();
+    return childExit(currentChild);
+  };
 
+  try {
   while (true) {
     let transcriptPath = await findTranscript(transcriptRoot, sessionId);
-    const offset = transcriptPath ? (await stat(transcriptPath)).size : 0;
+    const launchStartedAtMs = Date.now();
+    const initialTranscriptInfo = transcriptPath
+      ? await stat(transcriptPath).catch(() => null)
+      : null;
+    if (transcriptPath && !initialTranscriptInfo) transcriptPath = null;
+    const transcriptKnownAbsent = !transcriptPath;
+    let offset = initialTranscriptInfo?.size ?? 0;
+    const transcriptSizesBeforeLaunch = selector.kind === 'ambiguous'
+      && selector.resolverSafe === true
+      && !sessionId
+      ? await snapshotTranscriptSizes(transcriptRoot)
+      : null;
     // Defense in depth: a post-dispatch failure is never allowed to turn the
     // following UI reopen into another inference POST, even if a caller or a
     // future branch accidentally appends the literal continuation prompt.
@@ -604,20 +873,77 @@ export async function runClaudeWithRecovery({
       ? nextArgs.slice(0, 2)
       : nextArgs;
     suppressNextContinuationPrompt = false;
-    const child = spawnClaude(launchArgs, nextEnv);
+    let child;
+    let exitPromise;
+    try {
+      child = spawnClaude(launchArgs, nextEnv);
+      exitPromise = childExit(child);
+    } catch (error) {
+      await releaseFleetRecoveryClaim();
+      return { status: 1, signal: null, error };
+    }
+    if (selector.kind === 'ambiguous' && selector.resolverSafe === true && !sessionId) {
+      const deadline = Date.now() + Math.max(0, sessionResolveTimeoutMs);
+      while (Date.now() < deadline
+          && child.exitCode == null
+          && child.signalCode == null) {
+        const remaining = deadline - Date.now();
+        sessionId = await resolveSessionIdWithDeadline(
+          resolveSessionId,
+          { child, args: launchArgs, cwd },
+          remaining,
+          exitPromise,
+        );
+        if (UUID_RE.test(sessionId || '')) break;
+        sessionId = null;
+        if (Date.now() >= deadline) break;
+        await delay(Math.min(Math.max(1, sessionResolvePollIntervalMs), deadline - Date.now()));
+      }
+      if (!sessionId) return exitPromise;
+      transcriptPath = await findTranscript(transcriptRoot, sessionId);
+      if (transcriptPath) {
+        const discovered = await stat(transcriptPath).catch(() => null);
+        if (!discovered) {
+          transcriptPath = null;
+          offset = 0;
+        } else {
+          const createdForLaunch = transcriptKnownAbsent
+            && Number.isFinite(discovered.birthtimeMs)
+            && discovered.birthtimeMs >= launchStartedAtMs;
+          const priorSize = transcriptSizesBeforeLaunch?.get(transcriptPath);
+          offset = Number.isFinite(priorSize)
+            ? (discovered.size < priorSize ? 0 : priorSize)
+            : (createdForLaunch ? 0 : discovered.size);
+        }
+      } else {
+        offset = 0;
+      }
+    }
     const outcome = await monitorChild({
       child,
+      exitPromise,
       transcriptRoot,
       transcriptPath,
       sessionId,
       cwd,
       offset,
+      transcriptKnownAbsent,
+      launchStartedAtMs,
+      transcriptSizesBeforeLaunch,
       pollIntervalMs,
     });
-    if (outcome.type === 'exit') return outcome.result;
+    if (outcome.type === 'exit') {
+      await releaseFleetRecoveryClaim();
+      return outcome.result;
+    }
 
     sessionId = outcome.sessionId;
     transcriptPath = outcome.transcriptPath;
+    if (sessionId && leaseProtectedRecoveryKinds.has(outcome.event.kind)
+        && !(await acquireFleetRecoveryClaim(sessionId))) {
+      log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
+      return await preserveChild(child);
+    }
     if (outcome.event.kind === 'ambiguous_connection'
         || outcome.event.kind === 'ambiguous_dispatch') {
       suppressNextContinuationPrompt = true;
@@ -693,7 +1019,7 @@ export async function runClaudeWithRecovery({
         } else {
           log('[TeamClaude] Claude login expired; automatic recovery is unavailable. Run /login.');
         }
-        return childExit(child);
+        return await preserveChild(child);
       }
 
       log(`[TeamClaude] Claude login expired; switched account and resuming session ${sessionId}.`);
@@ -705,7 +1031,7 @@ export async function runClaudeWithRecovery({
 
     if (outcome.event.kind === 'model_refusal_fallback') {
       log(`[TeamClaude] Claude handled a Fable safeguard refusal with its in-session Opus fallback; no launcher retry was sent for session ${sessionId}.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'safety_denial') {
@@ -726,7 +1052,7 @@ export async function runClaudeWithRecovery({
         continue;
       }
       log(`[TeamClaude] Auto-mode safety-denial resume budget exhausted (${safetyDenialRecoveries}/${maxSafetyDenialResumes}); preserving the session for manual continuation.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'safeguard_refusal') {
@@ -747,7 +1073,7 @@ export async function runClaudeWithRecovery({
         continue;
       }
       log(`[TeamClaude] Fable safeguard resume budget exhausted (${safeguardRecoveries}/${maxSafeguardResumes}); preserving the blocked session for user revision.`);
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'connection_lost') {
@@ -758,6 +1084,7 @@ export async function runClaudeWithRecovery({
         retries += 1;
         log(`[TeamClaude] Local proxy connection lost; waiting to resume session ${sessionId} (${retries}/${maxRetries}).`);
         if (!(await waitForRecoveredConnection())) {
+          await releaseFleetRecoveryClaim();
           return { status: 1, signal: null };
         }
         log(`[TeamClaude] Local proxy connection restored; resuming session ${sessionId}.`);
@@ -767,9 +1094,10 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] Connection-refused retry budget exhausted (${retries}/${maxRetries}); preserving session ${sessionId} for manual continuation.`);
       if (child.exitCode == null && child.signalCode == null) {
         await stopChild(child);
+        await releaseFleetRecoveryClaim();
         return { status: 1, signal: null };
       }
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'ambiguous_connection'
@@ -784,6 +1112,7 @@ export async function runClaudeWithRecovery({
           : 'Upstream connection failed after dispatch; proxy did not replay the request';
         log(`[TeamClaude] ${failure}. Waiting to reopen session ${sessionId} without resending the last prompt (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}).`);
         if (!(await waitForRecoveredConnection())) {
+          await releaseFleetRecoveryClaim();
           return { status: 1, signal: null };
         }
         if (backoffMs > 0) {
@@ -796,9 +1125,10 @@ export async function runClaudeWithRecovery({
       log(`[TeamClaude] Ambiguous-request safe-reopen budget exhausted (${ambiguousRecoveries}/${maxAmbiguousDispatchResumes}); preserving session ${sessionId} without resending the last prompt.`);
       if (child.exitCode == null && child.signalCode == null) {
         await stopChild(child);
+        await releaseFleetRecoveryClaim();
         return { status: 1, signal: null };
       }
-      return childExit(child);
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'usage_limit'
@@ -857,10 +1187,46 @@ export async function runClaudeWithRecovery({
       return launchCodex(handoff);
     }
 
+    if (outcome.event.kind === 'fleet_exhausted'
+        && config.autoResumeClaude === true
+        && sessionId
+        && (maxFleetExhaustionRetries === 0
+          || fleetExhaustionRetries < maxFleetExhaustionRetries)) {
+      fleetExhaustionRetries += 1;
+      const retryAfterSeconds = outcome.event.retryAfterSeconds;
+      const waitMs = Math.min(retryAfterSeconds * 1000, MAX_FLEET_WAIT_MS);
+      const waitSeconds = Math.ceil(waitMs / 1000);
+      const retryBudget = maxFleetExhaustionRetries === 0
+        ? `${fleetExhaustionRetries}/unlimited`
+        : `${fleetExhaustionRetries}/${maxFleetExhaustionRetries}`;
+      log(`[TeamClaude] All Claude accounts are temporarily unavailable; waiting ${waitSeconds}s before resuming session (${retryBudget}).`);
+      if (!(await acquireFleetRecoveryClaim(sessionId))) {
+        log(`[TeamClaude] Another recovery path already owns session ${sessionId}; preserving it without a duplicate resume.`);
+        return await preserveChild(child);
+      }
+      await stopChild(child);
+      await wait(waitMs);
+      if (await transcriptHasConversationAfter(transcriptPath, outcome.offset)) {
+        await releaseFleetRecoveryClaim();
+        log(`[TeamClaude] Session ${sessionId} advanced while waiting; preserving the existing transcript without a duplicate resume.`);
+        return await childExit(child);
+      }
+      nextArgs = ['--resume', sessionId, 'continue'];
+      continue;
+    }
+
+    if (outcome.event.kind === 'fleet_exhausted') {
+      log(`[TeamClaude] Fleet exhaustion resume budget exhausted (${fleetExhaustionRetries}/${maxFleetExhaustionRetries}); preserving session ${sessionId} for manual continuation.`);
+      return await preserveChild(child);
+    }
+
     if (outcome.event.kind === 'usage_limit') {
       log('[TeamClaude] Claude usage limit detected; account rotation was not confirmed, so the same account will not be restarted.');
-      if (usageChildStopped) return { status: child.exitCode ?? 1, signal: null };
-      return childExit(child);
+      if (usageChildStopped) {
+        await releaseFleetRecoveryClaim();
+        return { status: child.exitCode ?? 1, signal: null };
+      }
+      return await preserveChild(child);
     }
 
     if (outcome.event.kind === 'timeout'
@@ -875,7 +1241,10 @@ export async function runClaudeWithRecovery({
       continue;
     }
 
-    if (config.autoResumeClaude === true && sessionId && retries < maxRetries) {
+    if (config.autoResumeClaude === true
+        && outcome.event.noAutoResume !== true
+        && sessionId
+        && retries < maxRetries) {
       retries += 1;
       log(`[TeamClaude] Claude ${outcome.event.kind} detected; resuming session automatically (${retries}/${maxRetries}).`);
       await stopChild(child);
@@ -883,6 +1252,9 @@ export async function runClaudeWithRecovery({
       nextArgs = ['--resume', sessionId, 'continue'];
       continue;
     }
-    return childExit(child);
+    return await preserveChild(child);
+  }
+  } finally {
+    await releaseFleetRecoveryClaim();
   }
 }
