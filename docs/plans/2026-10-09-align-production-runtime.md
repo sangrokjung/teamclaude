@@ -51,3 +51,14 @@ Intent: [2026-10-09-align-production-runtime](../intents/2026-10-09-align-produc
 
 - 배포 전 운영 `src/` 전체를 날짜 백업 폴더에 복사한다. 문제가 생기면 백업을 되돌리고 같은 swap 절차로 워커를 교체한다.
 - 저장소 쪽은 머지 커밋 revert.
+
+## 분할 (2026-10-10 대표 결정)
+
+교차 검증 13라운드 동안 cmux 복구 묶음(A)에서 라운드마다 새 하드닝 지적이 나와 두 PR로 나눈다.
+
+- **PR-1 (이 PR, 프록시)**: B~F, 재적재 프로브 예산, 진입점 판정 e2e 테스트, 브라우저 자산 lint 제외. 배포 대상은 3456 워커.
+- **PR-2 (cmux 복구, `chore/align-prod-runtime-20261009`)**: A와 검증에서 고친 결함들(transcript 청크 읽기·EOF 재확인, claim 원자적 해제, PID 재확인, supervisor 판정, 외래 형제 거부, timestamp·cwd fail-closed). 계속 다듬어 별도 머지.
+
+PR-1 배포는 운영 `src/`에서 A 파일(`claude-recovery.js`, `cmux-*.js`, `config.js`)을 운영 버전 그대로 두고 나머지를 머지 커밋으로 맞춘다. A가 PR-2로 머지된 뒤 `src/` 전체 바이트 일치를 달성한다.
+
+watchdog 운영 사본 대조(`test_watchdog_source_matches_operating_copy`)는 Codex 풀(3457) 사본이 저장소와 1,745줄 다르고 공개하면 안 되는 내부 값을 담고 있어, 이 작업에서는 "운영 사본 없음"(CI 조건)으로 검증한다. 사본 정렬은 3457 별도 과제.
