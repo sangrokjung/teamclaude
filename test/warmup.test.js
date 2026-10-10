@@ -1125,9 +1125,9 @@ test('exportProbeTemplate persists the model-tier recheck template', async () =>
   }
 });
 
-// Rechecking stale near-quota accounts is bounded per pass: a large fleet that
-// is near quota all at once must not fan out one probe per account at once.
-test('stale near-quota rechecks are capped per pass and the rest wait for the next one', async () => {
+// The cap must not starve the tail of the fleet: rechecks rotate through
+// every near-quota account and drain without waiting for another timer tick.
+test('stale near-quota rechecks eventually cover every account, each once', async () => {
   const seen = [];
   const upstream = recordingUpstream(seen);
   const upstreamPort = await listen(upstream);
@@ -1141,12 +1141,13 @@ test('stale near-quota rechecks are capped per pass and the rest wait for the ne
   });
   await listen(proxy);
   try {
-    assert.equal(proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' }), true);
-    await waitFor(() => seen.length >= 4);
-    await new Promise(r => setTimeout(r, 150));
-    assert.equal(seen.length, 4, 'one pass probes at most four accounts');
-    const scheduled = am.accounts.filter(a => a._nearQuotaRecheckAt > Date.now()).length;
-    assert.equal(scheduled, 4, 'only the probed accounts are rate-limited; the rest stay eligible for the next pass');
+    proxy.importProbeTemplate({ model: 'claude-prev', version: '2023-06-01', beta: null, system: 'sys' });
+    assert.ok(await waitFor(() => seen.length >= 10, 3000), `only ${seen.length} of 10 accounts were rechecked`);
+    await new Promise(r => setTimeout(r, 100));
+    const perAccount = new Map();
+    for (const s of seen) perAccount.set(s.auth, (perAccount.get(s.auth) || 0) + 1);
+    assert.equal(perAccount.size, 10);
+    assert.ok([...perAccount.values()].every(n => n === 1), 'each account rechecked once');
   } finally {
     proxy.close();
     upstream.close();

@@ -1148,11 +1148,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // must not stack new batches on probes still waiting for upstream.
   const STALE_RECHECKS_IN_FLIGHT = 4;
   let staleRechecksInFlight = 0;
+  // Selection rotates from where the last pass stopped so the cap cannot keep
+  // picking the head of the fleet, and a finished probe pulls the next one in
+  // without waiting for another timer tick (warmupIntervalMs may be 0).
+  let staleRecheckCursor = 0;
   function recheckStaleNearQuota() {
     if (!activeWarmup || warmupClosed || !probeTemplate) return;
     const now = Date.now();
-    for (const account of accountManager.accounts) {
+    const accounts = accountManager.accounts;
+    for (let step = 0; step < accounts.length; step += 1) {
       if (staleRechecksInFlight >= STALE_RECHECKS_IN_FLIGHT) break;
+      const index = (staleRecheckCursor + step) % accounts.length;
+      const account = accounts[index];
       if (account.enabled === false || account.status === 'error' || account.authRevoked
           || account.subscriptionDisabled || account.inflight !== 0 || account._warming
           || (account.type === 'oauth' && isTokenExpiringSoon(account.expiresAt))
@@ -1163,9 +1170,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         ? probeTemplate : staleRecheckTemplate;
       if (!template || !accountManager._isNearQuota(account, template.model)) continue;
       account._nearQuotaRecheckAt = now + Math.max(60_000, warmupIntervalMs);
+      staleRecheckCursor = (index + 1) % accounts.length;
       staleRechecksInFlight += 1;
       void warmupAccount(account, { force: true, template })
-        .finally(() => { staleRechecksInFlight -= 1; });
+        .finally(() => {
+          staleRechecksInFlight -= 1;
+          setImmediate(recheckStaleNearQuota);
+        });
     }
   }
 
