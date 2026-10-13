@@ -271,6 +271,13 @@ export function getServerStatePath() {
   return getConfigPath().replace(/\.json$/, '') + '.server.json';
 }
 
+// Request/result files for confirmed account reloads (see reload-ack.js): the
+// CLI drops a request here before signalling the worker, and the worker answers
+// it once the reload actually finished.
+export function getReloadAckDir() {
+  return getConfigPath().replace(/\.json$/, '') + '.reload';
+}
+
 export async function writeServerState(state) {
   const path = getServerStatePath();
   await mkdir(dirname(path), { recursive: true });

@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
+import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getReloadAckDir, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
@@ -79,6 +79,7 @@ import {
   normalizeSubscriptionCancellation,
   subscriptionSnapshot,
 } from './subscription.js';
+import { requestConfirmedReload, createReloadQueue, normalizeReloadTimeoutMs } from './reload-ack.js';
 import {
   installTimestampedConsole,
   formatSignalTrace,
@@ -241,15 +242,15 @@ switch (command) {
     break;
   case 'import':
     await importCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'login':
     await loginCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'reauth':
     await reauthenticateCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'env':
     await envCommand();
@@ -261,38 +262,38 @@ switch (command) {
     break;
   case 'accounts':
     await accountsCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'remove':
     await removeCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'disable':
     await setEnabledCommand(false);
-    process.exit(0);
+    process.exit();
     break;
   case 'enable':
     await setEnabledCommand(true);
-    process.exit(0);
+    process.exit();
     break;
   case 'priority':
     await setPriorityCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'subscription':
     await subscriptionCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'api':
     // `api <path>` is the raw endpoint call. Without a path (or with only
     // flags) it registers an API-key account: `api --name N --credit USD`.
     if (!args[1] || args[1].startsWith('--')) await loginApiCommand();
     else await apiCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'api-credit':
     await apiCreditCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'cloud-sidecar':
     await cloudSidecarCommand();
@@ -1694,14 +1695,18 @@ async function proxyWorkerCommand() {
     }
   };
   const server = createProxyServer(accountManager, config, hooks);
-  let liveSyncChain = Promise.resolve();
-  process.on('SIGHUP', () => {
-    // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
-    // and every in-flight response alive. Serializing signals avoids overlapping
-    // remove/add passes when several CLI changes land together.
-    liveSyncChain = liveSyncChain.then(async () => {
+  // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
+  // and every in-flight response alive. The queue serializes steps (one per
+  // SIGHUP) so overlapping remove/add passes cannot interleave, answers the CLI
+  // requests each step claimed (reload-ack.js) only after the reload finished,
+  // and keeps stepping while a request whose SIGHUP was coalesced is waiting.
+  // A failure is reported to the waiting CLIs and logged, never thrown, so it
+  // cannot take the worker or the supervisor down.
+  const accountReloads = createReloadQueue({
+    dir: getReloadAckDir(),
+    reload: async () => {
       const diskConfig = await accountManager.readAfterAccountFlagWrites(() => loadConfig());
-      if (!diskConfig) return;
+      if (!diskConfig) throw new Error(`config file not found: ${getConfigPath()}`);
       await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (codexMode) await server.refreshQuotaAll();
       if (process.connected) {
@@ -1710,11 +1715,18 @@ async function proxyWorkerCommand() {
           maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
         });
       }
-      console.log('[TeamClaude] Applied account config without restarting the worker');
-    }).catch(err => {
-      console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
-    });
+    },
+    onResultError: err => console.error(`[TeamClaude] Could not record account reload result: ${err.message}`),
+    onResult: result => {
+      if (result.ok) console.log('[TeamClaude] Applied account config without restarting the worker');
+      else console.error(`[TeamClaude] Account config reload failed: ${result.error}`);
+      if (result.ackError) {
+        console.error('[TeamClaude] A waiting account CLI was not sent its reload confirmation '
+          + `and will report the change as unconfirmed: ${result.ackError}`);
+      }
+    },
   });
+  process.on('SIGHUP', () => { accountReloads.trigger(); });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
   // freshly restarted idle proxy — without this the template is memory-only
@@ -3562,8 +3574,27 @@ async function removeCommand() {
 
 // ── enable / disable / priority ─────────────────────────────
 
-/** Ask the supervised worker to live-sync account changes without a restart. */
+/**
+ * Ask the supervised worker to live-sync account changes without a restart, and
+ * wait for it to confirm. Anything short of a confirmed reload is reported as
+ * "saved but not applied" with a non-zero exit code; the server is never
+ * restarted from here.
+ */
 async function noteRunningServerReload(config) {
+  const notApplied = (reason, { maybeInProgress = false } = {}) => {
+    console.error(`Saved to ${getConfigPath()}, but NOT confirmed as applied to the running server: ${reason}.`);
+    if (maybeInProgress) {
+      // The worker may have claimed the request and still be reloading; do not
+      // recommend a restart that would cut in-flight requests for nothing.
+      console.error('The reload may still be in progress. Check the server log for');
+      console.error('"Applied account config without restarting the worker" before retrying the command.');
+    } else {
+      console.error('The running server keeps its previous accounts until a reload succeeds or it restarts.');
+      console.error('Retry the command, or schedule a restart for an idle moment (a restart ends in-flight requests).');
+    }
+    process.exitCode = 1;
+    return false;
+  };
   try {
     const running = await findRunningServer(config, configuredStatusProbeTimeoutMs(30_000));
     if (!running) return false;
@@ -3572,18 +3603,27 @@ async function noteRunningServerReload(config) {
       && verifyWorkerIdentity(state, running.identity)
       ? state.workerPid
       : null;
-    if (!workerPid) {
-      console.error('The running server does not support account-only live reload.');
-      console.error('Apply the change with: teamcodex restart');
-      return false;
+    if (!workerPid) return notApplied('it does not support account-only live reload');
+    const timeoutMs = normalizeReloadTimeoutMs(process.env.TEAMCLAUDE_RELOAD_TIMEOUT_MS);
+    const outcome = await requestConfirmedReload({
+      dir: getReloadAckDir(),
+      signal: () => process.kill(workerPid, 'SIGHUP'),
+      isWorkerAlive: () => isPidAlive(workerPid),
+      timeoutMs,
+    });
+    if (outcome.status === 'applied') {
+      console.log('Applied to the running server without restarting active connections.');
+      return true;
     }
-    process.kill(workerPid, 'SIGHUP');
-    console.log('Applied to the running server without restarting active connections.');
-    return true;
+    if (outcome.status === 'failed') return notApplied(`the reload failed (${outcome.error})`);
+    if (outcome.reason === 'timeout') {
+      return notApplied(`no confirmation within ${timeoutMs / 1000}s (an older server never confirms)`,
+        { maybeInProgress: true });
+    }
+    if (outcome.reason === 'worker-exited') return notApplied('the worker exited before confirming');
+    return notApplied(outcome.reason);
   } catch (err) {
-    console.error(`Could not reload the running server automatically: ${err.message}`);
-    console.error('Apply the change with: teamcodex restart');
-    return false;
+    return notApplied(`could not reload it automatically (${err.message})`);
   }
 }
 
