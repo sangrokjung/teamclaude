@@ -439,7 +439,7 @@ export async function attemptCloudHandoff({
   now = new Date(),
   random = Math.random,
   claimBeforeLaunch = async () => true,
-  releaseClaim = async () => {},
+  releaseClaim = async () => true,
   beforeLaunch = async () => {},
   launchCloud,
   log = () => {},
@@ -491,9 +491,21 @@ export async function attemptCloudHandoff({
   }
   if (!claimed) return skip('claim-refused');
 
-  await beforeLaunch();
+  // Any failure after the claim must either confirm the claim was released
+  // (local recovery may continue) or report it as held, so the caller
+  // preserves the session instead of leaving it unrecoverable.
+  const failAfterClaim = async () => {
+    let released = false;
+    try {
+      released = (await releaseClaim(claimed)) === true;
+    } catch {
+      released = false;
+    }
+    return { ok: false, reason: 'launch-failed', stopped: true, claimHeld: !released };
+  };
   let result = null;
   try {
+    await beforeLaunch();
     result = await launchCloud({
       vendorBin,
       args: ['--cloud', prompt],
@@ -503,12 +515,7 @@ export async function attemptCloudHandoff({
   } catch {
     result = null;
   }
-  if (!result || result.error || result.status !== 0) {
-    try {
-      await releaseClaim(claimed);
-    } catch {}
-    return { ok: false, reason: 'launch-failed', stopped: true };
-  }
+  if (!result || result.error || result.status !== 0) return failAfterClaim();
   if (ledgerPath) {
     try {
       await appendCloudLedger(ledgerPath, {

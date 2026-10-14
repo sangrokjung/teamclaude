@@ -1019,8 +1019,10 @@ export async function runClaudeWithRecovery({
         // A launch that failed after the claim must not leave the session
         // permanently unrecoverable by the cmux rescuer.
         releaseClaim: async claim => {
-          if (typeof releaseRecoveryOnce !== 'function' || !claim || claim === true) return;
-          await releaseRecoveryOnce(handoffSessionId, claim);
+          // `true` means no claim store is wired, so nothing is held.
+          if (claim === true) return true;
+          if (typeof releaseRecoveryOnce !== 'function') return false;
+          return (await releaseRecoveryOnce(handoffSessionId, claim)) === true;
         },
         beforeLaunch: () => stopChild(currentChild),
         launchCloud,
@@ -1028,6 +1030,10 @@ export async function runClaudeWithRecovery({
       });
     } catch {
       outcome = { ok: false, reason: 'error' };
+    }
+    if (!outcome.ok && outcome.claimHeld) {
+      log(`[TeamClaude] Cloud session handoff for ${handoffSessionId} failed and its replay claim could not be released; preserving the session for manual continuation.`);
+      return { status: 1, signal: null };
     }
     if (!outcome.ok) {
       log(`[TeamClaude] Cloud session handoff for ${handoffSessionId} was not possible (${outcome.reason}); continuing with the local recovery path.`);

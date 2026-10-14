@@ -758,7 +758,7 @@ test('attemptCloudHandoff reports a failed cloud launch without writing the ledg
       beforeLaunch: async () => {},
       launchCloud,
     }));
-    assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true });
+    assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: false });
   }
   await assert.rejects(stat(join(root, 'ledger.jsonl')));
 });

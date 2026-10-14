@@ -503,7 +503,7 @@ test('a failed cloud launch releases the permanent replay claim it took', async 
     pollIntervalMs: 5,
     fetchStatus: async () => statusWithQuota(0.99),
     claimRecoveryOnce: async () => identity,
-    releaseRecoveryOnce: async (sessionId, claim) => released.push({ sessionId, claim }),
+    releaseRecoveryOnce: async (sessionId, claim) => { released.push({ sessionId, claim }); return true; },
     wait: async () => {},
     spawnClaude: scriptedSpawn(ctx, [], cwd => fleetExhaustedRecord(cwd, 3600)),
     launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
@@ -514,6 +514,43 @@ test('a failed cloud launch releases the permanent replay claim it took', async 
   assert.equal(released.length, 1);
   assert.deepEqual(released[0].claim, identity);
 });
+
+for (const [label, release] of [
+  ['returns false', async () => false],
+  ['throws', async () => { throw new Error('release failed'); }],
+]) {
+  test(`a cloud launch failure whose claim release ${label} preserves the session`, async t => {
+    const ctx = await setup(t, `teamclaude-cloud-claim-held-${label.replace(/ /g, '-')}-`);
+    const logs = [];
+    let waited = false;
+    const result = await runClaudeWithRecovery({
+      claudeArgs: [],
+      childEnv: {},
+      config: {
+        autoResumeClaude: true,
+        claudeAutoResumeBackoffMs: 0,
+        claudeFleetExhaustionMaxRetries: 1,
+        cloudFallbackOnExhaustion: true,
+      },
+      cwd: ctx.repo,
+      transcriptRoot: ctx.transcriptRoot,
+      handoffRoot: ctx.handoffRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => statusWithQuota(0.99),
+      claimRecoveryOnce: async () => ({ dev: 1, ino: 2 }),
+      releaseRecoveryOnce: release,
+      wait: async () => { waited = true; },
+      spawnClaude: scriptedSpawn(ctx, [], cwd => fleetExhaustedRecord(cwd, 3600)),
+      launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+      launchCloud: async () => ({ status: 1, signal: null }),
+      cloudHandoff: cloudOptions(ctx),
+      log: message => logs.push(message),
+    });
+    assert.deepEqual(result, { status: 1, signal: null });
+    assert.equal(waited, false);
+    assert.ok(logs.some(line => line.includes('could not be released')));
+  });
+}
 
 for (const [label, claimRecoveryOnce, reason] of [
   ['refused', async () => false, 'claim-refused'],

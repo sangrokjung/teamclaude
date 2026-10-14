@@ -120,6 +120,9 @@ test('containsSecret flags secret-named YAML keys with block scalar or next-line
     `api_token: |-\n  ${value}\n`,
     `api_token: >\n  ${value}\n`,
     `creds:\n  api_token:\n    ${value}\n`,
+    `api_token: |2-\n    ${value}\n`,
+    `api_token: >2+\n    ${value}\n`,
+    `api_token: |+2\n    ${value}\n`,
   ]) {
     assert.equal(containsSecret(input), true, input);
   }
