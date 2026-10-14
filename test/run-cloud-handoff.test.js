@@ -61,7 +61,7 @@ mkdirSync(dir, { recursive: true });
 const records = [
   { type: 'user', cwd: process.cwd(), message: { role: 'user', content: 'keep going' } },
   { type: 'assistant', cwd: process.cwd(), isApiErrorMessage: true, error: 'rate_limit_error', apiErrorStatus: 429,
-    message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: Server is temporarily limiting requests (not your usage limit) · All 2 accounts exhausted. Retry in 3s.' }] } },
+    message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: Server is temporarily limiting requests (not your usage limit) · All 2 accounts exhausted. Retry in 3600s.' }] } },
 ];
 writeFileSync(join(dir, args[flag + 1] + '.jsonl'), records.map(JSON.stringify).join('\\n') + '\\n');
 process.on('SIGTERM', () => process.exit(0));
