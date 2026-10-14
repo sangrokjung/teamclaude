@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   chmod,
   mkdir,
@@ -286,6 +286,114 @@ test('snapshot push sends HEAD itself when there is no local change', async t =>
   assert.equal(pushed.ok, true);
   assert.equal(pushed.commit, head);
   assert.equal(git(bare, env, 'rev-parse', `refs/heads/${pushed.branch}`), head);
+});
+
+function randomToken(length) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  return [...randomBytes(length)].map(byte => alphabet[byte % alphabet.length]).join('');
+}
+
+function handoffRefs(bare, env) {
+  return git(bare, env, 'for-each-ref', '--format=%(refname)', 'refs/heads/teamclaude-handoff/');
+}
+
+async function snapshot(repo, env) {
+  const inspected = await inspectHandoffRepo({ cwd: repo, gitEnv: env });
+  return pushHandoffSnapshot({
+    root: inspected.root,
+    head: inspected.head,
+    sessionId: SESSION_ID,
+    gitEnv: env,
+    now: new Date(2026, 9, 14, 9, 5),
+  });
+}
+
+test('snapshot push aborts without pushing when changed content carries a secret', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  await writeFile(join(repo, 'notes.txt'), `메모\nOPENAI_API_KEY=${randomToken(40)}\n`);
+  await writeFile(join(repo, 'tracked.txt'), 'harmless edit\n');
+
+  const pushed = await snapshot(repo, env);
+  assert.deepEqual(pushed, { ok: false, reason: 'snapshot-secret' });
+  assert.equal(handoffRefs(bare, env), '');
+});
+
+test('snapshot push aborts when an unpushed local commit carries a secret', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-commit-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  git(repo, env, 'branch', '--set-upstream-to=origin/main');
+  await writeFile(join(repo, 'config.json'), `{"client_secret": "${randomToken(32)}"}\n`);
+  git(repo, env, 'add', 'config.json');
+  git(repo, env, 'commit', '--quiet', '-m', 'unpushed secret');
+
+  assert.deepEqual(await snapshot(repo, env), { ok: false, reason: 'snapshot-secret' });
+  assert.equal(handoffRefs(bare, env), '');
+});
+
+test('snapshot scan diffs against the upstream the cloud already has, else the empty tree', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-base-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  // Already on the remote: pushing the handoff branch does not expose it again.
+  await writeFile(join(repo, 'legacy.txt'), `OPENAI_API_KEY=${randomToken(40)}\n`);
+  git(repo, env, 'add', 'legacy.txt');
+  git(repo, env, 'commit', '--quiet', '-m', 'legacy');
+  git(repo, env, 'push', '--quiet', 'origin', 'main');
+  await writeFile(join(repo, 'clean.txt'), 'clean change\n');
+
+  // No upstream and no origin/HEAD: the whole snapshot is scanned.
+  assert.deepEqual(await snapshot(repo, env), { ok: false, reason: 'snapshot-secret' });
+  assert.equal(handoffRefs(bare, env), '');
+
+  git(repo, env, 'branch', '--set-upstream-to=origin/main');
+  const pushed = await snapshot(repo, env);
+  assert.equal(pushed.ok, true);
+  assert.equal(git(bare, env, 'show', `refs/heads/${pushed.branch}:clean.txt`), 'clean change');
+});
+
+test('snapshot scan falls back to origin/HEAD and skips binary content', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-originhead-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  await writeFile(join(repo, 'legacy.txt'), `OPENAI_API_KEY=${randomToken(40)}\n`);
+  git(repo, env, 'add', 'legacy.txt');
+  git(repo, env, 'commit', '--quiet', '-m', 'legacy');
+  git(repo, env, 'push', '--quiet', 'origin', 'main');
+  git(repo, env, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+  await writeFile(
+    join(repo, 'image.bin'),
+    Buffer.concat([Buffer.from([0, 1, 2, 0]), Buffer.from(`token=${randomToken(48)}`)]),
+  );
+  await writeFile(join(repo, 'placeholder.env.example'), 'OPENAI_API_KEY=<your-key-here>\n');
+
+  const pushed = await snapshot(repo, env);
+  assert.equal(pushed.ok, true);
+  const files = git(bare, env, 'ls-tree', '-r', '--name-only', `refs/heads/${pushed.branch}`);
+  assert.match(files, /image\.bin/);
+});
+
+test('attemptCloudHandoff falls back without pushing or launching when the snapshot carries a secret', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-attempt-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  await writeFile(join(repo, 'notes.txt'), `OPENAI_API_KEY=${randomToken(40)}\n`);
+  const outcome = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    beforeLaunch: async () => {
+      throw new Error('must not stop');
+    },
+    launchCloud: async () => {
+      throw new Error('must not launch');
+    },
+  }));
+  assert.deepEqual(outcome, { ok: false, reason: 'snapshot-secret', stopped: false });
+  assert.equal(handoffRefs(bare, env), '');
 });
 
 test('inspectHandoffRepo rejects non-repositories and non-GitHub origins', async t => {
