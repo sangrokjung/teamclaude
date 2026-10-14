@@ -22,7 +22,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { normalizeExpiresAt } from './oauth.js';
-import { containsSecret } from './secrets.js';
+import { scanSnapshotForSecrets } from './snapshot-scan.js';
 
 export const CLOUD_PROMPT_MAX_BYTES = 48 * 1024;
 export const CLOUD_HANDOFF_MAX_FILE_BYTES = 5 * 1024 * 1024;
@@ -122,9 +122,11 @@ export function defaultRunGit(args, {
     });
     child.on('close', status => {
       clearTimeout(timer);
+      const stdoutBuffer = Buffer.concat(stdout);
       resolve({
         status: overflowed ? 1 : (status ?? 1),
-        stdout: Buffer.concat(stdout).toString('utf8'),
+        stdout: stdoutBuffer.toString('utf8'),
+        stdoutBuffer,
         stderr: Buffer.concat(stderr).toString('utf8'),
       });
     });
@@ -209,59 +211,6 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
-}
-
-// The base the cloud would already see on the remote: the current branch's
-// upstream, else origin's default branch, else nothing (the empty tree).
-// Against a commit base the merge base is used, so remote-only history is
-// not re-scanned.
-async function snapshotScanBase(root, commit, runGit, gitEnv) {
-  for (const ref of ['@{upstream}', 'refs/remotes/origin/HEAD']) {
-    const base = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root, env: gitEnv });
-    if (base.status !== 0 || !base.stdout.trim()) continue;
-    const mergeBase = await runGit(['merge-base', base.stdout.trim(), commit], { cwd: root, env: gitEnv });
-    return mergeBase.status === 0 && mergeBase.stdout.trim()
-      ? mergeBase.stdout.trim()
-      : base.stdout.trim();
-  }
-  const empty = await runGit(['hash-object', '-t', 'tree', '--stdin'], { cwd: root, env: gitEnv, input: '' });
-  return empty.status === 0 && empty.stdout.trim() ? empty.stdout.trim() : null;
-}
-
-// Added lines per file of a `git diff -U0 --text` patch. A file whose added
-// content holds a NUL byte is binary and is skipped.
-function addedTextPerFile(patch) {
-  const files = [];
-  let current = null;
-  let inHunk = false;
-  for (const line of patch.split('\n')) {
-    if (line.startsWith('diff --git ')) {
-      current = [];
-      files.push(current);
-      inHunk = false;
-    } else if (line.startsWith('@@')) {
-      inHunk = true;
-    } else if (inHunk && current && line.startsWith('+')) {
-      current.push(line.slice(1));
-    }
-  }
-  return files.map(lines => lines.join('\n')).filter(text => !text.includes('\0'));
-}
-
-const SNAPSHOT_SCAN_MAX_BYTES = 256 * 1024 * 1024;
-
-// Fail closed: any secret hit, unreadable diff, or unknown base aborts.
-export async function scanSnapshotForSecrets({ root, commit, runGit = defaultRunGit, gitEnv = process.env }) {
-  const base = await snapshotScanBase(root, commit, runGit, gitEnv);
-  if (!base) return { ok: false, reason: 'snapshot-scan-failed' };
-  const diff = await runGit(
-    ['diff', '-U0', '--text', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames',
-      '--diff-filter=d', base, commit, '--'],
-    { cwd: root, env: gitEnv, timeoutMs: 120_000, maxOutputBytes: SNAPSHOT_SCAN_MAX_BYTES },
-  );
-  if (diff.status !== 0) return { ok: false, reason: 'snapshot-scan-failed' };
-  if (addedTextPerFile(diff.stdout).some(containsSecret)) return { ok: false, reason: 'snapshot-secret' };
-  return { ok: true };
 }
 
 export async function pushHandoffSnapshot({
