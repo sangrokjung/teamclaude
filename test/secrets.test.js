@@ -113,3 +113,15 @@ test('containsSecret flags Authorization headers of any scheme and letter-only Y
   }
   assert.equal(containsSecret('Authorization: Token <your-token-here>'), false);
 });
+
+test('containsSecret flags secret-named YAML keys with block scalar or next-line values', () => {
+  const value = 'abcdefghijklmnopqrstu';
+  for (const input of [
+    `api_token: |-\n  ${value}\n`,
+    `api_token: >\n  ${value}\n`,
+    `creds:\n  api_token:\n    ${value}\n`,
+  ]) {
+    assert.equal(containsSecret(input), true, input);
+  }
+  assert.equal(containsSecret(`description: |-\n  ${value}\n`), false);
+});

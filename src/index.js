@@ -62,6 +62,7 @@ import {
 } from './cmux-session-rescue.js';
 import {
   claimSessionOnce,
+  releaseSessionClaim,
   claimSessionLease,
   releaseSessionLease,
   resolveCmuxSessionId,
@@ -2829,6 +2830,9 @@ async function runCommand(clientArgsOverride = null) {
       resolveSessionId: cmuxSessionResolver,
       claimRecoveryOnce: cmuxRecoveryEnabled
         ? sessionId => claimSessionOnce(cmuxRescuePaths.storePath, sessionId)
+        : null,
+      releaseRecoveryOnce: cmuxRecoveryEnabled
+        ? (sessionId, identity) => releaseSessionClaim(cmuxRescuePaths.storePath, sessionId, identity)
         : null,
       claimRecoveryLease: cmuxRecoveryEnabled
         ? sessionId => claimSessionLease(cmuxRescuePaths.storePath, sessionId)

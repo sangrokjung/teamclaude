@@ -439,6 +439,7 @@ export async function attemptCloudHandoff({
   now = new Date(),
   random = Math.random,
   claimBeforeLaunch = async () => true,
+  releaseClaim = async () => {},
   beforeLaunch = async () => {},
   launchCloud,
   log = () => {},
@@ -503,6 +504,9 @@ export async function attemptCloudHandoff({
     result = null;
   }
   if (!result || result.error || result.status !== 0) {
+    try {
+      await releaseClaim(claimed);
+    } catch {}
     return { ok: false, reason: 'launch-failed', stopped: true };
   }
   if (ledgerPath) {

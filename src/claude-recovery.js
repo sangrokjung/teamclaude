@@ -816,6 +816,7 @@ export async function runClaudeWithRecovery({
   sessionResolveTimeoutMs = 5000,
   sessionResolvePollIntervalMs = 50,
   claimRecoveryOnce,
+  releaseRecoveryOnce,
   claimRecovery,
   releaseRecovery,
   claimRecoveryLease = claimRecovery,
@@ -1013,8 +1014,14 @@ export async function runClaudeWithRecovery({
         // Mirrors protectCodexHandoff's permanent claim, but taken BEFORE the
         // launch: a refused (false) or failed claim keeps the session local.
         claimBeforeLaunch: async () => (typeof claimRecoveryOnce === 'function'
-          ? Boolean(await claimRecoveryOnce(handoffSessionId))
+          ? await claimRecoveryOnce(handoffSessionId)
           : true),
+        // A launch that failed after the claim must not leave the session
+        // permanently unrecoverable by the cmux rescuer.
+        releaseClaim: async claim => {
+          if (typeof releaseRecoveryOnce !== 'function' || !claim || claim === true) return;
+          await releaseRecoveryOnce(handoffSessionId, claim);
+        },
         beforeLaunch: () => stopChild(currentChild),
         launchCloud,
         log,

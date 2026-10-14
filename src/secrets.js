@@ -111,6 +111,8 @@ const ENV_ASSIGNMENT_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,12
 const QUOTED_ASSIGNMENT_RE = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\1[ \t]*[:=][ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)')/g;
 const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*([A-Za-z0-9_\-+/=~]{16,})[ \t]*$/gm;
 
+const YAML_BLOCK_KEY_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*(?:[|>][-+]?[0-9]?)?[ \t]*(?=\r?\n(?:[ \t]*\r?\n)*([ \t]+)([^\r\n]+))/gm;
+
 function hasSecretAssignment(text) {
   for (const match of text.matchAll(ENV_ASSIGNMENT_RE)) {
     const [, name, doubleQuoted, singleQuoted, bare] = match;
@@ -122,6 +124,12 @@ function hasSecretAssignment(text) {
   for (const match of text.matchAll(QUOTED_ASSIGNMENT_RE)) {
     const [, , name, doubleQuoted, singleQuoted] = match;
     if (isSecretName(name) && isPlausibleSecretValue(doubleQuoted ?? singleQuoted)) return true;
+  }
+  // Secret-named YAML keys whose value continues on indented lines (block
+  // scalars `|`, `>-`, or a bare `key:`) are blocked conservatively.
+  for (const match of text.matchAll(YAML_BLOCK_KEY_RE)) {
+    const [, indent, name, nextIndent, value] = match;
+    if (isSecretName(name) && nextIndent.length > indent.length && isPlausibleSecretValue(value.trim())) return true;
   }
   for (const match of text.matchAll(YAML_ASSIGNMENT_RE)) {
     const [, name, value] = match;

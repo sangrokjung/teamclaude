@@ -484,6 +484,37 @@ test('the permanent replay claim is taken before the cloud session launches', as
   assert.deepEqual(order, ['claim', 'launch']);
 });
 
+test('a failed cloud launch releases the permanent replay claim it took', async t => {
+  const ctx = await setup(t, 'teamclaude-cloud-claim-release-');
+  const released = [];
+  const identity = { dev: 7, ino: 9 };
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeBackoffMs: 0,
+      claudeFleetExhaustionMaxRetries: 1,
+      cloudFallbackOnExhaustion: true,
+    },
+    cwd: ctx.repo,
+    transcriptRoot: ctx.transcriptRoot,
+    handoffRoot: ctx.handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.99),
+    claimRecoveryOnce: async () => identity,
+    releaseRecoveryOnce: async (sessionId, claim) => released.push({ sessionId, claim }),
+    wait: async () => {},
+    spawnClaude: scriptedSpawn(ctx, [], cwd => fleetExhaustedRecord(cwd, 3600)),
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    launchCloud: async () => ({ status: 1, signal: null }),
+    cloudHandoff: cloudOptions(ctx),
+    log() {},
+  });
+  assert.equal(released.length, 1);
+  assert.deepEqual(released[0].claim, identity);
+});
+
 for (const [label, claimRecoveryOnce, reason] of [
   ['refused', async () => false, 'claim-refused'],
   ['failing', async () => { throw new Error('claim store unavailable'); }, 'claim-failed'],
