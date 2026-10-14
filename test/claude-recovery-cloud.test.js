@@ -207,7 +207,7 @@ test('fleet exhaustion hands the session to a cloud session and ends the local s
       return { dev: 1, ino: 1 };
     },
     wait: async () => { throw new Error('must not wait for the fleet'); },
-    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3)),
+    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3600)),
     launchCodex: async () => { throw new Error('cloud runs before the Codex fallback'); },
     launchCloud: async request => {
       launches += 1;
@@ -240,6 +240,35 @@ test('fleet exhaustion hands the session to a cloud session and ends the local s
     `[TeamClaude] Claude fleet exhausted; handed session ${sessionId} to a cloud session on cloud-acct (branch ${ledger.branch}).`,
   ));
   assert.equal(logs.some(line => line.includes('tok-cloud') || line.includes('마무리해')), false);
+});
+
+test('a short proxy throttle without confirmed quota exhaustion does not open a cloud session', async t => {
+  const ctx = await setup(t, 'teamclaude-cloud-short-throttle-');
+  const calls = [];
+  const waits = [];
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeBackoffMs: 0,
+      cloudFallbackOnExhaustion: true,
+    },
+    cwd: ctx.repo,
+    transcriptRoot: ctx.transcriptRoot,
+    handoffRoot: ctx.handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async ms => waits.push(ms),
+    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3)),
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    launchCloud: async () => { throw new Error('a 3s throttle must not reach the cloud'); },
+    cloudHandoff: cloudOptions(ctx),
+    log() {},
+  });
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [3000]);
+  await assert.rejects(stat(ctx.ledgerPath));
 });
 
 test('a failed cloud precondition falls back to the fleet wait path', async t => {
@@ -294,7 +323,7 @@ test('a failed cloud launch falls back to the wait path and is attempted once pe
     pollIntervalMs: 5,
     fetchStatus: async () => statusWithQuota(0.5),
     wait: async ms => waits.push(ms),
-    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3), (child, args) => {
+    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3600), (child, args) => {
       // The resumed child hits fleet exhaustion again, then exits by itself.
       const sessionId = args[args.indexOf('--resume') + 1];
       setTimeout(async () => {
@@ -314,7 +343,7 @@ test('a failed cloud launch falls back to the wait path and is attempted once pe
     log() {},
   });
   assert.equal(launches, 1);
-  assert.deepEqual(waits, [3000]);
+  assert.deepEqual(waits, [3600000]);
   assert.equal(calls.length, 2);
   assert.equal(result.status, 7);
   await assert.rejects(stat(ctx.ledgerPath));

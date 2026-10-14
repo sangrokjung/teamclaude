@@ -104,6 +104,8 @@ function modelWindowBlocked(account, label, threshold) {
 // when the proxy itself reported that every account is exhausted for the
 // session's request (a fleet-exhaustion error); windows of other models never
 // count, and without a known session model only general quota decides.
+const CLOUD_HANDOFF_MIN_WAIT_SECONDS = 600;
+
 export function isClaudeFleetExhausted(status, threshold = 0.98, { modelLabel = null } = {}) {
   const accounts = Array.isArray(status?.accounts)
     ? status.accounts.filter(account => account?.enabled !== false)
@@ -1403,7 +1405,11 @@ export async function runClaudeWithRecovery({
         ? modelQuotaLabel(sessionModel(claudeArgs, nextEnv ?? childEnv))
         : null,
     });
-    if (outcome.event.kind === 'fleet_exhausted' || quotaExhausted) {
+    // A short proxy throttle ("Retry in 3s") also surfaces as fleet_exhausted;
+    // only a confirmed quota exhaustion or a long wait is worth a cloud session.
+    const longFleetWait = outcome.event.kind === 'fleet_exhausted'
+      && outcome.event.retryAfterSeconds >= CLOUD_HANDOFF_MIN_WAIT_SECONDS;
+    if (quotaExhausted || longFleetWait) {
       const cloudResult = await tryCloudHandoff(child, transcriptPath);
       if (cloudResult) return cloudResult;
     }
