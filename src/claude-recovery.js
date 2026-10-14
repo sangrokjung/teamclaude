@@ -1010,6 +1010,11 @@ export async function runClaudeWithRecovery({
           cwd,
           title: 'Claude Code → cloud session handoff',
         }),
+        // Mirrors protectCodexHandoff's permanent claim, but taken BEFORE the
+        // launch: a refused (false) or failed claim keeps the session local.
+        claimBeforeLaunch: async () => (typeof claimRecoveryOnce === 'function'
+          ? Boolean(await claimRecoveryOnce(handoffSessionId))
+          : true),
         beforeLaunch: () => stopChild(currentChild),
         launchCloud,
         log,
@@ -1020,13 +1025,6 @@ export async function runClaudeWithRecovery({
     if (!outcome.ok) {
       log(`[TeamClaude] Cloud session handoff for ${handoffSessionId} was not possible (${outcome.reason}); continuing with the local recovery path.`);
       return null;
-    }
-    if (typeof claimRecoveryOnce === 'function') {
-      // The local session is finished here: leave a permanent replay claim so
-      // the cmux rescuer does not relaunch Claude next to the cloud session.
-      try {
-        await claimRecoveryOnce(handoffSessionId);
-      } catch {}
     }
     log(`[TeamClaude] Claude fleet exhausted; handed session ${handoffSessionId} to a cloud session on ${outcome.account} (branch ${outcome.branch}).`);
     return outcome.result;

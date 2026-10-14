@@ -409,6 +409,8 @@ async function isExecutableFile(path) {
 // Returns { ok: true, result, account, branch } after a successful launch,
 // otherwise { ok: false, reason, stopped } so the caller can fall back to its
 // existing behavior. `stopped` reports whether beforeLaunch already ran.
+// claimBeforeLaunch() runs right before beforeLaunch(); a falsy result or a
+// throw aborts the handoff with the child untouched.
 export async function attemptCloudHandoff({
   sessionId,
   cwd,
@@ -423,6 +425,7 @@ export async function attemptCloudHandoff({
   ledgerPath = null,
   now = new Date(),
   random = Math.random,
+  claimBeforeLaunch = async () => true,
   beforeLaunch = async () => {},
   launchCloud,
   log = () => {},
@@ -462,6 +465,17 @@ export async function attemptCloudHandoff({
   } catch {
     return skip('handoff-unreadable');
   }
+
+  // The permanent replay claim must exist before the local child is stopped
+  // and the cloud session starts; otherwise a rescuer could relaunch Claude
+  // next to the cloud session.
+  let claimed = false;
+  try {
+    claimed = await claimBeforeLaunch();
+  } catch {
+    return skip('claim-failed');
+  }
+  if (!claimed) return skip('claim-refused');
 
   await beforeLaunch();
   let result = null;

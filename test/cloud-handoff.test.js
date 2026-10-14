@@ -736,3 +736,42 @@ test('attemptCloudHandoff falls back when the snapshot push fails', async t => {
   }));
   assert.deepEqual(outcome, { ok: false, reason: 'push-failed', stopped: false });
 });
+
+test('attemptCloudHandoff takes the replay claim before stopping or launching, and stops on refusal', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-claim-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  const order = [];
+  const ok = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    claimBeforeLaunch: async () => {
+      order.push('claim');
+      return true;
+    },
+    beforeLaunch: async () => order.push('stop'),
+    launchCloud: async () => {
+      order.push('launch');
+      return { status: 0, signal: null };
+    },
+  }));
+  assert.equal(ok.ok, true);
+  assert.deepEqual(order, ['claim', 'stop', 'launch']);
+
+  for (const [claimBeforeLaunch, reason] of [
+    [async () => false, 'claim-refused'],
+    [async () => { throw new Error('boom'); }, 'claim-failed'],
+  ]) {
+    const outcome = await attemptCloudHandoff(handoffInputs(root, {
+      cwd: repo,
+      gitEnv: env,
+      vendorBin,
+      claimBeforeLaunch,
+      beforeLaunch: async () => { throw new Error('must not stop'); },
+      launchCloud: async () => { throw new Error('must not launch'); },
+    }));
+    assert.deepEqual(outcome, { ok: false, reason, stopped: false });
+  }
+});

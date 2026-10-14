@@ -448,3 +448,95 @@ test('the cloud prompt redacts JWTs, Authorization values, and long opaque token
     assert.ok(prompt.includes(kept), kept);
   }
 });
+
+test('the permanent replay claim is taken before the cloud session launches', async t => {
+  const ctx = await setup(t, 'teamclaude-cloud-claim-order-');
+  const order = [];
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeBackoffMs: 0,
+      cloudFallbackOnExhaustion: true,
+    },
+    cwd: ctx.repo,
+    transcriptRoot: ctx.transcriptRoot,
+    handoffRoot: ctx.handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.99),
+    claimRecoveryOnce: async () => {
+      order.push('claim');
+      return { dev: 1, ino: 1 };
+    },
+    wait: async () => { throw new Error('must not wait for the fleet'); },
+    spawnClaude: scriptedSpawn(ctx, [], cwd => fleetExhaustedRecord(cwd, 3600)),
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    launchCloud: async () => {
+      order.push('launch');
+      return { status: 0, signal: null };
+    },
+    cloudHandoff: cloudOptions(ctx),
+    log() {},
+  });
+  assert.deepEqual(result, { status: 0, signal: null });
+  assert.deepEqual(order, ['claim', 'launch']);
+});
+
+for (const [label, claimRecoveryOnce, reason] of [
+  ['refused', async () => false, 'claim-refused'],
+  ['failing', async () => { throw new Error('claim store unavailable'); }, 'claim-failed'],
+]) {
+  test(`a ${label} permanent replay claim keeps the session local without a cloud launch`, async t => {
+    const ctx = await setup(t, `teamclaude-cloud-claim-${label}-`);
+    const calls = [];
+    const waits = [];
+    const logs = [];
+    let launches = 0;
+    let claims = 0;
+    const result = await runClaudeWithRecovery({
+      claudeArgs: [],
+      childEnv: {},
+      config: {
+        autoResumeClaude: true,
+        claudeAutoResumeBackoffMs: 0,
+        claudeFleetExhaustionMaxRetries: 1,
+        cloudFallbackOnExhaustion: true,
+      },
+      cwd: ctx.repo,
+      transcriptRoot: ctx.transcriptRoot,
+      handoffRoot: ctx.handoffRoot,
+      pollIntervalMs: 5,
+      fetchStatus: async () => statusWithQuota(0.5),
+      claimRecoveryOnce: async sessionId => {
+        claims += 1;
+        return claimRecoveryOnce(sessionId);
+      },
+      wait: async ms => waits.push(ms),
+      spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3600), (child, args) => {
+        const sessionId = args[args.indexOf('--resume') + 1];
+        setTimeout(async () => {
+          await appendFile(
+            join(ctx.transcriptRoot, 'project', `${sessionId}.jsonl`),
+            `${fleetExhaustedRecord(ctx.repo, 5)}\n`,
+          );
+          setTimeout(() => child.finish(7), 60);
+        }, 10);
+      }),
+      launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+      launchCloud: async () => {
+        launches += 1;
+        return { status: 0, signal: null };
+      },
+      cloudHandoff: cloudOptions(ctx),
+      log: message => logs.push(message),
+    });
+    assert.equal(claims, 1);
+    assert.equal(launches, 0);
+    assert.deepEqual(waits, [3600000]);
+    assert.equal(calls.length, 2);
+    assert.equal(result.status, 7);
+    await assert.rejects(stat(ctx.ledgerPath));
+    assert.ok(logs.some(line => line.includes(`(${reason})`)), logs.join('\n'));
+  });
+}
