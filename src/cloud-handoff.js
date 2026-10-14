@@ -36,7 +36,11 @@ const MIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const MIN_REMAINING_DOLLARS = 1;
 const TOP_CANDIDATES = 3;
 // Credit lookups: bounded fan-out so a large fleet cannot stall the handoff.
-const MAX_CREDIT_LOOKUP_ACCOUNTS = 32;
+// A sanity bound against a pathologically huge config file, not a business
+// limit: the shared concurrency + time budget in lookupCredits() already
+// caps real work, so every genuinely eligible account (up to this bound) is
+// considered — none is silently dropped just for being past position 32.
+const MAX_ELIGIBLE_ACCOUNTS = 4096;
 const CREDIT_LOOKUP_CONCURRENCY = 4;
 const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
 const CREDIT_LOOKUP_BUDGET_MS = 30_000;
@@ -323,7 +327,7 @@ export async function findCloudAccount({
   creditLookup = fetchCloudCredits,
   now = Date.now(),
   random = Math.random,
-  maxAccounts = MAX_CREDIT_LOOKUP_ACCOUNTS,
+  maxAccounts = MAX_ELIGIBLE_ACCOUNTS,
   concurrency = CREDIT_LOOKUP_CONCURRENCY,
   lookupTimeoutMs = CREDIT_LOOKUP_TIMEOUT_MS,
   budgetMs = CREDIT_LOOKUP_BUDGET_MS,

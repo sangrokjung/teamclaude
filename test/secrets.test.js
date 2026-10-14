@@ -138,3 +138,9 @@ test('containsSecret flags secret-named YAML keys with a comment or tag after th
     assert.equal(containsSecret(input), true, input);
   }
 });
+
+test('containsSecret flags a secret further down a multi-line YAML block, not only its first line', () => {
+  const value = 'abcdefghijklmnopqrstu';
+  assert.equal(containsSecret(`api_token: |-\n  # retained for compatibility\n  ${value}\n`), true);
+  assert.equal(containsSecret('api_token: |-\n  # just a comment\n  # another comment\n'), false);
+});

@@ -153,7 +153,7 @@ function fleet(count, now) {
   }));
 }
 
-test('findCloudAccount caps the fan-out at 32 accounts with at most 4 lookups in flight', async () => {
+test('findCloudAccount bounds concurrency at 4 in flight but still visits every eligible account', async () => {
   const now = Date.UTC(2026, 9, 14);
   const looked = [];
   let inFlight = 0;
@@ -163,15 +163,23 @@ test('findCloudAccount caps the fan-out at 32 accounts with at most 4 lookups in
     assert.ok(options?.signal instanceof AbortSignal, 'each lookup gets an abort signal');
     inFlight += 1;
     maxInFlight = Math.max(maxInFlight, inFlight);
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await new Promise(resolve => setTimeout(resolve, 1));
     inFlight -= 1;
     return { remainingDollars: Number(token.slice(4)) + 1, lockedReason: null };
   };
   const best = await findCloudAccount({ accounts: fleet(40, now), creditLookup, now, random: () => 0 });
-  assert.equal(looked.length, 32);
+  assert.equal(looked.length, 40);
   assert.equal(maxInFlight, 4);
-  assert.equal(looked.includes('tok-32'), false);
-  assert.equal(best.name, 'acct-31');
+  assert.equal(best.name, 'acct-39');
+});
+
+test('findCloudAccount still finds a funded account past position 32 when earlier ones have no credit', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  const creditLookup = async token => (token === 'tok-32'
+    ? { remainingDollars: 10, lockedReason: null }
+    : { remainingDollars: 0, lockedReason: null });
+  const best = await findCloudAccount({ accounts: fleet(40, now), creditLookup, now, random: () => 0 });
+  assert.equal(best?.name, 'acct-32');
 });
 
 test('findCloudAccount treats a lookup past its timeout as ineligible and aborts it', async () => {

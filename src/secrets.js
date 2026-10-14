@@ -111,13 +111,39 @@ const ENV_ASSIGNMENT_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,12
 const QUOTED_ASSIGNMENT_RE = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\1[ \t]*[:=][ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)')/g;
 const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*([A-Za-z0-9_\-+/=~]{16,})[ \t]*$/gm;
 
-// A secret-named key followed by an indented continuation line is blocked
+// A secret-named key followed by an indented continuation block is blocked
 // regardless of what comes between the colon and the newline (a block
 // scalar indicator with any chomping/indentation digit in either order, a
-// YAML tag, a trailing comment, or nothing at all for a bare `key:\n  value`).
-// This is deliberately permissive: any syntax we don't specifically parse
-// still falls through to "secret-named key, indented value follows".
-const YAML_BLOCK_KEY_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[^\r\n]*(?=\r?\n(?:[ \t]*\r?\n)*([ \t]+)([^\r\n]+))/gm;
+// YAML tag, a trailing comment, or nothing at all for a bare `key:\n  value`),
+// and regardless of which line within that block carries the value — a
+// leading comment or tag line inside the block must not hide a secret a few
+// lines further down. Scanned line-by-line rather than by one regex, since a
+// block can span an unbounded number of continuation lines.
+const YAML_BLOCK_KEY_LINE_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[^\r\n]*$/;
+// A bound on how many continuation lines of one block we inspect: enough for
+// any real secret file, cheap enough to stay linear on pathological input.
+const YAML_BLOCK_SCAN_LIMIT = 64;
+
+function hasYamlBlockSecret(text) {
+  const lines = text.split(/\r\n|\r|\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const match = YAML_BLOCK_KEY_LINE_RE.exec(lines[i]);
+    if (!match) continue;
+    const [, indent, name] = match;
+    if (!isSecretName(name)) continue;
+    const baseIndent = indent.length;
+    let scanned = 0;
+    for (let j = i + 1; j < lines.length && scanned < YAML_BLOCK_SCAN_LIMIT; j++) {
+      const line = lines[j];
+      if (line.trim() === '') continue;
+      const lineIndent = line.length - line.trimStart().length;
+      if (lineIndent <= baseIndent) break;
+      scanned += 1;
+      if (isPlausibleSecretValue(line.trim())) return true;
+    }
+  }
+  return false;
+}
 
 function hasSecretAssignment(text) {
   for (const match of text.matchAll(ENV_ASSIGNMENT_RE)) {
@@ -133,10 +159,7 @@ function hasSecretAssignment(text) {
   }
   // Secret-named YAML keys whose value continues on indented lines (block
   // scalars `|`, `>-`, or a bare `key:`) are blocked conservatively.
-  for (const match of text.matchAll(YAML_BLOCK_KEY_RE)) {
-    const [, indent, name, nextIndent, value] = match;
-    if (isSecretName(name) && nextIndent.length > indent.length && isPlausibleSecretValue(value.trim())) return true;
-  }
+  if (hasYamlBlockSecret(text)) return true;
   for (const match of text.matchAll(YAML_ASSIGNMENT_RE)) {
     const [, name, value] = match;
     if (isSecretName(name) && isPlausibleSecretValue(value)) return true;
