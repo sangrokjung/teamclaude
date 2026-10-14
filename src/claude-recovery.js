@@ -12,6 +12,7 @@ import { basename, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { attemptCloudHandoff } from './cloud-handoff.js';
+import { redactSecrets } from './secrets.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -403,25 +404,6 @@ function sessionSelector(args) {
     }
   }
   return { kind: 'new', sessionId: null };
-}
-
-function redactSecrets(text) {
-  return text
-    .replace(
-      /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-      '[REDACTED PRIVATE KEY]',
-    )
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]')
-    .replace(/\b(sk-[A-Za-z0-9_-]{12,})\b/g, '[REDACTED]')
-    .replace(
-      /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/g,
-      '[REDACTED]',
-    )
-    .replace(/("(?:access|refresh|api)[_-]?token"\s*:\s*")[^"]+(")/gi, '$1[REDACTED]$2')
-    .replace(
-      /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|credential|signature|cookie|authorization)(?:[_-][A-Za-z0-9]+)*)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      '$1$2[REDACTED]',
-    );
 }
 
 function sanitizeBranch(value) {

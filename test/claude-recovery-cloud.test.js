@@ -132,7 +132,7 @@ function cloudOptions(ctx, overrides = {}) {
 
 // First spawn writes a user request plus `errorRecord`; later spawns run
 // `later(child, args, count)` (default: exit 0).
-function scriptedSpawn(ctx, calls, errorRecord, later = null) {
+function scriptedSpawn(ctx, calls, errorRecord, later = null, userText = '클라우드로 이어서 마무리해') {
   return (args, env) => {
     calls.push({ args: [...args], env: { ...env } });
     const child = fakeChild();
@@ -143,7 +143,7 @@ function scriptedSpawn(ctx, calls, errorRecord, later = null) {
         await mkdir(dir, { recursive: true });
         await writeFile(
           join(dir, `${sessionId}.jsonl`),
-          `${userRecord(ctx.repo, '클라우드로 이어서 마무리해')}\n${errorRecord(ctx.repo)}\n`,
+          `${userRecord(ctx.repo, userText)}\n${errorRecord(ctx.repo)}\n`,
         );
       }, 10);
     } else if (later) {
@@ -390,4 +390,61 @@ test('general quota exhaustion tries the cloud first, then the Codex fallback wh
   assert.equal(cloudLaunches, 0);
   assert.ok(codexHandoff?.path);
   assert.match(await readFile(codexHandoff.path, 'utf8'), /클라우드로 이어서 마무리해/);
+});
+
+// Secret-shaped strings that must never reach the cloud prompt, and the
+// look-alikes (git SHA, UUID, paths) that must survive redaction.
+const PROMPT_JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+const PROMPT_AUTH_VALUE = 'tok_live_abc123DEF456ghi';
+const PROMPT_OPAQUE = 'Q2xvdWRIYW5kb2ZmT3BhcXVlVG9rZW4xMjM0NTY3ODkwYWJjZGVmZ2hpams0NTY3';
+const PROMPT_SHA = '0123456789abcdef0123456789abcdef01234567';
+const PROMPT_UUID_RUN = 'session-0a1b2c3d-1111-4222-8333-444455556666';
+const PROMPT_PATH = 'src/components/dashboard2/widgets/AccountUsageTable3.tsx';
+
+test('the cloud prompt redacts JWTs, Authorization values, and long opaque tokens but keeps SHAs, UUIDs, and paths', async t => {
+  const ctx = await setup(t, 'teamclaude-cloud-redact-');
+  const calls = [];
+  let launch = null;
+  const userText = [
+    '배포 이어서 해줘',
+    `jwt ${PROMPT_JWT}`,
+    `Authorization: Token ${PROMPT_AUTH_VALUE}`,
+    `opaque ${PROMPT_OPAQUE}`,
+    `commit ${PROMPT_SHA}`,
+    `${PROMPT_UUID_RUN} 확인`,
+    `edit ${PROMPT_PATH}`,
+  ].join('\n');
+  await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeBackoffMs: 0,
+      cloudFallbackOnExhaustion: true,
+    },
+    cwd: ctx.repo,
+    transcriptRoot: ctx.transcriptRoot,
+    handoffRoot: ctx.handoffRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.99),
+    claimRecoveryOnce: async () => ({ dev: 1, ino: 1 }),
+    wait: async () => { throw new Error('must not wait for the fleet'); },
+    spawnClaude: scriptedSpawn(ctx, calls, cwd => fleetExhaustedRecord(cwd, 3600), null, userText),
+    launchCodex: async () => { throw new Error('unexpected Codex handoff'); },
+    launchCloud: async request => {
+      launch = request;
+      return { status: 0, signal: null };
+    },
+    cloudHandoff: cloudOptions(ctx),
+    log() {},
+  });
+  const prompt = launch.args[1];
+  assert.match(prompt, /배포 이어서 해줘/);
+  for (const secret of [PROMPT_JWT, PROMPT_AUTH_VALUE, PROMPT_OPAQUE]) {
+    assert.equal(prompt.includes(secret), false, secret);
+  }
+  assert.equal(prompt.includes(PROMPT_JWT.slice(0, 20)), false);
+  for (const kept of [PROMPT_SHA, PROMPT_UUID_RUN, PROMPT_PATH]) {
+    assert.ok(prompt.includes(kept), kept);
+  }
 });
