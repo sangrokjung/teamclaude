@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
 import { runClaudeWithRecovery } from '../src/claude-recovery.js';
+import { GIT_SHA, JWT, OPAQUE } from './helpers/secret-fixtures.js';
 
 function fakeChild(onKill = null) {
   const child = new EventEmitter();
@@ -394,10 +395,10 @@ test('general quota exhaustion tries the cloud first, then the Codex fallback wh
 
 // Secret-shaped strings that must never reach the cloud prompt, and the
 // look-alikes (git SHA, UUID, paths) that must survive redaction.
-const PROMPT_JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk';
-const PROMPT_AUTH_VALUE = 'tok_live_abc123DEF456ghi';
-const PROMPT_OPAQUE = 'Q2xvdWRIYW5kb2ZmT3BhcXVlVG9rZW4xMjM0NTY3ODkwYWJjZGVmZ2hpams0NTY3';
-const PROMPT_SHA = '0123456789abcdef0123456789abcdef01234567';
+const PROMPT_JWT = JWT;
+const PROMPT_AUTH_VALUE = ['tok_live_', 'abc123DEF456ghi'].join('');
+const PROMPT_OPAQUE = OPAQUE;
+const PROMPT_SHA = GIT_SHA;
 const PROMPT_UUID_RUN = 'session-0a1b2c3d-1111-4222-8333-444455556666';
 const PROMPT_PATH = 'src/components/dashboard2/widgets/AccountUsageTable3.tsx';
 

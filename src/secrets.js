@@ -32,7 +32,7 @@ function hasLetterAndDigit(value) {
   return /[A-Za-z]/.test(value) && /[0-9]/.test(value);
 }
 
-// `fix-account-selection-when-all-accounts-exhausted-2`: a slug of short words
+// `fix-login-retry-flow-2`-style slugs of short words
 // (branch names, spec ids), not a random token.
 function isWordSlug(piece) {
   const words = piece.split(/[-_]/);

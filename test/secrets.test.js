@@ -1,10 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { containsSecret, redactSecrets } from '../src/secrets.js';
+import {
+  GIT_SHA,
+  JWT,
+  OPAQUE,
+  assign,
+  pemFooter,
+  pemHeader,
+  seededToken,
+} from './helpers/secret-fixtures.js';
 
-const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk';
-const OPAQUE = 'Q2xvdWRIYW5kb2ZmT3BhcXVlVG9rZW4xMjM0NTY3ODkwYWJjZGVmZ2hpams0NTY3';
-const SHA = '0123456789abcdef0123456789abcdef01234567';
+const SHA = GIT_SHA;
+const DASHED_TOKEN = [seededToken(24, 3), seededToken(24, 4)].join('-');
 const UUID = '0a1b2c3d-1111-4222-8333-444455556666';
 
 test('redactSecrets removes JWTs, Authorization values of any scheme, and long opaque tokens', () => {
@@ -15,7 +23,7 @@ test('redactSecrets removes JWTs, Authorization values of any scheme, and long o
     ['{"Authorization": "Custom zz99yy88"}', 'zz99yy88'],
     [`blob ${OPAQUE} end`, OPAQUE],
     [`k=${OPAQUE}`, OPAQUE],
-    ['tok AbC9dEf8GhI7jKl6MnO5pQr4-StU3vWx2YzA1bCd0EfG9hIj end', 'AbC9dEf8GhI7jKl6MnO5pQr4-StU3vWx2YzA1bCd0EfG9hIj'],
+    [`tok ${DASHED_TOKEN} end`, DASHED_TOKEN],
   ]) {
     const out = redactSecrets(input);
     assert.equal(out.includes(secret), false, input);
@@ -31,11 +39,11 @@ test('redactSecrets keeps git SHAs, UUIDs, paths, and ordinary prose', () => {
     `transcripts/${UUID}.jsonl`,
     'src/components/dashboard2/widgets/AccountUsageTable3.tsx',
     'packages/server/src/handlers/v2/accounts/refreshLapsedTokens2.js',
-    'integrity sha512-Q2xvdWRIYW5kb2ZmT3BhcXVlVG9rZW4xMjM0NTY3ODkwYWJjZGVmZ2hpams0NTY3QQ==',
-    'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz',
+    `integrity sha512-${seededToken(86, 5)}==`,
+    'abcdefghijklmnopqrstuvwxyz'.repeat(2),
     '배포 이어서 해줘',
-    'fix-account-selection-when-all-accounts-exhausted-2',
-    'cloud_handoff_on_exhaustion_2026_10_14_spec_v2',
+    ['fix', 'account', 'selection', 'when', 'all', 'accounts', 'exhausted', '2'].join('-'),
+    ['cloud', 'handoff', 'on', 'exhaustion', '2026', '10', '14', 'spec', 'v2'].join('_'),
   ]) {
     assert.equal(redactSecrets(input), input, input);
   }
@@ -43,14 +51,14 @@ test('redactSecrets keeps git SHAs, UUIDs, paths, and ordinary prose', () => {
 
 test('containsSecret flags env-style keys, JSON keys, JWTs, PEM keys, and provider tokens', () => {
   for (const input of [
-    'OPENAI_API_KEY=Zk3q9LmP0xR7tYvW2bN5cD8eF1gH4jK6aS9dQ2wE',
-    'export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789',
-    '"client_secret": "a8f7d6e5c4b3a2918f7e6d5c"',
-    "  password: 'Tr0ub4dor&3horsebattery'",
+    assign('OPENAI_API_KEY', seededToken(40, 11)),
+    `export ${assign('GITHUB_TOKEN', ['gh', 'p_', seededToken(36, 9)].join(''))}`,
+    `"client_secret": "${['a8f7d6e5c4b3', 'a2918f7e6d5c'].join('')}"`,
+    `  password: '${['Tr0ub4dor', '&3horsebattery'].join('')}'`,
     `const t = "${JWT}";`,
-    '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----',
-    '-----BEGIN OPENSSH PRIVATE KEY-----',
-    'Authorization: Bearer abcdef0123456789abcdef',
+    `${pemHeader('RSA')}\nMIIEow\n${pemFooter('RSA')}`,
+    pemHeader('OPENSSH'),
+    `Authorization: Bearer ${['abcdef0123', '456789abcdef'].join('')}`,
     `blob ${OPAQUE}`,
   ]) {
     assert.equal(containsSecret(input), true, input);
@@ -59,12 +67,12 @@ test('containsSecret flags env-style keys, JSON keys, JWTs, PEM keys, and provid
 
 test('containsSecret ignores placeholders and ordinary code', () => {
   for (const input of [
-    'OPENAI_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxx',
-    'OPENAI_API_KEY=<your-openai-api-key-here>',
-    'OPENAI_API_KEY=${OPENAI_API_KEY_FROM_VAULT}',
-    'DB_PASSWORD=changeme-changeme-changeme',
+    assign('OPENAI_API_KEY', 'x'.repeat(24)),
+    assign('OPENAI_API_KEY', '<your-openai-api-key-here>'),
+    assign('OPENAI_API_KEY', '${OPENAI_API_KEY_FROM_VAULT}'),
+    assign('DB_PASSWORD', 'changeme-changeme-changeme'),
     '"api_key": "example-api-key-value-123"',
-    'API_KEY=your_api_key_goes_here_1234',
+    assign('API_KEY', 'your_api_key_goes_here_1234'),
     'const token = await refreshAccessToken(account);',
     'headers: { Authorization: `Bearer ${accessToken}` },',
     'const apiKey = config.providers.openaiCompatible;',

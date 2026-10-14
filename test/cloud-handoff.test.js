@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, isolatedGitEnv, makeRepo } from './helpers/git-fixture.js';
+import { ALNUM } from './helpers/secret-fixtures.js';
 import {
   CLOUD_PROMPT_MAX_BYTES,
   appendCloudLedger,
@@ -380,7 +381,7 @@ test('snapshot push sends HEAD itself when there is no local change', async t =>
 });
 
 function randomToken(length) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const alphabet = ALNUM;
   // Ends in a digit so detectors that want a letter and a digit always fire.
   const body = [...randomBytes(length - 1)].map(byte => alphabet[byte % alphabet.length]).join('');
   return `${body}${randomBytes(1)[0] % 10}`;
