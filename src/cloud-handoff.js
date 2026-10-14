@@ -29,6 +29,11 @@ export const CLOUD_HANDOFF_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const MIN_REMAINING_DOLLARS = 1;
 const TOP_CANDIDATES = 3;
+// Credit lookups: bounded fan-out so a large fleet cannot stall the handoff.
+const MAX_CREDIT_LOOKUP_ACCOUNTS = 32;
+const CREDIT_LOOKUP_CONCURRENCY = 4;
+const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
+const CREDIT_LOOKUP_BUDGET_MS = 30_000;
 const CREDIT_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 
 const EXCLUDED_SEGMENT_RES = [
@@ -284,13 +289,17 @@ export async function pushHandoffSnapshot({
   return { ok: true, branch, commit };
 }
 
-export async function fetchCloudCredits(accessToken, { fetchImpl = fetch, timeoutMs = 5000 } = {}) {
+export async function fetchCloudCredits(accessToken, {
+  fetchImpl = fetch,
+  timeoutMs = 5000,
+  signal = null,
+} = {}) {
   const response = await fetchImpl(CREDIT_USAGE_URL, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'anthropic-beta': 'oauth-2025-04-20',
     },
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal ?? AbortSignal.timeout(timeoutMs),
   });
   if (!response?.ok) return null;
   const body = await response.json();
@@ -301,11 +310,61 @@ export async function fetchCloudCredits(accessToken, { fetchImpl = fetch, timeou
   return { remainingDollars, lockedReason: credits.locked_reason ?? null };
 }
 
+// One lookup, settled as null when its own timeout or the shared budget fires,
+// whether or not the lookup itself honors the abort signal.
+function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timer = setTimeout(abort, timeoutMs);
+  budgetSignal.addEventListener('abort', abort, { once: true });
+  if (budgetSignal.aborted) abort();
+  const expired = new Promise(resolve => {
+    if (controller.signal.aborted) resolve(null);
+    controller.signal.addEventListener('abort', () => resolve(null), { once: true });
+  });
+  const answered = Promise.resolve()
+    .then(() => creditLookup(accessToken, { signal: controller.signal }))
+    .catch(() => null);
+  return Promise.race([answered, expired]).finally(() => {
+    clearTimeout(timer);
+    budgetSignal.removeEventListener('abort', abort);
+  });
+}
+
+async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
+  const results = new Array(candidates.length).fill(null);
+  const budget = new AbortController();
+  const budgetTimer = setTimeout(() => budget.abort(), budgetMs);
+  let next = 0;
+  const worker = async () => {
+    while (!budget.signal.aborted && next < candidates.length) {
+      const index = next;
+      next += 1;
+      results[index] = await boundedCreditLookup(
+        creditLookup,
+        candidates[index].accessToken,
+        lookupTimeoutMs,
+        budget.signal,
+      );
+    }
+  };
+  try {
+    await Promise.all(Array.from({ length: Math.min(concurrency, candidates.length) }, worker));
+  } finally {
+    clearTimeout(budgetTimer);
+  }
+  return candidates.map((account, index) => ({ account, credits: results[index] }));
+}
+
 export async function findCloudAccount({
   accounts,
   creditLookup = fetchCloudCredits,
   now = Date.now(),
   random = Math.random,
+  maxAccounts = MAX_CREDIT_LOOKUP_ACCOUNTS,
+  concurrency = CREDIT_LOOKUP_CONCURRENCY,
+  lookupTimeoutMs = CREDIT_LOOKUP_TIMEOUT_MS,
+  budgetMs = CREDIT_LOOKUP_BUDGET_MS,
 }) {
   if (!Array.isArray(accounts)) return null;
   const eligible = accounts.filter(account => account
@@ -313,14 +372,13 @@ export async function findCloudAccount({
     && typeof account.accessToken === 'string'
     && account.accessToken.length > 0
     && Number.isFinite(normalizeExpiresAt(account.expiresAt))
-    && normalizeExpiresAt(account.expiresAt) - now >= MIN_TOKEN_LIFETIME_MS);
-  const looked = await Promise.all(eligible.map(async account => {
-    try {
-      return { account, credits: await creditLookup(account.accessToken) };
-    } catch {
-      return { account, credits: null };
-    }
-  }));
+    && normalizeExpiresAt(account.expiresAt) - now >= MIN_TOKEN_LIFETIME_MS)
+    .slice(0, maxAccounts);
+  const looked = await lookupCredits(eligible, creditLookup, {
+    concurrency: Math.max(1, concurrency),
+    lookupTimeoutMs,
+    budgetMs,
+  });
   const funded = looked
     .filter(({ credits }) => credits
       && !credits.lockedReason

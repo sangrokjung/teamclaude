@@ -143,6 +143,97 @@ test('findCloudAccount picks among the top three credit balances of valid OAuth 
   assert.equal(await findCloudAccount({ accounts: null, creditLookup, now }), null);
 });
 
+function fleet(count, now) {
+  return Array.from({ length: count }, (_, i) => ({
+    name: `acct-${i}`,
+    type: 'oauth',
+    accessToken: `tok-${i}`,
+    expiresAt: now + 3_600_000,
+  }));
+}
+
+test('findCloudAccount caps the fan-out at 32 accounts with at most 4 lookups in flight', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  const looked = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const creditLookup = async (token, options) => {
+    looked.push(token);
+    assert.ok(options?.signal instanceof AbortSignal, 'each lookup gets an abort signal');
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    inFlight -= 1;
+    return { remainingDollars: Number(token.slice(4)) + 1, lockedReason: null };
+  };
+  const best = await findCloudAccount({ accounts: fleet(40, now), creditLookup, now, random: () => 0 });
+  assert.equal(looked.length, 32);
+  assert.equal(maxInFlight, 4);
+  assert.equal(looked.includes('tok-32'), false);
+  assert.equal(best.name, 'acct-31');
+});
+
+test('findCloudAccount treats a lookup past its timeout as ineligible and aborts it', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  const aborted = [];
+  const creditLookup = (token, { signal }) => {
+    if (token === 'tok-0') {
+      signal.addEventListener('abort', () => aborted.push(token));
+      // Never settles, even on abort: the timeout must not depend on it.
+      return new Promise(() => {});
+    }
+    return Promise.resolve({ remainingDollars: 10, lockedReason: null });
+  };
+  const started = Date.now();
+  const best = await findCloudAccount({
+    accounts: fleet(2, now),
+    creditLookup,
+    now,
+    random: () => 0,
+    lookupTimeoutMs: 50,
+  });
+  assert.equal(best.name, 'acct-1');
+  assert.deepEqual(aborted, ['tok-0']);
+  assert.ok(Date.now() - started < 2000);
+});
+
+test('findCloudAccount stops at the overall budget and counts missing results as ineligible', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  let started = 0;
+  const creditLookup = async (token, { signal }) => {
+    started += 1;
+    // The first batch answers fast; everything after it is slower than the budget.
+    const fast = Number(token.slice(4)) < 4;
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, fast ? 5 : 5_000);
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+    if (signal.aborted) throw new Error('aborted');
+    return { remainingDollars: fast ? 10 : 999, lockedReason: null };
+  };
+  const t0 = Date.now();
+  const best = await findCloudAccount({
+    accounts: fleet(12, now),
+    creditLookup,
+    now,
+    random: () => 0,
+    budgetMs: 200,
+  });
+  assert.ok(Date.now() - t0 < 2000, 'returns at the budget, not after the slow lookups');
+  assert.equal(best.remainingDollars, 10);
+  assert.ok(started < 12, 'no new lookups start after the budget');
+
+  assert.equal(await findCloudAccount({
+    accounts: fleet(3, now),
+    creditLookup: () => new Promise(() => {}),
+    now,
+    budgetMs: 50,
+  }), null);
+});
+
 test('fetchCloudCredits reads iguana_necktie from the OAuth usage endpoint', async () => {
   const calls = [];
   const fetchImpl = async (url, init) => {
