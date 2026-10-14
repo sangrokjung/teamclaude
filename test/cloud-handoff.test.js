@@ -741,15 +741,72 @@ test('attemptCloudHandoff falls back without side effects when a precondition fa
   await assert.rejects(stat(join(root, 'ledger.jsonl')));
 });
 
+
+test('a cloud launch killed by a signal keeps the claim held without attempting release', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-signal-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  let released = 0;
+  const outcome = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    beforeLaunch: async () => {},
+    launchCloud: async () => ({ status: null, signal: 'SIGTERM' }),
+    releaseClaim: async () => { released += 1; return true; },
+  }));
+  assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: true });
+  assert.equal(released, 0);
+});
+
+test('a post-spawn launch error keeps the claim held without attempting release', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-posterror-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  let released = 0;
+  const outcome = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    beforeLaunch: async () => {},
+    launchCloud: async () => ({ status: null, signal: null, error: new Error('lost connection'), pid: 4242 }),
+    releaseClaim: async () => { released += 1; return true; },
+  }));
+  assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: true });
+  assert.equal(released, 0);
+});
+
+test('a spawn-time ENOENT with no pid releases the claim', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-enoent-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  const outcome = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    beforeLaunch: async () => {},
+    launchCloud: async () => ({ status: null, signal: null, error: Object.assign(new Error('not found'), { code: 'ENOENT' }) }),
+    releaseClaim: async () => true,
+  }));
+  assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: false });
+});
+
 test('attemptCloudHandoff reports a failed cloud launch without writing the ledger', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-launch-fail-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { repo, env } = await makeRepo(root);
   const vendorBin = await vendorBinary(root);
-  for (const launchCloud of [
-    async () => ({ status: 1, signal: null }),
-    async () => ({ status: null, signal: null, error: new Error('spawn failed') }),
-    async () => { throw new Error('boom'); },
+  // A clean exit (whatever its exit code) proves the process is no longer
+  // running, so the claim is released. An error after spawn or an uncaught
+  // throw is ambiguous about whether the process is still alive, so the
+  // claim stays held.
+  for (const [launchCloud, claimHeld] of [
+    [async () => ({ status: 1, signal: null }), false],
+    [async () => ({ status: null, signal: null, error: new Error('spawn failed') }), true],
+    [async () => { throw new Error('boom'); }, true],
   ]) {
     const outcome = await attemptCloudHandoff(handoffInputs(root, {
       cwd: repo,
@@ -758,7 +815,7 @@ test('attemptCloudHandoff reports a failed cloud launch without writing the ledg
       beforeLaunch: async () => {},
       launchCloud,
     }));
-    assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: false });
+    assert.deepEqual(outcome, { ok: false, reason: 'launch-failed', stopped: true, claimHeld });
   }
   await assert.rejects(stat(join(root, 'ledger.jsonl')));
 });

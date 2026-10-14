@@ -111,7 +111,13 @@ const ENV_ASSIGNMENT_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,12
 const QUOTED_ASSIGNMENT_RE = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\1[ \t]*[:=][ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)')/g;
 const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*([A-Za-z0-9_\-+/=~]{16,})[ \t]*$/gm;
 
-const YAML_BLOCK_KEY_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*(?:[|>](?:[-+][0-9]?|[0-9][-+]?)?)?[ \t]*(?=\r?\n(?:[ \t]*\r?\n)*([ \t]+)([^\r\n]+))/gm;
+// A secret-named key followed by an indented continuation line is blocked
+// regardless of what comes between the colon and the newline (a block
+// scalar indicator with any chomping/indentation digit in either order, a
+// YAML tag, a trailing comment, or nothing at all for a bare `key:\n  value`).
+// This is deliberately permissive: any syntax we don't specifically parse
+// still falls through to "secret-named key, indented value follows".
+const YAML_BLOCK_KEY_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[^\r\n]*(?=\r?\n(?:[ \t]*\r?\n)*([ \t]+)([^\r\n]+))/gm;
 
 function hasSecretAssignment(text) {
   for (const match of text.matchAll(ENV_ASSIGNMENT_RE)) {

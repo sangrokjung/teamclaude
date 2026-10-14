@@ -515,7 +515,24 @@ export async function attemptCloudHandoff({
   } catch {
     result = null;
   }
-  if (!result || result.error || result.status !== 0) return failAfterClaim();
+  // Only a proven spawn failure (no process ever started — e.g. the vendor
+  // binary is missing) or a clean exit (the process ran to completion,
+  // whatever its exit code) are safe to release: in both cases there is no
+  // cloud process that could still be running concurrently. A signal kill, a
+  // post-spawn error, or an unreadable status is ambiguous — the cloud
+  // process may still be alive — so the claim stays held and release is not
+  // even attempted.
+  const neverSpawned = Boolean(result?.error
+    && (result.error.code === 'ENOENT' || result.error.code === 'EACCES')
+    && !result.pid);
+  const exitedCleanly = Boolean(result
+    && !result.error
+    && result.signal == null
+    && typeof result.status === 'number');
+  if (!result || result.status !== 0) {
+    if (neverSpawned || exitedCleanly) return failAfterClaim();
+    return { ok: false, reason: 'launch-failed', stopped: true, claimHeld: true };
+  }
   if (ledgerPath) {
     try {
       await appendCloudLedger(ledgerPath, {

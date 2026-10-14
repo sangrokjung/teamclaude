@@ -128,3 +128,13 @@ test('containsSecret flags secret-named YAML keys with block scalar or next-line
   }
   assert.equal(containsSecret(`description: |-\n  ${value}\n`), false);
 });
+
+test('containsSecret flags secret-named YAML keys with a comment or tag after the indicator', () => {
+  const value = 'abcdefghijklmnopqrstu';
+  for (const input of [
+    `api_token: |2- # comment\n    ${value}\n`,
+    `api_token: !!str |-\n  ${value}\n`,
+  ]) {
+    assert.equal(containsSecret(input), true, input);
+  }
+});
