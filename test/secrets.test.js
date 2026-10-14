@@ -76,3 +76,19 @@ test('containsSecret ignores placeholders and ordinary code', () => {
     assert.equal(containsSecret(input), false, input);
   }
 });
+
+test('secret detection stays linear on pathological megabyte inputs', () => {
+  const size = 1024 * 1024;
+  for (const input of [
+    'a'.repeat(size),
+    'a-'.repeat(size / 2),
+    `"${'a'.repeat(size)}`,
+    'token_'.repeat(size / 6),
+    `x${'=a'.repeat(size / 2)}`,
+  ]) {
+    const started = Date.now();
+    containsSecret(input);
+    redactSecrets(input);
+    assert.ok(Date.now() - started < 3000, `${input.slice(0, 8)}… took ${Date.now() - started}ms`);
+  }
+});

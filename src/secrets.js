@@ -10,14 +10,17 @@
 
 const PEM_BLOCK_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g;
 const PEM_HEADER_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
-const SK_TOKEN_RE = /\b(sk-[A-Za-z0-9_-]{12,})\b/g;
-const PROVIDER_TOKEN_RE = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16})\b/g;
-const JWT_RE = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g;
+// Token patterns start only at the beginning of a token run (lookbehind, not
+// \b) so a megabyte of `sk-sk-…` or `a-a-…` stays linear instead of
+// re-scanning the run from every boundary.
+const SK_TOKEN_RE = /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}/g;
+const PROVIDER_TOKEN_RE = /(?<![A-Za-z0-9_-])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{16}\b)/g;
+const JWT_RE = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g;
 const BEARER_RE = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi;
 const JSON_TOKEN_RE = /("(?:access|refresh|api)[_-]?token"\s*:\s*")[^"]+(")/gi;
 // Any scheme: "Authorization: Token x", "Digest ...", custom schemes.
 const AUTHORIZATION_RE = /\b(authorization)("?[ \t]*[:=][ \t]*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]*)/gi;
-const LOOSE_ASSIGNMENT_RE = /\b((?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|token|secret|password|credential|signature|cookie|authorization)(?:[_-][A-Za-z0-9]+)*)\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+const LOOSE_ASSIGNMENT_RE = /(?<![A-Za-z0-9_-])((?:[A-Za-z0-9]+[_-]){0,16}(?:api[_-]?key|token|secret|password|credential|signature|cookie|authorization)(?:[_-][A-Za-z0-9]+){0,16})\s*([:=])\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
 // A maximal run of token characters; judged by isOpaqueSecret().
 const OPAQUE_RUN_RE = /(?<![A-Za-z0-9_\-+/=])[A-Za-z0-9_\-+/=]{40,}(?![A-Za-z0-9_\-+/=])/g;
 const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
@@ -104,9 +107,9 @@ function isCodeExpression(value) {
   return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(value) || /[()[\]{}`$<>]/.test(value);
 }
 
-const ENV_ASSIGNMENT_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s#]+))/gm;
-const QUOTED_ASSIGNMENT_RE = /(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1[ \t]*[:=][ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)')/g;
-const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*:[ \t]*([A-Za-z0-9_\-+/=~]{16,})[ \t]*$/gm;
+const ENV_ASSIGNMENT_RE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*=[ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s#]+))/gm;
+const QUOTED_ASSIGNMENT_RE = /(?<![A-Za-z0-9_.-])(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})\1[ \t]*[:=][ \t]*(?:"([^"\r\n]*)"|'([^'\r\n]*)')/g;
+const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[ \t]*([A-Za-z0-9_\-+/=~]{16,})[ \t]*$/gm;
 
 function hasSecretAssignment(text) {
   for (const match of text.matchAll(ENV_ASSIGNMENT_RE)) {

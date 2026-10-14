@@ -2,8 +2,9 @@
 //
 // Fail closed: the scan reads the exact blob bytes `git push` would send —
 // every blob reachable from the snapshot commit that the remote does not
-// verifiably have — and aborts on any secret hit, unreadable object, or
-// oversized payload. "Verifiably has" means a tip advertised by
+// verifiably have — and aborts on any secret hit, any blob it cannot fully
+// read as UTF-8 text, or an oversized payload. Detection is pattern-based:
+// a secret in an unknown plain-text format can still pass. "Verifiably has" means a tip advertised by
 // `git ls-remote origin` right now, never a local (movable) remote-tracking
 // ref. Without such a tip, everything reachable is scanned.
 
@@ -63,31 +64,66 @@ function parseBatch(buffer, objectIds) {
   return blobs;
 }
 
-// Invisible characters that would split a token without changing what a
-// reader of the pushed file recovers.
-const INVISIBLE_RE = /[​-‍⁠﻿]/g;
-const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+// Only text the scanner fully read and classified may be pushed: at most
+// 1 MiB, no NUL byte, valid UTF-8. Anything else stays local (working-tree
+// files) or aborts the push (blobs already in unpushed commits).
+export const SNAPSHOT_TEXT_MAX_BYTES = 1024 * 1024;
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
 
-function normalizeText(text) {
-  return text.replace(INVISIBLE_RE, '').replace(/\r\n?/g, '\n').replace(CONTROL_RE, '\n');
+export function decodeScannableText(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length > SNAPSHOT_TEXT_MAX_BYTES || buffer.includes(0)) {
+    return null;
+  }
+  try {
+    return UTF8.decode(buffer);
+  } catch {
+    return null;
+  }
 }
 
-// Every reading of a blob a consumer could reasonably make: plain UTF-8 for
-// text; for NUL-carrying content, its printable runs as single-byte text and
-// as UTF-16 (LE and BE), so a NUL byte cannot hide a secret.
-export function blobTextViews(buffer) {
-  if (!buffer.includes(0)) return [normalizeText(buffer.toString('utf8'))];
-  const even = buffer.subarray(0, buffer.length - (buffer.length % 2));
-  const swapped = Buffer.from(even).swap16();
-  return [
-    normalizeText(buffer.toString('latin1')),
-    normalizeText(even.toString('utf16le')),
-    normalizeText(swapped.toString('utf16le')),
-  ];
+// Invisible characters that would split a token without changing what a
+// reader of the pushed file recovers.
+const INVISIBLE_RE = /[\u200b-\u200d\u2060\ufeff]/g;
+const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+
+function codePoint(hex) {
+  const value = parseInt(hex, 16);
+  return value <= 0x10ffff ? String.fromCodePoint(value) : '';
+}
+
+// Undoes the cheap encodings that would let a secret pass the patterns:
+// backslash-newline continuations, \xHH, \uHHHH, \u{H…}, and %HH.
+function decodeEscapes(text) {
+  return text
+    .replace(/\\\n/g, '')
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => codePoint(hex))
+    .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (_, hex) => codePoint(hex))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => codePoint(hex))
+    .replace(/%([0-9a-fA-F]{2})/g, (_, hex) => codePoint(hex));
+}
+
+// The views the patterns run over: the text as pushed (line endings and
+// invisible characters normalized) and, when different, its decoded copy.
+export function scanViews(text) {
+  const plain = text.replace(INVISIBLE_RE, '').replace(/\r\n?/g, '\n').replace(CONTROL_RE, '\n');
+  const views = [plain];
+  let decoded = plain;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = decodeEscapes(decoded).replace(INVISIBLE_RE, '');
+    if (next === decoded) break;
+    decoded = next;
+    views.push(decoded);
+  }
+  return views;
+}
+
+export function textHasSecret(text) {
+  return scanViews(text).some(containsSecret);
 }
 
 export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env }) {
   const failed = { ok: false, reason: 'snapshot-scan-failed' };
+  const unscannable = { ok: false, reason: 'snapshot-unscannable' };
   const bases = await verifiedRemoteBases({ root, runGit, gitEnv });
   const revList = ['rev-list', '--objects', '--no-object-names', commit];
   if (bases.length > 0) revList.push('--not', ...bases);
@@ -111,8 +147,11 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     const [id, type, sizeText] = line.split(' ');
     if (!OBJECT_ID_RE.test(id || '')) return failed;
     if (type !== 'blob') continue;
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size)) return failed;
+    if (size > SNAPSHOT_TEXT_MAX_BYTES) return unscannable;
     blobIds.push(id);
-    totalBytes += Number(sizeText) || 0;
+    totalBytes += size;
   }
   if (blobIds.length === 0) return { ok: true };
   if (totalBytes > SNAPSHOT_SCAN_MAX_BYTES) return failed;
@@ -126,6 +165,7 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     ? parseBatch(batch.stdoutBuffer, blobIds)
     : null;
   if (!blobs) return failed;
-  const leaked = blobs.some(blob => blobTextViews(blob).some(containsSecret));
-  return leaked ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
+  const texts = blobs.map(decodeScannableText);
+  if (texts.some(text => text === null)) return unscannable;
+  return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
 }

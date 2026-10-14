@@ -16,16 +16,22 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   stat,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { normalizeExpiresAt } from './oauth.js';
-import { scanSnapshotForSecrets } from './snapshot-scan.js';
+import {
+  SNAPSHOT_TEXT_MAX_BYTES,
+  decodeScannableText,
+  scanSnapshotForSecrets,
+} from './snapshot-scan.js';
 
 export const CLOUD_PROMPT_MAX_BYTES = 48 * 1024;
-export const CLOUD_HANDOFF_MAX_FILE_BYTES = 5 * 1024 * 1024;
+// Only scannable text travels (see snapshot-scan.js); larger files stay local.
+export const CLOUD_HANDOFF_MAX_FILE_BYTES = SNAPSHOT_TEXT_MAX_BYTES;
 const MIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const MIN_REMAINING_DOLLARS = 1;
 const TOP_CANDIDATES = 3;
@@ -169,7 +175,14 @@ async function snapshotPaths(root, runGit, gitEnv) {
     if (path.endsWith('/') || isExcludedHandoffPath(path)) continue;
     const info = await lstat(join(root, path)).catch(() => null);
     if (info?.isDirectory()) continue;
-    if (info?.isFile() && info.size > CLOUD_HANDOFF_MAX_FILE_BYTES) continue;
+    if (info?.isFile()) {
+      // Binary, non-UTF-8, or oversized files cannot be scanned, so they are
+      // left out of the snapshot. The push-time scan re-reads the exact blob
+      // bytes and aborts if anything unscannable slipped in anyway.
+      if (info.size > CLOUD_HANDOFF_MAX_FILE_BYTES) continue;
+      const content = await readFile(join(root, path)).catch(() => null);
+      if (!content || decodeScannableText(content) === null) continue;
+    }
     kept.push(path);
   }
   return kept;

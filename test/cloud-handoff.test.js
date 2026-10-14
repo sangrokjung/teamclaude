@@ -447,7 +447,7 @@ test('snapshot scan skips only what the verified upstream already has, else scan
   assert.equal(git(bare, env, 'show', `refs/heads/${pushed.branch}:clean.txt`), 'clean change');
 });
 
-test('snapshot scan trusts origin HEAD only as advertised by the remote, and ignores binary noise', async t => {
+test('snapshot scan trusts origin HEAD only as advertised by the remote, and keeps binary files local', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-originhead-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { repo, bare, env } = await makeRepo(root);
@@ -469,7 +469,9 @@ test('snapshot scan trusts origin HEAD only as advertised by the remote, and ign
   const pushed = await snapshot(repo, env);
   assert.equal(pushed.ok, true);
   const files = git(bare, env, 'ls-tree', '-r', '--name-only', `refs/heads/${pushed.branch}`);
-  assert.match(files, /image\.bin/);
+  // Binary content cannot be scanned, so it stays local.
+  assert.doesNotMatch(files, /image\.bin/);
+  assert.match(files, /placeholder\.env\.example/);
 });
 
 test('snapshot scan ignores a locally moved remote-tracking ref', async t => {
@@ -503,14 +505,21 @@ test('snapshot scan covers every pushed blob, including ones deleted again befor
   assert.equal(handoffRefs(bare, env), '');
 });
 
-test('snapshot scan reads the exact pushed bytes: NUL, CRLF, BOM, and odd paths do not hide a secret', async t => {
+test('snapshot scan reads the exact pushed text: CRLF, BOM, odd paths, and encodings do not hide a secret', async t => {
+  const hex = text => [...text].map(ch => `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+  const unicode = text => [...text].map(ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`).join('');
+  const percent = text => [...text].map(ch => `%${ch.charCodeAt(0).toString(16).padStart(2, '0')}`).join('');
+  const token = randomToken(40);
   const variants = [
-    ['nul.txt', Buffer.concat([Buffer.from('header\0\n'), Buffer.from(`OPENAI_API_KEY=${randomToken(40)}\n`)])],
-    ['crlf.yml', Buffer.from(`service:\r\n  api_token: ${randomToken(36)}\r\n`)],
-    ['bom.env.txt', Buffer.from(`\ufeffDB_PASSWORD=${randomToken(24)}\n`)],
-    ['utf16.txt', Buffer.from(`\ufeffOPENAI_API_KEY=${randomToken(40)}\n`, 'utf16le')],
-    ['no-newline.txt', Buffer.from(`OPENAI_API_KEY=${randomToken(40)}`)],
-    ['odd\nname "quoted".txt', Buffer.from(`OPENAI_API_KEY=${randomToken(40)}\n`)],
+    ['crlf.yml', `service:\r\n  api_token: ${randomToken(36)}\r\n`],
+    ['bom.env.txt', `\ufeffDB_PASSWORD=${randomToken(24)}\n`],
+    ['no-newline.txt', `OPENAI_API_KEY=${token}`],
+    ['odd\nname "quoted".txt', `OPENAI_API_KEY=${token}\n`],
+    ['zero-width.txt', `OPENAI_API_KEY=${token.slice(0, 10)}\u200b${token.slice(10)}\n`],
+    ['hex.js', `const k = "${hex(`sk-${token}`)}";\n`],
+    ['unicode.js', `const k = "${unicode(`sk-${token}`)}";\n`],
+    ['percent.txt', `${percent(`OPENAI_API_KEY=${token}`)}\n`],
+    ['continued.sh', `OPENAI_API_KEY=${token.slice(0, 10)}\\\n${token.slice(10, 20)}\\\n${token.slice(20)}\n`],
   ];
   for (const [name, content] of variants) {
     const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-bytes-'));
@@ -520,6 +529,42 @@ test('snapshot scan reads the exact pushed bytes: NUL, CRLF, BOM, and odd paths 
     await writeFile(join(repo, name), content);
     assert.deepEqual(await snapshot(repo, env), { ok: false, reason: 'snapshot-secret' }, JSON.stringify(name));
     assert.equal(handoffRefs(bare, env), '', JSON.stringify(name));
+  }
+});
+
+const UNSCANNABLE = [
+  ['nul.txt', Buffer.from('header\0\nplain\n')],
+  ['utf16.txt', Buffer.from('\ufeffplain text\n', 'utf16le')],
+  ['latin1.txt', Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a])],
+  ['large.txt', Buffer.alloc(1024 * 1024 + 1, 0x61)],
+];
+
+test('snapshot keeps binary, non-UTF-8, and oversized working-tree files local instead of pushing them unscanned', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-unscannable-wip-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, bare, env } = await makeRepo(root);
+  git(repo, env, 'branch', '--set-upstream-to=origin/main');
+  for (const [name, content] of UNSCANNABLE) await writeFile(join(repo, name), content);
+  await writeFile(join(repo, 'ok.txt'), 'plain change\n');
+
+  const pushed = await snapshot(repo, env);
+  assert.equal(pushed.ok, true);
+  const files = git(bare, env, 'ls-tree', '-r', '--name-only', `refs/heads/${pushed.branch}`).split('\n');
+  assert.ok(files.includes('ok.txt'));
+  for (const [name] of UNSCANNABLE) assert.equal(files.includes(name), false, name);
+});
+
+test('snapshot aborts when an unpushed commit carries a blob the scanner cannot read as text', async t => {
+  for (const [name, content] of UNSCANNABLE) {
+    const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-unscannable-commit-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const { repo, bare, env } = await makeRepo(root);
+    git(repo, env, 'branch', '--set-upstream-to=origin/main');
+    await writeFile(join(repo, name), content);
+    git(repo, env, 'add', name);
+    git(repo, env, 'commit', '--quiet', '-m', 'unscannable');
+    assert.deepEqual(await snapshot(repo, env), { ok: false, reason: 'snapshot-unscannable' }, name);
+    assert.equal(handoffRefs(bare, env), '', name);
   }
 });
 
