@@ -117,30 +117,28 @@ const YAML_ASSIGNMENT_RE = /^[ \t]*(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[
 // YAML tag, a trailing comment, or nothing at all for a bare `key:\n  value`),
 // and regardless of which line within that block carries the value — a
 // leading comment or tag line inside the block must not hide a secret a few
-// lines further down. Scanned line-by-line rather than by one regex, since a
-// block can span an unbounded number of continuation lines.
+// lines further down, however long the block runs. A single linear pass
+// with a stack of still-open secret-named keys (by indent) checks every
+// continuation line against its nearest enclosing key, with no cap on block
+// length: each line is visited once, so this stays O(n) even on a
+// pathological staircase of nested keys (unlike re-scanning forward from
+// every key line, which is quadratic on that shape).
 const YAML_BLOCK_KEY_LINE_RE = /^([ \t]*)(?:-[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]{0,127})[ \t]*:[^\r\n]*$/;
-// A bound on how many continuation lines of one block we inspect: enough for
-// any real secret file, cheap enough to stay linear on pathological input.
-const YAML_BLOCK_SCAN_LIMIT = 64;
+
+function lineIndentOf(line) {
+  return line.length - line.trimStart().length;
+}
 
 function hasYamlBlockSecret(text) {
   const lines = text.split(/\r\n|\r|\n/);
-  for (let i = 0; i < lines.length; i++) {
-    const match = YAML_BLOCK_KEY_LINE_RE.exec(lines[i]);
-    if (!match) continue;
-    const [, indent, name] = match;
-    if (!isSecretName(name)) continue;
-    const baseIndent = indent.length;
-    let scanned = 0;
-    for (let j = i + 1; j < lines.length && scanned < YAML_BLOCK_SCAN_LIMIT; j++) {
-      const line = lines[j];
-      if (line.trim() === '') continue;
-      const lineIndent = line.length - line.trimStart().length;
-      if (lineIndent <= baseIndent) break;
-      scanned += 1;
-      if (isPlausibleSecretValue(line.trim())) return true;
-    }
+  const openKeys = [];
+  for (const line of lines) {
+    if (line.trim() === '') continue;
+    const indent = lineIndentOf(line);
+    while (openKeys.length && openKeys[openKeys.length - 1] >= indent) openKeys.pop();
+    if (openKeys.length && isPlausibleSecretValue(line.trim())) return true;
+    const match = YAML_BLOCK_KEY_LINE_RE.exec(line);
+    if (match && isSecretName(match[2])) openKeys.push(indent);
   }
   return false;
 }
