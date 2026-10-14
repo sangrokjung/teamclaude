@@ -125,16 +125,20 @@ function hasSecretAssignment(text) {
   }
   for (const match of text.matchAll(YAML_ASSIGNMENT_RE)) {
     const [, name, value] = match;
-    if (isSecretName(name) && /[0-9]/.test(value) && isPlausibleSecretValue(value)) return true;
+    if (isSecretName(name) && isPlausibleSecretValue(value)) return true;
   }
   return false;
 }
 
 const SCAN_BEARER_RE = /\b(?:Bearer|Basic)[ \t]+([A-Za-z0-9._~+/=-]{16,})/gi;
+// Any scheme: `Authorization: Token abc...`, `authorization = "Digest ..."`.
+const SCAN_AUTHORIZATION_RE = /\bauthorization"?[ \t]*[:=][ \t]*["']?(?:[A-Za-z][A-Za-z0-9_-]*[ \t]+)?([A-Za-z0-9._~+/=-]{16,})/gi;
 
 function hasBearerCredential(text) {
-  for (const match of text.matchAll(SCAN_BEARER_RE)) {
-    if (isPlausibleSecretValue(match[1])) return true;
+  for (const re of [SCAN_BEARER_RE, SCAN_AUTHORIZATION_RE]) {
+    for (const match of text.matchAll(re)) {
+      if (isPlausibleSecretValue(match[1])) return true;
+    }
   }
   return false;
 }

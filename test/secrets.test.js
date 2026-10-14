@@ -100,3 +100,16 @@ test('secret detection stays linear on pathological megabyte inputs', () => {
     assert.ok(Date.now() - started < 3000, `${input.slice(0, 8)}… took ${Date.now() - started}ms`);
   }
 });
+
+test('containsSecret flags Authorization headers of any scheme and letter-only YAML secrets', () => {
+  const letters = 'QwErTyUiOpAsDfGhJkLzXcVbNmQwErTyUiOp';
+  for (const input of [
+    `Authorization: Token ${letters}`,
+    `authorization = "Digest ${letters}"`,
+    `"authorization": "${letters}"`,
+    `api_token: ${letters}`,
+  ]) {
+    assert.equal(containsSecret(input), true, input);
+  }
+  assert.equal(containsSecret('Authorization: Token <your-token-here>'), false);
+});
