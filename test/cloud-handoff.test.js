@@ -22,6 +22,7 @@ import {
   buildCloudEnv,
   buildCloudPrompt,
   fetchCloudCredits,
+  CLOUD_ACCOUNT_LOOKUP_INCOMPLETE,
   findCloudAccount,
   handoffBranchName,
   inspectHandoffRepo,
@@ -182,6 +183,35 @@ test('findCloudAccount still finds a funded account past position 32 when earlie
   assert.equal(best?.name, 'acct-32');
 });
 
+test('findCloudAccount reports an incomplete scan, not a plain miss, when the budget runs out early', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  // Only the last of 20 accounts has credit, but the shared time budget
+  // expires long before a lookup that slow could ever reach it.
+  const creditLookup = async (token, { signal }) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(token === 'tok-19'
+      ? { remainingDollars: 10, lockedReason: null }
+      : { remainingDollars: 0, lockedReason: null }), 100);
+    signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+  });
+  const result = await findCloudAccount({
+    accounts: fleet(20, now),
+    creditLookup,
+    now,
+    random: () => 0,
+    concurrency: 2,
+    lookupTimeoutMs: 1000,
+    budgetMs: 30,
+  });
+  assert.equal(result, CLOUD_ACCOUNT_LOOKUP_INCOMPLETE);
+});
+
+test('findCloudAccount returns plain null, not incomplete, when every account was actually checked', async () => {
+  const now = Date.UTC(2026, 9, 14);
+  const creditLookup = async () => ({ remainingDollars: 0, lockedReason: null });
+  const result = await findCloudAccount({ accounts: fleet(5, now), creditLookup, now, random: () => 0 });
+  assert.equal(result, null);
+});
+
 test('findCloudAccount treats a lookup past its timeout as ineligible and aborts it', async () => {
   const now = Date.UTC(2026, 9, 14);
   const aborted = [];
@@ -206,7 +236,7 @@ test('findCloudAccount treats a lookup past its timeout as ineligible and aborts
   assert.ok(Date.now() - started < 2000);
 });
 
-test('findCloudAccount stops at the overall budget and counts missing results as ineligible', async () => {
+test('findCloudAccount stops at the overall budget instead of waiting for slow lookups', async () => {
   const now = Date.UTC(2026, 9, 14);
   let started = 0;
   const creditLookup = async (token, { signal }) => {
@@ -235,12 +265,14 @@ test('findCloudAccount stops at the overall budget and counts missing results as
   assert.equal(best.remainingDollars, 10);
   assert.ok(started < 12, 'no new lookups start after the budget');
 
+  // Nobody answers before the budget fires: every status is genuinely
+  // unknown, which is "incomplete", not a confirmed "nobody has credit".
   assert.equal(await findCloudAccount({
     accounts: fleet(3, now),
     creditLookup: () => new Promise(() => {}),
     now,
     budgetMs: 50,
-  }), null);
+  }), CLOUD_ACCOUNT_LOOKUP_INCOMPLETE);
 });
 
 test('fetchCloudCredits reads iguana_necktie from the OAuth usage endpoint', async () => {
@@ -328,7 +360,6 @@ test('snapshot push carries local work to origin without touching the work tree,
   await writeFile(join(repo, 'secrets.json'), '{}\n');
   await mkdir(join(repo, 'nested'));
   await writeFile(join(repo, 'nested', 'deep.txt'), 'deep\n');
-  await writeFile(join(repo, 'big.bin'), Buffer.alloc(5 * 1024 * 1024 + 1));
   await unlink(join(repo, 'removed.txt'));
 
   const head = git(repo, env, 'rev-parse', 'HEAD');
@@ -456,7 +487,7 @@ test('snapshot scan skips only what the verified upstream already has, else scan
   assert.equal(git(bare, env, 'show', `refs/heads/${pushed.branch}:clean.txt`), 'clean change');
 });
 
-test('snapshot scan trusts origin HEAD only as advertised by the remote, and keeps binary files local', async t => {
+test('snapshot scan trusts origin HEAD only as advertised by the remote', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-secret-originhead-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { repo, bare, env } = await makeRepo(root);
@@ -464,10 +495,6 @@ test('snapshot scan trusts origin HEAD only as advertised by the remote, and kee
   git(repo, env, 'add', 'legacy.txt');
   git(repo, env, 'commit', '--quiet', '-m', 'legacy');
   git(repo, env, 'push', '--quiet', 'origin', 'main');
-  await writeFile(
-    join(repo, 'image.bin'),
-    Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2, 0]), randomBytes(256).map(b => b & 0x7f || 1)]),
-  );
   await writeFile(join(repo, 'placeholder.env.example'), 'OPENAI_API_KEY=<your-key-here>\n');
 
   // A local origin/HEAD alone is not proof of what the remote has.
@@ -478,8 +505,6 @@ test('snapshot scan trusts origin HEAD only as advertised by the remote, and kee
   const pushed = await snapshot(repo, env);
   assert.equal(pushed.ok, true);
   const files = git(bare, env, 'ls-tree', '-r', '--name-only', `refs/heads/${pushed.branch}`);
-  // Binary content cannot be scanned, so it stays local.
-  assert.doesNotMatch(files, /image\.bin/);
   assert.match(files, /placeholder\.env\.example/);
 });
 
@@ -548,19 +573,33 @@ const UNSCANNABLE = [
   ['large.txt', Buffer.alloc(1024 * 1024 + 1, 0x61)],
 ];
 
-test('snapshot keeps binary, non-UTF-8, and oversized working-tree files local instead of pushing them unscanned', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-unscannable-wip-'));
+test('an unscannable working-tree file aborts the handoff instead of being silently excluded', async t => {
+  // Excluding an oversized/binary/undecodable file from the snapshot would
+  // leave the cloud session on the file's stale HEAD content (for a tracked
+  // change) or simply missing it (for a new file) without saying so either
+  // way. Both abort the whole handoff and preserve the local session.
+  for (const [name, content] of UNSCANNABLE) {
+    const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-unscannable-wip-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const { repo, bare, env } = await makeRepo(root);
+    git(repo, env, 'branch', '--set-upstream-to=origin/main');
+    await writeFile(join(repo, name), content);
+    await writeFile(join(repo, 'ok.txt'), 'plain change\n');
+    assert.deepEqual(await snapshot(repo, env), { ok: false, reason: 'snapshot-unscannable' }, name);
+    assert.equal(handoffRefs(bare, env), '', name);
+  }
+});
+
+test('a clean working tree with only scannable changes still pushes normally', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-scannable-wip-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const { repo, bare, env } = await makeRepo(root);
   git(repo, env, 'branch', '--set-upstream-to=origin/main');
-  for (const [name, content] of UNSCANNABLE) await writeFile(join(repo, name), content);
   await writeFile(join(repo, 'ok.txt'), 'plain change\n');
-
   const pushed = await snapshot(repo, env);
   assert.equal(pushed.ok, true);
   const files = git(bare, env, 'ls-tree', '-r', '--name-only', `refs/heads/${pushed.branch}`).split('\n');
   assert.ok(files.includes('ok.txt'));
-  for (const [name] of UNSCANNABLE) assert.equal(files.includes(name), false, name);
 });
 
 test('snapshot aborts when an unpushed commit carries a blob the scanner cannot read as text', async t => {
@@ -734,6 +773,18 @@ test('attemptCloudHandoff falls back without side effects when a precondition fa
       creditLookup: async () => ({ remainingDollars: 0, lockedReason: null }),
     },
     { reason: 'no-credit-account', cwd: repo, vendorBin, loadAccounts: async () => [] },
+    {
+      reason: 'credit-lookup-incomplete',
+      cwd: repo,
+      vendorBin,
+      // Every lookup would eventually answer, but the budget expires first:
+      // this must be reported differently from a clean "nobody has credit".
+      creditLookup: async (token, { signal }) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({ remainingDollars: 0, lockedReason: null }), 1000);
+        signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+      }),
+      creditLookupOptions: { budgetMs: 10, lookupTimeoutMs: 1000, concurrency: 1 },
+    },
   ];
   for (const { reason, ...overrides } of cases) {
     const outcome = await attemptCloudHandoff(handoffInputs(root, {

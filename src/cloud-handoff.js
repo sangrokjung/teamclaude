@@ -167,24 +167,35 @@ async function snapshotPaths(root, runGit, gitEnv) {
     ['ls-files', '-z', '--others', '--exclude-standard'],
     { cwd: root, env: gitEnv },
   );
-  if (changed.status !== 0 || untracked.status !== 0) return null;
+  if (changed.status !== 0 || untracked.status !== 0) {
+    return { ok: false, reason: 'snapshot-failed' };
+  }
   const paths = [...new Set([...nulList(changed.stdout), ...nulList(untracked.stdout)])];
   const kept = [];
   for (const path of paths) {
+    // A secret-named path (.env*, *.pem, …) is an intentional, documented
+    // exclusion — the file is simply never considered part of the snapshot.
     if (path.endsWith('/') || isExcludedHandoffPath(path)) continue;
     const info = await lstat(join(root, path)).catch(() => null);
     if (info?.isDirectory()) continue;
     if (info?.isFile()) {
-      // Binary, non-UTF-8, or oversized files cannot be scanned, so they are
-      // left out of the snapshot. The push-time scan re-reads the exact blob
-      // bytes and aborts if anything unscannable slipped in anyway.
-      if (info.size > CLOUD_HANDOFF_MAX_FILE_BYTES) continue;
+      // A binary, non-UTF-8, or oversized CHANGED file cannot be silently
+      // left out of the snapshot: doing so would commit a tree that still
+      // has that file's HEAD content, silently dropping the user's
+      // uncommitted edit from the cloud session and risking it later
+      // overwriting the remote branch. Abort the whole handoff instead —
+      // the session is preserved for local/manual continuation.
+      if (info.size > CLOUD_HANDOFF_MAX_FILE_BYTES) {
+        return { ok: false, reason: 'snapshot-unscannable' };
+      }
       const content = await readFile(join(root, path)).catch(() => null);
-      if (!content || decodeScannableText(content) === null) continue;
+      if (!content || decodeScannableText(content) === null) {
+        return { ok: false, reason: 'snapshot-unscannable' };
+      }
     }
     kept.push(path);
   }
-  return kept;
+  return { ok: true, paths: kept };
 }
 
 async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) {
@@ -234,8 +245,9 @@ export async function pushHandoffSnapshot({
   now = new Date(),
 }) {
   const branch = handoffBranchName(sessionId, now);
-  const paths = await snapshotPaths(root, runGit, gitEnv);
-  if (!paths) return { ok: false, reason: 'snapshot-failed' };
+  const snapshotResult = await snapshotPaths(root, runGit, gitEnv);
+  if (!snapshotResult.ok) return { ok: false, reason: snapshotResult.reason };
+  const { paths } = snapshotResult;
   const commit = paths.length > 0
     ? await snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv })
     : head;
@@ -271,8 +283,12 @@ export async function fetchCloudCredits(accessToken, {
   return { remainingDollars, lockedReason: credits.locked_reason ?? null };
 }
 
-// One lookup, settled as null when its own timeout or the shared budget fires,
-// whether or not the lookup itself honors the abort signal.
+// One lookup, tagged `settled: false` when its own timeout or the shared
+// budget fires before `creditLookup` itself answers (whether or not the
+// lookup honors the abort signal) — as opposed to a definitive `settled:
+// true` answer, which may still carry `value: null` (the API said nothing
+// usable, or the call threw). Only the former means "we don't actually
+// know"; the latter is a confirmed negative, not an unknown.
 function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal) {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -280,12 +296,13 @@ function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal)
   budgetSignal.addEventListener('abort', abort, { once: true });
   if (budgetSignal.aborted) abort();
   const expired = new Promise(resolve => {
-    if (controller.signal.aborted) resolve(null);
-    controller.signal.addEventListener('abort', () => resolve(null), { once: true });
+    if (controller.signal.aborted) resolve({ settled: false, value: null });
+    controller.signal.addEventListener('abort', () => resolve({ settled: false, value: null }), { once: true });
   });
   const answered = Promise.resolve()
     .then(() => creditLookup(accessToken, { signal: controller.signal }))
-    .catch(() => null);
+    .then(value => ({ settled: true, value }))
+    .catch(() => ({ settled: true, value: null }));
   return Promise.race([answered, expired]).finally(() => {
     clearTimeout(timer);
     budgetSignal.removeEventListener('abort', abort);
@@ -294,6 +311,10 @@ function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal)
 
 async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
   const results = new Array(candidates.length).fill(null);
+  // Starts true for every candidate: one never reached (budget exhausted
+  // before its worker got to it) is exactly as unknown as one that timed
+  // out mid-lookup.
+  const unknown = new Array(candidates.length).fill(true);
   const budget = new AbortController();
   const budgetTimer = setTimeout(() => budget.abort(), budgetMs);
   let next = 0;
@@ -301,12 +322,14 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
     while (!budget.signal.aborted && next < candidates.length) {
       const index = next;
       next += 1;
-      results[index] = await boundedCreditLookup(
+      const outcome = await boundedCreditLookup(
         creditLookup,
         candidates[index].accessToken,
         lookupTimeoutMs,
         budget.signal,
       );
+      results[index] = outcome.value;
+      unknown[index] = !outcome.settled;
     }
   };
   try {
@@ -314,8 +337,21 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
   } finally {
     clearTimeout(budgetTimer);
   }
-  return candidates.map((account, index) => ({ account, credits: results[index] }));
+  return {
+    looked: candidates.map((account, index) => ({ account, credits: results[index] })),
+    // "No funded account" must not be reported the same way as a genuine
+    // scan of everyone when any candidate's status is still unknown — a
+    // confirmed negative (no credit, locked, API error) is not the same as
+    // never getting an answer at all.
+    incomplete: unknown.some(Boolean),
+  };
 }
+
+// A distinct sentinel rather than `null`, so a caller can tell "no account
+// had credit" (null — fine to fall back to local recovery) apart from "the
+// scan ran out of time before checking every eligible account" (this — an
+// account with credit may exist among the ones never reached).
+export const CLOUD_ACCOUNT_LOOKUP_INCOMPLETE = Object.freeze({ incomplete: true });
 
 export async function findCloudAccount({
   accounts,
@@ -336,7 +372,7 @@ export async function findCloudAccount({
     && account.accessToken.length > 0
     && Number.isFinite(normalizeExpiresAt(account.expiresAt))
     && normalizeExpiresAt(account.expiresAt) - now >= MIN_TOKEN_LIFETIME_MS);
-  const looked = await lookupCredits(eligible, creditLookup, {
+  const { looked, incomplete } = await lookupCredits(eligible, creditLookup, {
     concurrency: Math.max(1, concurrency),
     lookupTimeoutMs,
     budgetMs,
@@ -348,7 +384,9 @@ export async function findCloudAccount({
       && credits.remainingDollars >= MIN_REMAINING_DOLLARS)
     .sort((a, b) => b.credits.remainingDollars - a.credits.remainingDollars)
     .slice(0, TOP_CANDIDATES);
-  if (funded.length === 0) return null;
+  if (funded.length === 0) {
+    return incomplete ? CLOUD_ACCOUNT_LOOKUP_INCOMPLETE : null;
+  }
   const index = Math.min(funded.length - 1, Math.max(0, Math.floor(random() * funded.length)));
   const { account, credits } = funded[index];
   return {
@@ -443,6 +481,7 @@ export async function attemptCloudHandoff({
   beforeLaunch = async () => {},
   launchCloud,
   log = () => {},
+  creditLookupOptions = {},
 }) {
   const skip = reason => ({ ok: false, reason, stopped: false });
   if (!(await binExists(vendorBin))) return skip('vendor-missing');
@@ -457,7 +496,9 @@ export async function attemptCloudHandoff({
     creditLookup,
     now: now.getTime(),
     random,
+    ...creditLookupOptions,
   });
+  if (account === CLOUD_ACCOUNT_LOOKUP_INCOMPLETE) return skip('credit-lookup-incomplete');
   if (!account) return skip('no-credit-account');
   const snapshot = await pushHandoffSnapshot({
     root: repo.root,
