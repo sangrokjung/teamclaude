@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import { CloudHandoffNotStopped, attemptCloudHandoff } from './cloud-handoff.js';
 import { CLOUD_HANDOFF_MIN_WAIT_SECONDS } from './claude-recovery.js';
 import { readPrivateJson } from './cmux-session-guards.js';
+import { sameExhaustionEvent } from './sidecar-transcript.js';
 
 export const CLOUD_SIDECAR_LOG_PREFIX = '[TeamClaude cloud-sidecar]';
 export const CLOUD_SIDECAR_MIN_CHILDLESS_MS = 60_000;
@@ -79,13 +80,18 @@ export function isTeamclaudeRunSupervisor(command, trustedEntries = []) {
 //     that changes the pool is exactly `codex`, which a text starting with
 //     `anthropic` cannot be (real supervisors launched from a TeamClaude
 //     shell carry `TEAMCLAUDE_PROVIDER=anthropic`).
-// HOME is deliberately NOT judged from this text. The evidence for "same
-// HOME" is the supervisor's recovery lease: defaultCmuxRescuePaths() derives
-// the store from homedir() alone (HOME, else the passwd home — no other env
-// override exists, in the legacy code or now), and the sidecar only reads
-// leases from its OWN store. A supervisor with another HOME writes its lease
-// elsewhere and can never become a candidate.
-export function provesDefaultPool(text, command) {
+//   - `HOME=` exactly once (`XDG_CONFIG_HOME=` is already excluded), right
+//     after a space, with a value EXACTLY the sidecar's HOME, followed by the
+//     end or a space and an UPPERCASE env name token (`/^[A-Z_][A-Z0-9_]*=/`).
+//     A lowercase continuation (`archive=pool-b`) might be part of HOME.
+// Same HOME is required TOGETHER with the supervisor lease being in the
+// sidecar's own store (defaultCmuxRescuePaths() derives the store from
+// homedir() alone; no other env override exists) — a shared or symlinked
+// store alone is not enough.
+// Threat model / residual risk: same-uid processes are one trust domain. A
+// same-uid process that deliberately sets HOME="<sidecar HOME> X=y" AND
+// shares the store by symlink is indistinguishable here; that is accepted.
+export function provesDefaultPool(text, command, home) {
   const no = reason => ({ ok: false, reason });
   if (typeof text !== 'string' || typeof command !== 'string' || command.length === 0
       || !text.startsWith(`${command} `)
@@ -100,7 +106,20 @@ export function provesDefaultPool(text, command) {
   if (provider.length === 1 && !exactEntryAt(text, provider[0], 'TEAMCLAUDE_PROVIDER=', 'anthropic')) {
     return no('provider not provably anthropic');
   }
+  if (typeof home !== 'string' || !isAbsolute(home)) return no('sidecar HOME unknown');
+  const homes = occurrences(text, 'HOME=');
+  if (homes.length !== 1) return no(homes.length === 0 ? 'HOME not visible' : 'HOME ambiguous');
+  if (!homeEntryAt(text, homes[0], home)) return no('HOME not provably the sidecar HOME');
   return { ok: true };
+}
+
+// `HOME=<home>` right after a space, then the end or ` NAME=` (uppercase).
+function homeEntryAt(text, index, home) {
+  if (index === 0 || text[index - 1] !== ' ') return false;
+  const start = index + 'HOME='.length;
+  if (text.slice(start, start + home.length) !== home) return false;
+  const rest = text.slice(start + home.length);
+  return rest.length === 0 || /^ [A-Z_][A-Z0-9_]*=/.test(rest);
 }
 
 function occurrences(text, needle) {
@@ -301,18 +320,19 @@ async function trustedEntryOf(command, trusted, resolvePath) {
 
 // Pool membership from the supervisor's raw `ps -wwE` text (see
 // provesDefaultPool). Unreadable → not a member (fail closed).
-async function poolMembership(proc, { readProcessEnvText }) {
+async function poolMembership(proc, { readProcessEnvText, home }) {
   let text = null;
   try {
     text = typeof readProcessEnvText === 'function' ? await readProcessEnvText(proc.pid, proc) : null;
   } catch {
     text = null;
   }
-  return provesDefaultPool(text, proc.command);
+  return provesDefaultPool(text, proc.command, home);
 }
 
 // The sidecar serves the DEFAULT Claude pool only: no config override in its
-// own environment (its store and config then both follow homedir()).
+// own environment (its store and config then both follow homedir()), and an
+// absolute HOME that supervisors must provably share.
 function sidecarDefaultPool(selfEnv) {
   const env = selfEnv && typeof selfEnv === 'object' ? selfEnv : {};
   if (env.TEAMCLAUDE_CONFIG !== undefined || env.XDG_CONFIG_HOME !== undefined) {
@@ -321,7 +341,10 @@ function sidecarDefaultPool(selfEnv) {
   if (env.TEAMCLAUDE_PROVIDER !== undefined && env.TEAMCLAUDE_PROVIDER !== 'anthropic') {
     return { ok: false, reason: 'the sidecar provider is not anthropic' };
   }
-  return { ok: true };
+  if (typeof env.HOME !== 'string' || !isAbsolute(env.HOME)) {
+    return { ok: false, reason: 'the sidecar HOME is unknown' };
+  }
+  return { ok: true, home: env.HOME };
 }
 
 // One scan. Returns { handoffs, attempts }; never throws for an expected
@@ -340,7 +363,7 @@ export async function runCloudSidecar({
   readCwd,
   resolveSupervisorLease: resolveLease = async () => null,
   readLease = async () => null,
-  transcriptBlocked = async () => false,
+  inspectTranscript = async () => null,
   claimOnce,
   releaseClaim,
   kill,
@@ -457,7 +480,7 @@ export async function runCloudSidecar({
     }
     // Pool membership BEFORE any snapshot or push: the status above describes
     // this sidecar's pool only.
-    const membership = await poolMembership(proc, { readProcessEnvText });
+    const membership = await poolMembership(proc, { readProcessEnvText, home: self.home });
     if (!membership.ok) {
       say(`Supervisor pid ${proc.pid}: not provably in this pool (${membership.reason}); skipping.`);
       continue;
@@ -471,11 +494,13 @@ export async function runCloudSidecar({
       continue;
     }
     // Only a session whose transcript still ENDS in the quota error it is
-    // waiting out; a session that moved on (or cannot be judged) is left alone.
-    const stillBlocked = await Promise.resolve()
-      .then(() => transcriptBlocked(sessionId))
-      .catch(() => false);
-    if (stillBlocked !== true) {
+    // waiting out; a session that moved on (or cannot be judged) is left
+    // alone. The event (file identity, record offset, record id) is kept so
+    // the check under SIGSTOP can demand the very same one.
+    const firstEvent = await Promise.resolve()
+      .then(() => inspectTranscript(sessionId))
+      .catch(() => null);
+    if (firstEvent?.state !== 'blocked') {
       say(`Supervisor pid ${proc.pid}: session ${sessionId} transcript is not an unresolved exhaustion error; skipping.`);
       continue;
     }
@@ -547,14 +572,15 @@ export async function runCloudSidecar({
           say(`Supervisor pid ${proc.pid}: recovery lease changed during preparation; not stopping it.`);
           throw notStopped('supervisor lease changed');
         }
-        // The transcript must still end in the unresolved quota error.
-        let blockedNow = false;
+        // The SAME error event must still be the last unresolved word (a new
+        // error B, any conversation after it, or an unjudgeable read aborts).
+        let currentEvent = null;
         try {
-          blockedNow = (await transcriptBlocked(sessionId)) === true;
+          currentEvent = await inspectTranscript(sessionId);
         } catch {
-          blockedNow = false;
+          currentEvent = null;
         }
-        if (!blockedNow) {
+        if (!sameExhaustionEvent(firstEvent, currentEvent)) {
           say(`Supervisor pid ${proc.pid}: session ${sessionId} moved on during preparation; not stopping it.`);
           throw notStopped('transcript moved on');
         }

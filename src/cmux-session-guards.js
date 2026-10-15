@@ -223,18 +223,6 @@ export function unresolvedRecoverableApiErrorState(path, transcriptRoot, session
   );
 }
 
-// The transcript still ends in an UNRESOLVED quota error (fleet exhaustion or
-// usage limit) with no conversation after it. Used by the legacy cloud
-// sidecar right before it stops a waiting supervisor.
-export function unresolvedExhaustionErrorState(path, transcriptRoot, sessionId) {
-  return unresolvedApiError(
-    path,
-    transcriptRoot,
-    sessionId,
-    new Set(['fleet_exhausted', 'usage_limit']),
-  );
-}
-
 export function hasUnresolvedRecoverableApiError(path, transcriptRoot, sessionId) {
   return unresolvedRecoverableApiErrorKind(path, transcriptRoot, sessionId).then(Boolean);
 }

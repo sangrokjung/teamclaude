@@ -78,8 +78,8 @@ import {
   claimSessionLease,
   releaseSessionLease,
   resolveCmuxSessionId,
-  unresolvedExhaustionErrorState,
 } from './cmux-session-guards.js';
+import { scanExhaustionTail } from './sidecar-transcript.js';
 import {
   PROBE_BROKEN,
   createLoopStallMeter,
@@ -3485,15 +3485,15 @@ async function cloudSidecarCommand() {
     resolveSupervisorLease: ({ pid, startedAtMs }) =>
       resolveSupervisorLease({ storePath, pid, startedAtMs }),
     readLease: sessionId => readSessionLease({ storePath, sessionId }),
-    transcriptBlocked: async sessionId => {
+    inspectTranscript: async sessionId => {
       // Located once (a full tree walk) before the handoff, so the check
       // under SIGSTOP only reads the tail.
       if (!transcriptPaths.has(sessionId)) {
         transcriptPaths.set(sessionId, await findTranscript(transcriptRoot, sessionId));
       }
       const transcriptPath = transcriptPaths.get(sessionId);
-      if (!transcriptPath) return false;
-      return Boolean(await unresolvedExhaustionErrorState(transcriptPath, transcriptRoot, sessionId));
+      if (!transcriptPath) return null;
+      return scanExhaustionTail({ path: transcriptPath, transcriptRoot, sessionId });
     },
     claimOnce: sessionId => claimSessionOnce(storePath, sessionId),
     releaseClaim: (sessionId, claim) => releaseSessionClaim(storePath, sessionId, claim),
