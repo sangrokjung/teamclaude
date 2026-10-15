@@ -9,11 +9,10 @@ import {
   CLOUD_SIDECAR_LOG_PREFIX,
   fleetExhaustionVerdict,
   isTeamclaudeRunSupervisor,
-  parseProcessEnvOutput,
   parsePsOutput,
+  provesDefaultPool,
   resolveSupervisorSessionId,
   runCloudSidecar,
-  sessionIdFromArgv,
 } from '../src/cloud-sidecar.js';
 
 const SESSION_A = '0a1b2c3d-1111-4222-8333-444455556666';
@@ -23,7 +22,7 @@ const NODE = '/opt/node/bin/node';
 const ENTRY = '/opt/teamclaude/src/index.js';
 const BIN_ENTRY = '/opt/teamclaude/src/teamclaude.js';
 const TRUSTED = [ENTRY, BIN_ENTRY];
-const CONFIG_PATH = '/cfg/teamclaude.json';
+const HOME_DIR = '/home/user';
 const NOW = Date.parse('2026-10-16T03:00:00Z');
 const CUTOFF = '2026-10-15T00:00:00Z';
 const LSTART_OLD = 'Tue Oct 14 09:00:00 2026';
@@ -70,27 +69,6 @@ test('isTeamclaudeRunSupervisor matches only node running a trusted entry with t
   assert.equal(isTeamclaudeRunSupervisor(`${NODE} /srv/other-app/teamclaude.js run`, TRUSTED), false);
   assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`, []), false);
   assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`), false);
-});
-
-test('sessionIdFromArgv classifies argv as absent, valid, ambiguous or forked', () => {
-  const run = rest => sessionIdFromArgv(`${NODE} ${ENTRY} run ${rest}`.trim());
-  assert.deepEqual(run(`--session-id ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
-  assert.deepEqual(run(`--resume ${SESSION_A} continue`), { kind: 'valid', sessionId: SESSION_A });
-  assert.deepEqual(run(`-r ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
-  assert.deepEqual(run(`--resume=${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
-  assert.deepEqual(run(`--resume ${SESSION_A} --session-id ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
-  assert.deepEqual(run(''), { kind: 'absent', sessionId: null });
-  assert.deepEqual(run('--continue'), { kind: 'absent', sessionId: null });
-  assert.deepEqual(run('--model opus'), { kind: 'absent', sessionId: null });
-  // A selector without a UUID, or two different IDs, cannot be trusted.
-  assert.deepEqual(run('--resume not-a-uuid'), { kind: 'ambiguous', sessionId: null });
-  assert.deepEqual(run('--resume'), { kind: 'ambiguous', sessionId: null });
-  assert.deepEqual(run('-r'), { kind: 'ambiguous', sessionId: null });
-  assert.deepEqual(run('--session-id=nope'), { kind: 'ambiguous', sessionId: null });
-  assert.deepEqual(run(`--resume ${SESSION_A} --session-id ${SESSION_B}`), { kind: 'ambiguous', sessionId: null });
-  // A forked resume runs under a NEW session ID.
-  assert.deepEqual(run(`--resume ${SESSION_A} --fork-session`), { kind: 'forked', sessionId: null });
-  assert.deepEqual(run('--fork-session'), { kind: 'forked', sessionId: null });
 });
 
 // ── exhaustion verdict ──────────────────────────────────────
@@ -167,7 +145,7 @@ test('fleetExhaustionVerdict is not exhausted or is uncertain otherwise', () => 
 
 // ── session lookup ─────────────────────────────────────────
 
-test('resolveSupervisorSessionId finds the lease or store session bound to the supervisor pid', async t => {
+test('resolveSupervisorSessionId names the session only from the lease the supervisor itself holds', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-sidecar-lease-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const storePath = join(root, 'claude-hook-sessions.json');
@@ -178,40 +156,42 @@ test('resolveSupervisorSessionId finds the lease or store session bound to the s
     await writeFile(path, JSON.stringify(value), { mode: 0o600 });
     await chmod(path, 0o600);
   };
-  await writePrivate(join(leaseDir, SESSION_A), {
-    version: 1, pid: 4242, processStartSeconds: startedAtMs / 1000, nonce: 'n1', createdAt: NOW,
+  const lease = (pid, nonce, start = startedAtMs / 1000) => ({
+    version: 1, pid, processStartSeconds: start, nonce, createdAt: NOW,
   });
-  await writePrivate(join(leaseDir, SESSION_B), {
-    version: 1, pid: 5151, processStartSeconds: startedAtMs / 1000, nonce: 'n2', createdAt: NOW,
-  });
-  await writePrivate(join(leaseDir, 'not-a-session'), { version: 1, pid: 4242 });
+  // The legacy fleet_exhausted path holds claimSessionLease() — owner =
+  // the supervisor's own pid + process start — for the whole wait.
+  await writePrivate(join(leaseDir, SESSION_A), lease(4242, 'n1'));
+  // A rescuer (another process) holding a lease is NOT a supervisor lease.
+  await writePrivate(join(leaseDir, SESSION_B), lease(5151, 'n2'));
+  await writePrivate(join(leaseDir, 'not-a-session'), lease(4242, 'n3'));
 
   assert.equal(await resolveSupervisorSessionId({ storePath, pid: 4242, startedAtMs }), SESSION_A);
+  assert.equal(await resolveSupervisorSessionId({
+    storePath, pid: 4242, startedAtMs: startedAtMs + 1500,
+  }), SESSION_A, 'within the 2s start tolerance');
   // Same pid, different process start: a recycled pid is not the owner.
   assert.equal(await resolveSupervisorSessionId({
     storePath, pid: 4242, startedAtMs: startedAtMs + 60_000,
   }), null);
+  // A supervisor whose session is leased by the rescuer has no lease of its own.
   assert.equal(await resolveSupervisorSessionId({ storePath, pid: 9999, startedAtMs }), null);
 
+  // The hook session store is never consulted: a matching record without a
+  // lease does not make a target.
   await writePrivate(storePath, {
-    sessions: {
-      [SESSION_C]: { sessionId: SESSION_C, pid: 7070, pidStartSeconds: startedAtMs / 1000 },
-    },
+    sessions: { [SESSION_C]: { sessionId: SESSION_C, pid: 7070, pidStartSeconds: startedAtMs / 1000 } },
   });
-  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 7070, startedAtMs }), SESSION_C);
+  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 7070, startedAtMs }), null);
 
-  // Two different sessions bound to one pid are ambiguous.
-  await writePrivate(storePath, {
-    sessions: {
-      [SESSION_C]: { sessionId: SESSION_C, pid: 4242, pidStartSeconds: startedAtMs / 1000 },
-    },
-  });
+  // Two leases held by one supervisor are ambiguous.
+  await writePrivate(join(leaseDir, SESSION_C), lease(4242, 'n4'));
   assert.equal(await resolveSupervisorSessionId({ storePath, pid: 4242, startedAtMs }), null);
 });
 
 // ── runCloudSidecar ─────────────────────────────────────────
 
-function supervisor(pid, { lstart = LSTART_OLD, args = `--resume ${SESSION_A}`, ppid = 1 } = {}) {
+function supervisor(pid, { lstart = LSTART_OLD, args = '', ppid = 1 } = {}) {
   return {
     pid,
     ppid,
@@ -239,13 +219,14 @@ function harness(overrides = {}) {
     now: () => NOW,
     vendorBin: '/opt/vendor/claude',
     trustedEntries: TRUSTED,
-    configPath: CONFIG_PATH,
+    selfEnv: { HOME: HOME_DIR, PATH: '/usr/bin' },
     resolvePath: async path => path,
-    readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH }),
+    readProcessEnvText: async (pid, proc) => `${proc.command} PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic`,
     listProcesses: async () => processes.map(p => ({ ...p })),
+    listProcessesSync: () => processes.map(p => ({ ...p })),
     fetchStatus: async () => exhaustedStatus(),
     readCwd: async () => '/work/project',
-    resolveSessionFromStore: async () => null,
+    resolveSessionFromLease: async () => SESSION_A,
     claimOnce: async sessionId => {
       calls.push(['claim', sessionId]);
       return { dev: 1, ino: 2 };
@@ -412,27 +393,28 @@ test('runCloudSidecar drops observations for supervisors that disappeared', asyn
   assert.deepEqual(h.state.observations, {});
 });
 
-test('runCloudSidecar skips a supervisor whose session ID cannot be resolved', async () => {
-  const h = harness({ processes: [supervisor(4242, { args: '--continue' })] });
+test('runCloudSidecar skips a supervisor that holds no unique recovery lease (e.g. not under cmux)', async () => {
+  const h = harness({ deps: { resolveSessionFromLease: async () => null } });
   await runCloudSidecar(h.deps);
   assertNoSideEffects(h);
   assert.equal(h.count('attempt'), 0);
 });
 
-test('runCloudSidecar falls back to the cmux session bound to the supervisor pid', async () => {
+test('runCloudSidecar takes the session from the supervisor lease and never from argv', async () => {
   const seen = [];
   const h = harness({
-    processes: [supervisor(4242, { args: '' })],
+    // A prompt that mentions --resume, and a different resume ID, change nothing.
+    processes: [supervisor(4242, { args: `--resume ${SESSION_B} fix --resume ${SESSION_C} please` })],
     deps: {
-      resolveSessionFromStore: async ({ pid, startedAtMs }) => {
+      resolveSessionFromLease: async ({ pid, startedAtMs }) => {
         seen.push([pid, startedAtMs]);
-        return SESSION_B;
+        return SESSION_A;
       },
     },
   });
   await runCloudSidecar(h.deps);
   assert.deepEqual(seen, [[4242, new Date(LSTART_OLD).getTime()]]);
-  assert.deepEqual(h.calls.find(call => call[0] === 'claim'), ['claim', SESSION_B]);
+  assert.deepEqual(h.calls.find(call => call[0] === 'claim'), ['claim', SESSION_A]);
   assert.equal(h.count('launch'), 1);
 });
 
@@ -477,6 +459,7 @@ test('runCloudSidecar does not kill when the re-check before launch finds a chan
     const result = await runCloudSidecar(h.deps);
     assert.equal(h.count('kill'), 0);
     assert.equal(h.count('launch'), 0);
+    assert.equal(h.count('signal'), 0, 'no signal at all');
     assert.deepEqual(h.calls.find(call => call[0] === 'release'), ['release', SESSION_A, { dev: 1, ino: 2 }]);
     assert.equal(result.handoffs, 0);
   }
@@ -566,82 +549,48 @@ test('runCloudSidecar drives the real cloud handoff and records source legacy-si
 
 // ── pool membership, late re-check, argv classes ───────────
 
-test('runCloudSidecar never touches a supervisor of another pool or with an unreadable environment', async () => {
+test('runCloudSidecar never touches a supervisor that may belong to another pool', async () => {
   for (const env of [
-    { HOME: '/home/user', TEAMCLAUDE_CONFIG: '/cfg/other.json' },
-    { HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'codex' },
-    { HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'something-else' },
-    { HOME: '/home/user', TEAMCLAUDE_CONFIG: 'relative/teamclaude.json' },
-    { HOME: '/home/other' },
-    {},
-    null,
+    `PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/other.json`,
+    `PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=codex`,
+    `PATH=/usr/bin HOME=${HOME_DIR} XDG_CONFIG_HOME=/xdg`,
+    'PATH=/usr/bin HOME=/home/other',
+    'PATH=/usr/bin',
+    '',
   ]) {
-    const h = harness({ deps: { readProcessEnv: async () => env } });
+    const h = harness({
+      deps: { readProcessEnvText: async (pid, proc) => `${proc.command}${env ? ` ${env}` : ''}` },
+    });
     await runCloudSidecar(h.deps);
     assertNoSideEffects(h);
-    assert.equal(h.count('attempt'), 0, JSON.stringify(env));
+    assert.equal(h.count('attempt'), 0, env);
   }
-  const throwing = harness({
-    deps: {
-      readProcessEnv: async () => {
-        throw new Error('ps failed');
-      },
-    },
-  });
-  await runCloudSidecar(throwing.deps);
-  assert.equal(throwing.count('attempt'), 0);
+  for (const readProcessEnvText of [async () => null, async () => {
+    throw new Error('ps failed');
+  }]) {
+    const h = harness({ deps: { readProcessEnvText } });
+    await runCloudSidecar(h.deps);
+    assert.equal(h.count('attempt'), 0);
+  }
 });
 
-test('runCloudSidecar compares config paths by realpath and accepts the default path', async () => {
-  const viaLink = harness({
-    deps: {
-      readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: '/link/teamclaude.json' }),
-      resolvePath: async path => (path === '/link/teamclaude.json' ? CONFIG_PATH : path),
-    },
-  });
-  await runCloudSidecar(viaLink.deps);
-  assert.equal(viaLink.count('launch'), 1);
-
-  const byDefault = harness({
-    deps: {
-      configPath: '/home/user/.config/teamclaude.json',
-      readProcessEnv: async () => ({ HOME: '/home/user' }),
-    },
-  });
-  await runCloudSidecar(byDefault.deps);
-  assert.equal(byDefault.count('launch'), 1);
-
-  const byXdg = harness({
-    deps: {
-      configPath: '/xdg/teamclaude.json',
-      readProcessEnv: async () => ({ HOME: '/home/user', XDG_CONFIG_HOME: '/xdg' }),
-    },
-  });
-  await runCloudSidecar(byXdg.deps);
-  assert.equal(byXdg.count('launch'), 1);
-
-  // A missing config file (realpath fails) is not proof of membership.
-  const unresolved = harness({
-    deps: {
-      resolvePath: async path => {
-        if (path === CONFIG_PATH) throw new Error('ENOENT');
-        return path;
-      },
-    },
-  });
-  await runCloudSidecar(unresolved.deps);
-  assert.equal(unresolved.count('attempt'), 0);
-});
-
-test('runCloudSidecar trusts the teamclaude.js bin to be the Claude pool whatever its inherited provider', async () => {
-  const h = harness({
-    processes: [{ ...supervisor(4242), command: `${NODE} ${BIN_ENTRY} run --resume ${SESSION_A}` }],
-    deps: {
-      readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'codex' }),
-    },
-  });
-  await runCloudSidecar(h.deps);
-  assert.equal(h.count('launch'), 1);
+test('runCloudSidecar is a no-op unless the sidecar itself runs the default Claude pool', async () => {
+  for (const selfEnv of [
+    { HOME: HOME_DIR, TEAMCLAUDE_CONFIG: '/cfg/teamclaude.json' },
+    { HOME: HOME_DIR, TEAMCLAUDE_CONFIG: '' },
+    { HOME: HOME_DIR, XDG_CONFIG_HOME: '/xdg' },
+    { HOME: HOME_DIR, TEAMCLAUDE_PROVIDER: 'codex' },
+    { HOME: 'relative' },
+    {},
+  ]) {
+    const h = harness({ deps: { selfEnv } });
+    await runCloudSidecar(h.deps);
+    assertNoSideEffects(h);
+    assert.equal(h.count('attempt'), 0, JSON.stringify(Object.keys(selfEnv)));
+  }
+  const anthropic = harness({ deps: { selfEnv: { HOME: HOME_DIR, TEAMCLAUDE_PROVIDER: 'anthropic' } } });
+  await runCloudSidecar(anthropic.deps);
+  assert.equal(anthropic.count('launch'), 1);
 });
 
 test('runCloudSidecar ignores another app whose entry merely ends in src/index.js', async () => {
@@ -700,113 +649,56 @@ test('runCloudSidecar re-checks exhaustion right before SIGTERM and backs off wh
   }
 });
 
-test('runCloudSidecar skips ambiguous argv even when the store names a session', async () => {
-  let storeCalls = 0;
-  const h = harness({
-    processes: [supervisor(4242, { args: `--resume ${SESSION_A} --session-id ${SESSION_B}` })],
-    deps: {
-      resolveSessionFromStore: async () => {
-        storeCalls += 1;
-        return SESSION_A;
-      },
-    },
-  });
-  await runCloudSidecar(h.deps);
-  assertNoSideEffects(h);
-  assert.equal(h.count('attempt'), 0);
-  assert.equal(storeCalls, 0);
+// ── default-pool proof from the raw ps -wwE text ────────────
 
-  const nonUuid = harness({
-    processes: [supervisor(4242, { args: '--resume some-title' })],
-    deps: { resolveSessionFromStore: async () => SESSION_A },
-  });
-  await runCloudSidecar(nonUuid.deps);
-  assert.equal(nonUuid.count('attempt'), 0);
+test('provesDefaultPool accepts only a provable default-config, same-HOME Claude process', () => {
+  const cmd = `${NODE} ${ENTRY} run`;
+  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR} SHELL=/bin/zsh`), true);
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}`), true);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic PATH=/usr/bin`), true);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic`), true);
+  // A space inside an unrelated value is irrelevant.
+  assert.equal(ok(`${cmd} PS1=a b HOME=${HOME_DIR}`), true);
 });
 
-test('runCloudSidecar skips a forked resume even when the store names a session', async () => {
-  let storeCalls = 0;
-  const h = harness({
-    processes: [supervisor(4242, { args: `--resume ${SESSION_A} --fork-session` })],
-    deps: {
-      resolveSessionFromStore: async () => {
-        storeCalls += 1;
-        return SESSION_B;
-      },
-    },
-  });
-  await runCloudSidecar(h.deps);
-  assertNoSideEffects(h);
-  assert.equal(h.count('attempt'), 0);
-  assert.equal(storeCalls, 0);
+test('provesDefaultPool rejects any config override key anywhere in the text', () => {
+  const cmd = `${NODE} ${ENTRY} run`;
+  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json`), false);
+  // A NAME=-shaped tail on a space-containing path cannot hide the key.
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/POOL=b.json`), false);
+  // A fake key inside another value (or in argv) still disqualifies.
+  assert.equal(ok(`${cmd} NOTE=xTEAMCLAUDE_CONFIG=/cfg/a.json HOME=${HOME_DIR}`), false);
+  assert.equal(ok(`${cmd} --note TEAMCLAUDE_CONFIG=/cfg/a.json HOME=${HOME_DIR}`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} XDG_CONFIG_HOME=/xdg`), false);
 });
 
-test('parseProcessEnvOutput keeps only the membership keys and fails closed', () => {
-  const command = `${NODE} ${ENTRY} run --resume ${SESSION_A}`;
-  const out = `${command} PATH=/usr/bin HOME=/home/user OTHER_TOKEN=opaque TEAMCLAUDE_CONFIG=/cfg/teamclaude.json\n`;
-  assert.deepEqual(parseProcessEnvOutput(out, command), {
-    HOME: '/home/user',
-    TEAMCLAUDE_CONFIG: '/cfg/teamclaude.json',
-  });
-  // No visible environment (another user's process, or hidden).
-  assert.equal(parseProcessEnvOutput(`${command}\n`, command), null);
-  // Output that is not this command line.
-  assert.equal(parseProcessEnvOutput(`other command HOME=/x\n`, command), null);
-  assert.equal(parseProcessEnvOutput(`${command}X HOME=/x`, command), null);
-  // A needed key seen twice is ambiguous.
-  assert.equal(parseProcessEnvOutput(`${command} HOME=/a HOME=/b`, command), null);
-  assert.equal(parseProcessEnvOutput(out, ''), null);
+test('provesDefaultPool admits TEAMCLAUDE_PROVIDER only as one exact anthropic entry', () => {
+  const cmd = `${NODE} ${ENTRY} run`;
+  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=codex`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropicx`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} NOTE=TEAMCLAUDE_PROVIDER=anthropic`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic TEAMCLAUDE_PROVIDER=codex`), false);
 });
 
-// ── env value boundaries ───────────────────────────────────
-
-test('parseProcessEnvOutput rejects a membership value that may contain a space', () => {
-  const command = `${NODE} ${ENTRY} run`;
-  // B's config is "/cfg/teamclaude.json archive/pool-b.json": the cut-off
-  // first half must not pass as pool A's config.
-  assert.equal(parseProcessEnvOutput(
-    `${command} HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/pool-b.json PATH=/usr/bin`,
-    command,
-  ), null);
-  assert.equal(parseProcessEnvOutput(
-    `${command} HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/pool-b.json`,
-    command,
-  ), null);
-  assert.equal(parseProcessEnvOutput(`${command} HOME=/home/my user PATH=/usr/bin`, command), null);
-  // Double space: an empty token cannot be proven to be a boundary.
-  assert.equal(parseProcessEnvOutput(`${command} HOME=/home/user  PATH=/usr/bin`, command), null);
-});
-
-test('parseProcessEnvOutput rejects a membership key that also appears inside another value', () => {
-  const command = `${NODE} ${ENTRY} run`;
-  assert.equal(parseProcessEnvOutput(
-    `${command} NOTE=see TEAMCLAUDE_CONFIG=/cfg/a.json HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json`,
-    command,
-  ), null);
-  assert.equal(parseProcessEnvOutput(
-    `${command} TEAMCLAUDE_PROVIDER=anthropic HOME=/home/user TEAMCLAUDE_PROVIDER=codex`,
-    command,
-  ), null);
-});
-
-test('parseProcessEnvOutput accepts clean boundaries, including unrelated values with spaces', () => {
-  const command = `${NODE} ${ENTRY} run`;
-  assert.deepEqual(parseProcessEnvOutput(
-    `${command} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json HOME=/home/user XDG_CONFIG_HOME=/xdg PATH=/usr/bin`,
-    command,
-  ), { TEAMCLAUDE_CONFIG: '/cfg/teamclaude.json', HOME: '/home/user', XDG_CONFIG_HOME: '/xdg' });
-  // A space inside an UNRELATED value does not touch the membership keys.
-  assert.deepEqual(parseProcessEnvOutput(
-    `${command} PS1=a b HOME=/home/user TEAMCLAUDE_PROVIDER=anthropic`,
-    command,
-  ), { HOME: '/home/user', TEAMCLAUDE_PROVIDER: 'anthropic' });
-  // HOME= inside XDG_CONFIG_HOME= is not a second HOME at a boundary.
-  assert.deepEqual(parseProcessEnvOutput(
-    `${command} XDG_CONFIG_HOME=/xdg HOME=/home/user`,
-    command,
-  ), { XDG_CONFIG_HOME: '/xdg', HOME: '/home/user' });
-  // The env part must start with a KEY= token.
-  assert.equal(parseProcessEnvOutput(`${command} stray HOME=/home/user`, command), null);
+test('provesDefaultPool requires exactly one HOME= equal to the sidecar HOME', () => {
+  const cmd = `${NODE} ${ENTRY} run`;
+  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=/home/other`), false);
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}2`), false);
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}/sub`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} OLD=HOME=${HOME_DIR}`), false);
+  assert.equal(ok(`${cmd} JAVA_HOME=/opt/java HOME=${HOME_DIR}`), false);
+  assert.equal(ok(`${cmd} HOME=${HOME_DIR} HOME=${HOME_DIR}`), false);
+  assert.equal(ok(`${cmd} PATH=/usr/bin`), false);
+  assert.equal(ok(`${cmd}`), false);
+  assert.equal(ok(''), false);
+  assert.equal(ok(null), false);
+  assert.equal(provesDefaultPool(`${cmd} HOME=${HOME_DIR}`, '').ok, false);
+  assert.equal(provesDefaultPool(`${cmd} HOME=${HOME_DIR}`, 'relative').ok, false);
 });
 
 // ── SIGSTOP fence around the final check ───────────────────
@@ -826,7 +718,7 @@ test('runCloudSidecar fences the final check with SIGSTOP and sends STOP, TERM, 
   assert.deepEqual(order, ['claim', 'SIGSTOP', 'SIGTERM', 'SIGCONT', 'launch']);
 });
 
-test('runCloudSidecar resumes the supervisor and does not kill when a child appears during the final status fetch', async () => {
+test('runCloudSidecar sends no signal when a child appears during the final status fetch', async () => {
   let calls = 0;
   const h = harness();
   h.deps.fetchStatus = async () => {
@@ -838,14 +730,13 @@ test('runCloudSidecar resumes the supervisor and does not kill when a child appe
   };
   const result = await runCloudSidecar(h.deps);
   assert.equal(calls, 2);
-  assert.equal(h.count('kill'), 0);
   assert.equal(h.count('launch'), 0);
-  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+  assert.deepEqual(signals(h), []);
   assert.deepEqual(h.calls.find(call => call[0] === 'release'), ['release', SESSION_A, { dev: 1, ino: 2 }]);
   assert.equal(result.handoffs, 0);
 });
 
-test('runCloudSidecar does not kill when the pid was reused during the final status fetch', async () => {
+test('runCloudSidecar sends no signal at all when the pid was reused during the final status fetch', async () => {
   let calls = 0;
   const h = harness();
   h.deps.fetchStatus = async () => {
@@ -854,25 +745,77 @@ test('runCloudSidecar does not kill when the pid was reused during the final sta
     return exhaustedStatus();
   };
   await runCloudSidecar(h.deps);
-  assert.equal(h.count('kill'), 0);
+  assert.deepEqual(signals(h), []);
   assert.equal(h.count('launch'), 0);
-  assert.equal(signals(h).includes('SIGTERM'), false);
-  assert.equal(signals(h).at(-1), 'SIGCONT');
+  assert.equal(h.count('release'), 1);
+});
+
+test('runCloudSidecar checks synchronously after the status fetch, then stops at once', async () => {
+  const order = [];
+  const h = harness();
+  const fetchStatus = h.deps.fetchStatus;
+  h.deps.fetchStatus = async () => {
+    order.push('status');
+    return fetchStatus();
+  };
+  const listSync = h.deps.listProcessesSync;
+  h.deps.listProcessesSync = () => {
+    order.push('ps-sync');
+    return listSync();
+  };
+  const kill = h.deps.kill;
+  h.deps.kill = async (pid, signal) => {
+    order.push(signal);
+    return kill(pid, signal);
+  };
+  await runCloudSidecar(h.deps);
+  // scan status, final status, sync check, STOP, check under STOP, TERM, CONT
+  assert.deepEqual(order, ['status', 'status', 'ps-sync', 'SIGSTOP', 'ps-sync', 'SIGTERM', 'SIGCONT']);
+});
+
+test('runCloudSidecar resumes with SIGCONT when the check under SIGSTOP fails', async () => {
+  const h = harness();
+  const kill = h.deps.kill;
+  h.deps.kill = async (pid, signal) => {
+    // A child spawned in the last instant before the freeze.
+    if (signal === 'SIGSTOP') {
+      h.processes.push({ pid: 5000, ppid: 4242, lstart: LSTART_OLD, startedAtMs: 0, command: 'claude' });
+    }
+    return kill(pid, signal);
+  };
+  await runCloudSidecar(h.deps);
+  assert.equal(h.count('kill'), 0);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
   assert.equal(h.count('release'), 1);
 });
 
 test('runCloudSidecar always sends SIGCONT after SIGSTOP, even when the check throws', async () => {
   let lists = 0;
   const h = harness();
-  const list = h.deps.listProcesses;
-  h.deps.listProcesses = async () => {
+  const list = h.deps.listProcessesSync;
+  h.deps.listProcessesSync = () => {
     lists += 1;
-    // 1: scan, 2: pre-check, 3: the check under SIGSTOP.
-    if (lists === 3) throw new Error('ps failed');
+    // 1: before SIGSTOP, 2: the check under SIGSTOP.
+    if (lists === 2) throw new Error('ps failed');
     return list();
   };
   await runCloudSidecar(h.deps);
   assert.equal(h.count('kill'), 0);
   assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+  assert.equal(h.count('release'), 1);
+});
+
+test('runCloudSidecar sends nothing else when SIGSTOP itself fails', async () => {
+  const h = harness();
+  const kill = h.deps.kill;
+  h.deps.kill = async (pid, signal) => {
+    if (signal === 'SIGSTOP') {
+      h.calls.push(['signal', pid, signal]);
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    }
+    return kill(pid, signal);
+  };
+  await runCloudSidecar(h.deps);
+  assert.deepEqual(signals(h), ['SIGSTOP']);
   assert.equal(h.count('release'), 1);
 });
