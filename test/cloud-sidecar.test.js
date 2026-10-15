@@ -254,7 +254,11 @@ function harness(overrides = {}) {
       calls.push(['release', sessionId, claim]);
       return true;
     },
+    // Every signal is recorded as 'signal'; only SIGTERM counts as a kill
+    // (and ends the fake process).
     kill: async (pid, signal) => {
+      calls.push(['signal', pid, signal]);
+      if (signal !== 'SIGTERM') return;
       calls.push(['kill', pid, signal]);
       const index = processes.findIndex(p => p.pid === pid);
       if (index >= 0) processes.splice(index, 1);
@@ -482,7 +486,8 @@ test('runCloudSidecar keeps the claim and does not launch when the supervisor su
   const h = harness({
     deps: {
       kill: async (pid, signal) => {
-        h.calls.push(['kill', pid, signal]);
+        h.calls.push(['signal', pid, signal]);
+        if (signal === 'SIGTERM') h.calls.push(['kill', pid, signal]);
       },
     },
   });
@@ -751,4 +756,123 @@ test('parseProcessEnvOutput keeps only the membership keys and fails closed', ()
   // A needed key seen twice is ambiguous.
   assert.equal(parseProcessEnvOutput(`${command} HOME=/a HOME=/b`, command), null);
   assert.equal(parseProcessEnvOutput(out, ''), null);
+});
+
+// ── env value boundaries ───────────────────────────────────
+
+test('parseProcessEnvOutput rejects a membership value that may contain a space', () => {
+  const command = `${NODE} ${ENTRY} run`;
+  // B's config is "/cfg/teamclaude.json archive/pool-b.json": the cut-off
+  // first half must not pass as pool A's config.
+  assert.equal(parseProcessEnvOutput(
+    `${command} HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/pool-b.json PATH=/usr/bin`,
+    command,
+  ), null);
+  assert.equal(parseProcessEnvOutput(
+    `${command} HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/pool-b.json`,
+    command,
+  ), null);
+  assert.equal(parseProcessEnvOutput(`${command} HOME=/home/my user PATH=/usr/bin`, command), null);
+  // Double space: an empty token cannot be proven to be a boundary.
+  assert.equal(parseProcessEnvOutput(`${command} HOME=/home/user  PATH=/usr/bin`, command), null);
+});
+
+test('parseProcessEnvOutput rejects a membership key that also appears inside another value', () => {
+  const command = `${NODE} ${ENTRY} run`;
+  assert.equal(parseProcessEnvOutput(
+    `${command} NOTE=see TEAMCLAUDE_CONFIG=/cfg/a.json HOME=/home/user TEAMCLAUDE_CONFIG=/cfg/teamclaude.json`,
+    command,
+  ), null);
+  assert.equal(parseProcessEnvOutput(
+    `${command} TEAMCLAUDE_PROVIDER=anthropic HOME=/home/user TEAMCLAUDE_PROVIDER=codex`,
+    command,
+  ), null);
+});
+
+test('parseProcessEnvOutput accepts clean boundaries, including unrelated values with spaces', () => {
+  const command = `${NODE} ${ENTRY} run`;
+  assert.deepEqual(parseProcessEnvOutput(
+    `${command} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json HOME=/home/user XDG_CONFIG_HOME=/xdg PATH=/usr/bin`,
+    command,
+  ), { TEAMCLAUDE_CONFIG: '/cfg/teamclaude.json', HOME: '/home/user', XDG_CONFIG_HOME: '/xdg' });
+  // A space inside an UNRELATED value does not touch the membership keys.
+  assert.deepEqual(parseProcessEnvOutput(
+    `${command} PS1=a b HOME=/home/user TEAMCLAUDE_PROVIDER=anthropic`,
+    command,
+  ), { HOME: '/home/user', TEAMCLAUDE_PROVIDER: 'anthropic' });
+  // HOME= inside XDG_CONFIG_HOME= is not a second HOME at a boundary.
+  assert.deepEqual(parseProcessEnvOutput(
+    `${command} XDG_CONFIG_HOME=/xdg HOME=/home/user`,
+    command,
+  ), { XDG_CONFIG_HOME: '/xdg', HOME: '/home/user' });
+  // The env part must start with a KEY= token.
+  assert.equal(parseProcessEnvOutput(`${command} stray HOME=/home/user`, command), null);
+});
+
+// ── SIGSTOP fence around the final check ───────────────────
+
+function signals(h) {
+  return h.calls.filter(call => call[0] === 'signal').map(call => call[2]);
+}
+
+test('runCloudSidecar fences the final check with SIGSTOP and sends STOP, TERM, CONT in order', async () => {
+  const h = harness();
+  const result = await runCloudSidecar(h.deps);
+  assert.equal(result.handoffs, 1);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGTERM', 'SIGCONT']);
+  const order = h.calls
+    .filter(call => ['claim', 'signal', 'launch'].includes(call[0]))
+    .map(call => (call[0] === 'signal' ? call[2] : call[0]));
+  assert.deepEqual(order, ['claim', 'SIGSTOP', 'SIGTERM', 'SIGCONT', 'launch']);
+});
+
+test('runCloudSidecar resumes the supervisor and does not kill when a child appears during the final status fetch', async () => {
+  let calls = 0;
+  const h = harness();
+  h.deps.fetchStatus = async () => {
+    calls += 1;
+    if (calls === 2) {
+      h.processes.push({ pid: 5000, ppid: 4242, lstart: LSTART_OLD, startedAtMs: 0, command: 'claude' });
+    }
+    return exhaustedStatus();
+  };
+  const result = await runCloudSidecar(h.deps);
+  assert.equal(calls, 2);
+  assert.equal(h.count('kill'), 0);
+  assert.equal(h.count('launch'), 0);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+  assert.deepEqual(h.calls.find(call => call[0] === 'release'), ['release', SESSION_A, { dev: 1, ino: 2 }]);
+  assert.equal(result.handoffs, 0);
+});
+
+test('runCloudSidecar does not kill when the pid was reused during the final status fetch', async () => {
+  let calls = 0;
+  const h = harness();
+  h.deps.fetchStatus = async () => {
+    calls += 1;
+    if (calls === 2) h.processes[0] = supervisor(4242, { lstart: 'Thu Oct 15 11:00:00 2026' });
+    return exhaustedStatus();
+  };
+  await runCloudSidecar(h.deps);
+  assert.equal(h.count('kill'), 0);
+  assert.equal(h.count('launch'), 0);
+  assert.equal(signals(h).includes('SIGTERM'), false);
+  assert.equal(signals(h).at(-1), 'SIGCONT');
+  assert.equal(h.count('release'), 1);
+});
+
+test('runCloudSidecar always sends SIGCONT after SIGSTOP, even when the check throws', async () => {
+  let lists = 0;
+  const h = harness();
+  const list = h.deps.listProcesses;
+  h.deps.listProcesses = async () => {
+    lists += 1;
+    // 1: scan, 2: pre-check, 3: the check under SIGSTOP.
+    if (lists === 3) throw new Error('ps failed');
+    return list();
+  };
+  await runCloudSidecar(h.deps);
+  assert.equal(h.count('kill'), 0);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+  assert.equal(h.count('release'), 1);
 });
