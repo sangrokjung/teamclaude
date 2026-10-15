@@ -476,9 +476,9 @@ export async function runCloudSidecar({
       } catch {
         throw notStopped('process list unavailable');
       }
-      const same = current.find(p => p.pid === proc.pid && p.lstart === proc.lstart);
-      if (!same) throw notStopped('supervisor changed');
-      if (current.some(p => p.ppid === proc.pid)) throw notStopped('supervisor has a child again');
+      const unchanged = list => list.some(p => p.pid === proc.pid && p.lstart === proc.lstart)
+        && !list.some(p => p.ppid === proc.pid);
+      if (!unchanged(current)) throw notStopped('supervisor changed or has a child again');
       // Preparation (snapshot, push, credit lookup) took time: the fleet may
       // have recovered meanwhile.
       let lateStatus = null;
@@ -492,8 +492,31 @@ export async function runCloudSidecar({
         say(`Supervisor pid ${proc.pid}: ${late.message} at the final check; not stopping it.`);
         throw notStopped('fleet no longer exhausted');
       }
-      killSent = true;
-      await kill(proc.pid, 'SIGTERM');
+      // Freeze the supervisor, then check it under the freeze: a stopped
+      // process cannot spawn a child, and the pid+lstart check after the stop
+      // rules out pid reuse. SIGCONT always follows (finally), so a frozen
+      // supervisor is never left behind; after SIGTERM it lets the pending
+      // termination proceed.
+      try {
+        try {
+          await kill(proc.pid, 'SIGSTOP');
+        } catch {
+          throw notStopped('supervisor could not be paused');
+        }
+        let frozen;
+        try {
+          frozen = await listProcesses();
+        } catch {
+          throw notStopped('process list unavailable under pause');
+        }
+        if (!unchanged(frozen)) throw notStopped('supervisor changed or has a child again');
+        killSent = true;
+        await kill(proc.pid, 'SIGTERM');
+      } finally {
+        try {
+          await kill(proc.pid, 'SIGCONT');
+        } catch {}
+      }
       for (let waited = 0; waited <= stopTimeoutMs; waited += STOP_POLL_MS) {
         if (!(await isAlive({ pid: proc.pid, lstart: proc.lstart }))) return;
         await sleep(STOP_POLL_MS);
@@ -558,31 +581,37 @@ export async function listProcessesWithPs() {
 }
 
 const ENV_KEYS = ['TEAMCLAUDE_CONFIG', 'TEAMCLAUDE_PROVIDER', 'HOME', 'XDG_CONFIG_HOME'];
-const ENV_TOKEN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+const ENV_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 // Parses `ps -wwE -o command=` output: the known command line followed by the
-// launch environment. Returns ONLY the keys pool membership needs (the rest —
-// which may hold secrets — is dropped here and never logged), or null when
-// the environment is not visible or a needed key is ambiguous.
+// launch environment as space-separated KEY=VALUE entries. Spaces inside a
+// value are indistinguishable from entry boundaries, so a membership key is
+// trusted only when its boundary is PROVABLE: `KEY=` starts exactly one token
+// and the token after its value is the end or another `NAME=` token. Returns
+// ONLY the membership keys (the rest — which may hold secrets — is dropped
+// here and never logged), or null when the environment is not visible or any
+// membership key is ambiguous.
 export function parseProcessEnvOutput(output, command) {
   const text = String(output ?? '').replace(/\n+$/, '');
   if (typeof command !== 'string' || command.length === 0 || !text.startsWith(command)) return null;
   const rest = text.slice(command.length);
   if (!rest.startsWith(' ')) return null;
+  const parts = rest.slice(1).split(' ');
+  if (parts.length === 0 || !ENV_TOKEN_RE.test(parts[0])) return null;
   const env = {};
-  const seen = new Set();
-  let visible = false;
-  for (const token of rest.split(/\s+/)) {
-    const match = ENV_TOKEN_RE.exec(token);
-    if (!match) continue;
-    visible = true;
-    const [, key, value] = match;
-    if (!ENV_KEYS.includes(key)) continue;
-    if (seen.has(key)) return null;
-    seen.add(key);
-    env[key] = value;
+  for (const key of ENV_KEYS) {
+    const prefix = `${key}=`;
+    const hits = [];
+    parts.forEach((part, index) => {
+      if (part.startsWith(prefix)) hits.push(index);
+    });
+    if (hits.length === 0) continue;
+    if (hits.length > 1) return null;
+    const next = parts[hits[0] + 1];
+    if (next !== undefined && !ENV_TOKEN_RE.test(next)) return null;
+    env[key] = parts[hits[0]].slice(prefix.length);
   }
-  return visible ? env : null;
+  return env;
 }
 
 export async function readProcessEnvWithPs(pid, proc) {

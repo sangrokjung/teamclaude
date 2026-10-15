@@ -43,3 +43,4 @@ PR #66의 클라우드 인계는 `teamclaude run` 감독 프로세스 안에서 
 - 실제 seam 스모크: 임시 설정으로 `teamclaude cloud-sidecar` 실행 시 기능 꺼짐 no-op, `ps` 파싱·상태 파일 0600 기록, codex 모드 거부(exit 1). `processIsAlive`·`readProcessCwd`·`script -q /dev/null` 실행을 자기 프로세스와 `/usr/bin/true`로 확인.
 - 린트: `eslint src test` 0 errors (기존 경고만).
 - 적대 검증 Important 3건 반영(2026-10-16): ① 신뢰 설치 경로 정확 일치 + 대상 환경의 config realpath·provider 일치(읽기 실패 시 제외, snapshot·push 전), ② SIGTERM 직전 상태 재조회로 소진·600초 재평가(회복·조회 실패 시 kill 없이 `CloudHandoffNotStopped` → claim 해제), ③ argv를 absent/valid/ambiguous/forked로 구분해 absent만 저장소 fallback. 회귀 5개 파일 93 pass, 0 fail.
+- 2차 적대 검증 Important 2건 반영(2026-10-16): ① `ps -wwE` 환경에서 판정 키는 토큰 경계에 정확히 한 번, 값 다음 토큰은 끝 또는 `NAME=` 형태일 때만 인정(공백 경로·다른 값 안의 `KEY=` 제외), ② 최종 확인을 SIGSTOP 울타리 안에서 수행(STOP → 목록 재확인 → TERM → CONT, 실패 시 STOP → CONT·claim 해제, CONT는 finally). 회귀 5개 파일 100 pass, 0 fail.
