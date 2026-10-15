@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeRepo } from './helpers/git-fixture.js';
+import { CloudHandoffNotStopped } from '../src/cloud-handoff.js';
 import {
   CLOUD_SIDECAR_LOG_PREFIX,
   fleetExhaustionVerdict,
@@ -19,6 +20,9 @@ const SESSION_B = '1b2c3d4e-2222-4333-9444-555566667777';
 const SESSION_C = '2c3d4e5f-3333-4444-a555-666677778888';
 const NODE = '/opt/node/bin/node';
 const ENTRY = '/opt/teamclaude/src/index.js';
+const BIN_ENTRY = '/opt/teamclaude/src/teamclaude.js';
+const TRUSTED = [ENTRY, BIN_ENTRY];
+const CONFIG_PATH = '/cfg/teamclaude.json';
 const NOW = Date.parse('2026-10-16T03:00:00Z');
 const CUTOFF = '2026-10-15T00:00:00Z';
 const LSTART_OLD = 'Tue Oct 14 09:00:00 2026';
@@ -50,28 +54,42 @@ test('parsePsOutput reads pid, ppid, lstart and the full command line', () => {
   assert.equal(rows[1].command, 'claude --resume x');
 });
 
-test('isTeamclaudeRunSupervisor matches only node running the run subcommand', () => {
-  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`), true);
-  assert.equal(isTeamclaudeRunSupervisor(`${NODE} /opt/teamclaude/src/index.js run --resume ${SESSION_A}`), true);
-  assert.equal(isTeamclaudeRunSupervisor('node /pkg/src/teamclaude.js run -c'), true);
-  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} codex run`), false);
-  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} server`), false);
-  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} runner`), false);
-  assert.equal(isTeamclaudeRunSupervisor(`/bin/zsh -c ${NODE} ${ENTRY} run`), false);
-  assert.equal(isTeamclaudeRunSupervisor('claude --resume x'), false);
-  assert.equal(isTeamclaudeRunSupervisor(''), false);
+test('isTeamclaudeRunSupervisor matches only node running a trusted entry with the run subcommand', () => {
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`, TRUSTED), true);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run --resume ${SESSION_A}`, TRUSTED), true);
+  assert.equal(isTeamclaudeRunSupervisor(`node ${BIN_ENTRY} run -c`, TRUSTED), true);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} codex run`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} server`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} runner`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor(`/bin/zsh -c ${NODE} ${ENTRY} run`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor('claude --resume x', TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor('', TRUSTED), false);
+  // Same suffix, different install: another app is never a target.
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} /srv/other-app/src/index.js run`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} /srv/other-app/teamclaude.js run`, TRUSTED), false);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`, []), false);
+  assert.equal(isTeamclaudeRunSupervisor(`${NODE} ${ENTRY} run`), false);
 });
 
-test('sessionIdFromArgv accepts --session-id, --resume and -r with a UUID only', () => {
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --session-id ${SESSION_A}`), SESSION_A);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --resume ${SESSION_A} continue`), SESSION_A);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run -r ${SESSION_A}`), SESSION_A);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --resume not-a-uuid`), null);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --continue`), null);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run`), null);
-  // Two different IDs, or a forked resume (new ID), are ambiguous.
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --resume ${SESSION_A} --session-id ${SESSION_B}`), null);
-  assert.equal(sessionIdFromArgv(`${NODE} ${ENTRY} run --resume ${SESSION_A} --fork-session`), null);
+test('sessionIdFromArgv classifies argv as absent, valid, ambiguous or forked', () => {
+  const run = rest => sessionIdFromArgv(`${NODE} ${ENTRY} run ${rest}`.trim());
+  assert.deepEqual(run(`--session-id ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
+  assert.deepEqual(run(`--resume ${SESSION_A} continue`), { kind: 'valid', sessionId: SESSION_A });
+  assert.deepEqual(run(`-r ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
+  assert.deepEqual(run(`--resume=${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
+  assert.deepEqual(run(`--resume ${SESSION_A} --session-id ${SESSION_A}`), { kind: 'valid', sessionId: SESSION_A });
+  assert.deepEqual(run(''), { kind: 'absent', sessionId: null });
+  assert.deepEqual(run('--continue'), { kind: 'absent', sessionId: null });
+  assert.deepEqual(run('--model opus'), { kind: 'absent', sessionId: null });
+  // A selector without a UUID, or two different IDs, cannot be trusted.
+  assert.deepEqual(run('--resume not-a-uuid'), { kind: 'ambiguous', sessionId: null });
+  assert.deepEqual(run('--resume'), { kind: 'ambiguous', sessionId: null });
+  assert.deepEqual(run('-r'), { kind: 'ambiguous', sessionId: null });
+  assert.deepEqual(run('--session-id=nope'), { kind: 'ambiguous', sessionId: null });
+  assert.deepEqual(run(`--resume ${SESSION_A} --session-id ${SESSION_B}`), { kind: 'ambiguous', sessionId: null });
+  // A forked resume runs under a NEW session ID.
+  assert.deepEqual(run(`--resume ${SESSION_A} --fork-session`), { kind: 'forked', sessionId: null });
+  assert.deepEqual(run('--fork-session'), { kind: 'forked', sessionId: null });
 });
 
 // ── exhaustion verdict ──────────────────────────────────────
@@ -219,6 +237,10 @@ function harness(overrides = {}) {
     },
     now: () => NOW,
     vendorBin: '/opt/vendor/claude',
+    trustedEntries: TRUSTED,
+    configPath: CONFIG_PATH,
+    resolvePath: async path => path,
+    readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH }),
     listProcesses: async () => processes.map(p => ({ ...p })),
     fetchStatus: async () => exhaustedStatus(),
     readCwd: async () => '/work/project',
@@ -249,7 +271,11 @@ function harness(overrides = {}) {
       if (!claim) return { ok: false, reason: 'claim-refused', stopped: false };
       try {
         await options.beforeLaunch();
-      } catch {
+      } catch (error) {
+        if (error instanceof CloudHandoffNotStopped) {
+          const released = (await options.releaseClaim(claim)) === true;
+          return { ok: false, reason: 'launch-failed', stopped: false, claimHeld: !released };
+        }
         return { ok: false, reason: 'launch-failed', stopped: true, claimHeld: true };
       }
       const result = await options.launchCloud({
@@ -530,4 +556,181 @@ test('runCloudSidecar drives the real cloud handoff and records source legacy-si
   assert.equal(ledger.account, 'cloud-acct');
   assert.equal(JSON.stringify(ledger).includes('tok-cloud'), false);
   assert.equal(h.logs().some(line => line.includes('tok-cloud')), false);
+});
+
+// ── pool membership, late re-check, argv classes ───────────
+
+test('runCloudSidecar never touches a supervisor of another pool or with an unreadable environment', async () => {
+  for (const env of [
+    { HOME: '/home/user', TEAMCLAUDE_CONFIG: '/cfg/other.json' },
+    { HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'codex' },
+    { HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'something-else' },
+    { HOME: '/home/user', TEAMCLAUDE_CONFIG: 'relative/teamclaude.json' },
+    { HOME: '/home/other' },
+    {},
+    null,
+  ]) {
+    const h = harness({ deps: { readProcessEnv: async () => env } });
+    await runCloudSidecar(h.deps);
+    assertNoSideEffects(h);
+    assert.equal(h.count('attempt'), 0, JSON.stringify(env));
+  }
+  const throwing = harness({
+    deps: {
+      readProcessEnv: async () => {
+        throw new Error('ps failed');
+      },
+    },
+  });
+  await runCloudSidecar(throwing.deps);
+  assert.equal(throwing.count('attempt'), 0);
+});
+
+test('runCloudSidecar compares config paths by realpath and accepts the default path', async () => {
+  const viaLink = harness({
+    deps: {
+      readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: '/link/teamclaude.json' }),
+      resolvePath: async path => (path === '/link/teamclaude.json' ? CONFIG_PATH : path),
+    },
+  });
+  await runCloudSidecar(viaLink.deps);
+  assert.equal(viaLink.count('launch'), 1);
+
+  const byDefault = harness({
+    deps: {
+      configPath: '/home/user/.config/teamclaude.json',
+      readProcessEnv: async () => ({ HOME: '/home/user' }),
+    },
+  });
+  await runCloudSidecar(byDefault.deps);
+  assert.equal(byDefault.count('launch'), 1);
+
+  const byXdg = harness({
+    deps: {
+      configPath: '/xdg/teamclaude.json',
+      readProcessEnv: async () => ({ HOME: '/home/user', XDG_CONFIG_HOME: '/xdg' }),
+    },
+  });
+  await runCloudSidecar(byXdg.deps);
+  assert.equal(byXdg.count('launch'), 1);
+
+  // A missing config file (realpath fails) is not proof of membership.
+  const unresolved = harness({
+    deps: {
+      resolvePath: async path => {
+        if (path === CONFIG_PATH) throw new Error('ENOENT');
+        return path;
+      },
+    },
+  });
+  await runCloudSidecar(unresolved.deps);
+  assert.equal(unresolved.count('attempt'), 0);
+});
+
+test('runCloudSidecar trusts the teamclaude.js bin to be the Claude pool whatever its inherited provider', async () => {
+  const h = harness({
+    processes: [{ ...supervisor(4242), command: `${NODE} ${BIN_ENTRY} run --resume ${SESSION_A}` }],
+    deps: {
+      readProcessEnv: async () => ({ HOME: '/home/user', TEAMCLAUDE_CONFIG: CONFIG_PATH, TEAMCLAUDE_PROVIDER: 'codex' }),
+    },
+  });
+  await runCloudSidecar(h.deps);
+  assert.equal(h.count('launch'), 1);
+});
+
+test('runCloudSidecar ignores another app whose entry merely ends in src/index.js', async () => {
+  const other = { ...supervisor(4242), command: `${NODE} /srv/other-app/src/index.js run --resume ${SESSION_A}` };
+  const h = harness({ processes: [other] });
+  await runCloudSidecar(h.deps);
+  assertNoSideEffects(h);
+  assert.equal(h.count('attempt'), 0);
+  assert.deepEqual(h.state.observations, {});
+});
+
+test('runCloudSidecar accepts a supervisor whose entry resolves to the trusted install', async () => {
+  const linked = { ...supervisor(4242), command: `${NODE} /usr/local/bin/teamclaude run --resume ${SESSION_A}` };
+  const h = harness({
+    processes: [linked],
+    deps: { resolvePath: async path => (path === '/usr/local/bin/teamclaude' ? BIN_ENTRY : path) },
+  });
+  await runCloudSidecar(h.deps);
+  assert.equal(h.count('launch'), 1);
+});
+
+test('runCloudSidecar re-checks exhaustion right before SIGTERM and backs off when the fleet recovered', async () => {
+  for (const late of [
+    async () => exhaustedStatus([blockedAccount({ usable: true })]),
+    async () => {
+      throw new Error('proxy down');
+    },
+    async () => exhaustedStatus([blockedAccount({
+      quota: { unified5h: 1, unified5hReset: NOW + 20 * 60_000 },
+    })]),
+  ]) {
+    let calls = 0;
+    let clock = NOW;
+    const h = harness({
+      deps: {
+        now: () => clock,
+        fetchStatus: async () => {
+          calls += 1;
+          if (calls === 1) return exhaustedStatus();
+          return late();
+        },
+      },
+    });
+    const original = h.deps.claimOnce;
+    h.deps.claimOnce = async sessionId => {
+      // Preparation (snapshot, push, credit lookup) takes time.
+      clock = NOW + 15 * 60_000;
+      return original(sessionId);
+    };
+    const result = await runCloudSidecar(h.deps);
+    assert.equal(calls, 2);
+    assert.equal(h.count('kill'), 0);
+    assert.equal(h.count('launch'), 0);
+    assert.deepEqual(h.calls.find(call => call[0] === 'release'), ['release', SESSION_A, { dev: 1, ino: 2 }]);
+    assert.equal(result.handoffs, 0);
+  }
+});
+
+test('runCloudSidecar skips ambiguous argv even when the store names a session', async () => {
+  let storeCalls = 0;
+  const h = harness({
+    processes: [supervisor(4242, { args: `--resume ${SESSION_A} --session-id ${SESSION_B}` })],
+    deps: {
+      resolveSessionFromStore: async () => {
+        storeCalls += 1;
+        return SESSION_A;
+      },
+    },
+  });
+  await runCloudSidecar(h.deps);
+  assertNoSideEffects(h);
+  assert.equal(h.count('attempt'), 0);
+  assert.equal(storeCalls, 0);
+
+  const nonUuid = harness({
+    processes: [supervisor(4242, { args: '--resume some-title' })],
+    deps: { resolveSessionFromStore: async () => SESSION_A },
+  });
+  await runCloudSidecar(nonUuid.deps);
+  assert.equal(nonUuid.count('attempt'), 0);
+});
+
+test('runCloudSidecar skips a forked resume even when the store names a session', async () => {
+  let storeCalls = 0;
+  const h = harness({
+    processes: [supervisor(4242, { args: `--resume ${SESSION_A} --fork-session` })],
+    deps: {
+      resolveSessionFromStore: async () => {
+        storeCalls += 1;
+        return SESSION_B;
+      },
+    },
+  });
+  await runCloudSidecar(h.deps);
+  assertNoSideEffects(h);
+  assert.equal(h.count('attempt'), 0);
+  assert.equal(storeCalls, 0);
 });

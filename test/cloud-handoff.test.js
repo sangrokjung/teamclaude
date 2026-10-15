@@ -23,6 +23,7 @@ import {
   buildCloudPrompt,
   fetchCloudCredits,
   CLOUD_ACCOUNT_LOOKUP_INCOMPLETE,
+  CloudHandoffNotStopped,
   findCloudAccount,
   handoffBranchName,
   inspectHandoffRepo,
@@ -936,4 +937,69 @@ test('attemptCloudHandoff takes the replay claim before stopping or launching, a
     }));
     assert.deepEqual(outcome, { ok: false, reason, stopped: false });
   }
+});
+
+test('attemptCloudHandoff releases the claim when beforeLaunch aborts before stopping anything', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-cloud-not-stopped-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const { repo, env } = await makeRepo(root);
+  const vendorBin = await vendorBinary(root);
+  const claim = { dev: 1, ino: 2 };
+
+  const released = [];
+  const aborted = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    claimBeforeLaunch: async () => claim,
+    releaseClaim: async value => {
+      released.push(value);
+      return true;
+    },
+    beforeLaunch: async () => {
+      throw new CloudHandoffNotStopped('fleet recovered');
+    },
+    launchCloud: async () => {
+      throw new Error('must not launch');
+    },
+  }));
+  assert.deepEqual(aborted, { ok: false, reason: 'launch-failed', stopped: false, claimHeld: false });
+  assert.deepEqual(released, [claim]);
+
+  const unreleased = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    claimBeforeLaunch: async () => claim,
+    releaseClaim: async () => false,
+    beforeLaunch: async () => {
+      throw new CloudHandoffNotStopped('fleet recovered');
+    },
+    launchCloud: async () => {
+      throw new Error('must not launch');
+    },
+  }));
+  assert.deepEqual(unreleased, { ok: false, reason: 'launch-failed', stopped: false, claimHeld: true });
+
+  // Any other beforeLaunch failure stays ambiguous: the claim is kept and
+  // release is not even attempted.
+  const releaseCalls = [];
+  const ambiguous = await attemptCloudHandoff(handoffInputs(root, {
+    cwd: repo,
+    gitEnv: env,
+    vendorBin,
+    claimBeforeLaunch: async () => claim,
+    releaseClaim: async value => {
+      releaseCalls.push(value);
+      return true;
+    },
+    beforeLaunch: async () => {
+      throw new Error('stop failed midway');
+    },
+    launchCloud: async () => {
+      throw new Error('must not launch');
+    },
+  }));
+  assert.deepEqual(ambiguous, { ok: false, reason: 'launch-failed', stopped: true, claimHeld: true });
+  assert.deepEqual(releaseCalls, []);
 });
