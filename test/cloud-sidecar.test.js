@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeRepo } from './helpers/git-fixture.js';
 import { CloudHandoffNotStopped } from '../src/cloud-handoff.js';
+import { unresolvedExhaustionErrorState } from '../src/cmux-session-guards.js';
 import {
   CLOUD_SIDECAR_LOG_PREFIX,
   fleetExhaustionVerdict,
   isTeamclaudeRunSupervisor,
   parsePsOutput,
   provesDefaultPool,
-  resolveSupervisorSessionId,
+  resolveSupervisorLease,
   runCloudSidecar,
 } from '../src/cloud-sidecar.js';
 
@@ -28,6 +29,12 @@ const CUTOFF = '2026-10-15T00:00:00Z';
 const LSTART_OLD = 'Tue Oct 14 09:00:00 2026';
 const LSTART_NEW = 'Fri Oct 16 09:00:00 2026';
 const HOUR = 3_600_000;
+const SUPERVISOR_LEASE = Object.freeze({
+  sessionId: '0a1b2c3d-1111-4222-8333-444455556666',
+  pid: 4242,
+  processStartSeconds: new Date('Tue Oct 14 09:00:00 2026').getTime() / 1000,
+  nonce: 'lease-nonce-1',
+});
 
 // ── parsing ─────────────────────────────────────────────────
 
@@ -145,7 +152,7 @@ test('fleetExhaustionVerdict is not exhausted or is uncertain otherwise', () => 
 
 // ── session lookup ─────────────────────────────────────────
 
-test('resolveSupervisorSessionId names the session only from the lease the supervisor itself holds', async t => {
+test('resolveSupervisorLease names the session only from the lease the supervisor itself holds', async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-sidecar-lease-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const storePath = join(root, 'claude-hook-sessions.json');
@@ -159,6 +166,7 @@ test('resolveSupervisorSessionId names the session only from the lease the super
   const lease = (pid, nonce, start = startedAtMs / 1000) => ({
     version: 1, pid, processStartSeconds: start, nonce, createdAt: NOW,
   });
+  const resolve = (pid, at = startedAtMs) => resolveSupervisorLease({ storePath, pid, startedAtMs: at });
   // The legacy fleet_exhausted path holds claimSessionLease() — owner =
   // the supervisor's own pid + process start — for the whole wait.
   await writePrivate(join(leaseDir, SESSION_A), lease(4242, 'n1'));
@@ -166,27 +174,29 @@ test('resolveSupervisorSessionId names the session only from the lease the super
   await writePrivate(join(leaseDir, SESSION_B), lease(5151, 'n2'));
   await writePrivate(join(leaseDir, 'not-a-session'), lease(4242, 'n3'));
 
-  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 4242, startedAtMs }), SESSION_A);
-  assert.equal(await resolveSupervisorSessionId({
-    storePath, pid: 4242, startedAtMs: startedAtMs + 1500,
-  }), SESSION_A, 'within the 2s start tolerance');
+  assert.deepEqual(await resolve(4242), {
+    sessionId: SESSION_A, pid: 4242, processStartSeconds: startedAtMs / 1000, nonce: 'n1',
+  });
+  assert.equal((await resolve(4242, startedAtMs + 1500))?.sessionId, SESSION_A, 'within the 2s start tolerance');
   // Same pid, different process start: a recycled pid is not the owner.
-  assert.equal(await resolveSupervisorSessionId({
-    storePath, pid: 4242, startedAtMs: startedAtMs + 60_000,
-  }), null);
+  assert.equal(await resolve(4242, startedAtMs + 60_000), null);
   // A supervisor whose session is leased by the rescuer has no lease of its own.
-  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 9999, startedAtMs }), null);
+  assert.equal(await resolve(9999), null);
 
   // The hook session store is never consulted: a matching record without a
   // lease does not make a target.
   await writePrivate(storePath, {
     sessions: { [SESSION_C]: { sessionId: SESSION_C, pid: 7070, pidStartSeconds: startedAtMs / 1000 } },
   });
-  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 7070, startedAtMs }), null);
+  assert.equal(await resolve(7070), null);
+
+  // A lease without a nonce cannot be re-verified later.
+  await writePrivate(join(leaseDir, SESSION_C), { version: 1, pid: 6060, processStartSeconds: startedAtMs / 1000 });
+  assert.equal(await resolve(6060), null);
 
   // Two leases held by one supervisor are ambiguous.
   await writePrivate(join(leaseDir, SESSION_C), lease(4242, 'n4'));
-  assert.equal(await resolveSupervisorSessionId({ storePath, pid: 4242, startedAtMs }), null);
+  assert.equal(await resolve(4242), null);
 });
 
 // ── runCloudSidecar ─────────────────────────────────────────
@@ -220,13 +230,16 @@ function harness(overrides = {}) {
     vendorBin: '/opt/vendor/claude',
     trustedEntries: TRUSTED,
     selfEnv: { HOME: HOME_DIR, PATH: '/usr/bin' },
+    // The fence re-reads the supervisor lease and the session transcript.
+    readLease: async () => ({ ...SUPERVISOR_LEASE }),
+    transcriptBlocked: async () => true,
     resolvePath: async path => path,
     readProcessEnvText: async (pid, proc) => `${proc.command} PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic`,
     listProcesses: async () => processes.map(p => ({ ...p })),
     listProcessesSync: () => processes.map(p => ({ ...p })),
     fetchStatus: async () => exhaustedStatus(),
     readCwd: async () => '/work/project',
-    resolveSessionFromLease: async () => SESSION_A,
+    resolveSupervisorLease: async () => ({ ...SUPERVISOR_LEASE }),
     claimOnce: async sessionId => {
       calls.push(['claim', sessionId]);
       return { dev: 1, ino: 2 };
@@ -394,7 +407,7 @@ test('runCloudSidecar drops observations for supervisors that disappeared', asyn
 });
 
 test('runCloudSidecar skips a supervisor that holds no unique recovery lease (e.g. not under cmux)', async () => {
-  const h = harness({ deps: { resolveSessionFromLease: async () => null } });
+  const h = harness({ deps: { resolveSupervisorLease: async () => null } });
   await runCloudSidecar(h.deps);
   assertNoSideEffects(h);
   assert.equal(h.count('attempt'), 0);
@@ -406,9 +419,9 @@ test('runCloudSidecar takes the session from the supervisor lease and never from
     // A prompt that mentions --resume, and a different resume ID, change nothing.
     processes: [supervisor(4242, { args: `--resume ${SESSION_B} fix --resume ${SESSION_C} please` })],
     deps: {
-      resolveSessionFromLease: async ({ pid, startedAtMs }) => {
+      resolveSupervisorLease: async ({ pid, startedAtMs }) => {
         seen.push([pid, startedAtMs]);
-        return SESSION_A;
+        return { ...SUPERVISOR_LEASE };
       },
     },
   });
@@ -554,8 +567,7 @@ test('runCloudSidecar never touches a supervisor that may belong to another pool
     `PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/other.json`,
     `PATH=/usr/bin HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=codex`,
     `PATH=/usr/bin HOME=${HOME_DIR} XDG_CONFIG_HOME=/xdg`,
-    'PATH=/usr/bin HOME=/home/other',
-    'PATH=/usr/bin',
+    // Environment not visible (another uid): only argv comes back.
     '',
   ]) {
     const h = harness({
@@ -580,17 +592,17 @@ test('runCloudSidecar is a no-op unless the sidecar itself runs the default Clau
     { HOME: HOME_DIR, TEAMCLAUDE_CONFIG: '' },
     { HOME: HOME_DIR, XDG_CONFIG_HOME: '/xdg' },
     { HOME: HOME_DIR, TEAMCLAUDE_PROVIDER: 'codex' },
-    { HOME: 'relative' },
-    {},
   ]) {
     const h = harness({ deps: { selfEnv } });
     await runCloudSidecar(h.deps);
     assertNoSideEffects(h);
     assert.equal(h.count('attempt'), 0, JSON.stringify(Object.keys(selfEnv)));
   }
-  const anthropic = harness({ deps: { selfEnv: { HOME: HOME_DIR, TEAMCLAUDE_PROVIDER: 'anthropic' } } });
-  await runCloudSidecar(anthropic.deps);
-  assert.equal(anthropic.count('launch'), 1);
+  for (const selfEnv of [{ HOME: HOME_DIR, TEAMCLAUDE_PROVIDER: 'anthropic' }, {}]) {
+    const ok = harness({ deps: { selfEnv } });
+    await runCloudSidecar(ok.deps);
+    assert.equal(ok.count('launch'), 1);
+  }
 });
 
 test('runCloudSidecar ignores another app whose entry merely ends in src/index.js', async () => {
@@ -653,7 +665,7 @@ test('runCloudSidecar re-checks exhaustion right before SIGTERM and backs off wh
 
 test('provesDefaultPool accepts only a provable default-config, same-HOME Claude process', () => {
   const cmd = `${NODE} ${ENTRY} run`;
-  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  const ok = text => provesDefaultPool(text, cmd).ok;
   assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR} SHELL=/bin/zsh`), true);
   assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}`), true);
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic PATH=/usr/bin`), true);
@@ -664,7 +676,7 @@ test('provesDefaultPool accepts only a provable default-config, same-HOME Claude
 
 test('provesDefaultPool rejects any config override key anywhere in the text', () => {
   const cmd = `${NODE} ${ENTRY} run`;
-  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  const ok = text => provesDefaultPool(text, cmd).ok;
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json`), false);
   // A NAME=-shaped tail on a space-containing path cannot hide the key.
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_CONFIG=/cfg/teamclaude.json archive/POOL=b.json`), false);
@@ -676,7 +688,7 @@ test('provesDefaultPool rejects any config override key anywhere in the text', (
 
 test('provesDefaultPool admits TEAMCLAUDE_PROVIDER only as one exact anthropic entry', () => {
   const cmd = `${NODE} ${ENTRY} run`;
-  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
+  const ok = text => provesDefaultPool(text, cmd).ok;
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=codex`), false);
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropicx`), false);
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=`), false);
@@ -684,21 +696,22 @@ test('provesDefaultPool admits TEAMCLAUDE_PROVIDER only as one exact anthropic e
   assert.equal(ok(`${cmd} HOME=${HOME_DIR} TEAMCLAUDE_PROVIDER=anthropic TEAMCLAUDE_PROVIDER=codex`), false);
 });
 
-test('provesDefaultPool requires exactly one HOME= equal to the sidecar HOME', () => {
+test('provesDefaultPool does not judge HOME but requires a visible environment', () => {
   const cmd = `${NODE} ${ENTRY} run`;
-  const ok = text => provesDefaultPool(text, HOME_DIR).ok;
-  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=/home/other`), false);
-  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}2`), false);
-  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=${HOME_DIR}/sub`), false);
-  assert.equal(ok(`${cmd} HOME=${HOME_DIR} OLD=HOME=${HOME_DIR}`), false);
-  assert.equal(ok(`${cmd} JAVA_HOME=/opt/java HOME=${HOME_DIR}`), false);
-  assert.equal(ok(`${cmd} HOME=${HOME_DIR} HOME=${HOME_DIR}`), false);
-  assert.equal(ok(`${cmd} PATH=/usr/bin`), false);
-  assert.equal(ok(`${cmd}`), false);
+  const ok = text => provesDefaultPool(text, cmd).ok;
+  // HOME is not judged from text: the supervisor lease being in the
+  // sidecar's own store (under its own homedir) is the evidence instead.
+  assert.equal(ok(`${cmd} PATH=/usr/bin HOME=/home/other`), true);
+  assert.equal(ok(`${cmd} JAVA_HOME=/opt/java HOME=${HOME_DIR} HOME=x`), true);
+  assert.equal(ok(`${cmd} PATH=/usr/bin`), true);
+  // No visible environment, or text that is not this command line.
+  assert.equal(ok(cmd), false);
+  assert.equal(ok(`${cmd} `), false);
+  assert.equal(ok(`${cmd} stray`), false);
+  assert.equal(ok(`other command PATH=/usr/bin`), false);
   assert.equal(ok(''), false);
   assert.equal(ok(null), false);
-  assert.equal(provesDefaultPool(`${cmd} HOME=${HOME_DIR}`, '').ok, false);
-  assert.equal(provesDefaultPool(`${cmd} HOME=${HOME_DIR}`, 'relative').ok, false);
+  assert.equal(provesDefaultPool(`${cmd} PATH=/usr/bin`, '').ok, false);
 });
 
 // ── SIGSTOP fence around the final check ───────────────────
@@ -818,4 +831,160 @@ test('runCloudSidecar sends nothing else when SIGSTOP itself fails', async () =>
   await runCloudSidecar(h.deps);
   assert.deepEqual(signals(h), ['SIGSTOP']);
   assert.equal(h.count('release'), 1);
+});
+
+// ── fence: lease ownership and transcript state ─────────────
+
+test('runCloudSidecar aborts under SIGSTOP when the lease changed hands during preparation', async () => {
+  for (const lease of [
+    { ...SUPERVISOR_LEASE, pid: 5151, nonce: 'rescuer-nonce' },
+    { ...SUPERVISOR_LEASE, nonce: 'lease-nonce-2' },
+    { ...SUPERVISOR_LEASE, processStartSeconds: SUPERVISOR_LEASE.processStartSeconds + 60 },
+    null,
+  ]) {
+    const h = harness({ deps: { readLease: async () => lease } });
+    const result = await runCloudSidecar(h.deps);
+    assert.equal(h.count('kill'), 0, JSON.stringify(lease));
+    assert.equal(h.count('launch'), 0);
+    assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+    assert.deepEqual(h.calls.find(call => call[0] === 'release'), ['release', SESSION_A, { dev: 1, ino: 2 }]);
+    assert.equal(result.handoffs, 0);
+  }
+  const throwing = harness({
+    deps: {
+      readLease: async () => {
+        throw new Error('EACCES');
+      },
+    },
+  });
+  await runCloudSidecar(throwing.deps);
+  assert.equal(throwing.count('kill'), 0);
+  assert.deepEqual(signals(throwing), ['SIGSTOP', 'SIGCONT']);
+});
+
+test('runCloudSidecar re-reads the lease of the session it claimed', async () => {
+  const seen = [];
+  const h = harness({
+    deps: {
+      readLease: async sessionId => {
+        seen.push(sessionId);
+        return { ...SUPERVISOR_LEASE };
+      },
+    },
+  });
+  await runCloudSidecar(h.deps);
+  assert.deepEqual(seen, [SESSION_A]);
+  assert.equal(h.count('launch'), 1);
+});
+
+test('runCloudSidecar never stops a session whose transcript moved on after the error', async () => {
+  for (const verdict of [false, null, undefined]) {
+    const h = harness({ deps: { transcriptBlocked: async () => verdict } });
+    await runCloudSidecar(h.deps);
+    assert.equal(h.count('kill'), 0);
+    assert.equal(h.count('launch'), 0);
+    assert.equal(h.count('attempt'), 0, 'checked before any snapshot or push');
+  }
+  // The transcript moves on while the handoff is being prepared.
+  let checks = 0;
+  const h = harness({
+    deps: {
+      transcriptBlocked: async () => {
+        checks += 1;
+        return checks === 1;
+      },
+    },
+  });
+  await runCloudSidecar(h.deps);
+  assert.equal(checks, 2);
+  assert.equal(h.count('kill'), 0);
+  assert.equal(h.count('launch'), 0);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGCONT']);
+  assert.equal(h.count('release'), 1);
+
+  const throwing = harness();
+  let calls = 0;
+  throwing.deps.transcriptBlocked = async () => {
+    calls += 1;
+    if (calls === 2) throw new Error('unreadable');
+    return true;
+  };
+  await runCloudSidecar(throwing.deps);
+  assert.equal(throwing.count('kill'), 0);
+  assert.deepEqual(signals(throwing), ['SIGSTOP', 'SIGCONT']);
+});
+
+test('runCloudSidecar proceeds while the transcript still ends in the unresolved exhaustion error', async () => {
+  const seen = [];
+  const h = harness({
+    deps: {
+      transcriptBlocked: async sessionId => {
+        seen.push(sessionId);
+        return true;
+      },
+    },
+  });
+  const result = await runCloudSidecar(h.deps);
+  assert.deepEqual(seen, [SESSION_A, SESSION_A]);
+  assert.equal(result.handoffs, 1);
+  assert.deepEqual(signals(h), ['SIGSTOP', 'SIGTERM', 'SIGCONT']);
+});
+
+test('unresolvedExhaustionErrorState is set only while an exhaustion error is the last word', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-sidecar-transcript-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dir = join(root, 'project');
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `${SESSION_A}.jsonl`);
+  const write = async records => {
+    await writeFile(path, `${records.map(r => JSON.stringify(r)).join('\n')}\n`, { mode: 0o600 });
+    await chmod(path, 0o600);
+  };
+  const user = text => ({ type: 'user', message: { role: 'user', content: text } });
+  const assistant = text => ({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } });
+  const fleetExhausted = {
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'rate_limit_error',
+    apiErrorStatus: 429,
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: 'API Error: Server is temporarily limiting requests (not your usage limit) · All 4 accounts exhausted. Retry in 7200s.',
+      }],
+    },
+  };
+  const usageLimit = {
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'rate_limit',
+    apiErrorStatus: 429,
+    message: {
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: "You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.",
+      }],
+    },
+  };
+  const loginExpired = {
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'authentication_failed',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Login expired · Please run /login' }] },
+  };
+  const blocked = async () => Boolean(await unresolvedExhaustionErrorState(path, root, SESSION_A));
+
+  await write([user('일 해 줘'), assistant('네'), fleetExhausted]);
+  assert.equal(await blocked(), true, 'unresolved fleet exhaustion');
+  await write([user('일 해 줘'), assistant('네'), usageLimit]);
+  assert.equal(await blocked(), true, 'unresolved usage limit');
+  await write([user('일 해 줘'), fleetExhausted, user('계속'), assistant('진행합니다')]);
+  assert.equal(await blocked(), false, 'conversation continued after the error');
+  await write([user('일 해 줘'), assistant('완료')]);
+  assert.equal(await blocked(), false, 'no error at all');
+  await write([user('일 해 줘'), loginExpired]);
+  assert.equal(await blocked(), false, 'a non-exhaustion error does not count');
+  assert.equal(Boolean(await unresolvedExhaustionErrorState(join(dir, 'missing.jsonl'), root, SESSION_A)), false);
 });
