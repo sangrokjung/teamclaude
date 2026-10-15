@@ -40,6 +40,7 @@ import { formatBytes } from './system-metrics.js';
 import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { runClaudeWithRecovery } from './claude-recovery.js';
+import { fetchCloudCredits } from './cloud-handoff.js';
 import { reauthenticateAccount } from './reauth.js';
 import { applyOAuthUpsert, carryOverAccountSettings } from './account-upsert.js';
 import {
@@ -61,6 +62,7 @@ import {
 } from './cmux-session-rescue.js';
 import {
   claimSessionOnce,
+  releaseSessionClaim,
   claimSessionLease,
   releaseSessionLease,
   resolveCmuxSessionId,
@@ -2788,7 +2790,9 @@ async function runCommand(clientArgsOverride = null) {
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
-  if (config.autoResumeClaude === true || config.codexFallbackOnExhaustion === true) {
+  if (config.autoResumeClaude === true
+      || config.codexFallbackOnExhaustion === true
+      || config.cloudFallbackOnExhaustion === true) {
     const cmuxRescuePaths = defaultCmuxRescuePaths();
     const cmuxRecoveryEnabled = typeof process.env.CMUX_SURFACE_ID === 'string'
       && process.env.CMUX_SURFACE_ID.length > 0;
@@ -2827,6 +2831,9 @@ async function runCommand(clientArgsOverride = null) {
       claimRecoveryOnce: cmuxRecoveryEnabled
         ? sessionId => claimSessionOnce(cmuxRescuePaths.storePath, sessionId)
         : null,
+      releaseRecoveryOnce: cmuxRecoveryEnabled
+        ? (sessionId, identity) => releaseSessionClaim(cmuxRescuePaths.storePath, sessionId, identity)
+        : null,
       claimRecoveryLease: cmuxRecoveryEnabled
         ? sessionId => claimSessionLease(cmuxRescuePaths.storePath, sessionId)
         : null,
@@ -2859,6 +2866,20 @@ async function runCommand(clientArgsOverride = null) {
           [process.argv[1], 'codex', 'run', '--', handoff.prompt],
           { stdio: 'inherit', env: codexEnv },
         );
+      },
+      // Cloud handoff runs the native vendor binary directly (never the
+      // `claude` wrapper) on an account that still has cloud credits.
+      launchCloud: ({ vendorBin, args: cloudArgs, env: cloudEnv, cwd: cloudCwd }) => spawnSync(
+        vendorBin,
+        cloudArgs,
+        { stdio: 'inherit', env: cloudEnv, cwd: cloudCwd },
+      ),
+      cloudHandoff: {
+        vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN || null,
+        // Re-read disk: the running server persists refreshed tokens there.
+        loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+        creditLookup: token => fetchCloudCredits(token),
+        ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
       },
     });
     if (result?.error) {

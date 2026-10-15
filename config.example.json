@@ -45,6 +45,7 @@
     "maxConcurrent": 2
   },
   "codexFallbackOnExhaustion": false,
+  "cloudFallbackOnExhaustion": false,
   "codexAuthFailureThreshold": 3,
   "cmuxSessionRescue": false,
   "cmuxSessionRescueIntervalMs": 1000,

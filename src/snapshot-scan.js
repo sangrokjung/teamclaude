@@ -1,0 +1,171 @@
+// Content scan for the cloud-handoff snapshot push.
+//
+// Fail closed: the scan reads the exact blob bytes `git push` would send —
+// every blob reachable from the snapshot commit that the remote does not
+// verifiably have — and aborts on any secret hit, any blob it cannot fully
+// read as UTF-8 text, or an oversized payload. Detection is pattern-based:
+// a secret in an unknown plain-text format can still pass. "Verifiably has" means a tip advertised by
+// `git ls-remote origin` right now, never a local (movable) remote-tracking
+// ref. Without such a tip, everything reachable is scanned.
+
+import { containsSecret } from './secrets.js';
+
+export const SNAPSHOT_SCAN_MAX_BYTES = 256 * 1024 * 1024;
+const OBJECT_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function git(runGit, root, gitEnv, args, options = {}) {
+  return runGit(args, { cwd: root, env: gitEnv, ...options });
+}
+
+async function upstreamMergeRef(root, runGit, gitEnv) {
+  const head = await git(runGit, root, gitEnv, ['symbolic-ref', '--quiet', 'HEAD']);
+  const ref = head.status === 0 ? head.stdout.trim() : '';
+  if (!ref.startsWith('refs/heads/')) return null;
+  const branch = ref.slice('refs/heads/'.length);
+  const remote = await git(runGit, root, gitEnv, ['config', '--get', `branch.${branch}.remote`]);
+  const merge = await git(runGit, root, gitEnv, ['config', '--get', `branch.${branch}.merge`]);
+  if (remote.status !== 0 || remote.stdout.trim() !== 'origin' || merge.status !== 0) return null;
+  const mergeRef = merge.stdout.trim();
+  return mergeRef.startsWith('refs/heads/') ? mergeRef : null;
+}
+
+// Tips of the upstream branch and origin's HEAD as the remote advertises
+// them now, kept only when the commit exists locally (rev-list needs it).
+export async function verifiedRemoteBases({ root, runGit, gitEnv }) {
+  const upstream = await upstreamMergeRef(root, runGit, gitEnv);
+  const wanted = new Set(['HEAD', ...(upstream ? [upstream] : [])]);
+  const listed = await git(runGit, root, gitEnv, ['ls-remote', 'origin', ...wanted], { timeoutMs: 60_000 });
+  if (listed.status !== 0) return [];
+  const bases = [];
+  for (const line of listed.stdout.split('\n')) {
+    const [objectId, refName] = line.split('\t');
+    if (!OBJECT_ID_RE.test(objectId || '') || !wanted.has(refName) || bases.includes(objectId)) continue;
+    const exists = await git(runGit, root, gitEnv, ['cat-file', '-e', `${objectId}^{commit}`]);
+    if (exists.status === 0) bases.push(objectId);
+  }
+  return bases;
+}
+
+// Parses `git cat-file --batch` output for exactly the requested blobs.
+function parseBatch(buffer, objectIds) {
+  const blobs = [];
+  let offset = 0;
+  for (const objectId of objectIds) {
+    const newline = buffer.indexOf(0x0a, offset);
+    if (newline < 0) return null;
+    const [id, type, sizeText] = buffer.subarray(offset, newline).toString('latin1').split(' ');
+    const size = Number(sizeText);
+    if (id !== objectId || type !== 'blob' || !Number.isSafeInteger(size)) return null;
+    const end = newline + 1 + size;
+    if (end > buffer.length) return null;
+    blobs.push(buffer.subarray(newline + 1, end));
+    offset = end + 1;
+  }
+  return blobs;
+}
+
+// Only text the scanner fully read and classified may be pushed: at most
+// 1 MiB, no NUL byte, valid UTF-8. Anything else stays local (working-tree
+// files) or aborts the push (blobs already in unpushed commits).
+export const SNAPSHOT_TEXT_MAX_BYTES = 1024 * 1024;
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
+
+export function decodeScannableText(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length > SNAPSHOT_TEXT_MAX_BYTES || buffer.includes(0)) {
+    return null;
+  }
+  try {
+    return UTF8.decode(buffer);
+  } catch {
+    return null;
+  }
+}
+
+// Invisible characters that would split a token without changing what a
+// reader of the pushed file recovers.
+const INVISIBLE_RE = /[\u200b-\u200d\u2060\ufeff]/g;
+const CONTROL_RE = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+
+function codePoint(hex) {
+  const value = parseInt(hex, 16);
+  return value <= 0x10ffff ? String.fromCodePoint(value) : '';
+}
+
+// Undoes the cheap encodings that would let a secret pass the patterns:
+// backslash-newline continuations, \xHH, \uHHHH, \u{H…}, and %HH.
+function decodeEscapes(text) {
+  return text
+    .replace(/\\\n/g, '')
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => codePoint(hex))
+    .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (_, hex) => codePoint(hex))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => codePoint(hex))
+    .replace(/%([0-9a-fA-F]{2})/g, (_, hex) => codePoint(hex));
+}
+
+// The views the patterns run over: the text as pushed (line endings and
+// invisible characters normalized) and, when different, its decoded copy.
+export function scanViews(text) {
+  const plain = text.replace(INVISIBLE_RE, '').replace(/\r\n?/g, '\n').replace(CONTROL_RE, '\n');
+  const views = [plain];
+  let decoded = plain;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = decodeEscapes(decoded).replace(INVISIBLE_RE, '');
+    if (next === decoded) break;
+    decoded = next;
+    views.push(decoded);
+  }
+  return views;
+}
+
+export function textHasSecret(text) {
+  return scanViews(text).some(containsSecret);
+}
+
+export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env }) {
+  const failed = { ok: false, reason: 'snapshot-scan-failed' };
+  const unscannable = { ok: false, reason: 'snapshot-unscannable' };
+  const bases = await verifiedRemoteBases({ root, runGit, gitEnv });
+  const revList = ['rev-list', '--objects', '--no-object-names', commit];
+  if (bases.length > 0) revList.push('--not', ...bases);
+  const listed = await git(runGit, root, gitEnv, revList, { timeoutMs: 120_000 });
+  if (listed.status !== 0) return failed;
+  const objectIds = listed.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  if (objectIds.some(id => !OBJECT_ID_RE.test(id))) return failed;
+  if (objectIds.length === 0) return { ok: true };
+
+  const checked = await git(
+    runGit,
+    root,
+    gitEnv,
+    ['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'],
+    { input: `${objectIds.join('\n')}\n`, timeoutMs: 120_000 },
+  );
+  if (checked.status !== 0) return failed;
+  const blobIds = [];
+  let totalBytes = 0;
+  for (const line of checked.stdout.split('\n').filter(Boolean)) {
+    const [id, type, sizeText] = line.split(' ');
+    if (!OBJECT_ID_RE.test(id || '')) return failed;
+    if (type !== 'blob') continue;
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size)) return failed;
+    if (size > SNAPSHOT_TEXT_MAX_BYTES) return unscannable;
+    blobIds.push(id);
+    totalBytes += size;
+  }
+  if (blobIds.length === 0) return { ok: true };
+  if (totalBytes > SNAPSHOT_SCAN_MAX_BYTES) return failed;
+
+  const batch = await git(runGit, root, gitEnv, ['cat-file', '--batch'], {
+    input: `${blobIds.join('\n')}\n`,
+    timeoutMs: 300_000,
+    maxOutputBytes: totalBytes + blobIds.length * 160,
+  });
+  const blobs = batch.status === 0 && Buffer.isBuffer(batch.stdoutBuffer)
+    ? parseBatch(batch.stdoutBuffer, blobIds)
+    : null;
+  if (!blobs) return failed;
+  const texts = blobs.map(decodeScannableText);
+  if (texts.some(text => text === null)) return unscannable;
+  return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
+}
