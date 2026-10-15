@@ -474,6 +474,9 @@ export async function attemptCloudHandoff({
   loadAccounts,
   creditLookup = fetchCloudCredits,
   ledgerPath = null,
+  // Optional extra fields for the ledger entry (e.g. { source }). The core
+  // fields below always win, so callers cannot rewrite them.
+  ledgerExtra = null,
   now = new Date(),
   random = Math.random,
   claimBeforeLaunch = async () => true,
@@ -577,6 +580,7 @@ export async function attemptCloudHandoff({
   if (ledgerPath) {
     try {
       await appendCloudLedger(ledgerPath, {
+        ...(ledgerExtra && typeof ledgerExtra === 'object' ? ledgerExtra : {}),
         ts: now.toISOString(),
         sessionId,
         account: account.name,
