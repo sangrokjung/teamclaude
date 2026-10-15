@@ -45,9 +45,10 @@ import {
   killProcess,
   launchCloudWithScript,
   listProcessesWithPs,
+  listProcessesWithPsSync,
   processIsAlive,
   readProcessCwd,
-  readProcessEnvWithPs,
+  readProcessEnvTextWithPs,
   resolveSupervisorSessionId,
   runCloudSidecar,
 } from './cloud-sidecar.js';
@@ -3458,9 +3459,12 @@ async function cloudSidecarCommand() {
     config,
     vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudSidecarClaudeBin || null,
     trustedEntries: [selfEntry, join(dirname(selfEntry), 'teamclaude.js')],
-    configPath: getConfigPath(),
-    readProcessEnv: readProcessEnvWithPs,
+    // Default Claude pool only: the sidecar's own env must carry no config
+    // override, and supervisors must provably use the same default config.
+    selfEnv: process.env,
+    readProcessEnvText: readProcessEnvTextWithPs,
     listProcesses: listProcessesWithPs,
+    listProcessesSync: listProcessesWithPsSync,
     fetchStatus: async () => {
       const response = await fetch(`http://127.0.0.1:${config.proxy?.port}/teamclaude/status`, {
         headers: {
@@ -3473,7 +3477,7 @@ async function cloudSidecarCommand() {
       return response.json();
     },
     readCwd: readProcessCwd,
-    resolveSessionFromStore: ({ pid, startedAtMs }) =>
+    resolveSessionFromLease: ({ pid, startedAtMs }) =>
       resolveSupervisorSessionId({ storePath, pid, startedAtMs }),
     claimOnce: sessionId => claimSessionOnce(storePath, sessionId),
     releaseClaim: (sessionId, claim) => releaseSessionClaim(storePath, sessionId, claim),

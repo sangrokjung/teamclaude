@@ -8,7 +8,7 @@
 // the supervisor → `<vendor> --cloud <prompt>`. Pure decision logic with every
 // side effect injected; the real process/fs/proxy seams live at the bottom.
 
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { readdir, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -22,7 +22,6 @@ export const CLOUD_SIDECAR_DEFAULT_MAX_PER_RUN = 4;
 export const CLOUD_SIDECAR_STOP_TIMEOUT_MS = 10_000;
 const STOP_POLL_MS = 250;
 const LEASE_START_TOLERANCE_SECONDS = 2;
-const STORE_START_TOLERANCE_SECONDS = 5;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PS_LINE_RE = /^\s*(\d+)\s+(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*\S)\s*$/;
 const execFileAsync = promisify(execFile);
@@ -68,56 +67,52 @@ export function isTeamclaudeRunSupervisor(command, trustedEntries = []) {
   return entry !== null && Array.isArray(trustedEntries) && trustedEntries.includes(entry);
 }
 
-const SESSION_FLAGS = ['--session-id', '--resume', '-r'];
-
-// Classifies the supervisor's own argv:
-//   valid     — exactly one session UUID named by --session-id/--resume/-r
-//   absent    — no session selector at all (a store lookup may identify it)
-//   ambiguous — a selector without a UUID, or two different UUIDs
-//   forked    — --fork-session: the live session has a NEW, unknown ID
-// Only `absent` may fall back to the cmux stores.
-export function sessionIdFromArgv(command) {
-  const argv = tokens(command);
-  const runIndex = argv.indexOf('run');
-  const args = runIndex >= 0 ? argv.slice(runIndex + 1) : [];
-  if (args.includes('--fork-session')) return { kind: 'forked', sessionId: null };
-  const found = new Set();
-  let selectorWithoutId = false;
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    let value;
-    if (SESSION_FLAGS.includes(arg)) {
-      value = args[i + 1];
-      i += 1;
-    } else {
-      const flag = SESSION_FLAGS.find(name => name.startsWith('--') && arg.startsWith(`${name}=`));
-      if (!flag) continue;
-      value = arg.slice(flag.length + 1);
-    }
-    if (typeof value === 'string' && UUID_RE.test(value)) found.add(value.toLowerCase());
-    else selectorWithoutId = true;
+// The default Claude pool, PROVEN from the raw `ps -wwE` text (argv + launch
+// environment, space-joined). Values are never extracted — a space inside a
+// value makes entry boundaries unprovable — so only ABSENCE is proven:
+//   - no `TEAMCLAUDE_CONFIG=` / `XDG_CONFIG_HOME=` anywhere (argv included),
+//     so the process uses the default config path under its HOME;
+//   - `TEAMCLAUDE_PROVIDER=` at most once, and then right after a space,
+//     followed by exactly `anthropic` and a space or the end. The only value
+//     that changes the pool is exactly `codex`, which a text starting with
+//     `anthropic` cannot be (real supervisors launched from a TeamClaude
+//     shell carry `TEAMCLAUDE_PROVIDER=anthropic`);
+//   - `HOME=` exactly once, right after a space, followed by the sidecar's
+//     own HOME and then a space or the end.
+// Limit: a HOME whose real value is the sidecar HOME plus ` <more>` is
+// indistinguishable; accepted (same-uid process with a pathological HOME).
+export function provesDefaultPool(text, home) {
+  const no = reason => ({ ok: false, reason });
+  if (typeof text !== 'string' || text.length === 0) return no('launch environment unreadable');
+  if (typeof home !== 'string' || !isAbsolute(home)) return no('sidecar HOME unknown');
+  if (text.includes('TEAMCLAUDE_CONFIG=') || text.includes('XDG_CONFIG_HOME=')) {
+    return no('config override present');
   }
-  if (selectorWithoutId || found.size > 1) return { kind: 'ambiguous', sessionId: null };
-  if (found.size === 1) return { kind: 'valid', sessionId: [...found][0] };
-  return { kind: 'absent', sessionId: null };
+  const provider = occurrences(text, 'TEAMCLAUDE_PROVIDER=');
+  if (provider.length > 1) return no('provider ambiguous');
+  if (provider.length === 1 && !exactEntryAt(text, provider[0], 'TEAMCLAUDE_PROVIDER=', 'anthropic')) {
+    return no('provider not provably anthropic');
+  }
+  const homes = occurrences(text, 'HOME=');
+  if (homes.length !== 1) return no(homes.length === 0 ? 'HOME not visible' : 'HOME ambiguous');
+  if (!exactEntryAt(text, homes[0], 'HOME=', home)) return no('different HOME');
+  return { ok: true };
 }
 
-// The config file a supervisor runs against, from its launch environment —
-// the same rule as config.js getConfigPath(). Null when it cannot be told.
-export function supervisorConfigPath(env) {
-  if (!env || typeof env !== 'object') return null;
-  const explicit = env.TEAMCLAUDE_CONFIG;
-  if (typeof explicit === 'string' && explicit.length > 0) {
-    return isAbsolute(explicit) ? explicit : null;
-  }
-  const xdg = env.XDG_CONFIG_HOME;
-  if (typeof xdg === 'string' && xdg.length > 0) {
-    return isAbsolute(xdg) ? join(xdg, 'teamclaude.json') : null;
-  }
-  const home = env.HOME;
-  return typeof home === 'string' && isAbsolute(home)
-    ? join(home, '.config', 'teamclaude.json')
-    : null;
+function occurrences(text, needle) {
+  const found = [];
+  for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) found.push(at);
+  return found;
+}
+
+// `<key><value>` sits at `index`, right after a space, and is followed by a
+// space or the end.
+function exactEntryAt(text, index, key, value) {
+  if (index === 0 || text[index - 1] !== ' ') return false;
+  const start = index + key.length;
+  if (text.slice(start, start + value.length) !== value) return false;
+  const after = text[start + value.length];
+  return after === undefined || after === ' ';
 }
 
 // ── exhaustion verdict ──────────────────────────────────────
@@ -179,9 +174,19 @@ export function fleetExhaustionVerdict(status, nowMs, threshold = status?.switch
 
 // ── session lookup ─────────────────────────────────────────
 
-// The session bound to this supervisor (pid + process start) in the cmux
-// stores: the recovery lease it holds while waiting, or the hook session
-// record it launched. Exactly one distinct session, otherwise null.
+// The session a legacy supervisor is waiting on, from the ONE recovery lease
+// it holds itself. The legacy fleet_exhausted path calls
+// acquireFleetRecoveryClaim() → claimSessionLease(storePath, sessionId),
+// which records the supervisor's own pid + process start, and keeps it for the
+// whole wait(). Argv (which may quote a prompt) and the hook session store are
+// never used.
+// Why this also closes the rescuer race: while the supervisor is alive its
+// lease is live, so the cmux rescuer cannot take it; a lease held by the
+// rescuer names the rescuer's pid and therefore is not a target here. The
+// sidecar's permanent claim (claimSessionOnce) is published before the
+// supervisor is signalled, and the rescuer refuses to replay a claimed
+// session after the lease goes stale.
+// No lease (a non-cmux supervisor) or more than one → null (fail closed).
 export async function resolveSupervisorSessionId({
   storePath,
   pid,
@@ -204,17 +209,6 @@ export async function resolveSupervisorSessionId({
         && Number.isFinite(lease.processStartSeconds)
         && Math.abs(lease.processStartSeconds - startSeconds) <= LEASE_START_TOLERANCE_SECONDS) {
       found.add(name.toLowerCase());
-    }
-  }
-  const store = await readJson(storePath).catch(() => null);
-  const sessions = store?.sessions && typeof store.sessions === 'object' ? store.sessions : {};
-  for (const session of Object.values(sessions)) {
-    if (session
-        && UUID_RE.test(session.sessionId || '')
-        && session.pid === pid
-        && Number.isFinite(session.pidStartSeconds)
-        && Math.abs(session.pidStartSeconds - startSeconds) <= STORE_START_TOLERANCE_SECONDS) {
-      found.add(session.sessionId.toLowerCase());
     }
   }
   return found.size === 1 ? [...found][0] : null;
@@ -279,28 +273,32 @@ async function trustedEntryOf(command, trusted, resolvePath) {
   return resolved && trusted.has(resolved) ? resolved : null;
 }
 
-// Same provider (Claude) and same config file as this sidecar, read from the
-// supervisor's launch environment. Unreadable → not a member (fail closed).
-async function poolMembership(proc, { readProcessEnv, resolvePath, sidecarConfig }) {
-  let env = null;
+// Pool membership from the supervisor's raw `ps -wwE` text (see
+// provesDefaultPool). Unreadable → not a member (fail closed).
+async function poolMembership(proc, { readProcessEnvText, home }) {
+  let text = null;
   try {
-    env = typeof readProcessEnv === 'function' ? await readProcessEnv(proc.pid, proc) : null;
+    text = typeof readProcessEnvText === 'function' ? await readProcessEnvText(proc.pid, proc) : null;
   } catch {
-    env = null;
+    text = null;
   }
-  if (!env || typeof env !== 'object') return { ok: false, reason: 'launch environment unreadable' };
-  // teamclaude.js deletes an inherited TEAMCLAUDE_PROVIDER before loading
-  // index.js, so that bin is always the Claude pool.
-  const forcedClaude = basename(proc.entry || '') === 'teamclaude.js';
-  const provider = env.TEAMCLAUDE_PROVIDER;
-  if (!forcedClaude && provider != null && provider !== '' && provider !== 'anthropic') {
-    return { ok: false, reason: 'different provider' };
+  return provesDefaultPool(text, home);
+}
+
+// The sidecar serves the DEFAULT Claude pool only: no config override in its
+// own environment, and an absolute HOME to compare supervisors against.
+function sidecarDefaultPool(selfEnv) {
+  const env = selfEnv && typeof selfEnv === 'object' ? selfEnv : {};
+  if (env.TEAMCLAUDE_CONFIG !== undefined || env.XDG_CONFIG_HOME !== undefined) {
+    return { ok: false, reason: 'the sidecar runs with a config override (default pool only)' };
   }
-  const targetConfig = supervisorConfigPath(env);
-  if (!targetConfig) return { ok: false, reason: 'config path unknown' };
-  const resolved = await resolveOrNull(resolvePath, targetConfig);
-  if (!resolved || resolved !== sidecarConfig) return { ok: false, reason: 'different config' };
-  return { ok: true };
+  if (env.TEAMCLAUDE_PROVIDER !== undefined && env.TEAMCLAUDE_PROVIDER !== 'anthropic') {
+    return { ok: false, reason: 'the sidecar provider is not anthropic' };
+  }
+  if (typeof env.HOME !== 'string' || !isAbsolute(env.HOME)) {
+    return { ok: false, reason: 'the sidecar HOME is unknown' };
+  }
+  return { ok: true, home: env.HOME };
 }
 
 // One scan. Returns { handoffs, attempts }; never throws for an expected
@@ -310,13 +308,14 @@ export async function runCloudSidecar({
   now = () => Date.now(),
   vendorBin,
   trustedEntries = [],
-  configPath,
+  selfEnv = process.env,
   resolvePath = path => realpath(path),
-  readProcessEnv,
+  readProcessEnvText,
   listProcesses,
+  listProcessesSync,
   fetchStatus,
   readCwd,
-  resolveSessionFromStore = async () => null,
+  resolveSessionFromLease = async () => null,
   claimOnce,
   releaseClaim,
   kill,
@@ -348,6 +347,11 @@ export async function runCloudSidecar({
   }
   if (typeof vendorBin !== 'string' || vendorBin.length === 0) {
     say('No vendor claude binary configured (TEAMCLAUDE_CLAUDE_BIN / cloudSidecarClaudeBin); nothing to do.');
+    return summary;
+  }
+  const self = sidecarDefaultPool(selfEnv);
+  if (!self.ok) {
+    say(`${self.reason}; nothing to do.`);
     return summary;
   }
 
@@ -419,16 +423,6 @@ export async function runCloudSidecar({
     say(`${exhaustion.message}; leaving ${eligible.length} supervisor(s) alone.`);
     return summary;
   }
-  let sidecarConfig = null;
-  try {
-    sidecarConfig = typeof configPath === 'string' ? await resolvePath(configPath) : null;
-  } catch {
-    sidecarConfig = null;
-  }
-  if (!sidecarConfig) {
-    say('The sidecar config path cannot be resolved; nothing to do.');
-    return summary;
-  }
 
   const limit = maxPerRun(config);
   for (const proc of eligible) {
@@ -438,23 +432,16 @@ export async function runCloudSidecar({
     }
     // Pool membership BEFORE any snapshot or push: the status above describes
     // this sidecar's pool only.
-    const membership = await poolMembership(proc, { readProcessEnv, resolvePath, sidecarConfig });
+    const membership = await poolMembership(proc, { readProcessEnvText, home: self.home });
     if (!membership.ok) {
-      say(`Supervisor pid ${proc.pid}: ${membership.reason}; skipping.`);
+      say(`Supervisor pid ${proc.pid}: not provably in this pool (${membership.reason}); skipping.`);
       continue;
     }
-    const argvSession = sessionIdFromArgv(proc.command);
-    if (argvSession.kind === 'ambiguous' || argvSession.kind === 'forked') {
-      say(`Supervisor pid ${proc.pid}: session argv is ${argvSession.kind}; skipping.`);
-      continue;
-    }
-    const sessionId = argvSession.kind === 'valid'
-      ? argvSession.sessionId
-      : await Promise.resolve()
-        .then(() => resolveSessionFromStore({ pid: proc.pid, startedAtMs: proc.startedAtMs }))
-        .catch(() => null);
+    const sessionId = await Promise.resolve()
+      .then(() => resolveSessionFromLease({ pid: proc.pid, startedAtMs: proc.startedAtMs }))
+      .catch(() => null);
     if (!sessionId) {
-      say(`Supervisor pid ${proc.pid}: session ID unknown; skipping.`);
+      say(`Supervisor pid ${proc.pid}: holds no unique recovery lease; skipping.`);
       continue;
     }
     const cwd = await Promise.resolve().then(() => readCwd(proc.pid)).catch(() => null);
@@ -470,17 +457,17 @@ export async function runCloudSidecar({
     // attemptCloudHandoff releases the claim and the session stays local.
     const beforeLaunch = async () => {
       const notStopped = message => new CloudHandoffNotStopped(message);
-      let current;
-      try {
-        current = await listProcesses();
-      } catch {
-        throw notStopped('process list unavailable');
-      }
       const unchanged = list => list.some(p => p.pid === proc.pid && p.lstart === proc.lstart)
         && !list.some(p => p.ppid === proc.pid);
-      if (!unchanged(current)) throw notStopped('supervisor changed or has a child again');
-      // Preparation (snapshot, push, credit lookup) took time: the fleet may
-      // have recovered meanwhile.
+      const listNow = () => {
+        try {
+          return listProcessesSync();
+        } catch {
+          return null;
+        }
+      };
+      // 1. Preparation (snapshot, push, credit lookup) took time: re-check
+      //    the fleet at this moment.
       let lateStatus = null;
       try {
         lateStatus = await fetchStatus();
@@ -492,24 +479,27 @@ export async function runCloudSidecar({
         say(`Supervisor pid ${proc.pid}: ${late.message} at the final check; not stopping it.`);
         throw notStopped('fleet no longer exhausted');
       }
-      // Freeze the supervisor, then check it under the freeze: a stopped
-      // process cannot spawn a child, and the pid+lstart check after the stop
-      // rules out pid reuse. SIGCONT always follows (finally), so a frozen
-      // supervisor is never left behind; after SIGTERM it lets the pending
-      // termination proceed.
+      // 2. A SYNCHRONOUS process snapshot right before the first signal:
+      //    same pid + lstart (no reuse) and still childless. On failure no
+      //    signal at all is sent. Residual limit: the few milliseconds between
+      //    this ps snapshot and SIGSTOP are not covered (a pid recycled or a
+      //    child spawned exactly then); the check under SIGSTOP below catches
+      //    the child case, and pid reuse within that window is accepted.
+      const before = listNow();
+      if (!before || !unchanged(before)) throw notStopped('supervisor changed or has a child again');
       try {
-        try {
-          await kill(proc.pid, 'SIGSTOP');
-        } catch {
-          throw notStopped('supervisor could not be paused');
+        await kill(proc.pid, 'SIGSTOP');
+      } catch {
+        throw notStopped('supervisor could not be paused');
+      }
+      // 3. Check again under the freeze (a stopped process cannot spawn a
+      //    child). From here on SIGCONT always follows: on failure it resumes
+      //    the supervisor untouched; after SIGTERM it lets the termination run.
+      try {
+        const frozen = listNow();
+        if (!frozen || !unchanged(frozen)) {
+          throw notStopped('supervisor changed or has a child again under pause');
         }
-        let frozen;
-        try {
-          frozen = await listProcesses();
-        } catch {
-          throw notStopped('process list unavailable under pause');
-        }
-        if (!unchanged(frozen)) throw notStopped('supervisor changed or has a child again');
         killSent = true;
         await kill(proc.pid, 'SIGTERM');
       } finally {
@@ -570,6 +560,17 @@ export async function runCloudSidecar({
 
 // ── real seams (used by `teamclaude cloud-sidecar`) ─────────
 
+// Synchronous twin for the final check right before the first signal: no
+// event-loop turn between the snapshot and the SIGSTOP.
+export function listProcessesWithPsSync() {
+  const stdout = execFileSync(
+    'ps',
+    ['-ww', '-axo', 'pid=,ppid=,lstart=,command='],
+    { env: { ...process.env, LC_ALL: 'C' }, maxBuffer: 64 * 1024 * 1024, timeout: 10_000, encoding: 'utf8' },
+  );
+  return parsePsOutput(stdout);
+}
+
 export async function listProcessesWithPs() {
   const { stdout } = await execFileAsync(
     'ps',
@@ -580,47 +581,15 @@ export async function listProcessesWithPs() {
   return parsePsOutput(stdout);
 }
 
-const ENV_KEYS = ['TEAMCLAUDE_CONFIG', 'TEAMCLAUDE_PROVIDER', 'HOME', 'XDG_CONFIG_HOME'];
-const ENV_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-
-// Parses `ps -wwE -o command=` output: the known command line followed by the
-// launch environment as space-separated KEY=VALUE entries. Spaces inside a
-// value are indistinguishable from entry boundaries, so a membership key is
-// trusted only when its boundary is PROVABLE: `KEY=` starts exactly one token
-// and the token after its value is the end or another `NAME=` token. Returns
-// ONLY the membership keys (the rest — which may hold secrets — is dropped
-// here and never logged), or null when the environment is not visible or any
-// membership key is ambiguous.
-export function parseProcessEnvOutput(output, command) {
-  const text = String(output ?? '').replace(/\n+$/, '');
-  if (typeof command !== 'string' || command.length === 0 || !text.startsWith(command)) return null;
-  const rest = text.slice(command.length);
-  if (!rest.startsWith(' ')) return null;
-  const parts = rest.slice(1).split(' ');
-  if (parts.length === 0 || !ENV_TOKEN_RE.test(parts[0])) return null;
-  const env = {};
-  for (const key of ENV_KEYS) {
-    const prefix = `${key}=`;
-    const hits = [];
-    parts.forEach((part, index) => {
-      if (part.startsWith(prefix)) hits.push(index);
-    });
-    if (hits.length === 0) continue;
-    if (hits.length > 1) return null;
-    const next = parts[hits[0] + 1];
-    if (next !== undefined && !ENV_TOKEN_RE.test(next)) return null;
-    env[key] = parts[hits[0]].slice(prefix.length);
-  }
-  return env;
-}
-
-export async function readProcessEnvWithPs(pid, proc) {
+// The raw `ps -wwE` text (argv followed by the launch environment) for
+// provesDefaultPool. Returned as-is to the in-memory check; never logged.
+export async function readProcessEnvTextWithPs(pid) {
   const { stdout } = await execFileAsync(
     'ps',
     ['-wwE', '-p', String(pid), '-o', 'command='],
     { env: { ...process.env, LC_ALL: 'C' }, maxBuffer: 16 * 1024 * 1024, timeout: 10_000 },
   );
-  return parseProcessEnvOutput(stdout, proc?.command);
+  return stdout.replace(/\n+$/, '');
 }
 
 export async function readProcessCwd(pid) {
