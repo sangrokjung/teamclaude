@@ -9,6 +9,7 @@ import {
   CLOUD_SIDECAR_LOG_PREFIX,
   fleetExhaustionVerdict,
   isTeamclaudeRunSupervisor,
+  parseProcessEnvOutput,
   parsePsOutput,
   resolveSupervisorSessionId,
   runCloudSidecar,
@@ -733,4 +734,21 @@ test('runCloudSidecar skips a forked resume even when the store names a session'
   assertNoSideEffects(h);
   assert.equal(h.count('attempt'), 0);
   assert.equal(storeCalls, 0);
+});
+
+test('parseProcessEnvOutput keeps only the membership keys and fails closed', () => {
+  const command = `${NODE} ${ENTRY} run --resume ${SESSION_A}`;
+  const out = `${command} PATH=/usr/bin HOME=/home/user OTHER_TOKEN=opaque TEAMCLAUDE_CONFIG=/cfg/teamclaude.json\n`;
+  assert.deepEqual(parseProcessEnvOutput(out, command), {
+    HOME: '/home/user',
+    TEAMCLAUDE_CONFIG: '/cfg/teamclaude.json',
+  });
+  // No visible environment (another user's process, or hidden).
+  assert.equal(parseProcessEnvOutput(`${command}\n`, command), null);
+  // Output that is not this command line.
+  assert.equal(parseProcessEnvOutput(`other command HOME=/x\n`, command), null);
+  assert.equal(parseProcessEnvOutput(`${command}X HOME=/x`, command), null);
+  // A needed key seen twice is ambiguous.
+  assert.equal(parseProcessEnvOutput(`${command} HOME=/a HOME=/b`, command), null);
+  assert.equal(parseProcessEnvOutput(out, ''), null);
 });

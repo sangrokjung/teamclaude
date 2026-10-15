@@ -47,6 +47,7 @@ import {
   listProcessesWithPs,
   processIsAlive,
   readProcessCwd,
+  readProcessEnvWithPs,
   resolveSupervisorSessionId,
   runCloudSidecar,
 } from './cloud-sidecar.js';
@@ -3450,9 +3451,15 @@ async function cloudSidecarCommand() {
     return;
   }
   const { storePath, transcriptRoot } = defaultCmuxRescuePaths();
+  // Only supervisors running THIS install are candidates: its own entry and
+  // the teamclaude bin next to it, by real path.
+  const selfEntry = realpathSync(fileURLToPath(import.meta.url));
   await runCloudSidecar({
     config,
     vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudSidecarClaudeBin || null,
+    trustedEntries: [selfEntry, join(dirname(selfEntry), 'teamclaude.js')],
+    configPath: getConfigPath(),
+    readProcessEnv: readProcessEnvWithPs,
     listProcesses: listProcessesWithPs,
     fetchStatus: async () => {
       const response = await fetch(`http://127.0.0.1:${config.proxy?.port}/teamclaude/status`, {

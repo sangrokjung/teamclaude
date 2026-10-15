@@ -9,10 +9,10 @@
 // side effect injected; the real process/fs/proxy seams live at the bottom.
 
 import { execFile, spawnSync } from 'node:child_process';
-import { readdir } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { readdir, realpath } from 'node:fs/promises';
+import { basename, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
-import { attemptCloudHandoff } from './cloud-handoff.js';
+import { CloudHandoffNotStopped, attemptCloudHandoff } from './cloud-handoff.js';
 import { CLOUD_HANDOFF_MIN_WAIT_SECONDS } from './claude-recovery.js';
 import { readPrivateJson } from './cmux-session-guards.js';
 
@@ -52,30 +52,72 @@ function tokens(command) {
   return String(command ?? '').trim().split(/\s+/).filter(Boolean);
 }
 
-// node executing `.../src/index.js run` or `.../teamclaude.js run` (never
+// The script path of `node <entry> run …`, or null for anything else (never
 // `codex run`, `server`, or a shell that merely mentions it).
-export function isTeamclaudeRunSupervisor(command) {
+export function runSupervisorEntry(command) {
   const argv = tokens(command);
-  if (argv.length < 3 || !/^node(?:\d+)?$/.test(basename(argv[0]))) return false;
-  const entry = argv[1];
-  const isEntry = entry.endsWith('/src/index.js') || basename(entry) === 'teamclaude.js';
-  return isEntry && argv[2] === 'run';
+  if (argv.length < 3 || !/^node(?:\d+)?$/.test(basename(argv[0]))) return null;
+  return argv[2] === 'run' ? argv[1] : null;
 }
 
-// The exact session from the supervisor's own argv, or null when absent or
-// ambiguous (two different IDs, or a forked resume that mints a new ID).
+// node running EXACTLY one of the trusted install entries (this package's
+// src/index.js or src/teamclaude.js) with the run subcommand. A path that only
+// shares the suffix belongs to some other install or app.
+export function isTeamclaudeRunSupervisor(command, trustedEntries = []) {
+  const entry = runSupervisorEntry(command);
+  return entry !== null && Array.isArray(trustedEntries) && trustedEntries.includes(entry);
+}
+
+const SESSION_FLAGS = ['--session-id', '--resume', '-r'];
+
+// Classifies the supervisor's own argv:
+//   valid     — exactly one session UUID named by --session-id/--resume/-r
+//   absent    — no session selector at all (a store lookup may identify it)
+//   ambiguous — a selector without a UUID, or two different UUIDs
+//   forked    — --fork-session: the live session has a NEW, unknown ID
+// Only `absent` may fall back to the cmux stores.
 export function sessionIdFromArgv(command) {
   const argv = tokens(command);
   const runIndex = argv.indexOf('run');
   const args = runIndex >= 0 ? argv.slice(runIndex + 1) : [];
-  if (args.includes('--fork-session')) return null;
+  if (args.includes('--fork-session')) return { kind: 'forked', sessionId: null };
   const found = new Set();
-  for (let i = 0; i < args.length - 1; i += 1) {
-    if (['--session-id', '--resume', '-r'].includes(args[i]) && UUID_RE.test(args[i + 1])) {
-      found.add(args[i + 1].toLowerCase());
+  let selectorWithoutId = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    let value;
+    if (SESSION_FLAGS.includes(arg)) {
+      value = args[i + 1];
+      i += 1;
+    } else {
+      const flag = SESSION_FLAGS.find(name => name.startsWith('--') && arg.startsWith(`${name}=`));
+      if (!flag) continue;
+      value = arg.slice(flag.length + 1);
     }
+    if (typeof value === 'string' && UUID_RE.test(value)) found.add(value.toLowerCase());
+    else selectorWithoutId = true;
   }
-  return found.size === 1 ? [...found][0] : null;
+  if (selectorWithoutId || found.size > 1) return { kind: 'ambiguous', sessionId: null };
+  if (found.size === 1) return { kind: 'valid', sessionId: [...found][0] };
+  return { kind: 'absent', sessionId: null };
+}
+
+// The config file a supervisor runs against, from its launch environment —
+// the same rule as config.js getConfigPath(). Null when it cannot be told.
+export function supervisorConfigPath(env) {
+  if (!env || typeof env !== 'object') return null;
+  const explicit = env.TEAMCLAUDE_CONFIG;
+  if (typeof explicit === 'string' && explicit.length > 0) {
+    return isAbsolute(explicit) ? explicit : null;
+  }
+  const xdg = env.XDG_CONFIG_HOME;
+  if (typeof xdg === 'string' && xdg.length > 0) {
+    return isAbsolute(xdg) ? join(xdg, 'teamclaude.json') : null;
+  }
+  const home = env.HOME;
+  return typeof home === 'string' && isAbsolute(home)
+    ? join(home, '.config', 'teamclaude.json')
+    : null;
 }
 
 // ── exhaustion verdict ──────────────────────────────────────
@@ -191,12 +233,86 @@ function maxPerRun(config) {
 
 const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// Exhausted AND the earliest recovery is at least the in-process handoff's
+// minimum wait away. Anything uncertain fails.
+function exhaustionGate(status, nowMs) {
+  const verdict = fleetExhaustionVerdict(status, nowMs);
+  if (!verdict.exhausted) {
+    return { ok: false, message: `Fleet not confirmed exhausted (${verdict.reason})` };
+  }
+  const waitSeconds = Math.floor((verdict.earliestRecoveryMs - nowMs) / 1000);
+  if (waitSeconds < CLOUD_HANDOFF_MIN_WAIT_SECONDS) {
+    return {
+      ok: false,
+      message: `Fleet recovers in ${waitSeconds}s (< ${CLOUD_HANDOFF_MIN_WAIT_SECONDS}s)`,
+    };
+  }
+  return { ok: true, waitSeconds };
+}
+
+async function resolveOrNull(resolvePath, path) {
+  try {
+    const resolved = await resolvePath(path);
+    return typeof resolved === 'string' && resolved.length > 0 ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function trustedEntrySet(trustedEntries, resolvePath) {
+  const set = new Set();
+  for (const entry of Array.isArray(trustedEntries) ? trustedEntries : []) {
+    if (typeof entry !== 'string' || !isAbsolute(entry)) continue;
+    set.add(entry);
+    const resolved = await resolveOrNull(resolvePath, entry);
+    if (resolved) set.add(resolved);
+  }
+  return set;
+}
+
+// The trusted entry this command runs (exact path, or its realpath), or null.
+async function trustedEntryOf(command, trusted, resolvePath) {
+  const entry = runSupervisorEntry(command);
+  if (!entry || !isAbsolute(entry)) return null;
+  if (trusted.has(entry)) return entry;
+  const resolved = await resolveOrNull(resolvePath, entry);
+  return resolved && trusted.has(resolved) ? resolved : null;
+}
+
+// Same provider (Claude) and same config file as this sidecar, read from the
+// supervisor's launch environment. Unreadable → not a member (fail closed).
+async function poolMembership(proc, { readProcessEnv, resolvePath, sidecarConfig }) {
+  let env = null;
+  try {
+    env = typeof readProcessEnv === 'function' ? await readProcessEnv(proc.pid, proc) : null;
+  } catch {
+    env = null;
+  }
+  if (!env || typeof env !== 'object') return { ok: false, reason: 'launch environment unreadable' };
+  // teamclaude.js deletes an inherited TEAMCLAUDE_PROVIDER before loading
+  // index.js, so that bin is always the Claude pool.
+  const forcedClaude = basename(proc.entry || '') === 'teamclaude.js';
+  const provider = env.TEAMCLAUDE_PROVIDER;
+  if (!forcedClaude && provider != null && provider !== '' && provider !== 'anthropic') {
+    return { ok: false, reason: 'different provider' };
+  }
+  const targetConfig = supervisorConfigPath(env);
+  if (!targetConfig) return { ok: false, reason: 'config path unknown' };
+  const resolved = await resolveOrNull(resolvePath, targetConfig);
+  if (!resolved || resolved !== sidecarConfig) return { ok: false, reason: 'different config' };
+  return { ok: true };
+}
+
 // One scan. Returns { handoffs, attempts }; never throws for an expected
 // no-op. Every decision is logged as one prefixed line without secrets.
 export async function runCloudSidecar({
   config,
   now = () => Date.now(),
   vendorBin,
+  trustedEntries = [],
+  configPath,
+  resolvePath = path => realpath(path),
+  readProcessEnv,
   listProcesses,
   fetchStatus,
   readCwd,
@@ -244,9 +360,13 @@ export async function runCloudSidecar({
   }
   const nowMs = now();
   const parents = new Set(processes.map(proc => proc.ppid));
-  const legacy = processes.filter(proc => isTeamclaudeRunSupervisor(proc.command)
-    && Number.isFinite(proc.startedAtMs)
-    && proc.startedAtMs < cutoffMs);
+  const trusted = await trustedEntrySet(trustedEntries, resolvePath);
+  const legacy = [];
+  for (const proc of processes) {
+    if (!Number.isFinite(proc.startedAtMs) || proc.startedAtMs >= cutoffMs) continue;
+    const entry = await trustedEntryOf(proc.command, trusted, resolvePath);
+    if (entry) legacy.push({ ...proc, entry });
+  }
   const childless = legacy.filter(proc => !parents.has(proc.pid));
 
   // Consecutive-observation bookkeeping: keep only supervisors that are still
@@ -294,14 +414,19 @@ export async function runCloudSidecar({
   } catch {
     status = null;
   }
-  const verdict = fleetExhaustionVerdict(status, nowMs);
-  if (!verdict.exhausted) {
-    say(`Fleet not confirmed exhausted (${verdict.reason}); leaving ${eligible.length} supervisor(s) alone.`);
+  const exhaustion = exhaustionGate(status, nowMs);
+  if (!exhaustion.ok) {
+    say(`${exhaustion.message}; leaving ${eligible.length} supervisor(s) alone.`);
     return summary;
   }
-  const waitSeconds = Math.floor((verdict.earliestRecoveryMs - nowMs) / 1000);
-  if (waitSeconds < CLOUD_HANDOFF_MIN_WAIT_SECONDS) {
-    say(`Fleet recovers in ${waitSeconds}s (< ${CLOUD_HANDOFF_MIN_WAIT_SECONDS}s); leaving supervisors to resume locally.`);
+  let sidecarConfig = null;
+  try {
+    sidecarConfig = typeof configPath === 'string' ? await resolvePath(configPath) : null;
+  } catch {
+    sidecarConfig = null;
+  }
+  if (!sidecarConfig) {
+    say('The sidecar config path cannot be resolved; nothing to do.');
     return summary;
   }
 
@@ -311,8 +436,23 @@ export async function runCloudSidecar({
       say(`Per-run limit ${limit} reached; deferring the rest to the next scan.`);
       break;
     }
-    const sessionId = sessionIdFromArgv(proc.command)
-      ?? await resolveSessionFromStore({ pid: proc.pid, startedAtMs: proc.startedAtMs }).catch(() => null);
+    // Pool membership BEFORE any snapshot or push: the status above describes
+    // this sidecar's pool only.
+    const membership = await poolMembership(proc, { readProcessEnv, resolvePath, sidecarConfig });
+    if (!membership.ok) {
+      say(`Supervisor pid ${proc.pid}: ${membership.reason}; skipping.`);
+      continue;
+    }
+    const argvSession = sessionIdFromArgv(proc.command);
+    if (argvSession.kind === 'ambiguous' || argvSession.kind === 'forked') {
+      say(`Supervisor pid ${proc.pid}: session argv is ${argvSession.kind}; skipping.`);
+      continue;
+    }
+    const sessionId = argvSession.kind === 'valid'
+      ? argvSession.sessionId
+      : await Promise.resolve()
+        .then(() => resolveSessionFromStore({ pid: proc.pid, startedAtMs: proc.startedAtMs }))
+        .catch(() => null);
     if (!sessionId) {
       say(`Supervisor pid ${proc.pid}: session ID unknown; skipping.`);
       continue;
@@ -326,11 +466,32 @@ export async function runCloudSidecar({
     summary.attempts += 1;
     let claimIdentity = null;
     let killSent = false;
+    // Everything before the SIGTERM aborts with CloudHandoffNotStopped, so
+    // attemptCloudHandoff releases the claim and the session stays local.
     const beforeLaunch = async () => {
-      const current = await listProcesses();
+      const notStopped = message => new CloudHandoffNotStopped(message);
+      let current;
+      try {
+        current = await listProcesses();
+      } catch {
+        throw notStopped('process list unavailable');
+      }
       const same = current.find(p => p.pid === proc.pid && p.lstart === proc.lstart);
-      if (!same) throw new Error('supervisor changed');
-      if (current.some(p => p.ppid === proc.pid)) throw new Error('supervisor has a child again');
+      if (!same) throw notStopped('supervisor changed');
+      if (current.some(p => p.ppid === proc.pid)) throw notStopped('supervisor has a child again');
+      // Preparation (snapshot, push, credit lookup) took time: the fleet may
+      // have recovered meanwhile.
+      let lateStatus = null;
+      try {
+        lateStatus = await fetchStatus();
+      } catch {
+        lateStatus = null;
+      }
+      const late = exhaustionGate(lateStatus, now());
+      if (!late.ok) {
+        say(`Supervisor pid ${proc.pid}: ${late.message} at the final check; not stopping it.`);
+        throw notStopped('fleet no longer exhausted');
+      }
       killSent = true;
       await kill(proc.pid, 'SIGTERM');
       for (let waited = 0; waited <= stopTimeoutMs; waited += STOP_POLL_MS) {
@@ -370,16 +531,8 @@ export async function runCloudSidecar({
       delete observations[key];
       say(`Supervisor pid ${proc.pid}: handed session ${sessionId} to a cloud session on ${outcome.account} (branch ${outcome.branch}).`);
     } else {
-      // The supervisor was never signalled: a held claim would only block the
-      // cmux rescuer from replaying a session that is still local.
       if (outcome.claimHeld && !killSent && claimIdentity) {
-        let released = false;
-        try {
-          released = (await releaseClaim(sessionId, claimIdentity)) === true;
-        } catch {
-          released = false;
-        }
-        say(`Supervisor pid ${proc.pid}: changed before the stop; ${released ? 'released' : 'could not release'} the replay claim for ${sessionId}.`);
+        say(`Supervisor pid ${proc.pid}: handoff for ${sessionId} aborted before the stop, but its replay claim could not be released.`);
       } else if (outcome.claimHeld) {
         say(`Supervisor pid ${proc.pid}: cloud handoff for ${sessionId} failed after the stop; the replay claim stays held for manual continuation.`);
       } else {
@@ -397,10 +550,48 @@ export async function runCloudSidecar({
 export async function listProcessesWithPs() {
   const { stdout } = await execFileAsync(
     'ps',
-    ['-axo', 'pid=,ppid=,lstart=,command='],
+    // -ww: never truncate the command (session flags and the entry path).
+    ['-ww', '-axo', 'pid=,ppid=,lstart=,command='],
     { env: { ...process.env, LC_ALL: 'C' }, maxBuffer: 64 * 1024 * 1024, timeout: 10_000 },
   );
   return parsePsOutput(stdout);
+}
+
+const ENV_KEYS = ['TEAMCLAUDE_CONFIG', 'TEAMCLAUDE_PROVIDER', 'HOME', 'XDG_CONFIG_HOME'];
+const ENV_TOKEN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+
+// Parses `ps -wwE -o command=` output: the known command line followed by the
+// launch environment. Returns ONLY the keys pool membership needs (the rest —
+// which may hold secrets — is dropped here and never logged), or null when
+// the environment is not visible or a needed key is ambiguous.
+export function parseProcessEnvOutput(output, command) {
+  const text = String(output ?? '').replace(/\n+$/, '');
+  if (typeof command !== 'string' || command.length === 0 || !text.startsWith(command)) return null;
+  const rest = text.slice(command.length);
+  if (!rest.startsWith(' ')) return null;
+  const env = {};
+  const seen = new Set();
+  let visible = false;
+  for (const token of rest.split(/\s+/)) {
+    const match = ENV_TOKEN_RE.exec(token);
+    if (!match) continue;
+    visible = true;
+    const [, key, value] = match;
+    if (!ENV_KEYS.includes(key)) continue;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    env[key] = value;
+  }
+  return visible ? env : null;
+}
+
+export async function readProcessEnvWithPs(pid, proc) {
+  const { stdout } = await execFileAsync(
+    'ps',
+    ['-wwE', '-p', String(pid), '-o', 'command='],
+    { env: { ...process.env, LC_ALL: 'C' }, maxBuffer: 16 * 1024 * 1024, timeout: 10_000 },
+  );
+  return parseProcessEnvOutput(stdout, proc?.command);
 }
 
 export async function readProcessCwd(pid) {
