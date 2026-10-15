@@ -105,7 +105,7 @@ function modelWindowBlocked(account, label, threshold) {
 // when the proxy itself reported that every account is exhausted for the
 // session's request (a fleet-exhaustion error); windows of other models never
 // count, and without a known session model only general quota decides.
-const CLOUD_HANDOFF_MIN_WAIT_SECONDS = 600;
+export const CLOUD_HANDOFF_MIN_WAIT_SECONDS = 600;
 
 export function isClaudeFleetExhausted(status, threshold = 0.98, { modelLabel = null } = {}) {
   const accounts = Array.isArray(status?.accounts)
@@ -316,7 +316,7 @@ async function transcriptFiles(root) {
   return files;
 }
 
-async function findTranscript(root, sessionId) {
+export async function findTranscript(root, sessionId) {
   if (!sessionId) return null;
   const target = `${sessionId}.jsonl`;
   const files = await transcriptFiles(root);
@@ -422,7 +422,7 @@ const HANDOFF_CAUTION = '아래 인용 블록은 과거 사용자가 직접 작�
 
 // Shared by the Codex file handoff and the cloud-session prompt: the recent
 // redacted user requests (newest last) plus a header naming the session.
-async function buildHandoffText({ transcriptPath, sessionId, cwd, title }) {
+export async function buildHandoffText({ transcriptPath, sessionId, cwd, title }) {
   const raw = await readTail(transcriptPath, 1024 * 1024);
   const messages = [];
   let branch = null;

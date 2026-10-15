@@ -457,6 +457,12 @@ async function isExecutableFile(path) {
   }
 }
 
+// Thrown by beforeLaunch when it gives up BEFORE stopping anything (e.g. a
+// re-check found the fleet recovered). Nothing local was stopped and no cloud
+// process exists, so the claim is released and the caller keeps its session.
+// Any other beforeLaunch failure stays ambiguous and keeps the claim held.
+export class CloudHandoffNotStopped extends Error {}
+
 // Returns { ok: true, result, account, branch } after a successful launch,
 // otherwise { ok: false, reason, stopped } so the caller can fall back to its
 // existing behavior. `stopped` reports whether beforeLaunch already ran.
@@ -474,6 +480,9 @@ export async function attemptCloudHandoff({
   loadAccounts,
   creditLookup = fetchCloudCredits,
   ledgerPath = null,
+  // Optional extra fields for the ledger entry (e.g. { source }). The core
+  // fields below always win, so callers cannot rewrite them.
+  ledgerExtra = null,
   now = new Date(),
   random = Math.random,
   claimBeforeLaunch = async () => true,
@@ -535,25 +544,30 @@ export async function attemptCloudHandoff({
   // Any failure after the claim must either confirm the claim was released
   // (local recovery may continue) or report it as held, so the caller
   // preserves the session instead of leaving it unrecoverable.
-  const failAfterClaim = async () => {
+  const failAfterClaim = async ({ stopped = true } = {}) => {
     let released = false;
     try {
       released = (await releaseClaim(claimed)) === true;
     } catch {
       released = false;
     }
-    return { ok: false, reason: 'launch-failed', stopped: true, claimHeld: !released };
+    return { ok: false, reason: 'launch-failed', stopped, claimHeld: !released };
   };
   let result = null;
+  let stopDone = false;
   try {
     await beforeLaunch();
+    stopDone = true;
     result = await launchCloud({
       vendorBin,
       args: ['--cloud', prompt],
       env: buildCloudEnv(baseEnv, account.accessToken),
       cwd,
     });
-  } catch {
+  } catch (error) {
+    if (!stopDone && error instanceof CloudHandoffNotStopped) {
+      return failAfterClaim({ stopped: false });
+    }
     result = null;
   }
   // Only a proven spawn failure (no process ever started — e.g. the vendor
@@ -577,6 +591,7 @@ export async function attemptCloudHandoff({
   if (ledgerPath) {
     try {
       await appendCloudLedger(ledgerPath, {
+        ...(ledgerExtra && typeof ledgerExtra === 'object' ? ledgerExtra : {}),
         ts: now.toISOString(),
         sessionId,
         account: account.name,
