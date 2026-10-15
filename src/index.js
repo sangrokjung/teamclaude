@@ -49,7 +49,8 @@ import {
   processIsAlive,
   readProcessCwd,
   readProcessEnvTextWithPs,
-  resolveSupervisorSessionId,
+  readSessionLease,
+  resolveSupervisorLease,
   runCloudSidecar,
 } from './cloud-sidecar.js';
 import { reauthenticateAccount } from './reauth.js';
@@ -77,6 +78,7 @@ import {
   claimSessionLease,
   releaseSessionLease,
   resolveCmuxSessionId,
+  unresolvedExhaustionErrorState,
 } from './cmux-session-guards.js';
 import {
   PROBE_BROKEN,
@@ -3455,6 +3457,7 @@ async function cloudSidecarCommand() {
   // Only supervisors running THIS install are candidates: its own entry and
   // the teamclaude bin next to it, by real path.
   const selfEntry = realpathSync(fileURLToPath(import.meta.url));
+  const transcriptPaths = new Map();
   await runCloudSidecar({
     config,
     vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudSidecarClaudeBin || null,
@@ -3477,8 +3480,21 @@ async function cloudSidecarCommand() {
       return response.json();
     },
     readCwd: readProcessCwd,
-    resolveSessionFromLease: ({ pid, startedAtMs }) =>
-      resolveSupervisorSessionId({ storePath, pid, startedAtMs }),
+    // The store under homedir() is the same-HOME evidence: a supervisor with
+    // another HOME keeps its lease in another store.
+    resolveSupervisorLease: ({ pid, startedAtMs }) =>
+      resolveSupervisorLease({ storePath, pid, startedAtMs }),
+    readLease: sessionId => readSessionLease({ storePath, sessionId }),
+    transcriptBlocked: async sessionId => {
+      // Located once (a full tree walk) before the handoff, so the check
+      // under SIGSTOP only reads the tail.
+      if (!transcriptPaths.has(sessionId)) {
+        transcriptPaths.set(sessionId, await findTranscript(transcriptRoot, sessionId));
+      }
+      const transcriptPath = transcriptPaths.get(sessionId);
+      if (!transcriptPath) return false;
+      return Boolean(await unresolvedExhaustionErrorState(transcriptPath, transcriptRoot, sessionId));
+    },
     claimOnce: sessionId => claimSessionOnce(storePath, sessionId),
     releaseClaim: (sessionId, claim) => releaseSessionClaim(storePath, sessionId, claim),
     kill: killProcess,

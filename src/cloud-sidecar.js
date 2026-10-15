@@ -70,21 +70,28 @@ export function isTeamclaudeRunSupervisor(command, trustedEntries = []) {
 // The default Claude pool, PROVEN from the raw `ps -wwE` text (argv + launch
 // environment, space-joined). Values are never extracted — a space inside a
 // value makes entry boundaries unprovable — so only ABSENCE is proven:
+//   - the environment is visible: the text is the known command line plus a
+//     space and a `NAME=` token (another uid's process shows argv only);
 //   - no `TEAMCLAUDE_CONFIG=` / `XDG_CONFIG_HOME=` anywhere (argv included),
-//     so the process uses the default config path under its HOME;
+//     so the process reads the default config `<HOME>/.config/teamclaude.json`;
 //   - `TEAMCLAUDE_PROVIDER=` at most once, and then right after a space,
 //     followed by exactly `anthropic` and a space or the end. The only value
 //     that changes the pool is exactly `codex`, which a text starting with
 //     `anthropic` cannot be (real supervisors launched from a TeamClaude
-//     shell carry `TEAMCLAUDE_PROVIDER=anthropic`);
-//   - `HOME=` exactly once, right after a space, followed by the sidecar's
-//     own HOME and then a space or the end.
-// Limit: a HOME whose real value is the sidecar HOME plus ` <more>` is
-// indistinguishable; accepted (same-uid process with a pathological HOME).
-export function provesDefaultPool(text, home) {
+//     shell carry `TEAMCLAUDE_PROVIDER=anthropic`).
+// HOME is deliberately NOT judged from this text. The evidence for "same
+// HOME" is the supervisor's recovery lease: defaultCmuxRescuePaths() derives
+// the store from homedir() alone (HOME, else the passwd home — no other env
+// override exists, in the legacy code or now), and the sidecar only reads
+// leases from its OWN store. A supervisor with another HOME writes its lease
+// elsewhere and can never become a candidate.
+export function provesDefaultPool(text, command) {
   const no = reason => ({ ok: false, reason });
-  if (typeof text !== 'string' || text.length === 0) return no('launch environment unreadable');
-  if (typeof home !== 'string' || !isAbsolute(home)) return no('sidecar HOME unknown');
+  if (typeof text !== 'string' || typeof command !== 'string' || command.length === 0
+      || !text.startsWith(`${command} `)
+      || !/^[A-Za-z_][A-Za-z0-9_]*=/.test(text.slice(command.length + 1))) {
+    return no('launch environment not visible');
+  }
   if (text.includes('TEAMCLAUDE_CONFIG=') || text.includes('XDG_CONFIG_HOME=')) {
     return no('config override present');
   }
@@ -93,9 +100,6 @@ export function provesDefaultPool(text, home) {
   if (provider.length === 1 && !exactEntryAt(text, provider[0], 'TEAMCLAUDE_PROVIDER=', 'anthropic')) {
     return no('provider not provably anthropic');
   }
-  const homes = occurrences(text, 'HOME=');
-  if (homes.length !== 1) return no(homes.length === 0 ? 'HOME not visible' : 'HOME ambiguous');
-  if (!exactEntryAt(text, homes[0], 'HOME=', home)) return no('different HOME');
   return { ok: true };
 }
 
@@ -177,17 +181,18 @@ export function fleetExhaustionVerdict(status, nowMs, threshold = status?.switch
 // The session a legacy supervisor is waiting on, from the ONE recovery lease
 // it holds itself. The legacy fleet_exhausted path calls
 // acquireFleetRecoveryClaim() → claimSessionLease(storePath, sessionId),
-// which records the supervisor's own pid + process start, and keeps it for the
-// whole wait(). Argv (which may quote a prompt) and the hook session store are
-// never used.
+// which records the supervisor's own pid + process start (+ a nonce), and
+// keeps it for the whole wait(). Argv (which may quote a prompt) and the hook
+// session store are never used.
 // Why this also closes the rescuer race: while the supervisor is alive its
 // lease is live, so the cmux rescuer cannot take it; a lease held by the
 // rescuer names the rescuer's pid and therefore is not a target here. The
-// sidecar's permanent claim (claimSessionOnce) is published before the
-// supervisor is signalled, and the rescuer refuses to replay a claimed
-// session after the lease goes stale.
-// No lease (a non-cmux supervisor) or more than one → null (fail closed).
-export async function resolveSupervisorSessionId({
+// fence re-reads the lease under SIGSTOP and requires the same nonce: an
+// unchanged nonce on a frozen supervisor proves it never let go, so no
+// rescuer can have taken the lease before the sidecar's permanent claim.
+// No lease (a non-cmux supervisor), more than one, or no nonce → null.
+// Returns { sessionId, pid, processStartSeconds, nonce }.
+export async function resolveSupervisorLease({
   storePath,
   pid,
   startedAtMs,
@@ -198,7 +203,7 @@ export async function resolveSupervisorSessionId({
     return null;
   }
   const startSeconds = startedAtMs / 1000;
-  const found = new Set();
+  const found = [];
   const leaseDir = `${storePath}.recovery-leases`;
   const names = await listDir(leaseDir).catch(() => []);
   for (const name of names) {
@@ -208,10 +213,31 @@ export async function resolveSupervisorSessionId({
         && lease.pid === pid
         && Number.isFinite(lease.processStartSeconds)
         && Math.abs(lease.processStartSeconds - startSeconds) <= LEASE_START_TOLERANCE_SECONDS) {
-      found.add(name.toLowerCase());
+      found.push({ name: name.toLowerCase(), lease });
     }
   }
-  return found.size === 1 ? [...found][0] : null;
+  if (found.length !== 1) return null;
+  const [{ name, lease }] = found;
+  if (typeof lease.nonce !== 'string' || lease.nonce.length === 0) return null;
+  return {
+    sessionId: name,
+    pid: lease.pid,
+    processStartSeconds: lease.processStartSeconds,
+    nonce: lease.nonce,
+  };
+}
+
+// The same lease, re-read by session for the check under SIGSTOP.
+export async function readSessionLease({ storePath, sessionId, readJson = readPrivateJson }) {
+  if (typeof storePath !== 'string' || !UUID_RE.test(sessionId || '')) return null;
+  return readJson(join(`${storePath}.recovery-leases`, sessionId));
+}
+
+function sameLease(current, expected) {
+  return Boolean(current && expected)
+    && current.pid === expected.pid
+    && current.processStartSeconds === expected.processStartSeconds
+    && current.nonce === expected.nonce;
 }
 
 // ── scan ────────────────────────────────────────────────────
@@ -275,18 +301,18 @@ async function trustedEntryOf(command, trusted, resolvePath) {
 
 // Pool membership from the supervisor's raw `ps -wwE` text (see
 // provesDefaultPool). Unreadable → not a member (fail closed).
-async function poolMembership(proc, { readProcessEnvText, home }) {
+async function poolMembership(proc, { readProcessEnvText }) {
   let text = null;
   try {
     text = typeof readProcessEnvText === 'function' ? await readProcessEnvText(proc.pid, proc) : null;
   } catch {
     text = null;
   }
-  return provesDefaultPool(text, home);
+  return provesDefaultPool(text, proc.command);
 }
 
 // The sidecar serves the DEFAULT Claude pool only: no config override in its
-// own environment, and an absolute HOME to compare supervisors against.
+// own environment (its store and config then both follow homedir()).
 function sidecarDefaultPool(selfEnv) {
   const env = selfEnv && typeof selfEnv === 'object' ? selfEnv : {};
   if (env.TEAMCLAUDE_CONFIG !== undefined || env.XDG_CONFIG_HOME !== undefined) {
@@ -295,10 +321,7 @@ function sidecarDefaultPool(selfEnv) {
   if (env.TEAMCLAUDE_PROVIDER !== undefined && env.TEAMCLAUDE_PROVIDER !== 'anthropic') {
     return { ok: false, reason: 'the sidecar provider is not anthropic' };
   }
-  if (typeof env.HOME !== 'string' || !isAbsolute(env.HOME)) {
-    return { ok: false, reason: 'the sidecar HOME is unknown' };
-  }
-  return { ok: true, home: env.HOME };
+  return { ok: true };
 }
 
 // One scan. Returns { handoffs, attempts }; never throws for an expected
@@ -315,7 +338,9 @@ export async function runCloudSidecar({
   listProcessesSync,
   fetchStatus,
   readCwd,
-  resolveSessionFromLease = async () => null,
+  resolveSupervisorLease: resolveLease = async () => null,
+  readLease = async () => null,
+  transcriptBlocked = async () => false,
   claimOnce,
   releaseClaim,
   kill,
@@ -432,16 +457,26 @@ export async function runCloudSidecar({
     }
     // Pool membership BEFORE any snapshot or push: the status above describes
     // this sidecar's pool only.
-    const membership = await poolMembership(proc, { readProcessEnvText, home: self.home });
+    const membership = await poolMembership(proc, { readProcessEnvText });
     if (!membership.ok) {
       say(`Supervisor pid ${proc.pid}: not provably in this pool (${membership.reason}); skipping.`);
       continue;
     }
-    const sessionId = await Promise.resolve()
-      .then(() => resolveSessionFromLease({ pid: proc.pid, startedAtMs: proc.startedAtMs }))
+    const lease = await Promise.resolve()
+      .then(() => resolveLease({ pid: proc.pid, startedAtMs: proc.startedAtMs }))
       .catch(() => null);
+    const sessionId = lease?.sessionId;
     if (!sessionId) {
       say(`Supervisor pid ${proc.pid}: holds no unique recovery lease; skipping.`);
+      continue;
+    }
+    // Only a session whose transcript still ENDS in the quota error it is
+    // waiting out; a session that moved on (or cannot be judged) is left alone.
+    const stillBlocked = await Promise.resolve()
+      .then(() => transcriptBlocked(sessionId))
+      .catch(() => false);
+    if (stillBlocked !== true) {
+      say(`Supervisor pid ${proc.pid}: session ${sessionId} transcript is not an unresolved exhaustion error; skipping.`);
       continue;
     }
     const cwd = await Promise.resolve().then(() => readCwd(proc.pid)).catch(() => null);
@@ -499,6 +534,29 @@ export async function runCloudSidecar({
         const frozen = listNow();
         if (!frozen || !unchanged(frozen)) {
           throw notStopped('supervisor changed or has a child again under pause');
+        }
+        // Same lease nonce on a frozen supervisor = it never released the
+        // lease, so no rescuer could have taken it before our claim.
+        let currentLease = null;
+        try {
+          currentLease = await readLease(sessionId);
+        } catch {
+          currentLease = null;
+        }
+        if (!sameLease(currentLease, lease)) {
+          say(`Supervisor pid ${proc.pid}: recovery lease changed during preparation; not stopping it.`);
+          throw notStopped('supervisor lease changed');
+        }
+        // The transcript must still end in the unresolved quota error.
+        let blockedNow = false;
+        try {
+          blockedNow = (await transcriptBlocked(sessionId)) === true;
+        } catch {
+          blockedNow = false;
+        }
+        if (!blockedNow) {
+          say(`Supervisor pid ${proc.pid}: session ${sessionId} moved on during preparation; not stopping it.`);
+          throw notStopped('transcript moved on');
         }
         killSent = true;
         await kill(proc.pid, 'SIGTERM');
