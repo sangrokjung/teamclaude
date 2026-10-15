@@ -42,6 +42,15 @@ function inside(path, root) {
   return rel.length > 0 && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+// Metadata record kinds observed in Claude Code transcripts (2026-10).
+const METADATA_RECORD_TYPES = new Set([
+  'attachment', 'system', 'summary', 'ai-title', 'custom-title', 'last-prompt',
+  'queue-operation', 'permission-mode', 'mode', 'cost-state', 'atis-latch',
+  'api-request', 'api-request-blob', 'api-request-shape', 'pr-link', 'frame-link',
+  'agent-name', 'file-history-snapshot', 'file-history-delta',
+  'artifact-autoreact-ledger', 'artifact-comment-monitor', 'progress',
+]);
+
 function isConversationRecord(record) {
   return record?.type === 'user'
     || (record?.type === 'assistant' && record.isApiErrorMessage !== true);
@@ -142,11 +151,13 @@ export async function scanExhaustionTail({
         if (record === null || typeof record !== 'object' || Array.isArray(record)) {
           return unknown('non-object record');
         }
-        // Every transcript record carries a string `type` discriminator. Other
-        // string types (attachment, system, ai-title, ...) are metadata that
-        // neither resolve nor raise an error; a turn must have its message.
-        if (typeof record.type !== 'string' || record.type === '') {
-          return unknown('record without a type');
+        // Every transcript record carries a `type` discriminator. Only turns
+        // and the known metadata types (which neither resolve nor raise an
+        // error) are understood; anything else — a new Claude Code record
+        // kind included — makes the tail unjudgeable, so no handoff.
+        if (record.type !== 'user' && record.type !== 'assistant'
+            && !METADATA_RECORD_TYPES.has(record.type)) {
+          return unknown('unrecognized record type');
         }
         if ((record.type === 'user' || record.type === 'assistant')
             && (record.message === null || typeof record.message !== 'object'

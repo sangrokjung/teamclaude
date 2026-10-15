@@ -286,7 +286,8 @@ test('scanExhaustionTail lets any later API error supersede the exhaustion, and 
     assert.deepEqual(result, { state: 'clear' });
   }
   for (const tail of ['null\n', '[]\n', '42\n', '"x"\n', '{}\n', '{"type":null}\n', '{"type":""}\n',
-    '{"type":"user"}\n', '{"type":"assistant","message":null}\n']) {
+    '{"type":"user"}\n', '{"type":"assistant","message":null}\n', '{"type":" "}\n',
+    '{"type":"unrecognized-record","message":{"role":"user","content":"stop"}}\n']) {
     const result = await scan(memoryFs(`${jsonl([user('일'), fleetError(EVENT_UUID_A)])}${tail}`));
     assert.equal(result.state, 'unknown');
   }
