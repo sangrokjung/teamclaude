@@ -436,11 +436,18 @@ export async function killProcess(pid, signal) {
   process.kill(pid, signal);
 }
 
-// `--cloud` needs a TTY; `script` supplies a pseudo-terminal.
+// `--cloud` needs a TTY; `script` supplies a pseudo-terminal. Creating a
+// cloud session returns within seconds; the timeout keeps one hung launch from
+// blocking every later sidecar run (a timed-out launch is a signal kill, so
+// attemptCloudHandoff keeps the claim held and the session is preserved).
+export const CLOUD_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
+
 export function launchCloudWithScript({ vendorBin, args, env, cwd }) {
   return spawnSync('script', ['-q', '/dev/null', vendorBin, ...args], {
     env,
     cwd,
     stdio: ['ignore', 'ignore', 'ignore'],
+    timeout: CLOUD_LAUNCH_TIMEOUT_MS,
+    killSignal: 'SIGTERM',
   });
 }
