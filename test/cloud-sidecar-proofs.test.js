@@ -273,3 +273,20 @@ test('scanExhaustionTail cannot judge a short read, a shrink, a replacement, or 
     path: PATH_A, transcriptRoot: ROOT, sessionId: SESSION_B, fs: memoryFs(text), uid: UID,
   })).state, 'unknown', 'file name is not the session');
 });
+
+test('scanExhaustionTail lets any later API error supersede the exhaustion, and rejects non-object records', async () => {
+  const ambiguousDispatch = {
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'unknown',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 502 upstream dispatch ambiguous' }] },
+  };
+  for (const later of [loginExpired, ambiguousDispatch]) {
+    const result = await scan(memoryFs(jsonl([user('일'), fleetError(EVENT_UUID_A), later])));
+    assert.deepEqual(result, { state: 'clear' });
+  }
+  for (const tail of ['null\n', '[]\n', '42\n', '"x"\n']) {
+    const result = await scan(memoryFs(`${jsonl([user('일'), fleetError(EVENT_UUID_A)])}${tail}`));
+    assert.equal(result.state, 'unknown');
+  }
+});

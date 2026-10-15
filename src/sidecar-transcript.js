@@ -139,6 +139,9 @@ export async function scanExhaustionTail({
         } catch {
           return unknown('unparseable record');
         }
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+          return unknown('non-object record');
+        }
         const event = classifyClaudeApiErrorRecord(record);
         if (event && EXHAUSTION_KINDS.has(event.kind)) {
           blocked = {
@@ -148,7 +151,10 @@ export async function scanExhaustionTail({
               : null,
             kind: event.kind,
           };
-        } else if (blocked && isConversationRecord(record)) {
+        } else if (blocked && (event || record.isApiErrorMessage === true
+            || isConversationRecord(record))) {
+          // Any later API error (login, ambiguous dispatch, ...) or turn
+          // supersedes the exhaustion: it is no longer the last word.
           blocked = null;
         }
       }
