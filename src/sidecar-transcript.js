@@ -142,6 +142,17 @@ export async function scanExhaustionTail({
         if (record === null || typeof record !== 'object' || Array.isArray(record)) {
           return unknown('non-object record');
         }
+        // Every transcript record carries a string `type` discriminator. Other
+        // string types (attachment, system, ai-title, ...) are metadata that
+        // neither resolve nor raise an error; a turn must have its message.
+        if (typeof record.type !== 'string' || record.type === '') {
+          return unknown('record without a type');
+        }
+        if ((record.type === 'user' || record.type === 'assistant')
+            && (record.message === null || typeof record.message !== 'object'
+              || Array.isArray(record.message))) {
+          return unknown('turn without a message');
+        }
         const event = classifyClaudeApiErrorRecord(record);
         if (event && EXHAUSTION_KINDS.has(event.kind)) {
           blocked = {

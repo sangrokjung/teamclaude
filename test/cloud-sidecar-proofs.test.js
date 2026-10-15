@@ -285,8 +285,13 @@ test('scanExhaustionTail lets any later API error supersede the exhaustion, and 
     const result = await scan(memoryFs(jsonl([user('일'), fleetError(EVENT_UUID_A), later])));
     assert.deepEqual(result, { state: 'clear' });
   }
-  for (const tail of ['null\n', '[]\n', '42\n', '"x"\n']) {
+  for (const tail of ['null\n', '[]\n', '42\n', '"x"\n', '{}\n', '{"type":null}\n', '{"type":""}\n',
+    '{"type":"user"}\n', '{"type":"assistant","message":null}\n']) {
     const result = await scan(memoryFs(`${jsonl([user('일'), fleetError(EVENT_UUID_A)])}${tail}`));
     assert.equal(result.state, 'unknown');
   }
+  // Metadata records after the error leave it the last word.
+  const meta = await scan(memoryFs(jsonl([user('일'), fleetError(EVENT_UUID_A),
+    { type: 'attachment' }, { type: 'ai-title', title: 't' }, { type: 'system', subtype: 'x' }])));
+  assert.equal(meta.state, 'blocked');
 });
