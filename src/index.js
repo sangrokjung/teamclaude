@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs } from './config.js';
+import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -39,8 +39,17 @@ import { TUI, applyTuiAccountMutation } from './tui.js';
 import { formatBytes } from './system-metrics.js';
 import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
-import { runClaudeWithRecovery } from './claude-recovery.js';
+import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
+import {
+  killProcess,
+  launchCloudWithScript,
+  listProcessesWithPs,
+  processIsAlive,
+  readProcessCwd,
+  resolveSupervisorSessionId,
+  runCloudSidecar,
+} from './cloud-sidecar.js';
 import { reauthenticateAccount } from './reauth.js';
 import { applyOAuthUpsert, carryOverAccountSettings } from './account-upsert.js';
 import {
@@ -249,6 +258,10 @@ switch (command) {
   case 'api':
     await apiCommand();
     process.exit(0);
+    break;
+  case 'cloud-sidecar':
+    await cloudSidecarCommand();
+    process.exit(process.exitCode ?? 0);
     break;
   case 'install-claude-wrapper':
     await installClaudeWrapperCommand();
@@ -3422,6 +3435,66 @@ async function subscriptionCommand() {
     : anthropicSubscriptionCommand();
 }
 
+// One scan for legacy `run` supervisors waiting out an exhausted fleet; see
+// src/cloud-sidecar.js. Meant to be run periodically (e.g. launchd, 60s).
+async function cloudSidecarCommand() {
+  const log = message => console.error(message);
+  if (cliProvider === 'codex') {
+    log('[TeamClaude cloud-sidecar] The cloud sidecar serves the Claude pool only.');
+    process.exitCode = 1;
+    return;
+  }
+  const config = await loadConfig();
+  if (!config || isCodexMode(config)) {
+    log('[TeamClaude cloud-sidecar] No Claude-pool config; nothing to do.');
+    return;
+  }
+  const { storePath, transcriptRoot } = defaultCmuxRescuePaths();
+  await runCloudSidecar({
+    config,
+    vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudSidecarClaudeBin || null,
+    listProcesses: listProcessesWithPs,
+    fetchStatus: async () => {
+      const response = await fetch(`http://127.0.0.1:${config.proxy?.port}/teamclaude/status`, {
+        headers: {
+          'x-api-key': config.proxy?.apiKey,
+          'x-teamcodex-status-identity': '1',
+        },
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!response.ok) throw new Error(`TeamClaude status failed (${response.status})`);
+      return response.json();
+    },
+    readCwd: readProcessCwd,
+    resolveSessionFromStore: ({ pid, startedAtMs }) =>
+      resolveSupervisorSessionId({ storePath, pid, startedAtMs }),
+    claimOnce: sessionId => claimSessionOnce(storePath, sessionId),
+    releaseClaim: (sessionId, claim) => releaseSessionClaim(storePath, sessionId, claim),
+    kill: killProcess,
+    isAlive: processIsAlive,
+    launchCloud: launchCloudWithScript,
+    readState: readCloudSidecarState,
+    writeState: writeCloudSidecarState,
+    buildHandoff: async ({ sessionId, cwd }) => {
+      const transcriptPath = await findTranscript(transcriptRoot, sessionId);
+      if (!transcriptPath) throw new Error('transcript not found');
+      return buildHandoffText({
+        transcriptPath,
+        sessionId,
+        cwd,
+        title: 'Claude Code → cloud session handoff',
+      });
+    },
+    handoffOptions: {
+      // Re-read disk: the running server persists refreshed tokens there.
+      loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+      creditLookup: token => fetchCloudCredits(token),
+    },
+    ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    log,
+  });
+}
+
 async function installClaudeWrapperCommand() {
   const installed = await installClaudeWrapper({
     homeDir: homedir(),
@@ -3505,6 +3578,7 @@ Commands:
                       Mark an account's Claude subscription lapsed (kept out of
                       rotation, survives restarts) or clear the mark
   api <path>          Call an API endpoint with account credentials
+  cloud-sidecar       One scan: hand exhausted legacy \`run\` sessions to cloud
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help

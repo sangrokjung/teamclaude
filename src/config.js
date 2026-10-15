@@ -289,6 +289,26 @@ export async function clearServerState() {
   try { await rm(getServerStatePath(), { force: true }); } catch { /* best-effort */ }
 }
 
+// Legacy cloud-sidecar observations (pid + start time → first childless
+// sighting), written next to the config. Credential-free; 0o600 + atomic.
+export function getCloudSidecarStatePath() {
+  return getConfigPath().replace(/\.json$/, '') + '.cloud-sidecar.json';
+}
+
+export async function readCloudSidecarState() {
+  try {
+    return JSON.parse(await readFile(getCloudSidecarStatePath(), 'utf-8'));
+  } catch {
+    return null; // missing or unreadable → start with no observations
+  }
+}
+
+export async function writeCloudSidecarState(state) {
+  const path = getCloudSidecarStatePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFileAtomic(path, JSON.stringify(state, null, 2) + '\n');
+}
+
 // Per-account quota snapshot (credential-free), written next to the config so a
 // restarted server starts from the last known quota/throttle state instead of a
 // blank dashboard. Unlike the server-state file this survives exit on purpose.

@@ -38,4 +38,7 @@ PR #66의 클라우드 인계는 `teamclaude run` 감독 프로세스 안에서 
 - 테스트: 의존성을 주입한 단위 테스트(프로세스 목록, 상태, kill, launch를 스텁).
 
 ## Verification
-(구현 후 기록)
+- `node --test test/cloud-sidecar.test.js test/cloud-handoff.test.js test/claude-recovery-cloud.test.js test/run-cloud-handoff.test.js test/secrets.test.js`: 83 pass, 0 fail (사이드카 24건).
+- 사이드카 테스트가 덮는 것: 기능 꺼짐·컷오프 미설정, 소진 아님·상태 조회 실패·판정 불가, 복구 10분 미만, 컷오프 이후 프로세스, 자식 생존, 1회 관측·60초 미만, 세션 ID 없음, vendor·cwd 없음, claim 거부(kill 0·launch 0), 정상 경로(claim → SIGTERM → launch 순서, 원장 `source: "legacy-sidecar"`, 실제 `attemptCloudHandoff`·로컬 bare origin 사용), SIGTERM 전 재확인 실패 시 kill 없음·claim 해제, SIGTERM 후 생존 시 launch 없음·claim 유지, 감독당 1회 시도, 실행당 상한(기본 4·설정 2).
+- 실제 seam 스모크: 임시 설정으로 `teamclaude cloud-sidecar` 실행 시 기능 꺼짐 no-op, `ps` 파싱·상태 파일 0600 기록, codex 모드 거부(exit 1). `processIsAlive`·`readProcessCwd`·`script -q /dev/null` 실행을 자기 프로세스와 `/usr/bin/true`로 확인.
+- 린트: `eslint src test` 0 errors (기존 경고만).
