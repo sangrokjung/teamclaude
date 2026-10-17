@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import {
   chmod,
   lstat,
@@ -28,6 +29,12 @@ import {
 } from '../src/claude-wrapper.js';
 
 const entry = fileURLToPath(new URL('../src/index.js', import.meta.url));
+
+// The generated wrapper, vendor shim and test fixtures are `#!/bin/zsh` scripts
+// (macOS ships zsh). Tests that execute them need it; CI installs it explicitly.
+const needsZsh = {
+  skip: existsSync('/bin/zsh') ? false : '/bin/zsh is not installed on this machine',
+};
 
 async function makeFixture(prefix = 'teamclaude wrapper ') {
   const root = await mkdtemp(join(tmpdir(), prefix));
@@ -144,7 +151,7 @@ test('findNewestClaudeVendor uses semantic version order and ignores non-version
   }
 });
 
-test('vendor shim ignores malformed SemVer build metadata at runtime', async () => {
+test('vendor shim ignores malformed SemVer build metadata at runtime', needsZsh, async () => {
   const fixture = await makeFixture();
   try {
     await writeNative(fixture, '1.0.0');
@@ -182,7 +189,7 @@ const invalidRuntimeSemvers = [
   '1.0.0-01',
 ];
 
-test('vendor shim rejects the complete invalid SemVer corpus at runtime', async t => {
+test('vendor shim rejects the complete invalid SemVer corpus at runtime', needsZsh, async t => {
   for (const invalidVersion of invalidRuntimeSemvers) {
     await t.test(invalidVersion, async () => {
       const fixture = await makeFixture();
@@ -216,7 +223,7 @@ test('vendor shim rejects the complete invalid SemVer corpus at runtime', async 
   }
 });
 
-test('vendor shim preserves valid prerelease and build metadata precedence', async t => {
+test('vendor shim preserves valid prerelease and build metadata precedence', needsZsh, async t => {
   const scenarios = [
     {
       versions: ['2.0.0-alpha.2+build.7', '2.0.0-alpha.10+meta.1'],
@@ -421,7 +428,7 @@ test('interrupted existing install updates converge on the next install', async 
   }
 });
 
-test('installed wrapper dynamically adopts a new vendor and preserves argv and exit status', async () => {
+test('installed wrapper dynamically adopts a new vendor and preserves argv and exit status', needsZsh, async () => {
   const fixture = await makeFixture();
   try {
     await writeNative(fixture, '2.1.9');
@@ -655,7 +662,7 @@ test('uninstall fails closed when managed files remain but state is missing', as
   }
 });
 
-test('vendor shim fails closed for wrapper recursion, a non-executable candidate, and a symlink loop', async t => {
+test('vendor shim fails closed for wrapper recursion, a non-executable candidate, and a symlink loop', needsZsh, async t => {
   await t.test('same realpath as transparent wrapper or vendor shim exits 75', async () => {
     const fixture = await makeFixture();
     try {
@@ -715,7 +722,7 @@ test('vendor shim fails closed for wrapper recursion, a non-executable candidate
   });
 });
 
-test('exec chain preserves SIGINT and SIGTERM without leaving an orphan native process', async t => {
+test('exec chain preserves SIGINT and SIGTERM without leaving an orphan native process', needsZsh, async t => {
   for (const signal of ['SIGINT', 'SIGTERM']) {
     await t.test(signal, async () => {
       const fixture = await makeFixture();
