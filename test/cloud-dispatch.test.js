@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
@@ -13,6 +14,7 @@ import {
   extractSessionUrl,
   isFolderTrusted,
   launchCloudCapturing,
+  readTaskInput,
 } from '../src/cloud-dispatch.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
@@ -218,7 +220,14 @@ test('prompt names the branch and carries the task verbatim', () => {
 });
 
 test('session url extraction strips terminal escapes and tolerates junk', () => {
-  assert.equal(extractSessionUrl('\x1b]8;;x\x07see \x1b[1mhttps://claude.ai/code/session_A-b_9\x1b[0m'), 'https://claude.ai/code/session_A-b_9');
+  assert.equal(extractSessionUrl('\x1b]8;;x\x07see \x1b[1mhttps://claude.ai/code/session_Ab9\x1b[0m'), 'https://claude.ai/code/session_Ab9');
+  // Not session links: settings pages, partial ids.
+  assert.equal(extractSessionUrl('Error: launch failed. Visit https://claude.ai/code/settings'), null);
+  assert.equal(extractSessionUrl('https://claude.ai/code/session_ab-cd'), null);
+  // A link that was part of what we sent (echo, quoted old task) proves nothing.
+  const sent = '이전 작업 https://claude.ai/code/session_old1 이어서';
+  assert.equal(extractSessionUrl(`${sent}\nError: auth failed`, { sent }), null);
+  assert.equal(extractSessionUrl(`${sent}\nhttps://claude.ai/code/session_new2`, { sent }), 'https://claude.ai/code/session_new2');
   assert.equal(extractSessionUrl('no link here'), null);
   assert.equal(extractSessionUrl(undefined), null);
 });
@@ -267,4 +276,34 @@ test('folder trust reads exactly this folder from Claude Code config', async () 
   let read = null;
   await isFolderTrusted('/a', { env, resolvePath, readText: async path => { read = path; return '{}'; } });
   assert.equal(read, '/cfg/.claude.json');
+});
+
+test('an echoed old session link in a failed launch is not success', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    task: '지난번 https://claude.ai/code/session_old9 결과를 이어서 마무리',
+    launchCloud: async request => ({ status: 1, signal: null, output: `${request.args[1]}\nError: auth failed` }),
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.AMBIGUOUS);
+});
+
+test('task input is read with a hard byte cap from files and streams', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-dispatch-input-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const small = join(root, 'small.txt');
+  await writeFile(small, '이슈 #3 해결');
+  assert.deepEqual(await readTaskInput(small), { task: '이슈 #3 해결' });
+  const big = join(root, 'big.txt');
+  await writeFile(big, 'x'.repeat(DISPATCH_TASK_MAX_BYTES + 10));
+  assert.deepEqual(await readTaskInput(big), { reason: 'task-too-large' });
+  assert.deepEqual(await readTaskInput(join(root, 'missing')), { reason: 'task-unreadable' });
+
+  // An endless stream stops once past the cap instead of being buffered whole.
+  let pulled = 0;
+  const endless = new Readable({
+    read() { pulled += 1; this.push(Buffer.alloc(1024, 120)); },
+  });
+  assert.deepEqual(await readTaskInput(endless), { reason: 'task-too-large' });
+  assert.ok(pulled < 64, `pulled ${pulled} chunks`);
+  assert.deepEqual(await readTaskInput(Readable.from([Buffer.from('a'), Buffer.from('b')])), { task: 'ab' });
 });

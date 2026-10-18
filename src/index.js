@@ -41,7 +41,7 @@ import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
-import { DISPATCH_EXIT, attemptCloudDispatch } from './cloud-dispatch.js';
+import { DISPATCH_EXIT, attemptCloudDispatch, readTaskInput } from './cloud-dispatch.js';
 import {
   killProcess,
   launchCloudWithScript,
@@ -3472,11 +3472,9 @@ async function cloudDispatchCommand() {
   }
   let task = words.join(' ');
   if (taskFile) {
-    try {
-      task = readFileSync(taskFile === '-' ? 0 : taskFile, 'utf8');
-    } catch {
-      return local('task-unreadable');
-    }
+    const input = await readTaskInput(taskFile === '-' ? process.stdin : taskFile);
+    if (input.reason) return local(input.reason);
+    task = input.task;
   }
   const config = await loadConfig();
   if (!config || isCodexMode(config)) return local('no-claude-pool');

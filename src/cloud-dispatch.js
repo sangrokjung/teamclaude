@@ -17,7 +17,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { mkdtemp, open, readFile, realpath, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -38,7 +38,7 @@ export const DISPATCH_TASK_MAX_BYTES = 32 * 1024;
 export const DISPATCH_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
-const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_\-/]+/;
+const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?![A-Za-z0-9_\-/])/g;
 
 // `--cloud` in a folder Claude Code has never trusted stops at the trust
 // prompt (default "No, exit") and never prints a session link, so such a
@@ -77,11 +77,57 @@ export function buildDispatchPrompt({ branch, task }) {
   ].join('\n');
 }
 
-// The cloud session link printed by `<vendor> --cloud`, if any.
-export function extractSessionUrl(output) {
+// The cloud session link printed by `<vendor> --cloud`, if any: the last
+// `/code/session_<id>` link in the output that was not already part of what
+// we sent (a terminal may echo the prompt, and a task may quote old links).
+export function extractSessionUrl(output, { sent = '' } = {}) {
   if (typeof output !== 'string') return null;
-  const match = output.replace(ANSI_RE, '').match(SESSION_URL_RE);
-  return match ? match[0] : null;
+  const echoed = new Set(String(sent).match(SESSION_URL_RE) ?? []);
+  const links = (output.replace(ANSI_RE, '').match(SESSION_URL_RE) ?? [])
+    .filter(link => !echoed.has(link));
+  return links.length > 0 ? links[links.length - 1] : null;
+}
+
+// Reads at most DISPATCH_TASK_MAX_BYTES + 1 bytes from a file path or a
+// stream (stdin), so an oversized or endless input is refused without being
+// buffered whole. Returns { task } or { reason }.
+export async function readTaskInput(source, { maxBytes = DISPATCH_TASK_MAX_BYTES } = {}) {
+  const chunks = [];
+  let total = 0;
+  const take = chunk => {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buffer);
+    total += buffer.length;
+    return total > maxBytes;
+  };
+  try {
+    if (typeof source === 'string') {
+      const handle = await open(source, 'r');
+      try {
+        const buffer = Buffer.alloc(maxBytes + 1);
+        let filled = 0;
+        while (filled < buffer.length) {
+          const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, null);
+          if (bytesRead === 0) break;
+          filled += bytesRead;
+        }
+        take(buffer.subarray(0, filled));
+      } finally {
+        await handle.close();
+      }
+    } else {
+      for await (const chunk of source) {
+        if (take(chunk)) {
+          source.destroy?.();
+          break;
+        }
+      }
+    }
+  } catch {
+    return { reason: 'task-unreadable' };
+  }
+  if (total > maxBytes) return { reason: 'task-too-large' };
+  return { task: Buffer.concat(chunks).toString('utf8') };
 }
 
 // `--cloud` needs a TTY; `script` supplies one and records the terminal
@@ -168,18 +214,19 @@ export async function attemptCloudDispatch({
   });
   if (!snapshot.ok) return local(snapshot.reason);
 
+  const prompt = buildDispatchPrompt({ branch: snapshot.branch, task });
   let result = null;
   try {
     result = await launchCloud({
       vendorBin,
-      args: ['--cloud', buildDispatchPrompt({ branch: snapshot.branch, task })],
+      args: ['--cloud', prompt],
       env: buildCloudEnv(baseEnv, account.accessToken),
       cwd: repo.root,
     });
   } catch {
     result = null;
   }
-  const url = extractSessionUrl(result?.output);
+  const url = extractSessionUrl(result?.output, { sent: prompt });
   const neverSpawned = Boolean(result?.error
     && (result.error.code === 'ENOENT' || result.error.code === 'EACCES')
     && !result.pid);
