@@ -38,11 +38,14 @@ export const DISPATCH_TASK_MAX_BYTES = 32 * 1024;
 export const DISPATCH_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
-// Allowlist: the id must end the link, followed only by end of text,
-// whitespace, a closing quote/bracket, or one punctuation mark that itself
-// ends the text or precedes whitespace. Anything else (a path, `;x`, `+x`,
-// `.html`, an escape) makes it some other URL, not proof of a new session.
-const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?=$|[\s"'<>)\]]|[.,;:!?](?:$|\s))/g;
+// `<vendor> --cloud` reports a created session on its own lines (observed
+// 2026-10-18, Claude Code 2.1.302):
+//   View: https://claude.ai/code/session_<id>?from=cli&m=0
+//   Resume with: claude --teleport session_<id>
+// Only that exact, whole "Resume with" line counts; a link anywhere else
+// (an error hint, an echoed task) proves nothing.
+const RESUME_LINE_RE = /^Resume with: claude --teleport (session_[A-Za-z0-9]+)$/;
+const SESSION_ID_RE = /session_[A-Za-z0-9]+/g;
 
 // `--cloud` in a folder Claude Code has never trusted stops at the trust
 // prompt (default "No, exit") and never prints a session link, so such a
@@ -81,15 +84,17 @@ export function buildDispatchPrompt({ branch, task }) {
   ].join('\n');
 }
 
-// The cloud session link printed by `<vendor> --cloud`, if any: the last
-// `/code/session_<id>` link in the output that was not already part of what
-// we sent (a terminal may echo the prompt, and a task may quote old links).
+// The created session's link, from the launcher's "Resume with" line, or
+// null. Session ids that were already in what we sent (a terminal may echo
+// the prompt) never count.
 export function extractSessionUrl(output, { sent = '' } = {}) {
   if (typeof output !== 'string') return null;
-  const echoed = new Set(String(sent).replace(ANSI_RE, '').match(SESSION_URL_RE) ?? []);
-  const links = (output.replace(ANSI_RE, '').match(SESSION_URL_RE) ?? [])
-    .filter(link => !echoed.has(link));
-  return links.length > 0 ? links[links.length - 1] : null;
+  const echoed = new Set(String(sent).replace(ANSI_RE, '').match(SESSION_ID_RE) ?? []);
+  const ids = output.replace(ANSI_RE, '')
+    .split(/\r?\n|\r/)
+    .map(line => line.trim().match(RESUME_LINE_RE)?.[1])
+    .filter(id => id && !echoed.has(id));
+  return ids.length > 0 ? `https://claude.ai/code/${ids[ids.length - 1]}` : null;
 }
 
 // Reads at most DISPATCH_TASK_MAX_BYTES + 1 bytes from a file path or a

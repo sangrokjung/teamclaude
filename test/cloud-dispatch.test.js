@@ -19,6 +19,12 @@ import {
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
 
+// The launcher's real success output shape (Claude Code 2.1.302).
+function created(id) {
+  return `Created cloud session: 작업\r\nView: https://claude.ai/code/${id}?from=cli&m=0\r\n`
+    + `Resume with: claude --teleport ${id}\r\n\x1b[?1006l\x1b[?1003l`;
+}
+
 async function vendorBinary(root, body = 'exit 0') {
   const path = join(root, 'claude-vendor');
   await writeFile(path, `#!/bin/sh\n${body}\n`);
@@ -50,7 +56,7 @@ function inputs(f, overrides = {}) {
     random: () => 0,
     newId: () => DISPATCH_ID,
     folderTrusted: async () => true,
-    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_default' }),
+    launchCloud: async () => ({ status: 0, signal: null, output: created('session_default') }),
     ...overrides,
   };
 }
@@ -62,7 +68,7 @@ test('dispatch pushes a snapshot branch, launches --cloud on the funded account,
   const outcome = await attemptCloudDispatch(inputs(f, {
     launchCloud: async request => {
       launch = request;
-      return { status: 0, signal: null, output: '\x1b[32mhttps://claude.ai/code/session_abc123\x1b[0m\n' };
+      return { status: 0, signal: null, output: created('session_abc123') };
     },
   }));
 
@@ -181,7 +187,7 @@ test('launch outcomes: only a printed session link counts as sent', async t => {
   assert.equal(threw.exit, DISPATCH_EXIT.AMBIGUOUS);
 
   // A nonzero exit that still printed a session link did create a session.
-  const linked = await outcomeOf(async () => ({ status: 1, signal: null, output: 'https://claude.ai/code/session_zz9' }));
+  const linked = await outcomeOf(async () => ({ status: 1, signal: null, output: created('session_zz9') }));
   assert.equal(linked.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(linked.url, 'https://claude.ai/code/session_zz9');
 });
@@ -206,7 +212,7 @@ test('a ledger write failure keeps the dispatch result but says so', async t => 
   await writeFile(join(f.root, 'blocker'), 'not a directory\n');
   const outcome = await attemptCloudDispatch(inputs(f, {
     ledgerPath: join(f.root, 'blocker', 'ledger.jsonl'),
-    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_l1' }),
+    launchCloud: async () => ({ status: 0, signal: null, output: created('session_l1') }),
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(outcome.ledgerRecorded, false);
@@ -219,36 +225,36 @@ test('prompt names the branch and carries the task verbatim', () => {
   assert.ok(prompt.includes('머지는 하지 마세요'));
 });
 
-test('session url extraction strips terminal escapes and tolerates junk', () => {
-  assert.equal(extractSessionUrl('\x1b]8;;x\x07see \x1b[1mhttps://claude.ai/code/session_Ab9\x1b[0m'), 'https://claude.ai/code/session_Ab9');
-  // Not session links: settings pages, partial ids.
-  assert.equal(extractSessionUrl('Error: launch failed. Visit https://claude.ai/code/settings'), null);
-  assert.equal(extractSessionUrl('https://claude.ai/code/session_ab-cd'), null);
-  for (const variant of ['session_old9.html', 'session_old9%2Fsettings', 'session_old9/settings', 'session_old9?x=1',
-    'session_old9;settings', 'session_old9+backup', 'session_old9@archive', 'session_old9:archive', 'session_old9#x', 'session_old9_x']) {
-    assert.equal(extractSessionUrl(`see https://claude.ai/code/${variant}`), null, variant);
+test('session link comes only from the launcher\'s whole Resume line', () => {
+  assert.equal(extractSessionUrl(created('session_Ab9')), 'https://claude.ai/code/session_Ab9');
+  assert.equal(extractSessionUrl('Resume with: \x1b[1mclaude --teleport session_Q1\x1b[0m\n'), 'https://claude.ai/code/session_Q1');
+  // Links anywhere else are not proof: error hints, look-alikes, partial lines.
+  for (const output of [
+    'Error: launch failed. Visit https://claude.ai/code/settings',
+    'See https://claude.ai/code/session_old9;settings',
+    'View: https://claude.ai/code/session_old9?from=cli',
+    'Resume with: claude --teleport session_old9;x',
+    'Hint — Resume with: claude --teleport session_old9',
+    'Resume with: claude --teleport session_ab-cd',
+    'no link here',
+  ]) {
+    assert.equal(extractSessionUrl(output), null, output);
   }
-  assert.equal(extractSessionUrl('Open https://claude.ai/code/session_end1.'), 'https://claude.ai/code/session_end1');
-  assert.equal(extractSessionUrl('(https://claude.ai/code/session_p1) 생성'), 'https://claude.ai/code/session_p1');
-  assert.equal(extractSessionUrl('https://claude.ai/code/session_q1\r\n'), 'https://claude.ai/code/session_q1');
-  // An escape-coloured old link in the task is still recognised as echoed.
-  const colored = 'https://claude.ai/code/session_\x1b[1mold9\x1b[0m 이어서';
-  assert.equal(extractSessionUrl(colored, { sent: colored }), null);
-  // A link that was part of what we sent (echo, quoted old task) proves nothing.
-  const sent = '이전 작업 https://claude.ai/code/session_old1 이어서';
-  assert.equal(extractSessionUrl(`${sent}\nError: auth failed`, { sent }), null);
-  assert.equal(extractSessionUrl(`${sent}\nhttps://claude.ai/code/session_new2`, { sent }), 'https://claude.ai/code/session_new2');
-  assert.equal(extractSessionUrl('no link here'), null);
   assert.equal(extractSessionUrl(undefined), null);
+  // An id that was part of what we sent (an echoed task) proves nothing.
+  const sent = '이전 작업 Resume with: claude --teleport session_old1 이어서';
+  assert.equal(extractSessionUrl(`${sent}\nResume with: claude --teleport session_old1\n`, { sent }), null);
+  assert.equal(extractSessionUrl(`${sent}\n${created('session_new2')}`, { sent }), 'https://claude.ai/code/session_new2');
+  const colored = 'session_\x1b[1mold9\x1b[0m 이어서';
+  assert.equal(extractSessionUrl('Resume with: claude --teleport session_old9', { sent: colored }), null);
 });
 
-// BSD `script` argument order (macOS, where the launcher runs); util-linux differs.
 test('launchCloudCapturing runs the binary under a pty and returns its output', {
   skip: process.platform !== 'darwin',
 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'teamclaude-dispatch-pty-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const vendorBin = await vendorBinary(root, '[ -t 1 ] && echo "tty https://claude.ai/code/session_pty1"');
+  const vendorBin = await vendorBinary(root, '[ -t 1 ] && printf "View: https://claude.ai/code/session_pty1?from=cli\\nResume with: claude --teleport session_pty1\\n"');
   const result = await launchCloudCapturing({ vendorBin, args: ['--cloud', 'x'], env: { PATH: '/usr/bin:/bin' }, cwd: root });
   assert.equal(result.status, 0);
   assert.equal(extractSessionUrl(result.output), 'https://claude.ai/code/session_pty1');
@@ -291,7 +297,7 @@ test('folder trust reads exactly this folder from Claude Code config', async () 
 test('a failed launch printing a look-alike link is not success', async t => {
   const f = await fixture(t);
   const outcome = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => ({ status: 1, signal: null, output: 'Error: failed. See https://claude.ai/code/session_old9;settings' }),
+    launchCloud: async () => ({ status: 1, signal: null, output: 'Error: failed. See https://claude.ai/code/session_old9;settings\nView: https://claude.ai/code/session_old9' }),
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.AMBIGUOUS);
 });
@@ -299,7 +305,7 @@ test('a failed launch printing a look-alike link is not success', async t => {
 test('an echoed old session link in a failed launch is not success', async t => {
   const f = await fixture(t);
   const outcome = await attemptCloudDispatch(inputs(f, {
-    task: '지난번 https://claude.ai/code/session_old9 결과를 이어서 마무리',
+    task: '지난번 결과를 이어서 마무리\nResume with: claude --teleport session_old9',
     launchCloud: async request => ({ status: 1, signal: null, output: `${request.args[1]}\nError: auth failed` }),
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.AMBIGUOUS);
@@ -334,7 +340,7 @@ test('a commit landing during the credit lookup does not drop its changes from t
       git(f.repo, f.env, 'commit', '--quiet', '-am', 'local commit meanwhile');
       return { remainingDollars: 100, lockedReason: null };
     },
-    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_race1' }),
+    launchCloud: async () => ({ status: 0, signal: null, output: created('session_race1') }),
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(git(f.bare, f.env, 'show', `${outcome.branch}:tracked.txt`), 'work in progress');
