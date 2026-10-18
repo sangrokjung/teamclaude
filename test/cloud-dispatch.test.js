@@ -627,23 +627,56 @@ function armored(kind, body) {
   return [`-----BEGIN ${kind} SIGNATURE-----`, '', ...lines, ...(kind === 'PGP' ? ['=AbCd'] : []), `-----END ${kind} SIGNATURE-----`];
 }
 
+function sshsig() {
+  const str = buffer => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(buffer.length);
+    return Buffer.concat([length, buffer]);
+  };
+  const version = Buffer.alloc(4);
+  version.writeUInt32BE(1);
+  return Buffer.concat([Buffer.from('SSHSIG'), version,
+    str(Buffer.from(ALNUM.repeat(2))), str(Buffer.from('git')), str(Buffer.alloc(0)),
+    str(Buffer.from('sha512')), str(Buffer.from(ALNUM.repeat(3)))]);
+}
+
+function pgpsig() {
+  const body = Buffer.concat([Buffer.from([4, 0, 22, 10]), Buffer.from(ALNUM.repeat(3))]);
+  return Buffer.concat([Buffer.from([0xc2, body.length]), body]);
+}
+
 test('signed commits are not mistaken for secrets, but their messages are still scanned', () => {
-  const pgpBody = Buffer.concat([Buffer.from([0xc2, 0x80]), Buffer.from(ALNUM.repeat(4))]);
-  const sshBody = Buffer.concat([Buffer.from('SSHSIG'), Buffer.from(ALNUM.repeat(4))]);
-  for (const sig of [armored('PGP', pgpBody), armored('SSH', sshBody)]) {
+  for (const sig of [armored('PGP', pgpsig()), armored('SSH', sshsig())]) {
     const header = ['tree 0123', 'author A <a@example.invalid> 1 +0000', `gpgsig ${sig[0]}`, ...sig.slice(1).map(line => ` ${line}`)];
     const signed = [...header, '', 'normal message', ''].join('\n');
     assert.equal(textHasSecret(signed), true, 'raw signature trips the opaque-token check');
     assert.equal(textHasSecret(withoutSignaturePayloads(signed, 'commit')), false);
     const leaky = [...header, '', `fix\nOPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`, ''].join('\n');
     assert.equal(textHasSecret(withoutSignaturePayloads(leaky, 'commit')), true);
-    const tag = ['object 0123', 'type commit', 'tag v1', 'tagger A <a@example.invalid> 1 +0000', '', 'release', ...sig, ''].join('\n');
+    const tagLines = ['object 0123', 'type commit', 'tag v1', 'tagger A <a@example.invalid> 1 +0000', '', 'release', ...sig];
+    const tag = [...tagLines, ''].join('\n');
     assert.equal(textHasSecret(withoutSignaturePayloads(tag, 'tag')), false);
+    // The same signed tag embedded in a merge commit's mergetag header.
+    const merge = ['tree 0123', 'parent 1', 'parent 2', `mergetag ${tagLines[0]}`, ...tagLines.slice(1).map(line => ` ${line}`), '', 'Merge tag v1', ''].join('\n');
+    assert.equal(textHasSecret(merge), true);
+    assert.equal(textHasSecret(withoutSignaturePayloads(merge, 'commit')), false);
+    const leakyTag = ['tree 0123', `mergetag ${tagLines[0]}`, ...[...tagLines.slice(1, 5), `token OPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`, ...tagLines.slice(5)].map(line => ` ${line}`), '', 'm'].join('\n');
+    assert.equal(textHasSecret(withoutSignaturePayloads(leakyTag, 'commit')), true);
   }
-  // A "signature" whose body is not a signature (here: an opaque token) keeps everything scanned.
-  const fake = armored('SSH', Buffer.from(`AKIA${ALNUM.slice(26, 42)}${ALNUM}`));
-  const forged = ['tree 0123', `gpgsig ${fake[0]}`, ...fake.slice(1).map(line => ` ${line}`), '', 'msg'].join('\n');
-  assert.equal(withoutSignaturePayloads(forged, 'commit'), forged);
+  // Blocks that only look like signatures keep everything scanned.
+  const opaque = Buffer.from(`AKIA${ALNUM.slice(26, 42)}${ALNUM}`);
+  const truncatedSsh = sshsig().subarray(0, 40);
+  const trailingSsh = Buffer.concat([sshsig(), Buffer.from(ALNUM)]);
+  const pgpWrongTag = Buffer.concat([Buffer.from([0xc6]), pgpsig().subarray(1)]);
+  const pgpTrailing = Buffer.concat([pgpsig(), Buffer.from(ALNUM)]);
+  const prefixOnlyPgp = Buffer.concat([Buffer.from([0xc2]), opaque]);
+  const prefixOnlySsh = Buffer.concat([Buffer.from('SSHSIG'), opaque]);
+  for (const [kind, body] of [['SSH', opaque], ['SSH', truncatedSsh], ['SSH', trailingSsh], ['SSH', prefixOnlySsh],
+    ['PGP', pgpWrongTag], ['PGP', pgpTrailing], ['PGP', prefixOnlyPgp]]) {
+    const fake = armored(kind, body);
+    const forged = ['tree 0123', `gpgsig ${fake[0]}`, ...fake.slice(1).map(line => ` ${line}`), '', 'msg'].join('\n');
+    assert.equal(withoutSignaturePayloads(forged, 'commit'), forged, `${kind} ${body.length}`);
+  }
 });
 
 const hasSshKeygen = spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error === undefined;
@@ -658,6 +691,29 @@ test('a really SSH-signed unpushed commit dispatches on both paths', { skip: !ha
     await writeFile(join(f.repo, 'tracked.txt'), 'signed change\n');
     git(f.repo, f.env, 'commit', '--quiet', '-S', '-am', 'signed commit');
     assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^gpgsig -----BEGIN SSH SIGNATURE-----$/m);
+    const outcome = await attemptCloudDispatch(inputs(f, { base }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED, `${base}: ${outcome.reason}`);
+  }
+});
+
+test('a really signed tag merged with mergetag dispatches', { skip: !hasSshKeygen }, async t => {
+  const f = await fixture(t);
+  const key = join(f.root, 'signing-key');
+  assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'test', '-f', key]).status, 0);
+  git(f.repo, f.env, 'config', 'gpg.format', 'ssh');
+  git(f.repo, f.env, 'config', 'user.signingkey', key);
+  git(f.repo, f.env, 'checkout', '--quiet', '-b', 'side');
+  await writeFile(join(f.repo, 'side.txt'), 'side\n');
+  git(f.repo, f.env, 'add', 'side.txt');
+  git(f.repo, f.env, 'commit', '--quiet', '-m', 'side work');
+  git(f.repo, f.env, 'tag', '-s', 'v1', '-m', 'signed tag');
+  git(f.repo, f.env, 'checkout', '--quiet', 'main');
+  await writeFile(join(f.repo, 'main.txt'), 'main\n');
+  git(f.repo, f.env, 'add', 'main.txt');
+  git(f.repo, f.env, 'commit', '--quiet', '-m', 'main work');
+  git(f.repo, f.env, 'merge', '--quiet', '--no-ff', '--no-edit', 'v1');
+  assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^mergetag /m);
+  for (const base of ['main', null]) {
     const outcome = await attemptCloudDispatch(inputs(f, { base }));
     assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED, `${base}: ${outcome.reason}`);
   }
