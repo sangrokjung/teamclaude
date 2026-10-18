@@ -445,7 +445,7 @@ export async function appendCloudLedger(path, entry) {
   await chmod(path, 0o600);
 }
 
-async function isExecutableFile(path) {
+export async function isExecutableFile(path) {
   if (typeof path !== 'string' || !isAbsolute(path)) return false;
   try {
     const info = await stat(path);
