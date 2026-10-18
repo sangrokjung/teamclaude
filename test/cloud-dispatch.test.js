@@ -390,3 +390,16 @@ test('argument parsing takes the task from one source and refuses guesses', () =
     assert.deepEqual(parseDispatchArgs(argv), { reason: 'bad-arguments' }, argv.join(' '));
   }
 });
+
+test('a task with a NUL byte is refused before anything is pushed', async t => {
+  const f = await fixture(t);
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    task: 'a\0b',
+    launchCloud: async () => { launched = true; return { status: 0 }; },
+  }));
+  assert.equal(outcome.reason, 'task-invalid-content');
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(launched, false);
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});

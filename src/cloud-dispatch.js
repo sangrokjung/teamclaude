@@ -220,6 +220,8 @@ export async function attemptCloudDispatch({
   const local = reason => ({ ok: false, exit: DISPATCH_EXIT.RUN_LOCAL, reason });
   if (typeof task !== 'string' || task.trim().length === 0) return local('task-empty');
   if (Buffer.byteLength(task, 'utf8') > DISPATCH_TASK_MAX_BYTES) return local('task-too-large');
+  // A NUL cannot travel in a process argument; the launch would only throw.
+  if (task.includes('\0')) return local('task-invalid-content');
   if (textHasSecret(task)) return local('task-has-secret');
   // The launcher drives `script` with BSD (macOS) arguments; refuse elsewhere
   // before anything is pushed.
