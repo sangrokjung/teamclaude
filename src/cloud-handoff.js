@@ -162,9 +162,26 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
       || lines(fetchUrls)[0] !== lines(pushUrls)[0]) {
     return { ok: false, reason: 'origin-push-differs' };
   }
+  // Git re-applies insteadOf/pushInsteadOf to a URL given on the command
+  // line, so the resolved URL must be a fixed point of both rewrites: no
+  // rule's match prefix may match it, or `ls-remote <url>` and `push <url>`
+  // could still reach different hosts.
+  const remoteUrl = lines(pushUrls)[0];
+  const rules = await runGit(
+    ['config', '--get-regexp', '^url\\..*\\.(push)?insteadof$'],
+    { cwd: root, env: gitEnv },
+  );
+  // Exit 1 means no such rules; anything else is unreadable config.
+  if (rules.status !== 0 && rules.status !== 1) return { ok: false, reason: 'origin-push-differs' };
+  const prefixes = rules.status === 0
+    ? lines(rules).map(line => line.slice(line.indexOf(' ') + 1))
+    : [];
+  if (prefixes.some(prefix => prefix.length > 0 && remoteUrl.startsWith(prefix))) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const head = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, env: gitEnv });
   if (head.status !== 0 || !head.stdout.trim()) return { ok: false, reason: 'no-head' };
-  return { ok: true, root, head: head.stdout.trim(), remoteUrl: lines(pushUrls)[0] };
+  return { ok: true, root, head: head.stdout.trim(), remoteUrl };
 }
 
 function nulList(text) {
