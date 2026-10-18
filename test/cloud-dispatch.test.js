@@ -22,6 +22,9 @@ import {
 import { textHasSecret } from '../src/snapshot-scan.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
+// One clock for the fixture: token expiry is judged against `now`, not the wall clock.
+const NOW = new Date(2026, 9, 18, 15, 0);
+const TOKEN_EXPIRES = NOW.getTime() + 3_600_000;
 
 // The launcher's real success output shape (Claude Code 2.1.302).
 function created(id) {
@@ -52,11 +55,11 @@ function inputs(f, overrides = {}) {
     vendorBin: f.vendorBin,
     baseEnv: { PATH: '/usr/bin', ANTHROPIC_BASE_URL: 'http://localhost:3456', TEAMCLAUDE_X: '1' },
     loadAccounts: async () => [
-      { name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: Date.now() + 3_600_000 },
+      { name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: TOKEN_EXPIRES },
     ],
     creditLookup: async () => ({ remainingDollars: 100, lockedReason: null }),
     ledgerPath: join(f.root, 'ledger.jsonl'),
-    now: new Date(2026, 9, 18, 15, 0),
+    now: NOW,
     random: () => 0,
     newId: () => DISPATCH_ID,
     folderTrusted: async () => true,
@@ -203,7 +206,7 @@ test('disabled accounts are never used, not even looked up', async t => {
   const outcome = await attemptCloudDispatch(inputs(f, {
     dryRun: true,
     loadAccounts: async () => [
-      { name: 'off', enabled: false, type: 'oauth', accessToken: 'tok-off', expiresAt: Date.now() + 3_600_000 },
+      { name: 'off', enabled: false, type: 'oauth', accessToken: 'tok-off', expiresAt: TOKEN_EXPIRES },
     ],
     creditLookup: async token => { looked.push(token); return { remainingDollars: 100, lockedReason: null }; },
   }));
