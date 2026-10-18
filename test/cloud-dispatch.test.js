@@ -19,7 +19,6 @@ import {
   parseDispatchArgs,
   readTaskInput,
 } from '../src/cloud-dispatch.js';
-import { withoutSignaturePayloads } from '../src/snapshot-scan.js';
 import { textHasSecret } from '../src/snapshot-scan.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
@@ -621,100 +620,27 @@ test('every push sends one branch only: no tags, no submodule pushes, stored obj
   }
 });
 
-function armored(kind, body) {
-  const b64 = body.toString('base64');
-  const lines = b64.match(/.{1,64}/g);
-  return [`-----BEGIN ${kind} SIGNATURE-----`, '', ...lines, ...(kind === 'PGP' ? ['=AbCd'] : []), `-----END ${kind} SIGNATURE-----`];
-}
-
-function sshsig() {
-  const str = buffer => {
-    const length = Buffer.alloc(4);
-    length.writeUInt32BE(buffer.length);
-    return Buffer.concat([length, buffer]);
-  };
-  const version = Buffer.alloc(4);
-  version.writeUInt32BE(1);
-  return Buffer.concat([Buffer.from('SSHSIG'), version,
-    str(Buffer.from(ALNUM.repeat(2))), str(Buffer.from('git')), str(Buffer.alloc(0)),
-    str(Buffer.from('sha512')), str(Buffer.from(ALNUM.repeat(3)))]);
-}
-
-function pgpsig() {
-  const body = Buffer.concat([Buffer.from([4, 0, 22, 10]), Buffer.from(ALNUM.repeat(3))]);
-  return Buffer.concat([Buffer.from([0xc2, body.length]), body]);
-}
-
-test('signed commits are not mistaken for secrets, but their messages are still scanned', () => {
-  for (const sig of [armored('PGP', pgpsig()), armored('SSH', sshsig())]) {
-    const header = ['tree 0123', 'author A <a@example.invalid> 1 +0000', `gpgsig ${sig[0]}`, ...sig.slice(1).map(line => ` ${line}`)];
-    const signed = [...header, '', 'normal message', ''].join('\n');
-    assert.equal(textHasSecret(signed), true, 'raw signature trips the opaque-token check');
-    assert.equal(textHasSecret(withoutSignaturePayloads(signed, 'commit')), false);
-    const leaky = [...header, '', `fix\nOPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`, ''].join('\n');
-    assert.equal(textHasSecret(withoutSignaturePayloads(leaky, 'commit')), true);
-    const tagLines = ['object 0123', 'type commit', 'tag v1', 'tagger A <a@example.invalid> 1 +0000', '', 'release', ...sig];
-    const tag = [...tagLines, ''].join('\n');
-    assert.equal(textHasSecret(withoutSignaturePayloads(tag, 'tag')), false);
-    // The same signed tag embedded in a merge commit's mergetag header.
-    const merge = ['tree 0123', 'parent 1', 'parent 2', `mergetag ${tagLines[0]}`, ...tagLines.slice(1).map(line => ` ${line}`), '', 'Merge tag v1', ''].join('\n');
-    assert.equal(textHasSecret(merge), true);
-    assert.equal(textHasSecret(withoutSignaturePayloads(merge, 'commit')), false);
-    const leakyTag = ['tree 0123', `mergetag ${tagLines[0]}`, ...[...tagLines.slice(1, 5), `token OPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`, ...tagLines.slice(5)].map(line => ` ${line}`), '', 'm'].join('\n');
-    assert.equal(textHasSecret(withoutSignaturePayloads(leakyTag, 'commit')), true);
-  }
-  // Blocks that only look like signatures keep everything scanned.
-  const opaque = Buffer.from(`AKIA${ALNUM.slice(26, 42)}${ALNUM}`);
-  const truncatedSsh = sshsig().subarray(0, 40);
-  const trailingSsh = Buffer.concat([sshsig(), Buffer.from(ALNUM)]);
-  const pgpWrongTag = Buffer.concat([Buffer.from([0xc6]), pgpsig().subarray(1)]);
-  const pgpTrailing = Buffer.concat([pgpsig(), Buffer.from(ALNUM)]);
-  const prefixOnlyPgp = Buffer.concat([Buffer.from([0xc2]), opaque]);
-  const prefixOnlySsh = Buffer.concat([Buffer.from('SSHSIG'), opaque]);
-  for (const [kind, body] of [['SSH', opaque], ['SSH', truncatedSsh], ['SSH', trailingSsh], ['SSH', prefixOnlySsh],
-    ['PGP', pgpWrongTag], ['PGP', pgpTrailing], ['PGP', prefixOnlyPgp]]) {
-    const fake = armored(kind, body);
-    const forged = ['tree 0123', `gpgsig ${fake[0]}`, ...fake.slice(1).map(line => ` ${line}`), '', 'msg'].join('\n');
-    assert.equal(withoutSignaturePayloads(forged, 'commit'), forged, `${kind} ${body.length}`);
-  }
-});
-
 const hasSshKeygen = spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error === undefined;
 
-test('a really SSH-signed unpushed commit dispatches on both paths', { skip: !hasSshKeygen }, async t => {
-  for (const base of ['main', null]) {
-    const f = await fixture(t);
-    const key = join(f.root, 'signing-key');
-    assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'test', '-f', key]).status, 0);
-    git(f.repo, f.env, 'config', 'gpg.format', 'ssh');
-    git(f.repo, f.env, 'config', 'user.signingkey', key);
-    await writeFile(join(f.repo, 'tracked.txt'), 'signed change\n');
-    git(f.repo, f.env, 'commit', '--quiet', '-S', '-am', 'signed commit');
-    assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^gpgsig -----BEGIN SSH SIGNATURE-----$/m);
-    const outcome = await attemptCloudDispatch(inputs(f, { base }));
-    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED, `${base}: ${outcome.reason}`);
-  }
-});
-
-test('a really signed tag merged with mergetag dispatches', { skip: !hasSshKeygen }, async t => {
+test('an unpushed signed commit fails closed (run locally), a pushed base does not care', { skip: !hasSshKeygen }, async t => {
   const f = await fixture(t);
   const key = join(f.root, 'signing-key');
   assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'test', '-f', key]).status, 0);
   git(f.repo, f.env, 'config', 'gpg.format', 'ssh');
   git(f.repo, f.env, 'config', 'user.signingkey', key);
-  git(f.repo, f.env, 'checkout', '--quiet', '-b', 'side');
-  await writeFile(join(f.repo, 'side.txt'), 'side\n');
-  git(f.repo, f.env, 'add', 'side.txt');
-  git(f.repo, f.env, 'commit', '--quiet', '-m', 'side work');
-  git(f.repo, f.env, 'tag', '-s', 'v1', '-m', 'signed tag');
-  git(f.repo, f.env, 'checkout', '--quiet', 'main');
-  await writeFile(join(f.repo, 'main.txt'), 'main\n');
-  git(f.repo, f.env, 'add', 'main.txt');
-  git(f.repo, f.env, 'commit', '--quiet', '-m', 'main work');
-  git(f.repo, f.env, 'merge', '--quiet', '--no-ff', '--no-edit', 'v1');
-  assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^mergetag /m);
-  for (const base of ['main', null]) {
+  await writeFile(join(f.repo, 'tracked.txt'), 'signed change\n');
+  git(f.repo, f.env, 'commit', '--quiet', '-S', '-am', 'signed commit');
+  assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^gpgsig -----BEGIN SSH SIGNATURE-----$/m);
+  // Unpushed signed history: refused before any push, the task runs locally.
+  for (const base of ['HEAD', null]) {
     const outcome = await attemptCloudDispatch(inputs(f, { base }));
-    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED, `${base}: ${outcome.reason}`);
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL, String(base));
+    assert.equal(outcome.reason, 'snapshot-secret', String(base));
   }
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  // Once pushed, a base at that commit scans nothing new and dispatches.
+  // (-u: the fixture's bare HEAD does not name main, the upstream does.)
+  git(f.repo, f.env, 'push', '--quiet', '-u', 'origin', 'main');
+  const pushed = await attemptCloudDispatch(inputs(f, { base: 'main' }));
+  assert.equal(pushed.exit, DISPATCH_EXIT.DISPATCHED);
 });

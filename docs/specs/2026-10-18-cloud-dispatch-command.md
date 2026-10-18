@@ -36,6 +36,12 @@ Status: accepted
 
 stdout은 JSON 한 줄(`ok`, `exit`, `reason`, `account`, `branch`, `url`)이다.
 
+## 전송 경계 (인계·디스패치 공통, 교차 검증으로 보강)
+- origin은 fetch·push URL이 각각 하나이고 서로 같아야 하며, 그 URL에 다시 적용될 `insteadOf`·`pushInsteadOf` 규칙(빈 접두사 포함)이 없어야 한다. 확인한 URL을 스캔(`ls-remote`)과 push에 그대로 쓰고, push 직전에 재작성 규칙을 다시 확인한다. 실행 도중 같은 사용자 프로세스가 git 설정을 고의로 바꾸는 경우는 위협 모델 밖이다(사이드카와 동일).
+- 스냅샷은 처음 확인한 HEAD에 고정한다(조회 중 커밋이 생겨도 변경이 빠지지 않음).
+- 스캐너는 새로 나가는 blob·tree(파일명)·commit·tag 객체를 모두 텍스트로 검사하고, `GIT_NO_REPLACE_OBJECTS=1`로 저장된 원본만 읽는다. push는 `--no-follow-tags --recurse-submodules=no`로 브랜치 하나만 보낸다.
+- 서명 커밋: 서명 base64가 토큰처럼 보여 아직 push하지 않은 서명 커밋은 `snapshot-secret`으로 거부된다(로컬 진행). 서명 블록 예외는 구조 검사만으로는 우회가 입증돼 두지 않는다. `--base origin/<기본 브랜치>`는 이미 원격에 있는 커밋이라 검사 대상이 없어 영향이 없다.
+
 ## 범위 밖
 - 클라우드 세션 결과 회수·머지 자동화(하네스 규칙이 PR을 보고 로컬에서 처리).
 - Linux `script` 인자 순서(런처는 macOS 전용, 사이드카와 동일).

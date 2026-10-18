@@ -139,110 +139,6 @@ export function treeEntryNames(buffer, idBytes) {
   return Buffer.concat(names.flatMap(name => [name, Buffer.from('\n')]));
 }
 
-const ARMOR_BEGIN_RE = /^-----BEGIN (PGP|SSH) SIGNATURE-----$/;
-const BASE64_LINE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
-const PGP_CHECKSUM_RE = /^=[A-Za-z0-9+/]{4}$/;
-
-// SSHSIG blob (PROTOCOL.sshsig): "SSHSIG", uint32 version 1, then exactly
-// five length-prefixed strings (public key, namespace, reserved, hash
-// algorithm, signature) and nothing after them.
-function isSshSignature(data) {
-  if (data.length < 10 || data.subarray(0, 6).toString('latin1') !== 'SSHSIG') return false;
-  if (data.readUInt32BE(6) !== 1) return false;
-  let offset = 10;
-  for (let field = 0; field < 5; field += 1) {
-    if (offset + 4 > data.length) return false;
-    const length = data.readUInt32BE(offset);
-    offset += 4 + length;
-    if (offset > data.length) return false;
-  }
-  return offset === data.length;
-}
-
-// Exactly one OpenPGP signature packet (tag 2, RFC 4880/9580 framing,
-// version 3–6) whose declared length covers the whole body.
-function isPgpSignature(data) {
-  if (data.length < 3 || (data[0] & 0x80) === 0) return false;
-  let tag;
-  let offset;
-  let length;
-  if (data[0] & 0x40) {
-    tag = data[0] & 0x3f;
-    const first = data[1];
-    if (first < 192) {
-      length = first;
-      offset = 2;
-    } else if (first < 224) {
-      if (data.length < 3) return false;
-      length = ((first - 192) << 8) + data[2] + 192;
-      offset = 3;
-    } else if (first === 255) {
-      if (data.length < 6) return false;
-      length = data.readUInt32BE(2);
-      offset = 6;
-    } else {
-      return false; // partial lengths: not a single detached signature
-    }
-  } else {
-    tag = (data[0] >> 2) & 0x0f;
-    const type = data[0] & 0x03;
-    const size = [1, 2, 4][type];
-    if (!size || data.length < 1 + size) return false;
-    length = size === 1 ? data[1] : size === 2 ? data.readUInt16BE(1) : data.readUInt32BE(1);
-    offset = 1 + size;
-  }
-  return tag === 2
-    && offset + length === data.length
-    && [3, 4, 5, 6].includes(data[offset]);
-}
-
-// The base64 lines of an armored signature are public data, but long opaque
-// base64 looks like a token to the scanner. Only a block whose decoded body
-// parses completely as a signature has its base64 lines dropped; armor
-// headers and everything else stay scanned.
-function signatureBodyLines(lines) {
-  const begin = lines[0]?.match(ARMOR_BEGIN_RE);
-  if (!begin || lines[lines.length - 1] !== `-----END ${begin[1]} SIGNATURE-----`) return null;
-  const inner = lines.slice(1, -1);
-  const body = inner.filter(line => BASE64_LINE_RE.test(line) || PGP_CHECKSUM_RE.test(line));
-  const data = Buffer.from(body.filter(line => !PGP_CHECKSUM_RE.test(line)).join(''), 'base64');
-  const isSignature = begin[1] === 'SSH' ? isSshSignature(data) : isPgpSignature(data);
-  return isSignature ? new Set(body) : null;
-}
-
-const BLOCK_BEGIN_RE = /^(gpgsig(?:-sha256)? |[ #]*)-----BEGIN (PGP|SSH) SIGNATURE-----$/;
-
-// Commit/tag text with every verified armored signature's base64 payload
-// removed, wherever git puts one: a commit's `gpgsig` header, a signed tag
-// embedded in a `mergetag` header (" " prefix), a tag's own closing block,
-// and a signed tag's text copied into a merge message ("# " prefix). A block
-// is recognised only when all its lines carry the same prefix and its body
-// parses completely as a signature; everything else stays scanned.
-export function withoutSignaturePayloads(text) {
-  const lines = text.split('\n');
-  const drop = new Set();
-  for (let start = 0; start < lines.length; start += 1) {
-    const begin = lines[start].match(BLOCK_BEGIN_RE);
-    if (!begin) continue;
-    const prefix = begin[1].startsWith('gpgsig') ? ' ' : begin[1];
-    const endLine = `${prefix}-----END ${begin[2]} SIGNATURE-----`;
-    let end = start + 1;
-    while (end < lines.length && lines[end] !== endLine && lines[end].startsWith(prefix)) end += 1;
-    if (end >= lines.length || lines[end] !== endLine) continue;
-    const block = [`-----BEGIN ${begin[2]} SIGNATURE-----`,
-      ...lines.slice(start + 1, end).map(line => line.slice(prefix.length)),
-      `-----END ${begin[2]} SIGNATURE-----`];
-    const payload = signatureBodyLines(block);
-    if (payload) {
-      for (let index = start + 1; index < end; index += 1) {
-        if (payload.has(lines[index].slice(prefix.length))) drop.add(index);
-      }
-    }
-    start = end;
-  }
-  return lines.filter((_, index) => !drop.has(index)).join('\n');
-}
-
 export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: callerEnv = process.env, remote = 'origin' }) {
   // `git replace` would make rev-list/cat-file read substitutes while push
   // sends the originals; scan what is actually stored.
@@ -302,8 +198,11 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: cal
   if (contents.some(content => content === null)) return unscannable;
   const texts = contents.map(decodeScannableText);
   if (texts.some(text => text === null)) return unscannable;
-  for (const [index, type] of blobTypes.entries()) {
-    if (type === 'commit' || type === 'tag') texts[index] = withoutSignaturePayloads(texts[index]);
-  }
+  // Commit and tag objects are scanned whole, signatures included. A
+  // signature's long base64 can read as a token, so an unpushed SIGNED commit
+  // is refused (fail closed: the caller works locally). Exempting signature
+  // blocks would need full cryptographic verification; partial structural
+  // checks were shown to be bypassable. Dispatches started from an already
+  // pushed base (--base origin/<default>) never scan those commits at all.
   return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
 }
