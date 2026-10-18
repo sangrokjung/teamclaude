@@ -433,3 +433,28 @@ test('an unknown or option-like --base runs locally without pushing', async t =>
   }
   assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
 });
+
+test('origin whose push side differs from its fetch side is refused before any push', async t => {
+  for (const configure of [
+    (f, other) => git(f.repo, f.env, 'remote', 'set-url', '--push', 'origin', other),
+    (f, other) => git(f.repo, f.env, 'config', `url.${other}.pushInsteadOf`, 'https://github.com/'),
+    (f, other) => git(f.repo, f.env, 'remote', 'set-url', '--add', '--push', 'origin', other),
+    (f, other) => git(f.repo, f.env, 'remote', 'set-url', '--add', 'origin', other),
+  ]) {
+    const f = await fixture(t);
+    const other = join(f.root, 'other.git');
+    git(f.root, f.env, 'init', '--quiet', '--bare', other);
+    configure(f, other);
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base: 'main',
+      launchCloud: async () => { launched = true; return { status: 0 }; },
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL, configure.toString());
+    // A second fetch URL makes `remote.origin.url` itself non-GitHub (last wins).
+    assert.ok(['origin-push-differs', 'origin-not-github'].includes(outcome.reason), configure.toString());
+    assert.equal(launched, false);
+    assert.equal(git(other, f.env, 'for-each-ref'), '');
+    assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  }
+});

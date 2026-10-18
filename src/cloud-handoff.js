@@ -149,6 +149,18 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
   if (origin.status !== 0 || !isGitHubRemoteUrl(origin.stdout.trim())) {
     return { ok: false, reason: 'origin-not-github' };
   }
+  // The secret scan skips objects the FETCH side of origin already has, so
+  // the push must go to exactly that one repository: a pushurl, a
+  // pushInsteadOf rewrite, or several URLs would send unscanned objects
+  // somewhere else.
+  const fetchUrls = await runGit(['remote', 'get-url', '--all', 'origin'], { cwd: root, env: gitEnv });
+  const pushUrls = await runGit(['remote', 'get-url', '--push', '--all', 'origin'], { cwd: root, env: gitEnv });
+  const lines = result => result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  if (fetchUrls.status !== 0 || pushUrls.status !== 0
+      || lines(fetchUrls).length !== 1 || lines(pushUrls).length !== 1
+      || lines(fetchUrls)[0] !== lines(pushUrls)[0]) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const head = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, env: gitEnv });
   if (head.status !== 0 || !head.stdout.trim()) return { ok: false, reason: 'no-head' };
   return { ok: true, root, head: head.stdout.trim() };
