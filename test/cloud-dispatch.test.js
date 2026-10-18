@@ -332,6 +332,14 @@ test('task input is read with a hard byte cap from files and streams', async t =
   assert.deepEqual(await readTaskInput(endless), { reason: 'task-too-large' });
   assert.ok(pulled < 64, `pulled ${pulled} chunks`);
   assert.deepEqual(await readTaskInput(Readable.from([Buffer.from('a'), Buffer.from('b')])), { task: 'ab' });
+  // Invalid UTF-8 is refused from both sources, not passed on garbled.
+  const latin1 = join(root, 'latin1.txt');
+  await writeFile(latin1, Buffer.from([0x63, 0x61, 0x66, 0xe9]));
+  assert.deepEqual(await readTaskInput(latin1), { reason: 'task-invalid-encoding' });
+  assert.deepEqual(await readTaskInput(Readable.from([Buffer.from([0xff, 0xfe])])), { reason: 'task-invalid-encoding' });
+  // A multi-byte character split across stream chunks is still valid.
+  const han = Buffer.from('한', 'utf8');
+  assert.deepEqual(await readTaskInput(Readable.from([han.subarray(0, 1), han.subarray(1)])), { task: '한' });
 });
 
 test('a commit landing during the credit lookup does not drop its changes from the snapshot', async t => {
@@ -375,6 +383,9 @@ test('argument parsing takes the task from one source and refuses guesses', () =
     ['--cwd', '--dry-run', 'x'],
     ['--task-file', ''],
     ['--unknown', 'x'],
+    ['--task-file', 'a.txt', '--task-file', 'b.txt'],
+    ['--task-file', '-', '--task-file', 'b.txt'],
+    ['--cwd', 'a', '--cwd', 'b', 'x'],
   ]) {
     assert.deepEqual(parseDispatchArgs(argv), { reason: 'bad-arguments' }, argv.join(' '));
   }

@@ -115,8 +115,10 @@ export function parseDispatchArgs(argv) {
     } else if (arg === '--cwd' || arg === '--task-file') {
       const value = argv[i + 1];
       if (typeof value !== 'string' || value === '' || (value.startsWith('--') && value !== '-')) return bad;
-      if (arg === '--cwd') parsed.cwd = value;
-      else parsed.taskFile = value;
+      // Each takes one value; a repeat would silently replace the first.
+      const key = arg === '--cwd' ? 'cwd' : 'taskFile';
+      if (parsed[key] !== null) return bad;
+      parsed[key] = value;
       i += 1;
     } else if (arg.startsWith('--')) {
       return bad;
@@ -167,7 +169,12 @@ export async function readTaskInput(source, { maxBytes = DISPATCH_TASK_MAX_BYTES
     return { reason: 'task-unreadable' };
   }
   if (total > maxBytes) return { reason: 'task-too-large' };
-  return { task: Buffer.concat(chunks).toString('utf8') };
+  // Strict: text in another encoding must not reach the cloud garbled.
+  try {
+    return { task: new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)) };
+  } catch {
+    return { reason: 'task-invalid-encoding' };
+  }
 }
 
 // `--cloud` needs a TTY; `script` supplies one and records the terminal
