@@ -9,7 +9,7 @@ Status: accepted
 하네스가 큰 작업을 시작할 때 한 번 호출해 "클라우드로 보냈는가 / 로컬에서 하라"를 종료 코드로 받는다.
 
 ## 동작
-`teamclaude cloud-dispatch [--cwd DIR] [--dry-run] [--task-file FILE|-] [--] TASK`
+`teamclaude cloud-dispatch [--cwd DIR] [--base REF] [--dry-run] [--task-file FILE|-] [--] TASK`
 
 0. 인자 검증: 지시문은 `--task-file`(파일·stdin, 32KiB+1바이트까지만 읽음)과 위치 인자 중 한 곳에서만 받는다. 값 없는 플래그·모르는 플래그·두 출처 동시 지정은 `bad-arguments`로 거부한다. macOS가 아니면 `platform-unsupported`(런처가 BSD `script` 인자를 쓴다).
 1. 지시문 검증: 비었거나 32KiB 초과, 시크릿 포함(`textHasSecret`)이면 보내지 않는다.
@@ -18,7 +18,7 @@ Status: accepted
 4. 폴더 신뢰 확인: Claude Code 설정(`$CLAUDE_CONFIG_DIR` 또는 홈의 `.claude.json`)에 저장소 루트 자체가 신뢰로 기록돼 있어야 한다. 처음 보는 폴더는 `--cloud`가 신뢰 확인 창에서 멈춰 링크 없이 시간 초과되기 때문이다(실측 2026-10-18: 5분 대기 후 불확실). git 저장소 안에서는 상위 폴더의 신뢰가 넘어오지 않으므로 정확히 그 폴더만 본다. 읽기 전용이다.
 5. 크레딧 계정 선택(`findCloudAccount`): 디스크 설정을 다시 읽고, 비활성(`enabled: false`) 계정을 빼고, 크레딧 $1 이상·잠금 없음 계정 중 하나. 조회가 끝나지 않으면 보내지 않는다.
 6. `--dry-run`이면 고른 계정만 보고 끝낸다.
-7. 미커밋 변경을 포함한 스냅샷을 `teamclaude-handoff/<id>-<시각>` 브랜치로 push(`pushHandoffSnapshot`, 시크릿 스캔 포함). 사용자 브랜치·인덱스는 건드리지 않는다.
+7. 시작 커밋을 `teamclaude-handoff/<id>-<시각>` 브랜치로 push한다. `--base REF`가 있으면 그 커밋 그대로(작업 트리 무시, 새 작업의 기본), 없으면 HEAD에 미커밋 변경을 얹은 스냅샷(`pushHandoffSnapshot`, 진행 중이던 작업을 넘길 때). 두 경로 모두 push 전 시크릿 스캔을 거치고, 사용자 브랜치·인덱스·작업 트리는 건드리지 않는다. `-`로 시작하거나 없는 ref는 `base-not-found`.
 8. `script -q <임시파일> <vendor> --cloud <지시문>`으로 세션 생성(TTY 필요, 5분 제한). 런처 출력의 `Resume with: claude --teleport session_<id>` 줄 전체가 일치할 때만 세션 생성으로 인정하고(실측 출력 2.1.302), 보낸 지시문에 있던 id는 제외한다. 임시파일은 지운다.
 9. 원장 `~/.config/teamclaude-cloud-handoffs.jsonl`에 `source: "dispatch"`로 기록(토큰 미기록).
 

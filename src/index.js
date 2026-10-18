@@ -3457,7 +3457,7 @@ async function cloudDispatchCommand() {
   const parsed = parseDispatchArgs(args.slice(1));
   if (parsed.reason) return local(parsed.reason);
   const cwd = parsed.cwd ? resolve(parsed.cwd) : process.cwd();
-  const { dryRun, taskFile, words } = parsed;
+  const { dryRun, taskFile, words, base } = parsed;
   let task = words.join(' ');
   if (taskFile) {
     const input = await readTaskInput(taskFile === '-' ? process.stdin : taskFile);
@@ -3478,6 +3478,7 @@ async function cloudDispatchCommand() {
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
     ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
     dryRun,
+    base,
   }));
 }
 
@@ -3648,9 +3649,10 @@ Commands:
                       rotation, survives restarts) or clear the mark
   api <path>          Call an API endpoint with account credentials
   cloud-sidecar       One scan: hand exhausted legacy \`run\` sessions to cloud
-  cloud-dispatch [--cwd DIR] [--dry-run] [--task-file FILE|-] [--] TASK
+  cloud-dispatch [--cwd DIR] [--base REF] [--dry-run] [--task-file FILE|-] [--] TASK
                       Send TASK to a cloud session on an account with cloud
-                      credits (exit 0 sent, 3 run locally, 4 uncertain)
+                      credits (exit 0 sent, 3 run locally, 4 uncertain);
+                      --base starts it from REF, ignoring uncommitted work
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help

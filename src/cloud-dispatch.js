@@ -27,11 +27,12 @@ import {
   defaultRunGit,
   fetchCloudCredits,
   findCloudAccount,
+  handoffBranchName,
   inspectHandoffRepo,
   isExecutableFile,
   pushHandoffSnapshot,
 } from './cloud-handoff.js';
-import { textHasSecret } from './snapshot-scan.js';
+import { scanSnapshotForSecrets, textHasSecret } from './snapshot-scan.js';
 
 export const DISPATCH_EXIT = Object.freeze({ DISPATCHED: 0, RUN_LOCAL: 3, AMBIGUOUS: 4 });
 export const DISPATCH_TASK_MAX_BYTES = 32 * 1024;
@@ -103,7 +104,7 @@ export function extractSessionUrl(output, { sent = '' } = {}) {
 // guessed at (dropping half of what the caller wrote would be silent loss).
 export function parseDispatchArgs(argv) {
   const bad = { reason: 'bad-arguments' };
-  const parsed = { cwd: null, dryRun: false, taskFile: null, words: [] };
+  const parsed = { cwd: null, dryRun: false, taskFile: null, base: null, words: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--') {
@@ -112,11 +113,11 @@ export function parseDispatchArgs(argv) {
     }
     if (arg === '--dry-run') {
       parsed.dryRun = true;
-    } else if (arg === '--cwd' || arg === '--task-file') {
+    } else if (arg === '--cwd' || arg === '--task-file' || arg === '--base') {
       const value = argv[i + 1];
       if (typeof value !== 'string' || value === '' || (value.startsWith('--') && value !== '-')) return bad;
       // Each takes one value; a repeat would silently replace the first.
-      const key = arg === '--cwd' ? 'cwd' : 'taskFile';
+      const key = { '--cwd': 'cwd', '--task-file': 'taskFile', '--base': 'base' }[arg];
       if (parsed[key] !== null) return bad;
       parsed[key] = value;
       i += 1;
@@ -128,6 +129,25 @@ export function parseDispatchArgs(argv) {
   }
   if (parsed.taskFile !== null && parsed.words.length > 0) return bad;
   return parsed;
+}
+
+// A new task usually should not carry whatever happens to be uncommitted in
+// the caller's checkout. With `--base <ref>` the cloud session starts from
+// exactly that commit (e.g. origin/main): it is pushed as the dispatch branch
+// after the same secret scan as a snapshot, and the working tree is ignored.
+export async function pushBaseCommit({ root, ref, branch, runGit = defaultRunGit, gitEnv = process.env }) {
+  if (typeof ref !== 'string' || ref.length === 0 || ref.startsWith('-')) return { ok: false, reason: 'base-not-found' };
+  const resolved = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root, env: gitEnv });
+  const commit = resolved.status === 0 ? resolved.stdout.trim() : '';
+  if (!/^[0-9a-f]{40,64}$/.test(commit)) return { ok: false, reason: 'base-not-found' };
+  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv });
+  if (!scan.ok) return { ok: false, reason: scan.reason };
+  const pushed = await runGit(
+    ['push', '--quiet', 'origin', `${commit}:refs/heads/${branch}`],
+    { cwd: root, env: gitEnv, timeoutMs: 120_000 },
+  );
+  if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
+  return { ok: true, branch, commit };
 }
 
 // Reads at most DISPATCH_TASK_MAX_BYTES + 1 bytes from a file path or a
@@ -212,6 +232,8 @@ export async function attemptCloudDispatch({
   platform = process.platform,
   ledgerPath = null,
   dryRun = false,
+  // null: snapshot HEAD plus uncommitted changes; a ref: start from exactly it.
+  base = null,
   now = new Date(),
   random = Math.random,
   newId = randomUUID,
@@ -257,14 +279,22 @@ export async function attemptCloudDispatch({
   }
 
   const dispatchId = newId();
-  const snapshot = await pushHandoffSnapshot({
-    root: repo.root,
-    head: repo.head,
-    sessionId: dispatchId,
-    runGit,
-    gitEnv,
-    now,
-  });
+  const snapshot = base === null
+    ? await pushHandoffSnapshot({
+      root: repo.root,
+      head: repo.head,
+      sessionId: dispatchId,
+      runGit,
+      gitEnv,
+      now,
+    })
+    : await pushBaseCommit({
+      root: repo.root,
+      ref: base,
+      branch: handoffBranchName(dispatchId, now),
+      runGit,
+      gitEnv,
+    });
   if (!snapshot.ok) return local(snapshot.reason);
 
   const prompt = buildDispatchPrompt({ branch: snapshot.branch, task });

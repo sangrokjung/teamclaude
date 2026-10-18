@@ -370,11 +370,11 @@ test('dispatch is refused off macOS before anything is pushed', async t => {
 
 test('argument parsing takes the task from one source and refuses guesses', () => {
   assert.deepEqual(parseDispatchArgs(['--cwd', 'repo', '--dry-run', '--', '이슈', '--x']),
-    { cwd: 'repo', dryRun: true, taskFile: null, words: ['이슈', '--x'] });
-  assert.deepEqual(parseDispatchArgs(['--task-file', '-']),
-    { cwd: null, dryRun: false, taskFile: '-', words: [] });
+    { cwd: 'repo', dryRun: true, taskFile: null, base: null, words: ['이슈', '--x'] });
+  assert.deepEqual(parseDispatchArgs(['--task-file', '-', '--base', 'origin/main']),
+    { cwd: null, dryRun: false, taskFile: '-', base: 'origin/main', words: [] });
   assert.deepEqual(parseDispatchArgs(['README', '정리']),
-    { cwd: null, dryRun: false, taskFile: null, words: ['README', '정리'] });
+    { cwd: null, dryRun: false, taskFile: null, base: null, words: ['README', '정리'] });
   for (const argv of [
     ['--task-file', 'task.txt', '--', '수정하지 말고 분석만'],
     ['--task-file', 'task.txt', '추가'],
@@ -386,6 +386,8 @@ test('argument parsing takes the task from one source and refuses guesses', () =
     ['--task-file', 'a.txt', '--task-file', 'b.txt'],
     ['--task-file', '-', '--task-file', 'b.txt'],
     ['--cwd', 'a', '--cwd', 'b', 'x'],
+    ['--base'],
+    ['--base', 'a', '--base', 'b', 'x'],
   ]) {
     assert.deepEqual(parseDispatchArgs(argv), { reason: 'bad-arguments' }, argv.join(' '));
   }
@@ -401,5 +403,33 @@ test('a task with a NUL byte is refused before anything is pushed', async t => {
   assert.equal(outcome.reason, 'task-invalid-content');
   assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
   assert.equal(launched, false);
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});
+
+test('--base sends exactly that commit and leaves uncommitted work behind', async t => {
+  const f = await fixture(t);
+  const mainCommit = git(f.repo, f.env, 'rev-parse', 'HEAD');
+  git(f.repo, f.env, 'checkout', '--quiet', '-b', 'feature');
+  await writeFile(join(f.repo, 'tracked.txt'), 'feature commit\n');
+  git(f.repo, f.env, 'commit', '--quiet', '-am', 'unrelated feature commit');
+  await writeFile(join(f.repo, 'tracked.txt'), 'unrelated uncommitted edit\n');
+  await writeFile(join(f.repo, 'stray.txt'), 'untracked\n');
+
+  const outcome = await attemptCloudDispatch(inputs(f, { base: 'main' }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+  assert.equal(git(f.bare, f.env, 'rev-parse', outcome.branch), mainCommit);
+  assert.equal(git(f.bare, f.env, 'show', `${outcome.branch}:tracked.txt`), 'original');
+  // The caller's checkout is untouched.
+  assert.equal(git(f.repo, f.env, 'rev-parse', '--abbrev-ref', 'HEAD'), 'feature');
+  assert.equal(await readFile(join(f.repo, 'tracked.txt'), 'utf8'), 'unrelated uncommitted edit\n');
+});
+
+test('an unknown or option-like --base runs locally without pushing', async t => {
+  const f = await fixture(t);
+  for (const base of ['no-such-ref', '--upload-pack=x', '']) {
+    const outcome = await attemptCloudDispatch(inputs(f, { base }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL, base);
+    assert.equal(outcome.reason, 'base-not-found', base);
+  }
   assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
 });
