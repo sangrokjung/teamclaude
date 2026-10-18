@@ -77,7 +77,7 @@ test('dispatch pushes a snapshot branch, launches --cloud on the funded account,
     },
   }));
 
-  assert.equal(outcome.ok, true);
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(outcome.account, 'cloud-acct');
   assert.equal(outcome.url, 'https://claude.ai/code/session_abc123');
