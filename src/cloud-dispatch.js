@@ -38,7 +38,9 @@ export const DISPATCH_TASK_MAX_BYTES = 32 * 1024;
 export const DISPATCH_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
-const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?![A-Za-z0-9_\-/])/g;
+// The id must end the link: no further path, extension or escape may follow
+// (a sentence-ending period followed by space or end of text is fine).
+const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?![A-Za-z0-9_\-/%?#&=]|\.(?!\s|$))/g;
 
 // `--cloud` in a folder Claude Code has never trusted stops at the trust
 // prompt (default "No, exit") and never prints a session link, so such a
@@ -82,7 +84,7 @@ export function buildDispatchPrompt({ branch, task }) {
 // we sent (a terminal may echo the prompt, and a task may quote old links).
 export function extractSessionUrl(output, { sent = '' } = {}) {
   if (typeof output !== 'string') return null;
-  const echoed = new Set(String(sent).match(SESSION_URL_RE) ?? []);
+  const echoed = new Set(String(sent).replace(ANSI_RE, '').match(SESSION_URL_RE) ?? []);
   const links = (output.replace(ANSI_RE, '').match(SESSION_URL_RE) ?? [])
     .filter(link => !echoed.has(link));
   return links.length > 0 ? links[links.length - 1] : null;

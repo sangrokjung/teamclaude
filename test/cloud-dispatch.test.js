@@ -224,6 +224,13 @@ test('session url extraction strips terminal escapes and tolerates junk', () => 
   // Not session links: settings pages, partial ids.
   assert.equal(extractSessionUrl('Error: launch failed. Visit https://claude.ai/code/settings'), null);
   assert.equal(extractSessionUrl('https://claude.ai/code/session_ab-cd'), null);
+  for (const variant of ['session_old9.html', 'session_old9%2Fsettings', 'session_old9/settings', 'session_old9?x=1']) {
+    assert.equal(extractSessionUrl(`see https://claude.ai/code/${variant}`), null, variant);
+  }
+  assert.equal(extractSessionUrl('Open https://claude.ai/code/session_end1.'), 'https://claude.ai/code/session_end1');
+  // An escape-coloured old link in the task is still recognised as echoed.
+  const colored = 'https://claude.ai/code/session_\x1b[1mold9\x1b[0m 이어서';
+  assert.equal(extractSessionUrl(colored, { sent: colored }), null);
   // A link that was part of what we sent (echo, quoted old task) proves nothing.
   const sent = '이전 작업 https://claude.ai/code/session_old1 이어서';
   assert.equal(extractSessionUrl(`${sent}\nError: auth failed`, { sent }), null);
@@ -306,4 +313,18 @@ test('task input is read with a hard byte cap from files and streams', async t =
   assert.deepEqual(await readTaskInput(endless), { reason: 'task-too-large' });
   assert.ok(pulled < 64, `pulled ${pulled} chunks`);
   assert.deepEqual(await readTaskInput(Readable.from([Buffer.from('a'), Buffer.from('b')])), { task: 'ab' });
+});
+
+test('a commit landing during the credit lookup does not drop its changes from the snapshot', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.repo, 'tracked.txt'), 'work in progress\n');
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    creditLookup: async () => {
+      git(f.repo, f.env, 'commit', '--quiet', '-am', 'local commit meanwhile');
+      return { remainingDollars: 100, lockedReason: null };
+    },
+    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_race1' }),
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+  assert.equal(git(f.bare, f.env, 'show', `${outcome.branch}:tracked.txt`), 'work in progress');
 });

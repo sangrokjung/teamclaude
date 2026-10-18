@@ -158,9 +158,12 @@ function nulList(text) {
   return text.split('\0').filter(Boolean);
 }
 
-async function snapshotPaths(root, runGit, gitEnv) {
+// Everything is measured against the `head` inspected earlier, not the
+// symbolic HEAD: a commit landing meanwhile must not make its changes vanish
+// from a snapshot whose parent is still the old commit.
+async function snapshotPaths(root, head, runGit, gitEnv) {
   const changed = await runGit(
-    ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', 'HEAD', '--'],
+    ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', head, '--'],
     { cwd: root, env: gitEnv },
   );
   const untracked = await runGit(
@@ -204,7 +207,7 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
     // A private index seeded from HEAD: the user's index, work tree, and
     // branch are never written.
     const env = { ...gitEnv, GIT_INDEX_FILE: join(scratch, 'index') };
-    const seeded = await runGit(['read-tree', 'HEAD'], { cwd: root, env });
+    const seeded = await runGit(['read-tree', head], { cwd: root, env });
     if (seeded.status !== 0) return null;
     const updated = await runGit(
       ['update-index', '--add', '--remove', '-z', '--stdin'],
@@ -212,7 +215,7 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
     );
     if (updated.status !== 0) return null;
     const tree = await runGit(['write-tree'], { cwd: root, env });
-    const headTree = await runGit(['rev-parse', 'HEAD^{tree}'], { cwd: root, env });
+    const headTree = await runGit(['rev-parse', `${head}^{tree}`], { cwd: root, env });
     if (tree.status !== 0 || headTree.status !== 0) return null;
     if (tree.stdout.trim() === headTree.stdout.trim()) return head;
     const identity = await runGit(['var', 'GIT_COMMITTER_IDENT'], { cwd: root, env });
@@ -245,7 +248,7 @@ export async function pushHandoffSnapshot({
   now = new Date(),
 }) {
   const branch = handoffBranchName(sessionId, now);
-  const snapshotResult = await snapshotPaths(root, runGit, gitEnv);
+  const snapshotResult = await snapshotPaths(root, head, runGit, gitEnv);
   if (!snapshotResult.ok) return { ok: false, reason: snapshotResult.reason };
   const { paths } = snapshotResult;
   const commit = paths.length > 0
