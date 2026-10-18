@@ -31,10 +31,12 @@ async function upstreamMergeRef(root, runGit, gitEnv) {
 
 // Tips of the upstream branch and origin's HEAD as the remote advertises
 // them now, kept only when the commit exists locally (rev-list needs it).
-export async function verifiedRemoteBases({ root, runGit, gitEnv }) {
+// `remote` is the exact URL the caller will push to (default: origin), so
+// what counts as "already there" is measured on the push destination itself.
+export async function verifiedRemoteBases({ root, runGit, gitEnv, remote = 'origin' }) {
   const upstream = await upstreamMergeRef(root, runGit, gitEnv);
   const wanted = new Set(['HEAD', ...(upstream ? [upstream] : [])]);
-  const listed = await git(runGit, root, gitEnv, ['ls-remote', 'origin', ...wanted], { timeoutMs: 60_000 });
+  const listed = await git(runGit, root, gitEnv, ['ls-remote', '--', remote, ...wanted], { timeoutMs: 60_000 });
   if (listed.status !== 0) return [];
   const bases = [];
   for (const line of listed.stdout.split('\n')) {
@@ -121,10 +123,10 @@ export function textHasSecret(text) {
   return scanViews(text).some(containsSecret);
 }
 
-export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env }) {
+export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env, remote = 'origin' }) {
   const failed = { ok: false, reason: 'snapshot-scan-failed' };
   const unscannable = { ok: false, reason: 'snapshot-unscannable' };
-  const bases = await verifiedRemoteBases({ root, runGit, gitEnv });
+  const bases = await verifiedRemoteBases({ root, runGit, gitEnv, remote });
   const revList = ['rev-list', '--objects', '--no-object-names', commit];
   if (bases.length > 0) revList.push('--not', ...bases);
   const listed = await git(runGit, root, gitEnv, revList, { timeoutMs: 120_000 });

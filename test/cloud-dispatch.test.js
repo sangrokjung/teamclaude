@@ -458,3 +458,22 @@ test('origin whose push side differs from its fetch side is refused before any p
     assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
   }
 });
+
+test('a remote config change after inspection cannot redirect the push', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    const other = join(f.root, 'other.git');
+    git(f.root, f.env, 'init', '--quiet', '--bare', other);
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base,
+      creditLookup: async () => {
+        // Mid-run edit: point origin's push side elsewhere.
+        git(f.repo, f.env, 'remote', 'set-url', '--push', 'origin', other);
+        return { remainingDollars: 100, lockedReason: null };
+      },
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+    assert.equal(git(other, f.env, 'for-each-ref'), '', 'nothing reached the other repository');
+    assert.notEqual(git(f.bare, f.env, 'branch', '--list', outcome.branch), '');
+  }
+});

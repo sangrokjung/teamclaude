@@ -135,15 +135,15 @@ export function parseDispatchArgs(argv) {
 // the caller's checkout. With `--base <ref>` the cloud session starts from
 // exactly that commit (e.g. origin/main): it is pushed as the dispatch branch
 // after the same secret scan as a snapshot, and the working tree is ignored.
-export async function pushBaseCommit({ root, ref, branch, runGit = defaultRunGit, gitEnv = process.env }) {
+export async function pushBaseCommit({ root, ref, branch, remote = 'origin', runGit = defaultRunGit, gitEnv = process.env }) {
   if (typeof ref !== 'string' || ref.length === 0 || ref.startsWith('-')) return { ok: false, reason: 'base-not-found' };
   const resolved = await runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root, env: gitEnv });
   const commit = resolved.status === 0 ? resolved.stdout.trim() : '';
   if (!/^[0-9a-f]{40,64}$/.test(commit)) return { ok: false, reason: 'base-not-found' };
-  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv });
+  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv, remote });
   if (!scan.ok) return { ok: false, reason: scan.reason };
   const pushed = await runGit(
-    ['push', '--quiet', 'origin', `${commit}:refs/heads/${branch}`],
+    ['push', '--quiet', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
@@ -283,6 +283,7 @@ export async function attemptCloudDispatch({
     ? await pushHandoffSnapshot({
       root: repo.root,
       head: repo.head,
+      remote: repo.remoteUrl,
       sessionId: dispatchId,
       runGit,
       gitEnv,
@@ -292,6 +293,7 @@ export async function attemptCloudDispatch({
       root: repo.root,
       ref: base,
       branch: handoffBranchName(dispatchId, now),
+      remote: repo.remoteUrl,
       runGit,
       gitEnv,
     });

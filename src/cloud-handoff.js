@@ -149,10 +149,11 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
   if (origin.status !== 0 || !isGitHubRemoteUrl(origin.stdout.trim())) {
     return { ok: false, reason: 'origin-not-github' };
   }
-  // The secret scan skips objects the FETCH side of origin already has, so
-  // the push must go to exactly that one repository: a pushurl, a
-  // pushInsteadOf rewrite, or several URLs would send unscanned objects
-  // somewhere else.
+  // The secret scan skips objects the destination already has, so scan and
+  // push must address one repository: a pushurl, a pushInsteadOf rewrite, or
+  // several URLs are refused, and the single resolved URL is returned so the
+  // scan and the push use it verbatim — a later edit of the remote config
+  // cannot split them.
   const fetchUrls = await runGit(['remote', 'get-url', '--all', 'origin'], { cwd: root, env: gitEnv });
   const pushUrls = await runGit(['remote', 'get-url', '--push', '--all', 'origin'], { cwd: root, env: gitEnv });
   const lines = result => result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
@@ -163,7 +164,7 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
   }
   const head = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, env: gitEnv });
   if (head.status !== 0 || !head.stdout.trim()) return { ok: false, reason: 'no-head' };
-  return { ok: true, root, head: head.stdout.trim() };
+  return { ok: true, root, head: head.stdout.trim(), remoteUrl: lines(pushUrls)[0] };
 }
 
 function nulList(text) {
@@ -254,6 +255,8 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
 export async function pushHandoffSnapshot({
   root,
   head,
+  // The exact URL from inspectHandoffRepo; 'origin' only for direct callers.
+  remote = 'origin',
   sessionId,
   runGit = defaultRunGit,
   gitEnv = process.env,
@@ -267,10 +270,10 @@ export async function pushHandoffSnapshot({
     ? await snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv })
     : head;
   if (!commit) return { ok: false, reason: 'snapshot-failed' };
-  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv });
+  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv, remote });
   if (!scan.ok) return { ok: false, reason: scan.reason };
   const pushed = await runGit(
-    ['push', '--quiet', 'origin', `${commit}:refs/heads/${branch}`],
+    ['push', '--quiet', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
@@ -527,6 +530,7 @@ export async function attemptCloudHandoff({
   const snapshot = await pushHandoffSnapshot({
     root: repo.root,
     head: repo.head,
+    remote: repo.remoteUrl,
     sessionId,
     runGit,
     gitEnv,
