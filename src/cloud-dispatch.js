@@ -147,8 +147,9 @@ export async function pushBaseCommit({ root, ref, branch, remote = 'origin', run
     return { ok: false, reason: 'origin-push-differs' };
   }
   const pushed = await runGit(
-    // Only the one branch: never tags pulled along by push.followTags.
-    ['push', '--quiet', '--no-follow-tags', '--', remote, `${commit}:refs/heads/${branch}`],
+    // Only the one branch: no tags (push.followTags), no submodule pushes
+    // (push.recurseSubmodules) — neither is covered by the scan.
+    ['push', '--quiet', '--no-follow-tags', '--recurse-submodules=no', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
@@ -245,6 +246,9 @@ export async function attemptCloudDispatch({
   creditLookupOptions = {},
 }) {
   const local = reason => ({ ok: false, exit: DISPATCH_EXIT.RUN_LOCAL, reason });
+  // Snapshot, scan and push all read stored objects, never `git replace`
+  // substitutes (push would send the originals).
+  gitEnv = { ...gitEnv, GIT_NO_REPLACE_OBJECTS: '1' };
   if (typeof task !== 'string' || task.trim().length === 0) return local('task-empty');
   if (Buffer.byteLength(task, 'utf8') > DISPATCH_TASK_MAX_BYTES) return local('task-too-large');
   // A NUL cannot travel in a process argument; the launch would only throw.

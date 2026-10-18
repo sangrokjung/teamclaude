@@ -124,7 +124,25 @@ export function textHasSecret(text) {
   return scanViews(text).some(containsSecret);
 }
 
-export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env, remote = 'origin' }) {
+// Tree objects carry file names; names travel too, so they are scanned as
+// text (one per line). Entries: "<mode> <name>\0<raw object id>".
+export function treeEntryNames(buffer, idBytes) {
+  const names = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const space = buffer.indexOf(0x20, offset);
+    const nul = buffer.indexOf(0x00, space + 1);
+    if (space < 0 || nul < 0 || nul + 1 + idBytes > buffer.length) return null;
+    names.push(buffer.subarray(space + 1, nul));
+    offset = nul + 1 + idBytes;
+  }
+  return Buffer.concat(names.flatMap(name => [name, Buffer.from('\n')]));
+}
+
+export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: callerEnv = process.env, remote = 'origin' }) {
+  // `git replace` would make rev-list/cat-file read substitutes while push
+  // sends the originals; scan what is actually stored.
+  const gitEnv = { ...callerEnv, GIT_NO_REPLACE_OBJECTS: '1' };
   const failed = { ok: false, reason: 'snapshot-scan-failed' };
   const unscannable = { ok: false, reason: 'snapshot-unscannable' };
   const bases = await verifiedRemoteBases({ root, runGit, gitEnv, remote });
@@ -152,7 +170,7 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
   for (const line of checked.stdout.split('\n').filter(Boolean)) {
     const [id, type, sizeText] = line.split(' ');
     if (!OBJECT_ID_RE.test(id || '')) return failed;
-    if (type !== 'blob' && type !== 'commit' && type !== 'tag') continue;
+    if (type !== 'blob' && type !== 'commit' && type !== 'tag' && type !== 'tree') continue;
     const size = Number(sizeText);
     if (!Number.isSafeInteger(size)) return failed;
     if (size > SNAPSHOT_TEXT_MAX_BYTES) return unscannable;
@@ -172,7 +190,13 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     ? parseBatch(batch.stdoutBuffer, blobIds, blobTypes)
     : null;
   if (!blobs) return failed;
-  const texts = blobs.map(decodeScannableText);
+  // SHA-1 ids are 20 raw bytes in a tree, SHA-256 ids 32.
+  const idBytes = blobIds[0].length === 64 ? 32 : 20;
+  const contents = blobs.map((buffer, index) => (blobTypes[index] === 'tree'
+    ? treeEntryNames(buffer, idBytes)
+    : buffer));
+  if (contents.some(content => content === null)) return unscannable;
+  const texts = contents.map(decodeScannableText);
   if (texts.some(text => text === null)) return unscannable;
   return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
 }

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
 import { ALNUM } from './helpers/secret-fixtures.js';
+import { defaultRunGit } from '../src/cloud-handoff.js';
 import {
   DISPATCH_EXIT,
   DISPATCH_TASK_MAX_BYTES,
@@ -566,5 +567,53 @@ test('push.followTags does not publish tags along with the dispatch branch', asy
     const outcome = await attemptCloudDispatch(inputs(f, { base }));
     assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
     assert.equal(git(f.bare, f.env, 'tag', '--list'), '', String(base));
+  }
+});
+
+test('a secret in a file name or hidden behind git replace is never sent', async t => {
+  const secretName = `ghp_${ALNUM.slice(0, 36)}`;
+  for (const base of ['main', null]) {
+    // A file name.
+    const f = await fixture(t);
+    await writeFile(join(f.repo, `${secretName}.txt`), 'harmless\n');
+    git(f.repo, f.env, 'add', '--', `${secretName}.txt`);
+    git(f.repo, f.env, 'commit', '--quiet', '-m', 'add file');
+    git(f.repo, f.env, 'rm', '--quiet', '--', `${secretName}.txt`);
+    git(f.repo, f.env, 'commit', '--quiet', '-m', 'remove it again');
+    const named = await attemptCloudDispatch(inputs(f, { base }));
+    assert.equal(named.reason, 'snapshot-secret', `name ${base}`);
+
+    // A commit whose message carries a secret, replaced by a clean twin.
+    const g = await fixture(t);
+    await writeFile(join(g.repo, 'tracked.txt'), 'change\n');
+    git(g.repo, g.env, 'commit', '--quiet', '-am', `fix\n\nOPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`);
+    const dirty = git(g.repo, g.env, 'rev-parse', 'HEAD');
+    git(g.repo, g.env, 'commit', '--quiet', '--amend', '-m', 'fix');
+    const clean = git(g.repo, g.env, 'rev-parse', 'HEAD');
+    git(g.repo, g.env, 'reset', '--quiet', '--hard', dirty);
+    git(g.repo, g.env, 'replace', dirty, clean);
+    const replaced = await attemptCloudDispatch(inputs(g, { base }));
+    assert.equal(replaced.reason, 'snapshot-secret', `replace ${base}`);
+    assert.equal(git(g.bare, g.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  }
+});
+
+test('every push sends one branch only: no tags, no submodule pushes, stored objects', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    const calls = [];
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base,
+      runGit: (args, options) => {
+        calls.push({ args, env: options?.env });
+        return defaultRunGit(args, options);
+      },
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+    const pushes = calls.filter(call => call.args[0] === 'push');
+    assert.equal(pushes.length, 1);
+    assert.ok(pushes[0].args.includes('--no-follow-tags'));
+    assert.ok(pushes[0].args.includes('--recurse-submodules=no'));
+    assert.ok(calls.every(call => call.env?.GIT_NO_REPLACE_OBJECTS === '1'), 'all git calls ignore replacements');
   }
 });

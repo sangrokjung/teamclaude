@@ -306,8 +306,9 @@ export async function pushHandoffSnapshot({
     return { ok: false, reason: 'origin-push-differs' };
   }
   const pushed = await runGit(
-    // Only the one branch: never tags pulled along by push.followTags.
-    ['push', '--quiet', '--no-follow-tags', '--', remote, `${commit}:refs/heads/${branch}`],
+    // Only the one branch: no tags (push.followTags), no submodule pushes
+    // (push.recurseSubmodules) — neither is covered by the scan.
+    ['push', '--quiet', '--no-follow-tags', '--recurse-submodules=no', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
@@ -545,6 +546,9 @@ export async function attemptCloudHandoff({
   creditLookupOptions = {},
 }) {
   const skip = reason => ({ ok: false, reason, stopped: false });
+  // Snapshot, scan and push all read stored objects, never `git replace`
+  // substitutes (push would send the originals).
+  gitEnv = { ...gitEnv, GIT_NO_REPLACE_OBJECTS: '1' };
   if (!(await binExists(vendorBin))) return skip('vendor-missing');
   const repo = await inspectHandoffRepo({ cwd, runGit, gitEnv });
   if (!repo.ok) return skip(repo.reason);
