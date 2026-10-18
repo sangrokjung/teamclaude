@@ -41,7 +41,7 @@ import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
-import { DISPATCH_EXIT, attemptCloudDispatch, readTaskInput } from './cloud-dispatch.js';
+import { DISPATCH_EXIT, attemptCloudDispatch, parseDispatchArgs, readTaskInput } from './cloud-dispatch.js';
 import {
   killProcess,
   launchCloudWithScript,
@@ -3454,22 +3454,10 @@ async function cloudDispatchCommand() {
   };
   const local = reason => emit({ ok: false, exit: DISPATCH_EXIT.RUN_LOCAL, reason });
   if (cliProvider === 'codex') return local('claude-pool-only');
-  let cwd = process.cwd();
-  let dryRun = false;
-  let taskFile = null;
-  const words = [];
-  const rest = args.slice(1);
-  for (let i = 0; i < rest.length; i += 1) {
-    const arg = rest[i];
-    if (arg === '--') {
-      words.push(...rest.slice(i + 1));
-      break;
-    }
-    if (arg === '--dry-run') dryRun = true;
-    else if (arg === '--cwd') cwd = resolve(rest[++i] ?? '.');
-    else if (arg === '--task-file') taskFile = rest[++i] ?? null;
-    else words.push(arg);
-  }
+  const parsed = parseDispatchArgs(args.slice(1));
+  if (parsed.reason) return local(parsed.reason);
+  const cwd = parsed.cwd ? resolve(parsed.cwd) : process.cwd();
+  const { dryRun, taskFile, words } = parsed;
   let task = words.join(' ');
   if (taskFile) {
     const input = await readTaskInput(taskFile === '-' ? process.stdin : taskFile);

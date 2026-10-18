@@ -11,6 +11,7 @@ Status: accepted
 ## 동작
 `teamclaude cloud-dispatch [--cwd DIR] [--dry-run] [--task-file FILE|-] [--] TASK`
 
+0. 인자 검증: 지시문은 `--task-file`(파일·stdin, 32KiB+1바이트까지만 읽음)과 위치 인자 중 한 곳에서만 받는다. 값 없는 플래그·모르는 플래그·두 출처 동시 지정은 `bad-arguments`로 거부한다. macOS가 아니면 `platform-unsupported`(런처가 BSD `script` 인자를 쓴다).
 1. 지시문 검증: 비었거나 32KiB 초과, 시크릿 포함(`textHasSecret`)이면 보내지 않는다.
 2. vendor 바이너리(`TEAMCLAUDE_CLAUDE_BIN` → `cloudClaudeBin` → `cloudSidecarClaudeBin`) 확인.
 3. 저장소 검사(`inspectHandoffRepo`): git 저장소, origin이 github.com, HEAD 존재.
@@ -18,7 +19,7 @@ Status: accepted
 5. 크레딧 계정 선택(`findCloudAccount`): 디스크 설정을 다시 읽고, 비활성(`enabled: false`) 계정을 빼고, 크레딧 $1 이상·잠금 없음 계정 중 하나. 조회가 끝나지 않으면 보내지 않는다.
 6. `--dry-run`이면 고른 계정만 보고 끝낸다.
 7. 미커밋 변경을 포함한 스냅샷을 `teamclaude-handoff/<id>-<시각>` 브랜치로 push(`pushHandoffSnapshot`, 시크릿 스캔 포함). 사용자 브랜치·인덱스는 건드리지 않는다.
-8. `script -q <임시파일> <vendor> --cloud <지시문>`으로 세션 생성(TTY 필요, 5분 제한). 출력에서 `https://claude.ai/code/...` 링크를 뽑고 임시파일은 지운다.
+8. `script -q <임시파일> <vendor> --cloud <지시문>`으로 세션 생성(TTY 필요, 5분 제한). 런처 출력의 `Resume with: claude --teleport session_<id>` 줄 전체가 일치할 때만 세션 생성으로 인정하고(실측 출력 2.1.302), 보낸 지시문에 있던 id는 제외한다. 임시파일은 지운다.
 9. 원장 `~/.config/teamclaude-cloud-handoffs.jsonl`에 `source: "dispatch"`로 기록(토큰 미기록).
 
 지시문은 "브랜치에서 작업하고 같은 브랜치에 push, 기본 브랜치 대상 PR, 머지 금지"를 붙인다.
@@ -26,8 +27,8 @@ Status: accepted
 ## 종료 코드 계약
 | exit | 뜻 |
 |---|---|
-| 0 | 세션 생성됨: 세션 링크가 출력됨(종료 코드와 무관) |
-| 3 | 보내지 않음: 지시문 문제·vendor 없음·저장소 부적격·폴더 미신뢰·크레딧 없음·조회 미완·스냅샷/push 실패·런처 미기동 |
+| 0 | 세션 생성됨: 런처가 Resume 줄을 출력함(종료 코드와 무관) |
+| 3 | 보내지 않음: 인자 오류·비 macOS·지시문 문제·vendor 없음·저장소 부적격·폴더 미신뢰·크레딧 없음·조회 미완·스냅샷/push 실패·런처 미기동 |
 | 4 | 불확실: 런처는 돌았지만 링크가 없음(오류 종료·시그널·타임아웃·예외) — 로컬 중복 실행 금지 |
 
 세션 존재를 증명하는 것은 출력된 링크뿐이다. 종료 코드 0이나 1만으로는 서버가 세션을 만들었는지 알 수 없다.

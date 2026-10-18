@@ -97,6 +97,37 @@ export function extractSessionUrl(output, { sent = '' } = {}) {
   return ids.length > 0 ? `https://claude.ai/code/${ids[ids.length - 1]}` : null;
 }
 
+// `cloud-dispatch [--cwd DIR] [--dry-run] [--task-file FILE|-] [--] TASK`.
+// The task comes from exactly one source; a flag missing its value, an
+// unknown flag, or both a task file and task words is refused rather than
+// guessed at (dropping half of what the caller wrote would be silent loss).
+export function parseDispatchArgs(argv) {
+  const bad = { reason: 'bad-arguments' };
+  const parsed = { cwd: null, dryRun: false, taskFile: null, words: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--') {
+      parsed.words.push(...argv.slice(i + 1));
+      break;
+    }
+    if (arg === '--dry-run') {
+      parsed.dryRun = true;
+    } else if (arg === '--cwd' || arg === '--task-file') {
+      const value = argv[i + 1];
+      if (typeof value !== 'string' || value === '' || (value.startsWith('--') && value !== '-')) return bad;
+      if (arg === '--cwd') parsed.cwd = value;
+      else parsed.taskFile = value;
+      i += 1;
+    } else if (arg.startsWith('--')) {
+      return bad;
+    } else {
+      parsed.words.push(arg);
+    }
+  }
+  if (parsed.taskFile !== null && parsed.words.length > 0) return bad;
+  return parsed;
+}
+
 // Reads at most DISPATCH_TASK_MAX_BYTES + 1 bytes from a file path or a
 // stream (stdin), so an oversized or endless input is refused without being
 // buffered whole. Returns { task } or { reason }.
@@ -171,6 +202,7 @@ export async function attemptCloudDispatch({
   creditLookup = fetchCloudCredits,
   launchCloud = launchCloudCapturing,
   folderTrusted = isFolderTrusted,
+  platform = process.platform,
   ledgerPath = null,
   dryRun = false,
   now = new Date(),
@@ -182,6 +214,9 @@ export async function attemptCloudDispatch({
   if (typeof task !== 'string' || task.trim().length === 0) return local('task-empty');
   if (Buffer.byteLength(task, 'utf8') > DISPATCH_TASK_MAX_BYTES) return local('task-too-large');
   if (textHasSecret(task)) return local('task-has-secret');
+  // The launcher drives `script` with BSD (macOS) arguments; refuse elsewhere
+  // before anything is pushed.
+  if (platform !== 'darwin') return local('platform-unsupported');
   if (!(await binExists(vendorBin))) return local('vendor-missing');
   const repo = await inspectHandoffRepo({ cwd, runGit, gitEnv });
   if (!repo.ok) return local(repo.reason);

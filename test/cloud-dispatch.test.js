@@ -14,6 +14,7 @@ import {
   extractSessionUrl,
   isFolderTrusted,
   launchCloudCapturing,
+  parseDispatchArgs,
   readTaskInput,
 } from '../src/cloud-dispatch.js';
 
@@ -56,6 +57,7 @@ function inputs(f, overrides = {}) {
     random: () => 0,
     newId: () => DISPATCH_ID,
     folderTrusted: async () => true,
+    platform: 'darwin',
     launchCloud: async () => ({ status: 0, signal: null, output: created('session_default') }),
     ...overrides,
   };
@@ -344,4 +346,36 @@ test('a commit landing during the credit lookup does not drop its changes from t
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(git(f.bare, f.env, 'show', `${outcome.branch}:tracked.txt`), 'work in progress');
+});
+
+test('dispatch is refused off macOS before anything is pushed', async t => {
+  const f = await fixture(t);
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    platform: 'linux',
+    launchCloud: async () => { launched = true; return { status: 0 }; },
+  }));
+  assert.deepEqual(outcome, { ok: false, exit: DISPATCH_EXIT.RUN_LOCAL, reason: 'platform-unsupported' });
+  assert.equal(launched, false);
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});
+
+test('argument parsing takes the task from one source and refuses guesses', () => {
+  assert.deepEqual(parseDispatchArgs(['--cwd', 'repo', '--dry-run', '--', '이슈', '--x']),
+    { cwd: 'repo', dryRun: true, taskFile: null, words: ['이슈', '--x'] });
+  assert.deepEqual(parseDispatchArgs(['--task-file', '-']),
+    { cwd: null, dryRun: false, taskFile: '-', words: [] });
+  assert.deepEqual(parseDispatchArgs(['README', '정리']),
+    { cwd: null, dryRun: false, taskFile: null, words: ['README', '정리'] });
+  for (const argv of [
+    ['--task-file', 'task.txt', '--', '수정하지 말고 분석만'],
+    ['--task-file', 'task.txt', '추가'],
+    ['--task-file'],
+    ['--cwd'],
+    ['--cwd', '--dry-run', 'x'],
+    ['--task-file', ''],
+    ['--unknown', 'x'],
+  ]) {
+    assert.deepEqual(parseDispatchArgs(argv), { reason: 'bad-arguments' }, argv.join(' '));
+  }
 });
