@@ -30,6 +30,7 @@ import {
   handoffBranchName,
   inspectHandoffRepo,
   isExecutableFile,
+  remoteUrlIsFixedPoint,
   pushHandoffSnapshot,
 } from './cloud-handoff.js';
 import { scanSnapshotForSecrets, textHasSecret } from './snapshot-scan.js';
@@ -142,6 +143,9 @@ export async function pushBaseCommit({ root, ref, branch, remote = 'origin', run
   if (!/^[0-9a-f]{40,64}$/.test(commit)) return { ok: false, reason: 'base-not-found' };
   const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv, remote });
   if (!scan.ok) return { ok: false, reason: scan.reason };
+  if (remote !== 'origin' && !(await remoteUrlIsFixedPoint({ root, url: remote, runGit, gitEnv }))) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const pushed = await runGit(
     ['push', '--quiet', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },

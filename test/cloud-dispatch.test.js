@@ -503,3 +503,40 @@ test('a rewrite rule that would re-apply to the resolved URL at push time is ref
   const outcome = await attemptCloudDispatch(inputs(f, { base: 'main' }));
   assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
 });
+
+test('an empty-prefix rewrite rule matches every URL and is refused', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    const other = join(f.root, 'other.git');
+    git(f.root, f.env, 'init', '--quiet', '--bare', other);
+    git(f.repo, f.env, 'config', `url.${other}/.pushInsteadOf`, '');
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base,
+      launchCloud: async () => { launched = true; return { status: 0 }; },
+    }));
+    assert.equal(outcome.reason, 'origin-push-differs');
+    assert.equal(launched, false);
+  }
+});
+
+test('a rewrite rule added after inspection is caught right before the push', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    const other = join(f.root, 'other.git');
+    git(f.root, f.env, 'init', '--quiet', '--bare', other);
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base,
+      creditLookup: async () => {
+        git(f.repo, f.env, 'config', `url.${other}.pushInsteadOf`, f.bare);
+        return { remainingDollars: 100, lockedReason: null };
+      },
+      launchCloud: async () => { launched = true; return { status: 0 }; },
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+    assert.equal(outcome.reason, 'origin-push-differs');
+    assert.equal(launched, false);
+    assert.equal(git(other, f.env, 'for-each-ref'), '');
+  }
+});

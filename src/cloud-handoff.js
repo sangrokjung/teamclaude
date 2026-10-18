@@ -140,6 +140,32 @@ export function defaultRunGit(args, {
   });
 }
 
+// Git re-applies insteadOf/pushInsteadOf to a URL given on the command line,
+// so a URL is only a stable destination when no rewrite rule's prefix
+// matches it (an empty prefix matches everything). Checked at inspection and
+// again right before each push. Threat model: this guards against existing or
+// accidental configuration; a same-user process deliberately rewriting git
+// config between that last check and the push could also just push anything
+// itself, and is out of scope (as for the cloud sidecar).
+export async function remoteUrlIsFixedPoint({ root, url, runGit = defaultRunGit, gitEnv = process.env }) {
+  if (typeof url !== 'string' || url.length === 0) return false;
+  const rules = await runGit(
+    ['config', '-z', '--get-regexp', '^url\\..*\\.(push)?insteadof$'],
+    { cwd: root, env: gitEnv },
+  );
+  // Exit 1: no such rules. Anything else: unreadable config, fail closed.
+  if (rules.status === 1) return true;
+  if (rules.status !== 0) return false;
+  // -z entries are "<key>\n<value>\0"; the value may be empty.
+  for (const entry of rules.stdout.split('\0')) {
+    if (entry.length === 0) continue;
+    const newline = entry.indexOf('\n');
+    const prefix = newline === -1 ? '' : entry.slice(newline + 1);
+    if (url.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
 export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv = process.env }) {
   const top = await runGit(['rev-parse', '--show-toplevel'], { cwd, env: gitEnv });
   if (top.status !== 0 || !top.stdout.trim()) return { ok: false, reason: 'not-git-repo' };
@@ -162,21 +188,8 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
       || lines(fetchUrls)[0] !== lines(pushUrls)[0]) {
     return { ok: false, reason: 'origin-push-differs' };
   }
-  // Git re-applies insteadOf/pushInsteadOf to a URL given on the command
-  // line, so the resolved URL must be a fixed point of both rewrites: no
-  // rule's match prefix may match it, or `ls-remote <url>` and `push <url>`
-  // could still reach different hosts.
   const remoteUrl = lines(pushUrls)[0];
-  const rules = await runGit(
-    ['config', '--get-regexp', '^url\\..*\\.(push)?insteadof$'],
-    { cwd: root, env: gitEnv },
-  );
-  // Exit 1 means no such rules; anything else is unreadable config.
-  if (rules.status !== 0 && rules.status !== 1) return { ok: false, reason: 'origin-push-differs' };
-  const prefixes = rules.status === 0
-    ? lines(rules).map(line => line.slice(line.indexOf(' ') + 1))
-    : [];
-  if (prefixes.some(prefix => prefix.length > 0 && remoteUrl.startsWith(prefix))) {
+  if (!(await remoteUrlIsFixedPoint({ root, url: remoteUrl, runGit, gitEnv }))) {
     return { ok: false, reason: 'origin-push-differs' };
   }
   const head = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, env: gitEnv });
@@ -289,6 +302,9 @@ export async function pushHandoffSnapshot({
   if (!commit) return { ok: false, reason: 'snapshot-failed' };
   const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv, remote });
   if (!scan.ok) return { ok: false, reason: scan.reason };
+  if (remote !== 'origin' && !(await remoteUrlIsFixedPoint({ root, url: remote, runGit, gitEnv }))) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const pushed = await runGit(
     ['push', '--quiet', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
