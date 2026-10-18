@@ -224,10 +224,13 @@ test('session url extraction strips terminal escapes and tolerates junk', () => 
   // Not session links: settings pages, partial ids.
   assert.equal(extractSessionUrl('Error: launch failed. Visit https://claude.ai/code/settings'), null);
   assert.equal(extractSessionUrl('https://claude.ai/code/session_ab-cd'), null);
-  for (const variant of ['session_old9.html', 'session_old9%2Fsettings', 'session_old9/settings', 'session_old9?x=1']) {
+  for (const variant of ['session_old9.html', 'session_old9%2Fsettings', 'session_old9/settings', 'session_old9?x=1',
+    'session_old9;settings', 'session_old9+backup', 'session_old9@archive', 'session_old9:archive', 'session_old9#x', 'session_old9_x']) {
     assert.equal(extractSessionUrl(`see https://claude.ai/code/${variant}`), null, variant);
   }
   assert.equal(extractSessionUrl('Open https://claude.ai/code/session_end1.'), 'https://claude.ai/code/session_end1');
+  assert.equal(extractSessionUrl('(https://claude.ai/code/session_p1) 생성'), 'https://claude.ai/code/session_p1');
+  assert.equal(extractSessionUrl('https://claude.ai/code/session_q1\r\n'), 'https://claude.ai/code/session_q1');
   // An escape-coloured old link in the task is still recognised as echoed.
   const colored = 'https://claude.ai/code/session_\x1b[1mold9\x1b[0m 이어서';
   assert.equal(extractSessionUrl(colored, { sent: colored }), null);
@@ -283,6 +286,14 @@ test('folder trust reads exactly this folder from Claude Code config', async () 
   let read = null;
   await isFolderTrusted('/a', { env, resolvePath, readText: async path => { read = path; return '{}'; } });
   assert.equal(read, '/cfg/.claude.json');
+});
+
+test('a failed launch printing a look-alike link is not success', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    launchCloud: async () => ({ status: 1, signal: null, output: 'Error: failed. See https://claude.ai/code/session_old9;settings' }),
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.AMBIGUOUS);
 });
 
 test('an echoed old session link in a failed launch is not success', async t => {

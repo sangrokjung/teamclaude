@@ -38,9 +38,11 @@ export const DISPATCH_TASK_MAX_BYTES = 32 * 1024;
 export const DISPATCH_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
-// The id must end the link: no further path, extension or escape may follow
-// (a sentence-ending period followed by space or end of text is fine).
-const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?![A-Za-z0-9_\-/%?#&=]|\.(?!\s|$))/g;
+// Allowlist: the id must end the link, followed only by end of text,
+// whitespace, a closing quote/bracket, or one punctuation mark that itself
+// ends the text or precedes whitespace. Anything else (a path, `;x`, `+x`,
+// `.html`, an escape) makes it some other URL, not proof of a new session.
+const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+(?=$|[\s"'<>)\]]|[.,;:!?](?:$|\s))/g;
 
 // `--cloud` in a folder Claude Code has never trusted stops at the trust
 // prompt (default "No, exit") and never prints a session link, so such a
