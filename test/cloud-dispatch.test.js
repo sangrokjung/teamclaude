@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
@@ -18,6 +19,8 @@ import {
   parseDispatchArgs,
   readTaskInput,
 } from '../src/cloud-dispatch.js';
+import { withoutSignaturePayloads } from '../src/snapshot-scan.js';
+import { textHasSecret } from '../src/snapshot-scan.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
 
@@ -615,5 +618,47 @@ test('every push sends one branch only: no tags, no submodule pushes, stored obj
     assert.ok(pushes[0].args.includes('--no-follow-tags'));
     assert.ok(pushes[0].args.includes('--recurse-submodules=no'));
     assert.ok(calls.every(call => call.env?.GIT_NO_REPLACE_OBJECTS === '1'), 'all git calls ignore replacements');
+  }
+});
+
+function armored(kind, body) {
+  const b64 = body.toString('base64');
+  const lines = b64.match(/.{1,64}/g);
+  return [`-----BEGIN ${kind} SIGNATURE-----`, '', ...lines, ...(kind === 'PGP' ? ['=AbCd'] : []), `-----END ${kind} SIGNATURE-----`];
+}
+
+test('signed commits are not mistaken for secrets, but their messages are still scanned', () => {
+  const pgpBody = Buffer.concat([Buffer.from([0xc2, 0x80]), Buffer.from(ALNUM.repeat(4))]);
+  const sshBody = Buffer.concat([Buffer.from('SSHSIG'), Buffer.from(ALNUM.repeat(4))]);
+  for (const sig of [armored('PGP', pgpBody), armored('SSH', sshBody)]) {
+    const header = ['tree 0123', 'author A <a@example.invalid> 1 +0000', `gpgsig ${sig[0]}`, ...sig.slice(1).map(line => ` ${line}`)];
+    const signed = [...header, '', 'normal message', ''].join('\n');
+    assert.equal(textHasSecret(signed), true, 'raw signature trips the opaque-token check');
+    assert.equal(textHasSecret(withoutSignaturePayloads(signed, 'commit')), false);
+    const leaky = [...header, '', `fix\nOPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`, ''].join('\n');
+    assert.equal(textHasSecret(withoutSignaturePayloads(leaky, 'commit')), true);
+    const tag = ['object 0123', 'type commit', 'tag v1', 'tagger A <a@example.invalid> 1 +0000', '', 'release', ...sig, ''].join('\n');
+    assert.equal(textHasSecret(withoutSignaturePayloads(tag, 'tag')), false);
+  }
+  // A "signature" whose body is not a signature (here: an opaque token) keeps everything scanned.
+  const fake = armored('SSH', Buffer.from(`AKIA${ALNUM.slice(26, 42)}${ALNUM}`));
+  const forged = ['tree 0123', `gpgsig ${fake[0]}`, ...fake.slice(1).map(line => ` ${line}`), '', 'msg'].join('\n');
+  assert.equal(withoutSignaturePayloads(forged, 'commit'), forged);
+});
+
+const hasSshKeygen = spawnSync('ssh-keygen', ['-?'], { stdio: 'ignore' }).error === undefined;
+
+test('a really SSH-signed unpushed commit dispatches on both paths', { skip: !hasSshKeygen }, async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    const key = join(f.root, 'signing-key');
+    assert.equal(spawnSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'test', '-f', key]).status, 0);
+    git(f.repo, f.env, 'config', 'gpg.format', 'ssh');
+    git(f.repo, f.env, 'config', 'user.signingkey', key);
+    await writeFile(join(f.repo, 'tracked.txt'), 'signed change\n');
+    git(f.repo, f.env, 'commit', '--quiet', '-S', '-am', 'signed commit');
+    assert.match(git(f.repo, f.env, 'cat-file', 'commit', 'HEAD'), /^gpgsig -----BEGIN SSH SIGNATURE-----$/m);
+    const outcome = await attemptCloudDispatch(inputs(f, { base }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED, `${base}: ${outcome.reason}`);
   }
 });

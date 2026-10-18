@@ -139,6 +139,57 @@ export function treeEntryNames(buffer, idBytes) {
   return Buffer.concat(names.flatMap(name => [name, Buffer.from('\n')]));
 }
 
+const ARMOR_BEGIN_RE = /^-----BEGIN (PGP|SSH) SIGNATURE-----$/;
+const BASE64_LINE_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+const PGP_CHECKSUM_RE = /^=[A-Za-z0-9+/]{4}$/;
+
+// The base64 lines of an armored signature are public data, but long opaque
+// base64 looks like a token to the scanner. Only a block whose decoded body
+// is structurally a signature (an OpenPGP packet, or an "SSHSIG" blob) has
+// its base64 lines dropped; armor headers and everything else stay scanned.
+function signatureBodyLines(lines) {
+  const begin = lines[0]?.match(ARMOR_BEGIN_RE);
+  if (!begin || lines[lines.length - 1] !== `-----END ${begin[1]} SIGNATURE-----`) return null;
+  const inner = lines.slice(1, -1);
+  const body = inner.filter(line => BASE64_LINE_RE.test(line) || PGP_CHECKSUM_RE.test(line));
+  const data = Buffer.from(body.filter(line => !PGP_CHECKSUM_RE.test(line)).join(''), 'base64');
+  const isSignature = begin[1] === 'SSH'
+    ? data.subarray(0, 6).toString('latin1') === 'SSHSIG'
+    : data.length > 0 && (data[0] & 0x80) !== 0;
+  return isSignature ? new Set(body) : null;
+}
+
+// Commit/tag text with verified signature payloads removed.
+export function withoutSignaturePayloads(text, type) {
+  const lines = text.split('\n');
+  const out = [];
+  if (type === 'commit') {
+    let inHeaders = true;
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (inHeaders && line === '') inHeaders = false;
+      const sig = inHeaders && line.match(/^(gpgsig(?:-sha256)?) (.*)$/);
+      if (!sig) {
+        out.push(line);
+        continue;
+      }
+      const block = [sig[2]];
+      while (i + 1 < lines.length && lines[i + 1].startsWith(' ')) block.push(lines[(i += 1)].slice(1));
+      const drop = signatureBodyLines(block);
+      out.push(`${sig[1]} ${block[0]}`, ...block.slice(1).filter(line => !drop?.has(line)).map(line => ` ${line}`));
+    }
+    return out.join('\n');
+  }
+  // tag: an armored signature may close the message.
+  const start = lines.findIndex(line => ARMOR_BEGIN_RE.test(line));
+  if (start === -1) return text;
+  const end = lines.findIndex((line, index) => index > start && /^-----END (PGP|SSH) SIGNATURE-----$/.test(line));
+  if (end === -1) return text;
+  const drop = signatureBodyLines(lines.slice(start, end + 1));
+  if (!drop) return text;
+  return [...lines.slice(0, start + 1), ...lines.slice(start + 1, end).filter(line => !drop.has(line)), ...lines.slice(end)].join('\n');
+}
+
 export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: callerEnv = process.env, remote = 'origin' }) {
   // `git replace` would make rev-list/cat-file read substitutes while push
   // sends the originals; scan what is actually stored.
@@ -198,5 +249,8 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: cal
   if (contents.some(content => content === null)) return unscannable;
   const texts = contents.map(decodeScannableText);
   if (texts.some(text => text === null)) return unscannable;
+  for (const [index, type] of blobTypes.entries()) {
+    if (type === 'commit' || type === 'tag') texts[index] = withoutSignaturePayloads(texts[index], type);
+  }
   return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
 }
