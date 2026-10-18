@@ -31,10 +31,12 @@ async function upstreamMergeRef(root, runGit, gitEnv) {
 
 // Tips of the upstream branch and origin's HEAD as the remote advertises
 // them now, kept only when the commit exists locally (rev-list needs it).
-export async function verifiedRemoteBases({ root, runGit, gitEnv }) {
+// `remote` is the exact URL the caller will push to (default: origin), so
+// what counts as "already there" is measured on the push destination itself.
+export async function verifiedRemoteBases({ root, runGit, gitEnv, remote = 'origin' }) {
   const upstream = await upstreamMergeRef(root, runGit, gitEnv);
   const wanted = new Set(['HEAD', ...(upstream ? [upstream] : [])]);
-  const listed = await git(runGit, root, gitEnv, ['ls-remote', 'origin', ...wanted], { timeoutMs: 60_000 });
+  const listed = await git(runGit, root, gitEnv, ['ls-remote', '--', remote, ...wanted], { timeoutMs: 60_000 });
   if (listed.status !== 0) return [];
   const bases = [];
   for (const line of listed.stdout.split('\n')) {
@@ -46,16 +48,17 @@ export async function verifiedRemoteBases({ root, runGit, gitEnv }) {
   return bases;
 }
 
-// Parses `git cat-file --batch` output for exactly the requested blobs.
-function parseBatch(buffer, objectIds) {
+// Parses `git cat-file --batch` output for exactly the requested objects
+// (each of the type the batch check reported).
+function parseBatch(buffer, objectIds, types) {
   const blobs = [];
   let offset = 0;
-  for (const objectId of objectIds) {
+  for (const [index, objectId] of objectIds.entries()) {
     const newline = buffer.indexOf(0x0a, offset);
     if (newline < 0) return null;
     const [id, type, sizeText] = buffer.subarray(offset, newline).toString('latin1').split(' ');
     const size = Number(sizeText);
-    if (id !== objectId || type !== 'blob' || !Number.isSafeInteger(size)) return null;
+    if (id !== objectId || type !== types[index] || !Number.isSafeInteger(size)) return null;
     const end = newline + 1 + size;
     if (end > buffer.length) return null;
     blobs.push(buffer.subarray(newline + 1, end));
@@ -121,10 +124,28 @@ export function textHasSecret(text) {
   return scanViews(text).some(containsSecret);
 }
 
-export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = process.env }) {
+// Tree objects carry file names; names travel too, so they are scanned as
+// text (one per line). Entries: "<mode> <name>\0<raw object id>".
+export function treeEntryNames(buffer, idBytes) {
+  const names = [];
+  let offset = 0;
+  while (offset < buffer.length) {
+    const space = buffer.indexOf(0x20, offset);
+    const nul = buffer.indexOf(0x00, space + 1);
+    if (space < 0 || nul < 0 || nul + 1 + idBytes > buffer.length) return null;
+    names.push(buffer.subarray(space + 1, nul));
+    offset = nul + 1 + idBytes;
+  }
+  return Buffer.concat(names.flatMap(name => [name, Buffer.from('\n')]));
+}
+
+export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv: callerEnv = process.env, remote = 'origin' }) {
+  // `git replace` would make rev-list/cat-file read substitutes while push
+  // sends the originals; scan what is actually stored.
+  const gitEnv = { ...callerEnv, GIT_NO_REPLACE_OBJECTS: '1' };
   const failed = { ok: false, reason: 'snapshot-scan-failed' };
   const unscannable = { ok: false, reason: 'snapshot-unscannable' };
-  const bases = await verifiedRemoteBases({ root, runGit, gitEnv });
+  const bases = await verifiedRemoteBases({ root, runGit, gitEnv, remote });
   const revList = ['rev-list', '--objects', '--no-object-names', commit];
   if (bases.length > 0) revList.push('--not', ...bases);
   const listed = await git(runGit, root, gitEnv, revList, { timeoutMs: 120_000 });
@@ -141,16 +162,20 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     { input: `${objectIds.join('\n')}\n`, timeoutMs: 120_000 },
   );
   if (checked.status !== 0) return failed;
+  // File contents AND commit objects (author lines, message) travel, so
+  // both are scanned; trees carry only names and modes.
   const blobIds = [];
+  const blobTypes = [];
   let totalBytes = 0;
   for (const line of checked.stdout.split('\n').filter(Boolean)) {
     const [id, type, sizeText] = line.split(' ');
     if (!OBJECT_ID_RE.test(id || '')) return failed;
-    if (type !== 'blob') continue;
+    if (type !== 'blob' && type !== 'commit' && type !== 'tag' && type !== 'tree') continue;
     const size = Number(sizeText);
     if (!Number.isSafeInteger(size)) return failed;
     if (size > SNAPSHOT_TEXT_MAX_BYTES) return unscannable;
     blobIds.push(id);
+    blobTypes.push(type);
     totalBytes += size;
   }
   if (blobIds.length === 0) return { ok: true };
@@ -162,10 +187,22 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     maxOutputBytes: totalBytes + blobIds.length * 160,
   });
   const blobs = batch.status === 0 && Buffer.isBuffer(batch.stdoutBuffer)
-    ? parseBatch(batch.stdoutBuffer, blobIds)
+    ? parseBatch(batch.stdoutBuffer, blobIds, blobTypes)
     : null;
   if (!blobs) return failed;
-  const texts = blobs.map(decodeScannableText);
+  // SHA-1 ids are 20 raw bytes in a tree, SHA-256 ids 32.
+  const idBytes = blobIds[0].length === 64 ? 32 : 20;
+  const contents = blobs.map((buffer, index) => (blobTypes[index] === 'tree'
+    ? treeEntryNames(buffer, idBytes)
+    : buffer));
+  if (contents.some(content => content === null)) return unscannable;
+  const texts = contents.map(decodeScannableText);
   if (texts.some(text => text === null)) return unscannable;
+  // Commit and tag objects are scanned whole, signatures included. A
+  // signature's long base64 can read as a token, so an unpushed SIGNED commit
+  // is refused (fail closed: the caller works locally). Exempting signature
+  // blocks would need full cryptographic verification; partial structural
+  // checks were shown to be bypassable. Dispatches started from an already
+  // pushed base (--base origin/<default>) never scan those commits at all.
   return texts.some(textHasSecret) ? { ok: false, reason: 'snapshot-secret' } : { ok: true };
 }

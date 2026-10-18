@@ -140,6 +140,32 @@ export function defaultRunGit(args, {
   });
 }
 
+// Git re-applies insteadOf/pushInsteadOf to a URL given on the command line,
+// so a URL is only a stable destination when no rewrite rule's prefix
+// matches it (an empty prefix matches everything). Checked at inspection and
+// again right before each push. Threat model: this guards against existing or
+// accidental configuration; a same-user process deliberately rewriting git
+// config between that last check and the push could also just push anything
+// itself, and is out of scope (as for the cloud sidecar).
+export async function remoteUrlIsFixedPoint({ root, url, runGit = defaultRunGit, gitEnv = process.env }) {
+  if (typeof url !== 'string' || url.length === 0) return false;
+  const rules = await runGit(
+    ['config', '-z', '--get-regexp', '^url\\..*\\.(push)?insteadof$'],
+    { cwd: root, env: gitEnv },
+  );
+  // Exit 1: no such rules. Anything else: unreadable config, fail closed.
+  if (rules.status === 1) return true;
+  if (rules.status !== 0) return false;
+  // -z entries are "<key>\n<value>\0"; the value may be empty.
+  for (const entry of rules.stdout.split('\0')) {
+    if (entry.length === 0) continue;
+    const newline = entry.indexOf('\n');
+    const prefix = newline === -1 ? '' : entry.slice(newline + 1);
+    if (url.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
 export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv = process.env }) {
   const top = await runGit(['rev-parse', '--show-toplevel'], { cwd, env: gitEnv });
   if (top.status !== 0 || !top.stdout.trim()) return { ok: false, reason: 'not-git-repo' };
@@ -149,18 +175,38 @@ export async function inspectHandoffRepo({ cwd, runGit = defaultRunGit, gitEnv =
   if (origin.status !== 0 || !isGitHubRemoteUrl(origin.stdout.trim())) {
     return { ok: false, reason: 'origin-not-github' };
   }
+  // The secret scan skips objects the destination already has, so scan and
+  // push must address one repository: a pushurl, a pushInsteadOf rewrite, or
+  // several URLs are refused, and the single resolved URL is returned so the
+  // scan and the push use it verbatim — a later edit of the remote config
+  // cannot split them.
+  const fetchUrls = await runGit(['remote', 'get-url', '--all', 'origin'], { cwd: root, env: gitEnv });
+  const pushUrls = await runGit(['remote', 'get-url', '--push', '--all', 'origin'], { cwd: root, env: gitEnv });
+  const lines = result => result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  if (fetchUrls.status !== 0 || pushUrls.status !== 0
+      || lines(fetchUrls).length !== 1 || lines(pushUrls).length !== 1
+      || lines(fetchUrls)[0] !== lines(pushUrls)[0]) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
+  const remoteUrl = lines(pushUrls)[0];
+  if (!(await remoteUrlIsFixedPoint({ root, url: remoteUrl, runGit, gitEnv }))) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const head = await runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: root, env: gitEnv });
   if (head.status !== 0 || !head.stdout.trim()) return { ok: false, reason: 'no-head' };
-  return { ok: true, root, head: head.stdout.trim() };
+  return { ok: true, root, head: head.stdout.trim(), remoteUrl };
 }
 
 function nulList(text) {
   return text.split('\0').filter(Boolean);
 }
 
-async function snapshotPaths(root, runGit, gitEnv) {
+// Everything is measured against the `head` inspected earlier, not the
+// symbolic HEAD: a commit landing meanwhile must not make its changes vanish
+// from a snapshot whose parent is still the old commit.
+async function snapshotPaths(root, head, runGit, gitEnv) {
   const changed = await runGit(
-    ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', 'HEAD', '--'],
+    ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', head, '--'],
     { cwd: root, env: gitEnv },
   );
   const untracked = await runGit(
@@ -204,7 +250,7 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
     // A private index seeded from HEAD: the user's index, work tree, and
     // branch are never written.
     const env = { ...gitEnv, GIT_INDEX_FILE: join(scratch, 'index') };
-    const seeded = await runGit(['read-tree', 'HEAD'], { cwd: root, env });
+    const seeded = await runGit(['read-tree', head], { cwd: root, env });
     if (seeded.status !== 0) return null;
     const updated = await runGit(
       ['update-index', '--add', '--remove', '-z', '--stdin'],
@@ -212,7 +258,7 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
     );
     if (updated.status !== 0) return null;
     const tree = await runGit(['write-tree'], { cwd: root, env });
-    const headTree = await runGit(['rev-parse', 'HEAD^{tree}'], { cwd: root, env });
+    const headTree = await runGit(['rev-parse', `${head}^{tree}`], { cwd: root, env });
     if (tree.status !== 0 || headTree.status !== 0) return null;
     if (tree.stdout.trim() === headTree.stdout.trim()) return head;
     const identity = await runGit(['var', 'GIT_COMMITTER_IDENT'], { cwd: root, env });
@@ -239,23 +285,30 @@ async function snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv }) 
 export async function pushHandoffSnapshot({
   root,
   head,
+  // The exact URL from inspectHandoffRepo; 'origin' only for direct callers.
+  remote = 'origin',
   sessionId,
   runGit = defaultRunGit,
   gitEnv = process.env,
   now = new Date(),
 }) {
   const branch = handoffBranchName(sessionId, now);
-  const snapshotResult = await snapshotPaths(root, runGit, gitEnv);
+  const snapshotResult = await snapshotPaths(root, head, runGit, gitEnv);
   if (!snapshotResult.ok) return { ok: false, reason: snapshotResult.reason };
   const { paths } = snapshotResult;
   const commit = paths.length > 0
     ? await snapshotCommit({ root, head, sessionId, paths, runGit, gitEnv })
     : head;
   if (!commit) return { ok: false, reason: 'snapshot-failed' };
-  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv });
+  const scan = await scanSnapshotForSecrets({ root, commit, runGit, gitEnv, remote });
   if (!scan.ok) return { ok: false, reason: scan.reason };
+  if (remote !== 'origin' && !(await remoteUrlIsFixedPoint({ root, url: remote, runGit, gitEnv }))) {
+    return { ok: false, reason: 'origin-push-differs' };
+  }
   const pushed = await runGit(
-    ['push', '--quiet', 'origin', `${commit}:refs/heads/${branch}`],
+    // Only the one branch: no tags (push.followTags), no submodule pushes
+    // (push.recurseSubmodules) — neither is covered by the scan.
+    ['push', '--quiet', '--no-follow-tags', '--recurse-submodules=no', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };
@@ -445,7 +498,7 @@ export async function appendCloudLedger(path, entry) {
   await chmod(path, 0o600);
 }
 
-async function isExecutableFile(path) {
+export async function isExecutableFile(path) {
   if (typeof path !== 'string' || !isAbsolute(path)) return false;
   try {
     const info = await stat(path);
@@ -493,6 +546,9 @@ export async function attemptCloudHandoff({
   creditLookupOptions = {},
 }) {
   const skip = reason => ({ ok: false, reason, stopped: false });
+  // Snapshot, scan and push all read stored objects, never `git replace`
+  // substitutes (push would send the originals).
+  gitEnv = { ...gitEnv, GIT_NO_REPLACE_OBJECTS: '1' };
   if (!(await binExists(vendorBin))) return skip('vendor-missing');
   const repo = await inspectHandoffRepo({ cwd, runGit, gitEnv });
   if (!repo.ok) return skip(repo.reason);
@@ -512,6 +568,7 @@ export async function attemptCloudHandoff({
   const snapshot = await pushHandoffSnapshot({
     root: repo.root,
     head: repo.head,
+    remote: repo.remoteUrl,
     sessionId,
     runGit,
     gitEnv,

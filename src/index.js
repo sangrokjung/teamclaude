@@ -41,6 +41,7 @@ import { codexCreditsStatusLine } from './codex-credits.js';
 import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
+import { DISPATCH_EXIT, attemptCloudDispatch, parseDispatchArgs, readTaskInput } from './cloud-dispatch.js';
 import {
   killProcess,
   launchCloudWithScript,
@@ -265,6 +266,10 @@ switch (command) {
     break;
   case 'cloud-sidecar':
     await cloudSidecarCommand();
+    process.exit(process.exitCode ?? 0);
+    break;
+  case 'cloud-dispatch':
+    await cloudDispatchCommand();
     process.exit(process.exitCode ?? 0);
     break;
   case 'install-claude-wrapper':
@@ -3439,6 +3444,44 @@ async function subscriptionCommand() {
     : anthropicSubscriptionCommand();
 }
 
+// Sends one task to a cloud session on an account with cloud credits; see
+// src/cloud-dispatch.js. Prints one JSON line; the exit code is the contract:
+// 0 sent, 3 run it locally, 4 uncertain (check claude.ai first).
+async function cloudDispatchCommand() {
+  const emit = outcome => {
+    console.log(JSON.stringify(outcome));
+    process.exitCode = outcome.exit;
+  };
+  const local = reason => emit({ ok: false, exit: DISPATCH_EXIT.RUN_LOCAL, reason });
+  if (cliProvider === 'codex') return local('claude-pool-only');
+  const parsed = parseDispatchArgs(args.slice(1));
+  if (parsed.reason) return local(parsed.reason);
+  const cwd = parsed.cwd ? resolve(parsed.cwd) : process.cwd();
+  const { dryRun, taskFile, words, base } = parsed;
+  let task = words.join(' ');
+  if (taskFile) {
+    const input = await readTaskInput(taskFile === '-' ? process.stdin : taskFile);
+    if (input.reason) return local(input.reason);
+    task = input.task;
+  }
+  const config = await loadConfig();
+  if (!config || isCodexMode(config)) return local('no-claude-pool');
+  emit(await attemptCloudDispatch({
+    task,
+    cwd,
+    baseEnv: process.env,
+    vendorBin: process.env.TEAMCLAUDE_CLAUDE_BIN
+      || config.cloudClaudeBin
+      || config.cloudSidecarClaudeBin
+      || null,
+    // Re-read disk: the running server persists refreshed tokens there.
+    loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+    ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    dryRun,
+    base,
+  }));
+}
+
 // One scan for legacy `run` supervisors waiting out an exhausted fleet; see
 // src/cloud-sidecar.js. Meant to be run periodically (e.g. launchd, 60s).
 async function cloudSidecarCommand() {
@@ -3606,6 +3649,10 @@ Commands:
                       rotation, survives restarts) or clear the mark
   api <path>          Call an API endpoint with account credentials
   cloud-sidecar       One scan: hand exhausted legacy \`run\` sessions to cloud
+  cloud-dispatch [--cwd DIR] [--base REF] [--dry-run] [--task-file FILE|-] [--] TASK
+                      Send TASK to a cloud session on an account with cloud
+                      credits (exit 0 sent, 3 run locally, 4 uncertain);
+                      --base starts it from REF, ignoring uncommitted work
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
