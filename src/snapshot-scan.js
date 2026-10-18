@@ -48,16 +48,17 @@ export async function verifiedRemoteBases({ root, runGit, gitEnv, remote = 'orig
   return bases;
 }
 
-// Parses `git cat-file --batch` output for exactly the requested blobs.
-function parseBatch(buffer, objectIds) {
+// Parses `git cat-file --batch` output for exactly the requested objects
+// (each of the type the batch check reported).
+function parseBatch(buffer, objectIds, types) {
   const blobs = [];
   let offset = 0;
-  for (const objectId of objectIds) {
+  for (const [index, objectId] of objectIds.entries()) {
     const newline = buffer.indexOf(0x0a, offset);
     if (newline < 0) return null;
     const [id, type, sizeText] = buffer.subarray(offset, newline).toString('latin1').split(' ');
     const size = Number(sizeText);
-    if (id !== objectId || type !== 'blob' || !Number.isSafeInteger(size)) return null;
+    if (id !== objectId || type !== types[index] || !Number.isSafeInteger(size)) return null;
     const end = newline + 1 + size;
     if (end > buffer.length) return null;
     blobs.push(buffer.subarray(newline + 1, end));
@@ -143,16 +144,20 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     { input: `${objectIds.join('\n')}\n`, timeoutMs: 120_000 },
   );
   if (checked.status !== 0) return failed;
+  // File contents AND commit objects (author lines, message) travel, so
+  // both are scanned; trees carry only names and modes.
   const blobIds = [];
+  const blobTypes = [];
   let totalBytes = 0;
   for (const line of checked.stdout.split('\n').filter(Boolean)) {
     const [id, type, sizeText] = line.split(' ');
     if (!OBJECT_ID_RE.test(id || '')) return failed;
-    if (type !== 'blob') continue;
+    if (type !== 'blob' && type !== 'commit' && type !== 'tag') continue;
     const size = Number(sizeText);
     if (!Number.isSafeInteger(size)) return failed;
     if (size > SNAPSHOT_TEXT_MAX_BYTES) return unscannable;
     blobIds.push(id);
+    blobTypes.push(type);
     totalBytes += size;
   }
   if (blobIds.length === 0) return { ok: true };
@@ -164,7 +169,7 @@ export async function scanSnapshotForSecrets({ root, commit, runGit, gitEnv = pr
     maxOutputBytes: totalBytes + blobIds.length * 160,
   });
   const blobs = batch.status === 0 && Buffer.isBuffer(batch.stdoutBuffer)
-    ? parseBatch(batch.stdoutBuffer, blobIds)
+    ? parseBatch(batch.stdoutBuffer, blobIds, blobTypes)
     : null;
   if (!blobs) return failed;
   const texts = blobs.map(decodeScannableText);

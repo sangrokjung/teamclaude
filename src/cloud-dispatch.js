@@ -147,7 +147,8 @@ export async function pushBaseCommit({ root, ref, branch, remote = 'origin', run
     return { ok: false, reason: 'origin-push-differs' };
   }
   const pushed = await runGit(
-    ['push', '--quiet', '--', remote, `${commit}:refs/heads/${branch}`],
+    // Only the one branch: never tags pulled along by push.followTags.
+    ['push', '--quiet', '--no-follow-tags', '--', remote, `${commit}:refs/heads/${branch}`],
     { cwd: root, env: gitEnv, timeoutMs: 120_000 },
   );
   if (pushed.status !== 0) return { ok: false, reason: 'push-failed' };

@@ -540,3 +540,31 @@ test('a rewrite rule added after inspection is caught right before the push', as
     assert.equal(git(other, f.env, 'for-each-ref'), '');
   }
 });
+
+test('a secret only in an unpushed commit message is never sent', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    await writeFile(join(f.repo, 'tracked.txt'), 'harmless change\n');
+    git(f.repo, f.env, 'commit', '--quiet', '-am', `deploy fix\n\nOPENAI_API_KEY=sk-proj-${ALNUM.slice(0, 40)}`);
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      base,
+      launchCloud: async () => { launched = true; return { status: 0 }; },
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL, String(base));
+    assert.equal(outcome.reason, 'snapshot-secret', String(base));
+    assert.equal(launched, false);
+    assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  }
+});
+
+test('push.followTags does not publish tags along with the dispatch branch', async t => {
+  for (const base of ['main', null]) {
+    const f = await fixture(t);
+    git(f.repo, f.env, 'config', 'push.followTags', 'true');
+    git(f.repo, f.env, 'tag', '-a', 'v9.9.9', '-m', 'release tag');
+    const outcome = await attemptCloudDispatch(inputs(f, { base }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+    assert.equal(git(f.bare, f.env, 'tag', '--list'), '', String(base));
+  }
+});
