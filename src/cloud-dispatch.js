@@ -7,14 +7,18 @@
 // answers, as process exit codes for scripts and harness rules:
 //   DISPATCHED (0) — a cloud session was created; do not also run it locally;
 //   RUN_LOCAL  (3) — definitively not sent (no credit, repo not eligible,
-//                    secret in the task, ...); run the task locally;
-//   AMBIGUOUS  (4) — the launch may have created a session; check claude.ai
-//                    before running the task locally.
+//                    secret in the task, the launcher never started, ...);
+//                    run the task locally;
+//   AMBIGUOUS  (4) — the launcher ran but printed no session link, so a
+//                    session may exist; check claude.ai before running the
+//                    task locally.
+// Only a printed session link proves a session exists: an exit status alone
+// says nothing about what the server already created.
 
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   CLOUD_ACCOUNT_LOOKUP_INCOMPLETE,
@@ -35,6 +39,32 @@ export const DISPATCH_LAUNCH_TIMEOUT_MS = 5 * 60 * 1000;
 
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 const SESSION_URL_RE = /https:\/\/claude\.ai\/code\/[A-Za-z0-9_\-/]+/;
+
+// `--cloud` in a folder Claude Code has never trusted stops at the trust
+// prompt (default "No, exit") and never prints a session link, so such a
+// launch would only time out as AMBIGUOUS. Read-only check of Claude Code's
+// own record for exactly this folder: inside a git repository Claude Code
+// does not count trust given to folders above the repository root, so a
+// trusted parent proves nothing here.
+export async function isFolderTrusted(dir, {
+  env = process.env,
+  readText = path => readFile(path, 'utf8'),
+  resolvePath = realpath,
+} = {}) {
+  let projects;
+  try {
+    const configDir = env.CLAUDE_CONFIG_DIR || homedir();
+    projects = JSON.parse(await readText(join(configDir, '.claude.json')))?.projects;
+  } catch {
+    return false;
+  }
+  if (!projects || typeof projects !== 'object') return false;
+  try {
+    return projects[await resolvePath(dir)]?.hasTrustDialogAccepted === true;
+  } catch {
+    return false;
+  }
+}
 
 export function buildDispatchPrompt({ branch, task }) {
   return [
@@ -85,6 +115,7 @@ export async function attemptCloudDispatch({
   loadAccounts,
   creditLookup = fetchCloudCredits,
   launchCloud = launchCloudCapturing,
+  folderTrusted = isFolderTrusted,
   ledgerPath = null,
   dryRun = false,
   now = new Date(),
@@ -99,11 +130,14 @@ export async function attemptCloudDispatch({
   if (!(await binExists(vendorBin))) return local('vendor-missing');
   const repo = await inspectHandoffRepo({ cwd, runGit, gitEnv });
   if (!repo.ok) return local(repo.reason);
+  if (!(await folderTrusted(repo.root))) return local('folder-not-trusted');
 
   let accounts = null;
   try {
     accounts = typeof loadAccounts === 'function' ? await loadAccounts() : null;
   } catch {}
+  // An operator-disabled account is out of use, its cloud credits included.
+  if (Array.isArray(accounts)) accounts = accounts.filter(account => account?.enabled !== false);
   const account = await findCloudAccount({
     accounts,
     creditLookup,
@@ -149,18 +183,11 @@ export async function attemptCloudDispatch({
   const neverSpawned = Boolean(result?.error
     && (result.error.code === 'ENOENT' || result.error.code === 'EACCES')
     && !result.pid);
-  const exitedCleanly = Boolean(result
-    && !result.error
-    && result.signal == null
-    && typeof result.status === 'number');
-  const dispatched = exitedCleanly && (result.status === 0 || url !== null);
-  if (!dispatched) {
-    // A clean failing exit with no session link, or a spawn that never
-    // happened, created nothing; a kill, timeout or unreadable result might
-    // have.
-    if (neverSpawned || exitedCleanly) return local('launch-failed');
+  if (url === null) {
+    if (neverSpawned) return local('launch-failed');
     return { ok: false, exit: DISPATCH_EXIT.AMBIGUOUS, reason: 'launch-uncertain', branch: snapshot.branch };
   }
+  let ledgerRecorded = false;
   if (ledgerPath) {
     try {
       await appendCloudLedger(ledgerPath, {
@@ -172,6 +199,7 @@ export async function attemptCloudDispatch({
         cwd: repo.root,
         url,
       });
+      ledgerRecorded = true;
     } catch {}
   }
   return {
@@ -180,5 +208,6 @@ export async function attemptCloudDispatch({
     account: account.name,
     branch: snapshot.branch,
     url,
+    ledgerRecorded,
   };
 }

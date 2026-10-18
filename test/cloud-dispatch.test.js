@@ -11,6 +11,7 @@ import {
   attemptCloudDispatch,
   buildDispatchPrompt,
   extractSessionUrl,
+  isFolderTrusted,
   launchCloudCapturing,
 } from '../src/cloud-dispatch.js';
 
@@ -46,7 +47,8 @@ function inputs(f, overrides = {}) {
     now: new Date(2026, 9, 18, 15, 0),
     random: () => 0,
     newId: () => DISPATCH_ID,
-    launchCloud: async () => ({ status: 0, signal: null, output: '' }),
+    folderTrusted: async () => true,
+    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_default' }),
     ...overrides,
   };
 }
@@ -84,6 +86,7 @@ test('dispatch pushes a snapshot branch, launches --cloud on the funded account,
   assert.equal(ledger[0].account, 'cloud-acct');
   assert.equal(ledger[0].url, 'https://claude.ai/code/session_abc123');
   assert.equal(JSON.stringify(ledger).includes('tok-cloud'), false);
+  assert.equal(outcome.ledgerRecorded, true);
 });
 
 test('no funded account means run locally, with nothing pushed or launched', async t => {
@@ -152,36 +155,59 @@ test('dry run reports the account it would use without pushing or launching', as
   assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
 });
 
-test('launch outcomes: clean failure runs locally, a kill or throw is uncertain', async t => {
+test('launch outcomes: only a printed session link counts as sent', async t => {
   const f = await fixture(t);
-  const cleanFail = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => ({ status: 1, signal: null, output: 'error' }),
-  }));
-  assert.equal(cleanFail.exit, DISPATCH_EXIT.RUN_LOCAL);
-  assert.equal(cleanFail.reason, 'launch-failed');
+  const outcomeOf = launchCloud => attemptCloudDispatch(inputs(f, { launchCloud }));
 
-  const notSpawned = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => ({ error: Object.assign(new Error('x'), { code: 'ENOENT' }), status: null }),
-  }));
+  // The launcher never started: nothing can exist.
+  const notSpawned = await outcomeOf(async () => ({ error: Object.assign(new Error('x'), { code: 'ENOENT' }), status: null }));
   assert.equal(notSpawned.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(notSpawned.reason, 'launch-failed');
 
-  const killed = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => ({ status: null, signal: 'SIGTERM', output: '' }),
-  }));
-  assert.equal(killed.exit, DISPATCH_EXIT.AMBIGUOUS);
-  assert.equal(killed.reason, 'launch-uncertain');
-
-  const threw = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => { throw new Error('boom'); },
-  }));
+  // It ran but printed no link: a session may exist server-side.
+  for (const result of [
+    { status: 1, signal: null, output: 'error' },
+    { status: 0, signal: null, output: 'Do you trust this folder?' },
+    { status: null, signal: 'SIGTERM', output: '' },
+  ]) {
+    const outcome = await outcomeOf(async () => result);
+    assert.equal(outcome.exit, DISPATCH_EXIT.AMBIGUOUS, JSON.stringify(result));
+    assert.equal(outcome.reason, 'launch-uncertain');
+    assert.match(outcome.branch, /^teamclaude-handoff\//);
+  }
+  const threw = await outcomeOf(async () => { throw new Error('boom'); });
   assert.equal(threw.exit, DISPATCH_EXIT.AMBIGUOUS);
 
   // A nonzero exit that still printed a session link did create a session.
-  const linked = await attemptCloudDispatch(inputs(f, {
-    launchCloud: async () => ({ status: 1, signal: null, output: 'https://claude.ai/code/session_zz9' }),
-  }));
+  const linked = await outcomeOf(async () => ({ status: 1, signal: null, output: 'https://claude.ai/code/session_zz9' }));
   assert.equal(linked.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(linked.url, 'https://claude.ai/code/session_zz9');
+});
+
+test('disabled accounts are never used, not even looked up', async t => {
+  const f = await fixture(t);
+  const looked = [];
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    dryRun: true,
+    loadAccounts: async () => [
+      { name: 'off', enabled: false, type: 'oauth', accessToken: 'tok-off', expiresAt: Date.now() + 3_600_000 },
+    ],
+    creditLookup: async token => { looked.push(token); return { remainingDollars: 100, lockedReason: null }; },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'no-credit-account');
+  assert.deepEqual(looked, []);
+});
+
+test('a ledger write failure keeps the dispatch result but says so', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.root, 'blocker'), 'not a directory\n');
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    ledgerPath: join(f.root, 'blocker', 'ledger.jsonl'),
+    launchCloud: async () => ({ status: 0, signal: null, output: 'https://claude.ai/code/session_l1' }),
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+  assert.equal(outcome.ledgerRecorded, false);
 });
 
 test('prompt names the branch and carries the task verbatim', () => {
@@ -207,4 +233,38 @@ test('launchCloudCapturing runs the binary under a pty and returns its output', 
   const result = await launchCloudCapturing({ vendorBin, args: ['--cloud', 'x'], env: { PATH: '/usr/bin:/bin' }, cwd: root });
   assert.equal(result.status, 0);
   assert.equal(extractSessionUrl(result.output), 'https://claude.ai/code/session_pty1');
+});
+
+test('an untrusted folder runs locally before anything is pushed', async t => {
+  const f = await fixture(t);
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    folderTrusted: async () => false,
+    launchCloud: async () => { launched = true; return { status: 0 }; },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'folder-not-trusted');
+  assert.equal(launched, false);
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});
+
+test('folder trust reads exactly this folder from Claude Code config', async () => {
+  const config = projects => async () => JSON.stringify({ projects });
+  const resolvePath = async path => path;
+  const env = { CLAUDE_CONFIG_DIR: '/cfg' };
+  assert.equal(await isFolderTrusted('/a/b/c', {
+    env, resolvePath, readText: config({ '/a/b/c': { hasTrustDialogAccepted: true } }),
+  }), true);
+  // A trusted parent does not carry over into a repository below it.
+  assert.equal(await isFolderTrusted('/a/b/c', {
+    env, resolvePath, readText: config({ '/a': { hasTrustDialogAccepted: true } }),
+  }), false);
+  assert.equal(await isFolderTrusted('/a/b/c', {
+    env, resolvePath, readText: config({ '/a/b/c': { hasTrustDialogAccepted: false }, '/x': { hasTrustDialogAccepted: true } }),
+  }), false);
+  assert.equal(await isFolderTrusted('/a', { env, resolvePath, readText: async () => 'not json' }), false);
+  assert.equal(await isFolderTrusted('/a', { env, resolvePath, readText: async () => { throw new Error('missing'); } }), false);
+  let read = null;
+  await isFolderTrusted('/a', { env, resolvePath, readText: async path => { read = path; return '{}'; } });
+  assert.equal(read, '/cfg/.claude.json');
 });
