@@ -30,10 +30,15 @@ export async function readFeederState(path = feederStatePath()) {
   const state = JSON.parse(text);
   const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value);
   if (!plain(state) || !plain(state.sent)) throw new Error('corrupt feeder state');
+  const nonEmpty = value => typeof value === 'string' && value.length > 0;
   for (const entry of Object.values(state.sent)) {
-    if (!plain(entry) || ![0, 3, 4].includes(entry.exit) || !Number.isFinite(Date.parse(entry.ts))) {
-      throw new Error('corrupt feeder state entry');
-    }
+    const ok = plain(entry)
+      && [0, 3, 4].includes(entry.exit)
+      && Number.isFinite(Date.parse(entry.ts))
+      && nonEmpty(entry.repo)
+      // A sent entry is only useful (and only skipped) with the branch to follow.
+      && (entry.exit !== 0 || (nonEmpty(entry.branch) && (entry.merge == null || nonEmpty(entry.merge))));
+    if (!ok) throw new Error('corrupt feeder state entry');
   }
   return state;
 }
@@ -90,14 +95,22 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // A page of an oldest-first search starting at `cursor` (createdAt). A full
 // page returns the next cursor; a short one wraps back to the start, so later
 // items are reached on following runs however many stay open.
+export function nextSearchCursor(items, cursor, limit = LIST_LIMIT) {
+  if (items.length < limit) return null;
+  const last = items[items.length - 1].createdAt;
+  if (last !== cursor) return last;
+  // A full page that never leaves one timestamp would repeat forever: step
+  // one second past it (the rest of that same-second burst is skipped).
+  return new Date(Date.parse(last) + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
 function searchPage(kind, owner, cursor, fields) {
   const query = cursor && ISO_RE.test(cursor) ? [`created:>=${cursor}`] : [];
   const items = ghJson([
     'search', kind, ...query, '--owner', owner, '--state', 'open',
     '--sort', 'created', '--order', 'asc', '--limit', String(LIST_LIMIT), '--json', `${fields},createdAt`,
   ]);
-  const next = items.length >= LIST_LIMIT ? items[items.length - 1].createdAt : null;
-  return { items, next };
+  return { items, next: nextSearchCursor(items, cursor) };
 }
 
 function paged(kind, owners, cursors, fields) {
@@ -132,11 +145,20 @@ export function listPulls(owners, cursors, log) {
       'pr', 'list', '-R', repo, '--state', 'open', '--limit', String(LIST_LIMIT),
       '--json', 'number,headRefName,headRefOid,isCrossRepository',
     ]);
-    if (heads.length >= LIST_LIMIT) log?.(`[cloud-feed] ${repo} has ${LIST_LIMIT}+ open PRs; only the newest are reviewed`);
-    for (const head of heads) {
-      const pull = pulls.get(head.number);
-      if (pull) out.push({ ...pull, ...head, repository: { nameWithOwner: repo } });
+    const headsByNumber = new Map(heads.map(head => [head.number, head]));
+    let viewed = 0;
+    for (const [number, pull] of pulls) {
+      let head = headsByNumber.get(number);
+      // Beyond the bulk list (1000+ open PRs): look the PR up directly, bounded.
+      if (!head && viewed < 50) {
+        viewed += 1;
+        try {
+          head = ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'number,headRefName,headRefOid,isCrossRepository']);
+        } catch {}
+      }
+      if (head) out.push({ ...pull, ...head, repository: { nameWithOwner: repo } });
     }
+    if (heads.length >= LIST_LIMIT) log?.(`[cloud-feed] ${repo} has ${LIST_LIMIT}+ open PRs; looked ${viewed} up directly`);
   }
   return { items: out, cursors: page.cursors };
 }
@@ -207,7 +229,7 @@ export function defaultBase(cwd) {
 export function findPull(repo, branch) {
   const pulls = ghJson([
     'pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '20',
-    '--json', 'number,state,isDraft,headRefOid,headRefName,isCrossRepository,title,baseRefName',
+    '--json', 'number,state,isDraft,headRefOid,headRefName,isCrossRepository,title,baseRefName,baseRefOid',
   ]);
   return pulls.find(pull => pull.headRefName === branch && pull.isCrossRepository === false) ?? null;
 }
@@ -265,6 +287,22 @@ export async function reviewPull(repo, pull, cwd, checks = []) {
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
+}
+
+// Whether the PR head already contains the current base tip, so the CI that
+// ran on the head also covers what the merge will produce. null = unknown.
+export function headContainsBase(repo, pull) {
+  try {
+    const compare = ghJson(['api', `repos/${repo}/compare/${pull.baseRefOid}...${pull.headRefOid}`, '--jq', '{behind_by}']);
+    return Number.isInteger(compare.behind_by) ? compare.behind_by === 0 : null;
+  } catch {
+    return null;
+  }
+}
+
+// Brings a behind PR branch up to date with its base (a new head; CI reruns).
+export function updateBranch(repo, pull) {
+  return run('gh', ['pr', 'update-branch', String(pull.number), '-R', repo]).status === 0;
 }
 
 export function mergePull(repo, pull) {

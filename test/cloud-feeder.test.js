@@ -209,8 +209,10 @@ test('runMerge merges only approved PRs, keeps the rest for later, and caps revi
     dryRun: false,
     deps: {
       saveState: async () => {},
-      findPull: async (repo, branch) => ({ number: pulls[branch], state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main' }),
+      findPull: async (repo, branch) => ({ number: pulls[branch], state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
       listChecks: async () => [{ bucket: 'pass' }],
+      headContainsBase: async () => true,
+      updateBranch: async () => true,
       review: async (repo, pull) => (pull.number === 1 ? 'APPROVE' : 'REQUEST_CHANGES'),
       merge: async (repo, pull) => { merged.push(pull.number); return true; },
     },
@@ -228,8 +230,10 @@ test('a review that could not run is retried, never merged', async () => {
   let merged = 0;
   const deps = {
     saveState: async () => {},
-    findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main' }),
+    findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
     listChecks: async () => [{ bucket: 'pass' }],
+    headContainsBase: async () => true,
+    updateBranch: async () => true,
     review: async () => null,
     merge: async () => { merged += 1; return true; },
   };
@@ -295,8 +299,10 @@ test('reviews rotate: entries that keep failing review cannot starve the rest', 
   const reviewedOrder = [];
   const deps = {
     saveState: async () => {},
-    findPull: async (repo, branch) => ({ number: branch.charCodeAt(0), state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main' }),
+    findPull: async (repo, branch) => ({ number: branch.charCodeAt(0), state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
     listChecks: async () => [{ bucket: 'pass' }],
+    headContainsBase: async () => true,
+    updateBranch: async () => true,
     review: async (repo, pull) => { reviewedOrder.push(String.fromCharCode(pull.number)); return null; },
     merge: async () => true,
   };
@@ -306,33 +312,96 @@ test('reviews rotate: entries that keep failing review cannot starve the rest', 
   assert.ok(reviewedOrder.includes('c'), `c reviewed within three runs: ${reviewedOrder.join('')}`);
 });
 
-test('an approved PR is not merged if its head, base or checks changed during the review', async () => {
+test('an approved PR is not merged if its head, base, base commit or checks changed during the review', async () => {
   for (const change of [
     { headRefOid: 'h2' },
     { baseRefName: 'release' },
+    { baseRefOid: 'base2' },
     { checks: [{ bucket: 'fail' }] },
     { checks: null },
+    { contains: false },
   ]) {
     let calls = 0;
     let merged = false;
     const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
+    const later = () => calls > 1;
     const result = await runMerge({
       cfg, now: NOW, state, dryRun: false,
       deps: {
         saveState: async () => {},
         findPull: async () => {
           calls += 1;
-          const base = { number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h1', baseRefName: 'main' };
-          return calls === 1 ? base : { ...base, ...('checks' in change ? {} : change) };
+          const base = { number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h1', baseRefName: 'main', baseRefOid: 'base1' };
+          const pullChange = Object.fromEntries(Object.entries(change).filter(([k]) => k !== 'checks' && k !== 'contains'));
+          return later() ? { ...base, ...pullChange } : base;
         },
-        listChecks: async () => (calls === 1 || !('checks' in change) ? [{ bucket: 'pass' }] : change.checks),
+        listChecks: async () => (later() && 'checks' in change ? change.checks : [{ bucket: 'pass' }]),
+        headContainsBase: async () => (later() && 'contains' in change ? change.contains : true),
+        updateBranch: async () => true,
         review: async () => 'APPROVE',
         merge: async () => { merged = true; return true; },
       },
     });
     assert.equal(merged, false, JSON.stringify(change));
-    assert.equal(result.state.sent.a.merge, 'review-unavailable');
+    assert.equal(result.state.sent.a.merge, 'review-unavailable', JSON.stringify(change));
   }
+});
+
+test('checks are an allowlist: only passing (or skipped next to a pass) proceeds', () => {
+  const entry = { repo: 'o/a', ts: '2026-10-20T00:00:00Z' };
+  const open = { state: 'OPEN', isDraft: false, number: 1, headRefOid: 'h1' };
+  const decide = checks => mergeDecision({ entry, pull: open, checks, now: NOW, cfg });
+  assert.equal(decide([{ bucket: 'pass' }, { bucket: 'skipping' }]), 'review');
+  assert.equal(decide([{ bucket: 'skipping' }]), 'no-ci');
+  assert.equal(decide([{ state: 'WAITING' }]), 'checks-unknown');
+  assert.equal(decide([{}]), 'checks-unknown');
+  assert.equal(decide([{ bucket: 'pass' }, { bucket: 'weird' }]), 'checks-unknown');
+  assert.equal(decide({ not: 'an array' }), 'wait');
+});
+
+test('a behind PR is updated, not merged; unknown freshness waits', async () => {
+  for (const [contains, updated, expected] of [[false, true, 'pending'], [false, false, 'behind'], [null, true, 'pending']]) {
+    let merged = false;
+    const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
+    const result = await runMerge({
+      cfg, now: NOW, state, dryRun: false,
+      deps: {
+        saveState: async () => {},
+        findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h1', baseRefName: 'main', baseRefOid: 'b1' }),
+        listChecks: async () => [{ bucket: 'pass' }],
+        headContainsBase: async () => contains,
+        updateBranch: async () => updated,
+        review: async () => 'APPROVE',
+        merge: async () => { merged = true; return true; },
+      },
+    });
+    assert.equal(merged, false);
+    assert.equal(result.state.sent.a.merge, expected, `${contains} ${updated}`);
+  }
+});
+
+test('one entry whose lookup throws does not stop the others', async () => {
+  let state = { sent: {
+    bad: { exit: 0, repo: 'o/a', branch: 'bad', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
+    good: { exit: 0, repo: 'o/a', branch: 'good', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
+  } };
+  const looked = [];
+  const result = await runMerge({
+    cfg, now: NOW, state, dryRun: false,
+    deps: {
+      saveState: async () => {},
+      findPull: async (repo, branch) => {
+        looked.push(branch);
+        if (branch === 'bad') throw new Error('gh failed');
+        return { number: 2, state: 'MERGED' };
+      },
+      listChecks: async () => [],
+    },
+  });
+  assert.deepEqual(looked.sort(), ['bad', 'good']);
+  assert.equal(result.state.sent.good.merge, 'merged');
+  assert.ok(result.state.sent.bad.checkedAt);
+  assert.equal(result.state.sent.bad.merge, 'pending');
 });
 
 test('list cursors are carried in state between runs', async () => {

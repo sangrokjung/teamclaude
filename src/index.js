@@ -47,6 +47,7 @@ import {
   buildRepoIndex,
   defaultBase,
   findPull,
+  headContainsBase,
   listChecks,
   listIssues,
   listPulls,
@@ -54,6 +55,7 @@ import {
   mergePull,
   readFeederState,
   reviewPull,
+  updateBranch,
   withFeederLock,
   writeFeederState,
 } from './cloud-feeder-io.js';
@@ -3555,6 +3557,8 @@ async function cloudFeedCommand() {
     }),
     findPull,
     listChecks,
+    headContainsBase,
+    updateBranch,
     review: async (repo, pull, checks) => reviewPull(repo, pull, (await getRepoIndex()).get(repo), checks),
     merge: mergePull,
   };

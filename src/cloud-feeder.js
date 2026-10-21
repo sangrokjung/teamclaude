@@ -345,13 +345,16 @@ export function mergeDecision({ entry, pull, checks, now, cfg }) {
   if (pull.isDraft) return 'wait';
   // A rejected head is not re-reviewed; a new head is.
   if (entry.merge === 'changes-requested' && entry.mergeHead === pull.headRefOid) return 'changes-requested';
-  if (checks === null) return 'wait';
-  // Auto-merge needs real test evidence: a PR without any CI check waits for
-  // a person (and is re-checked, in case CI is added).
+  if (!Array.isArray(checks)) return 'wait';
+  // Auto-merge needs positive test evidence (an allowlist, not "no failure"):
+  // at least one passing check, every check passing or skipped. No checks or
+  // an unrecognised state never merges; both are re-checked later.
   if (checks.length === 0) return 'no-ci';
-  if (checks.some(check => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(check.state)
-    || ['fail', 'cancel'].includes(check.bucket))) return 'checks-failed';
-  if (checks.some(check => check.bucket === 'pending' || ['PENDING', 'QUEUED', 'IN_PROGRESS'].includes(check.state))) return 'wait';
+  const bucket = check => String(check?.bucket ?? '').toLowerCase();
+  if (checks.some(check => ['fail', 'cancel'].includes(bucket(check)))) return 'checks-failed';
+  if (checks.some(check => bucket(check) === 'pending')) return 'wait';
+  if (!checks.every(check => ['pass', 'skipping'].includes(bucket(check)))) return 'checks-unknown';
+  if (!checks.some(check => bucket(check) === 'pass')) return 'no-ci';
   return 'review';
 }
 
@@ -384,10 +387,27 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
     .slice(0, cfg.mergeLookups);
   const ready = [];
   for (const [key, entry] of open) {
-    const pull = await deps.findPull(entry.repo, entry.branch);
-    const checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.number) : [];
+    // One entry's lookup failure must not stop the others; it is retried
+    // later (its checkedAt moves it to the back of the queue).
+    let pull;
+    let checks;
+    try {
+      pull = await deps.findPull(entry.repo, entry.branch);
+      checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.number) : [];
+    } catch {
+      await save(key, { checkedAt: now.toISOString() });
+      results.push({ key, decision: 'lookup-failed', pr: null });
+      continue;
+    }
     await save(key, { checkedAt: now.toISOString() });
-    const decision = mergeDecision({ entry, pull, checks, now, cfg });
+    let decision = mergeDecision({ entry, pull, checks, now, cfg });
+    if (decision === 'review') {
+      // The CI that ran must cover what the merge produces: the head has to
+      // contain the current base tip, otherwise the branch is updated first.
+      const current = await deps.headContainsBase(entry.repo, pull);
+      if (current === null) decision = 'wait';
+      else if (!current) decision = (await deps.updateBranch(entry.repo, pull)) ? 'wait' : 'behind';
+    }
     if (decision === 'review') ready.push({ key, entry, pull, checks });
     else await settle(key, decision, pull);
   }
@@ -405,18 +425,31 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
       continue;
     }
     await save(item.key, { reviewAttemptedAt: now.toISOString() });
-    const verdict = await deps.review(item.entry.repo, item.pull, item.checks);
+    let verdict = null;
+    try {
+      verdict = await deps.review(item.entry.repo, item.pull, item.checks);
+    } catch {
+      verdict = null;
+    }
     if (verdict !== 'APPROVE') {
       await settle(item.key, verdict === 'REQUEST_CHANGES' ? 'changes-requested' : 'review-unavailable', item.pull);
       continue;
     }
-    // Right before merging: same head, same base, checks still all green.
-    const fresh = await deps.findPull(item.entry.repo, item.entry.branch);
-    const freshChecks = fresh && fresh.state === 'OPEN' ? await deps.listChecks(item.entry.repo, fresh.number) : null;
-    const unchanged = fresh
-      && fresh.headRefOid === item.pull.headRefOid
-      && fresh.baseRefName === item.pull.baseRefName
-      && mergeDecision({ entry: item.entry, pull: fresh, checks: freshChecks, now, cfg }) === 'review';
+    // Right before merging: same head, same base branch AND base commit,
+    // checks still all green, head still containing the base.
+    let unchanged = false;
+    try {
+      const fresh = await deps.findPull(item.entry.repo, item.entry.branch);
+      const freshChecks = fresh && fresh.state === 'OPEN' ? await deps.listChecks(item.entry.repo, fresh.number) : null;
+      unchanged = Boolean(fresh
+        && fresh.headRefOid === item.pull.headRefOid
+        && fresh.baseRefName === item.pull.baseRefName
+        && fresh.baseRefOid === item.pull.baseRefOid
+        && mergeDecision({ entry: item.entry, pull: fresh, checks: freshChecks, now, cfg }) === 'review'
+        && (await deps.headContainsBase(item.entry.repo, fresh)) === true);
+    } catch {
+      unchanged = false;
+    }
     if (!unchanged) {
       await settle(item.key, 'review-unavailable', item.pull);
       continue;
