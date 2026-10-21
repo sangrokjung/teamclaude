@@ -5267,3 +5267,59 @@ test('an untimed error appended well after the initial switch scan is still reco
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1], ['--resume', SWITCHED_SESSION_ID, 'continue']);
 });
+
+test('a pre-existing untimed error that only completes its newline later is still rejected as history', async t => {
+  // Finding 2b (round 5): once a split backlog line's newline arrives on a
+  // later poll, currentOffset-at-call-start had already advanced past
+  // historicalBoundaryOffset (the unterminated line was fully buffered into
+  // `pending` during the first scan), so the per-call check turned gating
+  // off for a line that actually started INSIDE the backlog.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-split-old-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const untimed = JSON.parse(fleetExhaustedRecord(cwd, 9));
+  delete untimed.timestamp;
+  // No trailing newline: a genuinely pre-existing, not-yet-terminated line.
+  await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), JSON.stringify(untimed));
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('a pre-existing untimed error must not be adopted, even once terminated later'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5656;
+      calls.push([...args]);
+      setTimeout(async () => {
+        await writeLiveSession(transcriptRoot, 5656, SWITCHED_SESSION_ID);
+        // Only now (well after the first scan already buffered the
+        // unterminated line into `pending`) does its newline arrive.
+        await new Promise(resolve => setTimeout(resolve, 40));
+        await appendFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), '\n');
+        await new Promise(resolve => setTimeout(resolve, 40));
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});

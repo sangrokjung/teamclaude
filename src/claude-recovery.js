@@ -621,6 +621,9 @@ async function monitorChild({
   // below this offset are gated by minRecordTimeMs; reads at or after it are
   // unambiguously post-switch growth and are never time-gated.
   let historicalBoundaryOffset = null;
+  // Set when a first-time switch needs historicalBoundaryOffset but hasn't
+  // taken a stat yet; resolved from scanTranscript's own stat (see above).
+  let historicalPending = false;
   // A session this child has already left is tracked by its own cursor, so
   // returning to it (another /resume) continues exactly where this child
   // stopped reading instead of either replaying its own prior errors or
@@ -729,10 +732,25 @@ async function monitorChild({
     // backlog is gated — historicalBoundaryOffset marks where it ends, and
     // any growth read from there on (true post-switch activity) is always
     // live regardless of whether it carries a timestamp.
+    //
     minRecordTimeMs = departureAtMs;
     currentOffset = 0;
-    const atSwitch = await stat(currentPath).catch(() => null);
-    historicalBoundaryOffset = atSwitch?.size ?? 0;
+    if (!currentPath) {
+      // The transcript doesn't exist yet: there is no backlog to race
+      // against (a file that isn't there yet can't have grown), so the
+      // boundary is unambiguously 0 — no stat, no deferral, needed here.
+      historicalBoundaryOffset = 0;
+    } else {
+      // The transcript already exists and could still grow: a separate
+      // stat() taken here could diverge from the one scanTranscript takes
+      // right after (something appended in between would then be misjudged
+      // as backlog despite never having been seen by either stat). Instead
+      // historicalPending defers the boundary to scanTranscript's own single
+      // stat below, so the boundary and the read it gates are always the
+      // same observation by construction — no race is possible, not just a
+      // narrowed one.
+      historicalPending = true;
+    }
   }
 
   async function scanTranscript(final = false) {
@@ -770,6 +788,10 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
+    if (historicalPending) {
+      historicalBoundaryOffset = info.size;
+      historicalPending = false;
+    }
     // A shrunk file (truncation) or a different file at the same path
     // (rotation) cannot continue the old offset: read it from the start.
     if (info.size < currentOffset
@@ -784,22 +806,23 @@ async function monitorChild({
       return unresolvedEvent;
     }
 
-    // Fixed for this scanTranscript call: only lines read from inside the
-    // captured backlog (below historicalBoundaryOffset, as of this call's
-    // starting offset) are gated by minRecordTimeMs. Growth already caught
-    // up to or past that boundary needs no gate at all — it can only be
-    // genuine post-switch activity.
-    const gatingHistoricalBacklog = minRecordTimeMs !== null
-      && historicalBoundaryOffset !== null
-      && currentOffset < historicalBoundaryOffset;
-    const processLine = line => {
+    // Gated per RECORD by its own file start offset, not per scanTranscript
+    // call: a call can straddle historicalBoundaryOffset (new growth arrives
+    // between the boundary snapshot and this read, or an old unterminated
+    // backlog line only completes once a later poll appends its newline),
+    // so judging the whole call by where it started would misclassify
+    // whichever line crosses that line.
+    const processLine = (line, lineStartOffset) => {
       const event = classifyTranscriptLine(line);
       if (event) {
         // Only a new error candidate is gated against the switch boundary.
         // Resolution below is never gated: a conversation record clearing a
         // pending error must still count even when (as is common) it carries
         // no timestamp of its own.
-        if (gatingHistoricalBacklog && !recordAtOrAfter(line, minRecordTimeMs)) return;
+        const withinBacklog = minRecordTimeMs !== null
+          && historicalBoundaryOffset !== null
+          && lineStartOffset < historicalBoundaryOffset;
+        if (withinBacklog && !recordAtOrAfter(line, minRecordTimeMs)) return;
         unresolvedEvent = event;
         return;
       }
@@ -835,7 +858,12 @@ async function monitorChild({
           }
           data = Buffer.concat([pending, data]);
           for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
-            processLine(data.subarray(0, newline).toString('utf8'));
+            // `data` at this exact point always spans file bytes
+            // [position - data.length, position), so this is the absolute
+            // file offset of the line about to be sliced off — true
+            // regardless of how many chunks/polls it took to accumulate it.
+            const lineStartOffset = position - data.length;
+            processLine(data.subarray(0, newline).toString('utf8'), lineStartOffset);
             data = data.subarray(newline + 1);
           }
           if (data.length > TRANSCRIPT_MAX_LINE_BYTES) {
@@ -852,7 +880,7 @@ async function monitorChild({
     }
     currentIdentity = { dev: info.dev, ino: info.ino };
     if (final && pending.length > 0) {
-      processLine(pending.toString('utf8'));
+      processLine(pending.toString('utf8'), currentOffset - pending.length);
       pending = Buffer.alloc(0);
     }
     return unresolvedEvent;
