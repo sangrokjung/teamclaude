@@ -413,16 +413,16 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
 // account with credit may exist among the ones never reached).
 export const CLOUD_ACCOUNT_LOOKUP_INCOMPLETE = Object.freeze({ incomplete: true });
 
-// Identity for matching a looked-up credential back to its full account
-// record. Stricter than index.js's private config-sync helper of the same
-// name: there, EITHER side lacking a uuid falls back to a name compare,
-// which lets an unrelated legacy (no-uuid) entry sharing a name silently
-// stand in for a uuid-bearing account (and then this check reads the wrong
-// expiresAt). Here, a uuid on EITHER side demands a uuid match on both; name
-// is only ever the tiebreaker when NEITHER side has ever had one.
-export function sameAccountIdentity(a, b) {
-  if (a?.accountUuid || b?.accountUuid) return Boolean(a?.accountUuid) && a.accountUuid === b?.accountUuid;
-  return a?.name === b?.name;
+// Whether a raw expiresAt value still has at least MIN_TOKEN_LIFETIME_MS of
+// life at `now`. The primitive both isCloudEligibleAccount and a later
+// re-check (cloud-dispatch.js) share, so a re-check never has to re-find the
+// account it already has the credential for — after rounds of chasing
+// account-identity bugs in that re-find (a same-name pair, uuid present on
+// only one side, array order...), the fix is to never re-identify at all:
+// carry the exact expiresAt the selection already resolved forward as data.
+export function hasFreshToken(expiresAt, now = Date.now()) {
+  return Number.isFinite(normalizeExpiresAt(expiresAt))
+    && normalizeExpiresAt(expiresAt) - now >= MIN_TOKEN_LIFETIME_MS;
 }
 
 // Whether an account can carry a cloud session now: an OAuth token that stays
@@ -433,8 +433,7 @@ export function isCloudEligibleAccount(account, now = Date.now()) {
     && account.type === 'oauth'
     && typeof account.accessToken === 'string'
     && account.accessToken.length > 0
-    && Number.isFinite(normalizeExpiresAt(account.expiresAt))
-    && normalizeExpiresAt(account.expiresAt) - now >= MIN_TOKEN_LIFETIME_MS);
+    && hasFreshToken(account.expiresAt, now));
 }
 
 export async function findCloudAccount({
@@ -473,6 +472,11 @@ export async function findCloudAccount({
     accountUuid: account.accountUuid ?? null,
     accessToken: account.accessToken,
     remainingDollars: credits.remainingDollars,
+    // The exact credential's own expiry, carried forward as data so a later
+    // freshness re-check never has to re-find this account in `accounts` by
+    // name/uuid (that re-find is what kept producing new identity-collision
+    // bugs across rounds — see hasFreshToken's comment).
+    expiresAt: normalizeExpiresAt(account.expiresAt),
   };
 }
 

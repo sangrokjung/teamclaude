@@ -14,8 +14,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { handoffBranchName, isCloudEligibleAccount } from './cloud-handoff.js';
 
-// A stable per-account key for the budget ledger: accountUuid when present
-// (the repo-wide identity rule — see cloud-handoff.js's sameAccountIdentity),
+// A stable per-account key for the budget ledger: accountUuid when present,
 // name otherwise. Two DIFFERENT accounts can never collide on this key: a
 // legacy pair sharing a name with neither carrying an accountUuid is the one
 // case this can't disambiguate, and totalCredit rejects that explicitly
@@ -479,7 +478,19 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     await deps.saveState(nextState);
     let outcome;
     try {
-      outcome = await deps.dispatch({ task: candidate.task, cwd, base, prTarget: candidate.prTarget ?? null, dispatchId, now });
+      outcome = await deps.dispatch({
+        task: candidate.task,
+        cwd,
+        base,
+        prTarget: candidate.prTarget ?? null,
+        dispatchId,
+        now,
+        // The authoritative recheck: inside attemptCloudDispatch, right
+        // before launch, after its OWN credit lookup/push have spent however
+        // long they spent — the cheap check above this loop only prevents
+        // starting work that was obviously already too late to begin with.
+        programDeadline: expiresAt,
+      });
     } catch {
       outcome = { exit: 4, reason: 'dispatch-threw', branch };
     }

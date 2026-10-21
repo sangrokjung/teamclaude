@@ -3558,13 +3558,14 @@ async function cloudFeedCommand() {
     listPulls: repos => listPulls(repos, log),
     defaultBase,
     saveState: state => writeFeederState(state),
-    dispatch: ({ task, cwd, base, prTarget, dispatchId, now }) => attemptCloudDispatch({
+    dispatch: ({ task, cwd, base, prTarget, dispatchId, now, programDeadline }) => attemptCloudDispatch({
       task,
       cwd,
       base,
       prTarget,
       newId: () => dispatchId,
       now,
+      programDeadline,
       // Collecting work (repo index, issues, PRs, TDL) can take minutes;
       // token freshness must be judged against the clock right now, not the
       // `now` already frozen into the in-flight record's branch name.

@@ -702,25 +702,59 @@ test('a token that is still fresh by liveNow launches normally', async t => {
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
 });
 
-test('the pre-launch recheck never mistakes a legacy same-name account for the uuid-bearing one actually selected', async t => {
+// The pre-launch recheck no longer re-finds the account in `accounts` at all
+// (every re-find kept being a fresh source of identity-collision bugs across
+// rounds: uuid on only one side, array order, ...) — it reads the exact
+// credential's expiresAt that findCloudAccount already resolved and carried
+// forward as data. These two cases are exactly the ones that broke the old
+// re-find approach, proven here by a decoy sharing the selected account's
+// name that would mislead ANY re-find, whether by uuid-aware identity or not.
+for (const uuidKind of ['uuid-bearing', 'legacy-no-uuid']) {
+  test(`the pre-launch recheck reads the exact selected credential's own expiry, not a same-name decoy's (${uuidKind})`, async t => {
+    const f = await fixture(t);
+    // A decoy sharing the chosen account's name, generously long-lived, with
+    // $0 credit so findCloudAccount can never select IT.
+    const decoy = { name: 'dup', type: 'oauth', accessToken: 'tok-decoy', expiresAt: NOW.getTime() + 3_600_000 };
+    // The account actually selected: funded, but only 6 min of margin at
+    // selection time — expired by the time liveNow (10 min later) is checked.
+    const selected = {
+      name: 'dup',
+      ...(uuidKind === 'uuid-bearing' ? { accountUuid: 'uuid-x' } : {}),
+      type: 'oauth',
+      accessToken: 'tok-dup',
+      expiresAt: NOW.getTime() + 6 * 60_000,
+    };
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      loadAccounts: async () => [decoy, selected],
+      creditLookup: async token => ({ remainingDollars: token === 'tok-dup' ? 100 : 0, lockedReason: null }),
+      launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+      liveNow: () => NOW.getTime() + 10 * 60_000,
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+    assert.equal(outcome.reason, 'token-expired-before-launch');
+    assert.equal(launched, false, 'must check the actually-selected account, not its same-name decoy');
+  });
+}
+
+test('a programDeadline that lapses during the snapshot push is caught right before launch', async t => {
   const f = await fixture(t);
-  // A legacy entry sharing the chosen account's name but carrying no
-  // accountUuid, and with $0 credit so findCloudAccount can never select IT.
-  // Its expiresAt is deliberately generous so that matching it by name alone
-  // (instead of the real uuid-bearing account) would wrongly pass the
-  // pre-launch freshness recheck.
-  const legacySameName = { name: 'dup', type: 'oauth', accessToken: 'tok-legacy', expiresAt: NOW.getTime() + 3_600_000 };
-  // The account actually selected: funded, but only 6 min of margin at
-  // selection time — expired by the time liveNow (10 min later) is checked.
-  const selected = { name: 'dup', accountUuid: 'uuid-x', type: 'oauth', accessToken: 'tok-dup', expiresAt: NOW.getTime() + 6 * 60_000 };
   let launched = false;
   const outcome = await attemptCloudDispatch(inputs(f, {
-    loadAccounts: async () => [legacySameName, selected],
-    creditLookup: async token => ({ remainingDollars: token === 'tok-dup' ? 100 : 0, lockedReason: null }),
+    programDeadline: NOW.getTime() + 5 * 60_000,
     launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
     liveNow: () => NOW.getTime() + 10 * 60_000,
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
-  assert.equal(outcome.reason, 'token-expired-before-launch');
-  assert.equal(launched, false, 'must check the actually-selected uuid-bearing account, not its no-uuid same-name decoy');
+  assert.equal(outcome.reason, 'program-expired-before-launch');
+  assert.equal(launched, false);
+});
+
+test('a programDeadline that has not lapsed yet does not block launch', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    programDeadline: NOW.getTime() + 5 * 60_000,
+    liveNow: () => NOW.getTime() + 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
 });

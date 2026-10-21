@@ -28,12 +28,11 @@ import {
   fetchCloudCredits,
   findCloudAccount,
   handoffBranchName,
+  hasFreshToken,
   inspectHandoffRepo,
-  isCloudEligibleAccount,
   isExecutableFile,
   remoteUrlIsFixedPoint,
   pushHandoffSnapshot,
-  sameAccountIdentity,
 } from './cloud-handoff.js';
 import { scanSnapshotForSecrets, textHasSecret } from './snapshot-scan.js';
 
@@ -262,6 +261,10 @@ export async function attemptCloudDispatch({
   // additional drift assumed) so a caller that injects only `eligibilityNow`
   // keeps its existing behavior; a real caller should pass `() => Date.now()`.
   liveNow = () => eligibilityNow.getTime(),
+  // A caller's own hard deadline (e.g. the credit feeder's cfg.expiresAt), as
+  // an epoch ms number. Re-checked against `liveNow()` right before launch,
+  // alongside the account's own token freshness. null/omitted: no such limit.
+  programDeadline = null,
   random = Math.random,
   newId = randomUUID,
   creditLookupOptions = {},
@@ -329,17 +332,22 @@ export async function attemptCloudDispatch({
     });
   if (!snapshot.ok) return local(snapshot.reason);
 
-  // The chosen account's own record (not the stripped-down `account` that
-  // findCloudAccount returned) still carries expiresAt, so re-verify against
-  // the live clock now that the snapshot push has spent however long it spent.
-  // Nothing has been launched yet, so a failure here is safely retryable
-  // (RUN_LOCAL), unlike an uncertain post-launch result (AMBIGUOUS). Matched by
-  // identity (accountUuid first, name only as a fallback for legacy accounts
-  // without one) so a re-login that reuses a name but gets a new accountUuid
-  // can never have this check read a different account's expiresAt.
-  const matchedAccount = Array.isArray(accounts) ? accounts.find(a => sameAccountIdentity(a, account)) : null;
-  if (matchedAccount && !isCloudEligibleAccount(matchedAccount, liveNow())) {
+  // Re-verify against the live clock now that the snapshot push has spent
+  // however long it spent. `account.expiresAt` is the exact credential
+  // findCloudAccount already resolved — checked directly, never by re-finding
+  // the account in `accounts` by name/uuid (every such re-find kept being a
+  // fresh source of account-identity bugs: a same-name pair, a uuid present
+  // on only one side, array order...). Nothing has been launched yet, so a
+  // failure here is safely retryable (RUN_LOCAL), unlike an uncertain
+  // post-launch result (AMBIGUOUS).
+  if (!hasFreshToken(account.expiresAt, liveNow())) {
     return local('token-expired-before-launch');
+  }
+  // Likewise the caller's own program deadline (e.g. the credit feeder's
+  // cfg.expiresAt), re-checked at the same late point rather than only once
+  // long before this push started.
+  if (Number.isFinite(programDeadline) && !(liveNow() < programDeadline)) {
+    return local('program-expired-before-launch');
   }
 
   const prompt = buildDispatchPrompt({ branch: snapshot.branch, task, prTarget });
