@@ -88,8 +88,17 @@ export async function writeFeederState(state, path = feederStatePath()) {
 const O_EXLOCK = 0x20;
 
 // One feeder at a time (launchd tick and a manual run share the state file).
-export async function withFeederLock(fn, path = `${feederStatePath()}.lock`) {
-  if (process.platform !== 'darwin') return { locked: true };
+// `platform` is injectable only for testing a non-darwin host without
+// mutating the real `process.platform`; production always uses the default.
+export async function withFeederLock(fn, path = `${feederStatePath()}.lock`, { platform = process.platform } = {}) {
+  // The O_EXLOCK flag value above is macOS-specific (Linux's open(2) has no
+  // such flag at all, so 0x20 there would silently set an unrelated bit) —
+  // this mechanism genuinely cannot run elsewhere. `unsupported: true` says
+  // so plainly: NOT "another feeder holds the lock" (`locked: true`, which
+  // the caller would read as ordinary, temporary contention and retry later
+  // expecting it to clear — it never would, every single run would report
+  // the same false contention forever).
+  if (platform !== 'darwin') return { locked: false, unsupported: true };
   let handle;
   try {
     handle = await open(path, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | O_EXLOCK, 0o600);
@@ -126,6 +135,13 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MAX_PAGES_PER_REPO = 30;
+// `selectCandidates()` only ever consumes a handful of items (`max`, usually
+// single-digit `perRun`), but MAX_PAGES_PER_REPO bounds growth per repo only
+// — with enough dispatchable repos, items could still accumulate unbounded
+// in memory, and every repo got its own full `gh` page-walk regardless of
+// whether anything downstream would ever look past the first few. This caps
+// the running TOTAL across every repo in one listing call.
+const OVERALL_ITEM_CAP = 6000;
 
 // Pages of a REST list, 100 items at a time, filtered as they arrive. Stops
 // after MAX_PAGES_PER_REPO pages and reports `complete: false` instead of
@@ -147,6 +163,14 @@ function perRepo(repos, what, fn, log) {
   const items = [];
   const incomplete = [];
   for (const repo of repos) {
+    if (items.length >= OVERALL_ITEM_CAP) {
+      // Cap already reached by earlier repos: skip the `gh` call entirely
+      // for everything after it (saves both memory and the API round trip),
+      // reported exactly like a truncated/failed repo so the caller knows
+      // this list was not exhaustive.
+      incomplete.push(repo);
+      continue;
+    }
     try {
       const page = fn(repo);
       for (const item of page.items) items.push(item);
@@ -199,6 +223,11 @@ export function listTasks() {
   const all = [];
   let cursor = null;
   for (;;) {
+    // A `todo` backlog this large would otherwise be read to the very end —
+    // `selectCandidates()` only ever consumes a handful of these — so this
+    // caps the same way listIssues/listPulls cap their own repo-by-repo
+    // growth, reporting the truncation instead of silently stopping short.
+    if (all.length >= OVERALL_ITEM_CAP) return { items: all, incomplete: ['os_tasks'] };
     const after = cursor ? `and (t.created_at, t.id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)` : '';
     const query = [
       "select t.id, t.title, t.description, p.github_repo,",

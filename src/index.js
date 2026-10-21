@@ -3609,6 +3609,11 @@ async function cloudFeedCommand() {
     if (!dryRun) await writeFeederState(state);
     return out;
   });
+  if (outcome.unsupported) {
+    log('[cloud-feed] This feature requires macOS; nothing can run on this platform.');
+    process.exitCode = 1;
+    return;
+  }
   if (outcome.locked) {
     log('[cloud-feed] Another feeder run holds the lock; skipping.');
     return;

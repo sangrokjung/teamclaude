@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deleteRemoteBranch, feederStatePath, readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
@@ -125,6 +125,15 @@ test('lock: an OS lock, held by one run at a time and freed when the holder dies
   assert.deepEqual(await withFeederLock(async () => 'ran', lock), { locked: false, value: 'ran' });
 });
 
+test('lock: a non-darwin host reports unsupported plainly, never claims contention, and never runs the body', async t => {
+  const dir = await scratch(t);
+  const lock = join(dir, 'lock');
+  let ran = false;
+  const outcome = await withFeederLock(async () => { ran = true; return 'x'; }, lock, { platform: 'linux' });
+  assert.deepEqual(outcome, { locked: false, unsupported: true });
+  assert.equal(ran, false, 'the O_EXLOCK trick is macOS-only — never attempted elsewhere');
+});
+
 test('REST listing reads page by page, reports truncated or failing repos, keeps the rest', { skip: process.platform === 'win32' }, async t => {
   const dir = await scratch(t);
   // A fake `gh`: o/full always returns full pages (never ends), o/broken
@@ -148,6 +157,30 @@ esac
   assert.equal(result.items.filter(p => p.repository.nameWithOwner === 'o/full').length, 3000);
   assert.deepEqual(result.items.filter(p => p.repository.nameWithOwner === 'o/small').map(p => p.number), [7]);
   assert.ok(logs.some(line => /o\/full truncated/.test(line)) && logs.some(line => /o\/broken failed/.test(line)));
+});
+
+test('an overall cap bounds total items across ALL repos, skipping later repos without even querying them', { skip: process.platform === 'win32' }, async t => {
+  const dir = await scratch(t);
+  const calls = join(dir, 'calls.log');
+  const fake = join(dir, 'gh');
+  await writeFile(fake, `#!/bin/sh
+echo "$2" >> ${JSON.stringify(calls)}
+case "$2" in
+  repos/o/full1/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'a'.repeat(40)}",repo:{full_name:"o/full1"}}}))))' ;;
+  repos/o/full2/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'b'.repeat(40)}",repo:{full_name:"o/full2"}}}))))' ;;
+  repos/o/never/*) echo '[{"number":1,"title":"t","draft":false,"user":{"login":"me"},"author_association":"OWNER","head":{"ref":"b","sha":"${'c'.repeat(40)}","repo":{"full_name":"o/never"}}}]' ;;
+esac
+`);
+  await chmod(fake, 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${previous}`;
+  t.after(() => { process.env.PATH = previous; });
+  const { listPulls } = await import('../src/cloud-feeder-io.js');
+  const result = listPulls(['o/full1', 'o/full2', 'o/never']);
+  assert.equal(result.items.length, 6000, 'each full repo caps at 3000 on its own; together they exactly fill the overall cap');
+  assert.deepEqual(result.incomplete, ['o/full1', 'o/full2', 'o/never']);
+  const calledRepos = (await readFile(calls, 'utf8')).split('\n').filter(Boolean);
+  assert.ok(!calledRepos.some(line => line.includes('o/never')), 'o/never must never be queried once the overall cap is already reached');
 });
 
 test('commit checks: statuses are read across pages and an unexplained aggregate state is unknown', { skip: process.platform === 'win32' }, async t => {
@@ -214,4 +247,38 @@ test('deleteRemoteBranch with the default origin never runs the rewrite check (l
   git(cwd, 'commit', '--quiet', '-m', 'init');
   git(cwd, 'push', '--quiet', 'origin', 'HEAD:refs/heads/teamclaude-handoff/legacy');
   assert.equal(await deleteRemoteBranch(cwd, 'teamclaude-handoff/legacy'), true);
+});
+
+test('listTasks caps the overall backlog it reads, instead of walking a huge todo table to the end', { skip: process.platform === 'win32' }, async t => {
+  const fakeHome = await scratch(t);
+  const binDir = join(fakeHome, '.claude', 'bin');
+  await mkdir(binDir, { recursive: true });
+  const counterFile = join(fakeHome, 'page-counter');
+  // Each call returns one more full (1000-row) page, with a later created_at
+  // than the last — a real keyset page boundary, so the cursor logic takes
+  // the normal "page is full, keep going" path every time, never the
+  // small-last-page termination.
+  await writeFile(join(binDir, 'sb-sql'), `#!/bin/sh
+PAGE=0
+if [ -f ${JSON.stringify(counterFile)} ]; then PAGE=$(cat ${JSON.stringify(counterFile)}); fi
+PAGE=$((PAGE+1))
+echo $PAGE > ${JSON.stringify(counterFile)}
+printf '{"rows":['
+i=1
+while [ $i -le 1000 ]; do
+  if [ $i -gt 1 ]; then printf ','; fi
+  printf '{"id":"00000000-0000-0000-0000-%012d","title":"t","description":"","github_repo":"o/a","created_at":"2026-01-%02dT00:00:00.000Z"}' $((PAGE*1000+i)) $PAGE
+  i=$((i+1))
+done
+printf ']}'
+`);
+  await chmod(join(binDir, 'sb-sql'), 0o755);
+  const previousHome = process.env.HOME;
+  process.env.HOME = fakeHome;
+  t.after(() => { process.env.HOME = previousHome; });
+  const { listTasks } = await import('../src/cloud-feeder-io.js');
+  const result = listTasks();
+  assert.equal(result.items.length, 6000, 'stops at the overall cap, not the end of the (fake, endless) table');
+  assert.deepEqual(result.incomplete, ['os_tasks']);
+  assert.equal(await readFile(counterFile, 'utf8').then(s => s.trim()), '6', 'never makes the 7th page request once the cap is already met');
 });
