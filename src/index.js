@@ -3566,6 +3566,7 @@ async function cloudFeedCommand() {
       out.run = {
         note: fed.note,
         incomplete: fed.incomplete,
+        failedSources: fed.failedSources,
         sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })),
       };
     }

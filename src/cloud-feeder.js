@@ -240,21 +240,29 @@ export function improvementCandidates(repos, now) {
   });
 }
 
-// Total remaining credit over the given accounts, or null when none answered.
+// Total remaining credit over the given accounts. `complete` is false when
+// any eligible account's lookup failed: a partial sum must not be taken for
+// the balance (it would look like credit spent or set a tiny daily target).
+// An account that answers "no credit" or "locked" counts as $0, not missing.
 export async function totalCredit({ accounts, creditLookup }) {
   let total = 0;
-  let answered = 0;
+  let eligible = 0;
+  let failed = 0;
   for (const account of accounts ?? []) {
     if (account?.enabled === false || account?.type !== 'oauth' || !account.accessToken) continue;
+    eligible += 1;
     try {
       const credits = await creditLookup(account.accessToken);
-      if (credits && !credits.lockedReason && Number.isFinite(credits.remainingDollars)) {
+      if (credits === null || credits === undefined) {
+        failed += 1;
+      } else if (!credits.lockedReason && Number.isFinite(credits.remainingDollars)) {
         total += credits.remainingDollars;
-        answered += 1;
       }
-    } catch {}
+    } catch {
+      failed += 1;
+    }
   }
-  return answered > 0 ? total : null;
+  return { total, complete: eligible > 0 && failed === 0, failed };
 }
 
 // One feeding pass. `deps` supplies every side effect.
@@ -262,8 +270,10 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   const log = deps.log ?? (() => {});
   // A dry run may preview even while the feeder is switched off.
   if (!cfg.enabled && !dryRun) return { state, sent: [], note: 'disabled' };
-  const remaining = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup });
-  if (remaining === null) return { state, sent: [], note: 'no-credit-info' };
+  const credit = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup });
+  // Nothing is planned on a partial balance; the next tick tries again.
+  if (!credit.complete) return { state, sent: [], note: credit.failed > 0 ? 'credit-incomplete' : 'no-credit-info' };
+  const remaining = credit.total;
   const budget = planBudget({ state, remainingDollars: remaining, now, cfg });
   const limit = Math.min(budget.allowed, Number.isInteger(max) && max >= 0 ? max : Infinity);
   log(`[cloud-feed] remaining $${remaining.toFixed(2)}, today target $${budget.target.toFixed(2)}, spent $${budget.spentToday.toFixed(2)}, allowed ${limit}`);
@@ -273,10 +283,12 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   const repoIndex = await deps.repoIndex();
   const owners = new Set(cfg.owners.map(owner => owner.toLowerCase()));
   const own = candidate => owners.has(candidate.repo.split('/')[0]);
+  const failedSources = [];
   const safely = async (source, fn) => {
     try {
       return (await fn()).filter(own);
     } catch (error) {
+      failedSources.push(source);
       log(`[cloud-feed] ${source} source failed: ${error?.message ?? error}`);
       return [];
     }
@@ -338,7 +350,7 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     sent.push({ key: candidate.key, exit: outcome.exit, reason: outcome.reason, url: outcome.url });
     log(`[cloud-feed] ${candidate.key} -> exit ${outcome.exit}${outcome.reason ? ` (${outcome.reason})` : ''}`);
   }
-  return { state: nextState, sent, note: 'ok', incomplete };
+  return { state: nextState, sent, note: 'ok', incomplete, failedSources };
 }
 
 function record(state, candidate, outcome, now) {
@@ -419,7 +431,17 @@ export async function runTriage({ cfg, now, state, dryRun, deps }) {
       results.push({ key, decision: 'lookup-failed', pr: null });
       continue;
     }
-    const decision = mergeDecision({ entry, pull, checks, now, cfg });
+    let decision = mergeDecision({ entry, pull, checks, now, cfg });
+    // Checks are read for whatever the PR's head is at that moment: a ready
+    // verdict only stands if the PR is still open, not a draft, and on the
+    // same head after the checks were read.
+    if (decision === 'ready-for-owner') {
+      let again = null;
+      try {
+        again = await deps.findPull(entry.repo, entry.branch);
+      } catch {}
+      if (!again || again.state !== 'OPEN' || again.isDraft || again.headRefOid !== pull.headRefOid) decision = 'wait';
+    }
     results.push({ key, decision, pr: pull?.number ?? null, url: pull?.url ?? null });
     // The stored state is always the current classification ("waiting"
     // included), so an earlier ready verdict is withdrawn when it stops

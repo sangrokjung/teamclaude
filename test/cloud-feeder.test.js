@@ -115,14 +115,18 @@ test('github remotes are normalised and others rejected', () => {
   assert.equal(githubRepoOf('https://gitlab.com/org/name.git'), null);
 });
 
-test('total credit skips disabled accounts and reports null when nothing answers', async () => {
+test('total credit skips disabled accounts and is incomplete when any lookup fails', async () => {
   const accounts = [
     { type: 'oauth', accessToken: 'a' },
     { type: 'oauth', accessToken: 'b', enabled: false },
     { type: 'oauth', accessToken: 'c' },
   ];
-  assert.equal(await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 10 } : null) }), 10);
-  assert.equal(await totalCredit({ accounts, creditLookup: async () => null }), null);
+  assert.deepEqual(await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 10 }) }), { total: 20, complete: true, failed: 0 });
+  // One failed lookup makes the sum incomplete (never a smaller "balance").
+  assert.deepEqual(await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 10 } : null) }), { total: 10, complete: false, failed: 1 });
+  assert.equal((await totalCredit({ accounts, creditLookup: async () => { throw new Error('x'); } })).complete, false);
+  // "No credit" and "locked" are answers ($0), not failures.
+  assert.deepEqual(await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 0 } : { remainingDollars: 5, lockedReason: 'x' }) }), { total: 0, complete: true, failed: 0 });
 });
 
 function feedDeps(overrides = {}) {
@@ -165,7 +169,7 @@ test('runFeed dispatches paced, interleaved work from origin/<default> and survi
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {
   const { deps, dispatched } = feedDeps();
   assert.equal((await runFeed({ cfg: { ...cfg, enabled: false }, now: NOW, state: {}, deps })).note, 'disabled');
-  assert.equal((await runFeed({ cfg, now: NOW, state: {}, deps: { ...deps, creditLookup: async () => null } })).note, 'no-credit-info');
+  assert.equal((await runFeed({ cfg, now: NOW, state: {}, deps: { ...deps, creditLookup: async () => null } })).note, 'credit-incomplete');
   const foreign = await runFeed({ cfg: { ...cfg, owners: ['someone-else'] }, now: NOW, state: { sent: {} }, deps });
   assert.equal(foreign.sent.length, 0);
   assert.equal(dispatched.length, 0);
@@ -409,4 +413,47 @@ test('a PR whose head moved is a new review key, never the old key with new code
   assert.equal(a.baseRef, 'a'.repeat(40));
   assert.equal(b.baseRef, 'b'.repeat(40));
   assert.equal(reviewCandidates([pull('not-a-sha')]).length, 0);
+});
+
+test('a partial credit read plans nothing and does not pin the day to a partial balance', async () => {
+  const accounts = [{ type: 'oauth', accessToken: 'a' }, { type: 'oauth', accessToken: 'b' }];
+  const { deps, dispatched } = feedDeps({
+    loadAccounts: async () => accounts,
+    creditLookup: async token => (token === 'a' ? { remainingDollars: 100 } : null),
+  });
+  const partial = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: false, deps });
+  assert.equal(partial.note, 'credit-incomplete');
+  assert.equal(partial.state.day, undefined);
+  assert.equal(dispatched.length, 0);
+  const recovered = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: partial.state, dryRun: false, deps: { ...deps, creditLookup: async () => ({ remainingDollars: 1500 }) } });
+  assert.equal(recovered.state.day.openingDollars, 3000);
+  assert.ok(dispatched.length > 0);
+});
+
+test('a failing source is reported in failedSources', async () => {
+  const { deps } = feedDeps();
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: true, deps });
+  assert.deepEqual(result.failedSources, ['tdl']);
+});
+
+test('ready is not recorded if the PR head moved, closed or turned draft while checks were read', async () => {
+  for (const [label, second] of [
+    ['head moved', { number: 1, state: 'OPEN', isDraft: false, headRefOid: 'hB' }],
+    ['closed', { number: 1, state: 'CLOSED', isDraft: false, headRefOid: 'hA' }],
+    ['draft', { number: 1, state: 'OPEN', isDraft: true, headRefOid: 'hA' }],
+    ['gone', null],
+  ]) {
+    let calls = 0;
+    const result = await runTriage({
+      cfg, now: NOW, dryRun: false,
+      state: { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } },
+      deps: {
+        saveState: async () => {},
+        findPull: async () => { calls += 1; return calls === 1 ? { number: 1, state: 'OPEN', isDraft: false, headRefOid: 'hA' } : second; },
+        listChecks: async () => [{ bucket: 'pass' }],
+      },
+    });
+    assert.equal(result.state.sent.a.merge, 'waiting', label);
+    assert.equal(result.state.sent.a.readyHead, null, label);
+  }
 });
