@@ -6,7 +6,7 @@ import { lstatSync, readdirSync } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
 import { mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
 
@@ -98,9 +98,23 @@ function restAll(path) {
   return Array.isArray(pages) ? pages.flat() : [];
 }
 
+// Runs `fn` per repository; one repository's failure is logged and skipped,
+// the others' results are kept.
+function perRepo(repos, what, fn, log) {
+  const out = [];
+  for (const repo of repos) {
+    try {
+      out.push(...fn(repo));
+    } catch (error) {
+      log?.(`[cloud-feed] ${what} for ${repo} failed: ${error?.message ?? error}`);
+    }
+  }
+  return out;
+}
+
 // Open issues (not PRs) of the given repositories, completely.
-export function listIssues(repos) {
-  return repos.flatMap(repo => restAll(`repos/${repo}/issues?state=open&per_page=100`)
+export function listIssues(repos, log) {
+  return perRepo(repos, 'issues', repo => restAll(`repos/${repo}/issues?state=open&per_page=100`)
     .filter(issue => !issue.pull_request)
     .map(issue => ({
       repository: { nameWithOwner: repo },
@@ -109,12 +123,12 @@ export function listIssues(repos) {
       body: issue.body,
       labels: issue.labels,
       authorAssociation: issue.author_association,
-    })));
+    })), log);
 }
 
 // Open PRs of the given repositories, completely, with head and trust fields.
-export function listPulls(repos) {
-  return repos.flatMap(repo => restAll(`repos/${repo}/pulls?state=open&per_page=100`)
+export function listPulls(repos, log) {
+  return perRepo(repos, 'pulls', repo => restAll(`repos/${repo}/pulls?state=open&per_page=100`)
     .map(pull => ({
       repository: { nameWithOwner: repo },
       number: pull.number,
@@ -125,7 +139,7 @@ export function listPulls(repos) {
       headRefName: pull.head?.ref,
       headRefOid: pull.head?.sha,
       isCrossRepository: String(pull.head?.repo?.full_name ?? '').toLowerCase() !== repo,
-    })));
+    })), log);
 }
 
 // Read-only ledger query through the guarded CLI, keyset-paged on
@@ -133,7 +147,7 @@ export function listPulls(repos) {
 export function listTasks() {
   const all = [];
   let cursor = null;
-  for (let page = 0; page < 50; page += 1) {
+  for (;;) {
     const after = cursor ? `and (t.created_at, t.id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)` : '';
     const query = [
       "select t.id, t.title, t.description, p.github_repo,",
@@ -150,9 +164,11 @@ export function listTasks() {
     if (rows.length < LIST_LIMIT) return all;
     const last = rows[rows.length - 1];
     if (!ISO_RE.test(last.created_at ?? '') || !UUID_RE.test(last.id ?? '')) throw new Error('task cursor invalid');
-    cursor = { createdAt: last.created_at, id: last.id };
+    const next = { createdAt: last.created_at, id: last.id };
+    // Keyset order is strict, so the cursor must move; if not, stop safely.
+    if (cursor && `${next.createdAt}|${next.id}` <= `${cursor.createdAt}|${cursor.id}`) throw new Error('task cursor did not advance');
+    cursor = next;
   }
-  throw new Error('task list did not end');
 }
 
 // owner/name -> trusted local clone path, from one level under each root.
@@ -223,27 +239,17 @@ export function listChecks(repo, number) {
   }
 }
 
-function headOf(repo, number) {
-  try {
-    return ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'headRefOid']).headRefOid ?? null;
-  } catch {
-    return null;
-  }
-}
-
-// Cross-vendor review of the PR diff with the PR's CI results as evidence;
-// returns APPROVE, REQUEST_CHANGES or null.
+// Cross-vendor review of exactly the PR head: a detached worktree of the
+// local clone at pull.headRefOid, reviewed against pull.baseRefOid, so the
+// receipt is bound to the commit that is merged. The PR's CI results ride
+// along as evidence. Returns APPROVE, REQUEST_CHANGES or null.
 export async function reviewPull(repo, pull, cwd, checks = []) {
+  if (!cwd || !/^[0-9a-f]{40,64}$/.test(pull.headRefOid ?? '') || !/^[0-9a-f]{40,64}$/.test(pull.baseRefOid ?? '')) return null;
   const scratch = await mkdtemp(join(tmpdir(), 'teamclaude-feed-review-'));
+  const tree = join(scratch, 'tree');
   try {
-    // The diff must be the one of pull.headRefOid, the commit merged later
-    // (--match-head-commit): the head is read before and after the diff.
-    if (headOf(repo, pull.number) !== pull.headRefOid) return null;
-    const diff = run('gh', ['pr', 'diff', String(pull.number), '-R', repo]);
-    if (diff.status !== 0 || !diff.stdout.trim()) return null;
-    if (headOf(repo, pull.number) !== pull.headRefOid) return null;
-    const diffPath = join(scratch, 'pr.diff');
-    await writeFile(diffPath, diff.stdout);
+    if (run('git', ['-C', cwd, 'fetch', '-q', 'origin', pull.headRefOid, pull.baseRefOid], { timeout: 180_000 }).status !== 0) return null;
+    if (run('git', ['-C', cwd, 'worktree', 'add', '-q', '--detach', tree, pull.headRefOid]).status !== 0) return null;
     const evidencePath = join(scratch, 'ci.txt');
     await writeFile(evidencePath, [
       `CI checks reported by GitHub for PR #${pull.number} at head ${pull.headRefOid}:`,
@@ -251,8 +257,8 @@ export async function reviewPull(repo, pull, cwd, checks = []) {
     ].join('\n'));
     const result = run('bash', [
       join(homedir(), '.claude', 'scripts', 'codex-astra-review.sh'),
-      '--diff', diffPath, '--evidence', evidencePath, '--label', `cloud-feed ${repo}#${pull.number}`,
-    ], { cwd: cwd ?? dirname(diffPath), timeout: REVIEW_TIMEOUT_MS });
+      '--base', pull.baseRefOid, '--evidence', evidencePath, '--label', `cloud-feed ${repo}#${pull.number}`,
+    ], { cwd: tree, timeout: REVIEW_TIMEOUT_MS });
     // The engine's exit code is its final (gate-adjusted) verdict: 0 approve,
     // 1 request changes; anything else is no verdict.
     const verdict = `${result.stdout}\n${result.stderr}`.match(/^VERDICT:\s*(APPROVE|REQUEST_CHANGES)\b/m)?.[1];
@@ -260,6 +266,7 @@ export async function reviewPull(repo, pull, cwd, checks = []) {
     if (result.status === 1 && verdict === 'REQUEST_CHANGES') return 'REQUEST_CHANGES';
     return null;
   } finally {
+    run('git', ['-C', cwd, 'worktree', 'remove', '--force', tree]);
     await rm(scratch, { recursive: true, force: true });
   }
 }
@@ -280,16 +287,28 @@ export function updateBranch(repo, pull) {
   return run('gh', ['pr', 'update-branch', String(pull.number), '-R', repo]).status === 0;
 }
 
+// Merges by fast-forwarding the base branch to exactly the reviewed head
+// (git ref update with force=false). GitHub refuses it atomically unless the
+// head descends from the base's current tip, so nothing untested can land if
+// the base moved after the last check. GitHub then marks the PR merged.
 export function mergePull(repo, pull) {
-  const merged = run('gh', ['pr', 'merge', String(pull.number), '-R', repo, '--merge', '--match-head-commit', pull.headRefOid]);
-  if (merged.status !== 0) return false;
+  if (!/^[A-Za-z0-9._/-]+$/.test(pull.baseRefName ?? '') || !/^[0-9a-f]{40,64}$/.test(pull.headRefOid ?? '')) return false;
+  const updated = run('gh', [
+    'api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/${pull.baseRefName}`,
+    '-f', `sha=${pull.headRefOid}`, '-F', 'force=false',
+  ]);
+  if (updated.status !== 0) return false;
   return findPullByNumber(repo, pull.number)?.state === 'MERGED';
 }
 
 function findPullByNumber(repo, number) {
-  try {
-    return ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'state']);
-  } catch {
-    return null;
+  // GitHub marks the PR merged shortly after the base ref moves.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      const pull = ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'state']);
+      if (pull.state === 'MERGED') return pull;
+    } catch {}
+    run('sleep', ['2']);
   }
+  return null;
 }

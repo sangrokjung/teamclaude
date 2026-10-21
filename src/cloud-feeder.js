@@ -10,7 +10,8 @@
 // Every side effect (gh, the ledger query, git, credit lookups, dispatch,
 // review) is an injected seam so the planning logic stays testable.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { handoffBranchName } from './cloud-handoff.js';
 
 export const FEED_DEFAULTS = Object.freeze({
   enabled: false,
@@ -284,7 +285,8 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   };
   // Issues and PRs are enumerated completely per dispatchable repository
   // (REST pagination, no search cap); only those repos can be sent anyway.
-  const repos = [...repoIndex.keys()];
+  // Owner filter first: repositories outside it are never even listed.
+  const repos = [...repoIndex.keys()].filter(repo => owners.has(repo.split('/')[0]));
   const lists = [
     await safely('issue', async () => issueCandidates(await deps.listIssues(repos))),
     await safely('tdl', async () => taskCandidates(await deps.listTasks())),
@@ -311,16 +313,21 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
       nextState = record(nextState, candidate, { exit: 3, reason: 'no-default-branch' }, now);
       continue;
     }
-    // Recorded as uncertain (exit 4) and saved BEFORE sending: a crash
-    // between the send and the result write must never cause a resend.
-    nextState = record(nextState, candidate, { exit: 4, reason: 'in-flight' }, now);
+    // Recorded as uncertain (exit 4) with its id and branch and saved BEFORE
+    // sending: a crash between the send and the result write never causes a
+    // resend, and the branch can still be followed for a PR afterwards.
+    const dispatchId = (deps.newId ?? randomUUID)();
+    const branch = handoffBranchName(dispatchId, now);
+    nextState = record(nextState, candidate, { exit: 4, reason: 'in-flight', branch }, now);
     await deps.saveState(nextState);
     let outcome;
     try {
-      outcome = await deps.dispatch({ task: candidate.task, cwd, base, prTarget: candidate.prTarget ?? null });
+      outcome = await deps.dispatch({ task: candidate.task, cwd, base, prTarget: candidate.prTarget ?? null, dispatchId, now });
     } catch {
-      outcome = { exit: 4, reason: 'dispatch-threw' };
+      outcome = { exit: 4, reason: 'dispatch-threw', branch };
     }
+    // A refusal before anything was pushed keeps no branch to follow.
+    if (outcome.exit === 4 && !outcome.branch) outcome = { ...outcome, branch };
     nextState = record(nextState, candidate, outcome, now);
     await deps.saveState(nextState);
     sent.push({ key: candidate.key, exit: outcome.exit, reason: outcome.reason, url: outcome.url });
