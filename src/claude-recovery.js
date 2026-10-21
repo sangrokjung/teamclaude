@@ -616,6 +616,11 @@ async function monitorChild({
   // are history, and anything at or after it may be this child's failure.
   let lastConfirmedAtMs = launchStartedAtMs;
   let minRecordTimeMs = null;
+  // Byte offset marking the end of the pre-existing backlog captured at the
+  // moment of a first-time switch (see followSessionSwitch). Only reads
+  // below this offset are gated by minRecordTimeMs; reads at or after it are
+  // unambiguously post-switch growth and are never time-gated.
+  let historicalBoundaryOffset = null;
   // A session this child has already left is tracked by its own cursor, so
   // returning to it (another /resume) continues exactly where this child
   // stopped reading instead of either replaying its own prior errors or
@@ -632,6 +637,11 @@ async function monitorChild({
   // scanning is paused — not just the stale event cleared — until the
   // registry answers again and either reconfirms or resolves the switch.
   let registryUncertain = false;
+  // The candidate set aside (not discarded) when uncertainty began. A
+  // transient registry blip that reconfirms the SAME session restores it —
+  // the child never actually left, so the error it already found is still
+  // real. Only a reconfirmed genuine switch discards it for good.
+  let uncertainEvent = null;
   let currentOffset = offset;
   let currentIdentity = null;
   let pending = Buffer.alloc(0);
@@ -654,17 +664,26 @@ async function monitorChild({
       // fresh one from its continued growth, so pause reading entirely until
       // the registry can confirm or resolve the switch.
       if (registryConfirmedEver) {
+        if (!registryUncertain) uncertainEvent = unresolvedEvent;
         registryUncertain = true;
         unresolvedEvent = null;
       }
       return;
     }
     registryConfirmedEver = true;
+    const wasUncertain = registryUncertain;
     registryUncertain = false;
     if (liveSessionId === currentSessionId) {
+      // A transient blip, not an actual switch: restore whatever candidate
+      // was set aside rather than losing it to the pause above.
+      if (wasUncertain) unresolvedEvent = uncertainEvent;
+      uncertainEvent = null;
       lastConfirmedAtMs = observedAtMs;
       return;
     }
+    // A genuine switch is now confirmed: any candidate set aside belonged to
+    // the session being left behind and is discarded with it below.
+    uncertainEvent = null;
     // Remember exactly where this child stopped reading its old session, so
     // a later return to it (another /resume) continues from there instead
     // of re-scanning (and re-triggering on) history already seen, or always
@@ -704,11 +723,16 @@ async function monitorChild({
     currentIdentity = null;
     // Never seen before: the switch point cannot be tied to a byte offset
     // (the switched-to transcript may already have grown by the time this
-    // poll sees the registry change), so read it whole and judge new error
-    // candidates by timestamp against the moment this child was last
-    // confirmed on the session it just left.
+    // poll sees the registry change), so read the existing backlog whole and
+    // judge new error candidates in it by timestamp against the moment this
+    // child was last confirmed on the session it just left. Only that
+    // backlog is gated — historicalBoundaryOffset marks where it ends, and
+    // any growth read from there on (true post-switch activity) is always
+    // live regardless of whether it carries a timestamp.
     minRecordTimeMs = departureAtMs;
     currentOffset = 0;
+    const atSwitch = await stat(currentPath).catch(() => null);
+    historicalBoundaryOffset = atSwitch?.size ?? 0;
   }
 
   async function scanTranscript(final = false) {
@@ -760,6 +784,14 @@ async function monitorChild({
       return unresolvedEvent;
     }
 
+    // Fixed for this scanTranscript call: only lines read from inside the
+    // captured backlog (below historicalBoundaryOffset, as of this call's
+    // starting offset) are gated by minRecordTimeMs. Growth already caught
+    // up to or past that boundary needs no gate at all — it can only be
+    // genuine post-switch activity.
+    const gatingHistoricalBacklog = minRecordTimeMs !== null
+      && historicalBoundaryOffset !== null
+      && currentOffset < historicalBoundaryOffset;
     const processLine = line => {
       const event = classifyTranscriptLine(line);
       if (event) {
@@ -767,7 +799,7 @@ async function monitorChild({
         // Resolution below is never gated: a conversation record clearing a
         // pending error must still count even when (as is common) it carries
         // no timestamp of its own.
-        if (minRecordTimeMs !== null && !recordAtOrAfter(line, minRecordTimeMs)) return;
+        if (gatingHistoricalBacklog && !recordAtOrAfter(line, minRecordTimeMs)) return;
         unresolvedEvent = event;
         return;
       }
