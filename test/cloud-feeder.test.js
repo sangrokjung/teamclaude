@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FEED_DEFAULTS,
   feedConfig,
   githubRepoOf,
   improvementCandidates,
@@ -18,9 +17,7 @@ import {
   taskCandidates,
   totalCredit,
 } from '../src/cloud-feeder.js';
-
-const cfg = { ...FEED_DEFAULTS, enabled: true, expiresAt: '2026-11-05T07:59:00Z' };
-const NOW = new Date('2026-10-21T00:00:00Z');
+import { NOW, cfg, feedDeps } from './helpers/cloud-feeder-fixtures.js';
 
 test('budget paces the remaining credit over the days left and counts what was spent today', () => {
   // 15.33 days left, $3000 -> ~$195.7/day; nothing spent yet -> perRun cap.
@@ -206,28 +203,6 @@ test('a legacy pair sharing a name with neither carrying an accountUuid makes th
   assert.equal(reversed.excluded, 1);
 });
 
-function feedDeps(overrides = {}) {
-  const dispatched = [];
-  return {
-    dispatched,
-    deps: {
-      loadAccounts: async () => [{ name: 'a', type: 'oauth', accessToken: 'a', expiresAt: Date.now() + 3_600_000 }],
-      creditLookup: async () => ({ remainingDollars: 3000 }),
-      repoIndex: async () => new Map([['o/a', '/clone/a'], ['o/b', '/clone/b']]),
-      listIssues: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }],
-      listTasks: async () => { throw new Error('ledger down'); },
-      listPulls: async () => [],
-      defaultBase: async () => 'origin/main',
-      dispatch: async request => {
-        dispatched.push(request);
-        return { ok: true, exit: 0, branch: `teamclaude-handoff/${dispatched.length}`, url: 'u' };
-      },
-      saveState: async () => {},
-      deleteRemoteBranch: () => true,
-      ...overrides,
-    },
-  };
-}
 
 test('runFeed dispatches paced, interleaved work from origin/<default> and survives a failing source', async () => {
   const { deps, dispatched } = feedDeps();
@@ -261,104 +236,6 @@ test('a program deadline that lapses while collecting work stops dispatch before
   const entries = Object.values(result.state.sent);
   assert.ok(entries.length > 0);
   assert.ok(entries.every(e => e.exit === 3 && e.reason === 'expired-before-dispatch'));
-});
-
-test('a branch whose inline delete failed goes on a durable cleanup list, separate from the per-task record', async () => {
-  const deleteCalls = [];
-  const { deps } = feedDeps({
-    dispatch: async () => ({
-      ok: false, exit: 3, reason: 'token-expired-before-launch',
-      branch: 'teamclaude-handoff/x', branchDeleted: false, remoteUrl: 'https://github.com/o/a.git',
-    }),
-    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ cwd, branch, remoteUrl }); return false; },
-  });
-  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: false, deps });
-  assert.deepEqual(result.state.pendingCleanup, [
-    { repo: 'o/a', branch: 'teamclaude-handoff/x', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() },
-  ]);
-  // The per-task record only keeps the latest outcome for that key — this is
-  // exactly the forgetting that makes the separate durable list necessary.
-  assert.ok(Object.values(result.state.sent).some(e => e.branch === 'teamclaude-handoff/x'));
-  // Nothing was pending BEFORE this tick, so the sweep had nothing to do —
-  // the failed delete above was cloud-dispatch's own inline attempt (stubbed
-  // here via `dispatch`), not something runFeed's sweep should have touched.
-  assert.deepEqual(deleteCalls, []);
-});
-
-test('a pending cleanup entry is swept and retried every tick: removed once deleted, kept while it keeps failing, by the exact remote it was pushed to', async () => {
-  const deleteCalls = [];
-  const state = {
-    sent: {},
-    pendingCleanup: [
-      { repo: 'o/a', branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() },
-      { repo: 'o/b', branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git', ts: NOW.toISOString() },
-    ],
-  };
-  // Dry runs must never touch the remote at all.
-  {
-    const { deps } = feedDeps({ deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ branch, remoteUrl }); return true; } });
-    await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, max: 0, dryRun: true, deps });
-    assert.deepEqual(deleteCalls, []);
-  }
-  // o/a's stale-1 deletes successfully; o/b's stale-2 keeps failing.
-  const { deps } = feedDeps({
-    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ branch, remoteUrl }); return branch === 'stale-1'; },
-  });
-  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
-  assert.deepEqual(deleteCalls, [
-    { branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git' },
-    { branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git' },
-  ]);
-  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/b', branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git', ts: NOW.toISOString() }]);
-});
-
-test('pending cleanup is retried even when the feeder is disabled, out of credit, or simply paced', async () => {
-  const pendingCleanup = [{ repo: 'o/a', branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() }];
-  const cases = [
-    { label: 'disabled', cfgOverrides: { enabled: false }, depsOverrides: {} },
-    { label: 'no credit info', cfgOverrides: {}, depsOverrides: { loadAccounts: async () => [] } },
-    { label: 'fully paced', cfgOverrides: { perRun: 0 }, depsOverrides: {} },
-  ];
-  for (const { label, cfgOverrides, depsOverrides } of cases) {
-    const deleteCalls = [];
-    const { deps } = feedDeps({
-      deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return true; },
-      ...depsOverrides,
-    });
-    const state = { sent: {}, pendingCleanup: [...pendingCleanup] };
-    const result = await runFeed({ cfg: { ...cfg, owners: ['o'], ...cfgOverrides }, now: NOW, state, dryRun: false, deps });
-    assert.deepEqual(deleteCalls, ['stale-1'], `${label}: cleanup must still run`);
-    assert.deepEqual(result.state.pendingCleanup, [], `${label}: a successful cleanup must still be recorded`);
-  }
-});
-
-test('a pending cleanup with a verified remoteUrl falls back to any other available clone when its own repo key is gone from the index', async () => {
-  // repoIndex no longer lists 'o/stale-repo' at all (its clone's origin
-  // drifted to something else, or it was re-cloned under a different key) —
-  // but the cleanup's destination is the verified remoteUrl, not whatever
-  // 'o/stale-repo' currently maps to, so any other local clone works fine as
-  // the scratch directory to run the delete from.
-  const deleteCalls = [];
-  const { deps } = feedDeps({
-    repoIndex: async () => new Map([['o/other', '/clone/other']]),
-    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ cwd, branch, remoteUrl }); return true; },
-  });
-  const state = { sent: {}, pendingCleanup: [{ repo: 'o/stale-repo', branch: 'stale-1', remoteUrl: 'https://github.com/o/stale-repo.git', ts: NOW.toISOString() }] };
-  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
-  assert.deepEqual(deleteCalls, [{ cwd: '/clone/other', branch: 'stale-1', remoteUrl: 'https://github.com/o/stale-repo.git' }]);
-  assert.deepEqual(result.state.pendingCleanup, []);
-});
-
-test('a legacy pending entry with no remoteUrl never falls back to another clone (its repo key IS the destination)', async () => {
-  const deleteCalls = [];
-  const { deps } = feedDeps({
-    repoIndex: async () => new Map([['o/other', '/clone/other']]),
-    deleteRemoteBranch: (cwd, branch) => { deleteCalls.push({ cwd, branch }); return true; },
-  });
-  const state = { sent: {}, pendingCleanup: [{ repo: 'o/stale-repo', branch: 'stale-1', ts: NOW.toISOString() }] };
-  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
-  assert.deepEqual(deleteCalls, []);
-  assert.deepEqual(result.state.pendingCleanup, state.pendingCleanup);
 });
 
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {
