@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
@@ -11,34 +12,44 @@ async function scratch(t) {
   return dir;
 }
 
-test('state: missing is a fresh start, corrupt is an error, writes round-trip', async t => {
+test('state: missing is a fresh start, any corruption is an error, writes round-trip', async t => {
   const dir = await scratch(t);
   const path = join(dir, 'state.json');
   assert.deepEqual(await readFeederState(path), { sent: {} });
-  await writeFile(path, '{not json');
-  await assert.rejects(readFeederState(path));
-  await writeFile(path, '{"sent": 5}');
-  await assert.rejects(readFeederState(path));
-  await writeFeederState({ sent: { a: { exit: 0 } } }, path);
-  assert.deepEqual(await readFeederState(path), { sent: { a: { exit: 0 } } });
+  for (const corrupt of [
+    '{not json', '{"sent": 5}', '{"sent": null}', '{"sent": []}', '[]',
+    '{"sent": {"k": {"ts": "2026-10-21T00:00:00Z"}}}',
+    '{"sent": {"k": {"exit": 7, "ts": "2026-10-21T00:00:00Z"}}}',
+    '{"sent": {"k": {"exit": 0, "ts": "yesterday"}}}',
+    '{"sent": {"k": null}}',
+  ]) {
+    await writeFile(path, corrupt);
+    await assert.rejects(readFeederState(path), corrupt);
+  }
+  const good = { sent: { a: { exit: 0, ts: '2026-10-21T00:00:00Z' } } };
+  await writeFeederState(good, path);
+  assert.deepEqual(await readFeederState(path), good);
 });
 
-test('lock: a live holder blocks, a dead holder is taken over, only the owner releases', async t => {
+test('lock: an OS lock, held by one run at a time and freed when the holder dies', { skip: process.platform !== 'darwin' }, async t => {
   const dir = await scratch(t);
   const lock = join(dir, 'lock');
-  // Held by this (live) process.
-  await writeFile(lock, JSON.stringify({ pid: process.pid, nonce: 'other' }));
+  // Nested acquisition while held is refused; after release it is free again.
+  const outer = await withFeederLock(async () => withFeederLock(async () => 'inner', lock), lock);
+  assert.deepEqual(outer, { locked: false, value: { locked: true } });
+  assert.deepEqual(await withFeederLock(async () => 'again', lock), { locked: false, value: 'again' });
+
+  // Another process holding it blocks us; once it exits, the kernel frees it.
+  const holder = spawn(process.execPath, ['-e', `
+    const fs = require('node:fs');
+    fs.openSync(${JSON.stringify(lock)}, fs.constants.O_RDWR | fs.constants.O_CREAT | 0x20);
+    process.stdout.write('held\\n');
+    setTimeout(() => {}, 60000);
+  `], { stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => holder.kill('SIGKILL'));
+  await new Promise(resolve => holder.stdout.once('data', resolve));
   assert.deepEqual(await withFeederLock(async () => 'ran', lock), { locked: true });
-  assert.equal(JSON.parse(await readFile(lock, 'utf8')).nonce, 'other', 'a live holder keeps its lock');
-  // A holder whose pid no longer exists is taken over.
-  await writeFile(lock, JSON.stringify({ pid: 2 ** 22 + 12345, nonce: 'dead' }));
+  holder.kill('SIGKILL');
+  await new Promise(resolve => holder.once('exit', resolve));
   assert.deepEqual(await withFeederLock(async () => 'ran', lock), { locked: false, value: 'ran' });
-  await assert.rejects(readFile(lock, 'utf8'), 'released after the run');
-  // A lock replaced by someone else during the run is not removed by us.
-  const result = await withFeederLock(async () => {
-    await writeFile(lock, JSON.stringify({ pid: process.pid, nonce: 'newcomer' }));
-    return 'ran';
-  }, lock);
-  assert.equal(result.value, 'ran');
-  assert.equal(JSON.parse(await readFile(lock, 'utf8')).nonce, 'newcomer');
 });

@@ -3,7 +3,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import { mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -28,7 +28,13 @@ export async function readFeederState(path = feederStatePath()) {
     throw error;
   }
   const state = JSON.parse(text);
-  if (!state || typeof state !== 'object' || typeof state.sent !== 'object') throw new Error('corrupt feeder state');
+  const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!plain(state) || !plain(state.sent)) throw new Error('corrupt feeder state');
+  for (const entry of Object.values(state.sent)) {
+    if (!plain(entry) || ![0, 3, 4].includes(entry.exit) || !Number.isFinite(Date.parse(entry.ts))) {
+      throw new Error('corrupt feeder state entry');
+    }
+  }
   return state;
 }
 
@@ -38,49 +44,25 @@ export async function writeFeederState(state, path = feederStatePath()) {
   await rename(temp, path);
 }
 
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === 'EPERM';
-  }
-}
+// macOS open(2) O_EXLOCK: an exclusive flock taken atomically with the open
+// and released by the kernel when the descriptor closes or the process dies,
+// so there is no stale lock to take over and no takeover race.
+const O_EXLOCK = 0x20;
 
 // One feeder at a time (launchd tick and a manual run share the state file).
-// The lock names its owner (pid + nonce); it is only taken over when that pid
-// is gone, and only released by the owner that still holds it.
 export async function withFeederLock(fn, path = `${feederStatePath()}.lock`) {
-  const nonce = randomUUID();
-  const take = async () => {
-    const handle = await open(path, 'wx', 0o600);
-    try {
-      await handle.writeFile(JSON.stringify({ pid: process.pid, nonce }));
-    } finally {
-      await handle.close();
-    }
-  };
+  if (process.platform !== 'darwin') return { locked: true };
+  let handle;
   try {
-    await take();
-  } catch {
-    let holder = null;
-    try {
-      holder = JSON.parse(await readFile(path, 'utf8'));
-    } catch {}
-    if (!Number.isInteger(holder?.pid) || pidAlive(holder.pid)) return { locked: true };
-    await rm(path, { force: true });
-    try {
-      await take();
-    } catch {
-      return { locked: true };
-    }
+    handle = await open(path, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | O_EXLOCK, 0o600);
+  } catch (error) {
+    if (error?.code === 'EAGAIN' || error?.code === 'EWOULDBLOCK') return { locked: true };
+    throw error;
   }
   try {
     return { locked: false, value: await fn() };
   } finally {
-    try {
-      if (JSON.parse(await readFile(path, 'utf8')).nonce === nonce) await rm(path, { force: true });
-    } catch {}
+    await handle.close();
   }
 }
 
@@ -102,24 +84,41 @@ function ghJson(args) {
   return JSON.parse(result.stdout || '[]');
 }
 
-function warnTruncated(what, list, log) {
-  if (list.length >= LIST_LIMIT) log?.(`[cloud-feed] ${what} list hit the ${LIST_LIMIT} limit; later items are not seen this run`);
-  return list;
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A page of an oldest-first search starting at `cursor` (createdAt). A full
+// page returns the next cursor; a short one wraps back to the start, so later
+// items are reached on following runs however many stay open.
+function searchPage(kind, owner, cursor, fields) {
+  const query = cursor && ISO_RE.test(cursor) ? [`created:>=${cursor}`] : [];
+  const items = ghJson([
+    'search', kind, ...query, '--owner', owner, '--state', 'open',
+    '--sort', 'created', '--order', 'asc', '--limit', String(LIST_LIMIT), '--json', `${fields},createdAt`,
+  ]);
+  const next = items.length >= LIST_LIMIT ? items[items.length - 1].createdAt : null;
+  return { items, next };
 }
 
-export function listIssues(owners, log) {
-  return owners.flatMap(owner => warnTruncated(`issues(${owner})`, ghJson([
-    'search', 'issues', '--owner', owner, '--state', 'open', '--limit', String(LIST_LIMIT),
-    '--json', 'repository,number,title,body,labels,authorAssociation',
-  ]), log));
+function paged(kind, owners, cursors, fields) {
+  const items = [];
+  const next = {};
+  for (const owner of owners) {
+    const page = searchPage(kind, owner, cursors?.[`${kind}:${owner}`] ?? null, fields);
+    items.push(...page.items);
+    next[`${kind}:${owner}`] = page.next;
+  }
+  return { items, cursors: next };
+}
+
+export function listIssues(owners, cursors) {
+  return paged('issues', owners, cursors, 'repository,number,title,body,labels,authorAssociation');
 }
 
 // Open PRs: trust (author association) from search, head fields per repo.
-export function listPulls(owners, log) {
-  const found = owners.flatMap(owner => warnTruncated(`prs(${owner})`, ghJson([
-    'search', 'prs', '--owner', owner, '--state', 'open', '--limit', String(LIST_LIMIT),
-    '--json', 'repository,number,title,isDraft,author,authorAssociation',
-  ]), log));
+export function listPulls(owners, cursors, log) {
+  const page = paged('prs', owners, cursors, 'repository,number,title,isDraft,author,authorAssociation');
+  const found = page.items;
   const byRepo = new Map();
   for (const pull of found) {
     const repo = pull.repository?.nameWithOwner;
@@ -133,26 +132,35 @@ export function listPulls(owners, log) {
       'pr', 'list', '-R', repo, '--state', 'open', '--limit', String(LIST_LIMIT),
       '--json', 'number,headRefName,headRefOid,isCrossRepository',
     ]);
+    if (heads.length >= LIST_LIMIT) log?.(`[cloud-feed] ${repo} has ${LIST_LIMIT}+ open PRs; only the newest are reviewed`);
     for (const head of heads) {
       const pull = pulls.get(head.number);
       if (pull) out.push({ ...pull, ...head, repository: { nameWithOwner: repo } });
     }
   }
-  return out;
+  return { items: out, cursors: page.cursors };
 }
 
-const TASK_QUERY = [
-  'select t.id, t.title, t.description, p.github_repo',
-  'from os_tasks t join os_projects p on p.id = t.project_id',
-  "where t.status = 'todo' and coalesce(p.github_repo, '') <> ''",
-  `order by t.created_at limit ${LIST_LIMIT}`,
-].join(' ');
-
-// Read-only ledger query through the guarded CLI.
-export function listTasks() {
-  const result = run(join(homedir(), '.claude', 'bin', 'sb-sql'), ['--project', 'internal', TASK_QUERY]);
+// Read-only ledger query through the guarded CLI, keyset-paged on
+// (created_at, id); the cursor values are validated before use.
+export function listTasks(cursors) {
+  const cursor = cursors?.tdl;
+  const after = cursor && ISO_RE.test(cursor.createdAt ?? '') && UUID_RE.test(cursor.id ?? '')
+    ? `and (t.created_at, t.id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)`
+    : '';
+  const query = [
+    "select t.id, t.title, t.description, p.github_repo,",
+    "to_char(t.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at",
+    'from os_tasks t join os_projects p on p.id = t.project_id',
+    "where t.status = 'todo' and coalesce(p.github_repo, '') <> ''",
+    after,
+    `order by t.created_at, t.id limit ${LIST_LIMIT}`,
+  ].join(' ');
+  const result = run(join(homedir(), '.claude', 'bin', 'sb-sql'), ['--project', 'internal', query]);
   if (result.status !== 0) throw new Error('task query failed');
-  return JSON.parse(result.stdout).rows ?? [];
+  const items = JSON.parse(result.stdout).rows ?? [];
+  const last = items[items.length - 1];
+  return { items, cursors: { tdl: items.length >= LIST_LIMIT ? { createdAt: last.created_at, id: last.id } : null } };
 }
 
 // owner/name -> trusted local clone path, from one level under each root.
@@ -226,8 +234,9 @@ function headOf(repo, number) {
   }
 }
 
-// Cross-vendor review of the PR diff; returns APPROVE, REQUEST_CHANGES or null.
-export async function reviewPull(repo, pull, cwd) {
+// Cross-vendor review of the PR diff with the PR's CI results as evidence;
+// returns APPROVE, REQUEST_CHANGES or null.
+export async function reviewPull(repo, pull, cwd, checks = []) {
   const scratch = await mkdtemp(join(tmpdir(), 'teamclaude-feed-review-'));
   try {
     // The diff must be the one of pull.headRefOid, the commit merged later
@@ -238,9 +247,14 @@ export async function reviewPull(repo, pull, cwd) {
     if (headOf(repo, pull.number) !== pull.headRefOid) return null;
     const diffPath = join(scratch, 'pr.diff');
     await writeFile(diffPath, diff.stdout);
+    const evidencePath = join(scratch, 'ci.txt');
+    await writeFile(evidencePath, [
+      `CI checks reported by GitHub for PR #${pull.number} at head ${pull.headRefOid}:`,
+      ...checks.map(check => `- ${check.name}: ${check.bucket ?? check.state}`),
+    ].join('\n'));
     const result = run('bash', [
       join(homedir(), '.claude', 'scripts', 'codex-astra-review.sh'),
-      '--diff', diffPath, '--label', `cloud-feed ${repo}#${pull.number}`,
+      '--diff', diffPath, '--evidence', evidencePath, '--label', `cloud-feed ${repo}#${pull.number}`,
     ], { cwd: cwd ?? dirname(diffPath), timeout: REVIEW_TIMEOUT_MS });
     // The engine's exit code is its final (gate-adjusted) verdict: 0 approve,
     // 1 request changes; anything else is no verdict.
