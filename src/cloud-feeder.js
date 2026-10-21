@@ -55,6 +55,14 @@ export function isoWeek(now) {
 
 // How many dispatches this run may send so the remaining credit is spent by
 // the expiry. Returns the next state too (it records the day's opening total).
+// Dispatches sent today (sent or uncertain), each reserving estCost until the
+// credit balance shows the real spend.
+function dispatchedToday(state, today) {
+  return Object.values(state?.sent ?? {})
+    .filter(entry => (entry.exit === 0 || entry.exit === 4) && String(entry.ts ?? '').startsWith(today))
+    .length;
+}
+
 export function planBudget({ state, remainingDollars, now, cfg }) {
   const expires = Date.parse(cfg.expiresAt);
   if (!Number.isFinite(remainingDollars) || remainingDollars <= 0 || !(now.getTime() < expires)) {
@@ -66,7 +74,11 @@ export function planBudget({ state, remainingDollars, now, cfg }) {
     : remainingDollars;
   const daysLeft = Math.max(1, (expires - now.getTime()) / DAY_MS);
   const target = opening / daysLeft;
-  const spentToday = Math.max(0, opening - remainingDollars);
+  // A cloud session bills over time, so the balance lags behind what was
+  // already sent: count each of today's dispatches at estCost until the
+  // measured spend overtakes that reservation.
+  const reserved = dispatchedToday(state, today) * cfg.estCost;
+  const spentToday = Math.max(0, opening - remainingDollars, reserved);
   const owed = target - spentToday;
   const allowed = owed <= 0 ? 0 : Math.min(cfg.perRun, Math.ceil(owed / Math.max(0.01, cfg.estCost)));
   return {
@@ -406,6 +418,7 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
       // contain the current base tip, otherwise the branch is updated first.
       const current = await deps.headContainsBase(entry.repo, pull);
       if (current === null) decision = 'wait';
+      else if (!current && dryRun) decision = 'would-update-branch';
       else if (!current) decision = (await deps.updateBranch(entry.repo, pull)) ? 'wait' : 'behind';
     }
     if (decision === 'review') ready.push({ key, entry, pull, checks });
