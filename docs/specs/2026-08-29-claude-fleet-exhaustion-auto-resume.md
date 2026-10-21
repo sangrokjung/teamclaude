@@ -54,3 +54,13 @@ TeamClaude proxy가 모든 Claude 계정의 제한 해제까지 남은 시간을
 - Targeted CLI: fake Claude transcript가 fleet-exhaustion을 기록한 뒤 재실행 call을 검증합니다.
 - Full: 부하 게이트를 거쳐 `npm test`, `npm run lint`
 - Adversarial: 현재 diff와 실행 evidence를 독립 checker가 대조합니다.
+
+## Addendum (2026-10-21): 세션 내 전환 추적
+
+위 메커니즘은 `teamclaude run`이 처음 띄운 `--session-id`/`--resume` transcript 경로만 끝까지 감시한다고 가정했다. Claude Code는 세션 안에서 `/clear`·`/resume`을 쓰면 `~/.claude/sessions/<pid>.json`의 `sessionId`를 다시 쓰는데(2.1.304 번들 확인), 래퍼는 이를 전혀 몰라 전환된 세션에 찍힌 fleet-exhaustion 오류를 영원히 놓쳤다(2026-10-20 사례: 전환 후 오류가 찍히고 12시간 멈춤).
+
+PR [sangrokjung/teamclaude#69](https://github.com/sangrokjung/teamclaude/pull/69)가 감시 루프를 매 폴링마다 `sessions/<pid>.json`을 읽어 전환을 따라가도록 확장했다(`readLiveSessionId`, `src/claude-recovery.js`). 세션별 커서(읽은 offset·파일 identity·파서 상태·전환 경계 게이트)를 저장·복원해 재방문 시 정확히 이어 읽고, 레지스트리가 일시적으로 사라져도 이미 읽은 오류를 잃지 않으며, 레코드 단위 offset으로 전환 전/후 경계를 판정한다.
+
+- 검증: `node --test test/claude-recovery.test.js` 153 pass / 0 fail, Codex astra 교차 검토 7라운드(Important 11건 전부 전용 회귀 테스트로 수정).
+- 잔존 위험(의도적으로 미조치, 7라운드 지적): 파일 rotation으로 교체된 새 파일에 과거 거부했던 오류와 바이트까지 동일한 내용이 재등장하면 재채택될 수 있음. settle 재스캔의 비동기 읽기 도중 세션이 다시 바뀌면 반환된 실패가 옛 세션 것일 수 있음. 둘 다 Claude Code의 append-only transcript 정상 동작에서는 발생하지 않는 합성 경쟁.
+- 실제 Claude 바이너리로 `/clear`·`/resume` 전환을 재현하는 통합 QA는 미수행(기존 테스트 전략인 fakeChild+수동 registry 작성을 그대로 따름).
