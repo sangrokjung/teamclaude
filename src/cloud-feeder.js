@@ -92,17 +92,17 @@ function dispatchedToday(state, today) {
 // one that appears later only adds its own opening balance.
 export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   const balances = perAccount ?? { _: remainingDollars };
-  const remaining = Object.values(balances).reduce((sum, value) => sum + value, 0);
-  const expires = Date.parse(cfg.expiresAt);
-  if (!Number.isFinite(remaining) || remaining <= 0 || !(now.getTime() < expires)) {
+  if (Object.values(balances).some(value => !Number.isFinite(value))) {
     return { allowed: 0, target: 0, spentToday: 0, state };
   }
   const today = dayKey(now);
-  const sameDay = state?.day?.date === today && state.day.openingByAccount && typeof state.day.openingByAccount === 'object';
-  const openingByAccount = { ...(sameDay ? state.day.openingByAccount : {}) };
+  const day = state?.day?.date === today ? state.day : {};
+  const plain = value => (value && typeof value === 'object' ? value : {});
+  const openingByAccount = { ...plain(day.openingByAccount) };
   // Last balance seen per account today: an account that drops out (locked,
-  // expired, disabled) keeps the spend already observed for it.
-  const lastByAccount = { ...(sameDay && state.day.lastByAccount && typeof state.day.lastByAccount === 'object' ? state.day.lastByAccount : {}) };
+  // expired, disabled) keeps the spend already observed for it. Recorded
+  // before any early return, so a $0 observation is never lost.
+  const lastByAccount = { ...plain(day.lastByAccount) };
   for (const [name, dollars] of Object.entries(balances)) {
     if (!Number.isFinite(openingByAccount[name])) openingByAccount[name] = dollars;
     lastByAccount[name] = dollars;
@@ -110,21 +110,23 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   const opening = Object.values(openingByAccount).reduce((sum, value) => sum + value, 0);
   const measured = Object.entries(openingByAccount)
     .reduce((sum, [name, start]) => sum + Math.max(0, start - (Number.isFinite(lastByAccount[name]) ? lastByAccount[name] : start)), 0);
+  // Reservations: each of today's dispatches holds estCost until the spend
+  // measured SINCE the first of them (not spend from earlier work) covers it.
+  const sentToday = dispatchedToday(state, today);
+  const reserveBaseline = sentToday > 0 && Number.isFinite(day.reserveBaseline) ? day.reserveBaseline : measured;
+  const unsettled = Math.max(0, sentToday * cfg.estCost - Math.max(0, measured - reserveBaseline));
+  const spentToday = measured + unsettled;
+  const nextState = { ...state, day: { date: today, openingDollars: opening, openingByAccount, lastByAccount, reserveBaseline } };
+  const remaining = Object.values(balances).reduce((sum, value) => sum + value, 0);
+  const expires = Date.parse(cfg.expiresAt);
+  if (remaining <= 0 || !(now.getTime() < expires)) {
+    return { allowed: 0, target: 0, spentToday, state: nextState };
+  }
   const daysLeft = Math.max(1, (expires - now.getTime()) / DAY_MS);
   const target = opening / daysLeft;
-  // A cloud session bills over time, so the balance lags behind what was
-  // already sent: count each of today's dispatches at estCost until the
-  // measured spend overtakes that reservation.
-  const reserved = dispatchedToday(state, today) * cfg.estCost;
-  const spentToday = Math.max(measured, reserved);
   const owed = target - spentToday;
-  const allowed = owed <= 0 ? 0 : Math.min(cfg.perRun, Math.ceil(owed / Math.max(0.01, cfg.estCost)));
-  return {
-    allowed,
-    target,
-    spentToday,
-    state: { ...state, day: { date: today, openingDollars: opening, openingByAccount, lastByAccount } },
-  };
+  const allowed = owed <= 0 ? 0 : Math.min(cfg.perRun, Math.ceil(owed / cfg.estCost));
+  return { allowed, target, spentToday, state: nextState };
 }
 
 // Whether `key` may be dispatched (again) now.

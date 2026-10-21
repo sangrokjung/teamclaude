@@ -539,3 +539,37 @@ test('invalid feeder settings fail before anything is planned', () => {
   assert.equal(feedConfig({ cloudFeed: { enabled: true } }).perRun, 3);
   assert.deepEqual(selectCandidates({ candidates: [{ key: 'k', repo: 'o/a' }], state: {}, now: NOW, cfg, max: NaN, hasRepo: () => true }), []);
 });
+
+test('a $0 observation is kept even when it is all that answered', () => {
+  const opts = { cfg: { ...cfg, perRun: 50, estCost: 1 } };
+  const morning = planBudget({ state: { sent: {} }, perAccount: { a: 1000, b: 3000 }, now: NOW, ...opts });
+  const empty = planBudget({ state: morning.state, perAccount: { b: 0 }, now: new Date('2026-10-21T02:00:00Z'), ...opts });
+  assert.equal(empty.allowed, 0);
+  assert.equal(empty.spentToday, 3000);
+  const later = planBudget({ state: empty.state, perAccount: { a: 1000 }, now: new Date('2026-10-21T03:00:00Z'), ...opts });
+  assert.equal(later.spentToday, 3000);
+  assert.equal(later.allowed, 0);
+});
+
+test('new dispatches reserve on top of spend that was already measured before them', () => {
+  // Target ~$100/day; $90 was measured before today's first dispatch.
+  const opts = { cfg: { ...cfg, perRun: 3, estCost: 3, expiresAt: '2026-10-21T12:00:00Z' } };
+  let state = { sent: {}, day: { date: '2026-10-21', openingByAccount: { a: 100 }, lastByAccount: { a: 100 } } };
+  let sent = 0;
+  for (let tick = 0; tick < 15; tick += 1) {
+    const plan = planBudget({ state, perAccount: { a: 10 }, now: new Date('2026-10-21T01:00:00Z'), ...opts });
+    state = plan.state;
+    for (let i = 0; i < plan.allowed; i += 1) {
+      state.sent[`k${tick}-${i}`] = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: 'b' };
+      sent += 1;
+    }
+  }
+  // Opening $100 on the last day = target $100; $90 already spent -> at most
+  // ceil($10 / $3) = 4 dispatches, not 34.
+  assert.ok(sent <= 4, `sent ${sent}`);
+  assert.equal(sent, 4);
+  // As the balance falls, reservations settle against spend after the
+  // baseline: $10 measured since then covers $10 of the $12 reserved.
+  const settled = planBudget({ state, perAccount: { a: 0 }, now: new Date('2026-10-21T02:00:00Z'), ...opts });
+  assert.equal(settled.spentToday, 102);
+});
