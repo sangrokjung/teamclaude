@@ -4,13 +4,32 @@ import { spawn } from 'node:child_process';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
+import { feederStatePath, readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
 
 async function scratch(t) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-feeder-io-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
 }
+
+test('feeder state follows TEAMCLAUDE_CONFIG, so two pools on one machine never share budget or history', t => {
+  const previousConfig = process.env.TEAMCLAUDE_CONFIG;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (previousConfig === undefined) delete process.env.TEAMCLAUDE_CONFIG;
+    else process.env.TEAMCLAUDE_CONFIG = previousConfig;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+  });
+  delete process.env.XDG_CONFIG_HOME;
+  process.env.TEAMCLAUDE_CONFIG = '/tmp/pool-a/teamclaude.json';
+  const a = feederStatePath();
+  process.env.TEAMCLAUDE_CONFIG = '/tmp/pool-b/teamcodex.json';
+  const b = feederStatePath();
+  assert.notEqual(a, b);
+  assert.equal(a, '/tmp/pool-a/teamclaude.cloud-feeder.json');
+  assert.equal(b, '/tmp/pool-b/teamcodex.cloud-feeder.json');
+});
 
 test('state: missing is a fresh start, any corruption is an error, writes round-trip', async t => {
   const dir = await scratch(t);

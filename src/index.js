@@ -3562,6 +3562,10 @@ async function cloudFeedCommand() {
       prTarget,
       newId: () => dispatchId,
       now,
+      // Collecting work (repo index, issues, PRs, TDL) can take minutes;
+      // token freshness must be judged against the clock right now, not the
+      // `now` already frozen into the in-flight record's branch name.
+      eligibilityNow: new Date(),
       baseEnv: process.env,
       vendorBin,
       loadAccounts: async () => (await loadConfig())?.accounts ?? [],

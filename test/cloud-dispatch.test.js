@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
 import { ALNUM } from './helpers/secret-fixtures.js';
-import { defaultRunGit } from '../src/cloud-handoff.js';
+import { defaultRunGit, handoffBranchName } from '../src/cloud-handoff.js';
 import {
   DISPATCH_EXIT,
   DISPATCH_TASK_MAX_BYTES,
@@ -649,4 +649,28 @@ test('an unpushed signed commit fails closed (run locally), a pushed base does n
   git(f.repo, f.env, 'push', '--quiet', '-u', 'origin', 'main');
   const pushed = await attemptCloudDispatch(inputs(f, { base: 'main' }));
   assert.equal(pushed.exit, DISPATCH_EXIT.DISPATCHED);
+});
+
+test('credential freshness is judged by eligibilityNow, not the branch-naming clock, when they diverge', async t => {
+  const f = await fixture(t);
+  // Margin looks fine measured from the frozen `now` (6 min, over the 5 min
+  // floor) but a slow collection phase means the real clock has moved on 10
+  // minutes by dispatch time: by then this token has 4 min left, under the
+  // floor.
+  const expiresSoonFromRealNow = NOW.getTime() + 6 * 60_000;
+  const tenMinutesLater = new Date(NOW.getTime() + 10 * 60_000);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: expiresSoonFromRealNow }],
+    eligibilityNow: tenMinutesLater,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'no-credit-account');
+});
+
+test('branch naming still uses the frozen now even when eligibilityNow is later', async t => {
+  const f = await fixture(t);
+  const muchLater = new Date(NOW.getTime() + 10 * 60_000);
+  const outcome = await attemptCloudDispatch(inputs(f, { eligibilityNow: muchLater }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW));
 });

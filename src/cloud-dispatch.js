@@ -244,6 +244,14 @@ export async function attemptCloudDispatch({
   // Branch the PR should target (default: the repository's default branch).
   prTarget = null,
   now = new Date(),
+  // `now` also fixes the branch name (it must match whatever the caller may
+  // already have recorded before invoking this), so it can be stale by the
+  // time a slow collection phase (listing repos, issues, PRs...) reaches this
+  // call. Credential freshness must use the real clock at THIS moment, not
+  // that frozen value, or an account whose token expired while we were busy
+  // collecting work would still look eligible. Defaults to `now` so other
+  // callers that pass a live clock keep working unchanged.
+  eligibilityNow = now,
   random = Math.random,
   newId = randomUUID,
   creditLookupOptions = {},
@@ -274,7 +282,7 @@ export async function attemptCloudDispatch({
   const account = await findCloudAccount({
     accounts,
     creditLookup,
-    now: now.getTime(),
+    now: eligibilityNow.getTime(),
     random,
     ...creditLookupOptions,
   });

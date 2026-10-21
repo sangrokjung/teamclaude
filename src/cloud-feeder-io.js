@@ -9,11 +9,16 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
+import { getConfigPath } from './config.js';
 
 const LIST_LIMIT = 1000;
 
+// Derived from the active config path (TEAMCLAUDE_CONFIG / XDG_CONFIG_HOME),
+// the same way getServerStatePath/getCloudSidecarStatePath are in config.js:
+// a pool run under a different config gets its own feeder state and lock,
+// never shares budget or dispatch history with another pool on this machine.
 export function feederStatePath() {
-  return join(homedir(), '.config', 'teamclaude.cloud-feeder.json');
+  return getConfigPath().replace(/\.json$/, '') + '.cloud-feeder.json';
 }
 
 // A missing file is a fresh start; an unreadable or corrupt one is an error
