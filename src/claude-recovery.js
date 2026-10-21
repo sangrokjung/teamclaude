@@ -3,12 +3,13 @@ import {
   chmod,
   mkdir,
   open,
+  readFile,
   readdir,
   stat,
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { attemptCloudHandoff } from './cloud-handoff.js';
@@ -554,6 +555,40 @@ async function stopChild(child) {
   }
 }
 
+// Claude Code rewrites <config>/sessions/<pid>.json with the new sessionId on
+// every in-process session switch (/clear, /resume — verified in the 2.1.304
+// bundle). Following it is the only way to see a recoverable error written to
+// the switched-to session's transcript; anything unverifiable returns null so
+// the watcher keeps its current session.
+export async function readLiveSessionId(sessionsRoot, pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let record;
+  try {
+    record = JSON.parse(await readFile(join(sessionsRoot, `${pid}.json`), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (record?.pid !== pid || typeof record.sessionId !== 'string') return null;
+  return UUID_RE.test(record.sessionId) ? record.sessionId : null;
+}
+
+// Only gates a NEW error candidate against the switch boundary (never the
+// resolution check below, which must keep clearing a pending error even when
+// the resolving record itself has no timestamp — real conversation records
+// often don't). An untimed or unparsable record cannot be proven to be at or
+// after the boundary, so — for admitting a NEW error only — it is treated as
+// history rather than risking a stale pre-switch error read as live.
+function recordAtOrAfter(line, minMs) {
+  let record;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  const at = typeof record?.timestamp === 'string' ? Date.parse(record.timestamp) : NaN;
+  return Number.isFinite(at) && at >= minMs;
+}
+
 const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 
@@ -569,11 +604,47 @@ async function monitorChild({
   launchStartedAtMs = 0,
   transcriptSizesBeforeLaunch = null,
   pollIntervalMs,
+  sessionsRoot = null,
 }) {
   const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
-  const sessionWasKnownAtLaunch = Boolean(sessionId);
+  let sessionWasKnownAtLaunch = Boolean(sessionId);
+  let pathKnownAbsent = transcriptKnownAbsent;
+  // Last moment the child was verifiably still on currentSessionId. A switch
+  // happens after it, so a switched-to transcript's records older than this
+  // are history, and anything at or after it may be this child's failure.
+  let lastConfirmedAtMs = launchStartedAtMs;
+  let minRecordTimeMs = null;
+  // Byte offset marking the end of the pre-existing backlog captured at the
+  // moment of a first-time switch (see followSessionSwitch). Only reads
+  // below this offset are gated by minRecordTimeMs; reads at or after it are
+  // unambiguously post-switch growth and are never time-gated.
+  let historicalBoundaryOffset = null;
+  // Set when a first-time switch needs historicalBoundaryOffset but hasn't
+  // taken a stat yet; resolved from scanTranscript's own stat (see above).
+  let historicalPending = false;
+  // A session this child has already left is tracked by its own cursor, so
+  // returning to it (another /resume) continues exactly where this child
+  // stopped reading instead of either replaying its own prior errors or
+  // silently losing ones written while this child was away on another
+  // session.
+  const sessionCursors = new Map();
+  // Becomes true the first time the registry is read successfully. Losing
+  // it afterwards (e.g. removed as the child exits) means a pending error
+  // can no longer be attributed to the session the registry last confirmed.
+  let registryConfirmedEver = false;
+  // True while a previously-working registry cannot currently be read. Any
+  // growth read while uncertain could belong to a session this child has
+  // already left (undetected because the registry couldn't confirm it), so
+  // scanning is paused — not just the stale event cleared — until the
+  // registry answers again and either reconfirms or resolves the switch.
+  let registryUncertain = false;
+  // The candidate set aside (not discarded) when uncertainty began. A
+  // transient registry blip that reconfirms the SAME session restores it —
+  // the child never actually left, so the error it already found is still
+  // real. Only a reconfirmed genuine switch discards it for good.
+  let uncertainEvent = null;
   let currentOffset = offset;
   let currentIdentity = null;
   let pending = Buffer.alloc(0);
@@ -583,7 +654,117 @@ async function monitorChild({
     ? Math.min(1000, Math.max(100, pollIntervalMs))
     : 1000;
 
+  async function followSessionSwitch() {
+    if (!sessionsRoot || !currentSessionId) return;
+    const observedAtMs = Date.now();
+    const liveSessionId = await readLiveSessionId(sessionsRoot, child.pid);
+    if (!liveSessionId) {
+      // The registry previously proved which session the child was on; now
+      // it can't. An event attributed under that proof is no longer safe to
+      // act on (the child may have switched away in the same gap we lost
+      // the registry, most visibly right as it exits) — and scanning more of
+      // the possibly-abandoned transcript below would just manufacture a
+      // fresh one from its continued growth, so pause reading entirely until
+      // the registry can confirm or resolve the switch.
+      if (registryConfirmedEver) {
+        if (!registryUncertain) uncertainEvent = unresolvedEvent;
+        registryUncertain = true;
+        unresolvedEvent = null;
+      }
+      return;
+    }
+    registryConfirmedEver = true;
+    const wasUncertain = registryUncertain;
+    registryUncertain = false;
+    if (liveSessionId === currentSessionId) {
+      // A transient blip, not an actual switch: restore whatever candidate
+      // was set aside rather than losing it to the pause above.
+      if (wasUncertain) unresolvedEvent = uncertainEvent;
+      uncertainEvent = null;
+      lastConfirmedAtMs = observedAtMs;
+      return;
+    }
+    // A genuine switch is now confirmed: any candidate set aside belonged to
+    // the session being left behind and is discarded with it below.
+    uncertainEvent = null;
+    // Remember exactly where this child stopped reading its old session, so
+    // a later return to it (another /resume) continues from there instead
+    // of re-scanning (and re-triggering on) history already seen, or always
+    // restarting from empty and losing anything written while away.
+    // Carries the in-progress line parser state too (not just the byte
+    // offset): a trailing partial line not yet terminated by a newline is
+    // held in `pending`, and discarding it on a later revisit would lose
+    // whatever record it completes into.
+    // The switch-boundary gate (minRecordTimeMs/historicalBoundaryOffset/
+    // historicalPending) belongs to whichever session's backlog it was
+    // measuring — it must travel with the cursor too, or a later revisit
+    // re-arms (or drops) a gate that was about this session specifically.
+    sessionCursors.set(currentSessionId, {
+      offset: currentOffset,
+      identity: currentIdentity,
+      pending,
+      skippingOversizedLine,
+      minRecordTimeMs,
+      historicalBoundaryOffset,
+      historicalPending,
+    });
+    const departureAtMs = lastConfirmedAtMs;
+    lastConfirmedAtMs = observedAtMs;
+    currentSessionId = liveSessionId;
+    sessionWasKnownAtLaunch = true;
+    // An error left in the previous session no longer blocks this child.
+    unresolvedEvent = null;
+    const revisited = sessionCursors.get(liveSessionId);
+    currentPath = await findTranscript(transcriptRoot, liveSessionId);
+    pathKnownAbsent = !currentPath;
+    if (revisited) {
+      // Seen before: resume exactly where this child left it, parser state
+      // included. No replay of its own prior errors, no gap for ones
+      // written while away, no lost partial line.
+      currentOffset = revisited.offset;
+      currentIdentity = revisited.identity;
+      pending = revisited.pending;
+      skippingOversizedLine = revisited.skippingOversizedLine;
+      minRecordTimeMs = revisited.minRecordTimeMs;
+      historicalBoundaryOffset = revisited.historicalBoundaryOffset;
+      historicalPending = revisited.historicalPending;
+      return;
+    }
+    pending = Buffer.alloc(0);
+    skippingOversizedLine = false;
+    currentIdentity = null;
+    // Never seen before: the switch point cannot be tied to a byte offset
+    // (the switched-to transcript may already have grown by the time this
+    // poll sees the registry change), so read the existing backlog whole and
+    // judge new error candidates in it by timestamp against the moment this
+    // child was last confirmed on the session it just left. Only that
+    // backlog is gated — historicalBoundaryOffset marks where it ends, and
+    // any growth read from there on (true post-switch activity) is always
+    // live regardless of whether it carries a timestamp.
+    //
+    minRecordTimeMs = departureAtMs;
+    currentOffset = 0;
+    if (!currentPath) {
+      // The transcript doesn't exist yet: there is no backlog to race
+      // against (a file that isn't there yet can't have grown), so the
+      // boundary is unambiguously 0 — no stat, no deferral, needed here.
+      historicalBoundaryOffset = 0;
+    } else {
+      // The transcript already exists and could still grow: a separate
+      // stat() taken here could diverge from the one scanTranscript takes
+      // right after (something appended in between would then be misjudged
+      // as backlog despite never having been seen by either stat). Instead
+      // historicalPending defers the boundary to scanTranscript's own single
+      // stat below, so the boundary and the read it gates are always the
+      // same observation by construction — no race is possible, not just a
+      // narrowed one.
+      historicalPending = true;
+    }
+  }
+
   async function scanTranscript(final = false) {
+    await followSessionSwitch();
+    if (registryUncertain) return unresolvedEvent;
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
@@ -599,12 +780,12 @@ async function monitorChild({
         // even when the file was created by this child. ID-less discovery still
         // uses the birthtime/snapshot safeguards because it can find an older
         // transcript with an unknown session owner.
-        const createdForLaunch = transcriptKnownAbsent
+        const createdForLaunch = pathKnownAbsent
           && (sessionWasKnownAtLaunch
             || (Number.isFinite(discovered?.birthtimeMs)
               && discovered.birthtimeMs >= launchStartedAtMs));
         const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
-        currentOffset = Number.isFinite(priorSize)
+        currentOffset = minRecordTimeMs !== null ? 0 : Number.isFinite(priorSize)
           ? ((discovered?.size ?? priorSize) < priorSize ? 0 : priorSize)
           : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       }
@@ -616,6 +797,10 @@ async function monitorChild({
       currentPath = null;
       return unresolvedEvent;
     }
+    if (historicalPending) {
+      historicalBoundaryOffset = info.size;
+      historicalPending = false;
+    }
     // A shrunk file (truncation) or a different file at the same path
     // (rotation) cannot continue the old offset: read it from the start.
     if (info.size < currentOffset
@@ -624,15 +809,42 @@ async function monitorChild({
       currentOffset = 0;
       pending = Buffer.alloc(0);
       skippingOversizedLine = false;
+      // A gate active for the file being replaced describes bytes that no
+      // longer exist at this path — reusing its boundary against the new
+      // file's (unrelated) bytes would misjudge them by coincidence of
+      // offset. Unlike a session switch, a rotation has no "backlog that
+      // predates this child's watch" concept at all (the existing rotation
+      // test already assumes the replacement file's content is read fresh,
+      // ungated); drop the gate entirely rather than re-arming it against
+      // the new file.
+      if (minRecordTimeMs !== null) {
+        minRecordTimeMs = null;
+        historicalBoundaryOffset = null;
+        historicalPending = false;
+      }
     }
     if (info.size === currentOffset && (!final || pending.length === 0)) {
       currentIdentity = { dev: info.dev, ino: info.ino };
       return unresolvedEvent;
     }
 
-    const processLine = line => {
+    // Gated per RECORD by its own file start offset, not per scanTranscript
+    // call: a call can straddle historicalBoundaryOffset (new growth arrives
+    // between the boundary snapshot and this read, or an old unterminated
+    // backlog line only completes once a later poll appends its newline),
+    // so judging the whole call by where it started would misclassify
+    // whichever line crosses that line.
+    const processLine = (line, lineStartOffset) => {
       const event = classifyTranscriptLine(line);
       if (event) {
+        // Only a new error candidate is gated against the switch boundary.
+        // Resolution below is never gated: a conversation record clearing a
+        // pending error must still count even when (as is common) it carries
+        // no timestamp of its own.
+        const withinBacklog = minRecordTimeMs !== null
+          && historicalBoundaryOffset !== null
+          && lineStartOffset < historicalBoundaryOffset;
+        if (withinBacklog && !recordAtOrAfter(line, minRecordTimeMs)) return;
         unresolvedEvent = event;
         return;
       }
@@ -668,7 +880,12 @@ async function monitorChild({
           }
           data = Buffer.concat([pending, data]);
           for (let newline = data.indexOf(10); newline !== -1; newline = data.indexOf(10)) {
-            processLine(data.subarray(0, newline).toString('utf8'));
+            // `data` at this exact point always spans file bytes
+            // [position - data.length, position), so this is the absolute
+            // file offset of the line about to be sliced off — true
+            // regardless of how many chunks/polls it took to accumulate it.
+            const lineStartOffset = position - data.length;
+            processLine(data.subarray(0, newline).toString('utf8'), lineStartOffset);
             data = data.subarray(newline + 1);
           }
           if (data.length > TRANSCRIPT_MAX_LINE_BYTES) {
@@ -685,7 +902,7 @@ async function monitorChild({
     }
     currentIdentity = { dev: info.dev, ino: info.ino };
     if (final && pending.length > 0) {
-      processLine(pending.toString('utf8'));
+      processLine(pending.toString('utf8'), currentOffset - pending.length);
       pending = Buffer.alloc(0);
     }
     return unresolvedEvent;
@@ -806,6 +1023,7 @@ export async function runClaudeWithRecovery({
   config,
   cwd = process.cwd(),
   transcriptRoot = join(homedir(), '.claude', 'projects'),
+  sessionsRoot = join(dirname(transcriptRoot), 'sessions'),
   handoffRoot = join(homedir(), '.config', 'teamclaude-handoffs'),
   pollIntervalMs = 1000,
   fetchStatus,
@@ -1134,6 +1352,7 @@ export async function runClaudeWithRecovery({
       launchStartedAtMs,
       transcriptSizesBeforeLaunch,
       pollIntervalMs,
+      sessionsRoot,
     });
     if (outcome.type === 'exit') {
       await releaseFleetRecoveryClaim();
