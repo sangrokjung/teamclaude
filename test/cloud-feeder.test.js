@@ -75,6 +75,32 @@ test('sources are interleaved, deduplicated and limited to repos with a local cl
   assert.deepEqual(chosen.map(c => c.key), ['k1', 'k4']);
 });
 
+test('interleave rotates which source goes first, so one source always winning the top slot cannot starve the rest', () => {
+  const lists = [['a1', 'a2'], ['b1', 'b2'], ['c1', 'c2']];
+  assert.deepEqual(interleave(lists, 0), ['a1', 'b1', 'c1', 'a2', 'b2', 'c2']);
+  assert.deepEqual(interleave(lists, 1), ['b1', 'c1', 'a1', 'b2', 'c2', 'a2']);
+  assert.deepEqual(interleave(lists, 2), ['c1', 'a1', 'b1', 'c2', 'a2', 'b2']);
+  // Out-of-range or negative starts wrap instead of throwing.
+  assert.deepEqual(interleave(lists, 3), interleave(lists, 0));
+  assert.deepEqual(interleave(lists, -1), interleave(lists, 2));
+  assert.deepEqual(interleave([], 5), []);
+});
+
+test('runFeed rotates its source order across calls, so the first source cannot always win the top slot', async () => {
+  const { deps } = feedDeps({
+    listIssues: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }],
+    listTasks: async () => [{ id: 't1', title: 'task', description: '', github_repo: 'o/a' }],
+  });
+  let state = { sent: {} };
+  const firstPicks = [];
+  for (let run = 0; run < 4; run += 1) {
+    const result = await runFeed({ cfg: { ...cfg, owners: ['o'], perRun: 1 }, now: NOW, state, dryRun: true, deps });
+    firstPicks.push(result.sent[0]?.key.split(':')[0]);
+    state = result.state;
+  }
+  assert.ok(new Set(firstPicks).size > 1, `always picked the same source first: ${firstPicks.join(',')}`);
+});
+
 test('candidate builders: issues, tasks, reviews, weekly improvements', () => {
   const issues = issueCandidates([
     { repository: { nameWithOwner: 'Org/Repo' }, number: 7, title: 'bug', body: 'steps', labels: [], authorAssociation: 'OWNER' },
@@ -338,25 +364,29 @@ test('uncertain dispatches with a branch are followed, and a late PR after no-pr
   assert.equal(isDue(result.state.sent.unsure, NOW, cfg), false);
 });
 
-test('today\'s dispatches reserve their estimated cost before the balance moves', () => {
-  const sent = {};
-  for (let i = 0; i < 4; i += 1) sent[`k${i}`] = { exit: 0, ts: '2026-10-21T00:10:00Z', repo: 'o/a', branch: `b${i}` };
-  sent.old = { exit: 0, ts: '2026-10-20T00:10:00Z', repo: 'o/a', branch: 'x' };
-  sent.refused = { exit: 3, ts: '2026-10-21T00:10:00Z', repo: 'o/a' };
-  // $30 left on the last day: target $30; 4 sent today reserve $12 -> $18 owed -> 6.
-  const state = { sent, day: { date: '2026-10-21', openingDollars: 30 } };
-  const plan = planBudget({ state, remainingDollars: 30, now: new Date('2026-10-21T01:00:00Z'), cfg: { ...cfg, perRun: 50, expiresAt: '2026-10-21T12:00:00Z' } });
-  assert.equal(plan.spentToday, 12);
-  assert.equal(plan.allowed, 6);
-  // Repeated runs with an unmoving balance never allocate past the target.
-  let st = state;
-  let total = 4;
-  for (let run = 0; run < 5; run += 1) {
-    const p = planBudget({ state: st, remainingDollars: 30, now: new Date('2026-10-21T01:00:00Z'), cfg: { ...cfg, perRun: 50, expiresAt: '2026-10-21T12:00:00Z' } });
-    for (let i = 0; i < p.allowed; i += 1) st.sent[`n${run}-${i}`] = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: 'z' };
-    total += p.allowed;
+test('a dispatch reserves its estimated cost before the balance moves, even across a day boundary', () => {
+  const opts = { cfg: { ...cfg, perRun: 50, estCost: 3, expiresAt: '2026-10-21T12:00:00Z' } };
+  // One dispatch went out yesterday, right before the date rolled over; the
+  // balance has not caught up to it yet.
+  let state = { sent: { old: { exit: 0, ts: '2026-10-20T23:59:00Z', repo: 'o/a', branch: 'x' }, refused: { exit: 3, ts: '2026-10-21T00:10:00Z', repo: 'o/a' } } };
+  const first = planBudget({ state, perAccount: { a: 30 }, now: new Date('2026-10-21T01:00:00Z'), ...opts });
+  state = first.state;
+  // $30 left on the last day (target $30); the carried-over reservation ($3)
+  // must still count today — not reset to $0 just because the date changed.
+  assert.equal(first.spentToday, 3);
+  assert.equal(first.allowed, 9);
+  for (let i = 0; i < 4; i += 1) state.sent[`k${i}`] = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: `b${i}` };
+  // Repeated runs with an unmoving balance never allocate past the target,
+  // whether or not the oldest reservation predates today.
+  for (let run = 0; run < 8; run += 1) {
+    const p = planBudget({ state, perAccount: { a: 30 }, now: new Date('2026-10-21T01:00:00Z'), ...opts });
+    state = p.state;
+    for (let i = 0; i < p.allowed; i += 1) state.sent[`n${run}-${i}`] = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: 'z' };
   }
-  assert.equal(total * cfg.estCost, 30);
+  const sent = Object.values(state.sent).filter(entry => entry.exit === 0 || entry.exit === 4).length;
+  assert.equal(sent * opts.cfg.estCost, 30);
+  const again = planBudget({ state, perAccount: { a: 30 }, now: new Date('2026-10-21T01:00:00Z'), ...opts });
+  assert.equal(again.allowed, 0);
 });
 
 test('the in-flight record already names the branch, so a crash after sending is still followed', async () => {

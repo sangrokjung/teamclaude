@@ -4,9 +4,9 @@
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
-import { open, readFile, rename, writeFile } from 'node:fs/promises';
+import { open, readFile, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
 
@@ -42,10 +42,24 @@ export async function readFeederState(path = feederStatePath()) {
   return state;
 }
 
+// Durable before it returns (data fsync, rename, directory fsync): the
+// in-flight record must survive a power loss before the dispatch it guards.
 export async function writeFeederState(state, path = feederStatePath()) {
   const temp = `${path}.${process.pid}.tmp`;
-  await writeFile(temp, `${JSON.stringify(state, null, 1)}\n`, { mode: 0o600 });
+  const handle = await open(temp, 'w', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(state, null, 1)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await rename(temp, path);
+  const dir = await open(dirname(path), 'r');
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
 }
 
 // macOS open(2) O_EXLOCK: an exclusive flock taken atomically with the open

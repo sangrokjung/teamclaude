@@ -77,62 +77,65 @@ export function isoWeek(now) {
 
 // How many dispatches this run may send so the remaining credit is spent by
 // the expiry. Returns the next state too (it records the day's opening total).
-// Dispatches sent today (sent or uncertain), each reserving estCost until the
-// credit balance shows the real spend.
-function dispatchedToday(state, today) {
-  return Object.values(state?.sent ?? {})
-    .filter(entry => (entry.exit === 0 || entry.exit === 4) && String(entry.ts ?? '').startsWith(today))
-    .length;
+// Counts ALL dispatches ever sent (exit 0/4), never scoped to "today": the
+// date is only the pacing window, not the reservation unit, so a dispatch
+// made near midnight keeps its reservation across the day boundary.
+function sentCount(state) {
+  return Object.values(state?.sent ?? {}).filter(entry => entry.exit === 0 || entry.exit === 4).length;
 }
 
 // `perAccount` maps account name -> remaining dollars for the accounts that
 // answered now (a plain `remainingDollars` is one anonymous account).
-// Spend is measured per account against the day's opening balance, so an
-// account that drops out (token expired) is not mistaken for spending and
-// one that appears later only adds its own opening balance.
+//
+// Two independent trackers:
+//  - `day` (reset at midnight) scopes today's TARGET: opening balance per
+//    account at first observation today, divided by days left. "Measured"
+//    spend is recomputed each call as opening-minus-last-seen per account
+//    (not an accumulated delta), so a dropped account's prior spend is kept
+//    and a later re-appearance does not double-count it.
+//  - `ledger` (persists across midnight) tracks outstanding RESERVATIONS: one
+//    estCost per dispatch, released only by real balance decreases observed
+//    AFTER that reservation existed. Because it is never reset by the date,
+//    a reservation made right before midnight is not silently released when
+//    the date rolls over (the bug a day-scoped ledger would have).
 export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   const balances = perAccount ?? { _: remainingDollars };
   if (Object.values(balances).some(value => !Number.isFinite(value))) {
     return { allowed: 0, target: 0, spentToday: 0, state };
   }
+  const plain = value => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+
+  // Ledger: settle existing reservations by real spend, then add new ones.
+  const ledger = plain(state?.ledger);
+  const ledgerLast = { ...plain(ledger.lastByAccount) };
+  let ledgerDelta = 0;
+  for (const [name, dollars] of Object.entries(balances)) {
+    if (Number.isFinite(ledgerLast[name])) ledgerDelta += Math.max(0, ledgerLast[name] - dollars);
+    ledgerLast[name] = dollars;
+  }
+  const reservedCount = Number.isInteger(ledger.reservedCount) ? ledger.reservedCount : 0;
+  const count = sentCount(state);
+  const unsettled = Math.max(0, (Number.isFinite(ledger.unsettled) ? ledger.unsettled : 0) - ledgerDelta)
+    + Math.max(0, count - reservedCount) * cfg.estCost;
+
+  // Day: today's opening per account, and spend measured against it.
   const today = dayKey(now);
   const day = state?.day?.date === today ? state.day : {};
-  const plain = value => (value && typeof value === 'object' ? value : {});
   const openingByAccount = { ...plain(day.openingByAccount) };
-  // Last balance seen per account today: an account that drops out (locked,
-  // expired, disabled) keeps the spend already observed for it. Recorded
-  // before any early return, so a $0 observation is never lost.
-  const lastByAccount = { ...plain(day.lastByAccount) };
+  const dayLast = { ...plain(day.lastByAccount) };
   for (const [name, dollars] of Object.entries(balances)) {
     if (!Number.isFinite(openingByAccount[name])) openingByAccount[name] = dollars;
-    lastByAccount[name] = dollars;
+    dayLast[name] = dollars;
   }
   const opening = Object.values(openingByAccount).reduce((sum, value) => sum + value, 0);
   const measured = Object.entries(openingByAccount)
-    .reduce((sum, [name, start]) => sum + Math.max(0, start - (Number.isFinite(lastByAccount[name]) ? lastByAccount[name] : start)), 0);
-  // Reservation ledger: each dispatch holds estCost until spend measured
-  // AFTER it was reserved covers it. Spend growth since the previous
-  // observation settles only reservations that already existed then (any
-  // excess is dropped); dispatches counted for the first time now are added
-  // afterwards, so earlier spend can never absorb a newer reservation.
-  const sentToday = dispatchedToday(state, today);
-  const previousMeasured = Number.isFinite(day.lastMeasured) ? day.lastMeasured : measured;
-  const reservedCount = Number.isInteger(day.reservedCount) ? day.reservedCount : 0;
-  let unsettled = Number.isFinite(day.unsettled) ? day.unsettled : 0;
-  unsettled = Math.max(0, unsettled - Math.max(0, measured - previousMeasured));
-  unsettled += Math.max(0, sentToday - reservedCount) * cfg.estCost;
+    .reduce((sum, [name, start]) => sum + Math.max(0, start - (Number.isFinite(dayLast[name]) ? dayLast[name] : start)), 0);
+
   const spentToday = measured + unsettled;
   const nextState = {
     ...state,
-    day: {
-      date: today,
-      openingDollars: opening,
-      openingByAccount,
-      lastByAccount,
-      lastMeasured: measured,
-      reservedCount: Math.max(sentToday, reservedCount),
-      unsettled,
-    },
+    ledger: { lastByAccount: ledgerLast, unsettled, reservedCount: Math.max(count, reservedCount) },
+    day: { date: today, openingDollars: opening, openingByAccount, lastByAccount: dayLast },
   };
   const remaining = Object.values(balances).reduce((sum, value) => sum + value, 0);
   const expires = Date.parse(cfg.expiresAt);
@@ -154,10 +157,12 @@ export function isDue(entry, now, cfg) {
   return !Number.isFinite(last) || now.getTime() - last >= cfg.retryAfterDays * DAY_MS;
 }
 
-// Round-robin across sources so one large source cannot starve the others.
-export function interleave(lists) {
+// Round-robin across sources so one large source cannot starve the others;
+// `start` rotates which source goes first from run to run.
+export function interleave(lists, start = 0) {
   const out = [];
-  const queues = lists.map(list => [...list]);
+  const offset = lists.length > 0 ? ((start % lists.length) + lists.length) % lists.length : 0;
+  const queues = [...lists.slice(offset), ...lists.slice(0, offset)].map(list => [...list]);
   while (queues.some(queue => queue.length > 0)) {
     for (const queue of queues) if (queue.length > 0) out.push(queue.shift());
   }
@@ -380,8 +385,10 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     await safely('review', async () => reviewCandidates(items('review', await deps.listPulls(repos)))),
     await safely('improve', async () => improvementCandidates(repos, now)),
   ];
+  const rotation = Number.isInteger(nextState.rotation) ? nextState.rotation : 0;
+  nextState = { ...nextState, rotation: (rotation + 1) % lists.length };
   const chosen = selectCandidates({
-    candidates: interleave(lists),
+    candidates: interleave(lists, rotation),
     state: nextState,
     now,
     cfg,
