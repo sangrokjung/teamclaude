@@ -261,12 +261,19 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
       return [];
     }
   };
+  let cursors = { ...(nextState.cursors ?? {}) };
+  const page = async lister => {
+    const result = await lister(cursors);
+    cursors = { ...cursors, ...result.cursors };
+    return result.items;
+  };
   const lists = [
-    await safely('issue', async () => issueCandidates(await deps.listIssues(cfg.owners))),
-    await safely('tdl', async () => taskCandidates(await deps.listTasks())),
-    await safely('review', async () => reviewCandidates(await deps.listPulls(cfg.owners))),
+    await safely('issue', async () => issueCandidates(await page(c => deps.listIssues(cfg.owners, c)))),
+    await safely('tdl', async () => taskCandidates(await page(c => deps.listTasks(c)))),
+    await safely('review', async () => reviewCandidates(await page(c => deps.listPulls(cfg.owners, c)))),
     await safely('improve', async () => improvementCandidates([...repoIndex.keys()], now)),
   ];
+  nextState = { ...nextState, cursors };
   const chosen = selectCandidates({
     candidates: interleave(lists),
     state: nextState,
@@ -339,6 +346,9 @@ export function mergeDecision({ entry, pull, checks, now, cfg }) {
   // A rejected head is not re-reviewed; a new head is.
   if (entry.merge === 'changes-requested' && entry.mergeHead === pull.headRefOid) return 'changes-requested';
   if (checks === null) return 'wait';
+  // Auto-merge needs real test evidence: a PR without any CI check waits for
+  // a person (and is re-checked, in case CI is added).
+  if (checks.length === 0) return 'no-ci';
   if (checks.some(check => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(check.state)
     || ['fail', 'cancel'].includes(check.bucket))) return 'checks-failed';
   if (checks.some(check => check.bucket === 'pending' || ['PENDING', 'QUEUED', 'IN_PROGRESS'].includes(check.state))) return 'wait';
@@ -354,47 +364,64 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
   if (!cfg.enabled && !dryRun) return { state, results: [], note: 'disabled' };
   let nextState = state;
   const results = [];
-  let reviewed = 0;
-  let lookups = 0;
   const limit = Number.isInteger(max) && max >= 0 ? max : cfg.mergePerRun;
-  // Least recently checked first, so a bounded pass still visits everything.
+  const save = async (key, patch) => {
+    if (dryRun) return;
+    nextState = { ...nextState, sent: { ...nextState.sent, [key]: { ...nextState.sent[key], ...patch } } };
+    await deps.saveState(nextState);
+  };
+  const settle = async (key, decision, pull) => {
+    results.push({ key, decision, pr: pull?.number ?? null });
+    if (decision === 'wait') return;
+    await save(key, { merge: decision, pr: pull?.number ?? null, mergeHead: pull?.headRefOid ?? null, mergeTs: now.toISOString() });
+    log(`[cloud-feed] merge ${key} -> ${decision}${pull ? ` (#${pull.number})` : ''}`);
+  };
+
+  // Pass 1: bounded lookups, least recently checked first.
   const open = Object.entries(state?.sent ?? {})
     .filter(([, entry]) => entry.exit === 0 && entry.branch && !FINAL.has(entry.merge))
-    .sort(([, a], [, b]) => String(a.checkedAt ?? '').localeCompare(String(b.checkedAt ?? '')));
+    .sort(([, a], [, b]) => String(a.checkedAt ?? '').localeCompare(String(b.checkedAt ?? '')))
+    .slice(0, cfg.mergeLookups);
+  const ready = [];
   for (const [key, entry] of open) {
-    if (lookups >= cfg.mergeLookups) break;
-    lookups += 1;
     const pull = await deps.findPull(entry.repo, entry.branch);
     const checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.number) : [];
-    let decision = mergeDecision({ entry, pull, checks, now, cfg });
-    if (decision === 'review') {
-      if (reviewed >= limit) decision = 'wait';
-      else if (dryRun) decision = 'would-review';
-      else {
-        reviewed += 1;
-        const verdict = await deps.review(entry.repo, pull);
-        if (verdict === 'APPROVE') {
-          decision = (await deps.merge(entry.repo, pull)) ? 'merged' : 'merge-failed';
-        } else {
-          decision = verdict === 'REQUEST_CHANGES' ? 'changes-requested' : 'review-unavailable';
-        }
-      }
+    await save(key, { checkedAt: now.toISOString() });
+    const decision = mergeDecision({ entry, pull, checks, now, cfg });
+    if (decision === 'review') ready.push({ key, entry, pull, checks });
+    else await settle(key, decision, pull);
+  }
+
+  // Pass 2: reviews, least recently attempted first, so entries that keep
+  // failing to review cannot starve the others.
+  ready.sort((a, b) => String(a.entry.reviewAttemptedAt ?? '').localeCompare(String(b.entry.reviewAttemptedAt ?? '')));
+  for (const [index, item] of ready.entries()) {
+    if (index >= limit) {
+      results.push({ key: item.key, decision: 'wait', pr: item.pull.number });
+      continue;
     }
-    results.push({ key, decision, pr: pull?.number ?? null });
-    if (dryRun) continue;
-    nextState = {
-      ...nextState,
-      sent: {
-        ...nextState.sent,
-        [key]: {
-          ...entry,
-          checkedAt: now.toISOString(),
-          ...(decision === 'wait' ? {} : { merge: decision, pr: pull?.number ?? null, mergeHead: pull?.headRefOid ?? null, mergeTs: now.toISOString() }),
-        },
-      },
-    };
-    await deps.saveState(nextState);
-    if (decision !== 'wait') log(`[cloud-feed] merge ${key} -> ${decision}${pull ? ` (#${pull.number})` : ''}`);
+    if (dryRun) {
+      results.push({ key: item.key, decision: 'would-review', pr: item.pull.number });
+      continue;
+    }
+    await save(item.key, { reviewAttemptedAt: now.toISOString() });
+    const verdict = await deps.review(item.entry.repo, item.pull, item.checks);
+    if (verdict !== 'APPROVE') {
+      await settle(item.key, verdict === 'REQUEST_CHANGES' ? 'changes-requested' : 'review-unavailable', item.pull);
+      continue;
+    }
+    // Right before merging: same head, same base, checks still all green.
+    const fresh = await deps.findPull(item.entry.repo, item.entry.branch);
+    const freshChecks = fresh && fresh.state === 'OPEN' ? await deps.listChecks(item.entry.repo, fresh.number) : null;
+    const unchanged = fresh
+      && fresh.headRefOid === item.pull.headRefOid
+      && fresh.baseRefName === item.pull.baseRefName
+      && mergeDecision({ entry: item.entry, pull: fresh, checks: freshChecks, now, cfg }) === 'review';
+    if (!unchanged) {
+      await settle(item.key, 'review-unavailable', item.pull);
+      continue;
+    }
+    await settle(item.key, (await deps.merge(item.entry.repo, item.pull)) ? 'merged' : 'merge-failed', item.pull);
   }
   return { state: nextState, results, note: 'ok' };
 }

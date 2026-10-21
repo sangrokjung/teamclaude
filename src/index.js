@@ -3539,9 +3539,9 @@ async function cloudFeedCommand() {
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
     creditLookup: token => fetchCloudCredits(token),
     repoIndex: getRepoIndex,
-    listIssues: owners => listIssues(owners, log),
-    listTasks,
-    listPulls: owners => listPulls(owners, log),
+    listIssues: (owners, cursors) => listIssues(owners, cursors),
+    listTasks: cursors => listTasks(cursors),
+    listPulls: (owners, cursors) => listPulls(owners, cursors, log),
     defaultBase,
     saveState: state => writeFeederState(state),
     dispatch: ({ task, cwd, base }) => attemptCloudDispatch({
@@ -3555,7 +3555,7 @@ async function cloudFeedCommand() {
     }),
     findPull,
     listChecks,
-    review: async (repo, pull) => reviewPull(repo, pull, (await getRepoIndex()).get(repo)),
+    review: async (repo, pull, checks) => reviewPull(repo, pull, (await getRepoIndex()).get(repo), checks),
     merge: mergePull,
   };
   const outcome = await withFeederLock(async () => {
