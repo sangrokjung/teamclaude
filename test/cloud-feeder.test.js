@@ -116,17 +116,28 @@ test('github remotes are normalised and others rejected', () => {
 });
 
 test('total credit skips disabled accounts and is incomplete when any lookup fails', async () => {
+  const valid = Date.now() + 3_600_000;
   const accounts = [
-    { type: 'oauth', accessToken: 'a' },
-    { type: 'oauth', accessToken: 'b', enabled: false },
-    { type: 'oauth', accessToken: 'c' },
+    { name: 'a', type: 'oauth', accessToken: 'a', expiresAt: valid },
+    { name: 'b', type: 'oauth', accessToken: 'b', expiresAt: valid, enabled: false },
+    { name: 'c', type: 'oauth', accessToken: 'c', expiresAt: valid },
   ];
-  assert.deepEqual(await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 10 }) }), { total: 20, complete: true, failed: 0 });
+  const all = await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 10 }) });
+  assert.deepEqual([all.total, all.complete, all.failed, all.excluded], [20, true, 0, 1]);
+  assert.deepEqual(all.perAccount, { a: 10, c: 10 });
   // One failed lookup makes the sum incomplete (never a smaller "balance").
-  assert.deepEqual(await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 10 } : null) }), { total: 10, complete: false, failed: 1 });
+  const partial = await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 10 } : null) });
+  assert.deepEqual([partial.total, partial.complete, partial.failed], [10, false, 1]);
   assert.equal((await totalCredit({ accounts, creditLookup: async () => { throw new Error('x'); } })).complete, false);
   // "No credit" and "locked" are answers ($0), not failures.
-  assert.deepEqual(await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 0 } : { remainingDollars: 5, lockedReason: 'x' }) }), { total: 0, complete: true, failed: 0 });
+  const zero = await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 0 } : { remainingDollars: 5, lockedReason: 'x' }) });
+  assert.deepEqual([zero.total, zero.complete], [0, true]);
+  // An expired token is not eligible: excluded, never a failed lookup.
+  const expired = await totalCredit({
+    accounts: [accounts[0], { name: 'x', type: 'oauth', accessToken: 'x', expiresAt: Date.now() - 1000 }],
+    creditLookup: async t => (t === 'x' ? null : { remainingDollars: 7 }),
+  });
+  assert.deepEqual([expired.total, expired.complete, expired.excluded], [7, true, 1]);
 });
 
 function feedDeps(overrides = {}) {
@@ -134,7 +145,7 @@ function feedDeps(overrides = {}) {
   return {
     dispatched,
     deps: {
-      loadAccounts: async () => [{ type: 'oauth', accessToken: 'a' }],
+      loadAccounts: async () => [{ name: 'a', type: 'oauth', accessToken: 'a', expiresAt: Date.now() + 3_600_000 }],
       creditLookup: async () => ({ remainingDollars: 3000 }),
       repoIndex: async () => new Map([['o/a', '/clone/a'], ['o/b', '/clone/b']]),
       listIssues: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }],
@@ -416,7 +427,10 @@ test('a PR whose head moved is a new review key, never the old key with new code
 });
 
 test('a partial credit read plans nothing and does not pin the day to a partial balance', async () => {
-  const accounts = [{ type: 'oauth', accessToken: 'a' }, { type: 'oauth', accessToken: 'b' }];
+  const accounts = [
+    { name: 'a', type: 'oauth', accessToken: 'a', expiresAt: Date.now() + 3_600_000 },
+    { name: 'b', type: 'oauth', accessToken: 'b', expiresAt: Date.now() + 3_600_000 },
+  ];
   const { deps, dispatched } = feedDeps({
     loadAccounts: async () => accounts,
     creditLookup: async token => (token === 'a' ? { remainingDollars: 100 } : null),
@@ -456,4 +470,30 @@ test('ready is not recorded if the PR head moved, closed or turned draft while c
     assert.equal(result.state.sent.a.merge, 'waiting', label);
     assert.equal(result.state.sent.a.readyHead, null, label);
   }
+});
+
+test('budget measures spend per account: an account dropping out is not spending', () => {
+  const day = planBudget({ state: { sent: {} }, perAccount: { a: 1000, b: 2000 }, now: NOW, cfg: { ...cfg, perRun: 50 } });
+  assert.equal(day.state.day.openingDollars, 3000);
+  // b's token expired (absent now), a spent $10: measured spend is $10, not $2010.
+  const later = planBudget({ state: day.state, perAccount: { a: 990 }, now: new Date('2026-10-21T06:00:00Z'), cfg: { ...cfg, perRun: 50 } });
+  assert.equal(later.spentToday, 10);
+  // A newly eligible account adds its own opening balance only.
+  const added = planBudget({ state: later.state, perAccount: { a: 990, c: 500 }, now: new Date('2026-10-21T07:00:00Z'), cfg: { ...cfg, perRun: 50 } });
+  assert.equal(added.state.day.openingDollars, 3500);
+  assert.equal(added.spentToday, 10);
+});
+
+test('checks are read for the exact head commit the PR was seen at', async () => {
+  const asked = [];
+  await runTriage({
+    cfg, now: NOW, dryRun: false,
+    state: { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } },
+    deps: {
+      saveState: async () => {},
+      findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'a'.repeat(40) }),
+      listChecks: async (repo, sha) => { asked.push(sha); return [{ bucket: 'pass' }]; },
+    },
+  });
+  assert.deepEqual(asked, ['a'.repeat(40)]);
 });

@@ -12,7 +12,7 @@
 // review) is an injected seam so the planning logic stays testable.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { handoffBranchName } from './cloud-handoff.js';
+import { handoffBranchName, isCloudEligibleAccount } from './cloud-handoff.js';
 
 export const FEED_DEFAULTS = Object.freeze({
   enabled: false,
@@ -65,29 +65,41 @@ function dispatchedToday(state, today) {
     .length;
 }
 
-export function planBudget({ state, remainingDollars, now, cfg }) {
+// `perAccount` maps account name -> remaining dollars for the accounts that
+// answered now (a plain `remainingDollars` is one anonymous account).
+// Spend is measured per account against the day's opening balance, so an
+// account that drops out (token expired) is not mistaken for spending and
+// one that appears later only adds its own opening balance.
+export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
+  const balances = perAccount ?? { _: remainingDollars };
+  const remaining = Object.values(balances).reduce((sum, value) => sum + value, 0);
   const expires = Date.parse(cfg.expiresAt);
-  if (!Number.isFinite(remainingDollars) || remainingDollars <= 0 || !(now.getTime() < expires)) {
+  if (!Number.isFinite(remaining) || remaining <= 0 || !(now.getTime() < expires)) {
     return { allowed: 0, target: 0, spentToday: 0, state };
   }
   const today = dayKey(now);
-  const opening = state?.day?.date === today && Number.isFinite(state.day.openingDollars)
-    ? state.day.openingDollars
-    : remainingDollars;
+  const sameDay = state?.day?.date === today && state.day.openingByAccount && typeof state.day.openingByAccount === 'object';
+  const openingByAccount = { ...(sameDay ? state.day.openingByAccount : {}) };
+  for (const [name, dollars] of Object.entries(balances)) {
+    if (!Number.isFinite(openingByAccount[name])) openingByAccount[name] = dollars;
+  }
+  const opening = Object.values(openingByAccount).reduce((sum, value) => sum + value, 0);
+  const measured = Object.entries(balances)
+    .reduce((sum, [name, dollars]) => sum + Math.max(0, openingByAccount[name] - dollars), 0);
   const daysLeft = Math.max(1, (expires - now.getTime()) / DAY_MS);
   const target = opening / daysLeft;
   // A cloud session bills over time, so the balance lags behind what was
   // already sent: count each of today's dispatches at estCost until the
   // measured spend overtakes that reservation.
   const reserved = dispatchedToday(state, today) * cfg.estCost;
-  const spentToday = Math.max(0, opening - remainingDollars, reserved);
+  const spentToday = Math.max(measured, reserved);
   const owed = target - spentToday;
   const allowed = owed <= 0 ? 0 : Math.min(cfg.perRun, Math.ceil(owed / Math.max(0.01, cfg.estCost)));
   return {
     allowed,
     target,
     spentToday,
-    state: { ...state, day: { date: today, openingDollars: opening } },
+    state: { ...state, day: { date: today, openingDollars: opening, openingByAccount } },
   };
 }
 
@@ -244,25 +256,35 @@ export function improvementCandidates(repos, now) {
 // any eligible account's lookup failed: a partial sum must not be taken for
 // the balance (it would look like credit spent or set a tiny daily target).
 // An account that answers "no credit" or "locked" counts as $0, not missing.
-export async function totalCredit({ accounts, creditLookup }) {
+// Counts exactly the accounts a dispatch could use (enabled, eligible token);
+// the others are reported as `excluded`, not failures.
+export async function totalCredit({ accounts, creditLookup, now = Date.now() }) {
   let total = 0;
   let eligible = 0;
   let failed = 0;
-  for (const account of accounts ?? []) {
-    if (account?.enabled === false || account?.type !== 'oauth' || !account.accessToken) continue;
+  let excluded = 0;
+  const perAccount = {};
+  for (const [index, account] of (accounts ?? []).entries()) {
+    if (account?.enabled === false || !isCloudEligibleAccount(account, now)) {
+      excluded += 1;
+      continue;
+    }
     eligible += 1;
+    const name = String(account.name ?? `#${index}`);
     try {
       const credits = await creditLookup(account.accessToken);
       if (credits === null || credits === undefined) {
         failed += 1;
-      } else if (!credits.lockedReason && Number.isFinite(credits.remainingDollars)) {
-        total += credits.remainingDollars;
+      } else {
+        const dollars = !credits.lockedReason && Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
+        perAccount[name] = dollars;
+        total += dollars;
       }
     } catch {
       failed += 1;
     }
   }
-  return { total, complete: eligible > 0 && failed === 0, failed };
+  return { total, perAccount, complete: eligible > 0 && failed === 0, failed, excluded };
 }
 
 // One feeding pass. `deps` supplies every side effect.
@@ -270,11 +292,11 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   const log = deps.log ?? (() => {});
   // A dry run may preview even while the feeder is switched off.
   if (!cfg.enabled && !dryRun) return { state, sent: [], note: 'disabled' };
-  const credit = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup });
+  const credit = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup, now: now.getTime() });
   // Nothing is planned on a partial balance; the next tick tries again.
   if (!credit.complete) return { state, sent: [], note: credit.failed > 0 ? 'credit-incomplete' : 'no-credit-info' };
   const remaining = credit.total;
-  const budget = planBudget({ state, remainingDollars: remaining, now, cfg });
+  const budget = planBudget({ state, perAccount: credit.perAccount, now, cfg });
   const limit = Math.min(budget.allowed, Number.isInteger(max) && max >= 0 ? max : Infinity);
   log(`[cloud-feed] remaining $${remaining.toFixed(2)}, today target $${budget.target.toFixed(2)}, spent $${budget.spentToday.toFixed(2)}, allowed ${limit}`);
   let nextState = budget.state;
@@ -424,7 +446,8 @@ export async function runTriage({ cfg, now, state, dryRun, deps }) {
     let checks;
     try {
       pull = await deps.findPull(entry.repo, entry.branch);
-      checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.number) : [];
+      // Checks of exactly this head commit (not "whatever the PR has now").
+      checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.headRefOid) : [];
     } catch {
       // Unknown now: a previous "ready" no longer holds.
       await save(key, { checkedAt: now.toISOString(), merge: entry.merge === 'no-pr' ? 'no-pr' : 'lookup-failed', readyHead: null });

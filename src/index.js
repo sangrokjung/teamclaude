@@ -3535,7 +3535,7 @@ async function cloudFeedCommand() {
   const deps = {
     log,
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
-    creditLookup: token => fetchCloudCredits(token),
+    creditLookup: token => fetchCloudCredits(token, { absentAsZero: true }),
     repoIndex: getRepoIndex,
     listIssues: repos => listIssues(repos, log),
     listTasks,

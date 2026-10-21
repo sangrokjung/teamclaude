@@ -244,15 +244,42 @@ export function findPull(repo, branch) {
   return pulls.find(pull => pull.headRefName === branch && pull.isCrossRepository === false) ?? null;
 }
 
-// [] = no checks configured; null = the query failed (unknown, so wait).
-export function listChecks(repo, number) {
-  const result = run('gh', ['pr', 'checks', String(number), '-R', repo, '--json', 'name,state,bucket']);
-  if (/no checks reported/i.test(result.stderr)) return [];
-  // gh exits 8 while checks are pending; the JSON is still complete.
-  if (result.status !== 0 && result.status !== 8 && result.status !== 1) return null;
+const RUN_BUCKET = {
+  success: 'pass',
+  skipped: 'skipping',
+  neutral: 'skipping',
+  failure: 'fail',
+  timed_out: 'fail',
+  action_required: 'fail',
+  startup_failure: 'fail',
+  stale: 'fail',
+  cancelled: 'cancel',
+};
+const STATUS_BUCKET = { success: 'pass', pending: 'pending', failure: 'fail', error: 'fail' };
+
+// Checks of exactly commit `sha` (check runs + commit statuses), each as
+// { name, bucket }. [] = none configured; null = the query failed.
+export function listChecks(repo, sha) {
+  if (!/^[0-9a-f]{40,64}$/.test(sha ?? '')) return null;
   try {
-    const checks = JSON.parse(result.stdout);
-    return Array.isArray(checks) ? checks : null;
+    const runs = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const batch = ghJson(['api', `repos/${repo}/commits/${sha}/check-runs?per_page=100&page=${page}`]);
+      const items = Array.isArray(batch?.check_runs) ? batch.check_runs : null;
+      if (!items) return null;
+      for (const run of items) {
+        runs.push({
+          name: run.name,
+          bucket: run.status !== 'completed' ? 'pending' : (RUN_BUCKET[run.conclusion] ?? 'unknown'),
+        });
+      }
+      if (items.length < 100) break;
+      if (page === 10) return null;
+    }
+    const combined = ghJson(['api', `repos/${repo}/commits/${sha}/status`]);
+    if (!Array.isArray(combined?.statuses)) return null;
+    const statuses = combined.statuses.map(status => ({ name: status.context, bucket: STATUS_BUCKET[status.state] ?? 'unknown' }));
+    return [...runs, ...statuses];
   } catch {
     return null;
   }
