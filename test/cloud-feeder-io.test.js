@@ -27,8 +27,25 @@ test('feeder state follows TEAMCLAUDE_CONFIG, so two pools on one machine never 
   process.env.TEAMCLAUDE_CONFIG = '/tmp/pool-b/teamcodex.json';
   const b = feederStatePath();
   assert.notEqual(a, b);
-  assert.equal(a, '/tmp/pool-a/teamclaude.cloud-feeder.json');
-  assert.equal(b, '/tmp/pool-b/teamcodex.cloud-feeder.json');
+  assert.equal(a, '/tmp/pool-a/teamclaude.json.cloud-feeder.json');
+  assert.equal(b, '/tmp/pool-b/teamcodex.json.cloud-feeder.json');
+});
+
+test('an extensionless TEAMCLAUDE_CONFIG never collides with a .json sibling of the same stem', t => {
+  const previousConfig = process.env.TEAMCLAUDE_CONFIG;
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  t.after(() => {
+    if (previousConfig === undefined) delete process.env.TEAMCLAUDE_CONFIG;
+    else process.env.TEAMCLAUDE_CONFIG = previousConfig;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = previousXdg;
+  });
+  delete process.env.XDG_CONFIG_HOME;
+  process.env.TEAMCLAUDE_CONFIG = '/x/profile';
+  const extensionless = feederStatePath();
+  process.env.TEAMCLAUDE_CONFIG = '/x/profile.json';
+  const withExtension = feederStatePath();
+  assert.notEqual(extensionless, withExtension);
 });
 
 test('state: missing is a fresh start, any corruption is an error, writes round-trip', async t => {

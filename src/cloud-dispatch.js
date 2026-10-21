@@ -29,6 +29,7 @@ import {
   findCloudAccount,
   handoffBranchName,
   inspectHandoffRepo,
+  isCloudEligibleAccount,
   isExecutableFile,
   remoteUrlIsFixedPoint,
   pushHandoffSnapshot,
@@ -252,6 +253,14 @@ export async function attemptCloudDispatch({
   // collecting work would still look eligible. Defaults to `now` so other
   // callers that pass a live clock keep working unchanged.
   eligibilityNow = now,
+  // Re-checked again right before the actual launcher call: `eligibilityNow`
+  // only proves freshness at account-selection time, but the snapshot push
+  // (git network I/O, up to 120s) can still let the token lapse before
+  // launchCloud is invoked. A function, not a value, so each call sees a fresh
+  // clock even though dispatch is async. Defaults to `eligibilityNow` (no
+  // additional drift assumed) so a caller that injects only `eligibilityNow`
+  // keeps its existing behavior; a real caller should pass `() => Date.now()`.
+  liveNow = () => eligibilityNow.getTime(),
   random = Math.random,
   newId = randomUUID,
   creditLookupOptions = {},
@@ -318,6 +327,16 @@ export async function attemptCloudDispatch({
       gitEnv,
     });
   if (!snapshot.ok) return local(snapshot.reason);
+
+  // The chosen account's own record (not the stripped-down `account` that
+  // findCloudAccount returned) still carries expiresAt, so re-verify against
+  // the live clock now that the snapshot push has spent however long it spent.
+  // Nothing has been launched yet, so a failure here is safely retryable
+  // (RUN_LOCAL), unlike an uncertain post-launch result (AMBIGUOUS).
+  const matchedAccount = Array.isArray(accounts) ? accounts.find(a => a?.name === account.name) : null;
+  if (matchedAccount && !isCloudEligibleAccount(matchedAccount, liveNow())) {
+    return local('token-expired-before-launch');
+  }
 
   const prompt = buildDispatchPrompt({ branch: snapshot.branch, task, prTarget });
   let result = null;

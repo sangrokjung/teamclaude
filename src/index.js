@@ -3566,6 +3566,10 @@ async function cloudFeedCommand() {
       // token freshness must be judged against the clock right now, not the
       // `now` already frozen into the in-flight record's branch name.
       eligibilityNow: new Date(),
+      // The snapshot push itself (git network I/O) can further delay the
+      // actual launcher call, so re-check against the real clock again right
+      // before it, not just once at account-selection time.
+      liveNow: () => Date.now(),
       baseEnv: process.env,
       vendorBin,
       loadAccounts: async () => (await loadConfig())?.accounts ?? [],

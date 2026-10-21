@@ -13,12 +13,15 @@ import { getConfigPath } from './config.js';
 
 const LIST_LIMIT = 1000;
 
-// Derived from the active config path (TEAMCLAUDE_CONFIG / XDG_CONFIG_HOME),
-// the same way getServerStatePath/getCloudSidecarStatePath are in config.js:
+// Derived from the active config path (TEAMCLAUDE_CONFIG / XDG_CONFIG_HOME):
 // a pool run under a different config gets its own feeder state and lock,
 // never shares budget or dispatch history with another pool on this machine.
+// Appended to the FULL config path (not stripped of its extension like
+// getServerStatePath/getCloudSidecarStatePath): stripping `.json$` would make
+// TEAMCLAUDE_CONFIG=/x/profile and TEAMCLAUDE_CONFIG=/x/profile.json — two
+// distinct config files — collide on the same feeder state path.
 export function feederStatePath() {
-  return getConfigPath().replace(/\.json$/, '') + '.cloud-feeder.json';
+  return `${getConfigPath()}.cloud-feeder.json`;
 }
 
 // A missing file is a fresh start; an unreadable or corrupt one is an error

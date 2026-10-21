@@ -674,3 +674,30 @@ test('branch naming still uses the frozen now even when eligibilityNow is later'
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
   assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW));
 });
+
+test('a token that lapses during the snapshot push is caught right before launch, not after', async t => {
+  const f = await fixture(t);
+  // Fine margin at selection time (6 min, over the 5 min floor from `now`),
+  // but the push to the handoff branch (git network I/O) is slow enough that
+  // by the time we are about to invoke the launcher, only 4 min are left.
+  const expiresAt = NOW.getTime() + 6 * 60_000;
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt }],
+    launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(launched, false, 'the launcher must never run once the chosen account is no longer eligible');
+});
+
+test('a token that is still fresh by liveNow launches normally', async t => {
+  const f = await fixture(t);
+  const expiresAt = NOW.getTime() + 6 * 60_000;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt }],
+    liveNow: () => NOW.getTime() + 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+});
