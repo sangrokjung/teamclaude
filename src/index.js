@@ -3504,11 +3504,17 @@ async function cloudDispatchCommand() {
 async function cloudFeedCommand() {
   const log = message => console.error(message);
   const [sub = 'status', ...rest] = args.slice(1);
-  const dryRun = rest.includes('--dry-run');
-  const maxIndex = rest.indexOf('--max');
-  const max = maxIndex >= 0 ? Number.parseInt(rest[maxIndex + 1], 10) : undefined;
-  if (!['run', 'triage', 'tick', 'status'].includes(sub)
-      || (maxIndex >= 0 && !(Number.isInteger(max) && max >= 0))) {
+  // Strict: an option that is not exactly understood (e.g. --dry-run=true)
+  // must never fall through into a real, credit-spending run.
+  let dryRun = false;
+  let max;
+  let badOption = false;
+  for (let i = 0; i < rest.length; i += 1) {
+    if (rest[i] === '--dry-run' && !dryRun) dryRun = true;
+    else if (rest[i] === '--max' && max === undefined && /^\d{1,4}$/.test(rest[i + 1] ?? '')) max = Number(rest[(i += 1)]);
+    else badOption = true;
+  }
+  if (!['run', 'triage', 'tick', 'status'].includes(sub) || badOption) {
     log('Usage: teamclaude cloud-feed <run|triage|tick|status> [--dry-run] [--max N]');
     process.exitCode = 1;
     return;

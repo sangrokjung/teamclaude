@@ -573,3 +573,23 @@ test('new dispatches reserve on top of spend that was already measured before th
   const settled = planBudget({ state, perAccount: { a: 0 }, now: new Date('2026-10-21T02:00:00Z'), ...opts });
   assert.equal(settled.spentToday, 102);
 });
+
+test('spend measured after a first dispatch cannot absorb later reservations', () => {
+  const opts = { cfg: { ...cfg, perRun: 3, estCost: 3, expiresAt: '2026-10-21T12:00:00Z' } };
+  let state = { sent: {} };
+  // Opening $100 on the last day; one dispatch goes out.
+  let plan = planBudget({ state, perAccount: { a: 100 }, now: new Date('2026-10-21T01:00:00Z'), ...opts });
+  state = plan.state;
+  state.sent.first = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: 'b' };
+  // $90 is then measured; the balance stays at $10 for many ticks.
+  let later = 0;
+  for (let tick = 0; tick < 15; tick += 1) {
+    plan = planBudget({ state, perAccount: { a: 10 }, now: new Date('2026-10-21T02:00:00Z'), ...opts });
+    state = plan.state;
+    for (let i = 0; i < plan.allowed; i += 1) {
+      state.sent[`k${tick}-${i}`] = { exit: 0, ts: '2026-10-21T02:00:00Z', repo: 'o/a', branch: 'b' };
+      later += 1;
+    }
+  }
+  assert.ok(later <= 4, `later ${later}`);
+});

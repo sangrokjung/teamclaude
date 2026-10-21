@@ -110,13 +110,30 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   const opening = Object.values(openingByAccount).reduce((sum, value) => sum + value, 0);
   const measured = Object.entries(openingByAccount)
     .reduce((sum, [name, start]) => sum + Math.max(0, start - (Number.isFinite(lastByAccount[name]) ? lastByAccount[name] : start)), 0);
-  // Reservations: each of today's dispatches holds estCost until the spend
-  // measured SINCE the first of them (not spend from earlier work) covers it.
+  // Reservation ledger: each dispatch holds estCost until spend measured
+  // AFTER it was reserved covers it. Spend growth since the previous
+  // observation settles only reservations that already existed then (any
+  // excess is dropped); dispatches counted for the first time now are added
+  // afterwards, so earlier spend can never absorb a newer reservation.
   const sentToday = dispatchedToday(state, today);
-  const reserveBaseline = sentToday > 0 && Number.isFinite(day.reserveBaseline) ? day.reserveBaseline : measured;
-  const unsettled = Math.max(0, sentToday * cfg.estCost - Math.max(0, measured - reserveBaseline));
+  const previousMeasured = Number.isFinite(day.lastMeasured) ? day.lastMeasured : measured;
+  const reservedCount = Number.isInteger(day.reservedCount) ? day.reservedCount : 0;
+  let unsettled = Number.isFinite(day.unsettled) ? day.unsettled : 0;
+  unsettled = Math.max(0, unsettled - Math.max(0, measured - previousMeasured));
+  unsettled += Math.max(0, sentToday - reservedCount) * cfg.estCost;
   const spentToday = measured + unsettled;
-  const nextState = { ...state, day: { date: today, openingDollars: opening, openingByAccount, lastByAccount, reserveBaseline } };
+  const nextState = {
+    ...state,
+    day: {
+      date: today,
+      openingDollars: opening,
+      openingByAccount,
+      lastByAccount,
+      lastMeasured: measured,
+      reservedCount: Math.max(sentToday, reservedCount),
+      unsettled,
+    },
+  };
   const remaining = Object.values(balances).reduce((sum, value) => sum + value, 0);
   const expires = Date.parse(cfg.expiresAt);
   if (remaining <= 0 || !(now.getTime() < expires)) {
