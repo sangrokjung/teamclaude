@@ -344,6 +344,13 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
   let eligible = 0;
   let failed = 0;
   let excluded = 0;
+  // A genuine name collision between two no-uuid accounts is order-dependent
+  // (whichever one this array happens to list first "wins" the key, and
+  // config.accounts ordering is not guaranteed stable across loads) — never
+  // safe to read as a resolved balance. `complete` is forced false below so
+  // the caller treats it exactly like any other partial read: plan nothing
+  // this tick, and never let an order flip silently rewrite the ledger.
+  let ambiguous = false;
   const perAccount = {};
   const keyedBy = new Map(); // identity key -> the account object already using it
   for (const [index, account] of (accounts ?? []).entries()) {
@@ -355,11 +362,7 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
     const key = accountIdentityKey(account, index);
     const owner = keyedBy.get(key);
     if (owner && owner !== account) {
-      // Two DISTINCT accounts resolve to the same identity key — neither
-      // carries an accountUuid and they share a name (a legacy pair; a real
-      // accountUuid collision is impossible). Merging their balances/freshness
-      // under one ledger entry would be silently wrong either way, so this
-      // account's credit is excluded rather than guessed at.
+      ambiguous = true;
       excluded += 1;
       continue;
     }
@@ -381,12 +384,21 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
       failed += 1;
     }
   }
-  return { total, perAccount, complete: eligible > 0 && failed === 0, failed, excluded };
+  return { total, perAccount, complete: !ambiguous && eligible > 0 && failed === 0, failed, excluded };
 }
 
 // One feeding pass. `deps` supplies every side effect.
 export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   const log = deps.log ?? (() => {});
+  // Collecting work (repo index, issues, PRs, TDL) plus, per candidate, a
+  // `defaultBase` fetch and a snapshot push can together take long enough
+  // that the program's own deadline (cfg.expiresAt) lapses mid-run. The
+  // gate below only checks it once against the frozen `now`; re-checked
+  // again right before each dispatch with a live clock. Defaults to `now`
+  // itself (no additional drift assumed) so callers that inject only `now`
+  // keep their existing behavior; a real caller should pass `() => Date.now()`.
+  const liveNow = deps.liveNow ?? (() => now.getTime());
+  const expiresAt = Date.parse(cfg.expiresAt);
   // A dry run may preview even while the feeder is switched off.
   if (!cfg.enabled && !dryRun) return { state, sent: [], note: 'disabled' };
   const credit = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup, now: now.getTime() });
@@ -449,6 +461,13 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     const base = await deps.defaultBase(cwd, candidate.baseRef ?? null);
     if (!base) {
       nextState = record(nextState, candidate, { exit: 3, reason: 'no-default-branch' }, now);
+      continue;
+    }
+    // The program's deadline can lapse during collection or this candidate's
+    // own `defaultBase` fetch; a live re-check right before the actual
+    // dispatch, not just the once-frozen gate above runFeed's loop.
+    if (Number.isFinite(expiresAt) && !(liveNow() < expiresAt)) {
+      nextState = record(nextState, candidate, { exit: 3, reason: 'expired-before-dispatch' }, now);
       continue;
     }
     // Recorded as uncertain (exit 4) with its id and branch and saved BEFORE

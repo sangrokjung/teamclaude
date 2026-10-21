@@ -189,17 +189,21 @@ test('two accounts sharing a name but carrying distinct accountUuids are never m
   assert.deepEqual(result.perAccount, { 'uuid:uuid-1': 3000, 'uuid:uuid-2': 0 });
 });
 
-test('a legacy pair sharing a name with neither carrying an accountUuid is rejected, not merged', async () => {
+test('a legacy pair sharing a name with neither carrying an accountUuid makes the whole read incomplete, order or not', async () => {
   const valid = Date.now() + 3_600_000;
-  const accounts = [
-    { name: 'legacy', type: 'oauth', accessToken: 'tok-first', expiresAt: valid },
-    { name: 'legacy', type: 'oauth', accessToken: 'tok-second', expiresAt: valid },
-  ];
-  const result = await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 3000 }) });
-  // The first account using the ambiguous key is kept; the second is excluded
-  // rather than silently overwriting the first's budget entry.
-  assert.deepEqual([result.total, result.complete, result.excluded], [3000, true, 1]);
-  assert.deepEqual(result.perAccount, { 'name:legacy': 3000 });
+  const first = { name: 'legacy', type: 'oauth', accessToken: 'tok-first', expiresAt: valid };
+  const second = { name: 'legacy', type: 'oauth', accessToken: 'tok-second', expiresAt: valid };
+  const lookup = async () => ({ remainingDollars: 3000 });
+  // Whichever one the array lists first "wins" the ambiguous key, so the
+  // budget read must never be taken as resolved regardless of array order —
+  // an order flip (config.accounts ordering is not guaranteed stable across
+  // loads) must not silently rewrite the ledger with a different balance.
+  const forward = await totalCredit({ accounts: [first, second], creditLookup: lookup });
+  const reversed = await totalCredit({ accounts: [second, first], creditLookup: lookup });
+  assert.equal(forward.complete, false);
+  assert.equal(reversed.complete, false);
+  assert.equal(forward.excluded, 1);
+  assert.equal(reversed.excluded, 1);
 });
 
 function feedDeps(overrides = {}) {
@@ -237,6 +241,25 @@ test('runFeed dispatches paced, interleaved work from origin/<default> and survi
   // A second run the same day does not resend the same keys.
   const again = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: result.state, dryRun: false, deps });
   assert.ok(again.sent.every(s => !result.state.sent[s.key]));
+});
+
+test('a program deadline that lapses while collecting work stops dispatch before it fires', async () => {
+  // The frozen `now` (NOW) is still one minute before expiresAt, so the
+  // once-only gate at the top of runFeed (planBudget) passes and the run
+  // proceeds into collection — but by the time each candidate reaches the
+  // dispatch step, deps.liveNow() reports the deadline has already passed.
+  const { deps, dispatched } = feedDeps({ liveNow: () => Date.parse('2026-10-21T00:02:00Z') });
+  const result = await runFeed({
+    cfg: { ...cfg, owners: ['o'], expiresAt: '2026-10-21T00:01:00Z' },
+    now: NOW,
+    state: { sent: {} },
+    dryRun: false,
+    deps,
+  });
+  assert.equal(dispatched.length, 0, 'the launcher must never run once the program deadline has passed');
+  const entries = Object.values(result.state.sent);
+  assert.ok(entries.length > 0);
+  assert.ok(entries.every(e => e.exit === 3 && e.reason === 'expired-before-dispatch'));
 });
 
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {

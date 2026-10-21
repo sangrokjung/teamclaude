@@ -413,13 +413,15 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
 // account with credit may exist among the ones never reached).
 export const CLOUD_ACCOUNT_LOOKUP_INCOMPLETE = Object.freeze({ incomplete: true });
 
-// The repo-wide identity rule (same as index.js's private sameAccountIdentity,
-// duplicated here since config.js/index.js are not a dependency of this
-// module): accountUuid when both sides have one, name otherwise. Accounts are
-// NEVER matched by array position or object reference across async steps —
-// a re-login, re-index, or another process's edit can reorder/replace them.
+// Identity for matching a looked-up credential back to its full account
+// record. Stricter than index.js's private config-sync helper of the same
+// name: there, EITHER side lacking a uuid falls back to a name compare,
+// which lets an unrelated legacy (no-uuid) entry sharing a name silently
+// stand in for a uuid-bearing account (and then this check reads the wrong
+// expiresAt). Here, a uuid on EITHER side demands a uuid match on both; name
+// is only ever the tiebreaker when NEITHER side has ever had one.
 export function sameAccountIdentity(a, b) {
-  if (a?.accountUuid && b?.accountUuid) return a.accountUuid === b.accountUuid;
+  if (a?.accountUuid || b?.accountUuid) return Boolean(a?.accountUuid) && a.accountUuid === b?.accountUuid;
   return a?.name === b?.name;
 }
 

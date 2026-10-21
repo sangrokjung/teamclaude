@@ -701,3 +701,26 @@ test('a token that is still fresh by liveNow launches normally', async t => {
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
 });
+
+test('the pre-launch recheck never mistakes a legacy same-name account for the uuid-bearing one actually selected', async t => {
+  const f = await fixture(t);
+  // A legacy entry sharing the chosen account's name but carrying no
+  // accountUuid, and with $0 credit so findCloudAccount can never select IT.
+  // Its expiresAt is deliberately generous so that matching it by name alone
+  // (instead of the real uuid-bearing account) would wrongly pass the
+  // pre-launch freshness recheck.
+  const legacySameName = { name: 'dup', type: 'oauth', accessToken: 'tok-legacy', expiresAt: NOW.getTime() + 3_600_000 };
+  // The account actually selected: funded, but only 6 min of margin at
+  // selection time — expired by the time liveNow (10 min later) is checked.
+  const selected = { name: 'dup', accountUuid: 'uuid-x', type: 'oauth', accessToken: 'tok-dup', expiresAt: NOW.getTime() + 6 * 60_000 };
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [legacySameName, selected],
+    creditLookup: async token => ({ remainingDollars: token === 'tok-dup' ? 100 : 0, lockedReason: null }),
+    launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(launched, false, 'must check the actually-selected uuid-bearing account, not its no-uuid same-name decoy');
+});

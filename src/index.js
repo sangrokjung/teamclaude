@@ -3580,6 +3580,10 @@ async function cloudFeedCommand() {
     }),
     findPull,
     listChecks,
+    // The program's own deadline (cfg.expiresAt) is checked once against the
+    // frozen `now` at the top of runFeed; this lets it re-check with the real
+    // clock right before each candidate's actual dispatch too.
+    liveNow: () => Date.now(),
   };
   const outcome = await withFeederLock(async () => {
     let state = await readFeederState();
