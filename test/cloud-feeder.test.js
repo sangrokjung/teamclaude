@@ -623,3 +623,43 @@ test('spend measured after a first dispatch cannot absorb later reservations', (
   }
   assert.ok(later <= 4, `later ${later}`);
 });
+
+test('a balance drop observed in the same call as a new dispatch settles that dispatch, not a stale reservation', () => {
+  // Last day, $6 left, estCost $3: exactly one dispatch should ever be owed.
+  const opts = { cfg: { ...cfg, perRun: 50, estCost: 3, expiresAt: '2026-10-21T12:00:00Z' } };
+  let state = { sent: {} };
+  let plan = planBudget({ state, perAccount: { a: 6 }, now: new Date('2026-10-21T11:00:00Z'), ...opts });
+  state = plan.state;
+  state.sent.first = { exit: 0, ts: '2026-10-21T11:00:00Z', repo: 'o/a', branch: 'b' };
+  // The real balance already reflects that first dispatch's cost by the next
+  // tick (billing was fast), in the SAME call that first counts it as sent.
+  plan = planBudget({ state, perAccount: { a: 3 }, now: new Date('2026-10-21T11:05:00Z'), ...opts });
+  // The $3 drop paid for the dispatch just counted; nothing should still be
+  // owed on top of it (old settle-then-add order left a phantom $3 reserved
+  // here, double-counting real spend as a second, unpaid reservation).
+  assert.equal(plan.state.ledger.unsettled, 0);
+  assert.equal(plan.spentToday, 3);
+});
+
+test('an account that stops answering for good cannot inflate the target past what is still reachable', () => {
+  const opts = { cfg: { ...cfg, perRun: 50, estCost: 3 } };
+  // Day opens with a well-funded account A and a nearly-empty account B.
+  let state = { sent: {} };
+  let plan = planBudget({ state, perAccount: { a: 3000, b: 3 }, now: NOW, ...opts });
+  state = plan.state;
+  // A is gone for the rest of the day (disabled/expired/locked); B's $3
+  // balance never moves (each real dispatch would actually deplete it, but
+  // this adversarial run freezes it to show the target alone cannot runaway).
+  let sent = 0;
+  for (let tick = 0; tick < 40; tick += 1) {
+    plan = planBudget({ state, perAccount: { b: 3 }, now: new Date(NOW.getTime() + tick * 60_000), ...opts });
+    state = plan.state;
+    for (let i = 0; i < plan.allowed; i += 1) {
+      state.sent[`k${tick}-${i}`] = { exit: 0, ts: new Date(NOW.getTime() + tick * 60_000).toISOString(), repo: 'o/a', branch: 'b' };
+      sent += 1;
+    }
+  }
+  // Bounded by what B could ever realistically cover ($3 / $3), never by the
+  // stale $3000 A contributed once and then vanished.
+  assert.ok(sent <= 1, `sent ${sent}`);
+});

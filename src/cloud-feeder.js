@@ -105,7 +105,12 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   }
   const plain = value => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
 
-  // Ledger: settle existing reservations by real spend, then add new ones.
+  // Ledger: a real balance decrease settles whatever is pending RIGHT NOW —
+  // reservations already outstanding AND the ones this very call is about to
+  // add for dispatches sent since the last call — rather than only the old
+  // ones. Settling old-then-adding-new would let a decrease that actually
+  // paid for a brand-new dispatch sit unclaimed against it and get charged
+  // again as a fresh reservation.
   const ledger = plain(state?.ledger);
   const ledgerLast = { ...plain(ledger.lastByAccount) };
   let ledgerDelta = 0;
@@ -115,8 +120,9 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   }
   const reservedCount = Number.isInteger(ledger.reservedCount) ? ledger.reservedCount : 0;
   const count = sentCount(state);
-  const unsettled = Math.max(0, (Number.isFinite(ledger.unsettled) ? ledger.unsettled : 0) - ledgerDelta)
-    + Math.max(0, count - reservedCount) * cfg.estCost;
+  const newReservations = Math.max(0, count - reservedCount) * cfg.estCost;
+  const pending = (Number.isFinite(ledger.unsettled) ? ledger.unsettled : 0) + newReservations;
+  const unsettled = Math.max(0, pending - ledgerDelta);
 
   // Day: today's opening per account, and spend measured against it.
   const today = dayKey(now);
@@ -143,7 +149,14 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
     return { allowed: 0, target: 0, spentToday, state: nextState };
   }
   const daysLeft = Math.max(1, (expires - now.getTime()) / DAY_MS);
-  const target = opening / daysLeft;
+  // An account that permanently stops answering (disabled/expired/locked for
+  // good, not just one missed observation) keeps its stale opening forever
+  // otherwise, inflating the target against money nothing will ever report
+  // spending. Cap the pacing basis — never the REPORTED day.openingDollars —
+  // to what is still realistically reachable: what currently answers, plus
+  // whatever has already been measured as spent today.
+  const openingForTarget = Math.min(opening, remaining + measured);
+  const target = openingForTarget / daysLeft;
   const owed = target - spentToday;
   const allowed = owed <= 0 ? 0 : Math.min(cfg.perRun, Math.ceil(owed / cfg.estCost));
   return { allowed, target, spentToday, state: nextState };
