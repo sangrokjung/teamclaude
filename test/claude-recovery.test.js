@@ -4608,10 +4608,9 @@ test('switching to an existing session ignores its historical fleet errors', asy
   const dir = join(transcriptRoot, 'project');
   await mkdir(cwd);
   await mkdir(dir, { recursive: true });
-  await writeFile(
-    join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
-    `${fleetExhaustedRecord(cwd, 3)}\n`,
-  );
+  const historical = JSON.parse(fleetExhaustedRecord(cwd, 3));
+  historical.timestamp = new Date(Date.now() - 60_000).toISOString();
+  await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), `${JSON.stringify(historical)}\n`);
   const calls = [];
   const waits = [];
 
@@ -4702,6 +4701,106 @@ test('a live-session file owned by another pid is not followed', async t => {
         await new Promise(resolve => setTimeout(resolve, 30));
         await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), `${fleetExhaustedRecord(cwd, 3)}\n`);
         await new Promise(resolve => setTimeout(resolve, 60));
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});
+
+test('a switch and its fleet error landing before the next poll are still recovered', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-race-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const historical = JSON.parse(fleetExhaustedRecord(cwd, 3));
+  historical.timestamp = new Date(Date.now() - 60_000).toISOString();
+  await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), `${JSON.stringify(historical)}\n`);
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 300,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 4545;
+      calls.push([...args]);
+      if (calls.length === 1) {
+        setTimeout(() => child.finish(0), 5000).unref();
+        setTimeout(async () => {
+          await writeLiveSession(transcriptRoot, 4545, SWITCHED_SESSION_ID);
+          await appendFile(
+            join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
+            `${fleetExhaustedRecord(cwd, 9)}\n`,
+          );
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [9000]);
+  assert.deepEqual(calls[1], ['--resume', SWITCHED_SESSION_ID, 'continue']);
+});
+
+test('an error in the session the user switched away from is not resumed on exit', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-left-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('the abandoned session must not be resumed'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 4646;
+      calls.push([...args]);
+      const launchId = args[args.indexOf('--session-id') + 1];
+      setTimeout(async () => {
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, `${launchId}.jsonl`), `${fleetExhaustedRecord(cwd, 3)}\n`);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        await writeLiveSession(transcriptRoot, 4646, SWITCHED_SESSION_ID);
         child.finish(0);
       }, 10);
       return child;

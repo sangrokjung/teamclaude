@@ -572,6 +572,19 @@ export async function readLiveSessionId(sessionsRoot, pid) {
   return UUID_RE.test(record.sessionId) ? record.sessionId : null;
 }
 
+// Untimed or unparsable records cannot be placed after a session switch, so
+// they are treated as history: a missed resume is safer than a stale one.
+function recordAtOrAfter(line, minMs) {
+  let record;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  const at = typeof record?.timestamp === 'string' ? Date.parse(record.timestamp) : NaN;
+  return Number.isFinite(at) && at >= minMs;
+}
+
 const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 
@@ -594,7 +607,11 @@ async function monitorChild({
   let currentSessionId = sessionId;
   let sessionWasKnownAtLaunch = Boolean(sessionId);
   let pathKnownAbsent = transcriptKnownAbsent;
-  let lastScanAtMs = launchStartedAtMs;
+  // Last moment the child was verifiably still on currentSessionId. A switch
+  // happens after it, so a switched-to transcript's records older than this
+  // are history, and anything at or after it may be this child's failure.
+  let lastConfirmedAtMs = launchStartedAtMs;
+  let minRecordTimeMs = null;
   let currentOffset = offset;
   let currentIdentity = null;
   let pending = Buffer.alloc(0);
@@ -605,12 +622,14 @@ async function monitorChild({
     : 1000;
 
   async function followSessionSwitch() {
-    const scanStartedAtMs = Date.now();
-    const previousScanAtMs = lastScanAtMs;
-    lastScanAtMs = scanStartedAtMs;
     if (!sessionsRoot || !currentSessionId) return;
+    const observedAtMs = Date.now();
     const liveSessionId = await readLiveSessionId(sessionsRoot, child.pid);
-    if (!liveSessionId || liveSessionId === currentSessionId) return;
+    if (!liveSessionId) return;
+    if (liveSessionId === currentSessionId) {
+      lastConfirmedAtMs = observedAtMs;
+      return;
+    }
     currentSessionId = liveSessionId;
     sessionWasKnownAtLaunch = true;
     pending = Buffer.alloc(0);
@@ -618,25 +637,17 @@ async function monitorChild({
     currentIdentity = null;
     // An error left in the previous session no longer blocks this child.
     unresolvedEvent = null;
+    // The switch point cannot be tied to a byte offset (the switched-to
+    // transcript may already have grown by the time this poll sees the
+    // registry change), so read it whole and judge records by timestamp.
+    minRecordTimeMs = lastConfirmedAtMs;
+    currentOffset = 0;
     currentPath = await findTranscript(transcriptRoot, liveSessionId);
-    const info = currentPath ? await stat(currentPath).catch(() => null) : null;
-    if (!info) {
-      // /clear creates the transcript lazily: everything it ever holds is new.
-      currentPath = null;
-      pathKnownAbsent = true;
-      currentOffset = 0;
-      return;
-    }
-    // /resume of an older session: its history is not this child's failure,
-    // unless the file was created since the last poll (a /clear racing us).
-    pathKnownAbsent = false;
-    currentOffset = Number.isFinite(info.birthtimeMs) && info.birthtimeMs >= previousScanAtMs
-      ? 0
-      : info.size;
+    pathKnownAbsent = !currentPath;
   }
 
   async function scanTranscript(final = false) {
-    if (!final) await followSessionSwitch();
+    await followSessionSwitch();
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
@@ -657,7 +668,7 @@ async function monitorChild({
             || (Number.isFinite(discovered?.birthtimeMs)
               && discovered.birthtimeMs >= launchStartedAtMs));
         const priorSize = transcriptSizesBeforeLaunch?.get(currentPath);
-        currentOffset = Number.isFinite(priorSize)
+        currentOffset = minRecordTimeMs !== null ? 0 : Number.isFinite(priorSize)
           ? ((discovered?.size ?? priorSize) < priorSize ? 0 : priorSize)
           : (createdForLaunch ? 0 : (discovered?.size ?? 0));
       }
@@ -684,6 +695,7 @@ async function monitorChild({
     }
 
     const processLine = line => {
+      if (minRecordTimeMs !== null && !recordAtOrAfter(line, minRecordTimeMs)) return;
       const event = classifyTranscriptLine(line);
       if (event) {
         unresolvedEvent = event;
