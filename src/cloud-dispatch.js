@@ -346,8 +346,11 @@ export async function attemptCloudDispatch({
     ).then(r => r.status === 0).catch(() => false);
     // `branchDeleted: false` tells the caller (the credit feeder) this branch
     // needs to go on a durable pending-cleanup list, since nothing else will
-    // ever retry deleting it otherwise.
-    return { ...local(reason), branch: snapshot.branch, branchDeleted: deleted };
+    // ever retry deleting it otherwise. `remoteUrl` is the exact, already
+    // verified destination this was pushed to — a later cleanup retry must
+    // target that same URL directly, not whatever a clone's `origin` alias
+    // happens to resolve to by then (it can be repointed independently).
+    return { ...local(reason), branch: snapshot.branch, branchDeleted: deleted, remoteUrl: repo.remoteUrl };
   };
 
   // Re-verify against the live clock now that the snapshot push has spent

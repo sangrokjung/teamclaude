@@ -424,7 +424,9 @@ async function sweepPendingCleanup(state, repoIndex, deps) {
   const remaining = [];
   for (const item of pending) {
     const cwd = repoIndex.get(item.repo);
-    const deleted = cwd ? await Promise.resolve(deps.deleteRemoteBranch(cwd, item.branch)).catch(() => false) : false;
+    const deleted = cwd
+      ? await Promise.resolve(deps.deleteRemoteBranch(cwd, item.branch, item.remoteUrl)).catch(() => false)
+      : false;
     if (!deleted) remaining.push(item);
   }
   return { ...state, pendingCleanup: remaining };
@@ -442,22 +444,32 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   // keep their existing behavior; a real caller should pass `() => Date.now()`.
   const liveNow = deps.liveNow ?? (() => now.getTime());
   const expiresAt = Date.parse(cfg.expiresAt);
+  // Finishing cleanup an EARLIER tick already started (a branch pushed, then
+  // pre-launch rejected, whose first delete attempt failed) has nothing to do
+  // with whether THIS tick can afford new work: not credit lookup, not
+  // budget/pacing, not even whether the feeder is enabled right now. Gating
+  // it behind any of those left a failed-to-delete branch stuck forever
+  // whenever the feeder was disabled, out of credit, or simply paced — all
+  // ordinary, frequent states. Runs first, unconditionally, except under a
+  // dry run (which must never touch the real remote at all).
+  let nextState = state;
+  if (!dryRun) {
+    const repoIndex = await deps.repoIndex();
+    nextState = await sweepPendingCleanup(nextState, repoIndex, deps);
+  }
   // A dry run may preview even while the feeder is switched off.
-  if (!cfg.enabled && !dryRun) return { state, sent: [], note: 'disabled' };
+  if (!cfg.enabled && !dryRun) return { state: nextState, sent: [], note: 'disabled' };
   const credit = await totalCredit({ accounts: await deps.loadAccounts(), creditLookup: deps.creditLookup, now: now.getTime() });
   // Nothing is planned on a partial balance; the next tick tries again.
-  if (!credit.complete) return { state, sent: [], note: credit.failed > 0 ? 'credit-incomplete' : 'no-credit-info' };
+  if (!credit.complete) return { state: nextState, sent: [], note: credit.failed > 0 ? 'credit-incomplete' : 'no-credit-info' };
   const remaining = credit.total;
-  const budget = planBudget({ state, perAccount: credit.perAccount, now, cfg });
+  const budget = planBudget({ state: nextState, perAccount: credit.perAccount, now, cfg });
   const limit = Math.min(budget.allowed, Number.isInteger(max) && max >= 0 ? max : Infinity);
   log(`[cloud-feed] remaining $${remaining.toFixed(2)}, today target $${budget.target.toFixed(2)}, spent $${budget.spentToday.toFixed(2)}, allowed ${limit}`);
-  let nextState = budget.state;
+  nextState = budget.state;
   if (limit <= 0) return { state: nextState, sent: [], note: 'paced' };
 
   const repoIndex = await deps.repoIndex();
-  // A dry run previews candidates only — it must never delete a real remote
-  // branch, so the sweep (like dispatch itself) is skipped entirely under it.
-  if (!dryRun) nextState = await sweepPendingCleanup(nextState, repoIndex, deps);
   const owners = new Set(cfg.owners.map(owner => owner.toLowerCase()));
   const own = candidate => owners.has(candidate.repo.split('/')[0]);
   const failedSources = [];
@@ -550,7 +562,7 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     if (outcome.branch && outcome.branchDeleted === false) {
       const pending = Array.isArray(nextState.pendingCleanup) ? nextState.pendingCleanup : [];
       if (!pending.some(item => item.branch === outcome.branch)) {
-        nextState = { ...nextState, pendingCleanup: [...pending, { repo: candidate.repo, branch: outcome.branch, ts: now.toISOString() }] };
+        nextState = { ...nextState, pendingCleanup: [...pending, { repo: candidate.repo, branch: outcome.branch, remoteUrl: outcome.remoteUrl, ts: now.toISOString() }] };
       }
     }
     nextState = record(nextState, candidate, outcome, now);

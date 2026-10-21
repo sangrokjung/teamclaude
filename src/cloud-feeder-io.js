@@ -47,6 +47,17 @@ export async function readFeederState(path = feederStatePath()) {
       && (entry.exit !== 0 || (nonEmpty(entry.branch) && (entry.merge == null || nonEmpty(entry.merge))));
     if (!ok) throw new Error('corrupt feeder state entry');
   }
+  // Optional, but if present it must be trustworthy too: a malformed entry
+  // here would silently drop a branch's cleanup obligation (treated as an
+  // empty list downstream) rather than fail closed like `sent` above.
+  if (state.pendingCleanup !== undefined) {
+    if (!Array.isArray(state.pendingCleanup)) throw new Error('corrupt feeder state');
+    for (const entry of state.pendingCleanup) {
+      if (!(plain(entry) && nonEmpty(entry.repo) && nonEmpty(entry.branch) && Number.isFinite(Date.parse(entry.ts)))) {
+        throw new Error('corrupt feeder state entry');
+      }
+    }
+  }
   return state;
 }
 
@@ -260,8 +271,13 @@ export function defaultBase(cwd, wanted = null) {
 // rejection pushed but no cloud session ever used). `true` only on a
 // confirmed delete; any failure (network, permissions, already gone) is
 // `false` so the caller can keep it on a pending-cleanup list and retry.
-export function deleteRemoteBranch(cwd, branch) {
-  return run('git', ['-C', cwd, 'push', '--quiet', 'origin', `:refs/heads/${branch}`], { timeout: 30_000 }).status === 0;
+// `remoteUrl`, when given, is the exact URL the branch was originally pushed
+// to (from the dispatch outcome) — targeted directly rather than through the
+// clone's `origin` alias, which can be repointed independently between the
+// push and a later cleanup retry. Falls back to `origin` only for state
+// written before `remoteUrl` was tracked.
+export function deleteRemoteBranch(cwd, branch, remoteUrl = 'origin') {
+  return run('git', ['-C', cwd, 'push', '--quiet', '--', remoteUrl, `:refs/heads/${branch}`], { timeout: 30_000 }).status === 0;
 }
 
 // The PR opened from exactly this branch of this repository (never a fork's

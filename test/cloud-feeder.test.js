@@ -264,32 +264,72 @@ test('a program deadline that lapses while collecting work stops dispatch before
 });
 
 test('a branch whose inline delete failed goes on a durable cleanup list, separate from the per-task record', async () => {
+  const deleteCalls = [];
   const { deps } = feedDeps({
-    dispatch: async () => ({ ok: false, exit: 3, reason: 'token-expired-before-launch', branch: 'teamclaude-handoff/x', branchDeleted: false }),
+    dispatch: async () => ({
+      ok: false, exit: 3, reason: 'token-expired-before-launch',
+      branch: 'teamclaude-handoff/x', branchDeleted: false, remoteUrl: 'https://github.com/o/a.git',
+    }),
+    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ cwd, branch, remoteUrl }); return false; },
   });
   const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: false, deps });
-  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/a', branch: 'teamclaude-handoff/x', ts: NOW.toISOString() }]);
+  assert.deepEqual(result.state.pendingCleanup, [
+    { repo: 'o/a', branch: 'teamclaude-handoff/x', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() },
+  ]);
   // The per-task record only keeps the latest outcome for that key — this is
   // exactly the forgetting that makes the separate durable list necessary.
   assert.ok(Object.values(result.state.sent).some(e => e.branch === 'teamclaude-handoff/x'));
+  // Nothing was pending BEFORE this tick, so the sweep had nothing to do —
+  // the failed delete above was cloud-dispatch's own inline attempt (stubbed
+  // here via `dispatch`), not something runFeed's sweep should have touched.
+  assert.deepEqual(deleteCalls, []);
 });
 
-test('a pending cleanup entry is swept and retried every tick: removed once deleted, kept while it keeps failing', async () => {
+test('a pending cleanup entry is swept and retried every tick: removed once deleted, kept while it keeps failing, by the exact remote it was pushed to', async () => {
   const deleteCalls = [];
-  const state = { sent: {}, pendingCleanup: [{ repo: 'o/a', branch: 'stale-1', ts: NOW.toISOString() }, { repo: 'o/b', branch: 'stale-2', ts: NOW.toISOString() }] };
+  const state = {
+    sent: {},
+    pendingCleanup: [
+      { repo: 'o/a', branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() },
+      { repo: 'o/b', branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git', ts: NOW.toISOString() },
+    ],
+  };
   // Dry runs must never touch the remote at all.
   {
-    const { deps } = feedDeps({ deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return true; } });
+    const { deps } = feedDeps({ deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ branch, remoteUrl }); return true; } });
     await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, max: 0, dryRun: true, deps });
     assert.deepEqual(deleteCalls, []);
   }
   // o/a's stale-1 deletes successfully; o/b's stale-2 keeps failing.
   const { deps } = feedDeps({
-    deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return branch === 'stale-1'; },
+    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ branch, remoteUrl }); return branch === 'stale-1'; },
   });
   const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
-  assert.deepEqual(deleteCalls, ['stale-1', 'stale-2']);
-  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/b', branch: 'stale-2', ts: NOW.toISOString() }]);
+  assert.deepEqual(deleteCalls, [
+    { branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git' },
+    { branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git' },
+  ]);
+  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/b', branch: 'stale-2', remoteUrl: 'https://github.com/o/b.git', ts: NOW.toISOString() }]);
+});
+
+test('pending cleanup is retried even when the feeder is disabled, out of credit, or simply paced', async () => {
+  const pendingCleanup = [{ repo: 'o/a', branch: 'stale-1', remoteUrl: 'https://github.com/o/a.git', ts: NOW.toISOString() }];
+  const cases = [
+    { label: 'disabled', cfgOverrides: { enabled: false }, depsOverrides: {} },
+    { label: 'no credit info', cfgOverrides: {}, depsOverrides: { loadAccounts: async () => [] } },
+    { label: 'fully paced', cfgOverrides: { perRun: 0 }, depsOverrides: {} },
+  ];
+  for (const { label, cfgOverrides, depsOverrides } of cases) {
+    const deleteCalls = [];
+    const { deps } = feedDeps({
+      deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return true; },
+      ...depsOverrides,
+    });
+    const state = { sent: {}, pendingCleanup: [...pendingCleanup] };
+    const result = await runFeed({ cfg: { ...cfg, owners: ['o'], ...cfgOverrides }, now: NOW, state, dryRun: false, deps });
+    assert.deepEqual(deleteCalls, ['stale-1'], `${label}: cleanup must still run`);
+    assert.deepEqual(result.state.pendingCleanup, [], `${label}: a successful cleanup must still be recorded`);
+  }
 });
 
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {

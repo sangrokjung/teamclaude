@@ -60,6 +60,10 @@ test('state: missing is a fresh start, any corruption is an error, writes round-
     '{"sent": {"k": null}}',
     '{"sent": {"k": {"exit": 0, "ts": "2026-10-21T00:00:00Z", "repo": "o/a"}}}',
     '{"sent": {"k": {"exit": 3, "ts": "2026-10-21T00:00:00Z"}}}',
+    '{"sent": {}, "pendingCleanup": {}}',
+    '{"sent": {}, "pendingCleanup": [{"branch": "x", "ts": "2026-10-21T00:00:00Z"}]}',
+    '{"sent": {}, "pendingCleanup": [{"repo": "o/a", "ts": "2026-10-21T00:00:00Z"}]}',
+    '{"sent": {}, "pendingCleanup": [{"repo": "o/a", "branch": "x", "ts": "not-a-date"}]}',
   ]) {
     await writeFile(path, corrupt);
     await assert.rejects(readFeederState(path), corrupt);
@@ -67,7 +71,9 @@ test('state: missing is a fresh start, any corruption is an error, writes round-
   const good = { sent: {
     a: { exit: 0, ts: '2026-10-21T00:00:00Z', repo: 'o/a', branch: 'teamclaude-handoff/x', merge: 'pending' },
     b: { exit: 3, ts: '2026-10-21T00:00:00Z', repo: 'o/a', reason: 'no-credit-account' },
-  } };
+  },
+  // remoteUrl is optional (older state written before it was tracked).
+  pendingCleanup: [{ repo: 'o/a', branch: 'stale-1', ts: '2026-10-21T00:00:00Z' }] };
   await writeFeederState(good, path);
   assert.deepEqual(await readFeederState(path), good);
 });
