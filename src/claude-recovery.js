@@ -572,17 +572,20 @@ export async function readLiveSessionId(sessionsRoot, pid) {
   return UUID_RE.test(record.sessionId) ? record.sessionId : null;
 }
 
-// Untimed or unparsable records cannot be placed after a session switch, so
-// they are treated as history: a missed resume is safer than a stale one.
+// Only gates a NEW error candidate against the switch boundary (never the
+// resolution check below, which must keep clearing a pending error even when
+// the resolving record itself has no timestamp — real conversation records
+// often don't). An untimed or unparsable record cannot be proven older than
+// the boundary, so it is treated as live rather than silently dropped.
 function recordAtOrAfter(line, minMs) {
   let record;
   try {
     record = JSON.parse(line);
   } catch {
-    return false;
+    return true;
   }
   const at = typeof record?.timestamp === 'string' ? Date.parse(record.timestamp) : NaN;
-  return Number.isFinite(at) && at >= minMs;
+  return !Number.isFinite(at) || at >= minMs;
 }
 
 const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
@@ -612,6 +615,16 @@ async function monitorChild({
   // are history, and anything at or after it may be this child's failure.
   let lastConfirmedAtMs = launchStartedAtMs;
   let minRecordTimeMs = null;
+  // A session this child has already left is tracked by its own cursor, so
+  // returning to it (another /resume) continues exactly where this child
+  // stopped reading instead of either replaying its own prior errors or
+  // silently losing ones written while this child was away on another
+  // session.
+  const sessionCursors = new Map();
+  // Becomes true the first time the registry is read successfully. Losing
+  // it afterwards (e.g. removed as the child exits) means a pending error
+  // can no longer be attributed to the session the registry last confirmed.
+  let registryConfirmedEver = false;
   let currentOffset = offset;
   let currentIdentity = null;
   let pending = Buffer.alloc(0);
@@ -625,11 +638,26 @@ async function monitorChild({
     if (!sessionsRoot || !currentSessionId) return;
     const observedAtMs = Date.now();
     const liveSessionId = await readLiveSessionId(sessionsRoot, child.pid);
-    if (!liveSessionId) return;
+    if (!liveSessionId) {
+      // The registry previously proved which session the child was on; now
+      // it can't. An event attributed under that proof is no longer safe to
+      // act on (the child may have switched away in the same gap we lost
+      // the registry, most visibly right as it exits).
+      if (registryConfirmedEver) unresolvedEvent = null;
+      return;
+    }
+    registryConfirmedEver = true;
     if (liveSessionId === currentSessionId) {
       lastConfirmedAtMs = observedAtMs;
       return;
     }
+    // Remember exactly where this child stopped reading its old session, so
+    // a later return to it (another /resume) continues from there instead
+    // of re-scanning (and re-triggering on) history already seen, or always
+    // restarting from empty and losing anything written while away.
+    sessionCursors.set(currentSessionId, { offset: currentOffset, identity: currentIdentity });
+    const departureAtMs = lastConfirmedAtMs;
+    lastConfirmedAtMs = observedAtMs;
     currentSessionId = liveSessionId;
     sessionWasKnownAtLaunch = true;
     pending = Buffer.alloc(0);
@@ -637,13 +665,24 @@ async function monitorChild({
     currentIdentity = null;
     // An error left in the previous session no longer blocks this child.
     unresolvedEvent = null;
-    // The switch point cannot be tied to a byte offset (the switched-to
-    // transcript may already have grown by the time this poll sees the
-    // registry change), so read it whole and judge records by timestamp.
-    minRecordTimeMs = lastConfirmedAtMs;
-    currentOffset = 0;
+    const revisited = sessionCursors.get(liveSessionId);
     currentPath = await findTranscript(transcriptRoot, liveSessionId);
     pathKnownAbsent = !currentPath;
+    if (revisited) {
+      // Seen before: resume exactly where this child left it. No replay of
+      // its own prior errors, no gap for ones written while away.
+      currentOffset = revisited.offset;
+      currentIdentity = revisited.identity;
+      minRecordTimeMs = null;
+      return;
+    }
+    // Never seen before: the switch point cannot be tied to a byte offset
+    // (the switched-to transcript may already have grown by the time this
+    // poll sees the registry change), so read it whole and judge new error
+    // candidates by timestamp against the moment this child was last
+    // confirmed on the session it just left.
+    minRecordTimeMs = departureAtMs;
+    currentOffset = 0;
   }
 
   async function scanTranscript(final = false) {
@@ -695,9 +734,13 @@ async function monitorChild({
     }
 
     const processLine = line => {
-      if (minRecordTimeMs !== null && !recordAtOrAfter(line, minRecordTimeMs)) return;
       const event = classifyTranscriptLine(line);
       if (event) {
+        // Only a new error candidate is gated against the switch boundary.
+        // Resolution below is never gated: a conversation record clearing a
+        // pending error must still count even when (as is common) it carries
+        // no timestamp of its own.
+        if (minRecordTimeMs !== null && !recordAtOrAfter(line, minRecordTimeMs)) return;
         unresolvedEvent = event;
         return;
       }
