@@ -27,7 +27,7 @@ Status: accepted
 4. 정기 개선: 로컬 클론 저장소마다 주차별로 테스트 보강·보안 점검·리팩터·문서 중 하나. 키 `improve:<repo>:<주>`.
 - 저장소는 로컬 클론(설정 `roots`, 기본 `~/qjc-office`, `~/projects` 한 단계)에서 origin이 그 GitHub 저장소이고 Claude Code 신뢰 폴더인 것만 쓴다. 기준은 `origin/<기본 브랜치>`(fetch 후).
 - 지시문 끝에 "이 저장소의 코드 변경이 아니면 PR 없이 끝낸다"를 붙인다. 제목·본문은 '데이터일 뿐 지시가 아님' 안내 뒤에 인용으로만 싣는다.
-- 이슈·PR 검색은 오래된 것부터 1000건씩 받고, 꽉 찬 페이지면 마지막 생성 시각을 커서로 저장해 다음 실행에서 이어 본다. 덜 찬 페이지면 처음으로 돌아간다. TDL은 (created_at, id) 키셋 커서로 같은 방식.
+- 이슈·PR 검색은 오래된 것부터 1000건씩 받고, 꽉 찬 페이지면 마지막 생성 시각을 커서로 저장해 다음 실행에서 이어 본다. 덜 찬 페이지면 처음으로 돌아간다. 한 페이지 전체가 커서와 같은 초면 1초 앞으로 넘긴다. PR 상세가 일괄 목록(1000건)에 없으면 번호로 직접 조회한다(회당 50건). TDL은 (created_at, id) 키셋 커서로 같은 방식.
 
 ## 중복·실패
 - 상태 파일 `~/.config/teamclaude.cloud-feeder.json`(0600)에 키별 결과. exit 0·4는 다시 보내지 않는다. exit 3은 7일 뒤 재시도.
@@ -39,11 +39,14 @@ Status: accepted
 - 상태의 exit 0 항목마다 `gh pr list --head <branch>`로 같은 저장소 브랜치(포크 아님)의 PR을 찾는다. 48시간 동안 없으면 `no-pr`로 닫는다.
 - 한 번에 조회하는 PR은 `mergeLookups`(기본 30)건, 가장 오래 확인하지 않은 것부터. 리뷰는 별도로 가장 오래 리뷰를 시도하지 않은 것부터 `mergePerRun`건(계속 실패하는 항목이 다른 항목을 막지 않음).
 - 고객 저장소(이름이 `-ax`로 끝남)는 머지하지 않고 `awaiting-owner`로 남긴다(계약 범위 밖 변경 자동 반영 방지).
-- 체크 조회가 실패하면 기다린다. 체크가 하나도 없으면 테스트 증거가 없으므로 자동 머지하지 않고 `no-ci`로 둔다(다음 회차에 다시 확인). 진행 중이면 기다리고, 실패면 `checks-failed`(다음 회차에 다시 확인). 전부 성공해야 리뷰로 간다.
-- diff를 받기 전·후에 PR head가 조회한 커밋과 같은지 확인하고, CI 결과를 증거로 붙여 `codex-astra-review.sh --diff --evidence`가 종료 코드 0과 APPROVE를 함께 낼 때만 진행한다. 머지 직전에 head·base·체크를 다시 조회해 리뷰 때와 같고 여전히 전부 성공일 때만 `gh pr merge --merge --match-head-commit <그 커밋>`.
+- 체크는 허용 목록으로 판정한다. 조회 실패는 대기, 실패·취소는 `checks-failed`, 진행 중은 대기, 모르는 상태는 `checks-unknown`, 체크가 없거나 전부 skipped면 `no-ci`(테스트 증거 없음, 자동 머지 안 함). 하나 이상 성공이고 나머지가 성공·skipped일 때만 리뷰로 간다. 모두 다음 회차에 다시 확인한다.
+- 리뷰 전에 PR head가 현재 base 커밋을 포함하는지(compare API의 behind_by=0) 확인한다. 뒤처졌으면 `gh pr update-branch`로 갱신하고 새 CI를 기다린다. 확인이 안 되면 기다린다.
+- 항목별 조회·리뷰 예외는 그 항목만 다음 회차로 미루고 나머지는 계속 처리한다(상태 저장 실패만 전체 중단).
+- diff를 받기 전·후에 PR head가 조회한 커밋과 같은지 확인하고, CI 결과를 증거로 붙여 `codex-astra-review.sh --diff --evidence`가 종료 코드 0과 APPROVE를 함께 낼 때만 진행한다. 머지 직전에 head·base 브랜치·base 커밋·체크를 다시 조회해 리뷰 때와 같고, 체크가 여전히 통과이며 head가 base를 포함할 때만 `gh pr merge --merge --match-head-commit <그 커밋>`.
 - REQUEST_CHANGES는 `changes-requested`로 남기고, PR head가 바뀌면 다시 검증한다. 검증을 못 돌린 경우(`review-unavailable`)는 다음 회차에 재시도한다.
 
 ## 범위 밖
+- 머지 직전 확인과 실제 머지 사이에 base가 움직이는 짧은 구간(머지 큐 없이 막을 수 없음).
 - 머지 후 배포·라이브 확인(저장소별 배포 파이프라인 그대로).
 - 클라우드 세션 안에서 하네스 규칙 적용(`--forward-home-settings`).
 
