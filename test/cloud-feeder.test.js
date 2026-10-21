@@ -511,3 +511,31 @@ test('a merge dry run never updates a branch, even when disabled', async () => {
   assert.equal(updates, 0);
   assert.deepEqual(result.results.map(r => r.decision), ['would-update-branch']);
 });
+
+test('the in-flight record already names the branch, so a crash after sending is still followed', async () => {
+  const saved = [];
+  const { deps } = feedDeps({
+    newId: () => '0a1b2c3d-1111-4222-8333-444455556666',
+    saveState: async state => { saved.push(JSON.parse(JSON.stringify(state))); },
+    dispatch: async request => {
+      assert.equal(request.dispatchId, '0a1b2c3d-1111-4222-8333-444455556666');
+      throw new Error('died after the cloud session was created');
+    },
+  });
+  await runFeed({ cfg: { ...cfg, owners: ['o'], perRun: 1 }, now: NOW, state: { sent: {} }, dryRun: false, deps });
+  const inflight = saved[0].sent['issue:o/a#1'];
+  assert.equal(inflight.exit, 4);
+  assert.match(inflight.branch, /^teamclaude-handoff\/0a1b2c3d-/);
+  assert.equal(saved.at(-1).sent['issue:o/a#1'].branch, inflight.branch);
+});
+
+test('repositories of other owners are never listed', async () => {
+  const asked = [];
+  const { deps } = feedDeps({
+    repoIndex: async () => new Map([['o/a', '/c/a'], ['stranger/x', '/c/x']]),
+    listIssues: async repos => { asked.push(repos); return []; },
+    listPulls: async repos => { asked.push(repos); return []; },
+  });
+  await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: true, deps });
+  assert.deepEqual(asked, [['o/a'], ['o/a']]);
+});
