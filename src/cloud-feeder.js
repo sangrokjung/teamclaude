@@ -412,6 +412,24 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
   };
 }
 
+// Retries deleting every branch a past pre-launch rejection couldn't clean up
+// itself (cloud-dispatch.js's `abortAfterPush` already tries once, inline,
+// before ever reporting back here). A durable list separate from `sent`'s
+// one-entry-per-task-key record: `sent` is keyed by task and overwritten on
+// every retry of that task, so a branch from a failed delete would be lost
+// the moment the SAME task dispatches again — this list survives that.
+async function sweepPendingCleanup(state, repoIndex, deps) {
+  const pending = Array.isArray(state?.pendingCleanup) ? state.pendingCleanup : [];
+  if (pending.length === 0) return state;
+  const remaining = [];
+  for (const item of pending) {
+    const cwd = repoIndex.get(item.repo);
+    const deleted = cwd ? await Promise.resolve(deps.deleteRemoteBranch(cwd, item.branch)).catch(() => false) : false;
+    if (!deleted) remaining.push(item);
+  }
+  return { ...state, pendingCleanup: remaining };
+}
+
 // One feeding pass. `deps` supplies every side effect.
 export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   const log = deps.log ?? (() => {});
@@ -437,6 +455,9 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   if (limit <= 0) return { state: nextState, sent: [], note: 'paced' };
 
   const repoIndex = await deps.repoIndex();
+  // A dry run previews candidates only — it must never delete a real remote
+  // branch, so the sweep (like dispatch itself) is skipped entirely under it.
+  if (!dryRun) nextState = await sweepPendingCleanup(nextState, repoIndex, deps);
   const owners = new Set(cfg.owners.map(owner => owner.toLowerCase()));
   const own = candidate => owners.has(candidate.repo.split('/')[0]);
   const failedSources = [];
@@ -522,6 +543,16 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     }
     // A refusal before anything was pushed keeps no branch to follow.
     if (outcome.exit === 4 && !outcome.branch) outcome = { ...outcome, branch };
+    // A pre-launch rejection's own inline delete attempt (cloud-dispatch.js)
+    // can itself fail; `record` below only keeps this task's LATEST outcome,
+    // so a branch that failed to delete here must go on the durable list
+    // or it is lost the instant this same task is retried.
+    if (outcome.branch && outcome.branchDeleted === false) {
+      const pending = Array.isArray(nextState.pendingCleanup) ? nextState.pendingCleanup : [];
+      if (!pending.some(item => item.branch === outcome.branch)) {
+        nextState = { ...nextState, pendingCleanup: [...pending, { repo: candidate.repo, branch: outcome.branch, ts: now.toISOString() }] };
+      }
+    }
     nextState = record(nextState, candidate, outcome, now);
     await deps.saveState(nextState);
     sent.push({ key: candidate.key, exit: outcome.exit, reason: outcome.reason, url: outcome.url });

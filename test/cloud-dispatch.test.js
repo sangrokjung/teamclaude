@@ -777,4 +777,21 @@ test('a pre-launch rejection after the snapshot was pushed cleans up the branch 
   assert.ok(deletePush, 'must attempt to delete the branch it just pushed');
   // The delete actually took effect on the remote, not merely attempted.
   assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  assert.equal(outcome.branchDeleted, true, 'a confirmed delete must be reported, not just attempted');
+});
+
+test('a branch delete that fails is reported as such, so the caller knows to keep tracking it', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: NOW.getTime() + 6 * 60_000 }],
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+    runGit: async (args, options) => {
+      if (args[0] === 'push' && args.some(a => a.startsWith(':refs/heads/'))) return { status: 1, stdout: '', stderr: 'denied' };
+      return defaultRunGit(args, options);
+    },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW));
+  assert.equal(outcome.branchDeleted, false);
 });

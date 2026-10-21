@@ -256,6 +256,14 @@ export function defaultBase(cwd, wanted = null) {
   return null;
 }
 
+// Best-effort cleanup of an orphaned handoff branch (one a pre-launch
+// rejection pushed but no cloud session ever used). `true` only on a
+// confirmed delete; any failure (network, permissions, already gone) is
+// `false` so the caller can keep it on a pending-cleanup list and retry.
+export function deleteRemoteBranch(cwd, branch) {
+  return run('git', ['-C', cwd, 'push', '--quiet', 'origin', `:refs/heads/${branch}`], { timeout: 30_000 }).status === 0;
+}
+
 // The PR opened from exactly this branch of this repository (never a fork's
 // branch that happens to share the name).
 export function findPull(repo, branch) {

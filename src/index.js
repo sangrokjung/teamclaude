@@ -46,6 +46,7 @@ import { feedConfig, runFeed, runTriage, summarize } from './cloud-feeder.js';
 import {
   buildRepoIndex,
   defaultBase,
+  deleteRemoteBranch,
   findPull,
   listChecks,
   listIssues,
@@ -3581,6 +3582,7 @@ async function cloudFeedCommand() {
     }),
     findPull,
     listChecks,
+    deleteRemoteBranch,
     // The program's own deadline (cfg.expiresAt) is checked once against the
     // frozen `now` at the top of runFeed; this lets it re-check with the real
     // clock right before each candidate's actual dispatch too.

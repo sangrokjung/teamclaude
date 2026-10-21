@@ -340,11 +340,14 @@ export async function attemptCloudDispatch({
   // push fails too, instead of an untracked branch silently accumulating on
   // every retry.
   const abortAfterPush = async reason => {
-    await runGit(
+    const deleted = await runGit(
       ['push', '--quiet', '--', repo.remoteUrl, `:refs/heads/${snapshot.branch}`],
       { cwd: repo.root, env: gitEnv, timeoutMs: 30_000 },
-    ).catch(() => {});
-    return { ...local(reason), branch: snapshot.branch };
+    ).then(r => r.status === 0).catch(() => false);
+    // `branchDeleted: false` tells the caller (the credit feeder) this branch
+    // needs to go on a durable pending-cleanup list, since nothing else will
+    // ever retry deleting it otherwise.
+    return { ...local(reason), branch: snapshot.branch, branchDeleted: deleted };
   };
 
   // Re-verify against the live clock now that the snapshot push has spent

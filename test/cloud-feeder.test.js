@@ -223,6 +223,7 @@ function feedDeps(overrides = {}) {
         return { ok: true, exit: 0, branch: `teamclaude-handoff/${dispatched.length}`, url: 'u' };
       },
       saveState: async () => {},
+      deleteRemoteBranch: () => true,
       ...overrides,
     },
   };
@@ -260,6 +261,35 @@ test('a program deadline that lapses while collecting work stops dispatch before
   const entries = Object.values(result.state.sent);
   assert.ok(entries.length > 0);
   assert.ok(entries.every(e => e.exit === 3 && e.reason === 'expired-before-dispatch'));
+});
+
+test('a branch whose inline delete failed goes on a durable cleanup list, separate from the per-task record', async () => {
+  const { deps } = feedDeps({
+    dispatch: async () => ({ ok: false, exit: 3, reason: 'token-expired-before-launch', branch: 'teamclaude-handoff/x', branchDeleted: false }),
+  });
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: false, deps });
+  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/a', branch: 'teamclaude-handoff/x', ts: NOW.toISOString() }]);
+  // The per-task record only keeps the latest outcome for that key — this is
+  // exactly the forgetting that makes the separate durable list necessary.
+  assert.ok(Object.values(result.state.sent).some(e => e.branch === 'teamclaude-handoff/x'));
+});
+
+test('a pending cleanup entry is swept and retried every tick: removed once deleted, kept while it keeps failing', async () => {
+  const deleteCalls = [];
+  const state = { sent: {}, pendingCleanup: [{ repo: 'o/a', branch: 'stale-1', ts: NOW.toISOString() }, { repo: 'o/b', branch: 'stale-2', ts: NOW.toISOString() }] };
+  // Dry runs must never touch the remote at all.
+  {
+    const { deps } = feedDeps({ deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return true; } });
+    await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, max: 0, dryRun: true, deps });
+    assert.deepEqual(deleteCalls, []);
+  }
+  // o/a's stale-1 deletes successfully; o/b's stale-2 keeps failing.
+  const { deps } = feedDeps({
+    deleteRemoteBranch: (cwd, branch) => { deleteCalls.push(branch); return branch === 'stale-1'; },
+  });
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
+  assert.deepEqual(deleteCalls, ['stale-1', 'stale-2']);
+  assert.deepEqual(result.state.pendingCleanup, [{ repo: 'o/b', branch: 'stale-2', ts: NOW.toISOString() }]);
 });
 
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {
