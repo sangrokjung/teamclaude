@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
@@ -57,4 +57,29 @@ test('lock: an OS lock, held by one run at a time and freed when the holder dies
   holder.kill('SIGKILL');
   await new Promise(resolve => holder.once('exit', resolve));
   assert.deepEqual(await withFeederLock(async () => 'ran', lock), { locked: false, value: 'ran' });
+});
+
+test('REST listing reads page by page, reports truncated or failing repos, keeps the rest', { skip: process.platform === 'win32' }, async t => {
+  const dir = await scratch(t);
+  // A fake `gh`: o/full always returns full pages (never ends), o/broken
+  // fails, o/small returns one short page of one PR.
+  const fake = join(dir, 'gh');
+  await writeFile(fake, `#!/bin/sh
+case "$2" in
+  repos/o/full/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'a'.repeat(40)}",repo:{full_name:"o/full"}}}))))' ;;
+  repos/o/broken/*) echo 'boom' >&2; exit 1 ;;
+  repos/o/small/*) echo '[{"number":7,"title":"t","draft":false,"user":{"login":"me"},"author_association":"OWNER","head":{"ref":"b","sha":"${'b'.repeat(40)}","repo":{"full_name":"o/small"}}}]' ;;
+esac
+`);
+  await chmod(fake, 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${previous}`;
+  t.after(() => { process.env.PATH = previous; });
+  const { listPulls } = await import('../src/cloud-feeder-io.js');
+  const logs = [];
+  const result = listPulls(['o/full', 'o/broken', 'o/small'], line => logs.push(line));
+  assert.deepEqual(result.incomplete, ['o/full', 'o/broken']);
+  assert.equal(result.items.filter(p => p.repository.nameWithOwner === 'o/full').length, 3000);
+  assert.deepEqual(result.items.filter(p => p.repository.nameWithOwner === 'o/small').map(p => p.number), [7]);
+  assert.ok(logs.some(line => /o\/full truncated/.test(line)) && logs.some(line => /o\/broken failed/.test(line)));
 });

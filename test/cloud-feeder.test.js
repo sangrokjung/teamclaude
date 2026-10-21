@@ -94,7 +94,7 @@ test('candidate builders: issues, tasks, reviews, weekly improvements', () => {
   assert.deepEqual(tasks.map(t => [t.key, t.repo]), [['tdl:t1', 'qjc-office/app'], ['tdl:t2', 'qjc-office/web']]);
 
   const reviews = reviewCandidates([
-    { repository: { nameWithOwner: 'o/r' }, number: 3, title: 'feat', isDraft: false, headRefName: 'feat/x', headRefOid: 'abcdef1234567890', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false },
+    { repository: { nameWithOwner: 'o/r' }, number: 3, title: 'feat', isDraft: false, headRefName: 'feat/x', headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false },
     { repository: { nameWithOwner: 'o/r' }, number: 4, title: 'cloud', isDraft: false, headRefName: 'teamclaude-handoff/1', headRefOid: 'x', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false },
     { repository: { nameWithOwner: 'o/r' }, number: 5, title: 'deps', isDraft: false, headRefName: 'dep', headRefOid: 'y', author: { login: 'dependabot[bot]' }, authorAssociation: 'NONE', isCrossRepository: false },
     { repository: { nameWithOwner: 'o/r' }, number: 6, title: 'wip', isDraft: true, headRefName: 'w', headRefOid: 'z', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false },
@@ -102,7 +102,7 @@ test('candidate builders: issues, tasks, reviews, weekly improvements', () => {
     { repository: { nameWithOwner: 'o/r' }, number: 8, title: 'outsider', isDraft: false, headRefName: 'p', headRefOid: 'g', author: { login: 'y' }, authorAssociation: 'CONTRIBUTOR', isCrossRepository: false },
     { repository: { nameWithOwner: 'o/r' }, number: 9, title: 'odd', isDraft: false, headRefName: 'a`b', headRefOid: 'h', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false },
   ]);
-  assert.deepEqual(reviews.map(r => r.key), ['review:o/r#3@abcdef123456']);
+  assert.deepEqual(reviews.map(r => r.key), ['review:o/r#3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
 
   const improve = improvementCandidates(['o/a', 'o/b'], NOW);
   assert.equal(improve[0].key, `improve:o/a:${isoWeek(NOW)}`);
@@ -270,7 +270,7 @@ test('one entry whose lookup throws does not stop the others', async () => {
   assert.deepEqual(looked.sort(), ['bad', 'good']);
   assert.equal(result.state.sent.good.merge, 'merged');
   assert.ok(result.state.sent.bad.checkedAt);
-  assert.equal(result.state.sent.bad.merge, 'pending');
+  assert.equal(result.state.sent.bad.merge, 'lookup-failed');
 });
 
 test('issues and PRs are listed for exactly the dispatchable repositories', async () => {
@@ -283,19 +283,19 @@ test('issues and PRs are listed for exactly the dispatchable repositories', asyn
   assert.deepEqual(asked, [['issues', ['o/a', 'o/b']], ['pulls', ['o/a', 'o/b']]]);
 });
 
-test('a review dispatch starts from the PR branch and targets it', async () => {
-  const [review] = reviewCandidates([{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'abc', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }]);
-  assert.equal(review.baseRef, 'origin/feat/x');
+test('a review dispatch starts from the exact listed head commit and targets the PR branch', async () => {
+  const [review] = reviewCandidates([{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }]);
+  assert.equal(review.baseRef, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   assert.equal(review.prTarget, 'feat/x');
   const bases = [];
   const { deps, dispatched } = feedDeps({
     listIssues: async () => [],
-    listPulls: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'abc', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }],
+    listPulls: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }],
     defaultBase: async (cwd, wanted) => { bases.push(wanted); return wanted ?? 'origin/main'; },
   });
   await runFeed({ cfg: { ...cfg, owners: ['o'], perRun: 1 }, now: NOW, state: { sent: {} }, dryRun: false, deps });
-  assert.deepEqual(bases, ['origin/feat/x']);
-  assert.equal(dispatched[0].base, 'origin/feat/x');
+  assert.deepEqual(bases, ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+  assert.equal(dispatched[0].base, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   assert.equal(dispatched[0].prTarget, 'feat/x');
 });
 
@@ -369,4 +369,44 @@ test('repositories of other owners are never listed', async () => {
   });
   await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: true, deps });
   assert.deepEqual(asked, [['o/a'], ['o/a']]);
+});
+
+test('a ready verdict is withdrawn when it stops holding, and names the head it was judged on', async () => {
+  for (const [label, findPull, listChecks, expected] of [
+    ['checks pending', async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h2' }), async () => [{ bucket: 'pending' }], 'waiting'],
+    ['checks unknown', async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h2' }), async () => null, 'waiting'],
+    ['draft again', async () => ({ number: 1, state: 'OPEN', isDraft: true, headRefOid: 'h2' }), async () => [{ bucket: 'pass' }], 'waiting'],
+    ['lookup throws', async () => { throw new Error('gh down'); }, async () => [], 'lookup-failed'],
+  ]) {
+    const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'ready-for-owner', readyHead: 'h1' } } };
+    const result = await runTriage({ cfg, now: NOW, state, dryRun: false, deps: { saveState: async () => {}, findPull, listChecks } });
+    assert.equal(result.state.sent.a.merge, expected, label);
+    assert.equal(result.state.sent.a.readyHead, null, label);
+  }
+  const fresh = await runTriage({
+    cfg, now: NOW, state: { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } }, dryRun: false,
+    deps: { saveState: async () => {}, findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h9' }), listChecks: async () => [{ bucket: 'pass' }] },
+  });
+  assert.equal(fresh.state.sent.a.merge, 'ready-for-owner');
+  assert.equal(fresh.state.sent.a.readyHead, 'h9');
+});
+
+test('repositories that could not be read completely are reported, the rest still feed', async () => {
+  const { deps, dispatched } = feedDeps({
+    listIssues: async () => ({ items: [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }], incomplete: ['o/b'] }),
+    listPulls: async () => ({ items: [], incomplete: [] }),
+  });
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'], perRun: 1 }, now: NOW, state: { sent: {} }, dryRun: false, deps });
+  assert.deepEqual(result.incomplete, { issue: ['o/b'] });
+  assert.equal(dispatched.length, 1);
+});
+
+test('a PR whose head moved is a new review key, never the old key with new code', () => {
+  const pull = sha => ({ repository: { nameWithOwner: 'o/r' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: sha, author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false });
+  const [a] = reviewCandidates([pull('a'.repeat(40))]);
+  const [b] = reviewCandidates([pull('b'.repeat(40))]);
+  assert.notEqual(a.key, b.key);
+  assert.equal(a.baseRef, 'a'.repeat(40));
+  assert.equal(b.baseRef, 'b'.repeat(40));
+  assert.equal(reviewCandidates([pull('not-a-sha')]).length, 0);
 });

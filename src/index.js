@@ -3563,7 +3563,11 @@ async function cloudFeedCommand() {
     if (sub === 'run' || sub === 'tick') {
       const fed = await runFeed({ cfg, now: new Date(), state, max, dryRun, deps });
       state = fed.state;
-      out.run = { note: fed.note, sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })) };
+      out.run = {
+        note: fed.note,
+        incomplete: fed.incomplete,
+        sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })),
+      };
     }
     if (sub === 'triage' || sub === 'tick') {
       const triaged = await runTriage({ cfg, now: new Date(), state, dryRun, deps });

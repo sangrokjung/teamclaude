@@ -91,37 +91,46 @@ function ghJson(args) {
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Every page of a REST list, one page (100 items) at a time, so a large
-// repository is neither capped nor limited by one huge response buffer.
-// `keep` filters each page as it arrives.
-function restAll(path, keep = () => true) {
-  const out = [];
-  for (let page = 1; ; page += 1) {
-    const items = ghJson(['api', `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`]);
-    if (!Array.isArray(items)) throw new Error('unexpected list response');
-    out.push(...items.filter(keep));
-    if (items.length < 100) return out;
+const MAX_PAGES_PER_REPO = 30;
+
+// Pages of a REST list, 100 items at a time, filtered as they arrive. Stops
+// after MAX_PAGES_PER_REPO pages and reports `complete: false` instead of
+// pretending the list ended.
+function restPages(path, keep = () => true) {
+  const items = [];
+  for (let page = 1; page <= MAX_PAGES_PER_REPO; page += 1) {
+    const batch = ghJson(['api', `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`]);
+    if (!Array.isArray(batch)) throw new Error('unexpected list response');
+    for (const item of batch) if (keep(item)) items.push(item);
+    if (batch.length < 100) return { items, complete: true };
   }
+  return { items, complete: false };
 }
 
-// Runs `fn` per repository; one repository's failure is logged and skipped,
-// the others' results are kept.
+// Runs `fn` per repository. One repository's failure or truncation does not
+// drop the others; both are reported in `incomplete`.
 function perRepo(repos, what, fn, log) {
-  const out = [];
+  const items = [];
+  const incomplete = [];
   for (const repo of repos) {
     try {
-      out.push(...fn(repo));
+      const page = fn(repo);
+      for (const item of page.items) items.push(item);
+      if (!page.complete) {
+        incomplete.push(repo);
+        log?.(`[cloud-feed] ${what} for ${repo} truncated at ${MAX_PAGES_PER_REPO * 100}`);
+      }
     } catch (error) {
+      incomplete.push(repo);
       log?.(`[cloud-feed] ${what} for ${repo} failed: ${error?.message ?? error}`);
     }
   }
-  return out;
+  return { items, incomplete };
 }
 
 // Open issues (not PRs) of the given repositories, completely.
 export function listIssues(repos, log) {
-  return perRepo(repos, 'issues', repo => restAll(`repos/${repo}/issues?state=open`, issue => !issue.pull_request)
-    .map(issue => ({
+  return perRepo(repos, 'issues', repo => mapPage(restPages(`repos/${repo}/issues?state=open`, issue => !issue.pull_request), issue => ({
       repository: { nameWithOwner: repo },
       number: issue.number,
       title: issue.title,
@@ -131,10 +140,13 @@ export function listIssues(repos, log) {
     })), log);
 }
 
+function mapPage(page, fn) {
+  return { items: page.items.map(fn), complete: page.complete };
+}
+
 // Open PRs of the given repositories, completely, with head and trust fields.
 export function listPulls(repos, log) {
-  return perRepo(repos, 'pulls', repo => restAll(`repos/${repo}/pulls?state=open`)
-    .map(pull => ({
+  return perRepo(repos, 'pulls', repo => mapPage(restPages(`repos/${repo}/pulls?state=open`), pull => ({
       repository: { nameWithOwner: repo },
       number: pull.number,
       title: pull.title,
@@ -204,13 +216,15 @@ export async function buildRepoIndex(roots) {
   return index;
 }
 
-// After a fetch: `wanted` (an origin/<branch> ref) when it exists, else
-// origin/<default branch>; null when neither resolves.
+// After a fetch: `wanted` (an exact commit SHA) when it exists locally
+// (fetched by SHA if needed), else origin/<default branch>; null otherwise.
 export function defaultBase(cwd, wanted = null) {
   if (run('git', ['-C', cwd, 'fetch', '-q', 'origin'], { timeout: 120_000 }).status !== 0) return null;
   if (wanted) {
-    if (!/^origin\/[A-Za-z0-9._/-]+$/.test(wanted)) return null;
-    return run('git', ['-C', cwd, 'rev-parse', '--verify', '--quiet', `${wanted}^{commit}`]).status === 0 ? wanted : null;
+    if (!/^[0-9a-f]{40,64}$/.test(wanted)) return null;
+    const has = () => run('git', ['-C', cwd, 'cat-file', '-e', `${wanted}^{commit}`]).status === 0;
+    if (!has()) run('git', ['-C', cwd, 'fetch', '-q', 'origin', wanted], { timeout: 120_000 });
+    return has() ? wanted : null;
   }
   const head = run('git', ['-C', cwd, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).stdout.trim();
   if (head) return head;

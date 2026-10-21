@@ -190,18 +190,20 @@ export function reviewCandidates(pulls) {
       && TRUSTED_ASSOCIATIONS.has(pull.authorAssociation)
       && !pull.isCrossRepository
       && /^[A-Za-z0-9._/-]+$/.test(pull.headRefName ?? '')
+      && /^[0-9a-f]{40,64}$/.test(pull.headRefOid ?? '')
       && !String(pull.headRefName ?? '').startsWith('teamclaude-handoff/')
       && !/\[bot\]$|^dependabot/i.test(pull.author?.login ?? ''))
     .map(pull => {
       const repo = String(pull.repository?.nameWithOwner ?? '').toLowerCase();
       return {
         kind: 'review',
-        key: `review:${repo}#${pull.number}@${String(pull.headRefOid ?? '').slice(0, 12)}`,
+        key: `review:${repo}#${pull.number}@${pull.headRefOid}`,
         repo,
         title: pull.title,
-        // Starts from the PR branch itself and targets it, so a fix PR holds
-        // only the fix.
-        baseRef: `origin/${pull.headRefName}`,
+        // Starts from exactly the listed head commit (immutable, the same one
+        // the key names) and targets the PR branch, so a fix PR holds only
+        // the fix and a moved branch is a new key, not a silent re-review.
+        baseRef: pull.headRefOid,
         prTarget: pull.headRefName,
         task: [
           `열린 PR #${pull.number}의 코드를 리뷰하세요. 지금 브랜치가 그 PR의 코드에서 시작합니다.`,
@@ -283,10 +285,17 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
   // (REST pagination, no search cap); only those repos can be sent anyway.
   // Owner filter first: repositories outside it are never even listed.
   const repos = [...repoIndex.keys()].filter(repo => owners.has(repo.split('/')[0]));
+  const incomplete = {};
+  // Listers return an array or { items, incomplete } (repos not fully read).
+  const items = (source, result) => {
+    if (Array.isArray(result)) return result;
+    if (result?.incomplete?.length) incomplete[source] = result.incomplete;
+    return result?.items ?? [];
+  };
   const lists = [
-    await safely('issue', async () => issueCandidates(await deps.listIssues(repos))),
-    await safely('tdl', async () => taskCandidates(await deps.listTasks())),
-    await safely('review', async () => reviewCandidates(await deps.listPulls(repos))),
+    await safely('issue', async () => issueCandidates(items('issue', await deps.listIssues(repos)))),
+    await safely('tdl', async () => taskCandidates(items('tdl', await deps.listTasks()))),
+    await safely('review', async () => reviewCandidates(items('review', await deps.listPulls(repos)))),
     await safely('improve', async () => improvementCandidates(repos, now)),
   ];
   const chosen = selectCandidates({
@@ -329,7 +338,7 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     sent.push({ key: candidate.key, exit: outcome.exit, reason: outcome.reason, url: outcome.url });
     log(`[cloud-feed] ${candidate.key} -> exit ${outcome.exit}${outcome.reason ? ` (${outcome.reason})` : ''}`);
   }
-  return { state: nextState, sent, note: 'ok' };
+  return { state: nextState, sent, note: 'ok', incomplete };
 }
 
 function record(state, candidate, outcome, now) {
@@ -405,15 +414,22 @@ export async function runTriage({ cfg, now, state, dryRun, deps }) {
       pull = await deps.findPull(entry.repo, entry.branch);
       checks = pull && pull.state === 'OPEN' ? await deps.listChecks(entry.repo, pull.number) : [];
     } catch {
-      await save(key, { checkedAt: now.toISOString() });
+      // Unknown now: a previous "ready" no longer holds.
+      await save(key, { checkedAt: now.toISOString(), merge: entry.merge === 'no-pr' ? 'no-pr' : 'lookup-failed', readyHead: null });
       results.push({ key, decision: 'lookup-failed', pr: null });
       continue;
     }
     const decision = mergeDecision({ entry, pull, checks, now, cfg });
     results.push({ key, decision, pr: pull?.number ?? null, url: pull?.url ?? null });
+    // The stored state is always the current classification ("waiting"
+    // included), so an earlier ready verdict is withdrawn when it stops
+    // holding; ready names the head commit it was judged on.
     await save(key, {
       checkedAt: now.toISOString(),
-      ...(decision === 'wait' ? {} : { merge: decision, pr: pull?.number ?? null }),
+      merge: decision === 'wait' ? (pull ? 'waiting' : 'pending') : decision,
+      pr: pull?.number ?? null,
+      readyHead: decision === 'ready-for-owner' ? pull.headRefOid : null,
+      ...(decision === 'ready-for-owner' && entry.merge !== 'ready-for-owner' ? { readySince: now.toISOString() } : {}),
     });
     if (decision !== 'wait' && decision !== entry.merge) log(`[cloud-feed] ${key} -> ${decision}${pull ? ` (#${pull.number})` : ''}`);
   }
