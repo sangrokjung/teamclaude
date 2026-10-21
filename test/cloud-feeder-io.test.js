@@ -1,15 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { feederStatePath, readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
+import { deleteRemoteBranch, feederStatePath, readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
 
 async function scratch(t) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-feeder-io-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
+}
+
+function git(cwd, ...args) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+async function cleanupFixture(t) {
+  const dir = await scratch(t);
+  const cwd = join(dir, 'work');
+  const bareA = join(dir, 'a.git');
+  const bareB = join(dir, 'b.git');
+  git(dir, 'init', '--quiet', '--bare', bareA);
+  git(dir, 'init', '--quiet', '--bare', bareB);
+  git(dir, 'init', '--quiet', '-b', 'main', cwd);
+  git(cwd, 'config', 'user.name', 'Test');
+  git(cwd, 'config', 'user.email', 'test@example.invalid');
+  git(cwd, 'config', 'commit.gpgsign', 'false');
+  await writeFile(join(cwd, 'f.txt'), 'x\n');
+  git(cwd, 'add', '-A');
+  git(cwd, 'commit', '--quiet', '-m', 'init');
+  git(cwd, 'push', '--quiet', bareA, `HEAD:refs/heads/teamclaude-handoff/x`);
+  return { cwd, bareA, bareB };
 }
 
 test('feeder state follows TEAMCLAUDE_CONFIG, so two pools on one machine never share budget or history', t => {
@@ -152,4 +176,42 @@ esac
   assert.ok(paged.some(check => check.name === 'late' && check.bucket === 'fail'));
   assert.equal(listChecks('o/liar', sha), null, 'aggregate failure without a failing status');
   assert.equal(listChecks('o/short', sha), null, 'fewer statuses than total_count');
+});
+
+test('deleteRemoteBranch deletes the exact branch from the exact verified URL', async t => {
+  const { cwd, bareA } = await cleanupFixture(t);
+  assert.equal(await deleteRemoteBranch(cwd, 'teamclaude-handoff/x', bareA), true);
+  assert.equal(git(bareA, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});
+
+test('deleteRemoteBranch refuses when a rewrite rule now redirects its own verified destination', async t => {
+  const { cwd, bareA, bareB } = await cleanupFixture(t);
+  // A rule added to the clone's config AFTER the branch was originally
+  // pushed, that would silently redirect this exact, already-resolved URL
+  // somewhere else. The delete must refuse rather than let that happen.
+  git(cwd, 'config', `url.${bareB}.insteadOf`, bareA);
+  assert.equal(await deleteRemoteBranch(cwd, 'teamclaude-handoff/x', bareA), false);
+  // Neither destination was touched: not the real one (refused before
+  // pushing), and not the decoy either (deleteRemoteBranch never pushes once
+  // it refuses).
+  assert.equal(git(bareA, 'branch', '--list', 'teamclaude-handoff/*'), 'teamclaude-handoff/x');
+  assert.equal(git(bareB, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});
+
+test('deleteRemoteBranch with the default origin never runs the rewrite check (legacy state compatibility)', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-feeder-io-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const cwd = join(dir, 'work');
+  const bare = join(dir, 'origin.git');
+  git(dir, 'init', '--quiet', '--bare', bare);
+  git(dir, 'init', '--quiet', '-b', 'main', cwd);
+  git(cwd, 'config', 'user.name', 'Test');
+  git(cwd, 'config', 'user.email', 'test@example.invalid');
+  git(cwd, 'config', 'commit.gpgsign', 'false');
+  git(cwd, 'remote', 'add', 'origin', bare);
+  await writeFile(join(cwd, 'f.txt'), 'x\n');
+  git(cwd, 'add', '-A');
+  git(cwd, 'commit', '--quiet', '-m', 'init');
+  git(cwd, 'push', '--quiet', 'origin', 'HEAD:refs/heads/teamclaude-handoff/legacy');
+  assert.equal(await deleteRemoteBranch(cwd, 'teamclaude-handoff/legacy'), true);
 });

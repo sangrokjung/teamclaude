@@ -423,7 +423,19 @@ async function sweepPendingCleanup(state, repoIndex, deps) {
   if (pending.length === 0) return state;
   const remaining = [];
   for (const item of pending) {
-    const cwd = repoIndex.get(item.repo);
+    // The delete targets `item.remoteUrl` directly (never the clone's own
+    // `origin`), so `cwd` only needs to be SOME local git working directory
+    // to run the command from — it is not the destination. `repoIndex` keys
+    // repos by what their `origin` currently resolves to, which can drift
+    // (a clone's origin gets repointed, a repo gets re-cloned elsewhere...),
+    // so a clone no longer listed under `item.repo` must not strand a
+    // verified-destination cleanup forever: fall back to any other clone.
+    // A legacy entry with no `remoteUrl` (defaults to the literal 'origin')
+    // has no such fallback — 'origin' there really does mean THAT repo's
+    // clone, not an arbitrary one.
+    const cwd = item.remoteUrl
+      ? (repoIndex.get(item.repo) ?? repoIndex.values().next().value ?? null)
+      : (repoIndex.get(item.repo) ?? null);
     const deleted = cwd
       ? await Promise.resolve(deps.deleteRemoteBranch(cwd, item.branch, item.remoteUrl)).catch(() => false)
       : false;

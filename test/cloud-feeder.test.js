@@ -332,6 +332,35 @@ test('pending cleanup is retried even when the feeder is disabled, out of credit
   }
 });
 
+test('a pending cleanup with a verified remoteUrl falls back to any other available clone when its own repo key is gone from the index', async () => {
+  // repoIndex no longer lists 'o/stale-repo' at all (its clone's origin
+  // drifted to something else, or it was re-cloned under a different key) —
+  // but the cleanup's destination is the verified remoteUrl, not whatever
+  // 'o/stale-repo' currently maps to, so any other local clone works fine as
+  // the scratch directory to run the delete from.
+  const deleteCalls = [];
+  const { deps } = feedDeps({
+    repoIndex: async () => new Map([['o/other', '/clone/other']]),
+    deleteRemoteBranch: (cwd, branch, remoteUrl) => { deleteCalls.push({ cwd, branch, remoteUrl }); return true; },
+  });
+  const state = { sent: {}, pendingCleanup: [{ repo: 'o/stale-repo', branch: 'stale-1', remoteUrl: 'https://github.com/o/stale-repo.git', ts: NOW.toISOString() }] };
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
+  assert.deepEqual(deleteCalls, [{ cwd: '/clone/other', branch: 'stale-1', remoteUrl: 'https://github.com/o/stale-repo.git' }]);
+  assert.deepEqual(result.state.pendingCleanup, []);
+});
+
+test('a legacy pending entry with no remoteUrl never falls back to another clone (its repo key IS the destination)', async () => {
+  const deleteCalls = [];
+  const { deps } = feedDeps({
+    repoIndex: async () => new Map([['o/other', '/clone/other']]),
+    deleteRemoteBranch: (cwd, branch) => { deleteCalls.push({ cwd, branch }); return true; },
+  });
+  const state = { sent: {}, pendingCleanup: [{ repo: 'o/stale-repo', branch: 'stale-1', ts: NOW.toISOString() }] };
+  const result = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state, dryRun: false, deps });
+  assert.deepEqual(deleteCalls, []);
+  assert.deepEqual(result.state.pendingCleanup, state.pendingCleanup);
+});
+
 test('runFeed does nothing when disabled, without credit info, or for repos of other owners', async () => {
   const { deps, dispatched } = feedDeps();
   assert.equal((await runFeed({ cfg: { ...cfg, enabled: false }, now: NOW, state: {}, deps })).note, 'disabled');

@@ -388,7 +388,12 @@ export async function attemptCloudDispatch({
     && (result.error.code === 'ENOENT' || result.error.code === 'EACCES')
     && !result.pid);
   if (url === null) {
-    if (neverSpawned) return local('launch-failed');
+    // A spawn-time failure (binary missing/not executable) happens AFTER the
+    // snapshot was already pushed, same as the pre-launch rejections above —
+    // it must go through the same cleanup-and-track path, or this specific
+    // failure shape silently orphans the branch exactly like the bug those
+    // fixes were for.
+    if (neverSpawned) return abortAfterPush('launch-failed');
     return { ok: false, exit: DISPATCH_EXIT.AMBIGUOUS, reason: 'launch-uncertain', branch: snapshot.branch };
   }
   let ledgerRecorded = false;

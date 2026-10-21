@@ -9,6 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
+import { remoteUrlIsFixedPoint } from './cloud-handoff.js';
 import { getConfigPath } from './config.js';
 
 const LIST_LIMIT = 1000;
@@ -269,14 +270,20 @@ export function defaultBase(cwd, wanted = null) {
 
 // Best-effort cleanup of an orphaned handoff branch (one a pre-launch
 // rejection pushed but no cloud session ever used). `true` only on a
-// confirmed delete; any failure (network, permissions, already gone) is
-// `false` so the caller can keep it on a pending-cleanup list and retry.
-// `remoteUrl`, when given, is the exact URL the branch was originally pushed
-// to (from the dispatch outcome) — targeted directly rather than through the
-// clone's `origin` alias, which can be repointed independently between the
-// push and a later cleanup retry. Falls back to `origin` only for state
-// written before `remoteUrl` was tracked.
-export function deleteRemoteBranch(cwd, branch, remoteUrl = 'origin') {
+// confirmed delete; any failure (network, permissions, already gone, or a
+// rewrite rule now hiding behind the stored URL) is `false` so the caller
+// can keep it on a pending-cleanup list and retry. `remoteUrl`, when given,
+// is the exact URL the branch was originally pushed to (from the dispatch
+// outcome) — targeted directly rather than through the clone's `origin`
+// alias, which can be repointed independently between the push and a later
+// cleanup retry. Falls back to `origin` only for state written before
+// `remoteUrl` was tracked (then a rewrite re-check make no sense — 'origin'
+// is already whatever the clone currently resolves it to be).
+export async function deleteRemoteBranch(cwd, branch, remoteUrl = 'origin') {
+  if (remoteUrl !== 'origin') {
+    const runGit = async (args, opts) => run('git', args, { cwd: opts?.cwd ?? cwd });
+    if (!(await remoteUrlIsFixedPoint({ root: cwd, url: remoteUrl, runGit }))) return false;
+  }
   return run('git', ['-C', cwd, 'push', '--quiet', '--', remoteUrl, `:refs/heads/${branch}`], { timeout: 30_000 }).status === 0;
 }
 

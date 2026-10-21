@@ -174,10 +174,14 @@ test('launch outcomes: only a printed session link counts as sent', async t => {
   const f = await fixture(t);
   const outcomeOf = launchCloud => attemptCloudDispatch(inputs(f, { launchCloud }));
 
-  // The launcher never started: nothing can exist.
+  // The launcher never started: nothing can exist, but the snapshot WAS
+  // already pushed before this spawn attempt, so it must still be tracked
+  // and cleaned up exactly like the pre-launch rejections above.
   const notSpawned = await outcomeOf(async () => ({ error: Object.assign(new Error('x'), { code: 'ENOENT' }), status: null }));
   assert.equal(notSpawned.exit, DISPATCH_EXIT.RUN_LOCAL);
   assert.equal(notSpawned.reason, 'launch-failed');
+  assert.match(notSpawned.branch, /^teamclaude-handoff\//, 'a spawn-time failure must not orphan the already-pushed branch untracked');
+  assert.equal(notSpawned.branchDeleted, true);
 
   // It ran but printed no link: a session may exist server-side.
   for (const result of [
