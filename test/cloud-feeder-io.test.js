@@ -4,15 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { nextSearchCursor, readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
-
-test('search cursor: advances on a full page, wraps on a short one, never stalls on one timestamp', () => {
-  const page = times => times.map(createdAt => ({ createdAt }));
-  assert.equal(nextSearchCursor(page(['2026-01-01T00:00:00Z']), null, 2), null);
-  assert.equal(nextSearchCursor(page(['2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z']), null, 2), '2026-01-02T00:00:00Z');
-  // Full page entirely at the cursor's own second: step past it.
-  assert.equal(nextSearchCursor(page(['2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z']), '2026-01-02T00:00:00Z', 2), '2026-01-02T00:00:01Z');
-});
+import { readFeederState, withFeederLock, writeFeederState } from '../src/cloud-feeder-io.js';
 
 async function scratch(t) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-feeder-io-'));

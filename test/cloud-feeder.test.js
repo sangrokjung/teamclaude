@@ -18,7 +18,7 @@ import {
   totalCredit,
 } from '../src/cloud-feeder.js';
 
-const cfg = { ...FEED_DEFAULTS, enabled: true, expiresAt: '2026-11-05T07:59:00Z' };
+const cfg = { ...FEED_DEFAULTS, enabled: true, autoMerge: true, expiresAt: '2026-11-05T07:59:00Z' };
 const NOW = new Date('2026-10-21T00:00:00Z');
 
 test('budget paces the remaining credit over the days left and counts what was spent today', () => {
@@ -133,9 +133,9 @@ function feedDeps(overrides = {}) {
       loadAccounts: async () => [{ type: 'oauth', accessToken: 'a' }],
       creditLookup: async () => ({ remainingDollars: 3000 }),
       repoIndex: async () => new Map([['o/a', '/clone/a'], ['o/b', '/clone/b']]),
-      listIssues: async () => ({ items: [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }], cursors: { 'issues:o': null } }),
+      listIssues: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 1, title: 'i', body: '', labels: [], authorAssociation: 'OWNER' }],
       listTasks: async () => { throw new Error('ledger down'); },
-      listPulls: async () => ({ items: [], cursors: {} }),
+      listPulls: async () => [],
       defaultBase: async () => 'origin/main',
       dispatch: async request => {
         dispatched.push(request);
@@ -404,14 +404,72 @@ test('one entry whose lookup throws does not stop the others', async () => {
   assert.equal(result.state.sent.bad.merge, 'pending');
 });
 
-test('list cursors are carried in state between runs', async () => {
-  const seen = [];
+test('issues and PRs are listed for exactly the dispatchable repositories', async () => {
+  const asked = [];
   const { deps } = feedDeps({
-    listIssues: async (owners, cursors) => { seen.push(cursors['issues:o'] ?? null); return { items: [], cursors: { 'issues:o': '2026-10-01T00:00:00Z' } }; },
+    listIssues: async repos => { asked.push(['issues', repos]); return []; },
+    listPulls: async repos => { asked.push(['pulls', repos]); return []; },
   });
-  const first = await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: true, deps });
-  await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: first.state, dryRun: true, deps });
-  assert.deepEqual(seen, [null, '2026-10-01T00:00:00Z']);
+  await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: { sent: {} }, dryRun: true, deps });
+  assert.deepEqual(asked, [['issues', ['o/a', 'o/b']], ['pulls', ['o/a', 'o/b']]]);
+});
+
+test('a review dispatch starts from the PR branch and targets it', async () => {
+  const [review] = reviewCandidates([{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'abc', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }]);
+  assert.equal(review.baseRef, 'origin/feat/x');
+  assert.equal(review.prTarget, 'feat/x');
+  const bases = [];
+  const { deps, dispatched } = feedDeps({
+    listIssues: async () => [],
+    listPulls: async () => [{ repository: { nameWithOwner: 'o/a' }, number: 3, title: 't', isDraft: false, headRefName: 'feat/x', headRefOid: 'abc', author: { login: 'me' }, authorAssociation: 'OWNER', isCrossRepository: false }],
+    defaultBase: async (cwd, wanted) => { bases.push(wanted); return wanted ?? 'origin/main'; },
+  });
+  await runFeed({ cfg: { ...cfg, owners: ['o'], perRun: 1 }, now: NOW, state: { sent: {} }, dryRun: false, deps });
+  assert.deepEqual(bases, ['origin/feat/x']);
+  assert.equal(dispatched[0].base, 'origin/feat/x');
+  assert.equal(dispatched[0].prTarget, 'feat/x');
+});
+
+test('without the operator opt-in a verified PR is left for a person', async () => {
+  let reviewed = 0;
+  const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
+  const result = await runMerge({
+    cfg: { ...cfg, autoMerge: false }, now: NOW, state, dryRun: false,
+    deps: {
+      saveState: async () => {},
+      findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b1' }),
+      listChecks: async () => [{ bucket: 'pass' }],
+      headContainsBase: async () => true,
+      updateBranch: async () => true,
+      review: async () => { reviewed += 1; return 'APPROVE'; },
+      merge: async () => { throw new Error('must not merge'); },
+    },
+  });
+  assert.equal(reviewed, 0);
+  assert.equal(result.state.sent.a.merge, 'ready-for-owner');
+});
+
+test('uncertain dispatches with a branch are followed, and a late PR after no-pr is found', async () => {
+  const state = { sent: {
+    unsure: { exit: 4, reason: 'launch-uncertain', repo: 'o/a', branch: 'u', ts: '2026-10-20T00:00:00Z' },
+    late: { exit: 0, repo: 'o/a', branch: 'l', ts: '2026-10-10T00:00:00Z', merge: 'no-pr', checkedAt: '2026-10-19T00:00:00Z' },
+    recent: { exit: 0, repo: 'o/a', branch: 'r', ts: '2026-10-10T00:00:00Z', merge: 'no-pr', checkedAt: '2026-10-20T23:00:00Z' },
+    lost: { exit: 4, reason: 'in-flight', repo: 'o/a', ts: '2026-10-20T00:00:00Z' },
+  } };
+  const looked = [];
+  const result = await runMerge({
+    cfg, now: NOW, state, dryRun: false,
+    deps: {
+      saveState: async () => {},
+      findPull: async (repo, branch) => { looked.push(branch); return { number: 9, state: 'MERGED' }; },
+      listChecks: async () => [],
+    },
+  });
+  assert.deepEqual(looked.sort(), ['l', 'u']);
+  assert.equal(result.state.sent.unsure.merge, 'merged');
+  assert.equal(result.state.sent.late.merge, 'merged');
+  // A resend is still never allowed for the uncertain entry.
+  assert.equal(isDue(result.state.sent.unsure, NOW, cfg), false);
 });
 
 test('today\'s dispatches reserve their estimated cost before the balance moves', () => {

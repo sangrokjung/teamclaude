@@ -17,10 +17,15 @@ export const FEED_DEFAULTS = Object.freeze({
   expiresAt: '2026-11-05T07:59:00Z',
   perRun: 3,
   estCost: 3,
+  // Off by default: without server-side protection (strict required checks or
+  // a merge queue) the base can move between the last check and the merge.
+  // The operator opts in explicitly (cloudFeed.autoMerge: true).
+  autoMerge: false,
   mergePerRun: 2,
   mergeLookups: 30,
   retryAfterDays: 7,
   noPrAfterHours: 48,
+  noPrRecheckHours: 24,
   owners: ['qjc-office', 'sangrokjung'],
 });
 
@@ -197,10 +202,14 @@ export function reviewCandidates(pulls) {
         key: `review:${repo}#${pull.number}@${String(pull.headRefOid ?? '').slice(0, 12)}`,
         repo,
         title: pull.title,
+        // Starts from the PR branch itself and targets it, so a fix PR holds
+        // only the fix.
+        baseRef: `origin/${pull.headRefName}`,
+        prTarget: pull.headRefName,
         task: [
-          `열린 PR #${pull.number}을 리뷰하세요.`,
-          `\`git fetch origin pull/${pull.number}/head\`로 PR 코드를 받아 버그·보안·누락된 테스트를 찾으세요.`,
-          `결함을 찾으면 PR 브랜치 \`${pull.headRefName}\`를 기준으로 수정 커밋을 만들어 이 세션의 브랜치로 push하고, \`${pull.headRefName}\` 대상으로 PR을 여세요. PR 본문에 원 PR 번호와 결함·재현을 적으세요.`,
+          `열린 PR #${pull.number}의 코드를 리뷰하세요. 지금 브랜치가 그 PR의 코드에서 시작합니다.`,
+          '버그·보안 문제·누락된 테스트를 찾으세요.',
+          'PR 본문에 원 PR 번호와 결함·재현을 적으세요.',
           '결함이 없으면 브랜치·커밋·PR 없이 끝내세요.',
           DATA_NOTE,
           '',
@@ -273,19 +282,15 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
       return [];
     }
   };
-  let cursors = { ...(nextState.cursors ?? {}) };
-  const page = async lister => {
-    const result = await lister(cursors);
-    cursors = { ...cursors, ...result.cursors };
-    return result.items;
-  };
+  // Issues and PRs are enumerated completely per dispatchable repository
+  // (REST pagination, no search cap); only those repos can be sent anyway.
+  const repos = [...repoIndex.keys()];
   const lists = [
-    await safely('issue', async () => issueCandidates(await page(c => deps.listIssues(cfg.owners, c)))),
-    await safely('tdl', async () => taskCandidates(await page(c => deps.listTasks(c)))),
-    await safely('review', async () => reviewCandidates(await page(c => deps.listPulls(cfg.owners, c)))),
-    await safely('improve', async () => improvementCandidates([...repoIndex.keys()], now)),
+    await safely('issue', async () => issueCandidates(await deps.listIssues(repos))),
+    await safely('tdl', async () => taskCandidates(await deps.listTasks())),
+    await safely('review', async () => reviewCandidates(await deps.listPulls(repos))),
+    await safely('improve', async () => improvementCandidates(repos, now)),
   ];
-  nextState = { ...nextState, cursors };
   const chosen = selectCandidates({
     candidates: interleave(lists),
     state: nextState,
@@ -301,7 +306,7 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
       sent.push({ ...candidate, dryRun: true });
       continue;
     }
-    const base = await deps.defaultBase(cwd);
+    const base = await deps.defaultBase(cwd, candidate.baseRef ?? null);
     if (!base) {
       nextState = record(nextState, candidate, { exit: 3, reason: 'no-default-branch' }, now);
       continue;
@@ -312,7 +317,7 @@ export async function runFeed({ cfg, now, state, max, dryRun, deps }) {
     await deps.saveState(nextState);
     let outcome;
     try {
-      outcome = await deps.dispatch({ task: candidate.task, cwd, base });
+      outcome = await deps.dispatch({ task: candidate.task, cwd, base, prTarget: candidate.prTarget ?? null });
     } catch {
       outcome = { exit: 4, reason: 'dispatch-threw' };
     }
@@ -370,9 +375,9 @@ export function mergeDecision({ entry, pull, checks, now, cfg }) {
   return 'review';
 }
 
-// Terminal outcomes. checks-failed and changes-requested are re-checked on
-// later passes (a new head or a re-run may fix them).
-const FINAL = new Set(['merged', 'closed', 'no-pr', 'awaiting-owner']);
+// Terminal outcomes. checks-failed, changes-requested and no-pr are
+// re-checked on later passes (a new head, a re-run or a late PR may change them).
+const FINAL = new Set(['merged', 'closed', 'awaiting-owner']);
 
 export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
   const log = deps.log ?? (() => {});
@@ -394,7 +399,12 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
 
   // Pass 1: bounded lookups, least recently checked first.
   const open = Object.entries(state?.sent ?? {})
-    .filter(([, entry]) => entry.exit === 0 && entry.branch && !FINAL.has(entry.merge))
+    // Uncertain dispatches (exit 4) that pushed a branch may still have
+    // produced a PR: they are never resent, but their PR is followed.
+    .filter(([, entry]) => (entry.exit === 0 || entry.exit === 4) && entry.branch && !FINAL.has(entry.merge))
+    // A branch that produced no PR in time is rechecked only occasionally.
+    .filter(([, entry]) => entry.merge !== 'no-pr'
+      || now.getTime() - Date.parse(entry.checkedAt ?? 0) >= cfg.noPrRecheckHours * 60 * 60 * 1000)
     .sort(([, a], [, b]) => String(a.checkedAt ?? '').localeCompare(String(b.checkedAt ?? '')))
     .slice(0, cfg.mergeLookups);
   const ready = [];
@@ -421,6 +431,8 @@ export async function runMerge({ cfg, now, state, max, dryRun, deps }) {
       else if (!current && dryRun) decision = 'would-update-branch';
       else if (!current) decision = (await deps.updateBranch(entry.repo, pull)) ? 'wait' : 'behind';
     }
+    // Without the operator's opt-in a verified PR is left for a person.
+    if (decision === 'review' && !cfg.autoMerge) decision = 'ready-for-owner';
     if (decision === 'review') ready.push({ key, entry, pull, checks });
     else await settle(key, decision, pull);
   }
