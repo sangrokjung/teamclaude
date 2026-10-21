@@ -4975,3 +4975,171 @@ test('losing a previously working registry at exit does not resume the session t
   assert.equal(result.status, 0);
   assert.equal(calls.length, 1);
 });
+
+test('registry uncertainty after a confirmed read pauses scanning instead of re-reading the abandoned session', async t => {
+  // Finding 1 (round 3): clearing unresolvedEvent once was not enough — the
+  // very same scan would keep reading currentPath's growth and immediately
+  // re-set it from the session the registry can no longer prove we're on.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-uncertain-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('an unconfirmable session must not be resumed'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5050;
+      calls.push([...args]);
+      const launchId = args[args.indexOf('--session-id') + 1];
+      const sessionsDir = join(transcriptRoot, '..', 'sessions');
+      setTimeout(async () => {
+        await mkdir(sessionsDir, { recursive: true });
+        await writeFile(join(sessionsDir, '5050.json'), JSON.stringify({ pid: 5050, sessionId: launchId }));
+        // Confirm the registry at least once (poll 1).
+        await new Promise(resolve => setTimeout(resolve, 15));
+        // Before the next poll: append A's error AND remove the registry,
+        // simulating the child having already moved on and exited.
+        await writeFile(join(dir, `${launchId}.jsonl`), `${fleetExhaustedRecord(cwd, 9)}\n`);
+        await rm(join(sessionsDir, '5050.json'), { force: true });
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});
+
+test('a session revisited mid-record continues the partial line instead of losing it', async t => {
+  // Finding 3 (round 3): the per-session cursor saved only offset+identity,
+  // discarding any trailing partial line (`pending`) held across a poll
+  // boundary — so a record split by a switch was lost forever on return.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-partial-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const SESSION_A = SWITCHED_SESSION_ID;
+  const SESSION_B = '11111111-2222-4333-8444-555555555555';
+  const fullRecord = fleetExhaustedRecord(cwd, 9);
+  const splitAt = Math.floor(fullRecord.length / 2);
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5151;
+      calls.push([...args]);
+      if (calls.length === 1) {
+        setTimeout(async () => {
+          // Write only the first half of the error line (no trailing
+          // newline yet) before this child ever polls A.
+          await writeLiveSession(transcriptRoot, 5151, SESSION_A);
+          await writeFile(join(dir, `${SESSION_A}.jsonl`), fullRecord.slice(0, splitAt));
+          await new Promise(resolve => setTimeout(resolve, 30));
+          // Switch away before the rest of the line ever arrives.
+          await writeLiveSession(transcriptRoot, 5151, SESSION_B);
+          await new Promise(resolve => setTimeout(resolve, 30));
+          // Switch back to A and only now complete the line.
+          await writeLiveSession(transcriptRoot, 5151, SESSION_A);
+          await appendFile(join(dir, `${SESSION_A}.jsonl`), `${fullRecord.slice(splitAt)}\n`);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [9000]);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], ['--resume', SESSION_A, 'continue']);
+});
+
+test('an untimed error already in a newly visited session is not treated as a fresh failure', async t => {
+  // Finding 4 (round 3): recordAtOrAfter admitted any error lacking a valid
+  // timestamp as "live" for the switch-boundary gate, so a pre-existing
+  // untimed error already in a /resume target was wrongly adopted as new.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-untimed-old-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const untimedError = JSON.parse(fleetExhaustedRecord(cwd, 9));
+  delete untimedError.timestamp;
+  await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), `${JSON.stringify(untimedError)}\n`);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('a pre-existing untimed error must not be adopted as new'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5252;
+      calls.push([...args]);
+      setTimeout(async () => {
+        await writeLiveSession(transcriptRoot, 5252, SWITCHED_SESSION_ID);
+        await new Promise(resolve => setTimeout(resolve, 60));
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});
