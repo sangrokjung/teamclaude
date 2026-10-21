@@ -144,26 +144,36 @@ const MAX_PAGES_PER_REPO = 30;
 const OVERALL_ITEM_CAP = 6000;
 
 // Pages of a REST list, 100 items at a time, filtered as they arrive. Stops
-// after MAX_PAGES_PER_REPO pages and reports `complete: false` instead of
-// pretending the list ended.
-function restPages(path, keep = () => true) {
+// after MAX_PAGES_PER_REPO pages, or once `limit` items have been kept
+// (whichever comes first — a lower caller-supplied budget, not just this
+// function's own page-count ceiling), and reports `complete: false` instead
+// of pretending the list ended.
+function restPages(path, keep = () => true, limit = Infinity) {
   const items = [];
   for (let page = 1; page <= MAX_PAGES_PER_REPO; page += 1) {
+    if (items.length >= limit) return { items, complete: false };
     const batch = ghJson(['api', `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`]);
     if (!Array.isArray(batch)) throw new Error('unexpected list response');
-    for (const item of batch) if (keep(item)) items.push(item);
+    for (const item of batch) {
+      if (keep(item)) items.push(item);
+      if (items.length >= limit) return { items, complete: false };
+    }
     if (batch.length < 100) return { items, complete: true };
   }
   return { items, complete: false };
 }
 
 // Runs `fn` per repository. One repository's failure or truncation does not
-// drop the others; both are reported in `incomplete`.
+// drop the others; both are reported in `incomplete`. `fn` receives the
+// repo's own remaining share of OVERALL_ITEM_CAP, so neither this function
+// nor `fn` can ever push `items` past the cap, no matter how large any one
+// repository's own result would otherwise be.
 function perRepo(repos, what, fn, log) {
   const items = [];
   const incomplete = [];
   for (const repo of repos) {
-    if (items.length >= OVERALL_ITEM_CAP) {
+    const remaining = OVERALL_ITEM_CAP - items.length;
+    if (remaining <= 0) {
       // Cap already reached by earlier repos: skip the `gh` call entirely
       // for everything after it (saves both memory and the API round trip),
       // reported exactly like a truncated/failed repo so the caller knows
@@ -172,11 +182,12 @@ function perRepo(repos, what, fn, log) {
       continue;
     }
     try {
-      const page = fn(repo);
+      const page = fn(repo, remaining);
       for (const item of page.items) items.push(item);
       if (!page.complete) {
         incomplete.push(repo);
-        log?.(`[cloud-feed] ${what} for ${repo} truncated at ${MAX_PAGES_PER_REPO * 100}`);
+        const bound = remaining < MAX_PAGES_PER_REPO * 100 ? `${OVERALL_ITEM_CAP} overall` : MAX_PAGES_PER_REPO * 100;
+        log?.(`[cloud-feed] ${what} for ${repo} truncated at ${bound}`);
       }
     } catch (error) {
       incomplete.push(repo);
@@ -188,7 +199,7 @@ function perRepo(repos, what, fn, log) {
 
 // Open issues (not PRs) of the given repositories, completely.
 export function listIssues(repos, log) {
-  return perRepo(repos, 'issues', repo => mapPage(restPages(`repos/${repo}/issues?state=open`, issue => !issue.pull_request), issue => ({
+  return perRepo(repos, 'issues', (repo, limit) => mapPage(restPages(`repos/${repo}/issues?state=open`, issue => !issue.pull_request, limit), issue => ({
       repository: { nameWithOwner: repo },
       number: issue.number,
       title: issue.title,
@@ -204,7 +215,7 @@ function mapPage(page, fn) {
 
 // Open PRs of the given repositories, completely, with head and trust fields.
 export function listPulls(repos, log) {
-  return perRepo(repos, 'pulls', repo => mapPage(restPages(`repos/${repo}/pulls?state=open`), pull => ({
+  return perRepo(repos, 'pulls', (repo, limit) => mapPage(restPages(`repos/${repo}/pulls?state=open`, () => true, limit), pull => ({
       repository: { nameWithOwner: repo },
       number: pull.number,
       title: pull.title,

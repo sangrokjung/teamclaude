@@ -183,6 +183,36 @@ esac
   assert.ok(!calledRepos.some(line => line.includes('o/never')), 'o/never must never be queried once the overall cap is already reached');
 });
 
+test('the overall cap holds exactly even when no single repo lands on a round multiple of it', { skip: process.platform === 'win32' }, async t => {
+  const dir = await scratch(t);
+  const fake = join(dir, 'gh');
+  // o/a ends naturally just short of a full page (2999, not truncated by
+  // anything); o/b would naturally fill to its own full 3000; o/c would too,
+  // but only 1 slot is left in the overall budget by the time it's reached.
+  // Before the fix, perRepo added each repo's FULL result before ever
+  // checking the running total against the next repo, so this exact shape
+  // (2999 + 3000 + 3000) would have produced 8999 instead of exactly 6000.
+  await writeFile(fake, `#!/bin/sh
+case "$2" in
+  repos/o/a/*page=30*) node -e 'console.log(JSON.stringify(Array.from({length:99},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'a'.repeat(40)}",repo:{full_name:"o/a"}}}))))' ;;
+  repos/o/a/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'a'.repeat(40)}",repo:{full_name:"o/a"}}}))))' ;;
+  repos/o/b/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'b'.repeat(40)}",repo:{full_name:"o/b"}}}))))' ;;
+  repos/o/c/*) node -e 'console.log(JSON.stringify(Array.from({length:100},(_,i)=>({number:i+1,title:"t",draft:false,user:{login:"me"},author_association:"OWNER",head:{ref:"b",sha:"${'c'.repeat(40)}",repo:{full_name:"o/c"}}}))))' ;;
+esac
+`);
+  await chmod(fake, 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${previous}`;
+  t.after(() => { process.env.PATH = previous; });
+  const { listPulls } = await import('../src/cloud-feeder-io.js');
+  const result = listPulls(['o/a', 'o/b', 'o/c']);
+  assert.equal(result.items.length, 6000, 'must stop exactly at the overall cap, never past it');
+  assert.equal(result.items.filter(p => p.repository.nameWithOwner === 'o/a').length, 2999);
+  assert.equal(result.items.filter(p => p.repository.nameWithOwner === 'o/b').length, 3000);
+  assert.equal(result.items.filter(p => p.repository.nameWithOwner === 'o/c').length, 1);
+  assert.deepEqual(result.incomplete, ['o/b', 'o/c']);
+});
+
 test('commit checks: statuses are read across pages and an unexplained aggregate state is unknown', { skip: process.platform === 'win32' }, async t => {
   const dir = await scratch(t);
   const fake = join(dir, 'gh');
