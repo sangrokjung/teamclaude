@@ -5041,7 +5041,6 @@ test('a session revisited mid-record continues the partial line instead of losin
   const dir = join(transcriptRoot, 'project');
   await mkdir(cwd);
   await mkdir(dir, { recursive: true });
-  const SESSION_A = SWITCHED_SESSION_ID;
   const SESSION_B = '11111111-2222-4333-8444-555555555555';
   const fullRecord = fleetExhaustedRecord(cwd, 9);
   const splitAt = Math.floor(fullRecord.length / 2);
@@ -5067,18 +5066,22 @@ test('a session revisited mid-record continues the partial line instead of losin
       child.pid = 5151;
       calls.push([...args]);
       if (calls.length === 1) {
+        // SESSION_A is the real launch session (matching what the registry
+        // will claim), not a separate switch destination — the point is a
+        // plain, ungated revisit, not a switch chained onto another switch.
+        const sessionA = args[args.indexOf('--session-id') + 1];
         setTimeout(async () => {
           // Write only the first half of the error line (no trailing
           // newline yet) before this child ever polls A.
-          await writeLiveSession(transcriptRoot, 5151, SESSION_A);
-          await writeFile(join(dir, `${SESSION_A}.jsonl`), fullRecord.slice(0, splitAt));
+          await writeLiveSession(transcriptRoot, 5151, sessionA);
+          await writeFile(join(dir, `${sessionA}.jsonl`), fullRecord.slice(0, splitAt));
           await new Promise(resolve => setTimeout(resolve, 30));
           // Switch away before the rest of the line ever arrives.
           await writeLiveSession(transcriptRoot, 5151, SESSION_B);
           await new Promise(resolve => setTimeout(resolve, 30));
           // Switch back to A and only now complete the line.
-          await writeLiveSession(transcriptRoot, 5151, SESSION_A);
-          await appendFile(join(dir, `${SESSION_A}.jsonl`), `${fullRecord.slice(splitAt)}\n`);
+          await writeLiveSession(transcriptRoot, 5151, sessionA);
+          await appendFile(join(dir, `${sessionA}.jsonl`), `${fullRecord.slice(splitAt)}\n`);
         }, 10);
       } else {
         setTimeout(() => child.finish(0), 10);
@@ -5092,7 +5095,8 @@ test('a session revisited mid-record continues the partial line instead of losin
   assert.equal(result.status, 0);
   assert.deepEqual(waits, [9000]);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1], ['--resume', SESSION_A, 'continue']);
+  const sessionA = calls[0][calls[0].indexOf('--session-id') + 1];
+  assert.deepEqual(calls[1], ['--resume', sessionA, 'continue']);
 });
 
 test('an untimed error already in a newly visited session is not treated as a fresh failure', async t => {
@@ -5322,4 +5326,139 @@ test('a pre-existing untimed error that only completes its newline later is stil
 
   assert.equal(result.status, 0);
   assert.equal(calls.length, 1);
+});
+
+test('an intermediate session visit does not drop the gate that keeps an old untimed error rejected', async t => {
+  // Finding 2a (round 6): the cursor saved offset/pending/identity on
+  // departure but not the gate state (minRecordTimeMs/historicalBoundary),
+  // and revisiting hardcoded minRecordTimeMs = null — so A -> B (gate armed,
+  // old untimed error buffered unterminated) -> C -> B restored the partial
+  // line but with the gate gone, adopting that old error as new once its
+  // newline finally arrived.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-gate-carry-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const SESSION_B = SWITCHED_SESSION_ID;
+  const SESSION_C = '11111111-2222-4333-8444-555555555555';
+  const untimed = JSON.parse(fleetExhaustedRecord(cwd, 9));
+  delete untimed.timestamp;
+  // No trailing newline: pre-existing, not yet terminated.
+  await writeFile(join(dir, `${SESSION_B}.jsonl`), JSON.stringify(untimed));
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('an old untimed error must stay rejected across an intermediate visit'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5757;
+      calls.push([...args]);
+      setTimeout(async () => {
+        // A -> B: buffers the unterminated old error into `pending`, gate armed.
+        await writeLiveSession(transcriptRoot, 5757, SESSION_B);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        // B -> C: departs with the old error still unresolved in `pending`.
+        await writeLiveSession(transcriptRoot, 5757, SESSION_C);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        // C -> B: must restore the SAME gate, not drop it.
+        await writeLiveSession(transcriptRoot, 5757, SESSION_B);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        // Only now does the old line finally get its newline.
+        await appendFile(join(dir, `${SESSION_B}.jsonl`), '\n');
+        await new Promise(resolve => setTimeout(resolve, 40));
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});
+
+test('a file replaced while a switch gate is still active does not inherit the old boundary', async t => {
+  // Finding 2b (round 6): rotation/truncation reset offset/pending/identity
+  // but never historicalBoundaryOffset — a still-active gate from the file
+  // being replaced kept gating the unrelated new file by coincidence of
+  // byte offset, permanently losing a genuinely new untimed error in it.
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-gate-rotate-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `${SWITCHED_SESSION_ID}.jsonl`);
+  // A sizeable pre-existing backlog so the gate (armed on first visit) is
+  // still active (currentOffset has not yet caught up to the boundary)
+  // when the file gets replaced.
+  await writeFile(path, `${normalAssistantRecord(cwd)}\n`.repeat(50));
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 5858;
+      calls.push([...args]);
+      if (calls.length === 1) {
+        setTimeout(async () => {
+          // First-time switch: gate armed against the 50-line backlog.
+          await writeLiveSession(transcriptRoot, 5858, SWITCHED_SESSION_ID);
+          // Give real polls a chance to establish currentIdentity against
+          // the OLD file before it's replaced (the fix applies once a gate
+          // was armed for this session at all, not only while still mid-
+          // backlog, but the rotation itself must be detected against an
+          // already-observed identity to exercise that code path at all).
+          await new Promise(resolve => setTimeout(resolve, 30));
+          // Replace the file at the same path with a short, unrelated new
+          // one (new inode) carrying a genuinely new untimed error.
+          const untimed = JSON.parse(fleetExhaustedRecord(cwd, 9));
+          delete untimed.timestamp;
+          await link(path, `${path}.old`);
+          await writeFile(`${path}.new`, `${JSON.stringify(untimed)}\n`);
+          await rename(`${path}.new`, path);
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [9000]);
+  assert.deepEqual(calls[1], ['--resume', SWITCHED_SESSION_ID, 'continue']);
 });

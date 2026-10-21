@@ -695,11 +695,18 @@ async function monitorChild({
     // offset): a trailing partial line not yet terminated by a newline is
     // held in `pending`, and discarding it on a later revisit would lose
     // whatever record it completes into.
+    // The switch-boundary gate (minRecordTimeMs/historicalBoundaryOffset/
+    // historicalPending) belongs to whichever session's backlog it was
+    // measuring — it must travel with the cursor too, or a later revisit
+    // re-arms (or drops) a gate that was about this session specifically.
     sessionCursors.set(currentSessionId, {
       offset: currentOffset,
       identity: currentIdentity,
       pending,
       skippingOversizedLine,
+      minRecordTimeMs,
+      historicalBoundaryOffset,
+      historicalPending,
     });
     const departureAtMs = lastConfirmedAtMs;
     lastConfirmedAtMs = observedAtMs;
@@ -718,7 +725,9 @@ async function monitorChild({
       currentIdentity = revisited.identity;
       pending = revisited.pending;
       skippingOversizedLine = revisited.skippingOversizedLine;
-      minRecordTimeMs = null;
+      minRecordTimeMs = revisited.minRecordTimeMs;
+      historicalBoundaryOffset = revisited.historicalBoundaryOffset;
+      historicalPending = revisited.historicalPending;
       return;
     }
     pending = Buffer.alloc(0);
@@ -800,6 +809,19 @@ async function monitorChild({
       currentOffset = 0;
       pending = Buffer.alloc(0);
       skippingOversizedLine = false;
+      // A gate active for the file being replaced describes bytes that no
+      // longer exist at this path — reusing its boundary against the new
+      // file's (unrelated) bytes would misjudge them by coincidence of
+      // offset. Unlike a session switch, a rotation has no "backlog that
+      // predates this child's watch" concept at all (the existing rotation
+      // test already assumes the replacement file's content is read fresh,
+      // ungated); drop the gate entirely rather than re-arming it against
+      // the new file.
+      if (minRecordTimeMs !== null) {
+        minRecordTimeMs = null;
+        historicalBoundaryOffset = null;
+        historicalPending = false;
+      }
     }
     if (info.size === currentOffset && (!final || pending.length === 0)) {
       currentIdentity = { dev: info.dev, ino: info.ino };
