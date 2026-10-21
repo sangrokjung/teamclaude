@@ -3494,6 +3494,9 @@ async function cloudDispatchCommand() {
     // Re-read disk: the running server persists refreshed tokens there.
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
     ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    // Without this, the account chosen before the snapshot push (git network
+    // I/O) is never re-checked against a later clock before launchCloud runs.
+    liveNow: () => Date.now(),
     dryRun,
     base,
   }));

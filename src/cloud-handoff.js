@@ -413,6 +413,16 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
 // account with credit may exist among the ones never reached).
 export const CLOUD_ACCOUNT_LOOKUP_INCOMPLETE = Object.freeze({ incomplete: true });
 
+// The repo-wide identity rule (same as index.js's private sameAccountIdentity,
+// duplicated here since config.js/index.js are not a dependency of this
+// module): accountUuid when both sides have one, name otherwise. Accounts are
+// NEVER matched by array position or object reference across async steps —
+// a re-login, re-index, or another process's edit can reorder/replace them.
+export function sameAccountIdentity(a, b) {
+  if (a?.accountUuid && b?.accountUuid) return a.accountUuid === b.accountUuid;
+  return a?.name === b?.name;
+}
+
 // Whether an account can carry a cloud session now: an OAuth token that stays
 // valid for at least MIN_TOKEN_LIFETIME_MS. Shared with the credit feeder so
 // it counts exactly the accounts a dispatch could use.
@@ -458,6 +468,7 @@ export async function findCloudAccount({
   const { account, credits } = funded[index];
   return {
     name: account.name,
+    accountUuid: account.accountUuid ?? null,
     accessToken: account.accessToken,
     remainingDollars: credits.remainingDollars,
   };

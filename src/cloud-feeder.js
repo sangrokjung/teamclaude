@@ -14,6 +14,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { handoffBranchName, isCloudEligibleAccount } from './cloud-handoff.js';
 
+// A stable per-account key for the budget ledger: accountUuid when present
+// (the repo-wide identity rule — see cloud-handoff.js's sameAccountIdentity),
+// name otherwise. Two DIFFERENT accounts can never collide on this key: a
+// legacy pair sharing a name with neither carrying an accountUuid is the one
+// case this can't disambiguate, and totalCredit rejects that explicitly
+// rather than silently merging their balances/freshness under one entry.
+function accountIdentityKey(account, index) {
+  return typeof account?.accountUuid === 'string' && account.accountUuid
+    ? `uuid:${account.accountUuid}`
+    : `name:${String(account?.name ?? `#${index}`)}`;
+}
+
 export const FEED_DEFAULTS = Object.freeze({
   enabled: false,
   expiresAt: '2026-11-05T07:59:00Z',
@@ -162,10 +174,17 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   return { allowed, target, spentToday, state: nextState };
 }
 
+// Reasons that mean "nothing was tried yet, a clock lost a race" rather than
+// "this was tried and failed" — retried on the very next tick, never held for
+// the full `retryAfterDays` cooldown that fits a scarce-resource wait
+// (no credit, locked account, ...).
+const RETRY_NEXT_TICK_REASONS = new Set(['token-expired-before-launch']);
+
 // Whether `key` may be dispatched (again) now.
 export function isDue(entry, now, cfg) {
   if (!entry) return true;
   if (entry.exit === 0 || entry.exit === 4) return false;
+  if (RETRY_NEXT_TICK_REASONS.has(entry.reason)) return true;
   const last = Date.parse(entry.ts);
   return !Number.isFinite(last) || now.getTime() - last >= cfg.retryAfterDays * DAY_MS;
 }
@@ -326,13 +345,25 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
   let failed = 0;
   let excluded = 0;
   const perAccount = {};
+  const keyedBy = new Map(); // identity key -> the account object already using it
   for (const [index, account] of (accounts ?? []).entries()) {
     if (account?.enabled === false || !isCloudEligibleAccount(account, now)) {
       excluded += 1;
       continue;
     }
     eligible += 1;
-    const name = String(account.name ?? `#${index}`);
+    const key = accountIdentityKey(account, index);
+    const owner = keyedBy.get(key);
+    if (owner && owner !== account) {
+      // Two DISTINCT accounts resolve to the same identity key — neither
+      // carries an accountUuid and they share a name (a legacy pair; a real
+      // accountUuid collision is impossible). Merging their balances/freshness
+      // under one ledger entry would be silently wrong either way, so this
+      // account's credit is excluded rather than guessed at.
+      excluded += 1;
+      continue;
+    }
+    keyedBy.set(key, account);
     try {
       const credits = await creditLookup(account.accessToken);
       if (credits === null || credits === undefined) {
@@ -343,7 +374,7 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
         excluded += 1;
       } else {
         const dollars = Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
-        perAccount[name] = dollars;
+        perAccount[key] = dollars;
         total += dollars;
       }
     } catch {

@@ -57,6 +57,14 @@ test('sent and uncertain work is never re-sent; refused work retries after a wee
   assert.equal(isDue({ exit: 3, ts: '2026-10-10T00:00:00Z' }, NOW, cfg), true);
 });
 
+test('a token that expired only during the push to launch is retried next tick, not held a week', () => {
+  // Same exit code (3) and a timestamp from seconds ago as the ordinary
+  // no-credit-account case above — only the reason distinguishes "nothing was
+  // actually tried" from "tried and failed for a reason that needs a cooldown".
+  assert.equal(isDue({ exit: 3, reason: 'token-expired-before-launch', ts: NOW.toISOString() }, NOW, cfg), true);
+  assert.equal(isDue({ exit: 3, reason: 'no-credit-account', ts: NOW.toISOString() }, NOW, cfg), false);
+});
+
 test('sources are interleaved, deduplicated and limited to repos with a local clone', () => {
   const merged = interleave([['a1', 'a2', 'a3'], ['b1'], [], ['c1', 'c2']]);
   assert.deepEqual(merged, ['a1', 'b1', 'c1', 'a2', 'c2', 'a3']);
@@ -151,7 +159,7 @@ test('total credit skips disabled accounts and is incomplete when any lookup fai
   ];
   const all = await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 10 }) });
   assert.deepEqual([all.total, all.complete, all.failed, all.excluded], [20, true, 0, 1]);
-  assert.deepEqual(all.perAccount, { a: 10, c: 10 });
+  assert.deepEqual(all.perAccount, { 'name:a': 10, 'name:c': 10 });
   // One failed lookup makes the sum incomplete (never a smaller "balance").
   const partial = await totalCredit({ accounts, creditLookup: async t => (t === 'a' ? { remainingDollars: 10 } : null) });
   assert.deepEqual([partial.total, partial.complete, partial.failed], [10, false, 1]);
@@ -165,6 +173,33 @@ test('total credit skips disabled accounts and is incomplete when any lookup fai
     creditLookup: async t => (t === 'x' ? null : { remainingDollars: 7 }),
   });
   assert.deepEqual([expired.total, expired.complete, expired.excluded], [7, true, 1]);
+});
+
+test('two accounts sharing a name but carrying distinct accountUuids are never merged', async () => {
+  const valid = Date.now() + 3_600_000;
+  const accounts = [
+    { name: 'same-name', accountUuid: 'uuid-1', type: 'oauth', accessToken: 'tok-1', expiresAt: valid },
+    { name: 'same-name', accountUuid: 'uuid-2', type: 'oauth', accessToken: 'tok-2', expiresAt: valid },
+  ];
+  const result = await totalCredit({
+    accounts,
+    creditLookup: async t => ({ remainingDollars: t === 'tok-1' ? 3000 : 0 }),
+  });
+  assert.deepEqual([result.total, result.complete, result.excluded], [3000, true, 0]);
+  assert.deepEqual(result.perAccount, { 'uuid:uuid-1': 3000, 'uuid:uuid-2': 0 });
+});
+
+test('a legacy pair sharing a name with neither carrying an accountUuid is rejected, not merged', async () => {
+  const valid = Date.now() + 3_600_000;
+  const accounts = [
+    { name: 'legacy', type: 'oauth', accessToken: 'tok-first', expiresAt: valid },
+    { name: 'legacy', type: 'oauth', accessToken: 'tok-second', expiresAt: valid },
+  ];
+  const result = await totalCredit({ accounts, creditLookup: async () => ({ remainingDollars: 3000 }) });
+  // The first account using the ambiguous key is kept; the second is excluded
+  // rather than silently overwriting the first's budget entry.
+  assert.deepEqual([result.total, result.complete, result.excluded], [3000, true, 1]);
+  assert.deepEqual(result.perAccount, { 'name:legacy': 3000 });
 });
 
 function feedDeps(overrides = {}) {

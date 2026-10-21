@@ -33,6 +33,7 @@ import {
   isExecutableFile,
   remoteUrlIsFixedPoint,
   pushHandoffSnapshot,
+  sameAccountIdentity,
 } from './cloud-handoff.js';
 import { scanSnapshotForSecrets, textHasSecret } from './snapshot-scan.js';
 
@@ -332,8 +333,11 @@ export async function attemptCloudDispatch({
   // findCloudAccount returned) still carries expiresAt, so re-verify against
   // the live clock now that the snapshot push has spent however long it spent.
   // Nothing has been launched yet, so a failure here is safely retryable
-  // (RUN_LOCAL), unlike an uncertain post-launch result (AMBIGUOUS).
-  const matchedAccount = Array.isArray(accounts) ? accounts.find(a => a?.name === account.name) : null;
+  // (RUN_LOCAL), unlike an uncertain post-launch result (AMBIGUOUS). Matched by
+  // identity (accountUuid first, name only as a fallback for legacy accounts
+  // without one) so a re-login that reuses a name but gets a new accountUuid
+  // can never have this check read a different account's expiresAt.
+  const matchedAccount = Array.isArray(accounts) ? accounts.find(a => sameAccountIdentity(a, account)) : null;
   if (matchedAccount && !isCloudEligibleAccount(matchedAccount, liveNow())) {
     return local('token-expired-before-launch');
   }

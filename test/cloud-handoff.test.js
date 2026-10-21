@@ -130,7 +130,7 @@ test('findCloudAccount picks among the top three credit balances of valid OAuth 
   };
 
   const best = await findCloudAccount({ accounts, creditLookup, now, random: () => 0 });
-  assert.deepEqual(best, { name: 'b', accessToken: 'tok-b', remainingDollars: 200 });
+  assert.deepEqual(best, { name: 'b', accountUuid: null, accessToken: 'tok-b', remainingDollars: 200 });
   assert.equal(lookups.includes('tok-expiring'), false);
   assert.equal(lookups.includes('tok-api'), false);
 
