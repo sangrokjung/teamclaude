@@ -3539,10 +3539,11 @@ async function cloudFeedCommand() {
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
     creditLookup: token => fetchCloudCredits(token),
     repoIndex: getRepoIndex,
-    listIssues,
+    listIssues: owners => listIssues(owners, log),
     listTasks,
-    listPulls,
+    listPulls: owners => listPulls(owners, log),
     defaultBase,
+    saveState: state => writeFeederState(state),
     dispatch: ({ task, cwd, base }) => attemptCloudDispatch({
       task,
       cwd,

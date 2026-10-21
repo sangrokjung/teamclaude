@@ -3,25 +3,33 @@
 
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync } from 'node:fs';
-import { mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
 
-const LOCK_STALE_MS = 2 * 60 * 60 * 1000;
 const REVIEW_TIMEOUT_MS = 25 * 60 * 1000;
+const LIST_LIMIT = 1000;
 
 export function feederStatePath() {
   return join(homedir(), '.config', 'teamclaude.cloud-feeder.json');
 }
 
+// A missing file is a fresh start; an unreadable or corrupt one is an error
+// (treating it as empty would resend everything already sent).
 export async function readFeederState(path = feederStatePath()) {
+  let text;
   try {
-    return JSON.parse(await readFile(path, 'utf8'));
-  } catch {
-    return { sent: {} };
+    text = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { sent: {} };
+    throw error;
   }
+  const state = JSON.parse(text);
+  if (!state || typeof state !== 'object' || typeof state.sent !== 'object') throw new Error('corrupt feeder state');
+  return state;
 }
 
 export async function writeFeederState(state, path = feederStatePath()) {
@@ -30,24 +38,49 @@ export async function writeFeederState(state, path = feederStatePath()) {
   await rename(temp, path);
 }
 
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
 // One feeder at a time (launchd tick and a manual run share the state file).
+// The lock names its owner (pid + nonce); it is only taken over when that pid
+// is gone, and only released by the owner that still holds it.
 export async function withFeederLock(fn, path = `${feederStatePath()}.lock`) {
+  const nonce = randomUUID();
+  const take = async () => {
+    const handle = await open(path, 'wx', 0o600);
+    try {
+      await handle.writeFile(JSON.stringify({ pid: process.pid, nonce }));
+    } finally {
+      await handle.close();
+    }
+  };
   try {
-    const info = await stat(path);
-    if (Date.now() - info.mtimeMs > LOCK_STALE_MS) await rm(path, { force: true });
-  } catch {}
-  let handle;
-  try {
-    handle = await open(path, 'wx', 0o600);
+    await take();
   } catch {
-    return { locked: true };
+    let holder = null;
+    try {
+      holder = JSON.parse(await readFile(path, 'utf8'));
+    } catch {}
+    if (!Number.isInteger(holder?.pid) || pidAlive(holder.pid)) return { locked: true };
+    await rm(path, { force: true });
+    try {
+      await take();
+    } catch {
+      return { locked: true };
+    }
   }
   try {
-    await handle.writeFile(String(process.pid));
     return { locked: false, value: await fn() };
   } finally {
-    await handle.close();
-    await rm(path, { force: true });
+    try {
+      if (JSON.parse(await readFile(path, 'utf8')).nonce === nonce) await rm(path, { force: true });
+    } catch {}
   }
 }
 
@@ -69,28 +102,50 @@ function ghJson(args) {
   return JSON.parse(result.stdout || '[]');
 }
 
-export function listIssues(owners) {
-  return owners.flatMap(owner => ghJson([
-    'search', 'issues', '--owner', owner, '--state', 'open', '--limit', '200',
-    '--json', 'repository,number,title,body,labels',
-  ]));
+function warnTruncated(what, list, log) {
+  if (list.length >= LIST_LIMIT) log?.(`[cloud-feed] ${what} list hit the ${LIST_LIMIT} limit; later items are not seen this run`);
+  return list;
 }
 
-export function listPulls(owners) {
-  const repos = new Set(owners.flatMap(owner => ghJson([
-    'search', 'prs', '--owner', owner, '--state', 'open', '--limit', '200', '--json', 'repository',
-  ]).map(pull => pull.repository?.nameWithOwner).filter(Boolean)));
-  return [...repos].flatMap(repo => ghJson([
-    'pr', 'list', '-R', repo, '--state', 'open', '--limit', '50',
-    '--json', 'number,title,isDraft,headRefName,headRefOid,author',
-  ]).map(pull => ({ ...pull, repository: { nameWithOwner: repo } })));
+export function listIssues(owners, log) {
+  return owners.flatMap(owner => warnTruncated(`issues(${owner})`, ghJson([
+    'search', 'issues', '--owner', owner, '--state', 'open', '--limit', String(LIST_LIMIT),
+    '--json', 'repository,number,title,body,labels,authorAssociation',
+  ]), log));
+}
+
+// Open PRs: trust (author association) from search, head fields per repo.
+export function listPulls(owners, log) {
+  const found = owners.flatMap(owner => warnTruncated(`prs(${owner})`, ghJson([
+    'search', 'prs', '--owner', owner, '--state', 'open', '--limit', String(LIST_LIMIT),
+    '--json', 'repository,number,title,isDraft,author,authorAssociation',
+  ]), log));
+  const byRepo = new Map();
+  for (const pull of found) {
+    const repo = pull.repository?.nameWithOwner;
+    if (!repo) continue;
+    if (!byRepo.has(repo)) byRepo.set(repo, new Map());
+    byRepo.get(repo).set(pull.number, pull);
+  }
+  const out = [];
+  for (const [repo, pulls] of byRepo) {
+    const heads = ghJson([
+      'pr', 'list', '-R', repo, '--state', 'open', '--limit', String(LIST_LIMIT),
+      '--json', 'number,headRefName,headRefOid,isCrossRepository',
+    ]);
+    for (const head of heads) {
+      const pull = pulls.get(head.number);
+      if (pull) out.push({ ...pull, ...head, repository: { nameWithOwner: repo } });
+    }
+  }
+  return out;
 }
 
 const TASK_QUERY = [
   'select t.id, t.title, t.description, p.github_repo',
   'from os_tasks t join os_projects p on p.id = t.project_id',
   "where t.status = 'todo' and coalesce(p.github_repo, '') <> ''",
-  'order by t.created_at limit 100',
+  `order by t.created_at limit ${LIST_LIMIT}`,
 ].join(' ');
 
 // Read-only ledger query through the guarded CLI.
@@ -139,19 +194,35 @@ export function defaultBase(cwd) {
   return null;
 }
 
+// The PR opened from exactly this branch of this repository (never a fork's
+// branch that happens to share the name).
 export function findPull(repo, branch) {
-  return ghJson([
-    'pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '1',
-    '--json', 'number,state,isDraft,headRefOid,title,baseRefName',
-  ])[0] ?? null;
+  const pulls = ghJson([
+    'pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '20',
+    '--json', 'number,state,isDraft,headRefOid,headRefName,isCrossRepository,title,baseRefName',
+  ]);
+  return pulls.find(pull => pull.headRefName === branch && pull.isCrossRepository === false) ?? null;
 }
 
+// [] = no checks configured; null = the query failed (unknown, so wait).
 export function listChecks(repo, number) {
   const result = run('gh', ['pr', 'checks', String(number), '-R', repo, '--json', 'name,state,bucket']);
+  if (/no checks reported/i.test(result.stderr)) return [];
+  // gh exits 8 while checks are pending; the JSON is still complete.
+  if (result.status !== 0 && result.status !== 8 && result.status !== 1) return null;
   try {
-    return JSON.parse(result.stdout || '[]');
+    const checks = JSON.parse(result.stdout);
+    return Array.isArray(checks) ? checks : null;
   } catch {
-    return [];
+    return null;
+  }
+}
+
+function headOf(repo, number) {
+  try {
+    return ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'headRefOid']).headRefOid ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -159,16 +230,24 @@ export function listChecks(repo, number) {
 export async function reviewPull(repo, pull, cwd) {
   const scratch = await mkdtemp(join(tmpdir(), 'teamclaude-feed-review-'));
   try {
+    // The diff must be the one of pull.headRefOid, the commit merged later
+    // (--match-head-commit): the head is read before and after the diff.
+    if (headOf(repo, pull.number) !== pull.headRefOid) return null;
     const diff = run('gh', ['pr', 'diff', String(pull.number), '-R', repo]);
     if (diff.status !== 0 || !diff.stdout.trim()) return null;
+    if (headOf(repo, pull.number) !== pull.headRefOid) return null;
     const diffPath = join(scratch, 'pr.diff');
     await writeFile(diffPath, diff.stdout);
     const result = run('bash', [
       join(homedir(), '.claude', 'scripts', 'codex-astra-review.sh'),
       '--diff', diffPath, '--label', `cloud-feed ${repo}#${pull.number}`,
     ], { cwd: cwd ?? dirname(diffPath), timeout: REVIEW_TIMEOUT_MS });
-    const verdict = `${result.stdout}\n${result.stderr}`.match(/^VERDICT:\s*(APPROVE|REQUEST_CHANGES)\b/m);
-    return verdict ? verdict[1] : null;
+    // The engine's exit code is its final (gate-adjusted) verdict: 0 approve,
+    // 1 request changes; anything else is no verdict.
+    const verdict = `${result.stdout}\n${result.stderr}`.match(/^VERDICT:\s*(APPROVE|REQUEST_CHANGES)\b/m)?.[1];
+    if (result.status === 0 && !result.error && verdict === 'APPROVE') return 'APPROVE';
+    if (result.status === 1 && verdict === 'REQUEST_CHANGES') return 'REQUEST_CHANGES';
+    return null;
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
