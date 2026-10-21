@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   FEED_DEFAULTS,
+  feedConfig,
   githubRepoOf,
   improvementCandidates,
   interleave,
@@ -511,4 +512,30 @@ test('a locked account is left out, so locking is never read as spending', async
   assert.ok(midday.allowed > 0);
   const unlocked = planBudget({ state: midday.state, perAccount: (await read(false)).perAccount, now: new Date('2026-10-21T07:00:00Z'), cfg: { ...cfg, perRun: 50 } });
   assert.equal(unlocked.spentToday, 0);
+});
+
+test('spend seen before an account drops out still counts after it is gone', () => {
+  const opts = { cfg: { ...cfg, perRun: 50, estCost: 1 } };
+  const morning = planBudget({ state: { sent: {} }, perAccount: { a: 1000, b: 2000 }, now: NOW, ...opts });
+  const spent = planBudget({ state: morning.state, perAccount: { a: 1000, b: 1700 }, now: new Date('2026-10-21T03:00:00Z'), ...opts });
+  assert.equal(spent.spentToday, 300);
+  const gone = planBudget({ state: spent.state, perAccount: { a: 1000 }, now: new Date('2026-10-21T04:00:00Z'), ...opts });
+  assert.equal(gone.spentToday, 300);
+  // $300 already exceeds the ~$196 daily target: still nothing more today.
+  assert.equal(spent.allowed, 0);
+  assert.equal(gone.allowed, 0);
+  const back = planBudget({ state: gone.state, perAccount: { a: 1000, b: 1650 }, now: new Date('2026-10-21T05:00:00Z'), ...opts });
+  assert.equal(back.spentToday, 350);
+});
+
+test('invalid feeder settings fail before anything is planned', () => {
+  for (const bad of [
+    { perRun: 'invalid' }, { perRun: -1 }, { perRun: 1.5 }, { estCost: 0 }, { estCost: 'x' },
+    { enabled: 'yes' }, { expiresAt: 'soon' }, { owners: 'qjc-office' }, { owners: ['bad owner'] },
+    { triageLookups: NaN }, { roots: 'x' },
+  ]) {
+    assert.throws(() => feedConfig({ cloudFeed: bad }), JSON.stringify(bad));
+  }
+  assert.equal(feedConfig({ cloudFeed: { enabled: true } }).perRun, 3);
+  assert.deepEqual(selectCandidates({ candidates: [{ key: 'k', repo: 'o/a' }], state: {}, now: NOW, cfg, max: NaN, hasRepo: () => true }), []);
 });

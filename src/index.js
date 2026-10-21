@@ -3523,7 +3523,14 @@ async function cloudFeedCommand() {
     log('[cloud-feed] No Claude-pool config; nothing to do.');
     return;
   }
-  const cfg = feedConfig(config);
+  let cfg;
+  try {
+    cfg = feedConfig(config);
+  } catch (error) {
+    log(`[cloud-feed] Invalid configuration: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
   if (sub === 'status') {
     console.log(JSON.stringify({ enabled: cfg.enabled, ...summarize(await readFeederState()) }));
     return;

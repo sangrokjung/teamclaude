@@ -38,8 +38,28 @@ function quoted(label, text) {
   return [`${label}:`, ...String(text ?? '').split('\n').map(line => `> ${line}`)].join('\n');
 }
 
+// Merged settings, validated: a bad value fails before anything is planned
+// (a NaN limit would otherwise lift every cap).
 export function feedConfig(config) {
-  return { ...FEED_DEFAULTS, ...(config?.cloudFeed ?? {}) };
+  const cfg = { ...FEED_DEFAULTS, ...(config?.cloudFeed ?? {}) };
+  const wholeAtLeast = (key, min) => {
+    if (!Number.isInteger(cfg[key]) || cfg[key] < min) throw new Error(`cloudFeed.${key} must be an integer >= ${min}`);
+  };
+  if (typeof cfg.enabled !== 'boolean') throw new Error('cloudFeed.enabled must be true or false');
+  if (!Number.isFinite(Date.parse(cfg.expiresAt))) throw new Error('cloudFeed.expiresAt must be a date');
+  wholeAtLeast('perRun', 0);
+  wholeAtLeast('triageLookups', 0);
+  wholeAtLeast('retryAfterDays', 0);
+  wholeAtLeast('noPrAfterHours', 0);
+  wholeAtLeast('noPrRecheckHours', 0);
+  if (!(Number.isFinite(cfg.estCost) && cfg.estCost > 0)) throw new Error('cloudFeed.estCost must be a positive number');
+  if (!Array.isArray(cfg.owners) || cfg.owners.some(owner => typeof owner !== 'string' || !/^[A-Za-z0-9-]+$/.test(owner))) {
+    throw new Error('cloudFeed.owners must be GitHub owner names');
+  }
+  if (cfg.roots !== undefined && (!Array.isArray(cfg.roots) || cfg.roots.some(root => typeof root !== 'string'))) {
+    throw new Error('cloudFeed.roots must be a list of paths');
+  }
+  return cfg;
 }
 
 function dayKey(now) {
@@ -80,12 +100,16 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
   const today = dayKey(now);
   const sameDay = state?.day?.date === today && state.day.openingByAccount && typeof state.day.openingByAccount === 'object';
   const openingByAccount = { ...(sameDay ? state.day.openingByAccount : {}) };
+  // Last balance seen per account today: an account that drops out (locked,
+  // expired, disabled) keeps the spend already observed for it.
+  const lastByAccount = { ...(sameDay && state.day.lastByAccount && typeof state.day.lastByAccount === 'object' ? state.day.lastByAccount : {}) };
   for (const [name, dollars] of Object.entries(balances)) {
     if (!Number.isFinite(openingByAccount[name])) openingByAccount[name] = dollars;
+    lastByAccount[name] = dollars;
   }
   const opening = Object.values(openingByAccount).reduce((sum, value) => sum + value, 0);
-  const measured = Object.entries(balances)
-    .reduce((sum, [name, dollars]) => sum + Math.max(0, openingByAccount[name] - dollars), 0);
+  const measured = Object.entries(openingByAccount)
+    .reduce((sum, [name, start]) => sum + Math.max(0, start - (Number.isFinite(lastByAccount[name]) ? lastByAccount[name] : start)), 0);
   const daysLeft = Math.max(1, (expires - now.getTime()) / DAY_MS);
   const target = opening / daysLeft;
   // A cloud session bills over time, so the balance lags behind what was
@@ -99,7 +123,7 @@ export function planBudget({ state, remainingDollars, perAccount, now, cfg }) {
     allowed,
     target,
     spentToday,
-    state: { ...state, day: { date: today, openingDollars: opening, openingByAccount } },
+    state: { ...state, day: { date: today, openingDollars: opening, openingByAccount, lastByAccount } },
   };
 }
 
@@ -122,6 +146,7 @@ export function interleave(lists) {
 }
 
 export function selectCandidates({ candidates, state, now, cfg, max, hasRepo }) {
+  if (!Number.isInteger(max) || max < 0) return [];
   const seen = new Set();
   const chosen = [];
   for (const candidate of candidates) {
