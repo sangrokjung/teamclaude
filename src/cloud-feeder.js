@@ -275,8 +275,12 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
       const credits = await creditLookup(account.accessToken);
       if (credits === null || credits === undefined) {
         failed += 1;
+      } else if (credits.lockedReason) {
+        // Locked credit is not spendable now, nor spent: leave the account
+        // out (like an expired token) so locking is never read as spending.
+        excluded += 1;
       } else {
-        const dollars = !credits.lockedReason && Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
+        const dollars = Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
         perAccount[name] = dollars;
         total += dollars;
       }

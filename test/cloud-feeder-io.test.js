@@ -83,3 +83,31 @@ esac
   assert.deepEqual(result.items.filter(p => p.repository.nameWithOwner === 'o/small').map(p => p.number), [7]);
   assert.ok(logs.some(line => /o\/full truncated/.test(line)) && logs.some(line => /o\/broken failed/.test(line)));
 });
+
+test('commit checks: statuses are read across pages and an unexplained aggregate state is unknown', { skip: process.platform === 'win32' }, async t => {
+  const dir = await scratch(t);
+  const fake = join(dir, 'gh');
+  const sha = 'c'.repeat(40);
+  // Status pages: 30 successes on page 1, one failure on page 2 (total 31).
+  await writeFile(fake, `#!/bin/sh
+case "$2" in
+  repos/o/paged/commits/*/check-runs*) echo '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}' ;;
+  repos/o/paged/commits/*/status*page=1) node -e 'console.log(JSON.stringify({state:"failure",total_count:31,statuses:Array.from({length:30},(_,i)=>({context:"s"+i,state:"success"}))}))' ;;
+  repos/o/paged/commits/*/status*page=2) echo '{"state":"failure","total_count":31,"statuses":[{"context":"late","state":"failure"}]}' ;;
+  repos/o/liar/commits/*/check-runs*) echo '{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}' ;;
+  repos/o/liar/commits/*/status*) echo '{"state":"failure","total_count":1,"statuses":[{"context":"x","state":"success"}]}' ;;
+  repos/o/short/commits/*/check-runs*) echo '{"check_runs":[]}' ;;
+  repos/o/short/commits/*/status*) echo '{"state":"success","total_count":5,"statuses":[]}' ;;
+esac
+`);
+  await chmod(fake, 0o755);
+  const previous = process.env.PATH;
+  process.env.PATH = `${dir}:${previous}`;
+  t.after(() => { process.env.PATH = previous; });
+  const { listChecks } = await import('../src/cloud-feeder-io.js');
+  const paged = listChecks('o/paged', sha);
+  assert.equal(paged.length, 32);
+  assert.ok(paged.some(check => check.name === 'late' && check.bucket === 'fail'));
+  assert.equal(listChecks('o/liar', sha), null, 'aggregate failure without a failing status');
+  assert.equal(listChecks('o/short', sha), null, 'fewer statuses than total_count');
+});

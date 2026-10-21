@@ -497,3 +497,18 @@ test('checks are read for the exact head commit the PR was seen at', async () =>
   });
   assert.deepEqual(asked, ['a'.repeat(40)]);
 });
+
+test('a locked account is left out, so locking is never read as spending', async () => {
+  const valid = Date.now() + 3_600_000;
+  const accounts = [{ name: 'a', type: 'oauth', accessToken: 'a', expiresAt: valid }, { name: 'b', type: 'oauth', accessToken: 'b', expiresAt: valid }];
+  const read = lockB => totalCredit({ accounts, creditLookup: async t => (t === 'b' && lockB ? { remainingDollars: 2000, lockedReason: 'x' } : { remainingDollars: t === 'a' ? 1000 : 2000 }) });
+  const morning = planBudget({ state: { sent: {} }, perAccount: (await read(false)).perAccount, now: NOW, cfg: { ...cfg, perRun: 50 } });
+  const locked = await read(true);
+  assert.equal(locked.complete, true);
+  assert.equal(locked.excluded, 1);
+  const midday = planBudget({ state: morning.state, perAccount: locked.perAccount, now: new Date('2026-10-21T06:00:00Z'), cfg: { ...cfg, perRun: 50 } });
+  assert.equal(midday.spentToday, 0);
+  assert.ok(midday.allowed > 0);
+  const unlocked = planBudget({ state: midday.state, perAccount: (await read(false)).perAccount, now: new Date('2026-10-21T07:00:00Z'), cfg: { ...cfg, perRun: 50 } });
+  assert.equal(unlocked.spentToday, 0);
+});

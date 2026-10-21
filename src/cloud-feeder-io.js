@@ -276,9 +276,25 @@ export function listChecks(repo, sha) {
       if (items.length < 100) break;
       if (page === 10) return null;
     }
-    const combined = ghJson(['api', `repos/${repo}/commits/${sha}/status`]);
-    if (!Array.isArray(combined?.statuses)) return null;
-    const statuses = combined.statuses.map(status => ({ name: status.context, bucket: STATUS_BUCKET[status.state] ?? 'unknown' }));
+    // Combined status, every page; incomplete pages or an aggregate state the
+    // collected statuses do not explain make the answer unknown (null).
+    const statuses = [];
+    let total = null;
+    let aggregate = null;
+    for (let page = 1; page <= 10; page += 1) {
+      const combined = ghJson(['api', `repos/${repo}/commits/${sha}/status?per_page=100&page=${page}`]);
+      if (!Array.isArray(combined?.statuses) || !Number.isInteger(combined.total_count)) return null;
+      total = combined.total_count;
+      aggregate = combined.state;
+      for (const status of combined.statuses) statuses.push({ name: status.context, bucket: STATUS_BUCKET[status.state] ?? 'unknown' });
+      if (statuses.length >= total || combined.statuses.length === 0) break;
+    }
+    if (statuses.length !== total) return null;
+    if (total > 0) {
+      const has = bucket => statuses.some(status => status.bucket === bucket);
+      if (['failure', 'error'].includes(aggregate) && !has('fail')) return null;
+      if (aggregate === 'pending' && !has('pending')) return null;
+    }
     return [...runs, ...statuses];
   } catch {
     return null;
