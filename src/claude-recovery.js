@@ -3,12 +3,13 @@ import {
   chmod,
   mkdir,
   open,
+  readFile,
   readdir,
   stat,
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { parseClaudeRecoveryAccount } from './claude-auth.js';
 import { modelQuotaLabel } from './account-manager.js';
 import { attemptCloudHandoff } from './cloud-handoff.js';
@@ -554,6 +555,23 @@ async function stopChild(child) {
   }
 }
 
+// Claude Code rewrites <config>/sessions/<pid>.json with the new sessionId on
+// every in-process session switch (/clear, /resume — verified in the 2.1.304
+// bundle). Following it is the only way to see a recoverable error written to
+// the switched-to session's transcript; anything unverifiable returns null so
+// the watcher keeps its current session.
+export async function readLiveSessionId(sessionsRoot, pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let record;
+  try {
+    record = JSON.parse(await readFile(join(sessionsRoot, `${pid}.json`), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (record?.pid !== pid || typeof record.sessionId !== 'string') return null;
+  return UUID_RE.test(record.sessionId) ? record.sessionId : null;
+}
+
 const TRANSCRIPT_SCAN_CHUNK_BYTES = 1024 * 1024;
 const TRANSCRIPT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 
@@ -569,11 +587,14 @@ async function monitorChild({
   launchStartedAtMs = 0,
   transcriptSizesBeforeLaunch = null,
   pollIntervalMs,
+  sessionsRoot = null,
 }) {
   const exited = (exitPromise || childExit(child)).then(result => ({ type: 'exit', result }));
   let currentPath = transcriptPath;
   let currentSessionId = sessionId;
-  const sessionWasKnownAtLaunch = Boolean(sessionId);
+  let sessionWasKnownAtLaunch = Boolean(sessionId);
+  let pathKnownAbsent = transcriptKnownAbsent;
+  let lastScanAtMs = launchStartedAtMs;
   let currentOffset = offset;
   let currentIdentity = null;
   let pending = Buffer.alloc(0);
@@ -583,7 +604,39 @@ async function monitorChild({
     ? Math.min(1000, Math.max(100, pollIntervalMs))
     : 1000;
 
+  async function followSessionSwitch() {
+    const scanStartedAtMs = Date.now();
+    const previousScanAtMs = lastScanAtMs;
+    lastScanAtMs = scanStartedAtMs;
+    if (!sessionsRoot || !currentSessionId) return;
+    const liveSessionId = await readLiveSessionId(sessionsRoot, child.pid);
+    if (!liveSessionId || liveSessionId === currentSessionId) return;
+    currentSessionId = liveSessionId;
+    sessionWasKnownAtLaunch = true;
+    pending = Buffer.alloc(0);
+    skippingOversizedLine = false;
+    currentIdentity = null;
+    // An error left in the previous session no longer blocks this child.
+    unresolvedEvent = null;
+    currentPath = await findTranscript(transcriptRoot, liveSessionId);
+    const info = currentPath ? await stat(currentPath).catch(() => null) : null;
+    if (!info) {
+      // /clear creates the transcript lazily: everything it ever holds is new.
+      currentPath = null;
+      pathKnownAbsent = true;
+      currentOffset = 0;
+      return;
+    }
+    // /resume of an older session: its history is not this child's failure,
+    // unless the file was created since the last poll (a /clear racing us).
+    pathKnownAbsent = false;
+    currentOffset = Number.isFinite(info.birthtimeMs) && info.birthtimeMs >= previousScanAtMs
+      ? 0
+      : info.size;
+  }
+
   async function scanTranscript(final = false) {
+    if (!final) await followSessionSwitch();
     if (!currentSessionId) currentSessionId = await findLatestSession(transcriptRoot, cwd);
     if (!currentPath && currentSessionId) {
       currentPath = await findTranscript(transcriptRoot, currentSessionId);
@@ -599,7 +652,7 @@ async function monitorChild({
         // even when the file was created by this child. ID-less discovery still
         // uses the birthtime/snapshot safeguards because it can find an older
         // transcript with an unknown session owner.
-        const createdForLaunch = transcriptKnownAbsent
+        const createdForLaunch = pathKnownAbsent
           && (sessionWasKnownAtLaunch
             || (Number.isFinite(discovered?.birthtimeMs)
               && discovered.birthtimeMs >= launchStartedAtMs));
@@ -806,6 +859,7 @@ export async function runClaudeWithRecovery({
   config,
   cwd = process.cwd(),
   transcriptRoot = join(homedir(), '.claude', 'projects'),
+  sessionsRoot = join(dirname(transcriptRoot), 'sessions'),
   handoffRoot = join(homedir(), '.config', 'teamclaude-handoffs'),
   pollIntervalMs = 1000,
   fetchStatus,
@@ -1134,6 +1188,7 @@ export async function runClaudeWithRecovery({
       launchStartedAtMs,
       transcriptSizesBeforeLaunch,
       pollIntervalMs,
+      sessionsRoot,
     });
     if (outcome.type === 'exit') {
       await releaseFleetRecoveryClaim();

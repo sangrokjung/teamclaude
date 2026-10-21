@@ -4526,3 +4526,190 @@ test('a session on another model is not handed off for a Fable-only shortage', a
       `the session waits and resumes instead: ${JSON.stringify({ claudeArgs, childEnv })}`);
   }
 });
+
+// Claude Code rewrites ~/.claude/sessions/<pid>.json with the new sessionId on
+// every in-process session switch (/clear, /resume). The wrapper must follow
+// it, or a fleet error in the switched-to session is never seen (2026-10-20:
+// a session parked for 12h on "Retry in 5107s" because the wrapper still
+// watched the launch session's transcript).
+async function writeLiveSession(transcriptRoot, pid, sessionId) {
+  const dir = join(transcriptRoot, '..', 'sessions');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `${pid}.json`), JSON.stringify({ pid, sessionId, kind: 'interactive' }));
+}
+
+const SWITCHED_SESSION_ID = '97faf00a-747d-44b2-88b1-d7c04b77d352';
+
+test('fleet exhaustion after an in-process session switch resumes the switched-to session', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-switch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 4242;
+      calls.push([...args]);
+      if (calls.length === 1) {
+        setTimeout(() => child.finish(0), 3000).unref();
+        const launchId = args[args.indexOf('--session-id') + 1];
+        setTimeout(async () => {
+          const dir = join(transcriptRoot, 'project');
+          await mkdir(dir, { recursive: true });
+          await writeFile(join(dir, `${launchId}.jsonl`), `${normalAssistantRecord(cwd)}\n`);
+          await writeLiveSession(transcriptRoot, 4242, launchId);
+          await new Promise(resolve => setTimeout(resolve, 30));
+          await writeLiveSession(transcriptRoot, 4242, SWITCHED_SESSION_ID);
+          await new Promise(resolve => setTimeout(resolve, 30));
+          await writeFile(
+            join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
+            `${fleetExhaustedRecord(cwd, 5107)}\n`,
+          );
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('fleet exhaustion should wait and resume Claude');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [5107000]);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1], ['--resume', SWITCHED_SESSION_ID, 'continue']);
+});
+
+test('switching to an existing session ignores its historical fleet errors', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  const dir = join(transcriptRoot, 'project');
+  await mkdir(cwd);
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
+    `${fleetExhaustedRecord(cwd, 3)}\n`,
+  );
+  const calls = [];
+  const waits = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async milliseconds => { waits.push(milliseconds); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 4343;
+      calls.push([...args]);
+      if (calls.length === 1) {
+        setTimeout(() => child.finish(0), 3000).unref();
+        setTimeout(async () => {
+          await writeLiveSession(transcriptRoot, 4343, SWITCHED_SESSION_ID);
+          await new Promise(resolve => setTimeout(resolve, 40));
+          await appendFile(
+            join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
+            `${normalAssistantRecord(cwd)}\n`,
+          );
+          await new Promise(resolve => setTimeout(resolve, 40));
+          await appendFile(
+            join(dir, `${SWITCHED_SESSION_ID}.jsonl`),
+            `${fleetExhaustedRecord(cwd, 7)}\n`,
+          );
+        }, 10);
+      } else {
+        setTimeout(() => child.finish(0), 10);
+      }
+      return child;
+    },
+    launchCodex: async () => {
+      throw new Error('fleet exhaustion should wait and resume Claude');
+    },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.deepEqual(waits, [7000]);
+  assert.deepEqual(calls[1], ['--resume', SWITCHED_SESSION_ID, 'continue']);
+});
+
+test('a live-session file owned by another pid is not followed', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-recovery-session-foreign-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project');
+  const transcriptRoot = join(root, 'transcripts');
+  await mkdir(cwd);
+  const calls = [];
+
+  const result = await runClaudeWithRecovery({
+    claudeArgs: [],
+    childEnv: {},
+    config: {
+      autoResumeClaude: true,
+      claudeAutoResumeMaxRetries: 1,
+      claudeAutoResumeBackoffMs: 0,
+      codexFallbackOnExhaustion: false,
+    },
+    cwd,
+    transcriptRoot,
+    pollIntervalMs: 5,
+    fetchStatus: async () => statusWithQuota(0.5),
+    wait: async () => { throw new Error('a foreign session must not trigger a resume'); },
+    spawnClaude(args) {
+      const child = fakeChild();
+      child.pid = 4444;
+      calls.push([...args]);
+      setTimeout(async () => {
+        const sessionsDir = join(transcriptRoot, '..', 'sessions');
+        await mkdir(sessionsDir, { recursive: true });
+        await writeFile(
+          join(sessionsDir, '4444.json'),
+          JSON.stringify({ pid: 9999, sessionId: SWITCHED_SESSION_ID }),
+        );
+        const dir = join(transcriptRoot, 'project');
+        await mkdir(dir, { recursive: true });
+        await new Promise(resolve => setTimeout(resolve, 30));
+        await writeFile(join(dir, `${SWITCHED_SESSION_ID}.jsonl`), `${fleetExhaustedRecord(cwd, 3)}\n`);
+        await new Promise(resolve => setTimeout(resolve, 60));
+        child.finish(0);
+      }, 10);
+      return child;
+    },
+    launchCodex: async () => { throw new Error('unexpected Codex launch'); },
+    log() {},
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(calls.length, 1);
+});
