@@ -42,6 +42,20 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
 import { DISPATCH_EXIT, attemptCloudDispatch, parseDispatchArgs, readTaskInput } from './cloud-dispatch.js';
+import { feedConfig, runFeed, runTriage, summarize } from './cloud-feeder.js';
+import {
+  buildRepoIndex,
+  defaultBase,
+  deleteRemoteBranch,
+  findPull,
+  listChecks,
+  listIssues,
+  listPulls,
+  listTasks,
+  readFeederState,
+  withFeederLock,
+  writeFeederState,
+} from './cloud-feeder-io.js';
 import {
   killProcess,
   launchCloudWithScript,
@@ -270,6 +284,10 @@ switch (command) {
     break;
   case 'cloud-dispatch':
     await cloudDispatchCommand();
+    process.exit(process.exitCode ?? 0);
+    break;
+  case 'cloud-feed':
+    await cloudFeedCommand();
     process.exit(process.exitCode ?? 0);
     break;
   case 'install-claude-wrapper':
@@ -3477,9 +3495,130 @@ async function cloudDispatchCommand() {
     // Re-read disk: the running server persists refreshed tokens there.
     loadAccounts: async () => (await loadConfig())?.accounts ?? [],
     ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    // Without this, the account chosen before the snapshot push (git network
+    // I/O) is never re-checked against a later clock before launchCloud runs.
+    liveNow: () => Date.now(),
     dryRun,
     base,
   }));
+}
+
+// Credit feeder; see src/cloud-feeder.js. `tick` (run then triage) is what
+// launchd calls; `run`, `triage` and `status` are for manual use.
+async function cloudFeedCommand() {
+  const log = message => console.error(message);
+  const [sub = 'status', ...rest] = args.slice(1);
+  // Strict: an option that is not exactly understood (e.g. --dry-run=true)
+  // must never fall through into a real, credit-spending run.
+  let dryRun = false;
+  let max;
+  let badOption = false;
+  for (let i = 0; i < rest.length; i += 1) {
+    if (rest[i] === '--dry-run' && !dryRun) dryRun = true;
+    else if (rest[i] === '--max' && max === undefined && /^\d{1,4}$/.test(rest[i + 1] ?? '')) max = Number(rest[(i += 1)]);
+    else badOption = true;
+  }
+  if (!['run', 'triage', 'tick', 'status'].includes(sub) || badOption) {
+    log('Usage: teamclaude cloud-feed <run|triage|tick|status> [--dry-run] [--max N]');
+    process.exitCode = 1;
+    return;
+  }
+  if (cliProvider === 'codex') {
+    log('[cloud-feed] The cloud feeder serves the Claude pool only.');
+    process.exitCode = 1;
+    return;
+  }
+  const config = await loadConfig();
+  if (!config || isCodexMode(config)) {
+    log('[cloud-feed] No Claude-pool config; nothing to do.');
+    return;
+  }
+  let cfg;
+  try {
+    cfg = feedConfig(config);
+  } catch (error) {
+    log(`[cloud-feed] Invalid configuration: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (sub === 'status') {
+    console.log(JSON.stringify({ enabled: cfg.enabled, ...summarize(await readFeederState()) }));
+    return;
+  }
+  const vendorBin = process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudClaudeBin || config.cloudSidecarClaudeBin || null;
+  const roots = cfg.roots ?? [join(homedir(), 'qjc-office'), join(homedir(), 'projects')];
+  let repoIndex = null;
+  const getRepoIndex = async () => (repoIndex ??= await buildRepoIndex(roots));
+  const deps = {
+    log,
+    loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+    creditLookup: token => fetchCloudCredits(token, { absentAsZero: true }),
+    repoIndex: getRepoIndex,
+    listIssues: repos => listIssues(repos, log),
+    listTasks,
+    listPulls: repos => listPulls(repos, log),
+    defaultBase,
+    saveState: state => writeFeederState(state),
+    dispatch: ({ task, cwd, base, prTarget, dispatchId, now, programDeadline }) => attemptCloudDispatch({
+      task,
+      cwd,
+      base,
+      prTarget,
+      newId: () => dispatchId,
+      now,
+      programDeadline,
+      // Collecting work (repo index, issues, PRs, TDL) can take minutes;
+      // token freshness must be judged against the clock right now, not the
+      // `now` already frozen into the in-flight record's branch name.
+      eligibilityNow: new Date(),
+      // The snapshot push itself (git network I/O) can further delay the
+      // actual launcher call, so re-check against the real clock again right
+      // before it, not just once at account-selection time.
+      liveNow: () => Date.now(),
+      baseEnv: process.env,
+      vendorBin,
+      loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+      ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    }),
+    findPull,
+    listChecks,
+    deleteRemoteBranch,
+    // The program's own deadline (cfg.expiresAt) is checked once against the
+    // frozen `now` at the top of runFeed; this lets it re-check with the real
+    // clock right before each candidate's actual dispatch too.
+    liveNow: () => Date.now(),
+  };
+  const outcome = await withFeederLock(async () => {
+    let state = await readFeederState();
+    const out = {};
+    if (sub === 'run' || sub === 'tick') {
+      const fed = await runFeed({ cfg, now: new Date(), state, max, dryRun, deps });
+      state = fed.state;
+      out.run = {
+        note: fed.note,
+        incomplete: fed.incomplete,
+        failedSources: fed.failedSources,
+        sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })),
+      };
+    }
+    if (sub === 'triage' || sub === 'tick') {
+      const triaged = await runTriage({ cfg, now: new Date(), state, dryRun, deps });
+      state = triaged.state;
+      out.triage = { note: triaged.note, results: triaged.results };
+    }
+    if (!dryRun) await writeFeederState(state);
+    return out;
+  });
+  if (outcome.unsupported) {
+    log('[cloud-feed] This feature requires macOS; nothing can run on this platform.');
+    process.exitCode = 1;
+    return;
+  }
+  if (outcome.locked) {
+    log('[cloud-feed] Another feeder run holds the lock; skipping.');
+    return;
+  }
+  console.log(JSON.stringify(outcome.value));
 }
 
 // One scan for legacy `run` supervisors waiting out an exhausted fleet; see
@@ -3653,6 +3792,9 @@ Commands:
                       Send TASK to a cloud session on an account with cloud
                       credits (exit 0 sent, 3 run locally, 4 uncertain);
                       --base starts it from REF, ignoring uncommitted work
+  cloud-feed <run|triage|tick|status> [--dry-run] [--max N]
+                      Keep cloud sessions busy until the credits expire and
+                      classify the PRs they open (needs cloudFeed.enabled)
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help

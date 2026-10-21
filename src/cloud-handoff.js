@@ -36,9 +36,13 @@ const MIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const MIN_REMAINING_DOLLARS = 1;
 const TOP_CANDIDATES = 3;
 // Credit lookups: bounded fan-out so a large fleet cannot stall the handoff.
-const CREDIT_LOOKUP_CONCURRENCY = 4;
-const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
-const CREDIT_LOOKUP_BUDGET_MS = 30_000;
+// Exported so the credit feeder's totalCredit() shares the exact same
+// bounded-concurrency/shared-deadline protection as findCloudAccount(),
+// instead of its own unbounded sequential scan (one slow/hanging account used
+// to stall the whole tick, and every future one behind it in the array).
+export const CREDIT_LOOKUP_CONCURRENCY = 4;
+export const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
+export const CREDIT_LOOKUP_BUDGET_MS = 30_000;
 const CREDIT_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 
 const EXCLUDED_SEGMENT_RES = [
@@ -315,10 +319,14 @@ export async function pushHandoffSnapshot({
   return { ok: true, branch, commit };
 }
 
+// `absentAsZero`: an OK response without a credit grant (the field missing or
+// null) is the answer "$0", not "unknown" (the credit feeder needs the two
+// apart; dispatch keeps the default and simply skips such accounts).
 export async function fetchCloudCredits(accessToken, {
   fetchImpl = fetch,
   timeoutMs = 5000,
   signal = null,
+  absentAsZero = false,
 } = {}) {
   const response = await fetchImpl(CREDIT_USAGE_URL, {
     headers: {
@@ -330,6 +338,9 @@ export async function fetchCloudCredits(accessToken, {
   if (!response?.ok) return null;
   const body = await response.json();
   const credits = body?.iguana_necktie;
+  if (absentAsZero && body && typeof body === 'object' && (credits === null || credits === undefined)) {
+    return { remainingDollars: 0, lockedReason: null, absent: true };
+  }
   if (!credits || typeof credits !== 'object') return null;
   const remainingDollars = Number(credits.remaining_dollars);
   if (!Number.isFinite(remainingDollars)) return null;
@@ -362,7 +373,7 @@ function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal)
   });
 }
 
-async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
+export async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
   const results = new Array(candidates.length).fill(null);
   // Starts true for every candidate: one never reached (budget exhausted
   // before its worker got to it) is exactly as unknown as one that timed
@@ -406,6 +417,29 @@ async function lookupCredits(candidates, creditLookup, { concurrency, lookupTime
 // account with credit may exist among the ones never reached).
 export const CLOUD_ACCOUNT_LOOKUP_INCOMPLETE = Object.freeze({ incomplete: true });
 
+// Whether a raw expiresAt value still has at least MIN_TOKEN_LIFETIME_MS of
+// life at `now`. The primitive both isCloudEligibleAccount and a later
+// re-check (cloud-dispatch.js) share, so a re-check never has to re-find the
+// account it already has the credential for — after rounds of chasing
+// account-identity bugs in that re-find (a same-name pair, uuid present on
+// only one side, array order...), the fix is to never re-identify at all:
+// carry the exact expiresAt the selection already resolved forward as data.
+export function hasFreshToken(expiresAt, now = Date.now()) {
+  return Number.isFinite(normalizeExpiresAt(expiresAt))
+    && normalizeExpiresAt(expiresAt) - now >= MIN_TOKEN_LIFETIME_MS;
+}
+
+// Whether an account can carry a cloud session now: an OAuth token that stays
+// valid for at least MIN_TOKEN_LIFETIME_MS. Shared with the credit feeder so
+// it counts exactly the accounts a dispatch could use.
+export function isCloudEligibleAccount(account, now = Date.now()) {
+  return Boolean(account
+    && account.type === 'oauth'
+    && typeof account.accessToken === 'string'
+    && account.accessToken.length > 0
+    && hasFreshToken(account.expiresAt, now));
+}
+
 export async function findCloudAccount({
   accounts,
   creditLookup = fetchCloudCredits,
@@ -419,12 +453,7 @@ export async function findCloudAccount({
   // No account-count cap: lookupCredits() already bounds real work by
   // concurrency and a shared time budget, so every eligible account gets a
   // chance within that budget — none is silently dropped by position.
-  const eligible = accounts.filter(account => account
-    && account.type === 'oauth'
-    && typeof account.accessToken === 'string'
-    && account.accessToken.length > 0
-    && Number.isFinite(normalizeExpiresAt(account.expiresAt))
-    && normalizeExpiresAt(account.expiresAt) - now >= MIN_TOKEN_LIFETIME_MS);
+  const eligible = accounts.filter(account => isCloudEligibleAccount(account, now));
   const { looked, incomplete } = await lookupCredits(eligible, creditLookup, {
     concurrency: Math.max(1, concurrency),
     lookupTimeoutMs,
@@ -444,8 +473,14 @@ export async function findCloudAccount({
   const { account, credits } = funded[index];
   return {
     name: account.name,
+    accountUuid: account.accountUuid ?? null,
     accessToken: account.accessToken,
     remainingDollars: credits.remainingDollars,
+    // The exact credential's own expiry, carried forward as data so a later
+    // freshness re-check never has to re-find this account in `accounts` by
+    // name/uuid (that re-find is what kept producing new identity-collision
+    // bugs across rounds — see hasFreshToken's comment).
+    expiresAt: normalizeExpiresAt(account.expiresAt),
   };
 }
 

@@ -28,6 +28,7 @@ import {
   fetchCloudCredits,
   findCloudAccount,
   handoffBranchName,
+  hasFreshToken,
   inspectHandoffRepo,
   isExecutableFile,
   remoteUrlIsFixedPoint,
@@ -75,10 +76,11 @@ export async function isFolderTrusted(dir, {
   }
 }
 
-export function buildDispatchPrompt({ branch, task }) {
+export function buildDispatchPrompt({ branch, task, prTarget = null }) {
+  const target = prTarget ? `\`${prTarget}\` 브랜치` : '기본 브랜치';
   return [
     '로컬 Claude Code 세션이 이 작업을 클라우드 세션에 맡깁니다.',
-    `브랜치 ${branch}에서 시작해 작업하고, 같은 브랜치에 커밋·push한 뒤 기본 브랜치 대상 PR을 여세요.`,
+    `브랜치 ${branch}에서 시작해 작업하고, 같은 브랜치에 커밋·push한 뒤 ${target} 대상 PR을 여세요.`,
     'PR 본문에 무엇을 바꿨고 무엇을 어떻게 검증했는지 적으세요. 머지는 하지 마세요(로컬에서 교차 검증 뒤 머지합니다).',
     '',
     '작업:',
@@ -240,7 +242,29 @@ export async function attemptCloudDispatch({
   dryRun = false,
   // null: snapshot HEAD plus uncommitted changes; a ref: start from exactly it.
   base = null,
+  // Branch the PR should target (default: the repository's default branch).
+  prTarget = null,
   now = new Date(),
+  // `now` also fixes the branch name (it must match whatever the caller may
+  // already have recorded before invoking this), so it can be stale by the
+  // time a slow collection phase (listing repos, issues, PRs...) reaches this
+  // call. Credential freshness must use the real clock at THIS moment, not
+  // that frozen value, or an account whose token expired while we were busy
+  // collecting work would still look eligible. Defaults to `now` so other
+  // callers that pass a live clock keep working unchanged.
+  eligibilityNow = now,
+  // Re-checked again right before the actual launcher call: `eligibilityNow`
+  // only proves freshness at account-selection time, but the snapshot push
+  // (git network I/O, up to 120s) can still let the token lapse before
+  // launchCloud is invoked. A function, not a value, so each call sees a fresh
+  // clock even though dispatch is async. Defaults to `eligibilityNow` (no
+  // additional drift assumed) so a caller that injects only `eligibilityNow`
+  // keeps its existing behavior; a real caller should pass `() => Date.now()`.
+  liveNow = () => eligibilityNow.getTime(),
+  // A caller's own hard deadline (e.g. the credit feeder's cfg.expiresAt), as
+  // an epoch ms number. Re-checked against `liveNow()` right before launch,
+  // alongside the account's own token freshness. null/omitted: no such limit.
+  programDeadline = null,
   random = Math.random,
   newId = randomUUID,
   creditLookupOptions = {},
@@ -271,7 +295,7 @@ export async function attemptCloudDispatch({
   const account = await findCloudAccount({
     accounts,
     creditLookup,
-    now: now.getTime(),
+    now: eligibilityNow.getTime(),
     random,
     ...creditLookupOptions,
   });
@@ -308,7 +332,46 @@ export async function attemptCloudDispatch({
     });
   if (!snapshot.ok) return local(snapshot.reason);
 
-  const prompt = buildDispatchPrompt({ branch: snapshot.branch, task });
+  // A rejection past this point still leaves the just-pushed branch behind
+  // with no cloud session ever started to use it. Best-effort delete it
+  // (nothing else can ever reference it, so there is nothing to lose), and
+  // report its name regardless of whether the delete itself succeeds — a
+  // RUN_LOCAL caller must still be able to find/clean it up if the delete
+  // push fails too, instead of an untracked branch silently accumulating on
+  // every retry.
+  const abortAfterPush = async reason => {
+    const deleted = await runGit(
+      ['push', '--quiet', '--', repo.remoteUrl, `:refs/heads/${snapshot.branch}`],
+      { cwd: repo.root, env: gitEnv, timeoutMs: 30_000 },
+    ).then(r => r.status === 0).catch(() => false);
+    // `branchDeleted: false` tells the caller (the credit feeder) this branch
+    // needs to go on a durable pending-cleanup list, since nothing else will
+    // ever retry deleting it otherwise. `remoteUrl` is the exact, already
+    // verified destination this was pushed to — a later cleanup retry must
+    // target that same URL directly, not whatever a clone's `origin` alias
+    // happens to resolve to by then (it can be repointed independently).
+    return { ...local(reason), branch: snapshot.branch, branchDeleted: deleted, remoteUrl: repo.remoteUrl };
+  };
+
+  // Re-verify against the live clock now that the snapshot push has spent
+  // however long it spent. `account.expiresAt` is the exact credential
+  // findCloudAccount already resolved — checked directly, never by re-finding
+  // the account in `accounts` by name/uuid (every such re-find kept being a
+  // fresh source of account-identity bugs: a same-name pair, a uuid present
+  // on only one side, array order...). Nothing has been launched yet, so a
+  // failure here is safely retryable (RUN_LOCAL), unlike an uncertain
+  // post-launch result (AMBIGUOUS).
+  if (!hasFreshToken(account.expiresAt, liveNow())) {
+    return abortAfterPush('token-expired-before-launch');
+  }
+  // Likewise the caller's own program deadline (e.g. the credit feeder's
+  // cfg.expiresAt), re-checked at the same late point rather than only once
+  // long before this push started.
+  if (Number.isFinite(programDeadline) && !(liveNow() < programDeadline)) {
+    return abortAfterPush('program-expired-before-launch');
+  }
+
+  const prompt = buildDispatchPrompt({ branch: snapshot.branch, task, prTarget });
   let result = null;
   try {
     result = await launchCloud({
@@ -325,7 +388,12 @@ export async function attemptCloudDispatch({
     && (result.error.code === 'ENOENT' || result.error.code === 'EACCES')
     && !result.pid);
   if (url === null) {
-    if (neverSpawned) return local('launch-failed');
+    // A spawn-time failure (binary missing/not executable) happens AFTER the
+    // snapshot was already pushed, same as the pre-launch rejections above —
+    // it must go through the same cleanup-and-track path, or this specific
+    // failure shape silently orphans the branch exactly like the bug those
+    // fixes were for.
+    if (neverSpawned) return abortAfterPush('launch-failed');
     return { ok: false, exit: DISPATCH_EXIT.AMBIGUOUS, reason: 'launch-uncertain', branch: snapshot.branch };
   }
   let ledgerRecorded = false;

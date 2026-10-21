@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { git, makeRepo } from './helpers/git-fixture.js';
 import { ALNUM } from './helpers/secret-fixtures.js';
-import { defaultRunGit } from '../src/cloud-handoff.js';
+import { defaultRunGit, handoffBranchName } from '../src/cloud-handoff.js';
 import {
   DISPATCH_EXIT,
   DISPATCH_TASK_MAX_BYTES,
@@ -19,7 +19,6 @@ import {
   parseDispatchArgs,
   readTaskInput,
 } from '../src/cloud-dispatch.js';
-import { textHasSecret } from '../src/snapshot-scan.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
 // One clock for the fixture: token expiry is judged against `now`, not the wall clock.
@@ -175,10 +174,14 @@ test('launch outcomes: only a printed session link counts as sent', async t => {
   const f = await fixture(t);
   const outcomeOf = launchCloud => attemptCloudDispatch(inputs(f, { launchCloud }));
 
-  // The launcher never started: nothing can exist.
+  // The launcher never started: nothing can exist, but the snapshot WAS
+  // already pushed before this spawn attempt, so it must still be tracked
+  // and cleaned up exactly like the pre-launch rejections above.
   const notSpawned = await outcomeOf(async () => ({ error: Object.assign(new Error('x'), { code: 'ENOENT' }), status: null }));
   assert.equal(notSpawned.exit, DISPATCH_EXIT.RUN_LOCAL);
   assert.equal(notSpawned.reason, 'launch-failed');
+  assert.match(notSpawned.branch, /^teamclaude-handoff\//, 'a spawn-time failure must not orphan the already-pushed branch untracked');
+  assert.equal(notSpawned.branchDeleted, true);
 
   // It ran but printed no link: a session may exist server-side.
   for (const result of [
@@ -231,6 +234,10 @@ test('prompt names the branch and carries the task verbatim', () => {
   assert.ok(prompt.includes('teamclaude-handoff/abc-1'));
   assert.ok(prompt.endsWith('README 정리'));
   assert.ok(prompt.includes('머지는 하지 마세요'));
+  assert.ok(prompt.includes('기본 브랜치 대상 PR'));
+  const targeted = buildDispatchPrompt({ branch: 'b', task: 't', prTarget: 'feat/x' });
+  assert.ok(targeted.includes('`feat/x` 브랜치 대상 PR'));
+  assert.ok(!targeted.includes('기본 브랜치 대상'));
 });
 
 test('session link comes only from the launcher\'s whole Resume line', () => {
@@ -646,4 +653,149 @@ test('an unpushed signed commit fails closed (run locally), a pushed base does n
   git(f.repo, f.env, 'push', '--quiet', '-u', 'origin', 'main');
   const pushed = await attemptCloudDispatch(inputs(f, { base: 'main' }));
   assert.equal(pushed.exit, DISPATCH_EXIT.DISPATCHED);
+});
+
+test('credential freshness is judged by eligibilityNow, not the branch-naming clock, when they diverge', async t => {
+  const f = await fixture(t);
+  // Margin looks fine measured from the frozen `now` (6 min, over the 5 min
+  // floor) but a slow collection phase means the real clock has moved on 10
+  // minutes by dispatch time: by then this token has 4 min left, under the
+  // floor.
+  const expiresSoonFromRealNow = NOW.getTime() + 6 * 60_000;
+  const tenMinutesLater = new Date(NOW.getTime() + 10 * 60_000);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: expiresSoonFromRealNow }],
+    eligibilityNow: tenMinutesLater,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'no-credit-account');
+});
+
+test('branch naming still uses the frozen now even when eligibilityNow is later', async t => {
+  const f = await fixture(t);
+  const muchLater = new Date(NOW.getTime() + 10 * 60_000);
+  const outcome = await attemptCloudDispatch(inputs(f, { eligibilityNow: muchLater }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW));
+});
+
+test('a token that lapses during the snapshot push is caught right before launch, not after', async t => {
+  const f = await fixture(t);
+  // Fine margin at selection time (6 min, over the 5 min floor from `now`),
+  // but the push to the handoff branch (git network I/O) is slow enough that
+  // by the time we are about to invoke the launcher, only 4 min are left.
+  const expiresAt = NOW.getTime() + 6 * 60_000;
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt }],
+    launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(launched, false, 'the launcher must never run once the chosen account is no longer eligible');
+});
+
+test('a token that is still fresh by liveNow launches normally', async t => {
+  const f = await fixture(t);
+  const expiresAt = NOW.getTime() + 6 * 60_000;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt }],
+    liveNow: () => NOW.getTime() + 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+});
+
+// The pre-launch recheck no longer re-finds the account in `accounts` at all
+// (every re-find kept being a fresh source of identity-collision bugs across
+// rounds: uuid on only one side, array order, ...) — it reads the exact
+// credential's expiresAt that findCloudAccount already resolved and carried
+// forward as data. These two cases are exactly the ones that broke the old
+// re-find approach, proven here by a decoy sharing the selected account's
+// name that would mislead ANY re-find, whether by uuid-aware identity or not.
+for (const uuidKind of ['uuid-bearing', 'legacy-no-uuid']) {
+  test(`the pre-launch recheck reads the exact selected credential's own expiry, not a same-name decoy's (${uuidKind})`, async t => {
+    const f = await fixture(t);
+    // A decoy sharing the chosen account's name, generously long-lived, with
+    // $0 credit so findCloudAccount can never select IT.
+    const decoy = { name: 'dup', type: 'oauth', accessToken: 'tok-decoy', expiresAt: NOW.getTime() + 3_600_000 };
+    // The account actually selected: funded, but only 6 min of margin at
+    // selection time — expired by the time liveNow (10 min later) is checked.
+    const selected = {
+      name: 'dup',
+      ...(uuidKind === 'uuid-bearing' ? { accountUuid: 'uuid-x' } : {}),
+      type: 'oauth',
+      accessToken: 'tok-dup',
+      expiresAt: NOW.getTime() + 6 * 60_000,
+    };
+    let launched = false;
+    const outcome = await attemptCloudDispatch(inputs(f, {
+      loadAccounts: async () => [decoy, selected],
+      creditLookup: async token => ({ remainingDollars: token === 'tok-dup' ? 100 : 0, lockedReason: null }),
+      launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+      liveNow: () => NOW.getTime() + 10 * 60_000,
+    }));
+    assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+    assert.equal(outcome.reason, 'token-expired-before-launch');
+    assert.equal(launched, false, 'must check the actually-selected account, not its same-name decoy');
+  });
+}
+
+test('a programDeadline that lapses during the snapshot push is caught right before launch', async t => {
+  const f = await fixture(t);
+  let launched = false;
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    programDeadline: NOW.getTime() + 5 * 60_000,
+    launchCloud: async () => { launched = true; return { status: 0, signal: null, output: created('session_default') }; },
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'program-expired-before-launch');
+  assert.equal(launched, false);
+});
+
+test('a programDeadline that has not lapsed yet does not block launch', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    programDeadline: NOW.getTime() + 5 * 60_000,
+    liveNow: () => NOW.getTime() + 60_000,
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
+});
+
+test('a pre-launch rejection after the snapshot was pushed cleans up the branch and still names it', async t => {
+  const f = await fixture(t);
+  const calls = [];
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: NOW.getTime() + 6 * 60_000 }],
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+    runGit: (args, options) => {
+      calls.push(args);
+      return defaultRunGit(args, options);
+    },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW), 'the orphaned branch must still be named for the caller to track');
+  const deletePush = calls.find(a => a[0] === 'push' && a.includes(`:refs/heads/${outcome.branch}`));
+  assert.ok(deletePush, 'must attempt to delete the branch it just pushed');
+  // The delete actually took effect on the remote, not merely attempted.
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+  assert.equal(outcome.branchDeleted, true, 'a confirmed delete must be reported, not just attempted');
+});
+
+test('a branch delete that fails is reported as such, so the caller knows to keep tracking it', async t => {
+  const f = await fixture(t);
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: NOW.getTime() + 6 * 60_000 }],
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+    runGit: async (args, options) => {
+      if (args[0] === 'push' && args.some(a => a.startsWith(':refs/heads/'))) return { status: 1, stdout: '', stderr: 'denied' };
+      return defaultRunGit(args, options);
+    },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW));
+  assert.equal(outcome.branchDeleted, false);
 });

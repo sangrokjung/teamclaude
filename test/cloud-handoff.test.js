@@ -130,7 +130,7 @@ test('findCloudAccount picks among the top three credit balances of valid OAuth 
   };
 
   const best = await findCloudAccount({ accounts, creditLookup, now, random: () => 0 });
-  assert.deepEqual(best, { name: 'b', accessToken: 'tok-b', remainingDollars: 200 });
+  assert.deepEqual(best, { name: 'b', accountUuid: null, accessToken: 'tok-b', remainingDollars: 200, expiresAt: now + 3_600_000 });
   assert.equal(lookups.includes('tok-expiring'), false);
   assert.equal(lookups.includes('tok-api'), false);
 
@@ -274,6 +274,14 @@ test('findCloudAccount stops at the overall budget instead of waiting for slow l
     now,
     budgetMs: 50,
   }), CLOUD_ACCOUNT_LOOKUP_INCOMPLETE);
+});
+
+test('fetchCloudCredits can read a missing credit grant as $0 (absentAsZero), never an HTTP failure', async () => {
+  const ok = body => ({ fetchImpl: async () => ({ ok: true, json: async () => body }), absentAsZero: true });
+  assert.deepEqual(await fetchCloudCredits('t', ok({ iguana_necktie: null })), { remainingDollars: 0, lockedReason: null, absent: true });
+  assert.deepEqual(await fetchCloudCredits('t', ok({})), { remainingDollars: 0, lockedReason: null, absent: true });
+  assert.equal(await fetchCloudCredits('t', { fetchImpl: async () => ({ ok: false }), absentAsZero: true }), null);
+  assert.equal(await fetchCloudCredits('t', ok(null)), null);
 });
 
 test('fetchCloudCredits reads iguana_necktie from the OAuth usage endpoint', async () => {
