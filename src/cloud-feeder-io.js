@@ -92,97 +92,67 @@ function ghJson(args) {
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// A page of an oldest-first search starting at `cursor` (createdAt). A full
-// page returns the next cursor; a short one wraps back to the start, so later
-// items are reached on following runs however many stay open.
-export function nextSearchCursor(items, cursor, limit = LIST_LIMIT) {
-  if (items.length < limit) return null;
-  const last = items[items.length - 1].createdAt;
-  if (last !== cursor) return last;
-  // A full page that never leaves one timestamp would repeat forever: step
-  // one second past it (the rest of that same-second burst is skipped).
-  return new Date(Date.parse(last) + 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+// Every page of a REST list (gh --paginate --slurp), so nothing is capped.
+function restAll(path) {
+  const pages = ghJson(['api', '--paginate', '--slurp', path]);
+  return Array.isArray(pages) ? pages.flat() : [];
 }
 
-function searchPage(kind, owner, cursor, fields) {
-  const query = cursor && ISO_RE.test(cursor) ? [`created:>=${cursor}`] : [];
-  const items = ghJson([
-    'search', kind, ...query, '--owner', owner, '--state', 'open',
-    '--sort', 'created', '--order', 'asc', '--limit', String(LIST_LIMIT), '--json', `${fields},createdAt`,
-  ]);
-  return { items, next: nextSearchCursor(items, cursor) };
+// Open issues (not PRs) of the given repositories, completely.
+export function listIssues(repos) {
+  return repos.flatMap(repo => restAll(`repos/${repo}/issues?state=open&per_page=100`)
+    .filter(issue => !issue.pull_request)
+    .map(issue => ({
+      repository: { nameWithOwner: repo },
+      number: issue.number,
+      title: issue.title,
+      body: issue.body,
+      labels: issue.labels,
+      authorAssociation: issue.author_association,
+    })));
 }
 
-function paged(kind, owners, cursors, fields) {
-  const items = [];
-  const next = {};
-  for (const owner of owners) {
-    const page = searchPage(kind, owner, cursors?.[`${kind}:${owner}`] ?? null, fields);
-    items.push(...page.items);
-    next[`${kind}:${owner}`] = page.next;
-  }
-  return { items, cursors: next };
-}
-
-export function listIssues(owners, cursors) {
-  return paged('issues', owners, cursors, 'repository,number,title,body,labels,authorAssociation');
-}
-
-// Open PRs: trust (author association) from search, head fields per repo.
-export function listPulls(owners, cursors, log) {
-  const page = paged('prs', owners, cursors, 'repository,number,title,isDraft,author,authorAssociation');
-  const found = page.items;
-  const byRepo = new Map();
-  for (const pull of found) {
-    const repo = pull.repository?.nameWithOwner;
-    if (!repo) continue;
-    if (!byRepo.has(repo)) byRepo.set(repo, new Map());
-    byRepo.get(repo).set(pull.number, pull);
-  }
-  const out = [];
-  for (const [repo, pulls] of byRepo) {
-    const heads = ghJson([
-      'pr', 'list', '-R', repo, '--state', 'open', '--limit', String(LIST_LIMIT),
-      '--json', 'number,headRefName,headRefOid,isCrossRepository',
-    ]);
-    const headsByNumber = new Map(heads.map(head => [head.number, head]));
-    let viewed = 0;
-    for (const [number, pull] of pulls) {
-      let head = headsByNumber.get(number);
-      // Beyond the bulk list (1000+ open PRs): look the PR up directly, bounded.
-      if (!head && viewed < 50) {
-        viewed += 1;
-        try {
-          head = ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'number,headRefName,headRefOid,isCrossRepository']);
-        } catch {}
-      }
-      if (head) out.push({ ...pull, ...head, repository: { nameWithOwner: repo } });
-    }
-    if (heads.length >= LIST_LIMIT) log?.(`[cloud-feed] ${repo} has ${LIST_LIMIT}+ open PRs; looked ${viewed} up directly`);
-  }
-  return { items: out, cursors: page.cursors };
+// Open PRs of the given repositories, completely, with head and trust fields.
+export function listPulls(repos) {
+  return repos.flatMap(repo => restAll(`repos/${repo}/pulls?state=open&per_page=100`)
+    .map(pull => ({
+      repository: { nameWithOwner: repo },
+      number: pull.number,
+      title: pull.title,
+      isDraft: pull.draft === true,
+      author: { login: pull.user?.login },
+      authorAssociation: pull.author_association,
+      headRefName: pull.head?.ref,
+      headRefOid: pull.head?.sha,
+      isCrossRepository: String(pull.head?.repo?.full_name ?? '').toLowerCase() !== repo,
+    })));
 }
 
 // Read-only ledger query through the guarded CLI, keyset-paged on
-// (created_at, id); the cursor values are validated before use.
-export function listTasks(cursors) {
-  const cursor = cursors?.tdl;
-  const after = cursor && ISO_RE.test(cursor.createdAt ?? '') && UUID_RE.test(cursor.id ?? '')
-    ? `and (t.created_at, t.id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)`
-    : '';
-  const query = [
-    "select t.id, t.title, t.description, p.github_repo,",
-    "to_char(t.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at",
-    'from os_tasks t join os_projects p on p.id = t.project_id',
-    "where t.status = 'todo' and coalesce(p.github_repo, '') <> ''",
-    after,
-    `order by t.created_at, t.id limit ${LIST_LIMIT}`,
-  ].join(' ');
-  const result = run(join(homedir(), '.claude', 'bin', 'sb-sql'), ['--project', 'internal', query]);
-  if (result.status !== 0) throw new Error('task query failed');
-  const items = JSON.parse(result.stdout).rows ?? [];
-  const last = items[items.length - 1];
-  return { items, cursors: { tdl: items.length >= LIST_LIMIT ? { createdAt: last.created_at, id: last.id } : null } };
+// (created_at, id) until exhausted, so no task is ever beyond a cap.
+export function listTasks() {
+  const all = [];
+  let cursor = null;
+  for (let page = 0; page < 50; page += 1) {
+    const after = cursor ? `and (t.created_at, t.id) > ('${cursor.createdAt}'::timestamptz, '${cursor.id}'::uuid)` : '';
+    const query = [
+      "select t.id, t.title, t.description, p.github_repo,",
+      "to_char(t.created_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as created_at",
+      'from os_tasks t join os_projects p on p.id = t.project_id',
+      "where t.status = 'todo' and coalesce(p.github_repo, '') <> ''",
+      after,
+      `order by t.created_at, t.id limit ${LIST_LIMIT}`,
+    ].join(' ');
+    const result = run(join(homedir(), '.claude', 'bin', 'sb-sql'), ['--project', 'internal', query]);
+    if (result.status !== 0) throw new Error('task query failed');
+    const rows = JSON.parse(result.stdout).rows ?? [];
+    all.push(...rows);
+    if (rows.length < LIST_LIMIT) return all;
+    const last = rows[rows.length - 1];
+    if (!ISO_RE.test(last.created_at ?? '') || !UUID_RE.test(last.id ?? '')) throw new Error('task cursor invalid');
+    cursor = { createdAt: last.created_at, id: last.id };
+  }
+  throw new Error('task list did not end');
 }
 
 // owner/name -> trusted local clone path, from one level under each root.
@@ -213,9 +183,14 @@ export async function buildRepoIndex(roots) {
   return index;
 }
 
-// origin/<default branch> after a fetch, or null.
-export function defaultBase(cwd) {
+// After a fetch: `wanted` (an origin/<branch> ref) when it exists, else
+// origin/<default branch>; null when neither resolves.
+export function defaultBase(cwd, wanted = null) {
   if (run('git', ['-C', cwd, 'fetch', '-q', 'origin'], { timeout: 120_000 }).status !== 0) return null;
+  if (wanted) {
+    if (!/^origin\/[A-Za-z0-9._/-]+$/.test(wanted)) return null;
+    return run('git', ['-C', cwd, 'rev-parse', '--verify', '--quiet', `${wanted}^{commit}`]).status === 0 ? wanted : null;
+  }
   const head = run('git', ['-C', cwd, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).stdout.trim();
   if (head) return head;
   for (const candidate of ['origin/main', 'origin/master']) {

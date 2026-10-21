@@ -19,7 +19,6 @@ import {
   parseDispatchArgs,
   readTaskInput,
 } from '../src/cloud-dispatch.js';
-import { textHasSecret } from '../src/snapshot-scan.js';
 
 const DISPATCH_ID = '9f8e7d6c-1111-4222-8333-444455556666';
 // One clock for the fixture: token expiry is judged against `now`, not the wall clock.
@@ -231,6 +230,10 @@ test('prompt names the branch and carries the task verbatim', () => {
   assert.ok(prompt.includes('teamclaude-handoff/abc-1'));
   assert.ok(prompt.endsWith('README 정리'));
   assert.ok(prompt.includes('머지는 하지 마세요'));
+  assert.ok(prompt.includes('기본 브랜치 대상 PR'));
+  const targeted = buildDispatchPrompt({ branch: 'b', task: 't', prTarget: 'feat/x' });
+  assert.ok(targeted.includes('`feat/x` 브랜치 대상 PR'));
+  assert.ok(!targeted.includes('기본 브랜치 대상'));
 });
 
 test('session link comes only from the launcher\'s whole Resume line', () => {

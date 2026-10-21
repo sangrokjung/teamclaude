@@ -75,10 +75,11 @@ export async function isFolderTrusted(dir, {
   }
 }
 
-export function buildDispatchPrompt({ branch, task }) {
+export function buildDispatchPrompt({ branch, task, prTarget = null }) {
+  const target = prTarget ? `\`${prTarget}\` 브랜치` : '기본 브랜치';
   return [
     '로컬 Claude Code 세션이 이 작업을 클라우드 세션에 맡깁니다.',
-    `브랜치 ${branch}에서 시작해 작업하고, 같은 브랜치에 커밋·push한 뒤 기본 브랜치 대상 PR을 여세요.`,
+    `브랜치 ${branch}에서 시작해 작업하고, 같은 브랜치에 커밋·push한 뒤 ${target} 대상 PR을 여세요.`,
     'PR 본문에 무엇을 바꿨고 무엇을 어떻게 검증했는지 적으세요. 머지는 하지 마세요(로컬에서 교차 검증 뒤 머지합니다).',
     '',
     '작업:',
@@ -240,6 +241,8 @@ export async function attemptCloudDispatch({
   dryRun = false,
   // null: snapshot HEAD plus uncommitted changes; a ref: start from exactly it.
   base = null,
+  // Branch the PR should target (default: the repository's default branch).
+  prTarget = null,
   now = new Date(),
   random = Math.random,
   newId = randomUUID,
@@ -308,7 +311,7 @@ export async function attemptCloudDispatch({
     });
   if (!snapshot.ok) return local(snapshot.reason);
 
-  const prompt = buildDispatchPrompt({ branch: snapshot.branch, task });
+  const prompt = buildDispatchPrompt({ branch: snapshot.branch, task, prTarget });
   let result = null;
   try {
     result = await launchCloud({
