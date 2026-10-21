@@ -12,7 +12,14 @@
 // review) is an injected seam so the planning logic stays testable.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { handoffBranchName, isCloudEligibleAccount } from './cloud-handoff.js';
+import {
+  CREDIT_LOOKUP_BUDGET_MS,
+  CREDIT_LOOKUP_CONCURRENCY,
+  CREDIT_LOOKUP_TIMEOUT_MS,
+  handoffBranchName,
+  isCloudEligibleAccount,
+  lookupCredits,
+} from './cloud-handoff.js';
 
 // A stable per-account key for the budget ledger: accountUuid when present,
 // name otherwise. Two DIFFERENT accounts can never collide on this key: a
@@ -339,9 +346,7 @@ export function improvementCandidates(repos, now) {
 // Counts exactly the accounts a dispatch could use (enabled, eligible token);
 // the others are reported as `excluded`, not failures.
 export async function totalCredit({ accounts, creditLookup, now = Date.now() }) {
-  let total = 0;
   let eligible = 0;
-  let failed = 0;
   let excluded = 0;
   // A genuine name collision between two no-uuid accounts is order-dependent
   // (whichever one this array happens to list first "wins" the key, and
@@ -350,8 +355,9 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
   // the caller treats it exactly like any other partial read: plan nothing
   // this tick, and never let an order flip silently rewrite the ledger.
   let ambiguous = false;
-  const perAccount = {};
   const keyedBy = new Map(); // identity key -> the account object already using it
+  const keyOf = new Map(); // account object -> its identity key, for the lookup pass below
+  const candidates = [];
   for (const [index, account] of (accounts ?? []).entries()) {
     if (account?.enabled === false || !isCloudEligibleAccount(account, now)) {
       excluded += 1;
@@ -366,24 +372,44 @@ export async function totalCredit({ accounts, creditLookup, now = Date.now() }) 
       continue;
     }
     keyedBy.set(key, account);
-    try {
-      const credits = await creditLookup(account.accessToken);
-      if (credits === null || credits === undefined) {
-        failed += 1;
-      } else if (credits.lockedReason) {
-        // Locked credit is not spendable now, nor spent: leave the account
-        // out (like an expired token) so locking is never read as spending.
-        excluded += 1;
-      } else {
-        const dollars = Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
-        perAccount[key] = dollars;
-        total += dollars;
-      }
-    } catch {
+    keyOf.set(account, key);
+    candidates.push(account);
+  }
+  // Bounded fan-out (shared with findCloudAccount): a fleet with a slow or
+  // hanging account can no longer stall this whole tick, or starve every
+  // account listed after it, the way an unbounded sequential await would.
+  const { looked, incomplete } = await lookupCredits(candidates, creditLookup, {
+    concurrency: CREDIT_LOOKUP_CONCURRENCY,
+    lookupTimeoutMs: CREDIT_LOOKUP_TIMEOUT_MS,
+    budgetMs: CREDIT_LOOKUP_BUDGET_MS,
+  });
+  let total = 0;
+  let failed = 0;
+  const perAccount = {};
+  for (const { account, credits } of looked) {
+    const key = keyOf.get(account);
+    if (credits === null || credits === undefined) {
+      // Covers both a confirmed negative (the lookup answered null, or
+      // threw) and `incomplete`'s "never got an answer at all" — either way
+      // this account's balance is unknown, not a $0 observation.
       failed += 1;
+    } else if (credits.lockedReason) {
+      // Locked credit is not spendable now, nor spent: leave the account
+      // out (like an expired token) so locking is never read as spending.
+      excluded += 1;
+    } else {
+      const dollars = Number.isFinite(credits.remainingDollars) ? credits.remainingDollars : 0;
+      perAccount[key] = dollars;
+      total += dollars;
     }
   }
-  return { total, perAccount, complete: !ambiguous && eligible > 0 && failed === 0, failed, excluded };
+  return {
+    total,
+    perAccount,
+    complete: !ambiguous && !incomplete && eligible > 0 && failed === 0,
+    failed,
+    excluded,
+  };
 }
 
 // One feeding pass. `deps` supplies every side effect.

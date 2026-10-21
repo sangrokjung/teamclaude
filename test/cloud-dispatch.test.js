@@ -758,3 +758,23 @@ test('a programDeadline that has not lapsed yet does not block launch', async t 
   }));
   assert.equal(outcome.exit, DISPATCH_EXIT.DISPATCHED);
 });
+
+test('a pre-launch rejection after the snapshot was pushed cleans up the branch and still names it', async t => {
+  const f = await fixture(t);
+  const calls = [];
+  const outcome = await attemptCloudDispatch(inputs(f, {
+    loadAccounts: async () => [{ name: 'cloud-acct', type: 'oauth', accessToken: 'tok-cloud', expiresAt: NOW.getTime() + 6 * 60_000 }],
+    liveNow: () => NOW.getTime() + 10 * 60_000,
+    runGit: (args, options) => {
+      calls.push(args);
+      return defaultRunGit(args, options);
+    },
+  }));
+  assert.equal(outcome.exit, DISPATCH_EXIT.RUN_LOCAL);
+  assert.equal(outcome.reason, 'token-expired-before-launch');
+  assert.equal(outcome.branch, handoffBranchName(DISPATCH_ID, NOW), 'the orphaned branch must still be named for the caller to track');
+  const deletePush = calls.find(a => a[0] === 'push' && a.includes(`:refs/heads/${outcome.branch}`));
+  assert.ok(deletePush, 'must attempt to delete the branch it just pushed');
+  // The delete actually took effect on the remote, not merely attempted.
+  assert.equal(git(f.bare, f.env, 'branch', '--list', 'teamclaude-handoff/*'), '');
+});

@@ -36,9 +36,13 @@ const MIN_TOKEN_LIFETIME_MS = 5 * 60 * 1000;
 const MIN_REMAINING_DOLLARS = 1;
 const TOP_CANDIDATES = 3;
 // Credit lookups: bounded fan-out so a large fleet cannot stall the handoff.
-const CREDIT_LOOKUP_CONCURRENCY = 4;
-const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
-const CREDIT_LOOKUP_BUDGET_MS = 30_000;
+// Exported so the credit feeder's totalCredit() shares the exact same
+// bounded-concurrency/shared-deadline protection as findCloudAccount(),
+// instead of its own unbounded sequential scan (one slow/hanging account used
+// to stall the whole tick, and every future one behind it in the array).
+export const CREDIT_LOOKUP_CONCURRENCY = 4;
+export const CREDIT_LOOKUP_TIMEOUT_MS = 10_000;
+export const CREDIT_LOOKUP_BUDGET_MS = 30_000;
 const CREDIT_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 
 const EXCLUDED_SEGMENT_RES = [
@@ -369,7 +373,7 @@ function boundedCreditLookup(creditLookup, accessToken, timeoutMs, budgetSignal)
   });
 }
 
-async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
+export async function lookupCredits(candidates, creditLookup, { concurrency, lookupTimeoutMs, budgetMs }) {
   const results = new Array(candidates.length).fill(null);
   // Starts true for every candidate: one never reached (budget exhausted
   // before its worker got to it) is exactly as unknown as one that timed

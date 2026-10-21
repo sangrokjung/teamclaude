@@ -332,6 +332,21 @@ export async function attemptCloudDispatch({
     });
   if (!snapshot.ok) return local(snapshot.reason);
 
+  // A rejection past this point still leaves the just-pushed branch behind
+  // with no cloud session ever started to use it. Best-effort delete it
+  // (nothing else can ever reference it, so there is nothing to lose), and
+  // report its name regardless of whether the delete itself succeeds — a
+  // RUN_LOCAL caller must still be able to find/clean it up if the delete
+  // push fails too, instead of an untracked branch silently accumulating on
+  // every retry.
+  const abortAfterPush = async reason => {
+    await runGit(
+      ['push', '--quiet', '--', repo.remoteUrl, `:refs/heads/${snapshot.branch}`],
+      { cwd: repo.root, env: gitEnv, timeoutMs: 30_000 },
+    ).catch(() => {});
+    return { ...local(reason), branch: snapshot.branch };
+  };
+
   // Re-verify against the live clock now that the snapshot push has spent
   // however long it spent. `account.expiresAt` is the exact credential
   // findCloudAccount already resolved — checked directly, never by re-finding
@@ -341,13 +356,13 @@ export async function attemptCloudDispatch({
   // failure here is safely retryable (RUN_LOCAL), unlike an uncertain
   // post-launch result (AMBIGUOUS).
   if (!hasFreshToken(account.expiresAt, liveNow())) {
-    return local('token-expired-before-launch');
+    return abortAfterPush('token-expired-before-launch');
   }
   // Likewise the caller's own program deadline (e.g. the credit feeder's
   // cfg.expiresAt), re-checked at the same late point rather than only once
   // long before this push started.
   if (Number.isFinite(programDeadline) && !(liveNow() < programDeadline)) {
-    return local('program-expired-before-launch');
+    return abortAfterPush('program-expired-before-launch');
   }
 
   const prompt = buildDispatchPrompt({ branch: snapshot.branch, task, prTarget });
