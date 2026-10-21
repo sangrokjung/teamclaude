@@ -4,13 +4,12 @@
 import { spawnSync } from 'node:child_process';
 import { lstatSync, readdirSync } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
-import { mkdtemp, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { open, readFile, rename, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { isFolderTrusted } from './cloud-dispatch.js';
 import { githubRepoOf } from './cloud-feeder.js';
 
-const REVIEW_TIMEOUT_MS = 25 * 60 * 1000;
 const LIST_LIMIT = 1000;
 
 export function feederStatePath() {
@@ -92,10 +91,17 @@ function ghJson(args) {
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Every page of a REST list (gh --paginate --slurp), so nothing is capped.
-function restAll(path) {
-  const pages = ghJson(['api', '--paginate', '--slurp', path]);
-  return Array.isArray(pages) ? pages.flat() : [];
+// Every page of a REST list, one page (100 items) at a time, so a large
+// repository is neither capped nor limited by one huge response buffer.
+// `keep` filters each page as it arrives.
+function restAll(path, keep = () => true) {
+  const out = [];
+  for (let page = 1; ; page += 1) {
+    const items = ghJson(['api', `${path}${path.includes('?') ? '&' : '?'}per_page=100&page=${page}`]);
+    if (!Array.isArray(items)) throw new Error('unexpected list response');
+    out.push(...items.filter(keep));
+    if (items.length < 100) return out;
+  }
 }
 
 // Runs `fn` per repository; one repository's failure is logged and skipped,
@@ -114,8 +120,7 @@ function perRepo(repos, what, fn, log) {
 
 // Open issues (not PRs) of the given repositories, completely.
 export function listIssues(repos, log) {
-  return perRepo(repos, 'issues', repo => restAll(`repos/${repo}/issues?state=open&per_page=100`)
-    .filter(issue => !issue.pull_request)
+  return perRepo(repos, 'issues', repo => restAll(`repos/${repo}/issues?state=open`, issue => !issue.pull_request)
     .map(issue => ({
       repository: { nameWithOwner: repo },
       number: issue.number,
@@ -128,7 +133,7 @@ export function listIssues(repos, log) {
 
 // Open PRs of the given repositories, completely, with head and trust fields.
 export function listPulls(repos, log) {
-  return perRepo(repos, 'pulls', repo => restAll(`repos/${repo}/pulls?state=open&per_page=100`)
+  return perRepo(repos, 'pulls', repo => restAll(`repos/${repo}/pulls?state=open`)
     .map(pull => ({
       repository: { nameWithOwner: repo },
       number: pull.number,
@@ -220,7 +225,7 @@ export function defaultBase(cwd, wanted = null) {
 export function findPull(repo, branch) {
   const pulls = ghJson([
     'pr', 'list', '-R', repo, '--head', branch, '--state', 'all', '--limit', '20',
-    '--json', 'number,state,isDraft,headRefOid,headRefName,isCrossRepository,title,baseRefName,baseRefOid',
+    '--json', 'number,state,isDraft,headRefOid,headRefName,isCrossRepository,title,baseRefName,url',
   ]);
   return pulls.find(pull => pull.headRefName === branch && pull.isCrossRepository === false) ?? null;
 }
@@ -237,78 +242,4 @@ export function listChecks(repo, number) {
   } catch {
     return null;
   }
-}
-
-// Cross-vendor review of exactly the PR head: a detached worktree of the
-// local clone at pull.headRefOid, reviewed against pull.baseRefOid, so the
-// receipt is bound to the commit that is merged. The PR's CI results ride
-// along as evidence. Returns APPROVE, REQUEST_CHANGES or null.
-export async function reviewPull(repo, pull, cwd, checks = []) {
-  if (!cwd || !/^[0-9a-f]{40,64}$/.test(pull.headRefOid ?? '') || !/^[0-9a-f]{40,64}$/.test(pull.baseRefOid ?? '')) return null;
-  const scratch = await mkdtemp(join(tmpdir(), 'teamclaude-feed-review-'));
-  const tree = join(scratch, 'tree');
-  try {
-    if (run('git', ['-C', cwd, 'fetch', '-q', 'origin', pull.headRefOid, pull.baseRefOid], { timeout: 180_000 }).status !== 0) return null;
-    if (run('git', ['-C', cwd, 'worktree', 'add', '-q', '--detach', tree, pull.headRefOid]).status !== 0) return null;
-    const evidencePath = join(scratch, 'ci.txt');
-    await writeFile(evidencePath, [
-      `CI checks reported by GitHub for PR #${pull.number} at head ${pull.headRefOid}:`,
-      ...checks.map(check => `- ${check.name}: ${check.bucket ?? check.state}`),
-    ].join('\n'));
-    const result = run('bash', [
-      join(homedir(), '.claude', 'scripts', 'codex-astra-review.sh'),
-      '--base', pull.baseRefOid, '--evidence', evidencePath, '--label', `cloud-feed ${repo}#${pull.number}`,
-    ], { cwd: tree, timeout: REVIEW_TIMEOUT_MS });
-    // The engine's exit code is its final (gate-adjusted) verdict: 0 approve,
-    // 1 request changes; anything else is no verdict.
-    const verdict = `${result.stdout}\n${result.stderr}`.match(/^VERDICT:\s*(APPROVE|REQUEST_CHANGES)\b/m)?.[1];
-    if (result.status === 0 && !result.error && verdict === 'APPROVE') return 'APPROVE';
-    if (result.status === 1 && verdict === 'REQUEST_CHANGES') return 'REQUEST_CHANGES';
-    return null;
-  } finally {
-    run('git', ['-C', cwd, 'worktree', 'remove', '--force', tree]);
-    await rm(scratch, { recursive: true, force: true });
-  }
-}
-
-// Whether the PR head already contains the current base tip, so the CI that
-// ran on the head also covers what the merge will produce. null = unknown.
-export function headContainsBase(repo, pull) {
-  try {
-    const compare = ghJson(['api', `repos/${repo}/compare/${pull.baseRefOid}...${pull.headRefOid}`, '--jq', '{behind_by}']);
-    return Number.isInteger(compare.behind_by) ? compare.behind_by === 0 : null;
-  } catch {
-    return null;
-  }
-}
-
-// Brings a behind PR branch up to date with its base (a new head; CI reruns).
-export function updateBranch(repo, pull) {
-  return run('gh', ['pr', 'update-branch', String(pull.number), '-R', repo]).status === 0;
-}
-
-// Merges by fast-forwarding the base branch to exactly the reviewed head
-// (git ref update with force=false). GitHub refuses it atomically unless the
-// head descends from the base's current tip, so nothing untested can land if
-// the base moved after the last check. GitHub then marks the PR merged.
-export function mergePull(repo, pull) {
-  if (!/^[A-Za-z0-9._/-]+$/.test(pull.baseRefName ?? '') || !/^[0-9a-f]{40,64}$/.test(pull.headRefOid ?? '')) return false;
-  const updated = run('gh', [
-    'api', '-X', 'PATCH', `repos/${repo}/git/refs/heads/${pull.baseRefName}`,
-    '-f', `sha=${pull.headRefOid}`, '-F', 'force=false',
-  ]);
-  if (updated.status !== 0) return false;
-  return findPullByNumber(repo, pull.number)?.state === 'MERGED';
-}
-
-function findPullByNumber(repo, number) {
-  // GitHub marks the PR merged shortly after the base ref moves.
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      const pull = ghJson(['pr', 'view', String(number), '-R', repo, '--json', 'state']);
-      if (pull.state === 'MERGED') return pull;
-    } catch {}
-    run('sleep', ['2']);
-  }
-  return null;
 }

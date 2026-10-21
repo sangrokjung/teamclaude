@@ -42,20 +42,16 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
 import { DISPATCH_EXIT, attemptCloudDispatch, parseDispatchArgs, readTaskInput } from './cloud-dispatch.js';
-import { feedConfig, runFeed, runMerge, summarize } from './cloud-feeder.js';
+import { feedConfig, runFeed, runTriage, summarize } from './cloud-feeder.js';
 import {
   buildRepoIndex,
   defaultBase,
   findPull,
-  headContainsBase,
   listChecks,
   listIssues,
   listPulls,
   listTasks,
-  mergePull,
   readFeederState,
-  reviewPull,
-  updateBranch,
   withFeederLock,
   writeFeederState,
 } from './cloud-feeder-io.js';
@@ -3503,17 +3499,17 @@ async function cloudDispatchCommand() {
   }));
 }
 
-// Credit feeder; see src/cloud-feeder.js. `tick` (run then merge) is what
-// launchd calls; `run`, `merge` and `status` are for manual use.
+// Credit feeder; see src/cloud-feeder.js. `tick` (run then triage) is what
+// launchd calls; `run`, `triage` and `status` are for manual use.
 async function cloudFeedCommand() {
   const log = message => console.error(message);
   const [sub = 'status', ...rest] = args.slice(1);
   const dryRun = rest.includes('--dry-run');
   const maxIndex = rest.indexOf('--max');
   const max = maxIndex >= 0 ? Number.parseInt(rest[maxIndex + 1], 10) : undefined;
-  if (!['run', 'merge', 'tick', 'status'].includes(sub)
+  if (!['run', 'triage', 'tick', 'status'].includes(sub)
       || (maxIndex >= 0 && !(Number.isInteger(max) && max >= 0))) {
-    log('Usage: teamclaude cloud-feed <run|merge|tick|status> [--dry-run] [--max N]');
+    log('Usage: teamclaude cloud-feed <run|triage|tick|status> [--dry-run] [--max N]');
     process.exitCode = 1;
     return;
   }
@@ -3560,10 +3556,6 @@ async function cloudFeedCommand() {
     }),
     findPull,
     listChecks,
-    headContainsBase,
-    updateBranch,
-    review: async (repo, pull, checks) => reviewPull(repo, pull, (await getRepoIndex()).get(repo), checks),
-    merge: mergePull,
   };
   const outcome = await withFeederLock(async () => {
     let state = await readFeederState();
@@ -3573,10 +3565,10 @@ async function cloudFeedCommand() {
       state = fed.state;
       out.run = { note: fed.note, sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })) };
     }
-    if (sub === 'merge' || sub === 'tick') {
-      const merged = await runMerge({ cfg, now: new Date(), state, max: sub === 'merge' ? max : undefined, dryRun, deps });
-      state = merged.state;
-      out.merge = { note: merged.note, results: merged.results };
+    if (sub === 'triage' || sub === 'tick') {
+      const triaged = await runTriage({ cfg, now: new Date(), state, dryRun, deps });
+      state = triaged.state;
+      out.triage = { note: triaged.note, results: triaged.results };
     }
     if (!dryRun) await writeFeederState(state);
     return out;
@@ -3759,9 +3751,9 @@ Commands:
                       Send TASK to a cloud session on an account with cloud
                       credits (exit 0 sent, 3 run locally, 4 uncertain);
                       --base starts it from REF, ignoring uncommitted work
-  cloud-feed <run|merge|tick|status> [--dry-run] [--max N]
+  cloud-feed <run|triage|tick|status> [--dry-run] [--max N]
                       Keep cloud sessions busy until the credits expire and
-                      merge their reviewed PRs (needs cloudFeed.enabled)
+                      classify the PRs they open (needs cloudFeed.enabled)
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help

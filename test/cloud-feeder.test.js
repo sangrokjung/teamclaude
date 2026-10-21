@@ -12,13 +12,13 @@ import {
   planBudget,
   reviewCandidates,
   runFeed,
-  runMerge,
+  runTriage,
   selectCandidates,
   taskCandidates,
   totalCredit,
 } from '../src/cloud-feeder.js';
 
-const cfg = { ...FEED_DEFAULTS, enabled: true, autoMerge: true, expiresAt: '2026-11-05T07:59:00Z' };
+const cfg = { ...FEED_DEFAULTS, enabled: true, expiresAt: '2026-11-05T07:59:00Z' };
 const NOW = new Date('2026-10-21T00:00:00Z');
 
 test('budget paces the remaining credit over the days left and counts what was spent today', () => {
@@ -188,60 +188,8 @@ test('merge decisions', () => {
   assert.equal(mergeDecision({ entry: { ...entry, repo: 'qjc-office/client-ax' }, pull: open, checks: [], now: NOW, cfg }), 'awaiting-owner');
   assert.equal(mergeDecision({ entry, pull: open, checks: [{ bucket: 'fail' }], now: NOW, cfg }), 'checks-failed');
   assert.equal(mergeDecision({ entry, pull: open, checks: [{ bucket: 'pass' }, { bucket: 'pending' }], now: NOW, cfg }), 'wait');
-  assert.equal(mergeDecision({ entry, pull: open, checks: [{ bucket: 'pass' }], now: NOW, cfg }), 'review');
+  assert.equal(mergeDecision({ entry, pull: open, checks: [{ bucket: 'pass' }], now: NOW, cfg }), 'ready-for-owner');
   assert.equal(mergeDecision({ entry, pull: { ...open, isDraft: true }, checks: [], now: NOW, cfg }), 'wait');
-});
-
-test('runMerge merges only approved PRs, keeps the rest for later, and caps reviews per run', async () => {
-  const state = { sent: {
-    a: { exit: 0, repo: 'o/a', branch: 'b1', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
-    b: { exit: 0, repo: 'o/a', branch: 'b2', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
-    c: { exit: 0, repo: 'o/a', branch: 'b3', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
-    d: { exit: 3, repo: 'o/a', ts: '2026-10-20T00:00:00Z' },
-    e: { exit: 0, repo: 'o/a', branch: 'b5', ts: '2026-10-20T00:00:00Z', merge: 'merged' },
-  } };
-  const pulls = { b1: 1, b2: 2, b3: 3 };
-  const merged = [];
-  const result = await runMerge({
-    cfg: { ...cfg, mergePerRun: 2 },
-    now: NOW,
-    state,
-    dryRun: false,
-    deps: {
-      saveState: async () => {},
-      findPull: async (repo, branch) => ({ number: pulls[branch], state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
-      listChecks: async () => [{ bucket: 'pass' }],
-      headContainsBase: async () => true,
-      updateBranch: async () => true,
-      review: async (repo, pull) => (pull.number === 1 ? 'APPROVE' : 'REQUEST_CHANGES'),
-      merge: async (repo, pull) => { merged.push(pull.number); return true; },
-    },
-  });
-  assert.deepEqual(merged, [1]);
-  assert.equal(result.state.sent.a.merge, 'merged');
-  assert.equal(result.state.sent.b.merge, 'changes-requested');
-  assert.equal(result.state.sent.c.merge, 'pending', 'third review waits for the next run');
-  assert.ok(result.state.sent.c.checkedAt, 'visited, so the next pass starts elsewhere');
-  assert.equal(result.state.sent.e.merge, 'merged');
-});
-
-test('a review that could not run is retried, never merged', async () => {
-  const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b1', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
-  let merged = 0;
-  const deps = {
-    saveState: async () => {},
-    findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
-    listChecks: async () => [{ bucket: 'pass' }],
-    headContainsBase: async () => true,
-    updateBranch: async () => true,
-    review: async () => null,
-    merge: async () => { merged += 1; return true; },
-  };
-  const first = await runMerge({ cfg, now: NOW, state, dryRun: false, deps });
-  assert.equal(first.state.sent.a.merge, 'review-unavailable');
-  const second = await runMerge({ cfg, now: NOW, state: first.state, dryRun: false, deps: { ...deps, review: async () => 'APPROVE' } });
-  assert.equal(second.state.sent.a.merge, 'merged');
-  assert.equal(merged, 1);
 });
 
 test('a dispatch is recorded as in-flight before it is sent, so a crash never resends it', async () => {
@@ -260,26 +208,22 @@ test('a dispatch is recorded as in-flight before it is sent, so a crash never re
   assert.ok(!again.sent.some(s => s.key === key));
 });
 
-test('unknown check status waits; a rejected head is re-reviewed only after it changes', () => {
+test('unknown check status waits; failed checks are re-checked', () => {
   const entry = { repo: 'o/a', ts: '2026-10-20T00:00:00Z' };
   const open = { state: 'OPEN', isDraft: false, number: 1, headRefOid: 'h1' };
   assert.equal(mergeDecision({ entry, pull: open, checks: null, now: NOW, cfg }), 'wait');
-  const rejected = { ...entry, merge: 'changes-requested', mergeHead: 'h1' };
-  const green = [{ bucket: 'pass' }];
-  assert.equal(mergeDecision({ entry: rejected, pull: open, checks: green, now: NOW, cfg }), 'changes-requested');
-  assert.equal(mergeDecision({ entry: rejected, pull: { ...open, headRefOid: 'h2' }, checks: green, now: NOW, cfg }), 'review');
-  // checks-failed is not terminal: a passing re-run proceeds.
-  assert.equal(mergeDecision({ entry: { ...entry, merge: 'checks-failed' }, pull: open, checks: [{ bucket: 'pass' }], now: NOW, cfg }), 'review');
+  // checks-failed is not terminal: a passing re-run becomes ready.
+  assert.equal(mergeDecision({ entry: { ...entry, merge: 'checks-failed' }, pull: open, checks: [{ bucket: 'pass' }], now: NOW, cfg }), 'ready-for-owner');
 });
 
-test('a merge pass looks up at most mergeLookups PRs, least recently checked first', async () => {
+test('a triage pass looks up at most triageLookups PRs, least recently checked first', async () => {
   const sent = {};
   for (let i = 0; i < 5; i += 1) {
     sent[`k${i}`] = { exit: 0, repo: 'o/a', branch: `b${i}`, ts: '2026-10-20T00:00:00Z', merge: 'pending', checkedAt: `2026-10-20T0${4 - i}:00:00Z` };
   }
   const looked = [];
-  const result = await runMerge({
-    cfg: { ...cfg, mergeLookups: 2 },
+  const result = await runTriage({
+    cfg: { ...cfg, triageLookups: 2 },
     now: NOW,
     state: { sent },
     dryRun: false,
@@ -293,91 +237,16 @@ test('a merge pass looks up at most mergeLookups PRs, least recently checked fir
   assert.equal(result.results.length, 2);
 });
 
-test('reviews rotate: entries that keep failing review cannot starve the rest', async () => {
-  let state = { sent: {} };
-  for (const k of ['a', 'b', 'c']) state.sent[k] = { exit: 0, repo: 'o/a', branch: k, ts: '2026-10-20T00:00:00Z', merge: 'pending' };
-  const reviewedOrder = [];
-  const deps = {
-    saveState: async () => {},
-    findPull: async (repo, branch) => ({ number: branch.charCodeAt(0), state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'base1' }),
-    listChecks: async () => [{ bucket: 'pass' }],
-    headContainsBase: async () => true,
-    updateBranch: async () => true,
-    review: async (repo, pull) => { reviewedOrder.push(String.fromCharCode(pull.number)); return null; },
-    merge: async () => true,
-  };
-  for (let run = 0; run < 3; run += 1) {
-    state = (await runMerge({ cfg: { ...cfg, mergePerRun: 2 }, now: new Date(NOW.getTime() + run * 1000), state, dryRun: false, deps })).state;
-  }
-  assert.ok(reviewedOrder.includes('c'), `c reviewed within three runs: ${reviewedOrder.join('')}`);
-});
-
-test('an approved PR is not merged if its head, base, base commit or checks changed during the review', async () => {
-  for (const change of [
-    { headRefOid: 'h2' },
-    { baseRefName: 'release' },
-    { baseRefOid: 'base2' },
-    { checks: [{ bucket: 'fail' }] },
-    { checks: null },
-    { contains: false },
-  ]) {
-    let calls = 0;
-    let merged = false;
-    const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
-    const later = () => calls > 1;
-    const result = await runMerge({
-      cfg, now: NOW, state, dryRun: false,
-      deps: {
-        saveState: async () => {},
-        findPull: async () => {
-          calls += 1;
-          const base = { number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h1', baseRefName: 'main', baseRefOid: 'base1' };
-          const pullChange = Object.fromEntries(Object.entries(change).filter(([k]) => k !== 'checks' && k !== 'contains'));
-          return later() ? { ...base, ...pullChange } : base;
-        },
-        listChecks: async () => (later() && 'checks' in change ? change.checks : [{ bucket: 'pass' }]),
-        headContainsBase: async () => (later() && 'contains' in change ? change.contains : true),
-        updateBranch: async () => true,
-        review: async () => 'APPROVE',
-        merge: async () => { merged = true; return true; },
-      },
-    });
-    assert.equal(merged, false, JSON.stringify(change));
-    assert.equal(result.state.sent.a.merge, 'review-unavailable', JSON.stringify(change));
-  }
-});
-
-test('checks are an allowlist: only passing (or skipped next to a pass) proceeds', () => {
+test('checks are an allowlist: only passing (or skipped next to a pass) is ready', () => {
   const entry = { repo: 'o/a', ts: '2026-10-20T00:00:00Z' };
   const open = { state: 'OPEN', isDraft: false, number: 1, headRefOid: 'h1' };
   const decide = checks => mergeDecision({ entry, pull: open, checks, now: NOW, cfg });
-  assert.equal(decide([{ bucket: 'pass' }, { bucket: 'skipping' }]), 'review');
+  assert.equal(decide([{ bucket: 'pass' }, { bucket: 'skipping' }]), 'ready-for-owner');
   assert.equal(decide([{ bucket: 'skipping' }]), 'no-ci');
   assert.equal(decide([{ state: 'WAITING' }]), 'checks-unknown');
   assert.equal(decide([{}]), 'checks-unknown');
   assert.equal(decide([{ bucket: 'pass' }, { bucket: 'weird' }]), 'checks-unknown');
   assert.equal(decide({ not: 'an array' }), 'wait');
-});
-
-test('a behind PR is updated, not merged; unknown freshness waits', async () => {
-  for (const [contains, updated, expected] of [[false, true, 'pending'], [false, false, 'behind'], [null, true, 'pending']]) {
-    let merged = false;
-    const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
-    const result = await runMerge({
-      cfg, now: NOW, state, dryRun: false,
-      deps: {
-        saveState: async () => {},
-        findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h1', baseRefName: 'main', baseRefOid: 'b1' }),
-        listChecks: async () => [{ bucket: 'pass' }],
-        headContainsBase: async () => contains,
-        updateBranch: async () => updated,
-        review: async () => 'APPROVE',
-        merge: async () => { merged = true; return true; },
-      },
-    });
-    assert.equal(merged, false);
-    assert.equal(result.state.sent.a.merge, expected, `${contains} ${updated}`);
-  }
 });
 
 test('one entry whose lookup throws does not stop the others', async () => {
@@ -386,7 +255,7 @@ test('one entry whose lookup throws does not stop the others', async () => {
     good: { exit: 0, repo: 'o/a', branch: 'good', ts: '2026-10-20T00:00:00Z', merge: 'pending' },
   } };
   const looked = [];
-  const result = await runMerge({
+  const result = await runTriage({
     cfg, now: NOW, state, dryRun: false,
     deps: {
       saveState: async () => {},
@@ -430,25 +299,6 @@ test('a review dispatch starts from the PR branch and targets it', async () => {
   assert.equal(dispatched[0].prTarget, 'feat/x');
 });
 
-test('without the operator opt-in a verified PR is left for a person', async () => {
-  let reviewed = 0;
-  const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
-  const result = await runMerge({
-    cfg: { ...cfg, autoMerge: false }, now: NOW, state, dryRun: false,
-    deps: {
-      saveState: async () => {},
-      findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b1' }),
-      listChecks: async () => [{ bucket: 'pass' }],
-      headContainsBase: async () => true,
-      updateBranch: async () => true,
-      review: async () => { reviewed += 1; return 'APPROVE'; },
-      merge: async () => { throw new Error('must not merge'); },
-    },
-  });
-  assert.equal(reviewed, 0);
-  assert.equal(result.state.sent.a.merge, 'ready-for-owner');
-});
-
 test('uncertain dispatches with a branch are followed, and a late PR after no-pr is found', async () => {
   const state = { sent: {
     unsure: { exit: 4, reason: 'launch-uncertain', repo: 'o/a', branch: 'u', ts: '2026-10-20T00:00:00Z' },
@@ -457,7 +307,7 @@ test('uncertain dispatches with a branch are followed, and a late PR after no-pr
     lost: { exit: 4, reason: 'in-flight', repo: 'o/a', ts: '2026-10-20T00:00:00Z' },
   } };
   const looked = [];
-  const result = await runMerge({
+  const result = await runTriage({
     cfg, now: NOW, state, dryRun: false,
     deps: {
       saveState: async () => {},
@@ -491,25 +341,6 @@ test('today\'s dispatches reserve their estimated cost before the balance moves'
     total += p.allowed;
   }
   assert.equal(total * cfg.estCost, 30);
-});
-
-test('a merge dry run never updates a branch, even when disabled', async () => {
-  let updates = 0;
-  const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
-  const result = await runMerge({
-    cfg: { ...cfg, enabled: false }, now: NOW, state, dryRun: true,
-    deps: {
-      saveState: async () => { throw new Error('dry run must not save'); },
-      findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b1' }),
-      listChecks: async () => [{ bucket: 'pass' }],
-      headContainsBase: async () => false,
-      updateBranch: async () => { updates += 1; return true; },
-      review: async () => { throw new Error('dry run must not review'); },
-      merge: async () => { throw new Error('dry run must not merge'); },
-    },
-  });
-  assert.equal(updates, 0);
-  assert.deepEqual(result.results.map(r => r.decision), ['would-update-branch']);
 });
 
 test('the in-flight record already names the branch, so a crash after sending is still followed', async () => {
