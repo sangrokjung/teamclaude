@@ -413,3 +413,43 @@ test('list cursors are carried in state between runs', async () => {
   await runFeed({ cfg: { ...cfg, owners: ['o'] }, now: NOW, state: first.state, dryRun: true, deps });
   assert.deepEqual(seen, [null, '2026-10-01T00:00:00Z']);
 });
+
+test('today\'s dispatches reserve their estimated cost before the balance moves', () => {
+  const sent = {};
+  for (let i = 0; i < 4; i += 1) sent[`k${i}`] = { exit: 0, ts: '2026-10-21T00:10:00Z', repo: 'o/a', branch: `b${i}` };
+  sent.old = { exit: 0, ts: '2026-10-20T00:10:00Z', repo: 'o/a', branch: 'x' };
+  sent.refused = { exit: 3, ts: '2026-10-21T00:10:00Z', repo: 'o/a' };
+  // $30 left on the last day: target $30; 4 sent today reserve $12 -> $18 owed -> 6.
+  const state = { sent, day: { date: '2026-10-21', openingDollars: 30 } };
+  const plan = planBudget({ state, remainingDollars: 30, now: new Date('2026-10-21T01:00:00Z'), cfg: { ...cfg, perRun: 50, expiresAt: '2026-10-21T12:00:00Z' } });
+  assert.equal(plan.spentToday, 12);
+  assert.equal(plan.allowed, 6);
+  // Repeated runs with an unmoving balance never allocate past the target.
+  let st = state;
+  let total = 4;
+  for (let run = 0; run < 5; run += 1) {
+    const p = planBudget({ state: st, remainingDollars: 30, now: new Date('2026-10-21T01:00:00Z'), cfg: { ...cfg, perRun: 50, expiresAt: '2026-10-21T12:00:00Z' } });
+    for (let i = 0; i < p.allowed; i += 1) st.sent[`n${run}-${i}`] = { exit: 0, ts: '2026-10-21T01:00:00Z', repo: 'o/a', branch: 'z' };
+    total += p.allowed;
+  }
+  assert.equal(total * cfg.estCost, 30);
+});
+
+test('a merge dry run never updates a branch, even when disabled', async () => {
+  let updates = 0;
+  const state = { sent: { a: { exit: 0, repo: 'o/a', branch: 'b', ts: '2026-10-20T00:00:00Z', merge: 'pending' } } };
+  const result = await runMerge({
+    cfg: { ...cfg, enabled: false }, now: NOW, state, dryRun: true,
+    deps: {
+      saveState: async () => { throw new Error('dry run must not save'); },
+      findPull: async () => ({ number: 1, state: 'OPEN', isDraft: false, headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b1' }),
+      listChecks: async () => [{ bucket: 'pass' }],
+      headContainsBase: async () => false,
+      updateBranch: async () => { updates += 1; return true; },
+      review: async () => { throw new Error('dry run must not review'); },
+      merge: async () => { throw new Error('dry run must not merge'); },
+    },
+  });
+  assert.equal(updates, 0);
+  assert.deepEqual(result.results.map(r => r.decision), ['would-update-branch']);
+});
