@@ -42,6 +42,21 @@ import { SseFramer, sseErrorEvent, isEventStream } from './sse.js';
 import { buildHandoffText, findTranscript, runClaudeWithRecovery } from './claude-recovery.js';
 import { fetchCloudCredits } from './cloud-handoff.js';
 import { DISPATCH_EXIT, attemptCloudDispatch, parseDispatchArgs, readTaskInput } from './cloud-dispatch.js';
+import { feedConfig, runFeed, runMerge, summarize } from './cloud-feeder.js';
+import {
+  buildRepoIndex,
+  defaultBase,
+  findPull,
+  listChecks,
+  listIssues,
+  listPulls,
+  listTasks,
+  mergePull,
+  readFeederState,
+  reviewPull,
+  withFeederLock,
+  writeFeederState,
+} from './cloud-feeder-io.js';
 import {
   killProcess,
   launchCloudWithScript,
@@ -270,6 +285,10 @@ switch (command) {
     break;
   case 'cloud-dispatch':
     await cloudDispatchCommand();
+    process.exit(process.exitCode ?? 0);
+    break;
+  case 'cloud-feed':
+    await cloudFeedCommand();
     process.exit(process.exitCode ?? 0);
     break;
   case 'install-claude-wrapper':
@@ -3482,6 +3501,85 @@ async function cloudDispatchCommand() {
   }));
 }
 
+// Credit feeder; see src/cloud-feeder.js. `tick` (run then merge) is what
+// launchd calls; `run`, `merge` and `status` are for manual use.
+async function cloudFeedCommand() {
+  const log = message => console.error(message);
+  const [sub = 'status', ...rest] = args.slice(1);
+  const dryRun = rest.includes('--dry-run');
+  const maxIndex = rest.indexOf('--max');
+  const max = maxIndex >= 0 ? Number.parseInt(rest[maxIndex + 1], 10) : undefined;
+  if (!['run', 'merge', 'tick', 'status'].includes(sub)
+      || (maxIndex >= 0 && !(Number.isInteger(max) && max >= 0))) {
+    log('Usage: teamclaude cloud-feed <run|merge|tick|status> [--dry-run] [--max N]');
+    process.exitCode = 1;
+    return;
+  }
+  if (cliProvider === 'codex') {
+    log('[cloud-feed] The cloud feeder serves the Claude pool only.');
+    process.exitCode = 1;
+    return;
+  }
+  const config = await loadConfig();
+  if (!config || isCodexMode(config)) {
+    log('[cloud-feed] No Claude-pool config; nothing to do.');
+    return;
+  }
+  const cfg = feedConfig(config);
+  if (sub === 'status') {
+    console.log(JSON.stringify({ enabled: cfg.enabled, ...summarize(await readFeederState()) }));
+    return;
+  }
+  const vendorBin = process.env.TEAMCLAUDE_CLAUDE_BIN || config.cloudClaudeBin || config.cloudSidecarClaudeBin || null;
+  const roots = cfg.roots ?? [join(homedir(), 'qjc-office'), join(homedir(), 'projects')];
+  let repoIndex = null;
+  const getRepoIndex = async () => (repoIndex ??= await buildRepoIndex(roots));
+  const deps = {
+    log,
+    loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+    creditLookup: token => fetchCloudCredits(token),
+    repoIndex: getRepoIndex,
+    listIssues,
+    listTasks,
+    listPulls,
+    defaultBase,
+    dispatch: ({ task, cwd, base }) => attemptCloudDispatch({
+      task,
+      cwd,
+      base,
+      baseEnv: process.env,
+      vendorBin,
+      loadAccounts: async () => (await loadConfig())?.accounts ?? [],
+      ledgerPath: join(homedir(), '.config', 'teamclaude-cloud-handoffs.jsonl'),
+    }),
+    findPull,
+    listChecks,
+    review: async (repo, pull) => reviewPull(repo, pull, (await getRepoIndex()).get(repo)),
+    merge: mergePull,
+  };
+  const outcome = await withFeederLock(async () => {
+    let state = await readFeederState();
+    const out = {};
+    if (sub === 'run' || sub === 'tick') {
+      const fed = await runFeed({ cfg, now: new Date(), state, max, dryRun, deps });
+      state = fed.state;
+      out.run = { note: fed.note, sent: fed.sent.map(({ key, exit, reason, url, dryRun: dry }) => ({ key, exit, reason, url, dryRun: dry })) };
+    }
+    if (sub === 'merge' || sub === 'tick') {
+      const merged = await runMerge({ cfg, now: new Date(), state, max: sub === 'merge' ? max : undefined, dryRun, deps });
+      state = merged.state;
+      out.merge = { note: merged.note, results: merged.results };
+    }
+    if (!dryRun) await writeFeederState(state);
+    return out;
+  });
+  if (outcome.locked) {
+    log('[cloud-feed] Another feeder run holds the lock; skipping.');
+    return;
+  }
+  console.log(JSON.stringify(outcome.value));
+}
+
 // One scan for legacy `run` supervisors waiting out an exhausted fleet; see
 // src/cloud-sidecar.js. Meant to be run periodically (e.g. launchd, 60s).
 async function cloudSidecarCommand() {
@@ -3653,6 +3751,9 @@ Commands:
                       Send TASK to a cloud session on an account with cloud
                       credits (exit 0 sent, 3 run locally, 4 uncertain);
                       --base starts it from REF, ignoring uncommitted work
+  cloud-feed <run|merge|tick|status> [--dry-run] [--max N]
+                      Keep cloud sessions busy until the credits expire and
+                      merge their reviewed PRs (needs cloudFeed.enabled)
   install-claude-wrapper   Install the transparent Claude launcher
   uninstall-claude-wrapper Remove it and restore the prior launchers
   help                Show this help
