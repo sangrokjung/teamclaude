@@ -35,6 +35,8 @@ SKIP_TESTS+=(DashboardOverviewBuilderTests.swift)
 SKIP_TESTS+=(CodexStatusLoaderTests.swift)
 # UsageLoadOutcomeTests는 main.swift의 AppDelegate·대시보드를 쓴다. test_usage_load_outcome.py가 선언부와 함께 컴파일해 돌린다.
 SKIP_TESTS+=(UsageLoadOutcomeTests.swift)
+# CodexPoolRowLayoutTests는 CodexStatusView(main.swift 타입 의존)를 실제로 그린다. test_codex_pool_row_layout.py가 선언부와 함께 컴파일해 돌린다.
+SKIP_TESTS+=(CodexPoolRowLayoutTests.swift)
 # 실제 외부 표면(브라우저 탭·브라우저 도구 바이너리·메일함 dry-run)을 건드리는 테스트.
 # 게이트는 트리만의 함수여야 하므로 CC_MENUBAR_LIVE_SURFACES=1일 때만 돌리고, 아니면 env-skip으로 표시한다.
 LIVE_SURFACE_TESTS=(test_live_subscription_surface.py)
