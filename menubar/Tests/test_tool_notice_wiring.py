@@ -95,7 +95,7 @@ class ToolNoticeWiringTests(unittest.TestCase):
         for name in ("func loadUsageInBackground(", "func loadUsageQuickInBackground("):
             body = function_body(self.main, name)
             with self.subTest(loader=name):
-                self.assertIn("loadCcusageDaily(timeoutSeconds: timeout)", body)
+                self.assertIn("loadCcusageDaily(timeoutSeconds: timeout, clock: clock)", body)
                 self.assertIn("self.usageLoadOutcome = daily.outcome", body)
                 self.assertNotIn('runCcusageRaw("daily")', body)
         self.assertNotIn("usageLoadFinished", self.main)

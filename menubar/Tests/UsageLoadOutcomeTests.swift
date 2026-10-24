@@ -123,6 +123,7 @@ struct UsageLoadOutcomeTests {
 
         overlappingLoaderChecks(delegate)
         missingTodayChecks(delegate)
+        midnightChecks(delegate)
 
         print("UsageLoadOutcomeTests: ok")
     }
@@ -209,5 +210,56 @@ extension UsageLoadOutcomeTests {
         runQuick(delegate)
         precondition(delegate.usageLoadOutcome == .noData, "quick 오늘 항목 없음: \(String(describing: delegate.usageLoadOutcome))")
         precondition(delegate.currentData?.today?.totalCost == 0, "quick이 어제 값을 오늘로 썼다")
+    }
+}
+
+// MARK: - 자정 경계
+extension UsageLoadOutcomeTests {
+    /// 처음 한 번은 23:59:59, 그 뒤로는 다음 날 00:00:01을 돌려주는 시계. daily 판정 뒤 weekly·monthly가
+    /// 자정을 넘긴 상황을 만든다(실제 날짜와도 겹치지 않게 지난 날짜를 쓴다).
+    final class MidnightClock {
+        let lock = NSLock()
+        var calls = 0
+        let before: Date
+        let after: Date
+        init(day: String) {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            before = formatter.date(from: "\(day) 23:59:59")!
+            after = before.addingTimeInterval(2)
+        }
+        func now() -> Date {
+            lock.lock(); defer { lock.unlock() }
+            calls += 1
+            return calls == 1 ? before : after
+        }
+    }
+
+    /// daily 판정과 최종 해석이 같은 "오늘"을 본다. 판정은 loaded인데 오늘 값이 새 날짜의 0원으로 덮이면 안 된다.
+    static func midnightChecks(_ delegate: AppDelegate) {
+        let day = "2020-01-15"
+        setMode("fixedday")
+
+        let full = MidnightClock(day: day)
+        delegate.ccusageClock = full.now
+        delegate.currentData = nil
+        runFull(delegate)
+        precondition(delegate.usageLoadOutcome == .loaded, "자정 경계 full 판정: \(String(describing: delegate.usageLoadOutcome))")
+        let fullToday = delegate.currentData?.today
+        precondition(fullToday?.period == day && fullToday?.totalCost == 4.5,
+                     "자정 경계 full: 판정은 \(day)인데 오늘 값은 \(fullToday?.period ?? "nil") \(fullToday?.totalCost ?? -1)")
+        precondition(delegate.currentData?.thisMonthCost == 4.5,
+                     "자정 경계 full: 이번 달이 다른 날짜로 계산됐다 \(delegate.currentData?.thisMonthCost ?? -1)")
+
+        let quick = MidnightClock(day: day)
+        delegate.ccusageClock = quick.now
+        delegate.currentData = nil
+        runQuick(delegate)
+        precondition(delegate.usageLoadOutcome == .loaded, "자정 경계 quick 판정: \(String(describing: delegate.usageLoadOutcome))")
+        precondition(delegate.currentData?.today?.period == day && delegate.currentData?.today?.totalCost == 4.5,
+                     "자정 경계 quick 오늘 값: \(delegate.currentData?.today?.period ?? "nil")")
+
+        delegate.ccusageClock = { Date() }
     }
 }

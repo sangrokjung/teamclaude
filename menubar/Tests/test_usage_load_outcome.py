@@ -27,6 +27,8 @@ case "$(cat "$dir/mode")" in
     if [ "$3" = daily ]; then head -c 20 "$dir/today.json"; sleep 0.5; tail -c +21 "$dir/today.json"
     else echo '{}'; fi ;;
   hang) trap '' TERM; exec /bin/sleep 30 ;;
+  fixedday)
+    if [ "$3" = daily ]; then cat "$dir/fixedday.json"; else echo '{}'; fi ;;
 esac
 """
 
@@ -63,6 +65,12 @@ class UsageLoadOutcomeTests(unittest.TestCase):
                 "daily": [{"period": yesterday, "totalCost": 7.77, "inputTokens": 70, "outputTokens": 7,
                            "cacheCreationTokens": 0, "cacheReadTokens": 0}],
                 "totals": {"totalCost": 7.77, "totalTokens": 77},
+            }))
+            # 자정 경계 검사용 지난 날짜 하루치(실제 오늘과 겹치지 않는다).
+            (fake / "fixedday.json").write_text(json.dumps({
+                "daily": [{"period": "2020-01-15", "totalCost": 4.5, "inputTokens": 40, "outputTokens": 5,
+                           "cacheCreationTokens": 0, "cacheReadTokens": 0}],
+                "totals": {"totalCost": 4.5, "totalTokens": 45},
             }))
             home = folder / "home"
             home.mkdir()

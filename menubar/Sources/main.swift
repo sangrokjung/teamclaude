@@ -1247,6 +1247,8 @@ struct CcusageDailyLoad {
     /// daily만으로 만든 값.
     let quick: UsageData?
     let rate: Double
+    /// 판정·해석이 본 "지금". weekly·monthly를 합친 최종 해석도 이 시각을 써야 자정을 넘겨도 같은 날을 본다.
+    let now: Date
 }
 
 /// ccusage가 쓰는 날짜 키(로컬 시간 yyyy-MM-dd).
@@ -1265,12 +1267,12 @@ func ccusageDailyHasEntry(_ data: Data, period: String) -> Bool? {
 }
 
 /// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
-func loadCcusageDaily(timeoutSeconds: Double) -> CcusageDailyLoad {
+func loadCcusageDaily(timeoutSeconds: Double, clock: () -> Date = { Date() }) -> CcusageDailyLoad {
     let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds)
     let output = run.successOutput
     let rate = output == nil ? 0 : fetchUsdKrwRate()
     // 해석과 오늘 판정이 같은 "오늘"을 보게 한 시각을 함께 넘긴다(자정 경계에서 엇갈리지 않게).
-    let now = Date()
+    let now = clock()
     let todayKey = ccusageDayKey(now)
     let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate, now: now) }
     // "오늘 읽었다"는 원시 daily에 정확히 오늘 날짜 항목이 있을 때만이다. quick.today는 표시용 값이라
@@ -1283,7 +1285,8 @@ func loadCcusageDaily(timeoutSeconds: Double) -> CcusageDailyLoad {
         print("CCUSAGE-FAIL[daily]: \(failure.label)")
         fflush(stdout)
     }
-    return CcusageDailyLoad(outcome: outcome, daily: outcome.succeeded ? output : nil, quick: quick, rate: rate)
+    return CcusageDailyLoad(outcome: outcome, daily: outcome.succeeded ? output : nil, quick: quick, rate: rate,
+                            now: now)
 }
 
 struct IsolatedProcessResult {
@@ -4142,6 +4145,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var usageLoadOutcome: CcusageLoadOutcome?
     /// ccusage 한 번의 시간 제한. 운영은 기본값, 테스트는 짧게 줄인다.
     var ccusageTimeoutSeconds = ccusageDefaultTimeoutSeconds
+    /// ccusage 해석이 볼 "지금". 운영은 실제 시각, 테스트는 자정 경계를 넘기는 시계로 바꾼다.
+    var ccusageClock: () -> Date = { Date() }
     var teamCodexConfigPresent: Bool?
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
@@ -5181,6 +5186,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetching = true
         let startedAt = Date()
         let timeout = ccusageTimeoutSeconds
+        let clock = ccusageClock
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard ccusageInstalled() else {
                 DispatchQueue.main.async {
@@ -5194,7 +5200,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             // 실행 실패·시간 초과·해석 실패는 "데이터 없음"이 아니다. 판정을 그대로 남긴다(이전 값은 지우지 않는다).
-            let daily = loadCcusageDaily(timeoutSeconds: timeout)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, clock: clock)
             guard let dailyData = daily.daily else {
                 DispatchQueue.main.async {
                     guard let self = self else { return }
@@ -5220,7 +5226,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             let weeklyData = runCcusageCommand("weekly", timeoutSeconds: timeout).successOutput
             let monthlyData = runCcusageCommand("monthly", timeoutSeconds: timeout).successOutput
-            let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate)
+            // weekly·monthly가 자정을 넘겨도 판정과 같은 날을 본다(기본값 Date()를 쓰면 오늘이 새 날의 0원으로 덮인다).
+            let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate,
+                                      now: daily.now)
             print("CCUSAGE-FULL: today=\(data?.today?.period ?? "nil") cost=\(data?.today?.totalCost ?? -1) thisMonth=\(data?.thisMonthCost ?? -1) rate=\(rate)")
             fflush(stdout)
 
@@ -5260,8 +5268,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetchingUsageQuick = true
         let startedAt = Date()
         let timeout = ccusageTimeoutSeconds
+        let clock = ccusageClock
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let daily = loadCcusageDaily(timeoutSeconds: timeout)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, clock: clock)
             let quickData = daily.quick
             print("CCUSAGE-QUICK[\(reason)]: today=\(quickData?.today?.period ?? "nil") cost=\(quickData?.today?.totalCost ?? -1)")
             fflush(stdout)
