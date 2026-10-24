@@ -1266,11 +1266,13 @@ func ccusageDailyHasEntry(_ data: Data, period: String) -> Bool? {
 
 /// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
 func loadCcusageDaily(timeoutSeconds: Double) -> CcusageDailyLoad {
-    let todayKey = ccusageDayKey(Date())
     let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds)
     let output = run.successOutput
     let rate = output == nil ? 0 : fetchUsdKrwRate()
-    let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate) }
+    // 해석과 오늘 판정이 같은 "오늘"을 보게 한 시각을 함께 넘긴다(자정 경계에서 엇갈리지 않게).
+    let now = Date()
+    let todayKey = ccusageDayKey(now)
+    let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate, now: now) }
     // "오늘 읽었다"는 원시 daily에 정확히 오늘 날짜 항목이 있을 때만이다. quick.today는 표시용 값이라
     // (지난 기록만 있으면 0원짜리 오늘) 판정에 쓰지 않는다.
     let hasExactToday = quick == nil ? nil : output.flatMap { ccusageDailyHasEntry($0, period: todayKey) }
@@ -1433,7 +1435,8 @@ func runCcusage() -> UsageData? {
     return parsed
 }
 
-func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly monthlyData: Data?, rate: Double) -> UsageData? {
+func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly monthlyData: Data?, rate: Double,
+                    now: Date = Date()) -> UsageData? {
     guard let json = try? JSONSerialization.jsonObject(with: dailyData) as? [String: Any],
           let dailyArray = json["daily"] as? [[String: Any]] else {
         print("CCUSAGE-PARSE-FAIL: JSON 파싱 실패 (data prefix: \(String(data: dailyData.prefix(120), encoding: .utf8) ?? "non-utf8"))")
@@ -1447,16 +1450,16 @@ func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly mon
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd"
     formatter.locale = Locale(identifier: "en_US_POSIX")
-    let todayStr = formatter.string(from: Date())
+    let todayStr = formatter.string(from: now)
 
     // 이번 달 키 (YYYY-MM) + 이번 주 월요일 키 (YYYY-MM-DD) — ccusage native weekly/monthly period 매칭용
     let monthFmt = DateFormatter()
     monthFmt.dateFormat = "yyyy-MM"
     monthFmt.locale = Locale(identifier: "en_US_POSIX")
-    let thisMonthKey = monthFmt.string(from: Date())
+    let thisMonthKey = monthFmt.string(from: now)
 
     let cal = Calendar(identifier: .gregorian)
-    let nowDate = Date()
+    let nowDate = now
     let weekday = cal.component(.weekday, from: nowDate) // 1=일 .. 7=토
     let mondayOffset = weekday == 1 ? 6 : weekday - 2     // 월요일까지 거슬러 올라갈 일수
     let mondayDate = cal.date(byAdding: .day, value: -mondayOffset, to: cal.startOfDay(for: nowDate)) ?? nowDate
