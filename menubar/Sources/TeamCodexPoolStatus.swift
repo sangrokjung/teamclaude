@@ -740,7 +740,8 @@ func loadTeamCodexPoolHealth(home: String = NSHomeDirectory()) -> TeamCodexPoolH
     let config = teamCodexReadObject(configPath)
     let server = teamCodexReadObject(serverPath)
     let proxy = config?["proxy"] as? [String: Any]
-    let port = teamCodexInt(server?["port"]) ?? teamCodexInt(proxy?["port"]) ?? 3457
+    let port = teamCodexInt(server?["port"]) ?? teamCodexInt(proxy?["port"])
+        ?? menubarDefaultPort(envKey: "CC_MENUBAR_TEAMCODEX_PORT", fallback: 3457)
     let serverPid = teamCodexInt(server?["pid"])
 
     if let data = teamCodexFetchStatus(port: port, apiKey: teamCodexString(proxy?["apiKey"])),

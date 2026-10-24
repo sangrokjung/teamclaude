@@ -268,3 +268,63 @@ func teamClaudeServerStatePath(configPath: String) -> String {
     let base = configPath.hasSuffix(".json") ? String(configPath.dropLast(5)) : configPath
     return base + ".server.json"
 }
+
+// MARK: - launchd 라벨과 재시작 계획(외부 배포 R3)
+//
+// 내부 운영은 `com.qjc.teamclaude` 서비스로 프록시를 띄운다. 외부 사용자는 다른 라벨을 쓰거나
+// launchd에 등록하지 않고 쓴다. 라벨은 환경변수 > UserDefaults > 기본값 순으로 정한다.
+// 라벨이 launchd에 없으면 kickstart로는 살릴 수 없으므로 `teamclaude server`를 분리 실행해 시작만 한다.
+// 살아 있는 프록시를 강제로 재시작하지 않는다는 원칙(PR #64)은 그대로다.
+
+let teamClaudeDefaultLaunchdLabel = "com.qjc.teamclaude"
+let teamClaudeLaunchdLabelEnvKey = "CC_MENUBAR_TEAMCLAUDE_LABEL"
+let teamClaudeLaunchdLabelDefaultsKey = "teamClaudeLaunchdLabel"
+
+/// launchctl 서비스 이름으로 쓸 수 있는 값인가(영문·숫자·`.`·`-`·`_`, 255자 이하).
+func teamClaudeLaunchdLabelIsValid(_ label: String) -> Bool {
+    guard !label.isEmpty, label.count <= 255 else { return false }
+    return label.unicodeScalars.allSatisfy { scalar in
+        scalar.isASCII && (CharacterSet.alphanumerics.contains(scalar)
+            || scalar == "." || scalar == "-" || scalar == "_")
+    }
+}
+
+func resolveTeamClaudeLaunchdLabel(environment: [String: String], defaultsValue: String?) -> String {
+    for candidate in [environment[teamClaudeLaunchdLabelEnvKey], defaultsValue] {
+        if let candidate, teamClaudeLaunchdLabelIsValid(candidate) { return candidate }
+    }
+    return teamClaudeDefaultLaunchdLabel
+}
+
+enum TeamClaudeRestartPlan: Equatable {
+    /// launchd 서비스가 등록돼 있다. 기존처럼 확인 대화상자를 거친 뒤에만 `-k` 재시작.
+    case forceRestartConfirmed
+    /// 라벨이 launchd에 없고 포트도 닫혔다. `teamclaude server`를 분리 실행해 시작만 한다.
+    case startDetached
+    /// 라벨이 launchd에 없는데 포트를 누가 잡고 있다(또는 판별 불가). 앱이 관리하지 않는 프로세스라 건드리지 않는다.
+    case leaveRunning
+    /// launchd 상태를 읽지 못했다. 증거 없이 조치하지 않는다.
+    case undetermined
+}
+
+/// 사용자가 누른 "서버 재시작"이 무엇을 할지. 미등록 라벨에서는 어떤 포트 상태에서도 kickstart로 가지 않는다(A4).
+func teamClaudeRestartPlan(launchd: TeamClaudeLaunchdProbe, port: TeamClaudePortProbe) -> TeamClaudeRestartPlan {
+    switch launchd {
+    case .running, .loadedNotRunning: return .forceRestartConfirmed
+    case .notLoaded: return port == .refused ? .startDetached : .leaveRunning
+    case .unknown: return .undetermined
+    }
+}
+
+/// 자동 동기화가 미등록 라벨의 멈춘 서버를 분리 실행해도 되는가. 설정 파일과 절대 경로 실행 파일이 있어야 한다.
+/// (설정이 없는 맥은 TeamClaude 미설치다. PATH 이름만 있으면 무엇이 뜰지 모른다.)
+func teamClaudeDetachedStartAllowed(configPresent: Bool, executable: String?) -> Bool {
+    guard configPresent, let executable else { return false }
+    return executable.hasPrefix("/")
+}
+
+/// `teamclaude server`를 셸 백그라운드로 띄우고 셸은 바로 끝난다. 서버는 launchd 아래로 넘어가 앱이 꺼져도 남는다.
+/// 인자는 `$0`·`$1`로 넘겨 셸 문자열에 경로를 끼워 넣지 않는다.
+func teamClaudeDetachedStartArguments(executable: String, logPath: String) -> (executable: String, arguments: [String]) {
+    ("/bin/sh", ["-c", "nohup \"$0\" server >>\"$1\" 2>&1 </dev/null &", executable, logPath])
+}

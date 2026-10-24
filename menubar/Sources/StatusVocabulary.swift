@@ -16,6 +16,10 @@ enum StatusVocabulary {
     static let notMeasured = "측정 전"
     /// 값이 없는 것이 정상인 칸(측정 시각이 없는 계정 등).
     static let none = "—"
+    /// 이 맥에 해당 도구가 없다. 오류가 아니라 안내다(외부 배포 R1).
+    static let notInstalled = "미설치"
+    /// 도구는 있을 수 있지만 읽을 기록이 아직 없다.
+    static let noData = "데이터 없음"
 
     /// 마지막 성공이 오래된 레인에 붙는 꼬리말. 값 자체는 남기고 낡았다는 사실만 덧붙인다 —
     /// 지우면 무엇이 얼마나 낡았는지 알 수 없고, 그대로 두면 최신값으로 읽힌다.

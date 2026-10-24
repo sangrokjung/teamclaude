@@ -24,6 +24,8 @@ struct GrokPercentOutcome: Equatable {
 struct GrokCardModel: Equatable {
     var headline: String
     var detail: String?
+    /// 도구가 없을 때의 공통 안내(R1). 있으면 레인이 같은 문구를 그린다.
+    var notice: ToolNotice? = nil
 }
 
 enum GrokMenuOutcome: Equatable {
@@ -37,6 +39,26 @@ struct GrokBillingParts: Equatable {
     var productPercent: Double?
     var creditPercent: Double?
     var headline: Double
+}
+
+/// grok CLI. 사용량은 CLI가 아니라 인증 파일+청구 API로 읽으므로, 이 탐색은 "설치 여부" 판정에만 쓴다.
+func grokSpec(home: String = NSHomeDirectory()) -> ToolSpec {
+    ToolSpec(name: "grok", envKey: "CC_MENUBAR_GROK_BIN", preferred: [
+        "\(home)/.local/bin/grok",
+        "/opt/homebrew/bin/grok",
+        "/usr/local/bin/grok",
+    ])
+}
+
+/// 레인은 한 줄짜리라 안내 카드 대신 같은 문구를 레인 모델에 싣는다(R1).
+func grokCardModel(for notice: ToolNotice) -> GrokCardModel {
+    GrokCardModel(headline: notice.headline, detail: notice.detail, notice: notice)
+}
+
+/// 앱 로더와 빈 HOME 스냅샷이 같은 판정을 쓴다.
+func grokPresenceNotice() -> ToolNotice? {
+    grokToolNotice(cliInstalled: ToolLocator.shared.resolve(grokSpec()).path != nil,
+                   authPresent: FileManager.default.fileExists(atPath: grokAuthFileURL().path))
 }
 
 func grokAuthFileURL() -> URL {
