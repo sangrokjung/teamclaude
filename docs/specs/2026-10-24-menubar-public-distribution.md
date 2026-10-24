@@ -107,6 +107,13 @@ Phase 1 결과 (2026-10-25, HEAD 3479094):
 
 Phase 2: `bash menubar/run-tests.sh`(qgate), 빈 HOME 스냅샷의 탭별 미설치 그리기(`TAB-DRAWN`), `Tests/snapshot_test_locale.py`(영어 한글 0자·한국어 A안 문구, 그려진 글자 기록으로 판정), A안 시안과 나란히 둔 실제 패널 PNG(`menubar/.build/`), Codex astra gate receipt.
 
+Phase 2 결과 (2026-10-25, HEAD 368b65a):
+- A2: `menubar tests: ran=49 failed=0 known_red=1`(known-red 그대로). `build.sh` 스냅샷 3종 통과.
+- A1: 빈 HOME에서 탭마다 미설치가 그려진다(`test_each_tab_draws_its_not_installed_cards`).
+- A5: 영어는 5개 탭 826개 그려진 문자열에 한글 0자, Phase 1 ccusage 문구 영어판도 포함. 한국어는 A안 문구.
+- 계정 17·100·250개 개요 띠가 패널 밖으로 넘치지 않고 묶음 칸은 Claude 탭을 연다. Codex 행 구독 버튼과 보조 줄이 겹치지 않음을 실제 그리기로 확인.
+- Codex astra APPROVE. 미확인: 실제 메뉴를 열어 단축키(R·1–5·⌘K) 누르기, 실제 GUI 실행. Concerns 3의 디자인 사이클 ③마감·④비평(웹용 emil·impeccable 단계)은 네이티브 AppKit 이식이라 돌리지 않았다(UNVERIFIED).
+
 ## Open questions
 
 없음. 원 개발자 표기는 유지한다(intent 참고).
