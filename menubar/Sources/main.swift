@@ -1162,6 +1162,20 @@ struct CcusageRun {
     }
 }
 
+/// ccusage 출력을 받을 호출별 임시 파일. FileManager.temporaryDirectory 아래에 mkstemps로 배타적으로 만든다(0600).
+/// 지우는 것은 부른 쪽 몫이다.
+func makeCcusageOutputFile(_ subcommand: String) -> (path: String, handle: FileHandle)? {
+    let safe = subcommand.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII }
+    let label = safe ? subcommand : "run"
+    let template = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cc-menubar-ccusage-\(label)-XXXXXXXX.json").path
+    var buffer = Array(template.utf8CString)
+    let fd = buffer.withUnsafeMutableBufferPointer { mkstemps($0.baseAddress!, 5) }
+    guard fd >= 0 else { return nil }
+    let path = String(cString: buffer)
+    return (path, FileHandle(fileDescriptor: fd, closeOnDealloc: true))
+}
+
 func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageRun {
     let process = Process()
     let home = NSHomeDirectory()
@@ -1182,14 +1196,17 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageR
     env["HOME"] = home
     process.environment = env
 
-    // 142KB JSON > 64KB pipe buffer → 자식 write block deadlock 회피용 파일 redirect
-    let tmpPath = "/tmp/cc-menubar-ccusage-\(subcommand)-\(getpid()).json"
-    FileManager.default.createFile(atPath: tmpPath, contents: nil, attributes: nil)
-    guard let writeHandle = FileHandle(forWritingAtPath: tmpPath) else {
-        print("CCUSAGE-FAIL[\(subcommand)]: tmp 파일 생성 실패 \(tmpPath)")
+    // 142KB JSON > 64KB pipe buffer → 자식 write block deadlock 회피용 파일 redirect.
+    // 호출마다 사용자 임시 폴더에 배타적 파일을 새로 만든다. 전체 갱신과 quick 갱신이 같은 서브커맨드를 동시에
+    // 돌려도 서로의 출력을 덮거나 먼저 지우지 않는다(이름이 서브커맨드+pid뿐이면 겹친다).
+    guard let output = makeCcusageOutputFile(subcommand) else {
+        print("CCUSAGE-FAIL[\(subcommand)]: tmp 파일 생성 실패")
         fflush(stdout)
         return .notLaunched
     }
+    let tmpPath = output.path
+    defer { try? FileManager.default.removeItem(atPath: tmpPath) }
+    let writeHandle = output.handle
     process.standardOutput = writeHandle
     guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else {
         writeHandle.closeFile()
@@ -1206,7 +1223,6 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageR
         fflush(stdout)
         writeHandle.closeFile()
         nullError.closeFile()
-        try? FileManager.default.removeItem(atPath: tmpPath)
         return .notLaunched
     }
     if result.timedOut {
@@ -1217,7 +1233,6 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageR
     nullError.closeFile()
 
     let data = (try? Data(contentsOf: URL(fileURLWithPath: tmpPath))) ?? Data()
-    try? FileManager.default.removeItem(atPath: tmpPath)
     print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(data.count)")
     fflush(stdout)
 
