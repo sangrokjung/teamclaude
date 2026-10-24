@@ -26,6 +26,8 @@ struct ToolNotice: Equatable {
     enum Kind: Equatable {
         case notInstalled
         case noData
+        /// 도구는 있는데 실행·해석에 실패했다. "데이터 없음"과 섞이면 수집기 장애가 정상처럼 보인다.
+        case loadFailed
     }
 
     let tool: MenubarTool
@@ -75,18 +77,150 @@ func higgsfieldToolNotice(installed: Bool) -> ToolNotice? {
     installed ? nil : notInstalled(.higgsfield, detail: envHint("CC_MENUBAR_HIGGSFIELD_BIN"))
 }
 
-/// ccusage는 npx로 돈다. npx가 없으면 미설치, 다 읽었는데 기록이 없으면 데이터 없음.
-/// 아직 읽는 중이면 nil(기존 "확인 중" 화면).
-func ccusageToolNotice(installed: Bool, loadFinished: Bool, hasData: Bool) -> ToolNotice? {
+/// ccusage 한 번 실행이 실패한 원인. 화면 문구와 로그가 같은 말을 쓴다.
+enum CcusageFailure: Equatable {
+    case launch
+    case timeout(seconds: Int)
+    case exitStatus(Int32)
+    case emptyOutput
+    case unparsable
+    /// stdout이 크기 상한을 넘었다. 끊었으므로 받은 출력은 쓰지 않는다.
+    case outputTooLarge
+
+    var label: String {
+        switch self {
+        case .launch: return L10n.ccusageFailLaunch
+        case .timeout(let seconds): return L10n.ccusageFailTimeout(seconds)
+        case .exitStatus(let code): return L10n.ccusageFailExit(code)
+        case .emptyOutput: return L10n.ccusageFailEmpty
+        case .unparsable: return L10n.ccusageFailUnparsable
+        case .outputTooLarge: return L10n.ccusageFailTooLarge
+        }
+    }
+}
+
+/// ccusage daily 한 번의 결과. 성공적으로 해석한 빈 결과만 noData다.
+enum CcusageLoadOutcome: Equatable {
+    case loaded
+    case noData
+    case failed(CcusageFailure)
+
+    var succeeded: Bool {
+        if case .failed = self { return false }
+        return true
+    }
+}
+
+/// 실행 결과 → 판정. 실패 원인이 여럿이면 앞의 것(실행 → 출력 크기 상한 → 시간 초과 → 종료 코드 → 빈 출력 → 해석)을 쓴다.
+/// 상한을 넘기면 자식을 끊으므로 그 뒤의 종료 코드·빈 출력은 결과일 뿐 원인이 아니다.
+/// parsedHasToday: 출력을 해석하지 못했으면 nil, 해석했으면 기록이 있는지.
+func ccusageLoadOutcome(launched: Bool, timedOut: Bool, timeoutSeconds: Double, exitStatus: Int32,
+                        outputBytes: Int, parsedHasToday: Bool?, outputTooLarge: Bool = false) -> CcusageLoadOutcome {
+    guard launched else { return .failed(.launch) }
+    if outputTooLarge { return .failed(.outputTooLarge) }
+    if timedOut { return .failed(.timeout(seconds: max(Int(timeoutSeconds.rounded()), 1))) }
+    guard exitStatus == 0 else { return .failed(.exitStatus(exitStatus)) }
+    guard outputBytes > 0 else { return .failed(.emptyOutput) }
+    guard let parsedHasToday else { return .failed(.unparsable) }
+    return parsedHasToday ? .loaded : .noData
+}
+
+/// ccusage는 npx로 돈다. npx가 없으면 미설치, 읽었는데 기록이 없으면 데이터 없음, 실행·해석이 실패했는데
+/// 보여 줄 이전 값도 없으면 확인 필요. 이전 값이 있으면 본문은 그대로 두고 ccusageStaleNote가 낡았다고 표시한다.
+/// 아직 한 번도 끝나지 않았으면(outcome nil) nil(기존 "확인 중" 화면).
+func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: Bool) -> ToolNotice? {
     if !installed {
         return ToolNotice(tool: .ccusage, kind: .notInstalled,
                           headline: "\(L10n.sectionUsage) \(StatusVocabulary.notInstalled)",
                           detail: L10n.noticeNoNpx(envHint("CC_MENUBAR_NPX_BIN")))
     }
-    guard loadFinished, !hasData else { return nil }
-    return ToolNotice(tool: .ccusage, kind: .noData,
-                      headline: "\(L10n.sectionUsage) \(StatusVocabulary.noData)",
-                      detail: L10n.noticeNoClaudeUsage)
+    guard let outcome, !hasData else { return nil }
+    switch outcome {
+    case .loaded:
+        return nil
+    case .noData:
+        return ToolNotice(tool: .ccusage, kind: .noData,
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.noData)",
+                          detail: L10n.noticeNoClaudeUsage)
+    case .failed(let failure):
+        return ToolNotice(tool: .ccusage, kind: .loadFailed,
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.needsCheck)",
+                          detail: L10n.noticeUsageLoadFailed(failure.label))
+    }
+}
+
+/// 전체 갱신에서 daily 뒤에 돌리는 보조 명령. 실패해도 daily 값은 보이므로 부분 실패로 따로 센다.
+enum CcusageAuxCommand: Equatable {
+    case weekly
+    case monthly
+
+    var label: String {
+        switch self {
+        case .weekly: return L10n.ccusageWeekly
+        case .monthly: return L10n.ccusageMonthly
+        }
+    }
+
+    /// ccusage가 내는 기간인가. 월간은 실제 있는 달의 YYYY-MM, 주간은 실제 있는 날짜의 YYYY-MM-DD이면서
+    /// 월요일이어야 한다(해석기가 이번 주를 월요일 키로 찾는다). 정규식만으로는 2026-13·2026-02-30을 걸러내지 못한다.
+    func periodMatches(_ period: String) -> Bool {
+        let parts = period.split(separator: "-", omittingEmptySubsequences: false)
+        let expected = self == .weekly ? [4, 2, 2] : [4, 2]
+        guard parts.count == expected.count,
+              zip(parts, expected).allSatisfy({ $0.count == $1 && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber) }) else {
+            return false
+        }
+        let numbers = parts.compactMap { Int($0) }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let components = DateComponents(year: numbers[0], month: numbers[1], day: self == .weekly ? numbers[2] : 1)
+        guard let date = calendar.date(from: components),
+              calendar.component(.year, from: date) == components.year,
+              calendar.component(.month, from: date) == components.month,
+              calendar.component(.day, from: date) == components.day else { return false }
+        return self == .monthly || calendar.component(.weekday, from: date) == 2
+    }
+
+    /// ccusage JSON에서 이 명령의 기간 배열 키.
+    var arrayKey: String {
+        switch self {
+        case .weekly: return "weekly"
+        case .monthly: return "monthly"
+        }
+    }
+}
+
+/// daily는 읽었는데 실패한 보조 명령과 그 원인.
+struct CcusageAuxFailure: Equatable {
+    let command: CcusageAuxCommand
+    let failure: CcusageFailure
+}
+
+/// 보조 명령 실패 꼬리말. 같은 원인은 "주간/월간: 원인"으로 묶고, 다르면 쉼표로 나눈다. 실패가 없으면 nil.
+func ccusagePartialNote(_ failures: [CcusageAuxFailure]) -> String? {
+    guard !failures.isEmpty else { return nil }
+    var groups: [(cause: String, commands: [String])] = []
+    for item in failures {
+        if let index = groups.firstIndex(where: { $0.cause == item.failure.label }) {
+            groups[index].commands.append(item.command.label)
+        } else {
+            groups.append((item.failure.label, [item.command.label]))
+        }
+    }
+    let body = groups.map { "\($0.commands.joined(separator: "/")): \($0.cause)" }.joined(separator: ", ")
+    return L10n.ccusagePartialNote(body)
+}
+
+/// 사용량 카드·헤더에 붙는 꼬리말. 이전 값을 남긴 채 갱신이 실패했거나, 지난 기록은 읽었는데 오늘 날짜 항목이
+/// 없을 때(오늘은 0으로 보인다), daily는 읽었는데 weekly·monthly가 실패했을 때(partial). 그 외에는 nil.
+/// daily 자체가 실패했으면 그 꼬리말만 쓴다(보이는 값 전체가 이전 값이다).
+func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool, partial: [CcusageAuxFailure] = []) -> String? {
+    guard hasData, let outcome else { return nil }
+    switch outcome {
+    case .loaded: return ccusagePartialNote(partial)
+    case .noData: return [L10n.ccusageNoTodayUsage, ccusagePartialNote(partial)].compactMap { $0 }.joined(separator: " · ")
+    case .failed(let failure): return L10n.ccusageStaleFailed(failure.label)
+    }
 }
 
 /// grok CLI도 인증 파일도 없을 때만 미설치. CLI가 있으면 기존 "Grok 로그인"이 맞다.

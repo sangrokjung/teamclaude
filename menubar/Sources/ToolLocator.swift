@@ -68,40 +68,118 @@ func toolLocatorLogLine(_ name: String, _ resolution: ToolResolution) -> String 
 /// 절대 경로가 아닌 답(alias·함수)은 버린다.
 func loginShellCommandPath(_ name: String, timeout: TimeInterval) -> String? {
     guard toolLocatorSafeName(name), FileManager.default.isExecutableFile(atPath: "/bin/zsh") else { return nil }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-    process.arguments = ["-lc", "command -v \(name)"]
-    let output = Pipe()
-    process.standardOutput = output
-    process.standardError = FileHandle.nullDevice
-    process.standardInput = FileHandle.nullDevice
-    let done = DispatchSemaphore(value: 0)
-    process.terminationHandler = { _ in done.signal() }
-    do {
-        try process.run()
-    } catch {
-        return nil
-    }
-    var collected = Data()
-    let reader = DispatchGroup()
-    reader.enter()
-    DispatchQueue.global(qos: .utility).async {
-        collected = output.fileHandleForReading.readDataToEndOfFile()
-        reader.leave()
-    }
-    if done.wait(timeout: .now() + timeout) == .timedOut {
-        let pid = process.processIdentifier
-        process.terminate()
-        if done.wait(timeout: .now() + 0.5) == .timedOut { kill(pid, SIGKILL) }
-        _ = reader.wait(timeout: .now() + 0.5)
-        return nil
-    }
-    _ = reader.wait(timeout: .now() + 0.5)
-    guard process.terminationStatus == 0 else { return nil }
-    let line = String(decoding: collected, as: UTF8.self)
+    guard let run = runInOwnProcessGroup(["/bin/zsh", "-lc", "command -v \(name)"], timeout: timeout,
+                                         drainGrace: 0.2, killGrace: 0.3),
+          run.exitStatus == 0 else { return nil }
+    let line = String(decoding: run.output, as: UTF8.self)
         .split(separator: "\n").first.map(String.init)?
         .trimmingCharacters(in: .whitespaces) ?? ""
     return line.hasPrefix("/") ? line : nil
+}
+
+struct ProcessGroupRun {
+    /// 셸의 종료 코드. 신호로 죽었으면(시간 초과 포함) 128+신호 번호.
+    let exitStatus: Int32
+    let output: Data
+}
+
+/// 명령을 자기 프로세스 그룹(그룹 id = 자식 pid)에서 띄우고 stdout을 모은다.
+/// 셸 설정(.zprofile 등)이 띄운 자식은 같은 그룹에 든다. 셸이 끝나면(EOF 또는 drainGrace 경과) 또는
+/// 시간 제한을 넘기면 언제나 그룹 전체에 TERM을 보내고, killGrace 안에 안 사라진 구성원에는 KILL을 보낸다.
+/// 셸 pid는 그룹 신호를 다 보낼 때까지 회수하지 않는다 — 그동안 그룹 id가 재사용될 수 없다.
+/// 읽기와 대기를 이 스레드 한 곳에서 하고 파이프는 직접 닫는다(떠도는 읽기 스레드·FD가 남지 않는다).
+func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
+                          drainGrace: TimeInterval, killGrace: TimeInterval) -> ProcessGroupRun? {
+    guard let executable = argv.first else { return nil }
+    var fds: [Int32] = [-1, -1]
+    guard pipe(&fds) == 0 else { return nil }
+    let readFD = fds[0], writeFD = fds[1]
+    defer { close(readFD) }
+
+    var actions: posix_spawn_file_actions_t?
+    guard posix_spawn_file_actions_init(&actions) == 0 else { close(writeFD); return nil }
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    var attributes: posix_spawnattr_t?
+    guard posix_spawnattr_init(&attributes) == 0 else { close(writeFD); return nil }
+    defer { posix_spawnattr_destroy(&attributes) }
+    guard posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0,
+          posix_spawn_file_actions_adddup2(&actions, writeFD, STDOUT_FILENO) == 0,
+          posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0,
+          posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0,
+          posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
+        close(writeFD)
+        return nil
+    }
+
+    var pid: pid_t = 0
+    let environment = ProcessInfo.processInfo.environment.map { "\($0.key)=\($0.value)" }
+    let cArgs: [UnsafeMutablePointer<CChar>?] = argv.map { strdup($0) } + [nil]
+    let cEnv: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
+    defer {
+        cArgs.forEach { free($0) }
+        cEnv.forEach { free($0) }
+    }
+    let spawned = posix_spawn(&pid, executable, &actions, &attributes, cArgs, cEnv)
+    close(writeFD)
+    guard spawned == 0, pid > 0 else { return nil }
+
+    _ = fcntl(readFD, F_SETFL, fcntl(readFD, F_GETFL) | O_NONBLOCK)
+    let outputLimit = 64 * 1024
+    var output = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    var reachedEOF = false
+    /// 읽을 수 있는 만큼 읽는다. EOF면 true.
+    func drain() -> Bool {
+        while true {
+            let count = read(readFD, &buffer, buffer.count)
+            if count > 0 {
+                if output.count < outputLimit { output.append(contentsOf: buffer[0..<min(count, outputLimit - output.count)]) }
+                continue
+            }
+            if count == 0 { return true }
+            return errno != EAGAIN && errno != EINTR
+        }
+    }
+    func leaderExited() -> Bool {
+        var info = siginfo_t()
+        let result = waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+        return result == 0 && info.si_pid == pid
+    }
+
+    let deadline = Date().addingTimeInterval(max(timeout, 0))
+    var exitedAt: Date?
+    while Date() < deadline {
+        if !reachedEOF {
+            var poller = pollfd(fd: readFD, events: Int16(POLLIN), revents: 0)
+            _ = poll(&poller, 1, 20)
+            reachedEOF = drain()
+        } else {
+            usleep(10_000)
+        }
+        if exitedAt == nil, leaderExited() { exitedAt = Date() }
+        if let exitedAt {
+            if reachedEOF { break }
+            if Date().timeIntervalSince(exitedAt) >= drainGrace { break }
+        }
+    }
+
+    // 셸이 어떻게 끝났든 그룹 전체를 끝낸다. 파이프 EOF는 자식 부재가 아니다 — 셸 설정이 stdout을
+    // /dev/null로 돌린 백그라운드 자식은 파이프를 닫고도 같은 그룹에 남는다.
+    // TERM 뒤 그룹에 산 구성원이 없어질 때까지 killGrace만 기다리고, 남았으면 KILL.
+    // (회수 전 셸 pid는 좀비로 그룹에 남지만 killpg(…, 0)은 산 구성원이 없으면 실패한다 — macOS는 EPERM, 그 뒤 ESRCH.)
+    func groupHasLiveMembers() -> Bool { killpg(pid, 0) == 0 }
+    _ = killpg(pid, SIGTERM)
+    let graceEnd = Date().addingTimeInterval(max(killGrace, 0))
+    while Date() < graceEnd, groupHasLiveMembers() {
+        if !reachedEOF { reachedEOF = drain() }
+        usleep(10_000)
+    }
+    if groupHasLiveMembers() { _ = killpg(pid, SIGKILL) }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) == -1, errno == EINTR {}
+    let signal = status & 0x7f
+    let exitStatus = signal == 0 ? (status >> 8) & 0xff : 128 + signal
+    return ProcessGroupRun(exitStatus: exitStatus, output: output)
 }
 
 final class ToolLocator {

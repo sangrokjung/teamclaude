@@ -388,6 +388,22 @@ enum L10n {
     static var noticeNoCodexSection: String { t("Codex CLI 기록과 TeamCodex 설정이 없습니다", "No Codex CLI history and no TeamCodex config") }
     static func noticeNoNpx(_ hint: String) -> String { t("ccusage를 실행할 npx(Node.js)가 없습니다 · \(hint)", "No npx (Node.js) to run ccusage · \(hint)") }
     static var noticeNoClaudeUsage: String { t("Claude Code 사용 기록이 아직 없습니다", "No Claude Code usage recorded yet") }
+    static func noticeUsageLoadFailed(_ cause: String) -> String {
+        t("ccusage \(cause) · 다음 갱신 때 다시 시도합니다", "ccusage \(cause) · retrying on the next refresh")
+    }
+    static var ccusageFailLaunch: String { t("실행하지 못함", "could not launch") }
+    static func ccusageFailTimeout(_ seconds: Int) -> String { t("\(seconds)초 시간 초과", "timed out after \(seconds)s") }
+    static func ccusageFailExit(_ code: Int32) -> String { t("종료 코드 \(code)", "exit code \(code)") }
+    static var ccusageFailEmpty: String { t("빈 출력", "empty output") }
+    static var ccusageFailUnparsable: String { t("출력 해석 실패", "unreadable output") }
+    static var ccusageFailTooLarge: String { t("출력 크기 상한 초과", "output size limit exceeded") }
+    static var ccusageWeekly: String { t("주간", "weekly") }
+    static var ccusageMonthly: String { t("월간", "monthly") }
+    static func ccusagePartialNote(_ body: String) -> String {
+        t("일부 갱신 실패(\(body)) · 일별만 최신", "partial refresh failed (\(body)) · only daily is current")
+    }
+    static var ccusageNoTodayUsage: String { t("오늘 사용 기록 없음", "no usage recorded today") }
+    static func ccusageStaleFailed(_ cause: String) -> String { t("갱신 실패(\(cause)) · 이전 값", "refresh failed (\(cause)) · previous values") }
     static var noticeCollectorHeadline: String { t("수집기 미설치(선택 기능)", "Collector not installed (optional)") }
     static var noticeCollectorDetail: String {
         t("구독 확인 수집기가 없어 결제 메일·청구 페이지 확인은 건너뜁니다", "No plan collector, so billing mail and invoice checks are skipped")

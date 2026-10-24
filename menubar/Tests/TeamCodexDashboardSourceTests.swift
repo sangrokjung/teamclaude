@@ -109,7 +109,7 @@ struct TeamCodexDashboardSourceTests {
         )
         let isolatedProcess = try functionBody(
             named: "func runTrustedProcessInIsolatedGroup(",
-            endingBefore: "\n/// daily(필수)",
+            endingBefore: "\nfunc parseUsageData(",
             in: source
         )
         let ccusage = try functionBody(

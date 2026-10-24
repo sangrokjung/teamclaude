@@ -49,13 +49,65 @@ struct ToolNoticeTests {
         precondition(higgs?.detail.contains("CC_MENUBAR_HIGGSFIELD_BIN") == true, higgs?.detail ?? "nil")
         precondition(higgsfieldToolNotice(installed: true) == nil)
 
-        precondition(ccusageToolNotice(installed: false, loadFinished: false, hasData: false)?.kind == .notInstalled)
-        precondition(ccusageToolNotice(installed: false, loadFinished: false, hasData: false)?.detail.contains("CC_MENUBAR_NPX_BIN") == true)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: false)?.kind == .noData)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: false)?.headline == "사용량 데이터 없음")
+        precondition(ccusageToolNotice(installed: false, outcome: nil, hasData: false)?.kind == .notInstalled)
+        precondition(ccusageToolNotice(installed: false, outcome: nil, hasData: false)?.detail.contains("CC_MENUBAR_NPX_BIN") == true)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.kind == .noData)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.headline == "사용량 데이터 없음")
         // 아직 읽는 중이면 기존 "확인 중" 화면을 둔다.
-        precondition(ccusageToolNotice(installed: true, loadFinished: false, hasData: false) == nil)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: true) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: nil, hasData: false) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: .loaded, hasData: true) == nil)
+        // 실행·해석 실패는 "데이터 없음"이 아니라 확인 필요다. 이전 값이 있으면 본문은 두고 꼬리말로 낡았다고 표시한다.
+        let failed = ccusageToolNotice(installed: true, outcome: .failed(.exitStatus(3)), hasData: false)
+        precondition(failed?.kind == .loadFailed && failed?.headline == "사용량 확인 필요", failed?.headline ?? "nil")
+        precondition(failed?.detail.contains("종료 코드 3") == true, failed?.detail ?? "nil")
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.unparsable), hasData: true) == nil)
+        precondition(ccusageStaleNote(outcome: .failed(.timeout(seconds: 60)), hasData: true) == "갱신 실패(60초 시간 초과) · 이전 값")
+        precondition(ccusageStaleNote(outcome: .failed(.timeout(seconds: 60)), hasData: false) == nil)
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true) == nil)
+        precondition(ccusageStaleNote(outcome: nil, hasData: true) == nil)
+        // 지난 기록은 있는데 오늘 날짜 항목이 없으면 오늘이 0으로 보이는 이유를 붙인다. 기록이 아예 없으면 안내 카드 몫.
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true) == "오늘 사용 기록 없음")
+        precondition(ccusageStaleNote(outcome: .noData, hasData: false) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: true) == nil)
+
+        // daily는 읽었는데 weekly·monthly가 실패하면 부분 결과라고 밝힌다. 같은 원인은 한 번에, 다르면 나눠 적는다.
+        let monthlyFlood = [CcusageAuxFailure(command: .monthly, failure: .outputTooLarge)]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: monthlyFlood)
+                     == "일부 갱신 실패(월간: 출력 크기 상한 초과) · 일별만 최신")
+        let bothExit = [CcusageAuxFailure(command: .weekly, failure: .exitStatus(3)),
+                        CcusageAuxFailure(command: .monthly, failure: .exitStatus(3))]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: bothExit)
+                     == "일부 갱신 실패(주간/월간: 종료 코드 3) · 일별만 최신")
+        let mixed = [CcusageAuxFailure(command: .weekly, failure: .timeout(seconds: 60)),
+                     CcusageAuxFailure(command: .monthly, failure: .unparsable)]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: mixed)
+                     == "일부 갱신 실패(주간: 60초 시간 초과, 월간: 출력 해석 실패) · 일별만 최신")
+        // 오늘 항목 없음과 겹치면 둘 다 적는다. daily 자체가 실패했으면 그 꼬리말이 우선한다. 값이 없으면 안내 카드 몫.
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true, partial: monthlyFlood)
+                     == "오늘 사용 기록 없음 · 일부 갱신 실패(월간: 출력 크기 상한 초과) · 일별만 최신")
+        precondition(ccusageStaleNote(outcome: .failed(.exitStatus(3)), hasData: true, partial: monthlyFlood)
+                     == "갱신 실패(종료 코드 3) · 이전 값")
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: false, partial: monthlyFlood) == nil)
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: []) == nil)
+
+        // 판정 순서: 실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석. 해석한 빈 결과만 noData.
+        func outcome(launched: Bool = true, timedOut: Bool = false, exit: Int32 = 0, bytes: Int = 10,
+                     parsed: Bool? = true, tooLarge: Bool = false) -> CcusageLoadOutcome {
+            ccusageLoadOutcome(launched: launched, timedOut: timedOut, timeoutSeconds: 60, exitStatus: exit,
+                               outputBytes: bytes, parsedHasToday: parsed, outputTooLarge: tooLarge)
+        }
+        precondition(outcome() == .loaded)
+        precondition(outcome(parsed: false) == .noData)
+        precondition(outcome(parsed: nil) == .failed(.unparsable))
+        precondition(outcome(bytes: 0, parsed: nil) == .failed(.emptyOutput))
+        precondition(outcome(exit: 1, parsed: false) == .failed(.exitStatus(1)))
+        precondition(outcome(timedOut: true, exit: 137, parsed: false) == .failed(.timeout(seconds: 60)))
+        precondition(outcome(launched: false, bytes: 0, parsed: nil) == .failed(.launch))
+        // 출력 크기 상한 초과는 끊어서 생긴 종료 코드·빈 출력보다 앞선다.
+        precondition(outcome(exit: 137, bytes: 0, parsed: nil, tooLarge: true) == .failed(.outputTooLarge))
+        precondition(outcome(launched: false, bytes: 0, parsed: nil, tooLarge: true) == .failed(.launch))
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.outputTooLarge), hasData: false)?.detail
+            == "ccusage 출력 크기 상한 초과 · 다음 갱신 때 다시 시도합니다")
 
         precondition(grokToolNotice(cliInstalled: false, authPresent: false)?.headline == "Grok 미설치")
         // CLI는 있는데 인증 파일이 없으면 기존 "Grok 로그인"이 맞다.
@@ -132,6 +184,30 @@ struct ToolNoticeTests {
         ToolNoticeDrawLog.reset()
         render(card)
         precondition(ToolNoticeDrawLog.drawn.isEmpty)
+
+        // MARK: 영어 화면(A5) — ccusage 실패·낡은 값·부분 실패 문구도 한글 0자
+        L10n.language = .en
+        func hangulFree(_ value: String?) -> Bool {
+            guard let value, !value.isEmpty else { return false }
+            return !value.unicodeScalars.contains { (0xAC00...0xD7A3).contains($0.value) || (0x3131...0x318E).contains($0.value) }
+        }
+        let failures: [CcusageFailure] = [.launch, .timeout(seconds: 60), .exitStatus(3), .emptyOutput, .unparsable, .outputTooLarge]
+        for failure in failures {
+            let notice = ccusageToolNotice(installed: true, outcome: .failed(failure), hasData: false)
+            precondition(hangulFree(notice?.headline) && hangulFree(notice?.detail), notice?.line ?? "nil")
+            precondition(hangulFree(ccusageStaleNote(outcome: .failed(failure), hasData: true)), failure.label)
+        }
+        let enPartial = [CcusageAuxFailure(command: .weekly, failure: .timeout(seconds: 60)),
+                         CcusageAuxFailure(command: .monthly, failure: .outputTooLarge)]
+        precondition(hangulFree(ccusageStaleNote(outcome: .noData, hasData: true, partial: enPartial)))
+        precondition(hangulFree(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.line))
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.exitStatus(3)), hasData: false)?.headline == "Usage Needs check")
+        precondition(ccusageStaleNote(outcome: .failed(.exitStatus(3)), hasData: true) == "refresh failed (exit code 3) · previous values")
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true) == "no usage recorded today")
+        precondition(ccusagePartialNote([CcusageAuxFailure(command: .weekly, failure: .exitStatus(3)),
+                                         CcusageAuxFailure(command: .monthly, failure: .exitStatus(3))])
+                     == "partial refresh failed (weekly/monthly: exit code 3) · only daily is current")
+        L10n.language = .ko
 
         print("ToolNoticeTests: ok")
     }

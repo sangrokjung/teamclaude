@@ -1132,8 +1132,38 @@ func ccusageInstalled(home: String = NSHomeDirectory()) -> Bool {
 }
 
 /// npx ccusage <subcommand> --json --offline 을 실행해 stdout JSON Data 반환. 실패 시 nil.
-/// daily/weekly/monthly 공용 — 각 호출은 별도 tmp 파일(서브커맨드명 포함)로 redirect.
+/// daily/weekly/monthly 공용 — 각 호출은 자기 파이프로 stdout을 받는다.
 func runCcusageRaw(_ subcommand: String) -> Data? {
+    runCcusageCommand(subcommand, timeoutSeconds: ccusageDefaultTimeoutSeconds).successOutput
+}
+
+/// ccusage 한 번의 기본 시간 제한.
+let ccusageDefaultTimeoutSeconds: Double = 60
+
+/// ccusage stdout 한 번의 크기 상한. 실제 daily JSON은 수백 KB(오래 쓴 기록도 수 MB)라 32MB면 넉넉하다.
+/// 넘으면 오동작(CC_MENUBAR_NPX_BIN 오지정·무한 출력)으로 보고 자식을 그룹째 끊는다. 출력 전량이 메모리에 올라가
+/// 메뉴바가 멈추는 것을 막는다.
+let ccusageDefaultOutputLimitBytes = 32 * 1024 * 1024
+
+/// ccusage 한 번 실행의 원 결과. 실패를 원인별로 가르려고 종료 코드·시간 초과·출력을 그대로 남긴다.
+struct CcusageRun {
+    let launched: Bool
+    let timedOut: Bool
+    let exitStatus: Int32
+    /// stdout이 크기 상한을 넘었다. 그때 output은 비어 있다(넘기 전까지 받은 출력도 버린다).
+    let outputTooLarge: Bool
+    let output: Data
+
+    static let notLaunched = CcusageRun(launched: false, timedOut: false, exitStatus: -1, outputTooLarge: false,
+                                        output: Data())
+
+    var successOutput: Data? {
+        launched && !timedOut && !outputTooLarge && exitStatus == 0 && !output.isEmpty ? output : nil
+    }
+}
+
+func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double,
+                       outputLimitBytes: Int = ccusageDefaultOutputLimitBytes) -> CcusageRun {
     let process = Process()
     let home = NSHomeDirectory()
     let fnmBin = "\(home)/.local/share/fnm/aliases/default/bin"
@@ -1153,51 +1183,175 @@ func runCcusageRaw(_ subcommand: String) -> Data? {
     env["HOME"] = home
     process.environment = env
 
-    // 142KB JSON > 64KB pipe buffer → 자식 write block deadlock 회피용 파일 redirect
-    let tmpPath = "/tmp/cc-menubar-ccusage-\(subcommand)-\(getpid()).json"
-    FileManager.default.createFile(atPath: tmpPath, contents: nil, attributes: nil)
-    guard let writeHandle = FileHandle(forWritingAtPath: tmpPath) else {
-        print("CCUSAGE-FAIL[\(subcommand)]: tmp 파일 생성 실패 \(tmpPath)")
-        fflush(stdout)
-        return nil
-    }
-    process.standardOutput = writeHandle
-    guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else {
-        writeHandle.closeFile()
-        return nil
-    }
+    // stdout은 호출마다 새 파이프로 받아 읽는 쪽이 상한까지만 메모리에 모은다(142KB JSON도 읽으면서 받으니
+    // 파이프 버퍼에 막히지 않는다). 호출끼리 나누는 상태가 없어 전체·quick 갱신이 겹쳐도 서로의 출력을 섞지 않는다.
+    guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else { return .notLaunched }
+    defer { nullError.closeFile() }
     process.standardError = nullError
 
     guard let result = runTrustedProcessInIsolatedGroup(
         process,
-        timeoutSeconds: 60,
-        terminationGraceMicroseconds: 700_000
+        timeoutSeconds: timeoutSeconds,
+        terminationGraceMicroseconds: 700_000,
+        captureOutputLimitBytes: outputLimitBytes
     ) else {
         print("CCUSAGE-FAIL[\(subcommand)]: 격리 프로세스 실행 실패")
         fflush(stdout)
-        writeHandle.closeFile()
-        nullError.closeFile()
-        return nil
+        return .notLaunched
     }
     if result.timedOut {
-        print("CCUSAGE-TIMEOUT[\(subcommand)]: 60초 초과, 강제 종료")
-        fflush(stdout)
+        print("CCUSAGE-TIMEOUT[\(subcommand)]: \(Int(timeoutSeconds))초 초과, 강제 종료")
     }
-    writeHandle.closeFile()
-    nullError.closeFile()
-
-    let data = (try? Data(contentsOf: URL(fileURLWithPath: tmpPath))) ?? Data()
-    try? FileManager.default.removeItem(atPath: tmpPath)
-    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(data.count)")
+    if result.outputExceeded {
+        print("CCUSAGE-FAIL[\(subcommand)]: 출력이 \(outputLimitBytes)바이트 상한 초과, 출력 폐기")
+    }
+    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(result.output.count)")
     fflush(stdout)
 
-    guard result.terminationStatus == 0, !data.isEmpty else { return nil }
-    return data
+    return CcusageRun(launched: true, timedOut: result.timedOut, exitStatus: result.terminationStatus,
+                      outputTooLarge: result.outputExceeded, output: result.output)
+}
+
+/// ccusage daily 한 번의 판정과 그 값. 전체·quick 로더가 같은 판정을 쓴다.
+struct CcusageDailyLoad {
+    let outcome: CcusageLoadOutcome
+    /// 실행·해석에 성공했을 때만 있다(weekly·monthly와 합쳐 다시 해석한다).
+    let daily: Data?
+    /// daily만으로 만든 값.
+    let quick: UsageData?
+    let rate: Double
+    /// 판정·해석이 본 "지금". weekly·monthly를 합친 최종 해석도 이 시각을 써야 자정을 넘겨도 같은 날을 본다.
+    let now: Date
+}
+
+/// ccusage가 쓰는 날짜 키(로컬 시간 yyyy-MM-dd).
+func ccusageDayKey(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    return formatter.string(from: date)
+}
+
+/// ccusage daily 원시 JSON에 그 날짜 항목이 정확히 있는가. 해석하지 못하면 nil.
+func ccusageDailyHasEntry(_ data: Data, period: String) -> Bool? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let daily = json["daily"] as? [[String: Any]] else { return nil }
+    return daily.contains { ($0["period"] as? String) == period }
+}
+
+/// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
+func loadCcusageDaily(timeoutSeconds: Double, outputLimitBytes: Int = ccusageDefaultOutputLimitBytes,
+                      clock: () -> Date = { Date() }) -> CcusageDailyLoad {
+    let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds, outputLimitBytes: outputLimitBytes)
+    let output = run.successOutput
+    let rate = output == nil ? 0 : fetchUsdKrwRate()
+    // 해석과 오늘 판정이 같은 "오늘"을 보게 한 시각을 함께 넘긴다(자정 경계에서 엇갈리지 않게).
+    let now = clock()
+    let todayKey = ccusageDayKey(now)
+    let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate, now: now) }
+    // "오늘 읽었다"는 원시 daily에 정확히 오늘 날짜 항목이 있을 때만이다. quick.today는 표시용 값이라
+    // (지난 기록만 있으면 0원짜리 오늘) 판정에 쓰지 않는다.
+    let hasExactToday = quick == nil ? nil : output.flatMap { ccusageDailyHasEntry($0, period: todayKey) }
+    let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
+                                     exitStatus: run.exitStatus, outputBytes: run.output.count,
+                                     parsedHasToday: hasExactToday, outputTooLarge: run.outputTooLarge)
+    if case .failed(let failure) = outcome {
+        print("CCUSAGE-FAIL[daily]: \(failure.label)")
+        fflush(stdout)
+    }
+    return CcusageDailyLoad(outcome: outcome, daily: outcome.succeeded ? output : nil, quick: quick, rate: rate,
+                            now: now)
+}
+
+/// 전체 갱신에서 해석에 넣을 weekly·monthly 출력과 실패한 명령.
+struct CcusageAuxResolution {
+    let weekly: Data?
+    let monthly: Data?
+    let failures: [CcusageAuxFailure]
+}
+
+/// JSON 숫자인가. JSONSerialization은 true/false도 NSNumber로 주므로 불리언은 뺀다.
+func ccusageIsJSONNumber(_ value: Any?) -> Bool {
+    guard let number = value as? NSNumber else { return false }
+    return CFGetTypeID(number) != CFBooleanGetTypeID()
+}
+
+/// 비용 값: 유한한 0 이상의 숫자.
+func ccusageIsValidCost(_ value: Any?) -> Bool {
+    guard ccusageIsJSONNumber(value), let number = value as? NSNumber else { return false }
+    let double = number.doubleValue
+    return double.isFinite && double >= 0
+}
+
+/// 토큰 값: 0 이상의 정수.
+func ccusageIsValidTokenCount(_ value: Any?) -> Bool {
+    guard ccusageIsValidCost(value), let number = value as? NSNumber else { return false }
+    return number.doubleValue.rounded(.towardZero) == number.doubleValue
+}
+
+/// 모델별 내역 한 줄: 이름 문자열, 비용과 있는 토큰 필드가 모두 올바른 값.
+func ccusageModelBreakdownIsValid(_ entry: [String: Any]) -> Bool {
+    guard entry["modelName"] is String, ccusageIsValidCost(entry["cost"]) else { return false }
+    return ["inputTokens", "outputTokens", "cacheCreationTokens", "cacheReadTokens"].allSatisfy { key in
+        entry[key] == nil || ccusageIsValidTokenCount(entry[key])
+    }
+}
+
+/// pickPeriod·parseModelBreakdown이 읽는 weekly·monthly 출력 형태인가. 명령별 기간 배열의 각 항목은 명령에 맞는
+/// `period`(주간 YYYY-MM-DD, 월간 YYYY-MM), 0 이상의 `totalCost`, 0 이상 정수 `totalTokens`를 갖고, `modelBreakdowns`가
+/// 있으면 각 줄이 올바라야 한다. `totals`가 있으면 같은 두 값을 가진 객체여야 한다. 형식이 틀린 값을 해석기가 0으로
+/// 읽거나 건너뛰어 정상값처럼 그리지 않게, 여기서 실패로 가른다. 빈 배열은 기간 항목이 없는 정상 경우다.
+func ccusageAuxOutputMatchesSchema(_ data: Data, command: CcusageAuxCommand) -> Bool {
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let entries = object[command.arrayKey] as? [[String: Any]] else { return false }
+    let entriesValid = entries.allSatisfy { entry in
+        guard let period = entry["period"] as? String, command.periodMatches(period),
+              ccusageIsValidCost(entry["totalCost"]), ccusageIsValidTokenCount(entry["totalTokens"]) else { return false }
+        guard let breakdowns = entry["modelBreakdowns"] else { return true }
+        guard let rows = breakdowns as? [[String: Any]] else { return false }
+        return rows.allSatisfy(ccusageModelBreakdownIsValid)
+    }
+    guard entriesValid else { return false }
+    guard let totals = object["totals"] else { return true }
+    guard let totalsObject = totals as? [String: Any] else { return false }
+    return ccusageIsValidCost(totalsObject["totalCost"]) && ccusageIsValidTokenCount(totalsObject["totalTokens"])
+}
+
+/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰고, 해석 실패는 출력이
+/// `ccusageAuxOutputMatchesSchema`를 통과하지 못할 때다.
+func ccusageAuxFailure(_ run: CcusageRun, command: CcusageAuxCommand, timeoutSeconds: Double) -> CcusageFailure? {
+    let matchesSchema = run.successOutput.map { ccusageAuxOutputMatchesSchema($0, command: command) } ?? false
+    let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
+                                     exitStatus: run.exitStatus, outputBytes: run.output.count,
+                                     parsedHasToday: matchesSchema ? true : nil, outputTooLarge: run.outputTooLarge)
+    if case .failed(let failure) = outcome { return failure }
+    return nil
+}
+
+/// 전체 갱신의 weekly·monthly 결과를 해석에 넣을 값으로 정한다. 실패한 명령은 이전에 해석에 쓴 출력을 대신 쓰고
+/// (없으면 nil — 해석이 daily 파생값으로 폴백한다), 실패 원인은 부분 실패 꼬리말로 넘긴다.
+func resolveCcusageAux(weekly: CcusageRun, monthly: CcusageRun, previousWeekly: Data?, previousMonthly: Data?,
+                       timeoutSeconds: Double) -> CcusageAuxResolution {
+    var failures: [CcusageAuxFailure] = []
+    func pick(_ run: CcusageRun, _ command: CcusageAuxCommand, previous: Data?) -> Data? {
+        guard let failure = ccusageAuxFailure(run, command: command, timeoutSeconds: timeoutSeconds) else { return run.successOutput }
+        failures.append(CcusageAuxFailure(command: command, failure: failure))
+        print("CCUSAGE-PARTIAL[\(command.label)]: \(failure.label) · \(previous == nil ? "daily 파생값" : "이전 값") 사용")
+        fflush(stdout)
+        return previous
+    }
+    let weeklyData = pick(weekly, .weekly, previous: previousWeekly)
+    let monthlyData = pick(monthly, .monthly, previous: previousMonthly)
+    return CcusageAuxResolution(weekly: weeklyData, monthly: monthlyData, failures: failures)
 }
 
 struct IsolatedProcessResult {
     let terminationStatus: Int32
     let timedOut: Bool
+    /// 캡처한 stdout이 상한을 넘어 그룹째 끊었다. 그때 output은 비어 있다.
+    var outputExceeded = false
+    /// 캡처 모드에서 모은 stdout(상한 이하). 캡처하지 않았으면 비어 있다.
+    var output = Data()
 }
 
 private func withOwnedCStringArray<Result>(
@@ -1249,22 +1403,46 @@ private func reapChild(_ pid: pid_t) -> Int32? {
 }
 
 /// `setsid`/`setpgid`로 의도적으로 탈출하지 않는 QJC 고정 CLI만 실행합니다.
+/// captureOutputLimitBytes를 주면 stdout은 process.standardOutput 대신 이 호출만의 파이프로 받는다
+/// (awaitCapturedGroup 참고). 주지 않으면 process.standardOutput(FileHandle)에 그대로 쓴다.
 func runTrustedProcessInIsolatedGroup(
     _ process: Process,
     timeoutSeconds: Double,
-    terminationGraceMicroseconds: useconds_t
+    terminationGraceMicroseconds: useconds_t,
+    captureOutputLimitBytes: Int? = nil
 ) -> IsolatedProcessResult? {
     guard let executableURL = process.executableURL,
           executableURL.isFileURL,
-          let standardOutput = process.standardOutput as? FileHandle,
           let standardError = process.standardError as? FileHandle else { return nil }
+
+    // 캡처 파이프. 두 끝 모두 CLOEXEC라 다른 스레드가 동시에 띄우는 자식에 새지 않는다(새면 EOF가 늦어진다).
+    var pipeFDs: [Int32] = [-1, -1]
+    if captureOutputLimitBytes != nil {
+        guard pipe(&pipeFDs) == 0 else { return nil }
+        for fd in pipeFDs { _ = fcntl(fd, F_SETFD, FD_CLOEXEC) }
+    }
+    let captureRead = pipeFDs[0], captureWrite = pipeFDs[1]
+    defer { if captureRead >= 0 { close(captureRead) } }
+    var writeEndOpen = captureWrite >= 0
+    func closeWriteEnd() {
+        if writeEndOpen { close(captureWrite); writeEndOpen = false }
+    }
+    defer { closeWriteEnd() }
+    let stdoutFD: Int32
+    if captureOutputLimitBytes != nil {
+        stdoutFD = captureWrite
+    } else if let standardOutput = process.standardOutput as? FileHandle {
+        stdoutFD = standardOutput.fileDescriptor
+    } else {
+        return nil
+    }
 
     var fileActions: posix_spawn_file_actions_t?
     guard posix_spawn_file_actions_init(&fileActions) == 0 else { return nil }
     defer { posix_spawn_file_actions_destroy(&fileActions) }
     guard posix_spawn_file_actions_adddup2(
         &fileActions,
-        standardOutput.fileDescriptor,
+        stdoutFD,
         STDOUT_FILENO
     ) == 0,
     posix_spawn_file_actions_adddup2(
@@ -1300,7 +1478,15 @@ func runTrustedProcessInIsolatedGroup(
             }
         }
     }
+    // 부모 쪽 쓰기 끝을 닫아야 자식(과 손자)이 모두 닫았을 때 EOF가 온다.
+    closeWriteEnd()
     guard spawnResult == 0, childPid > 0 else { return nil }
+
+    if let captureOutputLimitBytes {
+        var capture = BoundedPipeCapture(fd: captureRead, limit: captureOutputLimitBytes)
+        return awaitCapturedGroup(childPid, capture: &capture, timeoutSeconds: timeoutSeconds,
+                                  terminationGraceMicroseconds: terminationGraceMicroseconds)
+    }
 
     let timeoutNanoseconds = UInt64(max(timeoutSeconds, 0) * 1_000_000_000)
     let startedAt = DispatchTime.now().uptimeNanoseconds
@@ -1331,20 +1517,113 @@ func runTrustedProcessInIsolatedGroup(
     }
 }
 
-/// daily(필수) + weekly/monthly(정확도 향상, 실패 시 daily 파생 폴백) + 환율을 조합해 UsageData 반환.
-/// 수동 호출용 동기 헬퍼이며, 메뉴바 갱신은 loadUsageInBackground 에서 daily quick 반영을 먼저 수행한다.
-func runCcusage() -> UsageData? {
-    guard let dailyData = runCcusageRaw("daily") else { return nil }
-    let weeklyData = runCcusageRaw("weekly")
-    let monthlyData = runCcusageRaw("monthly")
-    let rate = fetchUsdKrwRate()
-    let parsed = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate)
-    print("CCUSAGE-PARSE: today=\(parsed?.today?.period ?? "nil") cost=\(parsed?.today?.totalCost ?? -1) thisMonth=\(parsed?.thisMonthCost ?? -1) rate=\(rate)")
-    fflush(stdout)
-    return parsed
+/// 캡처 파이프를 비차단으로 읽어 상한까지만 모은다. 상한을 넘기는 읽기가 오면 그 바이트는 버리고 exceeded를 세운다.
+/// 읽는 쪽이 멈추면 자식의 write()는 파이프 버퍼(수십 KB)에서 막히므로, 한 번의 큰 write()도 상한 너머로 쌓이지 않는다.
+private struct BoundedPipeCapture {
+    let fd: Int32
+    let limit: Int
+    var data = Data()
+    var reachedEOF = false
+    var exceeded = false
+    private var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+
+    init(fd: Int32, limit: Int) {
+        self.fd = fd
+        self.limit = max(limit, 0)
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+    }
+
+    /// 읽을 거리가 올 때까지 최대 milliseconds 기다린 뒤 지금 읽을 수 있는 만큼 읽는다. EOF 뒤에는 그냥 잔다.
+    mutating func waitAndDrain(milliseconds: Int32) {
+        guard !reachedEOF, !exceeded else {
+            usleep(useconds_t(milliseconds) * 1000)
+            return
+        }
+        var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        _ = poll(&poller, 1, milliseconds)
+        drain()
+    }
+
+    private mutating func drain() {
+        let fd = self.fd
+        while !reachedEOF && !exceeded {
+            let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if count > 0 {
+                guard data.count + count <= limit else {
+                    exceeded = true
+                    data = Data()
+                    return
+                }
+                data.append(contentsOf: buffer[0..<count])
+                continue
+            }
+            if count == 0 { reachedEOF = true; return }
+            if errno == EINTR { continue }
+            // EAGAIN은 지금 읽을 것이 없다는 뜻이다. 그 밖의 읽기 오류는 더 받을 수 없으니 EOF로 본다.
+            if errno != EAGAIN { reachedEOF = true }
+            return
+        }
+    }
 }
 
-func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly monthlyData: Data?, rate: Double) -> UsageData? {
+/// 직접 자식이 끝나고 파이프가 EOF가 될 때(또는 끝난 뒤 짧은 유예가 지날 때)까지, 혹은 시간 제한까지 읽는다.
+/// 상한을 넘기면 유예 없이 그룹째 KILL한다. 그 밖에는 어떻게 끝났든 그룹 전체에 TERM을 보내고, 유예 안에
+/// 산 구성원이 남으면 KILL한 뒤에 직접 자식을 회수한다 — 같은 그룹의 손자가 살아남아 계속 쓰지 못한다.
+/// 직접 자식은 그룹 신호를 다 보낼 때까지 회수하지 않으므로 그동안 그룹 id가 재사용될 수 없다.
+private func awaitCapturedGroup(
+    _ childPid: pid_t,
+    capture: inout BoundedPipeCapture,
+    timeoutSeconds: Double,
+    terminationGraceMicroseconds: useconds_t
+) -> IsolatedProcessResult? {
+    // 직접 자식이 끝난 뒤 손자가 쥔 파이프의 EOF를 기다리는 최대 시간.
+    let drainGraceNanoseconds: UInt64 = 200_000_000
+    let timeoutNanoseconds = UInt64(max(timeoutSeconds, 0) * 1_000_000_000)
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+    var exitedAt: UInt64?
+    var timedOut = false
+    func finish(_ status: Int32) -> IsolatedProcessResult {
+        IsolatedProcessResult(terminationStatus: status, timedOut: timedOut, outputExceeded: capture.exceeded,
+                              output: capture.exceeded ? Data() : capture.data)
+    }
+
+    while true {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now - startedAt >= timeoutNanoseconds { timedOut = true; break }
+        capture.waitAndDrain(milliseconds: 20)
+        if capture.exceeded {
+            _ = Darwin.killpg(childPid, SIGKILL)
+            return reapChild(childPid).map(finish)
+        }
+        if exitedAt == nil {
+            guard let hasExited = childHasExitedWithoutReaping(childPid) else {
+                _ = Darwin.killpg(childPid, SIGKILL)
+                return reapChild(childPid).map(finish)
+            }
+            if hasExited { exitedAt = DispatchTime.now().uptimeNanoseconds }
+        }
+        if let exitedAt,
+           capture.reachedEOF || DispatchTime.now().uptimeNanoseconds - exitedAt >= drainGraceNanoseconds {
+            break
+        }
+    }
+
+    // 파이프 EOF는 그룹이 비었다는 뜻이 아니다(stdout을 돌린 손자는 파이프를 닫고도 남는다).
+    // 산 구성원이 없으면 killpg(…, 0)은 실패한다(회수 전 직접 자식은 좀비라 산 구성원이 아니다).
+    func groupHasLiveMembers() -> Bool { Darwin.killpg(childPid, 0) == 0 }
+    _ = Darwin.killpg(childPid, SIGTERM)
+    let graceNanoseconds = UInt64(terminationGraceMicroseconds) * 1_000
+    let graceStartedAt = DispatchTime.now().uptimeNanoseconds
+    while DispatchTime.now().uptimeNanoseconds - graceStartedAt < graceNanoseconds, groupHasLiveMembers() {
+        capture.waitAndDrain(milliseconds: 10)
+        if capture.exceeded { break }
+    }
+    if groupHasLiveMembers() { _ = Darwin.killpg(childPid, SIGKILL) }
+    return reapChild(childPid).map(finish)
+}
+
+func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly monthlyData: Data?, rate: Double,
+                    now: Date = Date()) -> UsageData? {
     guard let json = try? JSONSerialization.jsonObject(with: dailyData) as? [String: Any],
           let dailyArray = json["daily"] as? [[String: Any]] else {
         print("CCUSAGE-PARSE-FAIL: JSON 파싱 실패 (data prefix: \(String(data: dailyData.prefix(120), encoding: .utf8) ?? "non-utf8"))")
@@ -1358,16 +1637,16 @@ func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly mon
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyy-MM-dd"
     formatter.locale = Locale(identifier: "en_US_POSIX")
-    let todayStr = formatter.string(from: Date())
+    let todayStr = formatter.string(from: now)
 
     // 이번 달 키 (YYYY-MM) + 이번 주 월요일 키 (YYYY-MM-DD) — ccusage native weekly/monthly period 매칭용
     let monthFmt = DateFormatter()
     monthFmt.dateFormat = "yyyy-MM"
     monthFmt.locale = Locale(identifier: "en_US_POSIX")
-    let thisMonthKey = monthFmt.string(from: Date())
+    let thisMonthKey = monthFmt.string(from: now)
 
     let cal = Calendar(identifier: .gregorian)
-    let nowDate = Date()
+    let nowDate = now
     let weekday = cal.component(.weekday, from: nowDate) // 1=일 .. 7=토
     let mondayOffset = weekday == 1 ? 6 : weekday - 2     // 월요일까지 거슬러 올라갈 일수
     let mondayDate = cal.date(byAdding: .day, value: -mondayOffset, to: cal.startOfDay(for: nowDate)) ?? nowDate
@@ -1468,16 +1747,20 @@ func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly mon
         ))
     }
 
-    // 오늘 데이터
-    let today = days.first(where: { $0.period == todayStr }) ?? days.last
+    // 오늘 데이터 — 정확히 오늘 날짜 항목만 오늘로 쓴다. 마지막 항목(어제일 수 있다)을 오늘로 쓰지 않는다.
+    // ccusage daily는 기록이 있는 날만 내므로, 지난 기록은 있는데 오늘 항목이 없으면 오늘 사용은 0이다.
+    // 그때는 0원짜리 오늘을 두어 주·월·누적 같은 지난 기록 표시는 유지한다. 기록이 아예 없으면 nil(데이터 없음).
+    let today = days.first(where: { $0.period == todayStr })
+        ?? (days.isEmpty ? nil : DailyUsage(period: todayStr, totalCost: 0, inputTokens: 0, cacheCreationTokens: 0,
+                                            cacheReadTokens: 0, outputTokens: 0, models: []))
 
     // 주간 비용: 최근 7일
     let recentDays = Array(days.suffix(7))
     let weeklyTotalCost = recentDays.reduce(0.0) { $0 + $1.totalCost }
 
     // native weekly/monthly 에서 이번 주/이번 달 정확 집계
-    let weeklyPick = pickPeriod(weeklyData, key: thisMondayKey, arrayKey: "weekly")
-    let monthlyPick = pickPeriod(monthlyData, key: thisMonthKey, arrayKey: "monthly")
+    let weeklyPick = pickPeriod(weeklyData, key: thisMondayKey, arrayKey: CcusageAuxCommand.weekly.arrayKey)
+    let monthlyPick = pickPeriod(monthlyData, key: thisMonthKey, arrayKey: CcusageAuxCommand.monthly.arrayKey)
 
     // 이번 달 모델별 분해 (codex 포함)
     let modelBreakdown = parseModelBreakdown(monthlyData, monthKey: thisMonthKey)
@@ -2558,8 +2841,12 @@ final class StatusMenuDashboardView: NSView {
 
     /// 섹션 헤더 우측 한 줄 요약. 모델에 이미 있는 값만 쓰고, 모르면 빈 문자열(헤더는 제목만 그린다).
     static func sectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?,
-                                 notices: DashboardToolNotices) -> [String: String] {
+                                 notices: DashboardToolNotices, staleNotes: [String: String]) -> [String: String] {
         var out = naturalSectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield)
+        // 사용량 갱신이 실패해 이전 값을 보이는 중이면 헤더 요약에도 그 사실을 붙인다(카드 본문과 같은 꼬리말).
+        if let note = staleNotes["usage"], let natural = out["usage"] {
+            out["usage"] = "\(natural) · \(note)"
+        }
         // 미설치 안내가 있는 섹션은 헤더 요약도 같은 안내 제목을 말한다(소비 지점마다 같은 상태).
         for id in notices.sections.keys {
             out[id] = dashboardNoticeSummary(section: id, natural: out[id], notices: notices)
@@ -2674,7 +2961,7 @@ final class StatusMenuDashboardView: NSView {
         self.overviewView = overviewView
 
         // 나머지 탭. preferredHeight와 같은 목록·같은 높이. 섹션을 더하면 sectionBodies와 sectionSummaries를 같이 고친다.
-        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices)
+        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes)
         let bodies = Self.sectionBodies(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
                                         burnModel: burnModel, notices: notices, summaries: summaries)
         var allSections: [DashboardSection] = []
@@ -2757,6 +3044,7 @@ final class StatusMenuDashboardView: NSView {
                 case "usage":
                     let usageDashboard = UsageDashboardView(frame: frame)
                     usageDashboard.usage = usage
+                    usageDashboard.staleNote = laneStaleNotes["usage"]
                     usageDashboard.parallelCount = parallelCount
                     usageDashboard.active = active
                     usageView = usageDashboard
@@ -2898,11 +3186,12 @@ final class StatusMenuDashboardView: NSView {
         cliLanesView?.staleNotes = laneStaleNotes
         cliLanesView?.agy = agy
         usageView?.usage = usage
+        usageView?.staleNote = laneStaleNotes["usage"]
         usageView?.parallelCount = parallelCount
         usageView?.active = active
         usageView?.needsDisplay = true
         phases.mark("cards")
-        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices))
+        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes))
         phases.mark("sections")
     }
 
@@ -2934,12 +3223,27 @@ final class DashboardScrimView: NSView {
 final class UsageDashboardView: NSView {
     var usage: UsageData? {
         didSet {
-            if let usage = usage, let today = usage.today {
-                setAccessibilityLabel(L10n.usageAccessibility(today: formatCost(today.totalCost), week: formatCost(usage.thisWeekCost),
-                                                              month: formatCost(usage.thisMonthCost)))
-            }
+            refreshAccessibilityLabel()
             needsDisplay = true
         }
+    }
+    /// 갱신이 실패해 이전 값을 보이는 중일 때의 꼬리말(ccusageStaleNote). 머리 줄 오른쪽에 그린다.
+    var staleNote: String? {
+        didSet {
+            guard staleNote != oldValue else { return }
+            // 칩 줄이 좁으면 꼬리말이 "…"로 줄어든다. 전문은 도움말 풍선과 접근성 라벨에 둔다.
+            toolTip = staleNote
+            refreshAccessibilityLabel()
+            needsDisplay = true
+        }
+    }
+
+    private func refreshAccessibilityLabel() {
+        guard let usage = usage, let today = usage.today else { return }
+        var label = L10n.usageAccessibility(today: formatCost(today.totalCost), week: formatCost(usage.thisWeekCost),
+                                            month: formatCost(usage.thisMonthCost))
+        if let staleNote { label += ", \(staleNote)" }
+        setAccessibilityLabel(label)
     }
     var parallelCount: Int = 0
     var active: Bool = false
@@ -3013,7 +3317,14 @@ final class UsageDashboardView: NSView {
             PanelDraw.text(PanelDraw.clipped(L10n.usageWaitingDetail, caption, maxWidth: box.width - 28), box.minX + 14, box.minY + 36, caption, fg3)
             return
         }
-        _ = chip(L10n.parallelSessions(parallelCount), x: x, y: 4, tone: parallelCount > 0 ? .ready : .info)
+        x += chip(L10n.parallelSessions(parallelCount), x: x, y: 4, tone: parallelCount > 0 ? .ready : .info)
+        // 갱신이 실패해 이전 값을 보이는 중이면(ccusageStaleNote) 칩 줄 오른쪽에 그 사실을 경고색으로 둔다.
+        if let staleNote {
+            let noteMax = x0 + width - (x + 12)
+            if noteMax > 0 {
+                _ = PanelDraw.right(PanelDraw.clipped(staleNote, caption, maxWidth: noteMax), x0 + width, 7.5, caption, TeamClaudePalette.amber)
+            }
+        }
         let rate = usageData.usdKrwRate
         let todayTokens = today.inputTokens + today.cacheCreationTokens + today.cacheReadTokens + today.outputTokens
 
@@ -3992,7 +4303,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// nil은 아직 모름 — 안내를 띄우지 않고 기존 "확인 중" 화면을 둔다.
     var higgsfieldInstalled: Bool?
     var ccusageInstalledState: Bool?
-    var usageLoadFinished = false
+    /// 마지막으로 끝난 ccusage daily 판정. nil이면 아직 한 번도 끝나지 않았다.
+    var usageLoadOutcome: CcusageLoadOutcome?
+    /// 마지막 전체 갱신에서 daily는 읽었는데 실패한 weekly·monthly. 다음 전체 갱신이 다시 정한다.
+    var usagePartialFailures: [CcusageAuxFailure] = []
+    /// 마지막으로 해석에 쓴 weekly·monthly 출력. 다음 전체 갱신에서 그 명령이 실패하면 이 값을 대신 쓴다.
+    var lastCcusageWeeklyData: Data?
+    var lastCcusageMonthlyData: Data?
+    /// ccusage 한 번의 시간 제한. 운영은 기본값, 테스트는 짧게 줄인다.
+    var ccusageTimeoutSeconds = ccusageDefaultTimeoutSeconds
+    /// ccusage 해석이 볼 "지금". 운영은 실제 시각, 테스트는 자정 경계를 넘기는 시계로 바꾼다.
+    var ccusageClock: () -> Date = { Date() }
+    /// ccusage stdout 한 번의 크기 상한. 운영은 기본값, 테스트는 작게 줄인다.
+    var ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
     var teamCodexConfigPresent: Bool?
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
@@ -4177,10 +4500,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sections["codex"] = codexSectionToolNotice(codex: codexNotice, teamCodex: teamCodexNotice)
         sections["higgsfield"] = higgsfieldInstalled.flatMap { higgsfieldToolNotice(installed: $0) }
         sections["usage"] = ccusageInstalledState.flatMap {
-            ccusageToolNotice(installed: $0, loadFinished: usageLoadFinished, hasData: currentData?.today != nil)
+            ccusageToolNotice(installed: $0, outcome: usageLoadOutcome, hasData: currentData?.today != nil)
         }
         sections["burn"] = currentBurnModel.collectorNotice
         return DashboardToolNotices(sections: sections)
+    }
+
+    /// 대시보드에 넘기는 꼬리말. CLI 레인(laneStaleNotes)에 사용량 갱신 실패(이전 값 표시 중)를 더한다.
+    var dashboardStaleNotes: [String: String] {
+        var notes = laneStaleNotes
+        notes["usage"] = ccusageStaleNote(outcome: usageLoadOutcome, hasData: currentData?.today != nil,
+                                          partial: usagePartialFailures)
+        return notes
     }
 
     func refreshBurnModel(now: Date = Date()) {
@@ -4665,7 +4996,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -5018,31 +5349,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         isFetching = true
         let startedAt = Date()
+        let timeout = ccusageTimeoutSeconds
+        let outputLimit = ccusageOutputLimitBytes
+        let clock = ccusageClock
+        let previousWeekly = lastCcusageWeeklyData
+        let previousMonthly = lastCcusageMonthlyData
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard ccusageInstalled() else {
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.isFetching = false
                     self.ccusageInstalledState = false
-                    self.usageLoadFinished = true
+                    self.usageLoadOutcome = nil
                     self.scheduleDashboardRefresh(reason: "loadUsageInBackground")
                     self.updateTitle()
                 }
                 return
             }
-            guard let dailyData = runCcusageRaw("daily") else {
+            // 실행 실패·시간 초과·해석 실패는 "데이터 없음"이 아니다. 판정을 그대로 남긴다(이전 값은 지우지 않는다).
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, outputLimitBytes: outputLimit, clock: clock)
+            guard let dailyData = daily.daily else {
                 DispatchQueue.main.async {
-                    self?.isFetching = false
-                    self?.ccusageInstalledState = true
-                    self?.usageLoadFinished = true
-                    self?.scheduleDashboardRefresh(reason: "loadUsageInBackground")
-                    self?.updateTitle()
+                    guard let self = self else { return }
+                    self.isFetching = false
+                    self.ccusageInstalledState = true
+                    self.usageLoadOutcome = daily.outcome
+                    self.scheduleDashboardRefresh(reason: "loadUsageInBackground")
+                    self.updateTitle()
                 }
                 return
             }
 
-            let rate = fetchUsdKrwRate()
-            if let quickData = parseUsageData(daily: dailyData, weekly: nil, monthly: nil, rate: rate) {
+            let rate = daily.rate
+            if let quickData = daily.quick {
                 print("CCUSAGE-QUICK: daily 반영 today=\(quickData.today?.period ?? "nil") cost=\(quickData.today?.totalCost ?? -1)")
                 fflush(stdout)
                 DispatchQueue.main.async {
@@ -5052,9 +5391,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            let weeklyData = runCcusageRaw("weekly")
-            let monthlyData = runCcusageRaw("monthly")
-            let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate)
+            // weekly·monthly 실패는 조용히 daily 파생값으로 바꾸지 않는다. 이전 값을 두고 부분 실패로 표시한다.
+            let aux = resolveCcusageAux(
+                weekly: runCcusageCommand("weekly", timeoutSeconds: timeout, outputLimitBytes: outputLimit),
+                monthly: runCcusageCommand("monthly", timeoutSeconds: timeout, outputLimitBytes: outputLimit),
+                previousWeekly: previousWeekly, previousMonthly: previousMonthly, timeoutSeconds: timeout)
+            // weekly·monthly가 자정을 넘겨도 판정과 같은 날을 본다(기본값 Date()를 쓰면 오늘이 새 날의 0원으로 덮인다).
+            let data = parseUsageData(daily: dailyData, weekly: aux.weekly, monthly: aux.monthly, rate: rate,
+                                      now: daily.now)
             print("CCUSAGE-FULL: today=\(data?.today?.period ?? "nil") cost=\(data?.today?.totalCost ?? -1) thisMonth=\(data?.thisMonthCost ?? -1) rate=\(rate)")
             fflush(stdout)
 
@@ -5062,7 +5406,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
                 self.isFetching = false
                 self.ccusageInstalledState = true
-                self.usageLoadFinished = true
+                self.usageLoadOutcome = daily.outcome
+                self.usagePartialFailures = aux.failures
+                self.lastCcusageWeeklyData = aux.weekly
+                self.lastCcusageMonthlyData = aux.monthly
                 self.lastFullUsageCompletedAt = Date()
                 if let data = data {
                     var finalData = data
@@ -5093,17 +5440,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         isFetchingUsageQuick = true
         let startedAt = Date()
+        let timeout = ccusageTimeoutSeconds
+        let outputLimit = ccusageOutputLimitBytes
+        let clock = ccusageClock
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let dailyData = runCcusageRaw("daily") else {
-                DispatchQueue.main.async {
-                    self?.isFetchingUsageQuick = false
-                    self?.updateTitle()
-                }
-                return
-            }
-
-            let rate = fetchUsdKrwRate()
-            let quickData = parseUsageData(daily: dailyData, weekly: nil, monthly: nil, rate: rate)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, outputLimitBytes: outputLimit, clock: clock)
+            let quickData = daily.quick
             print("CCUSAGE-QUICK[\(reason)]: today=\(quickData?.today?.period ?? "nil") cost=\(quickData?.today?.totalCost ?? -1)")
             fflush(stdout)
 
@@ -5116,6 +5458,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateTitle()
                     return
                 }
+                self.usageLoadOutcome = daily.outcome
                 if let quickData = quickData {
                     self.currentData = quickData
                     self.lastUsageQuickCompletedAt = Date()
@@ -5206,7 +5549,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -5346,7 +5689,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -6450,8 +6793,7 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
     delegate.currentCodex = loadCodexHealth()
     delegate.higgsfieldInstalled = !higgsfieldBinCandidates().isEmpty
     delegate.ccusageInstalledState = ccusageInstalled()
-    // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다.
-    delegate.usageLoadFinished = delegate.ccusageInstalledState == false
+    // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다(판정 nil).
     if let notice = grokPresenceNotice() { delegate.currentGrokCard = grokCardModel(for: notice) }
     if agyExecutableURL() == nil { delegate.currentAgyCard = agyCardModel(for: agyToolNotice()) }
     delegate.refreshBurnModel()

@@ -33,6 +33,8 @@ SKIP_TESTS+=(DashboardOverviewBuilderTests.swift)
 # CodexStatusLoaderTests는 $TMPDIR 아래 menubar-usage-check-* 격리 홈(CFFIXED_USER_HOME + CC_MENUBAR_CODEX_* 3종)이
 # 없으면 "Refusing fixture writes"로 exit 2 한다. 그 격리 홈은 test_usage_regressions.py가 만들어 돌린다.
 SKIP_TESTS+=(CodexStatusLoaderTests.swift)
+# UsageLoadOutcomeTests는 main.swift의 AppDelegate·대시보드를 쓴다. test_usage_load_outcome.py가 선언부와 함께 컴파일해 돌린다.
+SKIP_TESTS+=(UsageLoadOutcomeTests.swift)
 # 실제 외부 표면(브라우저 탭·브라우저 도구 바이너리·메일함 dry-run)을 건드리는 테스트.
 # 게이트는 트리만의 함수여야 하므로 CC_MENUBAR_LIVE_SURFACES=1일 때만 돌리고, 아니면 env-skip으로 표시한다.
 LIVE_SURFACE_TESTS=(test_live_subscription_surface.py)

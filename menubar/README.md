@@ -94,12 +94,16 @@ The app is not signed or notarized with an Apple developer ID, so you have to op
 If a tab's tool (TeamClaude, TeamCodex, Codex CLI, Higgsfield, ccusage, Grok, Antigravity CLI) is not on the Mac,
 its card shows a "Not installed" or "No data" notice instead of an error, and the menu-bar title leaves it out.
 The plan collector is optional; without its state file the Burn tab shows "Collector not installed (optional)".
+If ccusage is installed but a run fails (exit code, timeout, unreadable output), the Usage card shows "Usage Needs check"
+with the cause instead of "No data". When earlier values exist they stay on screen, and the Usage card and its header get
+a "refresh failed (cause) · previous values" note.
 
 The menu-bar app does not inherit your shell PATH, so it looks for executables itself, in this order:
 
 1. Override `CC_MENUBAR_<TOOL>_BIN` (if the path is wrong it shows "Not installed" instead of trying elsewhere)
 2. The existing candidate paths used by the internal install
-3. Login shell `/bin/zsh -lc 'command -v <tool>'` (2-second limit, remembered while the app runs)
+3. Login shell `/bin/zsh -lc 'command -v <tool>'` (2-second limit, remembered while the app runs; the shell runs in its own
+   process group, and the whole group is ended on timeout or when a child started by the shell config keeps the output open)
 4. Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`) → npm global prefix → fnm, nvm, Volta default aliases → `~/.local/bin`
 
 If a tool is installed but shows as missing, set its path. The startup log has one `TOOL <name>=<path>` line per tool.
