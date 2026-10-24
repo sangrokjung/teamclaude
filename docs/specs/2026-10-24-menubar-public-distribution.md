@@ -96,6 +96,15 @@ PR revert. Release는 draft로 만들어지므로 공개 전 삭제할 수 있�
 
 Phase 1: `bash menubar/run-tests.sh`, 신규 빈 HOME 스냅샷 테스트, `lipo -archs`, 라벨 미등록 단위 테스트, workflow_dispatch 시험 실행, R9 grep, Codex astra gate receipt.
 
+Phase 1 결과 (2026-10-25, HEAD 3479094):
+- A1: `snapshot_test_empty_home.py` 7건 통과(카드마다 미설치 그림). 실제 GUI 실행은 미확인(운영 메뉴바와 겹치지 않게 생략).
+- A2: `menubar tests: ran=42 failed=0 known_red=1`(known-red는 기존 test_teamclaude_availability 두 항목 그대로).
+- A3: `lipo -archs` = `x86_64 arm64`, `LSUIElement=true`, `LSMinimumSystemVersion=13.0`, ad-hoc 서명. x86_64 슬라이스 실행은 Rosetta가 없어 미확인.
+- A4: `teamClaudeRestartPlan(.notLoaded, *)`가 강제 재시작이 아님(단위 테스트), `test_no_proxy_kill` 통과.
+- A6: 머지 뒤 workflow_dispatch 시험 실행으로 확인한다(Release 게시 없음).
+- A7: diff 추가 줄과 바이너리 문자열 스윕 0건.
+- Codex astra 9라운드 끝에 APPROVE. 그 과정에서 로그인 셸 조회의 프로세스 그룹 정리, ccusage 실패·오늘 항목 없음·자정 경계·출력 상한(파이프)·weekly/monthly 부분 실패와 스키마(실제 날짜·월요일·값 범위·modelBreakdowns) 처리를 보강했다. 실제 ccusage weekly·monthly 출력이 새 검사를 통과함을 실제 Swift 함수로 확인했다.
+
 ## Open questions
 
 없음. 원 개발자 표기는 유지한다(intent 참고).
