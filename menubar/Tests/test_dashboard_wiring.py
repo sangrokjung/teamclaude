@@ -442,6 +442,13 @@ class PanelStructureTests(unittest.TestCase):
                        "toggleLoginItem()", "quitAction()"):
             self.assertIn(target, actions)
         self.assertIn("menubarLoginItemAvailable(bundlePath: Bundle.main.bundlePath)", actions)
+        # 로그인 시 열기는 메뉴를 닫지 않으므로 토글 결과 문구를 돌려줘야 열린 목록의 detail이 바뀐다(LoginItemTests가 동작을 본다).
+        self.assertIn("menubarLoginItemAction(", actions)
+        self.assertIn("return self?.toggleLoginItem()", actions)
+        on_run = self.main[self.main.index("actionList.onRun = {"):]
+        on_run = on_run[:on_run.index("\n        }\n")]
+        self.assertIn("let detail = action.run()", on_run)
+        self.assertIn("self.actionList.updateDetail(id: action.id, detail: detail)", on_run)
         self.assertNotIn("final class MenuActionRowView", self.main)
         self.assertIn("addDashboardShortcutItems(to: menu)", self.main)
 

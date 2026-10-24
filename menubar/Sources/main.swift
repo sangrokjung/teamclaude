@@ -5270,10 +5270,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         // 외부 배포본(.app)에서만 보인다. 내부 설치는 install.py의 LaunchAgent가 로그인 시 띄운다.
         if menubarLoginItemAvailable(bundlePath: Bundle.main.bundlePath) {
-            actions.append(DashboardAction(id: "login-item", group: .app, title: L10n.actionLoginItem,
-                                           detail: menubarLoginItemDetail(enabled: menubarLoginItemIsEnabled(home: NSHomeDirectory())),
-                                           closesMenu: false) { [weak self] in
-                self?.toggleLoginItem()
+            actions.append(menubarLoginItemAction(enabled: menubarLoginItemIsEnabled(home: NSHomeDirectory())) { [weak self] in
+                return self?.toggleLoginItem()
             })
         }
         actions.append(DashboardAction(id: "quit", group: .app, title: L10n.actionQuit, detail: "", keys: ["⌘", "Q"], danger: true) { [weak self] in
