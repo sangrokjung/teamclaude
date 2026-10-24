@@ -224,7 +224,10 @@ extension ToolLocatorTests {
         try! "#!/bin/sh\nexit 0\n".write(toFile: detachedTool, atomically: true, encoding: .utf8)
         chmod(detachedTool, 0o755)
         let detachedPidFile = detached + "/child.pid"
-        try! ("/bin/sh -c 'trap \"\" TERM; echo $$ > \"\(detachedPidFile)\"; exec /bin/sleep 30' >/dev/null 2>&1 </dev/null &\n")
+        // 셸은 자식이 TERM 무시를 건 뒤(pid 파일을 쓴 뒤)에야 끝난다. 그래야 부하 아래서도 자식이 준비되기 전에
+        // 그룹 정리가 먼저 와서 pid 파일 없이 죽는 일이 없다.
+        try! ("/bin/sh -c 'trap \"\" TERM; echo $$ > \"\(detachedPidFile)\"; exec /bin/sleep 30' >/dev/null 2>&1 </dev/null &\n"
+              + "while [ ! -s \"\(detachedPidFile)\" ]; do /bin/sleep 0.05; done\n")
             .write(toFile: detached + "/.zshenv", atomically: true, encoding: .utf8)
         withShellEnvironment(detached, path: detached + "/bin:/usr/bin:/bin") {
             let started = Date()
