@@ -46,7 +46,8 @@ def build():
     accounts.append(account("acct-16", session=0.99, weekly=0.995, usable=False))
     accounts.append(account("acct-17", session=0.98, weekly=0.99, usable=False))
     fixture = {
-        "teamclaude": {"accounts": accounts, "usableCount": 12, "totalCount": len(accounts)},
+        # switchThreshold는 프록시 기본값(0.98). 없으면 앱이 "한도 기준 확인 필요"로 모든 계정을 미확인 처리한다.
+        "teamclaude": {"accounts": accounts, "usableCount": 12, "totalCount": len(accounts), "switchThreshold": 0.98},
         "grok": "Grok 21%",
     }
     fixture["higgsfieldCredits"] = 1494

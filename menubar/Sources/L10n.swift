@@ -280,6 +280,74 @@ enum L10n {
         t("연동되면 계정별 5시간·7일 사용량과 리셋 시각이 여기에 뜹니다.", "Once connected, each account's 5-hour and 7-day usage and resets appear here.")
     }
 
+    // MARK: 소진 탭
+
+    static var burnAccessibilityTitle: String { t("구독 지출과 한도 소진", "Subscription spend and quota burn") }
+    static func burnLaneAccessibility(lane: String, paid: Int, contributing: Int) -> String {
+        t("\(lane) \(paid)계정 중 기여 \(contributing)", "\(lane) \(contributing) of \(paid) accounts contributing")
+    }
+    static var burnMonthlyTotal: String { t("월 합계", "Monthly total") }
+    static var notEntered: String { t("미입력", "Not set") }
+    static var burnRatesHint: String { t("요금표를 넣으면 계정별 지출이 계산됩니다", "Add a rate table to compute spend per account") }
+    static var burnRatesSet: String { t("요금표 기준", "From the rate table") }
+    static var burnIdleAccounts: String { t("기여 없는 계정", "Accounts not contributing") }
+    static func burnIdleBreakdown(errors: Int, disabled: Int, unsubscribed: Int) -> String {
+        t("오류 \(errors) · 꺼 둠 \(disabled) · 해지 \(unsubscribed)(지출 제외)", "errors \(errors) · off \(disabled) · cancelled \(unsubscribed) (not billed)")
+    }
+    static var burnByService: String { t("서비스별 판정", "By service") }
+    static var burnByServiceAside: String { t("계정 = 지출 (기여)", "accounts = paid (contributing)") }
+    static var burnFirstSteps: String { t("먼저 할 일", "Do first") }
+    static var burnFirstStepsAside: String { t("고칠 수 있는 것부터", "Fixable things first") }
+    static var burnRecordsLink: String { t("계정별 구독 기록은 Claude 탭에서 행을 펼쳐 ↗", "Per-account plan records: expand a row in Claude ↗") }
+    static var burnCollecting: String { t("수집 중", "Collecting") }
+    static func burnHistory(cycles: Int, percent: String) -> String { t("최근 \(cycles)주 평균 \(percent)", "avg of last \(cycles) weeks \(percent)") }
+    static func burnEstimate(_ current: String, _ projected: String) -> String { t("\(current) → \(projected) 추정", "\(current) → \(projected) est.") }
+    static var verdictBlocked: String { t("부족", "Short") }
+    static var verdictOnTarget: String { t("달성", "On target") }
+    static var verdictNear: String { t("근접", "Close") }
+    static var verdictSlack: String { t("여유", "Slack") }
+    static var verdictExcess: String { t("과다", "Excess") }
+
+    // MARK: CLI·Higgsfield
+
+    static var agyAskingNote: String { t("아직 물어보는 중 — 곧 값이 옵니다", "Still asking — a value is on the way") }
+    static func agyMoreLanes(_ name: String, _ count: Int) -> String { t("\(name) 외 \(count)", "\(name) +\(count)") }
+    static var higgsfieldTitle: String { t("힉스필드 크레딧", "Higgsfield credits") }
+    static var loading: String { t("불러오는 중...", "Loading…") }
+    static func higgsfieldFailed(_ error: String) -> String { t("힉스필드 크레딧 조회 실패: \(error)", "Higgsfield credits failed: \(error)") }
+    static func higgsfieldAccessibility(_ credits: String, _ dday: String) -> String {
+        t("힉스필드 크레딧 \(credits), 다음 리셋 \(dday)", "Higgsfield credits \(credits), next reset \(dday)")
+    }
+    static var higgsfieldLoginHint: String {
+        t("터미널에서 higgsfield auth login 으로 로그인한 뒤 새로고침하세요", "Run higgsfield auth login in a terminal, then refresh")
+    }
+    static var higgsfieldInstallHint: String { t("CLI 설치 확인: npm i -g @higgsfield/cli", "Check the CLI install: npm i -g @higgsfield/cli") }
+    static func higgsfieldGrant(_ amount: String) -> String { t("주기 지급 \(amount)", "Grant per cycle \(amount)") }
+    static var higgsfieldGrantUnknown: String { t("주기 지급 미상", "Grant per cycle unknown") }
+    static func higgsfieldRenewal(_ when: String) -> String { t("\(when) 갱신 예정", "Renews \(when)") }
+    static var higgsfieldNoRenewal: String { t("갱신 이력이 없어 예정일을 계산할 수 없습니다", "No renewal history to estimate the next date") }
+    static var higgsfieldNoHistory: String { t("갱신 이력 없음", "No renewal history") }
+    static var higgsfieldFutureGrant: String { t("지급 시각이 미래입니다 · 시계 확인 필요", "Grant time is in the future · check the clock") }
+    static func higgsfieldElapsed(_ days: Int, _ cycle: Int) -> String { t("\(days)일 경과 / \(cycle)일", "\(days)d elapsed / \(cycle)d") }
+    static var higgsfieldNoGrant: String { t("지급 기록 없음", "No grants recorded") }
+    static func higgsfieldAssumedCycle(_ days: Int) -> String { t("주기 미실측 · 기본 \(days)일 가정", "Cycle not measured · assuming \(days)d") }
+    static func higgsfieldMeasuredCycle(_ days: Int, _ count: Int) -> String {
+        t("\(days)일 주기 · 갱신 \(count)건 실측", "\(days)d cycle · \(count) renewals measured")
+    }
+    static func higgsfieldSpent(_ amount: String) -> String { t("이번 주기 사용 \(amount)", "Used this cycle \(amount)") }
+    static var higgsfieldExpiryUnknown: String { t("소멸 예상 계산 불가", "Expiry can't be estimated") }
+    static var higgsfieldExpiryMeasuring: String { t("소멸 예상 측정 중", "Measuring expiry") }
+    static func higgsfieldExpiryRatio(_ amount: String, _ percent: Int) -> String {
+        t("소멸 예상 \(amount) (지급분 \(percent)%)", "Expected to expire \(amount) (\(percent)% of grant)")
+    }
+    static func higgsfieldExpiry(_ amount: String) -> String { t("소멸 예상 \(amount)", "Expected to expire \(amount)") }
+    static func higgsfieldLastReset(_ date: String, _ amount: String) -> String {
+        t("직전 갱신(\(date))에 \(amount) 소멸", "\(amount) expired at last renewal (\(date))")
+    }
+    static var higgsfieldEstimated: String { t("갱신일은 API 미제공 · 지급 이력으로 추정", "Renewal date not in the API · estimated from grants") }
+    static func higgsfieldUnknownActions(_ list: String) -> String { t("처음 보는 거래 유형(\(list))", "New transaction types (\(list))") }
+    static var higgsfieldPartial: String { t("일부만 조회됨", "Partially loaded") }
+
     // MARK: CLI·빈 값 어휘
 
     static var grokChecking: String { t("Grok 확인 중", "Grok checking") }

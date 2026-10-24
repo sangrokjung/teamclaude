@@ -229,15 +229,13 @@ final class DashboardPanelFooterView: NSView {
 
         let refreshWidth = 8 + 14 + 8 + PanelDraw.width(L10n.refresh, font) + 8 + PanelDraw.keycapWidth("R") + 8
         refreshRect = NSRect(x: x - refreshWidth, y: midY - 16, width: refreshWidth, height: 32)
-        if let icon = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil) {
-            let tinted = icon.copy() as? NSImage ?? icon
-            tinted.isTemplate = true
-            let iconRect = NSRect(x: refreshRect.minX + 8, y: midY - 7, width: 14, height: 14)
-            NSGraphicsContext.saveGraphicsState()
-            tinted.draw(in: iconRect)
-            fg2.set()
-            iconRect.fill(using: .sourceAtop)
-            NSGraphicsContext.restoreGraphicsState()
+        let iconConfig = NSImage.SymbolConfiguration(pointSize: 11.5, weight: .medium)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [fg2]))
+        if let icon = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?.withSymbolConfiguration(iconConfig) {
+            let size = icon.size
+            icon.draw(in: NSRect(x: refreshRect.minX + 8 + (14 - size.width) / 2, y: midY - size.height / 2,
+                                 width: size.width, height: size.height),
+                      from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         }
         let refreshTextWidth = PanelDraw.text(L10n.refresh, refreshRect.minX + 30, midY - 8, font, fg2)
         PanelDraw.keycap("R", refreshRect.minX + 38 + refreshTextWidth, centerY: midY)

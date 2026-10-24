@@ -33,14 +33,6 @@ func installCrashRecorder() {
     }
 }
 
-/// "Grok 24%" 형태의 제목 슬롯에서 숫자만 떼어낸다. 상태 문구("Grok 로그인" 등)면 없다.
-func burnGrokPercent(_ slot: String) -> Double? {
-    guard let range = slot.range(of: #"[0-9]+(\.[0-9]+)?(?=%)"#, options: .regularExpression) else {
-        return nil
-    }
-    return Double(slot[range])
-}
-
 /// 스냅샷 픽스처를 구독·소진 모델로 옮긴다. 실패 화면은 실패했을 때만 나타나므로
 /// 이 경로가 없으면 눈으로 확인된 적 없는 화면이 된다.
 func subscriptionBurnFixture(_ raw: [String: Any]?) -> SubscriptionBurnModel {
@@ -2747,6 +2739,7 @@ final class StatusMenuDashboardView: NSView {
                 case "burn":
                     let burn = SubscriptionBurnView(frame: frame)
                     burn.model = burnModel
+                    burn.onOpenRecords = { [weak self] in self?.selectTab(.claude) }
                     burnView = burn
                     view = burn
                 case "cli":
