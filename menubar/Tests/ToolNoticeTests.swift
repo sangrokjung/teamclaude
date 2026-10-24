@@ -72,9 +72,9 @@ struct ToolNoticeTests {
 
         // 판정 순서: 실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석. 해석한 빈 결과만 noData.
         func outcome(launched: Bool = true, timedOut: Bool = false, exit: Int32 = 0, bytes: Int = 10,
-                     parsed: Bool? = true) -> CcusageLoadOutcome {
+                     parsed: Bool? = true, tooLarge: Bool = false) -> CcusageLoadOutcome {
             ccusageLoadOutcome(launched: launched, timedOut: timedOut, timeoutSeconds: 60, exitStatus: exit,
-                               outputBytes: bytes, parsedHasToday: parsed)
+                               outputBytes: bytes, parsedHasToday: parsed, outputTooLarge: tooLarge)
         }
         precondition(outcome() == .loaded)
         precondition(outcome(parsed: false) == .noData)
@@ -83,6 +83,11 @@ struct ToolNoticeTests {
         precondition(outcome(exit: 1, parsed: false) == .failed(.exitStatus(1)))
         precondition(outcome(timedOut: true, exit: 137, parsed: false) == .failed(.timeout(seconds: 60)))
         precondition(outcome(launched: false, bytes: 0, parsed: nil) == .failed(.launch))
+        // 출력 크기 상한 초과는 끊어서 생긴 종료 코드·빈 출력보다 앞선다.
+        precondition(outcome(exit: 137, bytes: 0, parsed: nil, tooLarge: true) == .failed(.outputTooLarge))
+        precondition(outcome(launched: false, bytes: 0, parsed: nil, tooLarge: true) == .failed(.launch))
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.outputTooLarge), hasData: false)?.detail
+            == "ccusage 출력 크기 상한 초과 · 다음 갱신 때 다시 시도합니다")
 
         precondition(grokToolNotice(cliInstalled: false, authPresent: false)?.headline == "Grok 미설치")
         // CLI는 있는데 인증 파일이 없으면 기존 "Grok 로그인"이 맞다.

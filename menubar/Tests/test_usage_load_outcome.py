@@ -27,6 +27,12 @@ case "$(cat "$dir/mode")" in
     if [ "$3" = daily ]; then head -c 20 "$dir/today.json"; sleep 0.5; tail -c +21 "$dir/today.json"
     else echo '{}'; fi ;;
   hang) trap '' TERM; exec /bin/sleep 30 ;;
+  flood)
+    echo $$ > "$dir/flood.pid"
+    trap '' TERM
+    i=0; while [ $i -lt 128 ]; do head -c 65536 /dev/zero; i=$((i + 1)); done
+    exec /bin/sleep 30 ;;
+  burst) head -c 1048576 /dev/zero; exit 0 ;;
   fixedday)
     if [ "$3" = daily ]; then cat "$dir/fixedday.json"; else echo '{}'; fi ;;
 esac

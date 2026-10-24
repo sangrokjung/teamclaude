@@ -1148,17 +1148,27 @@ func runCcusageRaw(_ subcommand: String) -> Data? {
 /// ccusage 한 번의 기본 시간 제한.
 let ccusageDefaultTimeoutSeconds: Double = 60
 
+/// ccusage stdout 한 번의 크기 상한. 실제 daily JSON은 수백 KB(오래 쓴 기록도 수 MB)라 32MB면 넉넉하다.
+/// 넘으면 오동작(CC_MENUBAR_NPX_BIN 오지정·무한 출력)으로 보고 자식을 그룹째 끊는다. 임시 파일이 디스크를 채우거나
+/// 출력 전량이 메모리에 올라가 메뉴바가 멈추는 것을 막는다.
+let ccusageDefaultOutputLimitBytes = 32 * 1024 * 1024
+
 /// ccusage 한 번 실행의 원 결과. 실패를 원인별로 가르려고 종료 코드·시간 초과·출력을 그대로 남긴다.
 struct CcusageRun {
     let launched: Bool
     let timedOut: Bool
     let exitStatus: Int32
+    /// stdout이 크기 상한을 넘었다. 그때 output은 비어 있다(넘친 출력은 읽지 않는다).
+    let outputTooLarge: Bool
     let output: Data
+    /// 출력을 받았던 임시 파일(이미 지워졌다). 로그·검증용.
+    let outputPath: String?
 
-    static let notLaunched = CcusageRun(launched: false, timedOut: false, exitStatus: -1, output: Data())
+    static let notLaunched = CcusageRun(launched: false, timedOut: false, exitStatus: -1, outputTooLarge: false,
+                                        output: Data(), outputPath: nil)
 
     var successOutput: Data? {
-        launched && !timedOut && exitStatus == 0 && !output.isEmpty ? output : nil
+        launched && !timedOut && !outputTooLarge && exitStatus == 0 && !output.isEmpty ? output : nil
     }
 }
 
@@ -1176,7 +1186,8 @@ func makeCcusageOutputFile(_ subcommand: String) -> (path: String, handle: FileH
     return (path, FileHandle(fileDescriptor: fd, closeOnDealloc: true))
 }
 
-func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageRun {
+func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double,
+                       outputLimitBytes: Int = ccusageDefaultOutputLimitBytes) -> CcusageRun {
     let process = Process()
     let home = NSHomeDirectory()
     let fnmBin = "\(home)/.local/share/fnm/aliases/default/bin"
@@ -1217,7 +1228,8 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageR
     guard let result = runTrustedProcessInIsolatedGroup(
         process,
         timeoutSeconds: timeoutSeconds,
-        terminationGraceMicroseconds: 700_000
+        terminationGraceMicroseconds: 700_000,
+        outputLimit: (descriptor: writeHandle.fileDescriptor, bytes: outputLimitBytes)
     ) else {
         print("CCUSAGE-FAIL[\(subcommand)]: 격리 프로세스 실행 실패")
         fflush(stdout)
@@ -1232,11 +1244,31 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageR
     writeHandle.closeFile()
     nullError.closeFile()
 
-    let data = (try? Data(contentsOf: URL(fileURLWithPath: tmpPath))) ?? Data()
-    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(data.count)")
+    // 폴링 사이에 다 쓰고 끝난 큰 출력도 여기서 거른다. 상한을 넘긴 출력은 한 바이트도 쓰지 않는다.
+    let read = result.outputExceeded
+        ? (data: Data(), tooLarge: true)
+        : readCcusageOutput(atPath: tmpPath, limitBytes: outputLimitBytes)
+    if read.tooLarge {
+        print("CCUSAGE-FAIL[\(subcommand)]: 출력이 \(outputLimitBytes)바이트 상한 초과, 강제 종료·폐기")
+    }
+    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(read.data.count)")
     fflush(stdout)
 
-    return CcusageRun(launched: true, timedOut: result.timedOut, exitStatus: result.terminationStatus, output: data)
+    return CcusageRun(launched: true, timedOut: result.timedOut, exitStatus: result.terminationStatus,
+                      outputTooLarge: read.tooLarge, output: read.data, outputPath: tmpPath)
+}
+
+/// 임시 파일에서 상한까지만 읽는다. 크기가 상한을 넘으면 읽지 않고 tooLarge다.
+/// 정상 종료 뒤에도 남은 손자가 계속 쓸 수 있으므로 크기 확인 뒤에도 상한+1바이트까지만 읽어 넘침을 가린다.
+func readCcusageOutput(atPath path: String, limitBytes: Int) -> (data: Data, tooLarge: Bool) {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return (Data(), false) }
+    defer { try? handle.close() }
+    var info = stat()
+    if fstat(handle.fileDescriptor, &info) == 0, info.st_size > off_t(limitBytes) {
+        return (Data(), true)
+    }
+    let data = (try? handle.read(upToCount: limitBytes + 1)) ?? Data()
+    return data.count > limitBytes ? (Data(), true) : (data, false)
 }
 
 /// ccusage daily 한 번의 판정과 그 값. 전체·quick 로더가 같은 판정을 쓴다.
@@ -1267,8 +1299,9 @@ func ccusageDailyHasEntry(_ data: Data, period: String) -> Bool? {
 }
 
 /// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
-func loadCcusageDaily(timeoutSeconds: Double, clock: () -> Date = { Date() }) -> CcusageDailyLoad {
-    let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds)
+func loadCcusageDaily(timeoutSeconds: Double, outputLimitBytes: Int = ccusageDefaultOutputLimitBytes,
+                      clock: () -> Date = { Date() }) -> CcusageDailyLoad {
+    let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds, outputLimitBytes: outputLimitBytes)
     let output = run.successOutput
     let rate = output == nil ? 0 : fetchUsdKrwRate()
     // 해석과 오늘 판정이 같은 "오늘"을 보게 한 시각을 함께 넘긴다(자정 경계에서 엇갈리지 않게).
@@ -1280,7 +1313,7 @@ func loadCcusageDaily(timeoutSeconds: Double, clock: () -> Date = { Date() }) ->
     let hasExactToday = quick == nil ? nil : output.flatMap { ccusageDailyHasEntry($0, period: todayKey) }
     let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
                                      exitStatus: run.exitStatus, outputBytes: run.output.count,
-                                     parsedHasToday: hasExactToday)
+                                     parsedHasToday: hasExactToday, outputTooLarge: run.outputTooLarge)
     if case .failed(let failure) = outcome {
         print("CCUSAGE-FAIL[daily]: \(failure.label)")
         fflush(stdout)
@@ -1292,6 +1325,14 @@ func loadCcusageDaily(timeoutSeconds: Double, clock: () -> Date = { Date() }) ->
 struct IsolatedProcessResult {
     let terminationStatus: Int32
     let timedOut: Bool
+    /// 지정한 출력 파일이 상한을 넘어 그룹째 끊었다.
+    var outputExceeded = false
+}
+
+/// 자식 stdout을 받는 파일의 현재 크기가 상한을 넘었는가.
+private func outputFileExceeds(_ limit: (descriptor: Int32, bytes: Int)) -> Bool {
+    var info = stat()
+    return fstat(limit.descriptor, &info) == 0 && info.st_size > off_t(limit.bytes)
 }
 
 private func withOwnedCStringArray<Result>(
@@ -1346,7 +1387,8 @@ private func reapChild(_ pid: pid_t) -> Int32? {
 func runTrustedProcessInIsolatedGroup(
     _ process: Process,
     timeoutSeconds: Double,
-    terminationGraceMicroseconds: useconds_t
+    terminationGraceMicroseconds: useconds_t,
+    outputLimit: (descriptor: Int32, bytes: Int)? = nil
 ) -> IsolatedProcessResult? {
     guard let executableURL = process.executableURL,
           executableURL.isFileURL,
@@ -1399,6 +1441,13 @@ func runTrustedProcessInIsolatedGroup(
     let timeoutNanoseconds = UInt64(max(timeoutSeconds, 0) * 1_000_000_000)
     let startedAt = DispatchTime.now().uptimeNanoseconds
     while DispatchTime.now().uptimeNanoseconds - startedAt < timeoutNanoseconds {
+        // 출력 상한: 넘치면 유예 없이 그룹째 KILL한다. 디스크에 더 쓰이는 양은 폴링 한 번(50ms) 사이 분량뿐이다.
+        if let outputLimit, outputFileExceeds(outputLimit) {
+            _ = Darwin.killpg(childPid, SIGKILL)
+            return reapChild(childPid).map {
+                IsolatedProcessResult(terminationStatus: $0, timedOut: false, outputExceeded: true)
+            }
+        }
         guard let hasExited = childHasExitedWithoutReaping(childPid) else {
             _ = Darwin.killpg(childPid, SIGKILL)
             return reapChild(childPid).map {
@@ -4147,6 +4196,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ccusageTimeoutSeconds = ccusageDefaultTimeoutSeconds
     /// ccusage 해석이 볼 "지금". 운영은 실제 시각, 테스트는 자정 경계를 넘기는 시계로 바꾼다.
     var ccusageClock: () -> Date = { Date() }
+    /// ccusage stdout 한 번의 크기 상한. 운영은 기본값, 테스트는 작게 줄인다.
+    var ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
     var teamCodexConfigPresent: Bool?
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
@@ -5186,6 +5237,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetching = true
         let startedAt = Date()
         let timeout = ccusageTimeoutSeconds
+        let outputLimit = ccusageOutputLimitBytes
         let clock = ccusageClock
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard ccusageInstalled() else {
@@ -5200,7 +5252,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             // 실행 실패·시간 초과·해석 실패는 "데이터 없음"이 아니다. 판정을 그대로 남긴다(이전 값은 지우지 않는다).
-            let daily = loadCcusageDaily(timeoutSeconds: timeout, clock: clock)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, outputLimitBytes: outputLimit, clock: clock)
             guard let dailyData = daily.daily else {
                 DispatchQueue.main.async {
                     guard let self = self else { return }
@@ -5224,8 +5276,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            let weeklyData = runCcusageCommand("weekly", timeoutSeconds: timeout).successOutput
-            let monthlyData = runCcusageCommand("monthly", timeoutSeconds: timeout).successOutput
+            let weeklyData = runCcusageCommand("weekly", timeoutSeconds: timeout, outputLimitBytes: outputLimit).successOutput
+            let monthlyData = runCcusageCommand("monthly", timeoutSeconds: timeout, outputLimitBytes: outputLimit).successOutput
             // weekly·monthly가 자정을 넘겨도 판정과 같은 날을 본다(기본값 Date()를 쓰면 오늘이 새 날의 0원으로 덮인다).
             let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate,
                                       now: daily.now)
@@ -5268,9 +5320,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetchingUsageQuick = true
         let startedAt = Date()
         let timeout = ccusageTimeoutSeconds
+        let outputLimit = ccusageOutputLimitBytes
         let clock = ccusageClock
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let daily = loadCcusageDaily(timeoutSeconds: timeout, clock: clock)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout, outputLimitBytes: outputLimit, clock: clock)
             let quickData = daily.quick
             print("CCUSAGE-QUICK[\(reason)]: today=\(quickData?.today?.period ?? "nil") cost=\(quickData?.today?.totalCost ?? -1)")
             fflush(stdout)

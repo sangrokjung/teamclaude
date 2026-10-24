@@ -84,6 +84,8 @@ enum CcusageFailure: Equatable {
     case exitStatus(Int32)
     case emptyOutput
     case unparsable
+    /// stdout이 크기 상한을 넘었다. 끊었으므로 받은 출력은 쓰지 않는다.
+    case outputTooLarge
 
     var label: String {
         switch self {
@@ -92,6 +94,7 @@ enum CcusageFailure: Equatable {
         case .exitStatus(let code): return "종료 코드 \(code)"
         case .emptyOutput: return "빈 출력"
         case .unparsable: return "출력 해석 실패"
+        case .outputTooLarge: return "출력 크기 상한 초과"
         }
     }
 }
@@ -108,11 +111,13 @@ enum CcusageLoadOutcome: Equatable {
     }
 }
 
-/// 실행 결과 → 판정. 실패 원인이 여럿이면 앞의 것(실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석)을 쓴다.
+/// 실행 결과 → 판정. 실패 원인이 여럿이면 앞의 것(실행 → 출력 크기 상한 → 시간 초과 → 종료 코드 → 빈 출력 → 해석)을 쓴다.
+/// 상한을 넘기면 자식을 끊으므로 그 뒤의 종료 코드·빈 출력은 결과일 뿐 원인이 아니다.
 /// parsedHasToday: 출력을 해석하지 못했으면 nil, 해석했으면 기록이 있는지.
 func ccusageLoadOutcome(launched: Bool, timedOut: Bool, timeoutSeconds: Double, exitStatus: Int32,
-                        outputBytes: Int, parsedHasToday: Bool?) -> CcusageLoadOutcome {
+                        outputBytes: Int, parsedHasToday: Bool?, outputTooLarge: Bool = false) -> CcusageLoadOutcome {
     guard launched else { return .failed(.launch) }
+    if outputTooLarge { return .failed(.outputTooLarge) }
     if timedOut { return .failed(.timeout(seconds: max(Int(timeoutSeconds.rounded()), 1))) }
     guard exitStatus == 0 else { return .failed(.exitStatus(exitStatus)) }
     guard outputBytes > 0 else { return .failed(.emptyOutput) }

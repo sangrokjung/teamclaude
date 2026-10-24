@@ -124,6 +124,7 @@ struct UsageLoadOutcomeTests {
         overlappingLoaderChecks(delegate)
         missingTodayChecks(delegate)
         midnightChecks(delegate)
+        outputCapChecks(delegate)
 
         print("UsageLoadOutcomeTests: ok")
     }
@@ -261,5 +262,70 @@ extension UsageLoadOutcomeTests {
                      "자정 경계 quick 오늘 값: \(delegate.currentData?.today?.period ?? "nil")")
 
         delegate.ccusageClock = { Date() }
+    }
+}
+
+// MARK: - 출력 크기 상한
+extension UsageLoadOutcomeTests {
+    /// 출력이 상한을 넘으면 시간 제한을 기다리지 않고 그룹째 끊고, 넘친 출력은 메모리에 올리지 않으며,
+    /// 임시 파일을 지우고, "출력 크기 상한 초과" 실패로 판정한다.
+    /// 가짜 npx(flood)는 8MB를 64KB씩 흘린 뒤 TERM을 무시하고 30초 잔다. 상한은 256KB로 줄인다.
+    static func outputCapChecks(_ delegate: AppDelegate) {
+        let cap = 256 * 1024
+
+        // 상한 안의 정상 출력은 그대로 읽는다.
+        setMode("today")
+        let ok = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
+        precondition(ok.successOutput != nil && !ok.outputTooLarge, "상한 안의 출력이 실패했다")
+
+        setMode("flood")
+        let pidFile = fakeDir + "/flood.pid"
+        try? FileManager.default.removeItem(atPath: pidFile)
+        let started = Date()
+        let flood = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
+        let elapsed = Date().timeIntervalSince(started)
+        precondition(elapsed < 3, "상한 초과를 바로 끊지 않았다: \(elapsed)초")
+        precondition(flood.launched && flood.outputTooLarge && !flood.timedOut,
+                     "상한 초과 판정: tooLarge=\(flood.outputTooLarge) timedOut=\(flood.timedOut)")
+        precondition(flood.successOutput == nil, "상한을 넘긴 출력을 성공으로 넘겼다")
+        precondition(flood.output.count <= cap, "상한을 넘긴 출력을 메모리에 올렸다: \(flood.output.count)바이트")
+        precondition(flood.output.isEmpty, "상한을 넘긴 출력 일부를 남겼다: \(flood.output.count)바이트")
+        precondition(flood.outputPath.map { !FileManager.default.fileExists(atPath: $0) } == true,
+                     "임시 파일이 남았다: \(flood.outputPath ?? "nil")")
+        // 쓰던 자식이 그룹째 사라졌다.
+        let leader = (try? String(contentsOfFile: pidFile, encoding: .utf8))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        precondition(leader != nil, "가짜 npx가 pid를 남기지 않았다")
+        precondition(Darwin.killpg(leader!, 0) == -1 && errno == ESRCH, "상한 초과 뒤 자식 그룹이 남았다")
+
+        // 끝난 뒤 보니 상한을 넘긴 출력(폴링 사이에 다 쓰고 정상 종료)도 같은 실패다.
+        setMode("burst")
+        let burst = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
+        precondition(burst.outputTooLarge && burst.output.isEmpty && burst.successOutput == nil,
+                     "정상 종료한 큰 출력: tooLarge=\(burst.outputTooLarge) bytes=\(burst.output.count)")
+        precondition(burst.outputPath.map { !FileManager.default.fileExists(atPath: $0) } == true)
+
+        setMode("flood")
+        let load = loadCcusageDaily(timeoutSeconds: 10, outputLimitBytes: cap)
+        precondition(load.outcome == .failed(.outputTooLarge), "daily 판정: \(load.outcome)")
+        precondition(load.daily == nil && load.quick == nil)
+
+        // 실제 로더·안내 카드·헤더 요약까지 같은 실패가 닿는다.
+        let savedTimeout = delegate.ccusageTimeoutSeconds
+        delegate.ccusageTimeoutSeconds = 10
+        delegate.ccusageOutputLimitBytes = cap
+        delegate.currentData = nil
+        let loaderStarted = Date()
+        runFull(delegate)
+        precondition(Date().timeIntervalSince(loaderStarted) < 4, "로더가 상한 초과를 바로 끊지 않았다")
+        let notice = delegate.currentToolNotices.sections["usage"]
+        precondition(notice?.kind == .loadFailed && notice?.headline == "사용량 확인 필요",
+                     "상한 초과 안내: \(notice?.headline ?? "nil")")
+        precondition(notice?.detail.contains("출력 크기 상한 초과") == true, "원인이 안내에 없다: \(notice?.detail ?? "nil")")
+        let drawn = render(delegate)
+        precondition(drawn.drawn == "사용량 확인 필요" && drawn.summary == "사용량 확인 필요",
+                     "카드 \(drawn.drawn ?? "nil") 요약 \(drawn.summary)")
+        delegate.ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
+        delegate.ccusageTimeoutSeconds = savedTimeout
     }
 }
