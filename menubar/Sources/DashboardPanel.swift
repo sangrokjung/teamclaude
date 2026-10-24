@@ -46,19 +46,22 @@ enum DashboardTab: Int, CaseIterable {
     }
 }
 
-/// 패널 단축키(⌘K 동작 목록, R 새로고침, 1–5 탭, esc 닫기). 판정은 순수 함수이고, 키를 받는 쪽은 AppDelegate다.
+/// 패널 단축키(⌘K 동작 목록, R·⌘R 새로고침, 1–5 탭). 판정은 순수 함수이고, 키를 받는 쪽은 AppDelegate다.
+/// esc는 메뉴가 스스로 닫히며 처리한다(닫힐 때 동작 목록도 닫는다).
 enum DashboardShortcut: Equatable {
     case tab(DashboardTab)
     case refresh
     case toggleActions
-    case closeActions
+
+    /// 메뉴 항목으로 등록할 키 등가 전부. resolve가 이 목록의 판정을 정한다.
+    static let keyEquivalents: [(key: String, command: Bool)] =
+        [("r", false), ("r", true), ("k", true)] + DashboardTab.allCases.map { ($0.shortcutKey, false) }
 
     static func resolve(characters: String, command: Bool, otherModifiers: Bool) -> DashboardShortcut? {
         let key = characters.lowercased()
-        if command, !otherModifiers, key == "k" { return .toggleActions }
-        guard !command, !otherModifiers else { return nil }
+        guard !otherModifiers else { return nil }
         if key == "r" { return .refresh }
-        if key == "\u{1b}" { return .closeActions }
+        if command { return key == "k" ? .toggleActions : nil }
         if let number = Int(key), let tab = DashboardTab(rawValue: number - 1) { return .tab(tab) }
         return nil
     }
@@ -241,8 +244,8 @@ final class DashboardPanelFooterView: NSView {
         PanelDraw.keycap("R", refreshRect.minX + 38 + refreshTextWidth, centerY: midY)
 
         let contextMax = refreshRect.minX - 16 - 12
-        PanelDraw.text(PanelDraw.clipped(context, NSFont.systemFont(ofSize: 11.5), maxWidth: contextMax), 16, midY - 7.5,
-                       NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.fg3)
+        PanelDraw.text(PanelDraw.clipped(context, TeamClaudePalette.legendFont, maxWidth: contextMax), 16, midY - 7.5,
+                       TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
     }
 }
 
@@ -339,7 +342,7 @@ final class DashboardActionListView: NSView {
                 right -= 8
             }
             if !action.detail.isEmpty {
-                let detailFont = NSFont.systemFont(ofSize: 11.5)
+                let detailFont = TeamClaudePalette.legendFont
                 let detail = PanelDraw.clipped(action.detail, detailFont, maxWidth: 130)
                 right = PanelDraw.right(detail, right, row.midY - 7.5, detailFont, TeamClaudePalette.fg3) - 10
             }

@@ -61,7 +61,6 @@ enum L10n {
     // MARK: 개요
 
     static var routableNow: String { t("지금 라우팅 가능", "Routable now") }
-    static var waitingReturns: String { t("기다리면 풀림", "Clears on its own") }
     static var footerBurn: String { t("목표 사용률 100%", "Target utilization 100%") }
     static var footerCli: String { "Grok · agy · Higgsfield" }
     static func footerOverview(todo: Int, waiting: Int) -> String { t("손볼 것 \(todo) · 대기 \(waiting)", "To fix \(todo) · Waiting \(waiting)") }

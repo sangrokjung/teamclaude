@@ -238,8 +238,8 @@ final class OverviewTabView: NSView {
             }
             let inner = rect.minX + 12
             let maxText = rect.width - 20
-            PanelDraw.text(PanelDraw.clipped(lane.name, NSFont.systemFont(ofSize: 11.5), maxWidth: maxText), inner, rect.minY + 12,
-                           NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.fg3)
+            PanelDraw.text(PanelDraw.clipped(lane.name, TeamClaudePalette.legendFont, maxWidth: maxText), inner, rect.minY + 12,
+                           TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
             if lane.quiet {
                 PanelDraw.text(PanelDraw.clipped(lane.value, NSFont.systemFont(ofSize: 14, weight: .semibold), maxWidth: maxText),
                                inner, rect.minY + 32, NSFont.systemFont(ofSize: 14, weight: .semibold), TeamClaudePalette.fg2)
@@ -261,7 +261,7 @@ final class OverviewTabView: NSView {
         // 3. 손볼 것
         if !model.todos.isEmpty || !model.waitingNames.isEmpty {
             PanelDraw.meta(L10n.todoBadge(model.todos.count), x0, todoTop)
-            PanelDraw.right(L10n.todoAside, x0 + width, todoTop, NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.fg3)
+            PanelDraw.right(L10n.todoAside, x0 + width, todoTop, TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
             for (index, todo) in model.todos.enumerated() {
                 let row = todoRowRect(index)
                 PanelDraw.card(row)
@@ -291,7 +291,7 @@ final class OverviewTabView: NSView {
         // 4. 주간 소진 전망 미리보기
         PanelDraw.meta(L10n.burnPreviewTitle, x0, burnTop)
         if let aside = model.burnAside {
-            PanelDraw.right(aside, x0 + width, burnTop, NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.amber)
+            PanelDraw.right(aside, x0 + width, burnTop, TeamClaudePalette.legendFont, TeamClaudePalette.amber)
         }
         if model.burnLines.isEmpty {
             PanelDraw.text(StatusVocabulary.notMeasured, x0, burnTop + 22, TeamClaudePalette.bodyFont, TeamClaudePalette.fg3)
@@ -314,7 +314,7 @@ final class OverviewTabView: NSView {
         for (label, tone) in [(L10n.legendExcluded(model.excludedCount), PanelTone.error),
                               (L10n.legendWait(model.waitCount), PanelTone.wait),
                               (L10n.legendReady(model.readyCount), PanelTone.ready)] {
-            legendX = PanelDraw.right(label, legendX, top, NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.fg3)
+            legendX = PanelDraw.right(label, legendX, top, TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
             PanelDraw.dot(legendX - 12, centerY: top + 7.5, tone.color)
             legendX -= 24
         }
@@ -364,8 +364,8 @@ final class OverviewTabView: NSView {
             let y = chart.maxY + 26
             TeamClaudePalette.sky.setFill()
             NSBezierPath(roundedRect: NSRect(x: x0, y: y + 7, width: 16, height: 2), xRadius: 1, yRadius: 1).fill()
-            PanelDraw.text(PanelDraw.clipped(caption, NSFont.systemFont(ofSize: 11.5), maxWidth: width - 24), x0 + 24, y,
-                           NSFont.systemFont(ofSize: 11.5), TeamClaudePalette.fg3)
+            PanelDraw.text(PanelDraw.clipped(caption, TeamClaudePalette.legendFont, maxWidth: width - 24), x0 + 24, y,
+                           TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
         }
     }
 }

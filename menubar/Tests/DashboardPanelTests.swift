@@ -37,7 +37,13 @@ struct DashboardPanelTests {
         precondition(DashboardShortcut.resolve(characters: "k", command: false, otherModifiers: false) == nil)
         precondition(DashboardShortcut.resolve(characters: "r", command: false, otherModifiers: false) == .refresh)
         precondition(DashboardShortcut.resolve(characters: "r", command: false, otherModifiers: true) == nil)
-        precondition(DashboardShortcut.resolve(characters: "\u{1b}", command: false, otherModifiers: false) == .closeActions)
+        precondition(DashboardShortcut.resolve(characters: "r", command: true, otherModifiers: false) == .refresh, "⌘R from the old menu still refreshes")
+        precondition(DashboardShortcut.resolve(characters: "1", command: true, otherModifiers: false) == nil)
+        // 등록하는 키 등가는 전부 판정이 있다(메뉴 항목과 판정이 갈리지 않는다).
+        for entry in DashboardShortcut.keyEquivalents {
+            precondition(DashboardShortcut.resolve(characters: entry.key, command: entry.command, otherModifiers: false) != nil, entry.key)
+        }
+        precondition(DashboardShortcut.keyEquivalents.count == 3 + DashboardTab.allCases.count)
         for tab in DashboardTab.allCases {
             precondition(DashboardShortcut.resolve(characters: tab.shortcutKey, command: false, otherModifiers: false) == .tab(tab))
         }

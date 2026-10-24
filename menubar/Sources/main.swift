@@ -2177,7 +2177,7 @@ final class TeamClaudeTableView: NSView {
             PanelDraw.dot(left + 2, centerY: y + 7.5, tone.color)
             let titleW = PanelDraw.text(title, left + 16, y, TeamClaudePalette.legendMediumFont, fg2)
             PanelDraw.text("\(heading.count)", left + 16 + titleW + 6, y + 0.5, TeamClaudePalette.smallFont, fg3)
-            PanelDraw.right(note, rightEdge, y, NSFont.systemFont(ofSize: 11.5), fg3)
+            PanelDraw.right(note, rightEdge, y, TeamClaudePalette.legendFont, fg3)
         }
 
         for i in grouped.order {
@@ -2239,7 +2239,7 @@ final class TeamClaudeTableView: NSView {
 
             // 상태 칸: 재인증 버튼(layout이 배치) · 오류 사유 · 측정 · 측정 문제 · 상태 라벨. 맨 오른쪽은 펼침 표시.
             let chevron = isExpanded ? "⌃" : "⌄"
-            PanelDraw.right(chevron, rightEdge, y + 6, NSFont.systemFont(ofSize: 11), fg3)
+            PanelDraw.right(chevron, rightEdge, y + 6, micro, fg3)
             let statusRight = rightEdge - 14
             let statusWidth = statusRight - TeamClaudeColumns.statusX
             let canReauth = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
@@ -2449,18 +2449,13 @@ final class StatusMenuDashboardView: NSView {
         needsLayout = true
     }
 
-    /// 단축키 판정(DashboardShortcut)을 실행한다. 처리했으면 true.
-    @discardableResult
-    func perform(_ shortcut: DashboardShortcut) -> Bool {
+    /// 단축키 판정(DashboardShortcut)을 실행한다.
+    func perform(_ shortcut: DashboardShortcut) {
         switch shortcut {
         case .tab(let tab): selectTab(tab)
         case .refresh: onRefresh?()
         case .toggleActions: setActionsOpen(!actionsOpen)
-        case .closeActions:
-            guard actionsOpen else { return false }
-            setActionsOpen(false)
         }
-        return true
     }
 
     func updateActionDetail(id: String, detail: String) {
@@ -5290,13 +5285,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 패널 단축키(R·1–5·⌘K)를 받는 메뉴 항목. 메뉴가 열려 있는 동안 키보드 이벤트는 메뉴 추적 루프가 가져가
     /// 커스텀 뷰에 오지 않으므로, 키 등가(keyEquivalent)를 가진 높이 1pt 항목으로 받는다.
     func addDashboardShortcutItems(to menu: NSMenu) {
-        var shortcuts: [(String, NSEvent.ModifierFlags, DashboardShortcut)] = [
-            ("r", [], .refresh), ("r", [.command], .refresh), ("k", [.command], .toggleActions),
-        ]
-        for tab in DashboardTab.allCases { shortcuts.append((tab.shortcutKey, [], .tab(tab))) }
-        for (key, modifiers, shortcut) in shortcuts {
+        for (key, command) in DashboardShortcut.keyEquivalents {
+            guard let shortcut = DashboardShortcut.resolve(characters: key, command: command, otherModifiers: false) else { continue }
             let item = NSMenuItem(title: "", action: #selector(dashboardShortcutAction(_:)), keyEquivalent: key)
-            item.keyEquivalentModifierMask = modifiers
+            item.keyEquivalentModifierMask = command ? [.command] : []
             item.target = self
             item.representedObject = DashboardShortcutBox(shortcut)
             item.view = NSView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: 1))
