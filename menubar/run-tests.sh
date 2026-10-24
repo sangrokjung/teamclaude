@@ -18,6 +18,9 @@ SRC="$ROOT/menubar/Sources"
 TESTS="$ROOT/menubar/Tests"
 OUT="$ROOT/menubar/.build/tests"
 mkdir -p "$OUT"
+# 화면 문구 언어(R5). 기존 테스트가 한국어 문구를 단언하므로 러너는 한국어로 고정한다.
+# CI 러너의 시스템 언어는 영어라 고정하지 않으면 같은 트리가 기계마다 다르게 판정된다. 영어 화면은 스냅샷 테스트가 따로 본다.
+export CC_MENUBAR_LANG="${CC_MENUBAR_LANG:-ko}"
 
 # main.swift는 최상위 코드가 있어 -parse-as-library 바이너리에 못 들어간다.
 # 아래 두 파일은 main.swift의 TeamClaudeHealth / UsageData에 의존한다.
