@@ -161,6 +161,16 @@ enum CcusageAuxCommand: Equatable {
         }
     }
 
+    /// ccusage가 내는 기간 형식인가(주간은 주 시작일 YYYY-MM-DD, 월간은 YYYY-MM).
+    func periodMatches(_ period: String) -> Bool {
+        let pattern: String
+        switch self {
+        case .weekly: pattern = #"^\d{4}-\d{2}-\d{2}$"#
+        case .monthly: pattern = #"^\d{4}-\d{2}$"#
+        }
+        return period.range(of: pattern, options: .regularExpression) != nil
+    }
+
     /// ccusage JSON에서 이 명령의 기간 배열 키.
     var arrayKey: String {
         switch self {

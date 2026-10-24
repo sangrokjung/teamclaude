@@ -492,7 +492,23 @@ extension UsageLoadOutcomeTests {
             (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":true}]}"#, "토큰이 불리언"),
             (#"{"weekly":[],"totals":{"totalCost":"x","totalTokens":1}}"#, "합계 비용이 문자열"),
             (#"{"weekly":[],"totals":[]}"#, "합계가 객체 아님"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":-5,"totalTokens":1}]}"#, "음수 비용"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1.5}]}"#, "소수 토큰"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":-1}]}"#, "음수 토큰"),
+            (#"{"weekly":[{"period":"garbage","totalCost":1,"totalTokens":1}]}"#, "기간 형식이 틀림"),
+            (#"{"weekly":[{"period":"2020-01","totalCost":1,"totalTokens":1}]}"#, "주간에 월 형식"),
+            (#"{"weekly":[],"totals":{"totalCost":-1,"totalTokens":1}}"#, "음수 합계"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1,"modelBreakdowns":[{"modelName":"x","cost":"bad","inputTokens":1}]}]}"#, "모델 비용이 문자열"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1,"modelBreakdowns":[{"modelName":"x","cost":1,"inputTokens":"bad"}]}]}"#, "모델 토큰이 문자열"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1,"modelBreakdowns":[{"cost":1}]}]}"#, "모델 이름 없음"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1,"modelBreakdowns":{}}]}"#, "모델 내역이 배열 아님"),
         ]
+        // 월간은 YYYY-MM만 받는다.
+        let monthlyWeekShape = resolveCcusageAux(weekly: run(#"{"weekly":[]}"#),
+                                                 monthly: run(#"{"monthly":[{"period":"2020-01-06","totalCost":1,"totalTokens":1}]}"#),
+                                                 previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
+        precondition(monthlyWeekShape.failures == [CcusageAuxFailure(command: .monthly, failure: .unparsable)],
+                     "월간에 주 형식 기간을 받았다: \(monthlyWeekShape.failures)")
         for (json, why) in malformed {
             let r = resolveCcusageAux(weekly: run(json), monthly: run(#"{"monthly":[]}"#),
                                       previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
@@ -502,7 +518,7 @@ extension UsageLoadOutcomeTests {
 
         // 빈 배열, 필드가 맞는 항목과 합계는 정상이다.
         let ok = resolveCcusageAux(weekly: run(#"{"weekly":[]}"#),
-                                   monthly: run(#"{"monthly":[{"period":"2020-01","totalCost":1.5,"totalTokens":10}],"totals":{"totalCost":1.5,"totalTokens":10}}"#),
+                                   monthly: run(#"{"monthly":[{"period":"2020-01","totalCost":1.5,"totalTokens":10,"modelBreakdowns":[{"modelName":"claude-x","cost":1.5,"inputTokens":4,"outputTokens":6,"cacheCreationTokens":0,"cacheReadTokens":0}]}],"totals":{"totalCost":1.5,"totalTokens":10}}"#),
                                    previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
         precondition(ok.failures.isEmpty, "정상 보조 출력을 실패로 봤다: \(ok.failures)")
     }

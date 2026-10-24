@@ -1284,19 +1284,45 @@ func ccusageIsJSONNumber(_ value: Any?) -> Bool {
     return CFGetTypeID(number) != CFBooleanGetTypeID()
 }
 
-/// pickPeriod가 읽는 weekly·monthly 출력 형태인가. 명령별 기간 배열의 각 항목은 문자열 `period`와 숫자
-/// `totalCost`·`totalTokens`를 갖고, `totals`가 있으면 같은 두 숫자를 가진 객체여야 한다. 형식이 틀린 값을
-/// 해석기가 0으로 읽어 정상값처럼 그리지 않게, 여기서 실패로 가른다. 빈 배열은 기간 항목이 없는 정상 경우다.
+/// 비용 값: 유한한 0 이상의 숫자.
+func ccusageIsValidCost(_ value: Any?) -> Bool {
+    guard ccusageIsJSONNumber(value), let number = value as? NSNumber else { return false }
+    let double = number.doubleValue
+    return double.isFinite && double >= 0
+}
+
+/// 토큰 값: 0 이상의 정수.
+func ccusageIsValidTokenCount(_ value: Any?) -> Bool {
+    guard ccusageIsValidCost(value), let number = value as? NSNumber else { return false }
+    return number.doubleValue.rounded(.towardZero) == number.doubleValue
+}
+
+/// 모델별 내역 한 줄: 이름 문자열, 비용과 있는 토큰 필드가 모두 올바른 값.
+func ccusageModelBreakdownIsValid(_ entry: [String: Any]) -> Bool {
+    guard entry["modelName"] is String, ccusageIsValidCost(entry["cost"]) else { return false }
+    return ["inputTokens", "outputTokens", "cacheCreationTokens", "cacheReadTokens"].allSatisfy { key in
+        entry[key] == nil || ccusageIsValidTokenCount(entry[key])
+    }
+}
+
+/// pickPeriod·parseModelBreakdown이 읽는 weekly·monthly 출력 형태인가. 명령별 기간 배열의 각 항목은 명령에 맞는
+/// `period`(주간 YYYY-MM-DD, 월간 YYYY-MM), 0 이상의 `totalCost`, 0 이상 정수 `totalTokens`를 갖고, `modelBreakdowns`가
+/// 있으면 각 줄이 올바라야 한다. `totals`가 있으면 같은 두 값을 가진 객체여야 한다. 형식이 틀린 값을 해석기가 0으로
+/// 읽거나 건너뛰어 정상값처럼 그리지 않게, 여기서 실패로 가른다. 빈 배열은 기간 항목이 없는 정상 경우다.
 func ccusageAuxOutputMatchesSchema(_ data: Data, command: CcusageAuxCommand) -> Bool {
     guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
           let entries = object[command.arrayKey] as? [[String: Any]] else { return false }
     let entriesValid = entries.allSatisfy { entry in
-        entry["period"] is String && ccusageIsJSONNumber(entry["totalCost"]) && ccusageIsJSONNumber(entry["totalTokens"])
+        guard let period = entry["period"] as? String, command.periodMatches(period),
+              ccusageIsValidCost(entry["totalCost"]), ccusageIsValidTokenCount(entry["totalTokens"]) else { return false }
+        guard let breakdowns = entry["modelBreakdowns"] else { return true }
+        guard let rows = breakdowns as? [[String: Any]] else { return false }
+        return rows.allSatisfy(ccusageModelBreakdownIsValid)
     }
     guard entriesValid else { return false }
     guard let totals = object["totals"] else { return true }
     guard let totalsObject = totals as? [String: Any] else { return false }
-    return ccusageIsJSONNumber(totalsObject["totalCost"]) && ccusageIsJSONNumber(totalsObject["totalTokens"])
+    return ccusageIsValidCost(totalsObject["totalCost"]) && ccusageIsValidTokenCount(totalsObject["totalTokens"])
 }
 
 /// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰고, 해석 실패는 출력이
@@ -1602,19 +1628,6 @@ private func awaitCapturedGroup(
     }
     if groupHasLiveMembers() { _ = Darwin.killpg(childPid, SIGKILL) }
     return reapChild(childPid).map(finish)
-}
-
-/// daily(필수) + weekly/monthly(정확도 향상, 실패 시 daily 파생 폴백) + 환율을 조합해 UsageData 반환.
-/// 수동 호출용 동기 헬퍼이며, 메뉴바 갱신은 loadUsageInBackground 에서 daily quick 반영을 먼저 수행한다.
-func runCcusage() -> UsageData? {
-    guard let dailyData = runCcusageRaw("daily") else { return nil }
-    let weeklyData = runCcusageRaw("weekly")
-    let monthlyData = runCcusageRaw("monthly")
-    let rate = fetchUsdKrwRate()
-    let parsed = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate)
-    print("CCUSAGE-PARSE: today=\(parsed?.today?.period ?? "nil") cost=\(parsed?.today?.totalCost ?? -1) thisMonth=\(parsed?.thisMonthCost ?? -1) rate=\(rate)")
-    fflush(stdout)
-    return parsed
 }
 
 func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly monthlyData: Data?, rate: Double,
