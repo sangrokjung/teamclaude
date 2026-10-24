@@ -6,7 +6,8 @@
 - 영어(CC_MENUBAR_LANG=en): 한글 0자.
 - 한국어(CC_MENUBAR_LANG=ko): A안 문구가 그대로 그려진다.
 
-build.sh가 mv 직전의 후보 바이너리(CC_MENUBAR_BINARY)로 실행한다(러너의 test_*.py 글롭 밖)."""
+build.sh가 mv 직전의 후보 바이너리(CC_MENUBAR_BINARY)로 실행하고, run-tests.sh에서는 test_locale_snapshot.py가
+지금 소스로 새로 컴파일한 바이너리로 실행한다(러너 요약에 나타나도록)."""
 import os
 import pathlib
 import re
