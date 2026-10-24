@@ -22,6 +22,8 @@ struct AgyQuotaGroup: Equatable {
 struct AgyCardModel: Equatable {
     var message: String?
     var groups: [AgyQuotaGroup]
+    /// 도구가 없을 때의 공통 안내(R1).
+    var notice: ToolNotice? = nil
 }
 
 enum AgyFetchOutcome: Equatable {

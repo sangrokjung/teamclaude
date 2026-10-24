@@ -73,6 +73,7 @@ final class CliQuotaLanesView: NSView {
         let grokY = Self.topInset
         drawText("Grok", 20, grokY, laneFont, muted)
         drawText(grok.headline, valueX, grokY - 1, valueFont, text)
+        if let notice = grok.notice { ToolNoticeDrawLog.record("grok", notice) }
         var grokTail = grok.detail ?? ""
         if let note = staleNotes["grok"] {
             grokTail = grokTail.isEmpty ? note : "\(grokTail) · \(note)"
@@ -90,6 +91,7 @@ final class CliQuotaLanesView: NSView {
             let message = agy.message ?? StatusVocabulary.checking
             let line = staleNotes["agy"].map { "\(message) · \($0)" } ?? message
             drawText(line, valueX, agyY - 1, valueFont, text)
+            if let notice = agy.notice { ToolNoticeDrawLog.record("agy", notice) }
             return
         }
         // 레인이 여럿이면 첫 줄만 그리고 나머지는 세어서 알린다. 조용히 버리면 화면과

@@ -24,6 +24,8 @@ struct GrokPercentOutcome: Equatable {
 struct GrokCardModel: Equatable {
     var headline: String
     var detail: String?
+    /// 도구가 없을 때의 공통 안내(R1). 있으면 레인이 같은 문구를 그린다.
+    var notice: ToolNotice? = nil
 }
 
 enum GrokMenuOutcome: Equatable {

@@ -9,13 +9,16 @@ struct SubscriptionBurnModel: Equatable {
     let recommendations: [String]
     /// 금액 앞에 붙는 통화 기호. 단가 파일의 currency에서 온다.
     let currency: String
+    /// 구독 수집기 상태 파일이 없을 때의 안내(R4). 높이와 그리기가 같은 모델에서 읽는다.
+    let collectorNotice: ToolNotice?
 
     init(usages: [LaneUsage], rates: [String: LaneRate], recommendations: [String],
-         currency: String = "") {
+         currency: String = "", collectorNotice: ToolNotice? = nil) {
         self.usages = usages
         self.rates = rates
         self.recommendations = recommendations
         self.currency = currency
+        self.collectorNotice = collectorNotice
     }
 }
 
@@ -87,7 +90,8 @@ final class SubscriptionBurnView: NSView {
     static func preferredHeight(_ model: SubscriptionBurnModel) -> CGFloat {
         let rows = CGFloat(model.usages.count) * rowHeight
         let recommendations = model.recommendations.isEmpty ? 0 : recommendationHeight
-        return spendHeight + blockGap + padding * 2 + headerHeight + rows + recommendations
+        let collector = model.collectorNotice == nil ? 0 : recommendationHeight
+        return spendHeight + blockGap + padding * 2 + headerHeight + rows + recommendations + collector
     }
 
     var model = SubscriptionBurnModel(usages: [], rates: [:], recommendations: []) {
@@ -116,7 +120,8 @@ final class SubscriptionBurnView: NSView {
             "\(usage.lane) \(usage.paidAccounts)계정 중 기여 \(usage.contributingAccounts), "
             + "\(burnProjectionLabel(burnBindingProjection(usage))), \(burnVerdictLabel(burnVerdict(usage)))"
         }
-        return (["구독 지출과 한도 소진"] + lanes + model.recommendations).joined(separator: "; ")
+        let collector = model.collectorNotice.map { [$0.headline] } ?? []
+        return (["구독 지출과 한도 소진"] + lanes + model.recommendations + collector).joined(separator: "; ")
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -206,6 +211,11 @@ final class SubscriptionBurnView: NSView {
 
         if !model.recommendations.isEmpty {
             drawText(model.recommendations.joined(separator: " · "), columnLane, y + 4, small, muted)
+            y += Self.recommendationHeight
+        }
+        if let notice = model.collectorNotice {
+            drawText(notice.line, columnLane, y + 4, small, muted)
+            ToolNoticeDrawLog.record("subscription", notice)
         }
     }
 }
