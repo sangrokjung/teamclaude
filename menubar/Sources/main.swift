@@ -5479,6 +5479,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         restartTeamClaudeItem.view = restartTeamClaudeView
         menu.addItem(restartTeamClaudeItem)
 
+        // 외부 배포본(.app)에서만 보인다. 내부 설치는 install.py의 LaunchAgent가 로그인 시 띄운다.
+        if menubarLoginItemAvailable(bundlePath: Bundle.main.bundlePath) {
+            let loginAtStartItem = NSMenuItem(title: "로그인 시 열기", action: #selector(toggleLoginItemAction), keyEquivalent: "")
+            loginAtStartItem.target = self
+            let loginAtStartView = MenuActionRowView(frame: NSRect(x: 0, y: 0, width: actionWidth, height: MenuActionRowView.preferredHeight), icon: "⏻", symbolName: "person.badge.clock", title: "로그인 시 열기", detail: menubarLoginItemDetail(enabled: menubarLoginItemIsEnabled(home: NSHomeDirectory())), tone: blue)
+            loginAtStartView.onClick = { [weak self, weak loginAtStartView] in
+                guard let self else { return }
+                loginAtStartView?.detail = self.toggleLoginItem()
+            }
+            loginAtStartItem.view = loginAtStartView
+            menu.addItem(loginAtStartItem)
+        }
+
         let quitItem = NSMenuItem(title: "종료", action: #selector(quitAction), keyEquivalent: "q")
         quitItem.target = self
         let quitView = MenuActionRowView(frame: NSRect(x: 0, y: 0, width: actionWidth, height: MenuActionRowView.preferredHeight), icon: "×", symbolName: "power", title: "종료", detail: "⌘Q", tone: red)
@@ -5907,6 +5920,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         notice.addButton(withTitle: "확인")
         NSApp.activate(ignoringOtherApps: true)
         notice.runModal()
+    }
+
+    @objc func toggleLoginItemAction() {
+        _ = toggleLoginItem()
+    }
+
+    /// 로그인 시 열기를 켜고 끈다. 사용자 LaunchAgent 파일만 다루고, 바뀐 상태 문구를 돌려준다.
+    func toggleLoginItem() -> String {
+        let home = NSHomeDirectory()
+        let enable = !menubarLoginItemIsEnabled(home: home)
+        guard let executable = Bundle.main.executablePath else { return menubarLoginItemDetail(enabled: !enable) }
+        do {
+            try setMenubarLoginItem(enabled: enable, executablePath: executable, home: home)
+            print("LOGIN-ITEM: \(menubarLoginItemDetail(enabled: enable))")
+        } catch {
+            print("LOGIN-ITEM: 변경 실패 \(error.localizedDescription)")
+        }
+        fflush(stdout)
+        return menubarLoginItemDetail(enabled: menubarLoginItemIsEnabled(home: home))
     }
 
     @objc func quitAction() {
