@@ -28,6 +28,8 @@ EXCLUDE_SOURCES=(main.swift TeamClaudeAvailability.swift CodexStatusView.swift D
 # main.swift 심볼을 쓰는 테스트. main.swift 분할(후속 계획) 전까지 러너에서 못 돌린다.
 # (세 파일 모두 짝이 되는 test_*.py가 main.swift의 진입점 앞부분을 잘라 붙여 직접 컴파일·실행하므로 실제로는 돈다.)
 SKIP_TESTS=(AccountSubscriptionLayoutTests.swift TeamClaudeAvailabilityTests.swift TeamCodexDashboardSourceTests.swift)
+# makeOverviewModel(DashboardOverviewBuilder.swift)도 main.swift 타입을 읽는다. test_dashboard_overview_builder.py가 같은 방식으로 돌린다.
+SKIP_TESTS+=(DashboardOverviewBuilderTests.swift)
 # CodexStatusLoaderTests는 $TMPDIR 아래 menubar-usage-check-* 격리 홈(CFFIXED_USER_HOME + CC_MENUBAR_CODEX_* 3종)이
 # 없으면 "Refusing fixture writes"로 exit 2 한다. 그 격리 홈은 test_usage_regressions.py가 만들어 돌린다.
 SKIP_TESTS+=(CodexStatusLoaderTests.swift)
