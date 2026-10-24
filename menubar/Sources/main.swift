@@ -3485,7 +3485,11 @@ func teamCodexPoolHealth(
 // supervisor 강제 재시작(kickstart의 -k 옵션)은 진행 중인 Claude Code 요청을 모두 끊는다(10/10 23:47 inflight 14건).
 // 자동 경로는 재시작하지 않는다. 판정은 TeamClaudeServerControl.swift의 순수 함수가 한다.
 
-let teamClaudeLaunchdLabel = "com.qjc.teamclaude"
+/// 환경변수(CC_MENUBAR_TEAMCLAUDE_LABEL) > UserDefaults(teamClaudeLaunchdLabel) > 기본값 com.qjc.teamclaude.
+let teamClaudeLaunchdLabel = resolveTeamClaudeLaunchdLabel(
+    environment: ProcessInfo.processInfo.environment,
+    defaultsValue: UserDefaults.standard.string(forKey: teamClaudeLaunchdLabelDefaultsKey)
+)
 
 private func runTeamClaudeCapture(
     executable: String,
@@ -3636,6 +3640,41 @@ func startStoppedTeamClaudeService() -> Bool {
     }
 }
 
+/// 라벨이 launchd에 없을 때 `teamclaude server`를 분리 실행해 시작만 한다. 살아 있는 프로세스는 건드리지 않는다
+/// (호출부가 포트가 닫혔음을 확인한 뒤에만 부른다). 출력은 ~/Library/Logs/cc-menubar/teamclaude-server.log.
+@discardableResult
+func startTeamClaudeServerDetached(executable: String) -> Bool {
+    let logDir = "\(NSHomeDirectory())/Library/Logs/cc-menubar"
+    try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+    let command = teamClaudeDetachedStartArguments(executable: executable, logPath: "\(logDir)/teamclaude-server.log")
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: command.executable)
+    task.arguments = command.arguments
+    var environment = ProcessInfo.processInfo.environment
+    // teamclaude는 `#!/usr/bin/env node` 스크립트다. 설치 폴더(nvm·fnm·npm prefix)에 같이 있는 node를 먼저 찾게 한다.
+    let executableBin = (executable as NSString).deletingLastPathComponent
+    environment["PATH"] = "\(executableBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    task.environment = environment
+    task.standardInput = FileHandle.nullDevice
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    do {
+        try task.run()
+        task.waitUntilExit()
+        print("TEAMCLAUDE-START: launchd 미등록 → teamclaude server 분리 실행 exit=\(task.terminationStatus)")
+        fflush(stdout)
+        return task.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+/// 분리 실행할 수 있는 teamclaude 실행 파일(절대 경로). 못 찾으면 nil.
+func teamClaudeDetachedExecutable() -> String? {
+    let executable = resolveTeamClaudeExecutable()
+    return executable.hasPrefix("/") ? executable : nil
+}
+
 /// supervisor를 죽였다 다시 띄운다. 진행 중 요청이 모두 끊긴다.
 /// 사용자가 확인 대화상자에서 재시작을 고른 restartTeamClaudeAction에서만 부른다.
 @discardableResult
@@ -3671,7 +3710,7 @@ enum TeamClaudeSyncOutcome: Equatable {
             return "프로세스 실행 중(pid \(pid.map(String.init) ?? "미확인")) · 응답 지연, 재시작 안 함"
         case .serviceStarted: return "멈춘 서비스 시작(kickstart, -k 없음)"
         case .serviceStartFailed: return "멈춘 서비스 시작 실패"
-        case .serviceNotLoaded: return "launchd 서비스 미등록 · 조치 안 함"
+        case .serviceNotLoaded: return "launchd 서비스 미등록 · 시작할 설정·실행 파일 없음, 조치 안 함"
         case .undetermined: return "launchd 상태 확인 불가 · 조치 안 함"
         }
     }
@@ -3724,7 +3763,20 @@ func syncTeamClaudeServerWithoutRestart(current: TeamClaudeHealth) -> (outcome: 
         case .responseDelayed(let pid):
             return (.responseDelayed(pid: pid), current)
         case .serviceNotLoaded:
-            return (.serviceNotLoaded, current)
+            // 라벨이 launchd에 없다(외부 설치 등). 포트가 닫혔음은 판정이 이미 확인했다.
+            // 설정과 실행 파일이 있을 때만 `teamclaude server`를 분리 실행해 시작만 한다.
+            let executable = teamClaudeDetachedExecutable()
+            guard teamClaudeDetachedStartAllowed(configPresent: current.configPresent, executable: executable),
+                  let executable, startTeamClaudeServerDetached(executable: executable) else {
+                return (.serviceNotLoaded, current)
+            }
+            var detachedHealth = current
+            for _ in 0..<45 {
+                Thread.sleep(forTimeInterval: 1)
+                detachedHealth = loadTeamClaudeHealth()
+                if detachedHealth.serverReachable { return (.serviceStarted, detachedHealth) }
+            }
+            return (.serviceStartFailed, detachedHealth)
         case .undetermined:
             return (.undetermined, current)
         case .startStoppedService:
@@ -5789,31 +5841,72 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 사용자가 명시적으로 누르는 재시작. 끊길 진행 중 요청 수를 보여 주고 확인을 받은 뒤에만 -k 재시작한다.
     @objc func restartTeamClaudeAction() {
         let health = currentTeamClaude
-        let confirmation = teamClaudeRestartConfirmation(
-            inflight: health?.inflight,
-            serverReachable: health?.serverReachable ?? false
-        )
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = confirmation.title
-        alert.informativeText = confirmation.message
-        // 첫 버튼(기본, Return)은 취소다. 재시작은 두 번째 버튼을 눌러야 한다.
-        alert.addButton(withTitle: confirmation.cancelTitle)
-        alert.addButton(withTitle: confirmation.confirmTitle)
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertSecondButtonReturn else {
-            print("TEAMCLAUDE-RESTART: 사용자 취소")
-            fflush(stdout)
-            return
-        }
-        print("TEAMCLAUDE-RESTART: 사용자 확인 inflight=\(health?.inflight.description ?? "unknown")")
-        fflush(stdout)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            _ = forceRestartTeamClaudeServerConfirmedByUser()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                self?.refreshStatusOnly()
+        let port = health?.serverPort ?? 3456
+        // 라벨이 launchd에 등록됐는지부터 본다. 미등록이면 kickstart는 쓸 수 없고(A4), 살아 있는 서버는 앱 소관이 아니다.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let launchd = probeTeamClaudeLaunchd()
+            let plan = teamClaudeRestartPlan(
+                launchd: launchd,
+                port: launchd == .notLoaded ? probeTeamClaudePort(port) : .unknown
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                print("TEAMCLAUDE-RESTART: label=\(teamClaudeLaunchdLabel) plan=\(plan)")
+                fflush(stdout)
+                switch plan {
+                case .forceRestartConfirmed:
+                    // launchd에 등록된 서비스일 때만 온다. 끊길 진행 중 요청 수를 보여 주고 확인을 받은 뒤에만 -k 재시작한다.
+                    let confirmation = teamClaudeRestartConfirmation(
+                        inflight: health?.inflight,
+                        serverReachable: health?.serverReachable ?? false
+                    )
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = confirmation.title
+                    alert.informativeText = confirmation.message
+                    // 첫 버튼(기본, Return)은 취소다. 재시작은 두 번째 버튼을 눌러야 한다.
+                    alert.addButton(withTitle: confirmation.cancelTitle)
+                    alert.addButton(withTitle: confirmation.confirmTitle)
+                    NSApp.activate(ignoringOtherApps: true)
+                    guard alert.runModal() == .alertSecondButtonReturn else {
+                        print("TEAMCLAUDE-RESTART: 사용자 취소")
+                        fflush(stdout)
+                        return
+                    }
+                    print("TEAMCLAUDE-RESTART: 사용자 확인 inflight=\(health?.inflight.description ?? "unknown")")
+                    fflush(stdout)
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        _ = forceRestartTeamClaudeServerConfirmedByUser()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                            self?.refreshStatusOnly()
+                        }
+                    }
+                case .startDetached:
+                    guard let executable = teamClaudeDetachedExecutable() else {
+                        self.showTeamClaudeRestartNotice("teamclaude 실행 파일을 찾지 못했습니다. CC_MENUBAR_TEAMCLAUDE_BIN으로 경로를 지정하세요.")
+                        return
+                    }
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        _ = startTeamClaudeServerDetached(executable: executable)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self?.refreshStatusOnly() }
+                    }
+                case .leaveRunning:
+                    self.showTeamClaudeRestartNotice("launchd 서비스(\(teamClaudeLaunchdLabel))에 등록되지 않은 서버가 실행 중입니다. 앱은 이 서버를 재시작하지 않습니다. 실행한 터미널에서 직접 다시 시작하세요.")
+                case .undetermined:
+                    self.showTeamClaudeRestartNotice("launchd 상태를 확인하지 못해 아무것도 하지 않았습니다.")
+                }
             }
         }
+    }
+
+    private func showTeamClaudeRestartNotice(_ message: String) {
+        let notice = NSAlert()
+        notice.alertStyle = .informational
+        notice.messageText = "TeamClaude 서버"
+        notice.informativeText = message
+        notice.addButton(withTitle: "확인")
+        NSApp.activate(ignoringOtherApps: true)
+        notice.runModal()
     }
 
     @objc func quitAction() {

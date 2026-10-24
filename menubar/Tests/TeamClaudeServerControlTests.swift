@@ -229,6 +229,56 @@ struct TeamClaudeServerControlTests {
         precondition(teamClaudeConfigPath(environment: ["TEAMCLAUDE_CONFIG": "config.json"], home: "/h") == nil)
         precondition(teamClaudeConfigPath(environment: ["XDG_CONFIG_HOME": "rel"], home: "/h") == nil)
 
+        // MARK: launchd 라벨 — 환경변수 > UserDefaults > 기본값(R3)
+        precondition(teamClaudeDefaultLaunchdLabel == "com.qjc.teamclaude")
+        precondition(resolveTeamClaudeLaunchdLabel(environment: [:], defaultsValue: nil) == "com.qjc.teamclaude")
+        precondition(resolveTeamClaudeLaunchdLabel(environment: [:], defaultsValue: "dev.me.proxy") == "dev.me.proxy")
+        precondition(resolveTeamClaudeLaunchdLabel(
+            environment: ["CC_MENUBAR_TEAMCLAUDE_LABEL": "org.x.teamclaude"], defaultsValue: "dev.me.proxy")
+            == "org.x.teamclaude")
+        // 빈 값·셸·경로 문자가 섞인 값은 무시하고 다음 단계로 넘어간다.
+        precondition(resolveTeamClaudeLaunchdLabel(
+            environment: ["CC_MENUBAR_TEAMCLAUDE_LABEL": ""], defaultsValue: "dev.me.proxy") == "dev.me.proxy")
+        precondition(resolveTeamClaudeLaunchdLabel(
+            environment: ["CC_MENUBAR_TEAMCLAUDE_LABEL": "a b;rm"], defaultsValue: nil) == "com.qjc.teamclaude")
+        precondition(resolveTeamClaudeLaunchdLabel(environment: [:], defaultsValue: "gui/501/x") == "com.qjc.teamclaude")
+        precondition(teamClaudeLaunchdLabelIsValid("com.example.teamclaude-2"))
+        precondition(!teamClaudeLaunchdLabelIsValid(String(repeating: "a", count: 300)))
+
+        // MARK: 재시작 버튼 계획(A4) — 라벨이 launchd에 없으면 절대 kickstart(-k)로 가지 않는다
+        for port in [TeamClaudePortProbe.listening, .refused, .unknown] {
+            precondition(teamClaudeRestartPlan(launchd: .notLoaded, port: port) != .forceRestartConfirmed,
+                         "미등록 라벨에서 kickstart 금지: \(port)")
+        }
+        // 미등록 + 포트 닫힘: 서버를 분리 실행해 시작만 한다.
+        precondition(teamClaudeRestartPlan(launchd: .notLoaded, port: .refused) == .startDetached)
+        // 미등록인데 포트를 누가 잡고 있거나 판별 불가: 앱이 관리하지 않는 프로세스다. 건드리지 않는다.
+        precondition(teamClaudeRestartPlan(launchd: .notLoaded, port: .listening) == .leaveRunning)
+        precondition(teamClaudeRestartPlan(launchd: .notLoaded, port: .unknown) == .leaveRunning)
+        // 등록된 서비스는 기존처럼 확인 대화상자를 거친 -k 재시작.
+        precondition(teamClaudeRestartPlan(launchd: .running(pid: 30821), port: .listening) == .forceRestartConfirmed)
+        precondition(teamClaudeRestartPlan(launchd: .loadedNotRunning, port: .refused) == .forceRestartConfirmed)
+        // launchd 상태를 못 읽으면 아무것도 하지 않는다.
+        for port in [TeamClaudePortProbe.listening, .refused, .unknown] {
+            precondition(teamClaudeRestartPlan(launchd: .unknown, port: port) == .undetermined)
+        }
+
+        // MARK: 자동 동기화의 분리 실행 — 설정과 실행 파일이 있을 때만(미설치 맥에서 아무것도 띄우지 않는다)
+        precondition(teamClaudeDetachedStartAllowed(configPresent: true, executable: "/opt/bin/teamclaude"))
+        precondition(!teamClaudeDetachedStartAllowed(configPresent: false, executable: "/opt/bin/teamclaude"))
+        precondition(!teamClaudeDetachedStartAllowed(configPresent: true, executable: nil))
+        precondition(!teamClaudeDetachedStartAllowed(configPresent: true, executable: "teamclaude"),
+                     "PATH 의존 이름만 있으면 띄우지 않는다")
+
+        // 분리 실행 명령은 `server` 하나만 넘기고 재시작 인자를 쓰지 않는다.
+        let detached = teamClaudeDetachedStartArguments(executable: "/opt/bin/teamclaude", logPath: "/tmp/l.log")
+        precondition(detached.executable == "/bin/sh")
+        precondition(detached.arguments.contains("/opt/bin/teamclaude"))
+        precondition(detached.arguments[1].contains("server"))
+        precondition(!detached.arguments.joined(separator: " ").contains("restart"))
+        precondition(!detached.arguments.joined(separator: " ").contains("kickstart"))
+        precondition(detached.arguments[1].contains("nohup"))
+
         print("TeamClaudeServerControlTests: ok")
     }
 }
