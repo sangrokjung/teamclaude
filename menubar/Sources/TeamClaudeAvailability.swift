@@ -124,12 +124,22 @@ extension TeamClaudeHealth {
             let details = store.details(provider: "anthropic", uuid: local.uuid, fallbackPlan: local.plan,
                                         fallbackConfirmation: row.subscriptionConfirmation)
             let appearance = state.subscriptionAppearance == .standard ? details.appearance(now: now) : state.subscriptionAppearance
-            // 구독 줄은 기록이 있을 때, 또는 기록이 없어도 이름이 길어 이름 줄에 조용한 진입점을 못 둘 때 그린다.
+            // 구독 줄은 기록이 있을 때만 그린다. 기록이 없는 행의 입력 진입점은 펼친 행의 상세 칸에 있다.
             return TeamClaudeRowLines(
                 reason: teamClaudeReasonLineIsInformative(state.reason),
-                subscription: accountSubscriptionLineIsInformative(details, appearance: appearance)
-                    || !teamClaudeSubscriptionEntryFitsInline(name: row.name))
+                subscription: accountSubscriptionLineIsInformative(details, appearance: appearance))
         }
+    }
+}
+
+/// 표의 상태 묶음. 구독이 끝난 계정은 판정과 무관하게 제외 묶음이다.
+func teamClaudeRowGroup(_ state: TeamClaudeFableAvailability) -> TeamClaudeRowGroup {
+    if state.subscriptionAppearance == .ended { return .excluded }
+    switch state.state {
+    case .ready: return .ready
+    case .limited: return .limited
+    case .unconfirmed: return .check
+    case .excluded: return .excluded
     }
 }
 

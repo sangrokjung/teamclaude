@@ -35,21 +35,51 @@ func dashboardCurrentSection(_ sections: [DashboardSection], scrollOffset: CGFlo
 /// Body origin inside a section (below its header strip).
 func dashboardSectionBodyY(_ section: DashboardSection) -> CGFloat { section.y + dashboardSectionHeaderHeight }
 
-/// 섹션 제목 띠. 문서 안에서는 섹션마다 하나, 스크롤 뷰 위에는 현재 섹션을 말하는 고정본 하나가 더 뜬다.
+/// 섹션 머리: 벌린 자간의 메타 라벨(왼쪽)과 한 줄 요약(오른쪽). 면을 칠하지 않는다(A안).
 final class DashboardSectionHeaderView: NSView {
     var section: DashboardSection? { didSet { if oldValue != section { needsDisplay = true } } }
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
         guard let section else { return }
-        TeamClaudePalette.panel.setFill()
-        bounds.fill()
-        let titleAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.headFont, .foregroundColor: TeamClaudePalette.text]
-        let summaryAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.smallFont, .foregroundColor: TeamClaudePalette.muted]
-        (section.title as NSString).draw(at: NSPoint(x: 16, y: 6), withAttributes: titleAttrs)
+        let titleAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.metaFont, .foregroundColor: TeamClaudePalette.fg3,
+                                                         .kern: TeamClaudePalette.metaKern]
+        let summaryAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.captionFont, .foregroundColor: TeamClaudePalette.fg3]
+        (section.title as NSString).draw(at: NSPoint(x: 16, y: 9), withAttributes: titleAttrs)
+        let titleWidth = (section.title as NSString).size(withAttributes: titleAttrs).width
         let summary = section.summary as NSString
         let w = summary.size(withAttributes: summaryAttrs).width
-        summary.draw(at: NSPoint(x: bounds.width - 16 - w, y: 8), withAttributes: summaryAttrs)
-        TeamClaudePalette.line.setFill()
-        NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
+        summary.draw(at: NSPoint(x: max(16 + titleWidth + 12, bounds.width - 16 - w), y: 8.5), withAttributes: summaryAttrs)
+    }
+}
+
+/// CLI 탭 맨 아래: 값이 없는 칸에 쓰는 말 네 가지(StatusVocabulary)와 지연 꼬리말 규칙.
+final class EmptyValueVocabularyView: NSView {
+    static let preferredHeight: CGFloat = 112
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel(L10n.sectionVocabulary)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let entries: [(String, String)] = [
+            (StatusVocabulary.checking, L10n.vocabCheckingDesc), (StatusVocabulary.needsCheck, L10n.vocabNeedsCheckDesc),
+            (StatusVocabulary.syncing, L10n.vocabSyncingDesc), (StatusVocabulary.notMeasured, L10n.vocabNotMeasuredDesc),
+        ]
+        let columnWidth = (bounds.width - 32 - 16) / 2
+        for (index, entry) in entries.enumerated() {
+            let x = 16 + CGFloat(index % 2) * (columnWidth + 16)
+            let y = 4 + CGFloat(index / 2) * 36
+            PanelDraw.text(entry.0, x, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg)
+            PanelDraw.text(PanelDraw.clipped(entry.1, TeamClaudePalette.captionFont, maxWidth: columnWidth), x, y + 16,
+                           TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+        }
+        PanelDraw.text(PanelDraw.clipped(L10n.vocabStaleNote, TeamClaudePalette.legendFont, maxWidth: bounds.width - 32), 16, 84,
+                       TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
     }
 }

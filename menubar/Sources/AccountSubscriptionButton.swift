@@ -9,15 +9,10 @@ final class AccountSubscriptionButton: NSButton {
     private let fallbackConfirmation: AccountSubscriptionConfirmation?
     private let store: AccountSubscriptionStore
     private var rowAppearance: AccountSubscriptionAppearance = .standard
-    /// 기록이 없어 구독 줄을 그리지 않는 행에서 이름 줄 안에 놓이는 조용한 진입점.
-    /// 화면 제목만 짧게 바꾸고 접근성 라벨·툴팁은 전체 문구를 유지한다 — 보조기기에는 여전히 무엇이 미확인인지 읽힌다.
-    private(set) var isQuietEntry = false
-    static let quietTitle = "구독 기록"
 
-    func setQuietEntry(_ quiet: Bool) {
-        guard quiet != isQuietEntry else { return }
-        isQuietEntry = quiet
-        refreshTitle()
+    /// 구독 기록 대화상자를 연다. 버튼을 누른 것과 같다(개요의 "구독 확인", 펼친 행의 "구독 기록"이 쓴다).
+    func openRecordDialog() {
+        editPaymentDate()
     }
 
     init(provider: String, accountUuid: String?, accountName: String, plan: String? = nil, confirmation: AccountSubscriptionConfirmation? = nil, store: AccountSubscriptionStore = .shared) {
@@ -71,12 +66,7 @@ final class AccountSubscriptionButton: NSButton {
                 styled.addAttribute(.font, value: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold), range: range)
             }
         }
-        attributedTitle = isQuietEntry
-            ? NSAttributedString(string: Self.quietTitle, attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor(calibratedWhite: 0.72, alpha: 1)
-            ])
-            : styled
+        attributedTitle = styled
         setAccessibilityLabel("\(accountName): \(title)")
         toolTip = provider == "anthropic"
             ? "구독 관리 화면이나 해지 확인 메일의 내용을 기록합니다. 실제 구독은 변경하지 않습니다. Max/active만으로 해지 여부를 확인할 수 없습니다."
