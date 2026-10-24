@@ -296,7 +296,14 @@ extension UsageLoadOutcomeTests {
         let leader = (try? String(contentsOfFile: pidFile, encoding: .utf8))
             .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
         precondition(leader != nil, "가짜 npx가 pid를 남기지 않았다")
-        precondition(Darwin.killpg(leader!, 0) == -1 && errno == ESRCH, "상한 초과 뒤 자식 그룹이 남았다")
+        // KILL된 손자는 launchd가 거둘 때까지 잠깐 좀비로 그룹에 남는다. 그 짧은 틈만 기다린다(sleep 30보다 한참 짧다).
+        let groupDeadline = Date().addingTimeInterval(2)
+        var groupGone = false
+        while !groupGone && Date() < groupDeadline {
+            groupGone = Darwin.killpg(leader!, 0) == -1 && errno == ESRCH
+            if !groupGone { usleep(20_000) }
+        }
+        precondition(groupGone, "상한 초과 뒤 자식 그룹이 남았다")
 
         // 끝난 뒤 보니 상한을 넘긴 출력(폴링 사이에 다 쓰고 정상 종료)도 같은 실패다.
         setMode("burst")

@@ -1244,12 +1244,12 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double,
     writeHandle.closeFile()
     nullError.closeFile()
 
-    // 폴링 사이에 다 쓰고 끝난 큰 출력도 여기서 거른다. 상한을 넘긴 출력은 한 바이트도 쓰지 않는다.
+    // 폴링 사이에 다 쓰고 끝난 큰 출력도 여기서 거른다. 상한을 넘긴 출력은 통째로 버린다.
     let read = result.outputExceeded
         ? (data: Data(), tooLarge: true)
         : readCcusageOutput(atPath: tmpPath, limitBytes: outputLimitBytes)
     if read.tooLarge {
-        print("CCUSAGE-FAIL[\(subcommand)]: 출력이 \(outputLimitBytes)바이트 상한 초과, 강제 종료·폐기")
+        print("CCUSAGE-FAIL[\(subcommand)]: 출력이 \(outputLimitBytes)바이트 상한 초과, 출력 폐기")
     }
     print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(read.data.count)")
     fflush(stdout)
