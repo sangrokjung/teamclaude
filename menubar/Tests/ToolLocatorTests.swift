@@ -110,6 +110,12 @@ struct ToolLocatorTests {
         precondition(Date().timeIntervalSince(started) < 4.5, "로그인 셸 조회가 시간 제한을 넘겼다")
         precondition(loginShellCommandPath("bad;name", timeout: 2) == nil)
 
+        // MARK: 기본 포트 재정의
+        precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: [:]) == 3456)
+        precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: ["P": "4100"]) == 4100)
+        precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: ["P": "0"]) == 3456)
+        precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: ["P": "x"]) == 3456)
+
         print("ToolLocatorTests: ok")
     }
 }

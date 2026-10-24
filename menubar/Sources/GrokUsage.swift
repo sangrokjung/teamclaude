@@ -50,6 +50,12 @@ func grokSpec(home: String = NSHomeDirectory()) -> ToolSpec {
     ])
 }
 
+/// 앱 로더와 빈 HOME 스냅샷이 같은 판정을 쓴다.
+func grokPresenceNotice() -> ToolNotice? {
+    grokToolNotice(cliInstalled: ToolLocator.shared.resolve(grokSpec()).path != nil,
+                   authPresent: FileManager.default.fileExists(atPath: grokAuthFileURL().path))
+}
+
 func grokAuthFileURL() -> URL {
     if let override = ProcessInfo.processInfo.environment["CC_MENUBAR_GROK_AUTH"], !override.isEmpty {
         return URL(fileURLWithPath: override)

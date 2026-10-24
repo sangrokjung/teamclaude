@@ -219,6 +219,13 @@ final class ToolLocator {
     }
 }
 
+/// 설정·상태 파일에 포트가 없을 때 쓰는 기본 포트. 환경변수로 바꿀 수 있다(다른 포트로 띄운 프록시, 격리 테스트).
+func menubarDefaultPort(envKey: String, fallback: Int,
+                        environment: [String: String] = ProcessInfo.processInfo.environment) -> Int {
+    guard let raw = environment[envKey], let port = Int(raw), port > 0, port < 65_536 else { return fallback }
+    return port
+}
+
 /// "v20.9.0" < "v20.11.1" 같은 숫자 단위 비교.
 func toolLocatorVersionLess(_ lhs: String, _ rhs: String) -> Bool {
     func parts(_ value: String) -> [Int] {

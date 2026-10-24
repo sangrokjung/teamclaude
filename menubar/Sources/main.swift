@@ -564,7 +564,7 @@ func loadTeamClaudeHealth() -> TeamClaudeHealth {
     let server = configPath.flatMap { readTeamClaudeJSON(teamClaudeServerStatePath(configPath: $0)) }
     let port = tcInt(server?["port"])
         ?? tcInt(tcDict(config?["proxy"])?["port"])
-        ?? 3456
+        ?? menubarDefaultPort(envKey: "CC_MENUBAR_TEAMCLAUDE_PORT", fallback: 3456)
     let status = fetchTeamClaudeStatus(
         port: port,
         apiKey: tcString(tcDict(config?["proxy"])?["apiKey"])
@@ -2291,6 +2291,8 @@ final class ServiceAvailabilitySummaryView: NSView {
 
     var teamClaude: TeamClaudeHealth? { didSet { refreshSummary() } }
     var teamCodex: TeamCodexPoolHealth? { didSet { refreshSummary() } }
+    /// 미설치 안내(R1). "claude"·"codex" 섹션 안내가 있으면 그 열은 "연동되지 않음" 대신 미설치를 말한다.
+    var notices = DashboardToolNotices() { didSet { if notices != oldValue { refreshSummary() } } }
     var evaluatedAt = Date() { didSet { refreshSummary() } }
 
     override var isFlipped: Bool { true }
@@ -2384,7 +2386,11 @@ final class ServiceAvailabilitySummaryView: NSView {
             return count > 0 ? green : yellow
         }
         /// 수 뒤에 붙는 설명. 사용 가능 계정이 있으면 이름(2개까지, 나머지는 +N), 없으면 왜 0인지.
-        func detail(_ names: [String], hasService: Bool, reachable: Bool) -> (String, NSColor) {
+        func detail(_ names: [String], hasService: Bool, reachable: Bool, notice: ToolNotice? = nil) -> (String, NSColor) {
+            if let notice {
+                ToolNoticeDrawLog.record("summary-\(notice.tool.rawValue)", notice)
+                return (StatusVocabulary.notInstalled, muted)
+            }
             guard hasService else { return ("연동되지 않음", muted) }
             guard reachable else { return ("서버 오프라인", red) }
             guard !names.isEmpty else { return ("", muted) }
@@ -2406,20 +2412,22 @@ final class ServiceAvailabilitySummaryView: NSView {
         let namesClaude = namesForClaude()
         let namesOpus = teamClaude?.opusAvailability(now: evaluatedAt) ?? []
         let namesCodex = namesForCodex()
-        let claudeService = teamClaude != nil
+        let claudeNotice = notices.sections["claude"]
+        let codexNotice = notices.sections["codex"]
+        let claudeService = teamClaude != nil && claudeNotice == nil
         let claudeReachable = teamClaude?.serverReachable ?? false
-        let codexService = teamCodex != nil
+        let codexService = teamCodex != nil && codexNotice == nil
         let codexReachable = teamCodex?.serverReachable ?? false
         let columns: [(String, [String], NSColor, (String, NSColor))] = [
             ("Claude Fable", namesClaude,
              statusColor(namesClaude.count, hasService: claudeService, reachable: claudeReachable),
-             detail(namesClaude, hasService: claudeService, reachable: claudeReachable)),
+             detail(namesClaude, hasService: claudeService, reachable: claudeReachable, notice: claudeNotice)),
             ("Claude Opus", namesOpus,
              statusColor(namesOpus.count, hasService: claudeService, reachable: claudeReachable),
-             detail(namesOpus, hasService: claudeService, reachable: claudeReachable)),
+             detail(namesOpus, hasService: claudeService, reachable: claudeReachable, notice: claudeNotice)),
             ("Codex", namesCodex,
              statusColor(namesCodex.count, hasService: codexService, reachable: codexReachable),
-             detail(namesCodex, hasService: codexService, reachable: codexReachable)),
+             detail(namesCodex, hasService: codexService, reachable: codexReachable, notice: codexNotice)),
         ]
         let columnsX = card.minX + 16 + Self.leadWidth
         let columnWidth = (card.maxX - 16 - columnsX) / CGFloat(columns.count)
@@ -2485,6 +2493,7 @@ final class StatusMenuDashboardView: NSView {
     private var renderedTeamCodexAccountCount = -1
     private var renderedTeamCodexPresent = false
     private var renderedUsageHeight: CGFloat = 0
+    private var renderedNotices = DashboardToolNotices()
     override var isFlipped: Bool { true }
 
     static func teamContentHeight(_ health: TeamClaudeHealth?, now: Date = Date()) -> CGFloat {
@@ -2505,20 +2514,35 @@ final class StatusMenuDashboardView: NSView {
     /// "CLI 쿼터" 본문 = Grok·agy 두 레인이 든 카드 한 장. 두 모델은 옵셔널이 아니라 항상 그린다.
     static let cliHeight: CGFloat = CliQuotaLanesView.fixedHeight
 
+    /// 미설치 안내가 있는 섹션은 본문 대신 안내 카드 높이를 쓴다. preferredHeight·configure가 같은 판정을 본다.
+    static func bodyHeight(_ id: String, _ natural: CGFloat, _ notices: DashboardToolNotices) -> CGFloat {
+        dashboardNoticeBodyHeight(section: id, natural: natural, notices: notices)
+    }
+
     static func preferredHeight(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData? = nil,
-                                burnModel: SubscriptionBurnModel) -> CGFloat {
+                                burnModel: SubscriptionBurnModel, notices: DashboardToolNotices) -> CGFloat {
         dashboardSectionLayout(startY: sectionStartY, bodies: [
             (id: "burn", title: "구독·소진", summary: "", height: SubscriptionBurnView.preferredHeight(burnModel)),
-            (id: "claude", title: "Claude 풀", summary: "", height: teamContentHeight(teamClaude)),
-            (id: "codex", title: "Codex 풀", summary: "", height: codexHeight(codex, teamCodex: teamCodex)),
-            (id: "higgsfield", title: "Higgsfield", summary: "", height: HiggsfieldCreditsView.preferredHeight(for: higgsfield)),
+            (id: "claude", title: "Claude 풀", summary: "", height: bodyHeight("claude", teamContentHeight(teamClaude), notices)),
+            (id: "codex", title: "Codex 풀", summary: "", height: bodyHeight("codex", codexHeight(codex, teamCodex: teamCodex), notices)),
+            (id: "higgsfield", title: "Higgsfield", summary: "", height: bodyHeight("higgsfield", HiggsfieldCreditsView.preferredHeight(for: higgsfield), notices)),
             (id: "cli", title: "CLI 쿼터", summary: "", height: cliHeight),
-            (id: "usage", title: "사용량", summary: "", height: UsageDashboardView.preferredHeight(for: usage)),
+            (id: "usage", title: "사용량", summary: "", height: bodyHeight("usage", UsageDashboardView.preferredHeight(for: usage), notices)),
         ]).totalHeight
     }
 
     /// 섹션 헤더 우측 한 줄 요약. 모델에 이미 있는 값만 쓰고, 모르면 빈 문자열(헤더는 제목만 그린다).
-    static func sectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?) -> [String: String] {
+    static func sectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?,
+                                 notices: DashboardToolNotices) -> [String: String] {
+        var out = naturalSectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield)
+        // 미설치 안내가 있는 섹션은 헤더 요약도 같은 안내 제목을 말한다(소비 지점마다 같은 상태).
+        for id in notices.sections.keys {
+            out[id] = dashboardNoticeSummary(section: id, natural: out[id], notices: notices)
+        }
+        return out
+    }
+
+    private static func naturalSectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?) -> [String: String] {
         var out: [String: String] = [:]
         if let teamClaude {
             // 요약 카드와 같은 숫자: 전체 계정 수, Fable 기준 지금 요청을 받을 수 있는 계정 수.
@@ -2563,6 +2587,7 @@ final class StatusMenuDashboardView: NSView {
         grok: GrokCardModel = GrokCardModel(headline: "Grok 확인 중", detail: nil),
         agy: AgyCardModel = AgyCardModel(message: "agy 확인 중", groups: []),
         burnModel: SubscriptionBurnModel,
+        notices: DashboardToolNotices,
         laneStaleNotes: [String: String] = [:],
         parallelCount: Int,
         active: Bool,
@@ -2577,6 +2602,8 @@ final class StatusMenuDashboardView: NSView {
         teamClaudeView = nil
         codexView = nil
         higgsfieldView = nil
+        usageView = nil
+        renderedNotices = notices
         renderedAccountCount = teamClaude?.accounts.count ?? 0
         renderedTeamClaudePresent = teamClaude != nil
         renderedCodexPresent = codex != nil
@@ -2589,19 +2616,20 @@ final class StatusMenuDashboardView: NSView {
         let summary = ServiceAvailabilitySummaryView(frame: NSRect(x: 0, y: 4, width: bounds.width, height: ServiceAvailabilitySummaryView.preferredHeight))
         summary.teamClaude = teamClaude
         summary.teamCodex = teamCodex
+        summary.notices = notices
         summary.evaluatedAt = Date()
         addSubview(summary)
         summaryView = summary
 
         // preferredHeight와 같은 순서·같은 높이. 섹션을 더하면 두 목록과 sectionSummaries를 같이 고친다.
-        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield)
+        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices)
         sections = dashboardSectionLayout(startY: Self.sectionStartY, bodies: [
             (id: "burn", title: "구독·소진", summary: summaries["burn"] ?? "", height: SubscriptionBurnView.preferredHeight(burnModel)),
-            (id: "claude", title: "Claude 풀", summary: summaries["claude"] ?? "", height: Self.teamContentHeight(teamClaude)),
-            (id: "codex", title: "Codex 풀", summary: summaries["codex"] ?? "", height: Self.codexHeight(codex, teamCodex: teamCodex)),
-            (id: "higgsfield", title: "Higgsfield", summary: summaries["higgsfield"] ?? "", height: HiggsfieldCreditsView.preferredHeight(for: higgsfield)),
+            (id: "claude", title: "Claude 풀", summary: summaries["claude"] ?? "", height: Self.bodyHeight("claude", Self.teamContentHeight(teamClaude), notices)),
+            (id: "codex", title: "Codex 풀", summary: summaries["codex"] ?? "", height: Self.bodyHeight("codex", Self.codexHeight(codex, teamCodex: teamCodex), notices)),
+            (id: "higgsfield", title: "Higgsfield", summary: summaries["higgsfield"] ?? "", height: Self.bodyHeight("higgsfield", HiggsfieldCreditsView.preferredHeight(for: higgsfield), notices)),
             (id: "cli", title: "CLI 쿼터", summary: summaries["cli"] ?? "", height: Self.cliHeight),
-            (id: "usage", title: "사용량", summary: summaries["usage"] ?? "", height: UsageDashboardView.preferredHeight(for: usage)),
+            (id: "usage", title: "사용량", summary: summaries["usage"] ?? "", height: Self.bodyHeight("usage", UsageDashboardView.preferredHeight(for: usage), notices)),
         ]).sections
 
         for section in sections {
@@ -2611,6 +2639,15 @@ final class StatusMenuDashboardView: NSView {
             headerViews.append(header)
             let bodyY = dashboardSectionBodyY(section)
             let bodyHeight = section.height - dashboardSectionHeaderHeight - dashboardSectionGap
+
+            // 도구가 없는 섹션은 본문 대신 공통 안내 카드를 둔다(구독 섹션은 카드 안에 안내 줄을 더한다).
+            if section.id != "burn", let notice = notices.sections[section.id] {
+                let noticeView = ToolNoticeView(frame: NSRect(x: 0, y: bodyY, width: bounds.width, height: bodyHeight))
+                noticeView.cardID = section.id
+                noticeView.notice = notice
+                addSubview(noticeView)
+                continue
+            }
 
             switch section.id {
             case "claude":
@@ -2673,6 +2710,7 @@ final class StatusMenuDashboardView: NSView {
         grok: GrokCardModel = GrokCardModel(headline: "Grok 확인 중", detail: nil),
         agy: AgyCardModel = AgyCardModel(message: "agy 확인 중", groups: []),
         burnModel: SubscriptionBurnModel,
+        notices: DashboardToolNotices,
         laneStaleNotes: [String: String] = [:],
         parallelCount: Int,
         active: Bool,
@@ -2692,11 +2730,12 @@ final class StatusMenuDashboardView: NSView {
             || usageHeight != renderedUsageHeight
             || HiggsfieldCreditsView.preferredHeight(for: higgsfield) != renderedHiggsfieldHeight
             || Self.teamContentHeight(teamClaude) != renderedTeamHeight
+            || notices != renderedNotices
         if structureChanged {
             // 가장 비싼 경로다. 여기서도 단계 시간을 남긴다(예전엔 phases=- 로 비어 보였다).
             let structurePhases = DashboardRefreshPhases()
             lastRefreshPhases = structurePhases
-            frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, burnModel: burnModel)
+            frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, burnModel: burnModel, notices: notices)
             structurePhases.mark("height")
             configure(
                 teamClaude: teamClaude,
@@ -2707,6 +2746,7 @@ final class StatusMenuDashboardView: NSView {
                 grok: grok,
                 agy: agy,
                 burnModel: burnModel,
+                notices: notices,
                 parallelCount: parallelCount,
                 active: active,
                 isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -2723,6 +2763,7 @@ final class StatusMenuDashboardView: NSView {
         lastRefreshPhases = phases
         summaryView?.teamClaude = teamClaude
         summaryView?.teamCodex = teamCodex
+        summaryView?.notices = notices
         summaryView?.evaluatedAt = Date()
         phases.mark("summary")
         teamClaudeView?.health = teamClaude
@@ -2747,7 +2788,7 @@ final class StatusMenuDashboardView: NSView {
         usageView?.active = active
         usageView?.needsDisplay = true
         phases.mark("cards")
-        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield))
+        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices))
         phases.mark("sections")
     }
 }
@@ -3929,6 +3970,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentCodex: CodexHealth?
     var currentTeamCodex: TeamCodexPoolHealth?
     var currentHiggsfield: HiggsfieldCreditsData?
+    /// 도구 설치 여부(R1). 탐색은 백그라운드 로더가 하고 결과만 여기 둔다(로그인 셸 조회가 메인 스레드를 막지 않게).
+    /// nil은 아직 모름 — 안내를 띄우지 않고 기존 "확인 중" 화면을 둔다.
+    var higgsfieldInstalled: Bool?
+    var ccusageInstalledState: Bool?
+    var usageLoadFinished = false
+    var teamCodexConfigPresent: Bool?
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
     var currentGrokSlot: String?
@@ -4087,9 +4134,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 네 레인을 한 모델로 모은다. 폴링 결과가 바뀔 때마다 부른다.
+    var teamClaudeNotice: ToolNotice? {
+        guard let health = currentTeamClaude else { return nil }
+        return teamClaudeToolNotice(configPresent: health.configPresent, serverReachable: health.serverReachable,
+                                    accountCount: health.accounts.count)
+    }
+
+    var teamCodexNotice: ToolNotice? {
+        guard let pool = currentTeamCodex, let configPresent = teamCodexConfigPresent else { return nil }
+        return teamCodexToolNotice(configPresent: configPresent, serverReachable: pool.serverReachable,
+                                   accountCount: pool.accounts.count)
+    }
+
+    var codexNotice: ToolNotice? {
+        guard let codex = currentCodex else { return nil }
+        return codexToolNotice(authPresent: codex.authPresent, configPresent: codex.configPresent,
+                               scannedLogFiles: codex.scannedLogFiles, totalCalls: codex.totalCalls)
+    }
+
+    /// 대시보드의 높이·배치·헤더 요약·요약 띠가 모두 이 값 하나를 본다.
+    var currentToolNotices: DashboardToolNotices {
+        var sections: [String: ToolNotice] = [:]
+        sections["claude"] = teamClaudeNotice
+        sections["codex"] = codexSectionToolNotice(codex: codexNotice, teamCodex: teamCodexNotice)
+        sections["higgsfield"] = higgsfieldInstalled.flatMap { higgsfieldToolNotice(installed: $0) }
+        sections["usage"] = ccusageInstalledState.flatMap {
+            ccusageToolNotice(installed: $0, loadFinished: usageLoadFinished, hasData: currentData?.today != nil)
+        }
+        sections["burn"] = currentBurnModel.collectorNotice
+        return DashboardToolNotices(sections: sections)
+    }
+
     func refreshBurnModel(now: Date = Date()) {
         var usages: [LaneUsage] = []
-        if let claude = currentTeamClaude {
+        // 미설치 도구는 0계정 레인으로 그리지 않는다(지출·소진 표가 없는 풀을 "수집 중"으로 보이게 된다).
+        if let claude = currentTeamClaude, teamClaudeNotice == nil {
             usages.append(burnPoolUsage(lane: "claude", rows: claude.accounts.map {
                 BurnAccountRow(name: $0.name, enabled: $0.enabled, status: $0.status,
                                errorReason: $0.errorReason,
@@ -4100,7 +4179,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }, now: now))
         }
         // Codex도 같은 풀이다. 빠뜨리면 월 합계가 줄고 그 레인의 권고가 사라진다.
-        if let codex = currentTeamCodex {
+        if let codex = currentTeamCodex, teamCodexNotice == nil {
             usages.append(burnPoolUsage(lane: "codex", rows: codex.accounts.map {
                 BurnAccountRow(name: $0.name, enabled: $0.enabled, status: $0.status,
                                errorReason: $0.errorReason,
@@ -4122,7 +4201,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         currentBurnModel = SubscriptionBurnModel(usages: usages, rates: subscriptionRates(),
                                                  recommendations: burnRecommendations(usages),
-                                                 currency: subscriptionCurrency())
+                                                 currency: subscriptionCurrency(),
+                                                 collectorNotice: subscriptionCollectorToolNotice(home: NSHomeDirectory()))
     }
 
     var cachedPulseImage: NSImage?
@@ -4308,9 +4388,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isMeasuringTeamClaude {
             return ["Claude 측정 중"]
         }
-        let teamClaudeSlot = currentTeamClaude?.titleSlot
-        let codexSlot = currentCodex?.titleSlot
-        let teamCodexSlot = currentTeamCodex?.titleSlot
+        // 미설치 도구는 제목에 올리지 않는다. "로그인"·"오프라인"처럼 고칠 일이 있는 것으로 읽히면 안 된다.
+        let teamClaudeSlot = teamClaudeNotice == nil ? currentTeamClaude?.titleSlot : nil
+        let codexSlot = codexNotice == nil ? currentCodex?.titleSlot : nil
+        let teamCodexSlot = teamCodexNotice == nil ? currentTeamCodex?.titleSlot : nil
         // 데이터 없으면 최소 정보 — 병렬 세션 수만이라도 의미 있음
         guard let usage = currentData, let today = usage.today else {
             return [teamClaudeSlot, teamCodexSlot, codexSlot, "병렬 \(parallelCount)"].compactMap { $0 }
@@ -4446,9 +4527,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetchingHiggsfield = true
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            let installed = !higgsfieldBinCandidates().isEmpty
+            guard installed else {
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.isFetchingHiggsfield = false
+                    self.lastHiggsfieldFetchedAt = Date()
+                    if self.higgsfieldInstalled != false {
+                        print("HIGGSFIELD: \(StatusVocabulary.notInstalled)")
+                        fflush(stdout)
+                    }
+                    self.higgsfieldInstalled = false
+                    self.currentHiggsfield = nil
+                    self.scheduleDashboardRefresh(reason: "loadHiggsfieldInBackground")
+                }
+                return
+            }
             let data = fetchHiggsfieldCredits()
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                self.higgsfieldInstalled = true
                 self.isFetchingHiggsfield = false
                 self.lastHiggsfieldFetchedAt = Date()
                 // 실패해도 기존 데이터를 지우지 않는다(깜빡임 방지). 첫 조회 실패만 그대로 보여 준다.
@@ -4554,6 +4652,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             grok: currentGrokCard,
             agy: currentAgyCard,
             burnModel: currentBurnModel,
+            notices: currentToolNotices,
             laneStaleNotes: laneStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
@@ -4583,6 +4682,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !force, let last = lastGrokFetchedAt, Date().timeIntervalSince(last) < grokUsageFetchInterval { return }
         isFetchingGrok = true
         lastGrokFetchedAt = Date()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            if let notice = grokPresenceNotice() {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.isFetchingGrok = false
+                    self.currentGrokSlot = nil
+                    self.currentGrokCard = grokCardModel(for: notice)
+                    print("GROK-SLOT: \(notice.headline)")
+                    fflush(stdout)
+                    self.updateTitle()
+                    self.refreshBurnModel()
+                    self.scheduleDashboardRefresh(reason: "loadGrokUsageInBackground")
+                }
+                return
+            }
+            self?.fetchGrokUsage()
+        }
+    }
+
+    private func fetchGrokUsage() {
         fetchGrokMenuOutcome { [weak self] outcome in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -4641,7 +4760,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 switch outcome {
                 case .missing:
                     self.agyHasValue = false
-                    self.currentAgyCard = AgyCardModel(message: "agy 없음", groups: [])
+                    self.currentAgyCard = agyCardModel(for: agyToolNotice())
                 case .ready(let groups):
                     let lanes = agyVisibleGroups(groups)
                     if !lanes.isEmpty { self.agyLastSuccessAt = Date() }
@@ -4867,6 +4986,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             teamCodexPoolHealth(aligning: candidate, to: $0)
         } ?? candidate
         currentTeamCodex = aligned
+        teamCodexConfigPresent = FileManager.default.fileExists(atPath: "\(NSHomeDirectory())/.config/teamcodex.json")
         scheduleDashboardRefresh(reason: "commitTeamCodexHealth")
         updateTitle()
         print("TEAMCODEX-REFRESH: status=\(aligned.statusLabel) accounts=\(aligned.accounts.count) current=\(aligned.currentAccount ?? "-")")
@@ -4887,9 +5007,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isFetching = true
         let startedAt = Date()
         DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard ccusageInstalled() else {
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.isFetching = false
+                    self.ccusageInstalledState = false
+                    self.usageLoadFinished = true
+                    self.scheduleDashboardRefresh(reason: "loadUsageInBackground")
+                    self.updateTitle()
+                }
+                return
+            }
             guard let dailyData = runCcusageRaw("daily") else {
                 DispatchQueue.main.async {
                     self?.isFetching = false
+                    self?.ccusageInstalledState = true
+                    self?.usageLoadFinished = true
+                    self?.scheduleDashboardRefresh(reason: "loadUsageInBackground")
                     self?.updateTitle()
                 }
                 return
@@ -4915,6 +5049,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.isFetching = false
+                self.ccusageInstalledState = true
+                self.usageLoadFinished = true
                 self.lastFullUsageCompletedAt = Date()
                 if let data = data {
                     var finalData = data
@@ -5131,6 +5267,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             grok: currentGrokCard,
             agy: currentAgyCard,
             burnModel: currentBurnModel,
+            notices: currentToolNotices,
             laneStaleNotes: laneStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
@@ -5151,7 +5288,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             teamCodex: currentTeamCodex,
             usage: currentData,
             higgsfield: currentHiggsfield,
-            burnModel: currentBurnModel
+            burnModel: currentBurnModel,
+            notices: currentToolNotices
         )
         dashboard.lastRefreshPhases?.mark("height")
         dashboard.frame.size.height = contentHeight
@@ -5186,7 +5324,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 메뉴 열릴 때마다 최신 데이터로 항목 재구성
         menu.removeAllItems()
 
-        let dashboardContentHeight = StatusMenuDashboardView.preferredHeight(teamClaude: currentTeamClaude, codex: currentCodex, teamCodex: currentTeamCodex, usage: currentData, higgsfield: currentHiggsfield, burnModel: currentBurnModel)
+        let dashboardContentHeight = StatusMenuDashboardView.preferredHeight(teamClaude: currentTeamClaude, codex: currentCodex, teamCodex: currentTeamCodex, usage: currentData, higgsfield: currentHiggsfield, burnModel: currentBurnModel, notices: currentToolNotices)
         let dashboard = StatusMenuDashboardView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: dashboardContentHeight))
         dashboard.onTeamRowsChange = { [weak self] in self?.scheduleDashboardRefresh(reason: "team-rows") }
         dashboard.configure(
@@ -5198,6 +5336,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             grok: currentGrokCard,
             agy: currentAgyCard,
             burnModel: currentBurnModel,
+            notices: currentToolNotices,
             laneStaleNotes: laneStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
@@ -5920,7 +6059,8 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
             teamCodex: initial,
             usage: nil,
             higgsfield: nil,
-            burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: [])
+            burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
+            notices: DashboardToolNotices()
         )
     ))
     dashboard.configure(
@@ -5929,6 +6069,7 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
         teamCodex: initial,
         usage: nil,
         burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
+        notices: DashboardToolNotices(),
         parallelCount: 0,
         active: false,
         isMeasuringTeamClaude: false,
@@ -5943,6 +6084,7 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
             teamCodex: health,
             usage: nil,
             burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
+            notices: DashboardToolNotices(),
             parallelCount: 0,
             active: false,
             isMeasuringTeamClaude: false,
@@ -5956,7 +6098,8 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
                 teamCodex: health,
                 usage: nil,
                 higgsfield: nil,
-                burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: [])
+                burnModel: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
+                notices: DashboardToolNotices()
             )
         )
     }
@@ -6266,6 +6409,71 @@ if let recoveryLayoutIndex = CommandLine.arguments.firstIndex(of: "--teamcodex-r
     exit(0)
 }
 
+// 빈 HOME 스모크(외부 배포 A1). 도구가 하나도 없는 맥에서 실제 로더와 실제 판정(AppDelegate.currentToolNotices)을
+// 그대로 돌려 대시보드 한 장을 그리고, 카드마다 실제로 그려진 안내를 한 줄씩 출력한다.
+// 실행: HOME·CFFIXED_USER_HOME을 빈 폴더로, CC_MENUBAR_<TOOL>_BIN을 없는 경로로 두고 부른다(Tests/snapshot_test_empty_home.py).
+if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot") {
+    let outputPath = CommandLine.arguments.indices.contains(emptyIndex + 1)
+        ? CommandLine.arguments[emptyIndex + 1]
+        : NSTemporaryDirectory() + "cc-menubar-empty-home.png"
+    _ = NSApplication.shared
+    ToolNoticeDrawLog.isEnabled = true
+    let delegate = AppDelegate()
+    delegate.currentTeamClaude = loadTeamClaudeHealth()
+    delegate.currentTeamCodex = loadTeamCodexPoolHealth()
+    delegate.teamCodexConfigPresent = FileManager.default.fileExists(atPath: "\(NSHomeDirectory())/.config/teamcodex.json")
+    delegate.currentCodex = loadCodexHealth()
+    delegate.higgsfieldInstalled = !higgsfieldBinCandidates().isEmpty
+    delegate.ccusageInstalledState = ccusageInstalled()
+    // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다.
+    delegate.usageLoadFinished = delegate.ccusageInstalledState == false
+    if let notice = grokPresenceNotice() { delegate.currentGrokCard = grokCardModel(for: notice) }
+    if agyExecutableURL() == nil { delegate.currentAgyCard = agyCardModel(for: agyToolNotice()) }
+    delegate.refreshBurnModel()
+    let notices = delegate.currentToolNotices
+    let view = StatusMenuDashboardView(frame: NSRect(
+        x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth,
+        height: StatusMenuDashboardView.preferredHeight(
+            teamClaude: delegate.currentTeamClaude, codex: delegate.currentCodex, teamCodex: delegate.currentTeamCodex,
+            usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
+            burnModel: delegate.currentBurnModel, notices: notices)
+    ))
+    view.configure(
+        teamClaude: delegate.currentTeamClaude, codex: delegate.currentCodex, teamCodex: delegate.currentTeamCodex,
+        usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
+        grok: delegate.currentGrokCard, agy: delegate.currentAgyCard,
+        burnModel: delegate.currentBurnModel, notices: notices,
+        parallelCount: 0, active: false,
+        isMeasuringTeamClaude: false, teamClaudeMeasureDetail: nil, onMeasureTeamClaude: nil
+    )
+    view.layoutSubtreeIfNeeded()
+    guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+        fputs("EMPTY-HOME-SNAPSHOT: bitmap 생성 실패\n", stderr)
+        exit(1)
+    }
+    view.cacheDisplay(in: view.bounds, to: rep)
+    guard let png = rep.representation(using: .png, properties: [:]) else {
+        fputs("EMPTY-HOME-SNAPSHOT: PNG 변환 실패\n", stderr)
+        exit(1)
+    }
+    do {
+        try png.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+    } catch {
+        fputs("EMPTY-HOME-SNAPSHOT: 쓰기 실패 \(error)\n", stderr)
+        exit(1)
+    }
+    for (card, headline) in ToolNoticeDrawLog.drawn.sorted(by: { $0.key < $1.key }) {
+        print("DRAWN \(card)=\(headline)")
+    }
+    for section in view.sections {
+        print("SECTION \(section.id)=\(section.summary)")
+    }
+    print("TITLE-SLOTS \(delegate.displaySlots().joined(separator: " | "))")
+    print("BURN-LANES \(delegate.currentBurnModel.usages.map(\.lane).joined(separator: ","))")
+    print("EMPTY-HOME-SNAPSHOT: \(outputPath) \(Int(view.bounds.width))x\(Int(view.bounds.height))")
+    exit(0)
+}
+
 // 대시보드 한 장을 통째로 오프스크린 렌더한다. 메뉴는 스크립트로 열 수 없어서, 화면을 고쳐 가며
 // 눈으로 비교하려면 이 경로가 필요하다. 표 전용 스냅샷(--teamclaude-table-snapshot)의 확장판이다.
 if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") {
@@ -6299,7 +6507,7 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
         width: StatusMenuDashboardView.preferredWidth,
         height: StatusMenuDashboardView.preferredHeight(
             teamClaude: health, codex: nil, teamCodex: nil, usage: nil,
-            higgsfield: higgsfield, burnModel: burnModel
+            higgsfield: higgsfield, burnModel: burnModel, notices: DashboardToolNotices()
         )
     ))
     view.configure(
@@ -6308,6 +6516,7 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
         grok: GrokCardModel(headline: (fixture["grok"] as? String) ?? "Grok 21%", detail: nil),
         agy: AgyCardModel(message: nil, groups: []),
         burnModel: burnModel,
+        notices: DashboardToolNotices(),
         // 픽스처가 지연 상태를 담고 있으면 그대로 그린다. 이 경로는 실패했을 때만 나타나서
         // 스냅샷이 다루지 않으면 눈으로 확인된 적 없는 화면이 된다(적대 리뷰 2026-09-24).
         laneStaleNotes: (fixture["staleNotes"] as? [String: String]) ?? [:],

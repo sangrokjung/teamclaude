@@ -41,6 +41,8 @@ chmod +x "$CANDIDATE"
 if [ "${CC_MENUBAR_SKIP_SNAPSHOT:-0}" != "1" ]; then
     # mv 전에 후보 바이너리로 스모크. 실패하면 set -e가 멈추고 trap이 후보를 지워 기존 바이너리가 남는다.
     CC_MENUBAR_BINARY="$CANDIDATE" python3 "$SCRIPT_DIR/Tests/snapshot_test_teamclaude_table.py"
+    # 도구가 하나도 없는 빈 HOME에서 카드마다 미설치 안내가 그려지는지(외부 배포 A1).
+    CC_MENUBAR_BINARY="$CANDIDATE" python3 "$SCRIPT_DIR/Tests/snapshot_test_empty_home.py"
 fi
 mv -f "$CANDIDATE" "$BINARY"
 
