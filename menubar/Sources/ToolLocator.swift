@@ -77,11 +77,10 @@ func loginShellCommandPath(_ name: String, timeout: TimeInterval) -> String? {
     return line.hasPrefix("/") ? line : nil
 }
 
-struct ProcessGroupRun: Equatable {
-    /// 셸의 종료 코드. 신호로 죽었으면 128+신호 번호.
+struct ProcessGroupRun {
+    /// 셸의 종료 코드. 신호로 죽었으면(시간 초과 포함) 128+신호 번호.
     let exitStatus: Int32
     let output: Data
-    let timedOut: Bool
 }
 
 /// 명령을 자기 프로세스 그룹(그룹 id = 자식 pid)에서 띄우고 stdout을 모은다.
@@ -149,8 +148,7 @@ func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
 
     let deadline = Date().addingTimeInterval(max(timeout, 0))
     var exitedAt: Date?
-    var timedOut = false
-    while true {
+    while Date() < deadline {
         if !reachedEOF {
             var poller = pollfd(fd: readFD, events: Int16(POLLIN), revents: 0)
             _ = poll(&poller, 1, 20)
@@ -162,10 +160,6 @@ func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
         if let exitedAt {
             if reachedEOF { break }
             if Date().timeIntervalSince(exitedAt) >= drainGrace { break }
-        }
-        if Date() >= deadline {
-            timedOut = true
-            break
         }
     }
 
@@ -183,7 +177,7 @@ func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
     while waitpid(pid, &status, 0) == -1, errno == EINTR {}
     let signal = status & 0x7f
     let exitStatus = signal == 0 ? (status >> 8) & 0xff : 128 + signal
-    return ProcessGroupRun(exitStatus: exitStatus, output: output, timedOut: timedOut)
+    return ProcessGroupRun(exitStatus: exitStatus, output: output)
 }
 
 final class ToolLocator {
