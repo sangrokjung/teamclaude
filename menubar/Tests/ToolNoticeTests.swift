@@ -49,13 +49,36 @@ struct ToolNoticeTests {
         precondition(higgs?.detail.contains("CC_MENUBAR_HIGGSFIELD_BIN") == true, higgs?.detail ?? "nil")
         precondition(higgsfieldToolNotice(installed: true) == nil)
 
-        precondition(ccusageToolNotice(installed: false, loadFinished: false, hasData: false)?.kind == .notInstalled)
-        precondition(ccusageToolNotice(installed: false, loadFinished: false, hasData: false)?.detail.contains("CC_MENUBAR_NPX_BIN") == true)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: false)?.kind == .noData)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: false)?.headline == "사용량 데이터 없음")
+        precondition(ccusageToolNotice(installed: false, outcome: nil, hasData: false)?.kind == .notInstalled)
+        precondition(ccusageToolNotice(installed: false, outcome: nil, hasData: false)?.detail.contains("CC_MENUBAR_NPX_BIN") == true)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.kind == .noData)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.headline == "사용량 데이터 없음")
         // 아직 읽는 중이면 기존 "확인 중" 화면을 둔다.
-        precondition(ccusageToolNotice(installed: true, loadFinished: false, hasData: false) == nil)
-        precondition(ccusageToolNotice(installed: true, loadFinished: true, hasData: true) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: nil, hasData: false) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: .loaded, hasData: true) == nil)
+        // 실행·해석 실패는 "데이터 없음"이 아니라 확인 필요다. 이전 값이 있으면 본문은 두고 꼬리말로 낡았다고 표시한다.
+        let failed = ccusageToolNotice(installed: true, outcome: .failed(.exitStatus(3)), hasData: false)
+        precondition(failed?.kind == .loadFailed && failed?.headline == "사용량 확인 필요", failed?.headline ?? "nil")
+        precondition(failed?.detail.contains("종료 코드 3") == true, failed?.detail ?? "nil")
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.unparsable), hasData: true) == nil)
+        precondition(ccusageStaleNote(outcome: .failed(.timeout(seconds: 60)), hasData: true) == "갱신 실패(60초 시간 초과) · 이전 값")
+        precondition(ccusageStaleNote(outcome: .failed(.timeout(seconds: 60)), hasData: false) == nil)
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true) == nil)
+        precondition(ccusageStaleNote(outcome: nil, hasData: true) == nil)
+
+        // 판정 순서: 실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석. 해석한 빈 결과만 noData.
+        func outcome(launched: Bool = true, timedOut: Bool = false, exit: Int32 = 0, bytes: Int = 10,
+                     parsed: Bool? = true) -> CcusageLoadOutcome {
+            ccusageLoadOutcome(launched: launched, timedOut: timedOut, timeoutSeconds: 60, exitStatus: exit,
+                               outputBytes: bytes, parsedHasToday: parsed)
+        }
+        precondition(outcome() == .loaded)
+        precondition(outcome(parsed: false) == .noData)
+        precondition(outcome(parsed: nil) == .failed(.unparsable))
+        precondition(outcome(bytes: 0, parsed: nil) == .failed(.emptyOutput))
+        precondition(outcome(exit: 1, parsed: false) == .failed(.exitStatus(1)))
+        precondition(outcome(timedOut: true, exit: 137, parsed: false) == .failed(.timeout(seconds: 60)))
+        precondition(outcome(launched: false, bytes: 0, parsed: nil) == .failed(.launch))
 
         precondition(grokToolNotice(cliInstalled: false, authPresent: false)?.headline == "Grok 미설치")
         // CLI는 있는데 인증 파일이 없으면 기존 "Grok 로그인"이 맞다.

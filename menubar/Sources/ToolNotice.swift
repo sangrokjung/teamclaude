@@ -26,6 +26,8 @@ struct ToolNotice: Equatable {
     enum Kind: Equatable {
         case notInstalled
         case noData
+        /// 도구는 있는데 실행·해석에 실패했다. "데이터 없음"과 섞이면 수집기 장애가 정상처럼 보인다.
+        case loadFailed
     }
 
     let tool: MenubarTool
@@ -75,18 +77,77 @@ func higgsfieldToolNotice(installed: Bool) -> ToolNotice? {
     installed ? nil : notInstalled(.higgsfield, detail: envHint("CC_MENUBAR_HIGGSFIELD_BIN"))
 }
 
-/// ccusage는 npx로 돈다. npx가 없으면 미설치, 다 읽었는데 기록이 없으면 데이터 없음.
-/// 아직 읽는 중이면 nil(기존 "확인 중" 화면).
-func ccusageToolNotice(installed: Bool, loadFinished: Bool, hasData: Bool) -> ToolNotice? {
+/// ccusage 한 번 실행이 실패한 원인. 화면 문구와 로그가 같은 말을 쓴다.
+enum CcusageFailure: Equatable {
+    case launch
+    case timeout(seconds: Int)
+    case exitStatus(Int32)
+    case emptyOutput
+    case unparsable
+
+    var label: String {
+        switch self {
+        case .launch: return "실행하지 못함"
+        case .timeout(let seconds): return "\(seconds)초 시간 초과"
+        case .exitStatus(let code): return "종료 코드 \(code)"
+        case .emptyOutput: return "빈 출력"
+        case .unparsable: return "출력 해석 실패"
+        }
+    }
+}
+
+/// ccusage daily 한 번의 결과. 성공적으로 해석한 빈 결과만 noData다.
+enum CcusageLoadOutcome: Equatable {
+    case loaded
+    case noData
+    case failed(CcusageFailure)
+
+    var succeeded: Bool {
+        if case .failed = self { return false }
+        return true
+    }
+}
+
+/// 실행 결과 → 판정. 실패 원인이 여럿이면 앞의 것(실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석)을 쓴다.
+/// parsedHasToday: 출력을 해석하지 못했으면 nil, 해석했으면 기록이 있는지.
+func ccusageLoadOutcome(launched: Bool, timedOut: Bool, timeoutSeconds: Double, exitStatus: Int32,
+                        outputBytes: Int, parsedHasToday: Bool?) -> CcusageLoadOutcome {
+    guard launched else { return .failed(.launch) }
+    if timedOut { return .failed(.timeout(seconds: max(Int(timeoutSeconds.rounded()), 1))) }
+    guard exitStatus == 0 else { return .failed(.exitStatus(exitStatus)) }
+    guard outputBytes > 0 else { return .failed(.emptyOutput) }
+    guard let parsedHasToday else { return .failed(.unparsable) }
+    return parsedHasToday ? .loaded : .noData
+}
+
+/// ccusage는 npx로 돈다. npx가 없으면 미설치, 읽었는데 기록이 없으면 데이터 없음, 실행·해석이 실패했는데
+/// 보여 줄 이전 값도 없으면 확인 필요. 이전 값이 있으면 본문은 그대로 두고 ccusageStaleNote가 낡았다고 표시한다.
+/// 아직 한 번도 끝나지 않았으면(outcome nil) nil(기존 "확인 중" 화면).
+func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: Bool) -> ToolNotice? {
     if !installed {
         return ToolNotice(tool: .ccusage, kind: .notInstalled,
                           headline: "사용량 \(StatusVocabulary.notInstalled)",
                           detail: "ccusage를 실행할 npx(Node.js)가 없습니다 · \(envHint("CC_MENUBAR_NPX_BIN"))")
     }
-    guard loadFinished, !hasData else { return nil }
-    return ToolNotice(tool: .ccusage, kind: .noData,
-                      headline: "사용량 \(StatusVocabulary.noData)",
-                      detail: "Claude Code 사용 기록이 아직 없습니다")
+    guard let outcome, !hasData else { return nil }
+    switch outcome {
+    case .loaded:
+        return nil
+    case .noData:
+        return ToolNotice(tool: .ccusage, kind: .noData,
+                          headline: "사용량 \(StatusVocabulary.noData)",
+                          detail: "Claude Code 사용 기록이 아직 없습니다")
+    case .failed(let failure):
+        return ToolNotice(tool: .ccusage, kind: .loadFailed,
+                          headline: "사용량 \(StatusVocabulary.needsCheck)",
+                          detail: "ccusage \(failure.label) · 다음 갱신 때 다시 시도합니다")
+    }
+}
+
+/// 이전 값을 남긴 채 갱신이 실패했을 때 사용량 카드·헤더에 붙는 꼬리말. 그 외에는 nil.
+func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool) -> String? {
+    guard hasData, case .failed(let failure)? = outcome else { return nil }
+    return "갱신 실패(\(failure.label)) · 이전 값"
 }
 
 /// grok CLI도 인증 파일도 없을 때만 미설치. CLI가 있으면 기존 "Grok 로그인"이 맞다.

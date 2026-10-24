@@ -1142,6 +1142,27 @@ func ccusageInstalled(home: String = NSHomeDirectory()) -> Bool {
 /// npx ccusage <subcommand> --json --offline 을 실행해 stdout JSON Data 반환. 실패 시 nil.
 /// daily/weekly/monthly 공용 — 각 호출은 별도 tmp 파일(서브커맨드명 포함)로 redirect.
 func runCcusageRaw(_ subcommand: String) -> Data? {
+    runCcusageCommand(subcommand, timeoutSeconds: ccusageDefaultTimeoutSeconds).successOutput
+}
+
+/// ccusage 한 번의 기본 시간 제한.
+let ccusageDefaultTimeoutSeconds: Double = 60
+
+/// ccusage 한 번 실행의 원 결과. 실패를 원인별로 가르려고 종료 코드·시간 초과·출력을 그대로 남긴다.
+struct CcusageRun {
+    let launched: Bool
+    let timedOut: Bool
+    let exitStatus: Int32
+    let output: Data
+
+    static let notLaunched = CcusageRun(launched: false, timedOut: false, exitStatus: -1, output: Data())
+
+    var successOutput: Data? {
+        launched && !timedOut && exitStatus == 0 && !output.isEmpty ? output : nil
+    }
+}
+
+func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double) -> CcusageRun {
     let process = Process()
     let home = NSHomeDirectory()
     let fnmBin = "\(home)/.local/share/fnm/aliases/default/bin"
@@ -1167,28 +1188,29 @@ func runCcusageRaw(_ subcommand: String) -> Data? {
     guard let writeHandle = FileHandle(forWritingAtPath: tmpPath) else {
         print("CCUSAGE-FAIL[\(subcommand)]: tmp 파일 생성 실패 \(tmpPath)")
         fflush(stdout)
-        return nil
+        return .notLaunched
     }
     process.standardOutput = writeHandle
     guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else {
         writeHandle.closeFile()
-        return nil
+        return .notLaunched
     }
     process.standardError = nullError
 
     guard let result = runTrustedProcessInIsolatedGroup(
         process,
-        timeoutSeconds: 60,
+        timeoutSeconds: timeoutSeconds,
         terminationGraceMicroseconds: 700_000
     ) else {
         print("CCUSAGE-FAIL[\(subcommand)]: 격리 프로세스 실행 실패")
         fflush(stdout)
         writeHandle.closeFile()
         nullError.closeFile()
-        return nil
+        try? FileManager.default.removeItem(atPath: tmpPath)
+        return .notLaunched
     }
     if result.timedOut {
-        print("CCUSAGE-TIMEOUT[\(subcommand)]: 60초 초과, 강제 종료")
+        print("CCUSAGE-TIMEOUT[\(subcommand)]: \(Int(timeoutSeconds))초 초과, 강제 종료")
         fflush(stdout)
     }
     writeHandle.closeFile()
@@ -1199,8 +1221,33 @@ func runCcusageRaw(_ subcommand: String) -> Data? {
     print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(data.count)")
     fflush(stdout)
 
-    guard result.terminationStatus == 0, !data.isEmpty else { return nil }
-    return data
+    return CcusageRun(launched: true, timedOut: result.timedOut, exitStatus: result.terminationStatus, output: data)
+}
+
+/// ccusage daily 한 번의 판정과 그 값. 전체·quick 로더가 같은 판정을 쓴다.
+struct CcusageDailyLoad {
+    let outcome: CcusageLoadOutcome
+    /// 실행·해석에 성공했을 때만 있다(weekly·monthly와 합쳐 다시 해석한다).
+    let daily: Data?
+    /// daily만으로 만든 값.
+    let quick: UsageData?
+    let rate: Double
+}
+
+/// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
+func loadCcusageDaily(timeoutSeconds: Double) -> CcusageDailyLoad {
+    let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds)
+    let output = run.successOutput
+    let rate = output == nil ? 0 : fetchUsdKrwRate()
+    let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate) }
+    let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
+                                     exitStatus: run.exitStatus, outputBytes: run.output.count,
+                                     parsedHasToday: quick.map { $0.today != nil })
+    if case .failed(let failure) = outcome {
+        print("CCUSAGE-FAIL[daily]: \(failure.label)")
+        fflush(stdout)
+    }
+    return CcusageDailyLoad(outcome: outcome, daily: outcome.succeeded ? output : nil, quick: quick, rate: rate)
 }
 
 struct IsolatedProcessResult {
@@ -2533,8 +2580,12 @@ final class StatusMenuDashboardView: NSView {
 
     /// 섹션 헤더 우측 한 줄 요약. 모델에 이미 있는 값만 쓰고, 모르면 빈 문자열(헤더는 제목만 그린다).
     static func sectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?,
-                                 notices: DashboardToolNotices) -> [String: String] {
+                                 notices: DashboardToolNotices, staleNotes: [String: String]) -> [String: String] {
         var out = naturalSectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield)
+        // 사용량 갱신이 실패해 이전 값을 보이는 중이면 헤더 요약에도 그 사실을 붙인다(카드 본문과 같은 꼬리말).
+        if let note = staleNotes["usage"], let natural = out["usage"] {
+            out["usage"] = "\(natural) · \(note)"
+        }
         // 미설치 안내가 있는 섹션은 헤더 요약도 같은 안내 제목을 말한다(소비 지점마다 같은 상태).
         for id in notices.sections.keys {
             out[id] = dashboardNoticeSummary(section: id, natural: out[id], notices: notices)
@@ -2622,7 +2673,7 @@ final class StatusMenuDashboardView: NSView {
         summaryView = summary
 
         // preferredHeight와 같은 순서·같은 높이. 섹션을 더하면 두 목록과 sectionSummaries를 같이 고친다.
-        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices)
+        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes)
         sections = dashboardSectionLayout(startY: Self.sectionStartY, bodies: [
             (id: "burn", title: "구독·소진", summary: summaries["burn"] ?? "", height: SubscriptionBurnView.preferredHeight(burnModel)),
             (id: "claude", title: "Claude 풀", summary: summaries["claude"] ?? "", height: Self.bodyHeight("claude", Self.teamContentHeight(teamClaude), notices)),
@@ -2691,6 +2742,7 @@ final class StatusMenuDashboardView: NSView {
             case "usage":
                 let view = UsageDashboardView(frame: NSRect(x: 0, y: bodyY, width: bounds.width, height: bodyHeight))
                 view.usage = usage
+                view.staleNote = laneStaleNotes["usage"]
                 view.parallelCount = parallelCount
                 view.active = active
                 addSubview(view)
@@ -2747,6 +2799,7 @@ final class StatusMenuDashboardView: NSView {
                 agy: agy,
                 burnModel: burnModel,
                 notices: notices,
+                laneStaleNotes: laneStaleNotes,
                 parallelCount: parallelCount,
                 active: active,
                 isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -2784,11 +2837,12 @@ final class StatusMenuDashboardView: NSView {
         cliLanesView?.staleNotes = laneStaleNotes
         cliLanesView?.agy = agy
         usageView?.usage = usage
+        usageView?.staleNote = laneStaleNotes["usage"]
         usageView?.parallelCount = parallelCount
         usageView?.active = active
         usageView?.needsDisplay = true
         phases.mark("cards")
-        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices))
+        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes))
         phases.mark("sections")
     }
 }
@@ -2796,11 +2850,24 @@ final class StatusMenuDashboardView: NSView {
 final class UsageDashboardView: NSView {
     var usage: UsageData? {
         didSet {
-            if let usage = usage, let today = usage.today {
-                setAccessibilityLabel("사용량 대시보드, 오늘 \(formatCost(today.totalCost)), 이번 주 \(formatCost(usage.thisWeekCost)), 이번 달 \(formatCost(usage.thisMonthCost))")
-            }
+            refreshAccessibilityLabel()
             needsDisplay = true
         }
+    }
+    /// 갱신이 실패해 이전 값을 보이는 중일 때의 꼬리말(ccusageStaleNote). 머리 줄 오른쪽에 대신 그린다.
+    var staleNote: String? {
+        didSet {
+            guard staleNote != oldValue else { return }
+            refreshAccessibilityLabel()
+            needsDisplay = true
+        }
+    }
+
+    private func refreshAccessibilityLabel() {
+        guard let usage = usage, let today = usage.today else { return }
+        var label = "사용량 대시보드, 오늘 \(formatCost(today.totalCost)), 이번 주 \(formatCost(usage.thisWeekCost)), 이번 달 \(formatCost(usage.thisMonthCost))"
+        if let staleNote { label += ", \(staleNote)" }
+        setAccessibilityLabel(label)
     }
     var parallelCount: Int = 0
     var active: Bool = false
@@ -3014,7 +3081,11 @@ final class UsageDashboardView: NSView {
         drawText("사용량 대시보드", innerX, topY, titleFont, text)
         pill(active ? "작업 중" : "대기", x: innerX + 148, y: topY - 2, color: active ? green : muted)
         pill("병렬 \(parallelCount)", x: innerX + 236, y: topY - 2, color: parallelCount > 0 ? green : blue)
-        drawRight("오늘 \(formatKRWShort(today.totalCost, rate: rate)) · 총 \(formatTokens(usageData.allTimeTokens))", card.maxX - 16, topY + 2, bodyFont, muted)
+        if let staleNote {
+            drawRight(staleNote, card.maxX - 16, topY + 2, bodyFont, yellow)
+        } else {
+            drawRight("오늘 \(formatKRWShort(today.totalCost, rate: rate)) · 총 \(formatTokens(usageData.allTimeTokens))", card.maxX - 16, topY + 2, bodyFont, muted)
+        }
 
         let metricY = topY + 44
         let gap: CGFloat = 9
@@ -4026,7 +4097,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// nil은 아직 모름 — 안내를 띄우지 않고 기존 "확인 중" 화면을 둔다.
     var higgsfieldInstalled: Bool?
     var ccusageInstalledState: Bool?
-    var usageLoadFinished = false
+    /// 마지막으로 끝난 ccusage daily 판정. nil이면 아직 한 번도 끝나지 않았다.
+    var usageLoadOutcome: CcusageLoadOutcome?
+    /// ccusage 한 번의 시간 제한. 운영은 기본값, 테스트는 짧게 줄인다.
+    var ccusageTimeoutSeconds = ccusageDefaultTimeoutSeconds
     var teamCodexConfigPresent: Bool?
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
@@ -4211,10 +4285,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sections["codex"] = codexSectionToolNotice(codex: codexNotice, teamCodex: teamCodexNotice)
         sections["higgsfield"] = higgsfieldInstalled.flatMap { higgsfieldToolNotice(installed: $0) }
         sections["usage"] = ccusageInstalledState.flatMap {
-            ccusageToolNotice(installed: $0, loadFinished: usageLoadFinished, hasData: currentData?.today != nil)
+            ccusageToolNotice(installed: $0, outcome: usageLoadOutcome, hasData: currentData?.today != nil)
         }
         sections["burn"] = currentBurnModel.collectorNotice
         return DashboardToolNotices(sections: sections)
+    }
+
+    /// 대시보드에 넘기는 꼬리말. CLI 레인(laneStaleNotes)에 사용량 갱신 실패(이전 값 표시 중)를 더한다.
+    var dashboardStaleNotes: [String: String] {
+        var notes = laneStaleNotes
+        notes["usage"] = ccusageStaleNote(outcome: usageLoadOutcome, hasData: currentData?.today != nil)
+        return notes
     }
 
     func refreshBurnModel(now: Date = Date()) {
@@ -4705,7 +4786,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -5058,31 +5139,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         isFetching = true
         let startedAt = Date()
+        let timeout = ccusageTimeoutSeconds
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard ccusageInstalled() else {
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.isFetching = false
                     self.ccusageInstalledState = false
-                    self.usageLoadFinished = true
+                    self.usageLoadOutcome = nil
                     self.scheduleDashboardRefresh(reason: "loadUsageInBackground")
                     self.updateTitle()
                 }
                 return
             }
-            guard let dailyData = runCcusageRaw("daily") else {
+            // 실행 실패·시간 초과·해석 실패는 "데이터 없음"이 아니다. 판정을 그대로 남긴다(이전 값은 지우지 않는다).
+            let daily = loadCcusageDaily(timeoutSeconds: timeout)
+            guard let dailyData = daily.daily else {
                 DispatchQueue.main.async {
-                    self?.isFetching = false
-                    self?.ccusageInstalledState = true
-                    self?.usageLoadFinished = true
-                    self?.scheduleDashboardRefresh(reason: "loadUsageInBackground")
-                    self?.updateTitle()
+                    guard let self = self else { return }
+                    self.isFetching = false
+                    self.ccusageInstalledState = true
+                    self.usageLoadOutcome = daily.outcome
+                    self.scheduleDashboardRefresh(reason: "loadUsageInBackground")
+                    self.updateTitle()
                 }
                 return
             }
 
-            let rate = fetchUsdKrwRate()
-            if let quickData = parseUsageData(daily: dailyData, weekly: nil, monthly: nil, rate: rate) {
+            let rate = daily.rate
+            if let quickData = daily.quick {
                 print("CCUSAGE-QUICK: daily 반영 today=\(quickData.today?.period ?? "nil") cost=\(quickData.today?.totalCost ?? -1)")
                 fflush(stdout)
                 DispatchQueue.main.async {
@@ -5092,8 +5177,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            let weeklyData = runCcusageRaw("weekly")
-            let monthlyData = runCcusageRaw("monthly")
+            let weeklyData = runCcusageCommand("weekly", timeoutSeconds: timeout).successOutput
+            let monthlyData = runCcusageCommand("monthly", timeoutSeconds: timeout).successOutput
             let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate)
             print("CCUSAGE-FULL: today=\(data?.today?.period ?? "nil") cost=\(data?.today?.totalCost ?? -1) thisMonth=\(data?.thisMonthCost ?? -1) rate=\(rate)")
             fflush(stdout)
@@ -5102,7 +5187,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
                 self.isFetching = false
                 self.ccusageInstalledState = true
-                self.usageLoadFinished = true
+                self.usageLoadOutcome = daily.outcome
                 self.lastFullUsageCompletedAt = Date()
                 if let data = data {
                     var finalData = data
@@ -5133,17 +5218,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         isFetchingUsageQuick = true
         let startedAt = Date()
+        let timeout = ccusageTimeoutSeconds
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let dailyData = runCcusageRaw("daily") else {
-                DispatchQueue.main.async {
-                    self?.isFetchingUsageQuick = false
-                    self?.updateTitle()
-                }
-                return
-            }
-
-            let rate = fetchUsdKrwRate()
-            let quickData = parseUsageData(daily: dailyData, weekly: nil, monthly: nil, rate: rate)
+            let daily = loadCcusageDaily(timeoutSeconds: timeout)
+            let quickData = daily.quick
             print("CCUSAGE-QUICK[\(reason)]: today=\(quickData?.today?.period ?? "nil") cost=\(quickData?.today?.totalCost ?? -1)")
             fflush(stdout)
 
@@ -5156,6 +5234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateTitle()
                     return
                 }
+                self.usageLoadOutcome = daily.outcome
                 if let quickData = quickData {
                     self.currentData = quickData
                     self.lastUsageQuickCompletedAt = Date()
@@ -5320,7 +5399,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -5389,7 +5468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agy: currentAgyCard,
             burnModel: currentBurnModel,
             notices: currentToolNotices,
-            laneStaleNotes: laneStaleNotes,
+            laneStaleNotes: dashboardStaleNotes,
             parallelCount: parallelCount,
             active: isActive,
             isMeasuringTeamClaude: isMeasuringTeamClaude,
@@ -6552,8 +6631,7 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
     delegate.currentCodex = loadCodexHealth()
     delegate.higgsfieldInstalled = !higgsfieldBinCandidates().isEmpty
     delegate.ccusageInstalledState = ccusageInstalled()
-    // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다.
-    delegate.usageLoadFinished = delegate.ccusageInstalledState == false
+    // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다(판정 nil).
     if let notice = grokPresenceNotice() { delegate.currentGrokCard = grokCardModel(for: notice) }
     if agyExecutableURL() == nil { delegate.currentAgyCard = agyCardModel(for: agyToolNotice()) }
     delegate.refreshBurnModel()

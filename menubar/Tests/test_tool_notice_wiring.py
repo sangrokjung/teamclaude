@@ -80,7 +80,7 @@ class ToolNoticeWiringTests(unittest.TestCase):
 
     def test_loaders_do_not_run_missing_tools(self):
         usage = function_body(self.main, "func loadUsageInBackground(")
-        self.assertLess(usage.index("guard ccusageInstalled()"), usage.index('runCcusageRaw("daily")'))
+        self.assertLess(usage.index("guard ccusageInstalled()"), usage.index("loadCcusageDaily(timeoutSeconds:"))
         higgs = function_body(self.main, "func loadHiggsfieldInBackground(")
         self.assertLess(higgs.index("higgsfieldBinCandidates().isEmpty"), higgs.index("fetchHiggsfieldCredits()"))
         grok = function_body(self.main, "func loadGrokUsageInBackground(")
@@ -88,6 +88,28 @@ class ToolNoticeWiringTests(unittest.TestCase):
         self.assertIn("self.currentGrokSlot = nil", grok)
         agy = function_body(self.main, "func loadAgyUsageInBackground(")
         self.assertIn("agyCardModel(for: agyToolNotice())", agy)
+
+    def test_usage_failure_reaches_every_usage_consumer(self):
+        # 실행 실패·시간 초과·해석 실패를 "데이터 없음"으로 축약하지 않는다(외부 리뷰 2026-10-24).
+        # 두 로더가 같은 판정(loadCcusageDaily)을 남기고, 판정은 안내 카드·헤더 요약·사용량 카드 꼬리말에 모두 닿아야 한다.
+        for name in ("func loadUsageInBackground(", "func loadUsageQuickInBackground("):
+            body = function_body(self.main, name)
+            with self.subTest(loader=name):
+                self.assertIn("loadCcusageDaily(timeoutSeconds: timeout)", body)
+                self.assertIn("self.usageLoadOutcome = daily.outcome", body)
+                self.assertNotIn('runCcusageRaw("daily")', body)
+        self.assertNotIn("usageLoadFinished", self.main)
+        self.assertIn("ccusageToolNotice(installed: $0, outcome: usageLoadOutcome", self.main)
+        # 앱이 대시보드에 넘기는 꼬리말은 사용량 꼬리말을 더한 dashboardStaleNotes 하나다.
+        self.assertNotIn("laneStaleNotes: laneStaleNotes,\n            parallelCount: parallelCount,\n            active: isActive", self.main)
+        self.assertEqual(self.main.count("laneStaleNotes: dashboardStaleNotes"), 3)
+        # 구조가 바뀌어 configure를 다시 부를 때도 꼬리말을 넘긴다(빠뜨리면 그 갱신에서 표시가 사라진다).
+        update = function_body(self.main, "func updateContent(")
+        self.assertIn("laneStaleNotes: laneStaleNotes,", update)
+        self.assertIn('usageView?.staleNote = laneStaleNotes["usage"]', update)
+        configure = function_body(self.main, "func configure(\n        teamClaude: TeamClaudeHealth?")
+        self.assertIn('view.staleNote = laneStaleNotes["usage"]', configure)
+        self.assertEqual(self.main.count("notices: notices, staleNotes: laneStaleNotes)"), 2)
 
     def test_subscription_collector_reaches_the_burn_model(self):
         burn = function_body(self.main, "func refreshBurnModel(")
