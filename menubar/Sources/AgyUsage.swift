@@ -40,6 +40,11 @@ func agySpec(home: String = NSHomeDirectory()) -> ToolSpec {
     ])
 }
 
+/// 레인은 한 줄짜리라 안내 카드 대신 같은 문구를 레인 모델에 싣는다(R1).
+func agyCardModel(for notice: ToolNotice) -> AgyCardModel {
+    AgyCardModel(message: notice.line, groups: [], notice: notice)
+}
+
 /// 재정의(CC_MENUBAR_AGY_BIN)가 틀렸으면 다른 후보로 넘어가지 않고 nil(예전 동작 유지).
 func agyExecutableURL() -> URL? {
     ToolLocator.shared.resolve(agySpec()).path.map { URL(fileURLWithPath: $0) }
@@ -174,18 +179,19 @@ func agyWorkspaceURL() -> URL? {
 }
 
 func fetchAgyUsage(completion: @escaping (AgyFetchOutcome) -> Void) {
-    guard let executable = agyExecutableURL() else {
-        completion(.missing)
-        return
-    }
-    guard let workspace = agyWorkspaceURL() else {
-        // 실행 파일은 있는데 전용 작업 폴더를 못 만든 경우다. "설치 안 됨"과 구분해 알린다.
-        print("AGY-WORKSPACE: 전용 작업 폴더를 만들지 못해 호출을 건너뛴다")
-        fflush(stdout)
-        completion(.failed)
-        return
-    }
+    // 탐색은 로그인 셸 조회(최대 2초)를 띄울 수 있어 호출부(메인 스레드)가 아니라 이 큐 안에서 한다.
     DispatchQueue.global(qos: .utility).async {
+        guard let executable = agyExecutableURL() else {
+            completion(.missing)
+            return
+        }
+        guard let workspace = agyWorkspaceURL() else {
+            // 실행 파일은 있는데 전용 작업 폴더를 못 만든 경우다. "설치 안 됨"과 구분해 알린다.
+            print("AGY-WORKSPACE: 전용 작업 폴더를 만들지 못해 호출을 건너뛴다")
+            fflush(stdout)
+            completion(.failed)
+            return
+        }
         let process = Process()
         process.executableURL = executable
         process.arguments = ["-p", "/usage", "--output-format", "json"]

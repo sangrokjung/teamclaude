@@ -1,9 +1,9 @@
-import Cocoa
+import Foundation
 
 // 도구·데이터가 없을 때 카드들이 공통으로 그리는 상태(외부 배포 R1·R4).
 // 외부 사용자의 맥에는 TeamClaude·Codex·Higgsfield 같은 도구가 없을 수 있다. 그때 카드가
 // 크래시·빈 카드·원시 오류 문자열 대신 "미설치/데이터 없음" 안내 하나를 같은 모양으로 그린다.
-// 판정은 순수 함수, 그리기는 ToolNoticeView 한 곳이다. 레인·구독 카드는 같은 문구를 자기 자리에 그린다.
+// 판정은 이 파일의 순수 함수, 그리기는 ToolNoticeView.swift 한 곳이다. 레인·구독 카드는 같은 문구를 자기 자리에 그린다.
 
 enum MenubarTool: String, CaseIterable {
     case teamclaude, teamcodex, codex, higgsfield, ccusage, grok, agy, subscription
@@ -111,25 +111,19 @@ func subscriptionCollectorToolNotice(home: String) -> ToolNotice? {
     return subscriptionCollectorToolNotice(stateFileExists: FileManager.default.fileExists(atPath: path))
 }
 
-/// CLI 레인은 한 줄짜리라 안내 카드 대신 같은 문구를 레인 모델에 싣는다.
-func grokCardModel(for notice: ToolNotice) -> GrokCardModel {
-    GrokCardModel(headline: notice.headline, detail: notice.detail, notice: notice)
-}
-
-func agyCardModel(for notice: ToolNotice) -> AgyCardModel {
-    AgyCardModel(message: notice.line, groups: [], notice: notice)
-}
-
 /// 섹션 id("claude"·"codex"·"higgsfield"·"usage"·"burn") → 안내. 대시보드의 높이·배치·요약이 같은 값을 본다.
 struct DashboardToolNotices: Equatable {
     var sections: [String: ToolNotice] = [:]
     var isEmpty: Bool { sections.isEmpty }
 }
 
+/// 공통 안내 카드(ToolNoticeView) 높이.
+let toolNoticeCardHeight: CGFloat = 64
+
 /// 구독 섹션(burn)은 본문을 바꾸지 않고 카드 안에 안내 줄을 더한다. 나머지는 본문을 안내 카드로 바꾼다.
 func dashboardNoticeBodyHeight(section: String, natural: CGFloat, notices: DashboardToolNotices) -> CGFloat {
     guard section != "burn", notices.sections[section] != nil else { return natural }
-    return ToolNoticeView.preferredHeight
+    return toolNoticeCardHeight
 }
 
 func dashboardNoticeSummary(section: String, natural: String?, notices: DashboardToolNotices) -> String {
@@ -151,46 +145,4 @@ enum ToolNoticeDrawLog {
     }
 
     static func reset() { drawn = [:] }
-}
-
-/// 공통 안내 카드. 도구가 없는 섹션의 본문 자리에 놓인다.
-final class ToolNoticeView: NSView {
-    static let preferredHeight: CGFloat = 64
-
-    var cardID = ""
-    var notice: ToolNotice? {
-        didSet {
-            guard notice != oldValue else { return }
-            setAccessibilityLabel(notice.map { "\($0.headline), \($0.detail)" } ?? "")
-            needsDisplay = true
-        }
-    }
-
-    override var isFlipped: Bool { true }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setAccessibilityElement(true)
-        setAccessibilityRole(.group)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard let notice, bounds.width > 0 else { return }
-        TeamClaudePalette.panel.setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 8, dy: 4), xRadius: 8, yRadius: 8).fill()
-        (notice.headline as NSString).draw(at: NSPoint(x: 24, y: 14), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
-            .foregroundColor: TeamClaudePalette.text,
-        ])
-        (notice.detail as NSString).draw(at: NSPoint(x: 24, y: 36), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: TeamClaudePalette.muted,
-        ])
-        ToolNoticeDrawLog.record(cardID, notice)
-    }
 }

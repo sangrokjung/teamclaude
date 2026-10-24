@@ -6,6 +6,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+# 도구 탐색(ToolLocator)·미설치 안내(ToolNotice)는 Agy·Grok·TeamCodex 로더가 함께 쓴다. 셋 다 Foundation만 쓴다.
+TOOL_SOURCES = ["ToolLocator.swift", "ToolNotice.swift", "StatusVocabulary.swift"]
 
 
 class UsageRegressionTests(unittest.TestCase):
@@ -64,7 +66,8 @@ class UsageRegressionTests(unittest.TestCase):
 
     def test_pool_preserves_unknown_zero_and_current_account(self):
         # TeamCodexPoolStatus.swift가 status의 runtime 블록을 teamRuntimeSummary(TeamClaudePresentationLogic.swift)로 읽으므로 같이 컴파일한다.
-        self.run_swift(["TeamCodexPoolStatus.swift", "CodexStatusLayout.swift", "TeamClaudePresentationLogic.swift"],
+        self.run_swift(["TeamCodexPoolStatus.swift", "CodexStatusLayout.swift", "TeamClaudePresentationLogic.swift",
+                        *TOOL_SOURCES],
                        "TeamCodexPoolStatusTests.swift")
 
     def test_menu_title_uses_tokens(self):
@@ -72,11 +75,11 @@ class UsageRegressionTests(unittest.TestCase):
         self.assertIn("Codex title token usage test passed", output)
 
     def test_grok_title_uses_billing_percent(self):
-        output = self.run_swift(["GrokUsage.swift"], "GrokUsageTests.swift")
+        output = self.run_swift(["GrokUsage.swift", *TOOL_SOURCES], "GrokUsageTests.swift")
         self.assertIn("Grok title usage test passed", output)
 
     def test_agy_usage_parser(self):
-        output = self.run_swift(["AgyUsage.swift"], "AgyUsageTests.swift")
+        output = self.run_swift(["AgyUsage.swift", *TOOL_SOURCES], "AgyUsageTests.swift")
         self.assertIn("agy usage parser test passed", output)
 
 

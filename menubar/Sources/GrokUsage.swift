@@ -50,6 +50,11 @@ func grokSpec(home: String = NSHomeDirectory()) -> ToolSpec {
     ])
 }
 
+/// 레인은 한 줄짜리라 안내 카드 대신 같은 문구를 레인 모델에 싣는다(R1).
+func grokCardModel(for notice: ToolNotice) -> GrokCardModel {
+    GrokCardModel(headline: notice.headline, detail: notice.detail, notice: notice)
+}
+
 /// 앱 로더와 빈 HOME 스냅샷이 같은 판정을 쓴다.
 func grokPresenceNotice() -> ToolNotice? {
     grokToolNotice(cliInstalled: ToolLocator.shared.resolve(grokSpec()).path != nil,

@@ -5862,6 +5862,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 launchd: launchd,
                 port: launchd == .notLoaded ? probeTeamClaudePort(port) : .unknown
             )
+            // 실행 파일 탐색도 로그인 셸 조회를 띄울 수 있어 백그라운드에서 끝낸다.
+            let detachedExecutable = plan == .startDetached ? teamClaudeDetachedExecutable() : nil
             DispatchQueue.main.async {
                 guard let self else { return }
                 print("TEAMCLAUDE-RESTART: label=\(teamClaudeLaunchdLabel) plan=\(plan)")
@@ -5895,7 +5897,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         }
                     }
                 case .startDetached:
-                    guard let executable = teamClaudeDetachedExecutable() else {
+                    guard let executable = detachedExecutable else {
                         self.showTeamClaudeRestartNotice("teamclaude 실행 파일을 찾지 못했습니다. CC_MENUBAR_TEAMCLAUDE_BIN으로 경로를 지정하세요.")
                         return
                     }
