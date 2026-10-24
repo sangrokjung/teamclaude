@@ -30,18 +30,34 @@ func dashboardSectionBodyY(_ section: DashboardSection) -> CGFloat { section.y +
 
 /// 섹션 머리: 벌린 자간의 메타 라벨(왼쪽)과 한 줄 요약(오른쪽). 면을 칠하지 않는다(A안).
 final class DashboardSectionHeaderView: NSView {
-    var section: DashboardSection? { didSet { if oldValue != section { needsDisplay = true } } }
+    var section: DashboardSection? {
+        didSet {
+            guard oldValue != section else { return }
+            // 요약이 길어 "…"로 줄어도 전문은 도움말 풍선에서 읽힌다(사용량 갱신 실패 꼬리말 등).
+            toolTip = section?.summary.isEmpty == false ? section?.summary : nil
+            needsDisplay = true
+        }
+    }
     override var isFlipped: Bool { true }
+
+    private static var titleAttrs: [NSAttributedString.Key: Any] {
+        [.font: TeamClaudePalette.metaFont, .foregroundColor: TeamClaudePalette.fg3, .kern: TeamClaudePalette.metaKern]
+    }
+
+    /// 요약을 제목 오른쪽 남은 폭에 맞춘다. 넘치면 뒤를 "…"로 줄여 패널 밖으로 나가지 않게 한다.
+    static func fittedSummary(_ summary: String, title: String, width: CGFloat) -> (text: String, x: CGFloat) {
+        let titleWidth = (title as NSString).size(withAttributes: titleAttrs).width
+        let minX = 16 + titleWidth + 12
+        let text = PanelDraw.clipped(summary, TeamClaudePalette.captionFont, maxWidth: max(0, width - 16 - minX))
+        return (text, max(minX, width - 16 - PanelDraw.width(text, TeamClaudePalette.captionFont)))
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         guard let section else { return }
-        let titleAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.metaFont, .foregroundColor: TeamClaudePalette.fg3,
-                                                         .kern: TeamClaudePalette.metaKern]
         let summaryAttrs: [NSAttributedString.Key: Any] = [.font: TeamClaudePalette.captionFont, .foregroundColor: TeamClaudePalette.fg3]
-        (section.title as NSString).draw(at: NSPoint(x: 16, y: 9), withAttributes: titleAttrs)
-        let titleWidth = (section.title as NSString).size(withAttributes: titleAttrs).width
-        let summary = section.summary as NSString
-        let w = summary.size(withAttributes: summaryAttrs).width
-        summary.draw(at: NSPoint(x: max(16 + titleWidth + 12, bounds.width - 16 - w), y: 8.5), withAttributes: summaryAttrs)
+        (section.title as NSString).draw(at: NSPoint(x: 16, y: 9), withAttributes: Self.titleAttrs)
+        let fitted = Self.fittedSummary(section.summary, title: section.title, width: bounds.width)
+        (fitted.text as NSString).draw(at: NSPoint(x: fitted.x, y: 8.5), withAttributes: summaryAttrs)
     }
 }
 
