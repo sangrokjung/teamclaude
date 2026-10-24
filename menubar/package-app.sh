@@ -65,6 +65,11 @@ resolve_version() {
 }
 
 VERSION="$(resolve_version "${1:-}")"
+# 버전은 파일 이름과 Info.plist에 들어간다. 영문·숫자·`.`·`+`·`-`만 받는다.
+if ! [[ "$VERSION" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+    echo "✗ 버전 표기가 올바르지 않습니다: $VERSION" >&2
+    exit 2
+fi
 BUILD_DIR="$SCRIPT_DIR/.build"
 WORK="$BUILD_DIR/package"
 APP="$BUILD_DIR/$APP_BUNDLE"

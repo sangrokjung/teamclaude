@@ -1,0 +1,96 @@
+name: Menubar release
+# 외부 배포용 CC Menubar.app(유니버설) 빌드.
+# - workflow_dispatch: 테스트 → 패키징 → 아티팩트 업로드까지만 한다(Release를 만들지 않는다).
+# - 태그 menubar-v*: 같은 산출물로 Release 초안(draft)을 만든다. 공개 전환은 사람이 한다.
+on:
+  push:
+    tags: ['menubar-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '산출물 버전 표기(비우면 0.0.0-dev)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: menubar-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Swift/Python 테스트
+        run: bash menubar/run-tests.sh
+      - name: 유니버설 앱 패키징
+        env:
+          MENUBAR_VERSION: ${{ inputs.version }}
+        run: bash menubar/package-app.sh
+      - name: 아키텍처·Info.plist 확인
+        run: |
+          app="menubar/.build/CC Menubar.app"
+          archs="$(lipo -archs "$app/Contents/MacOS/cc-menubar")"
+          echo "archs: $archs"
+          case " $archs " in *" x86_64 "*) ;; *) echo "x86_64 슬라이스 없음"; exit 1 ;; esac
+          case " $archs " in *" arm64 "*) ;; *) echo "arm64 슬라이스 없음"; exit 1 ;; esac
+          test "$(plutil -extract LSUIElement raw "$app/Contents/Info.plist")" = "true"
+          codesign --verify --strict "$app"
+      - name: 공개 산출물 스윕(R9)
+        run: |
+          binary="menubar/.build/CC Menubar.app/Contents/MacOS/cc-menubar"
+          if strings -a "$binary" | grep -E '/Users/[a-z]|100\.[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "산출물에 내부 경로·주소가 남아 있습니다"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cc-menubar-macos-universal
+          path: |
+            menubar/.build/dist/*.zip
+            menubar/.build/dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: menubar-release-test-logs
+          path: menubar/.build/tests/*.log
+          if-no-files-found: ignore
+
+  draft-release:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/menubar-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cc-menubar-macos-universal
+          path: dist
+      - name: Release 초안 만들기
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#menubar-v}"
+          cat > notes.md <<EOF
+          CC Menubar ${version} (macOS 13+, Apple Silicon·Intel 유니버설).
+
+          설치: zip을 받아 풀고 "CC Menubar.app"을 응용 프로그램 폴더로 옮긴 뒤, 처음 한 번은 우클릭 → 열기.
+          서명·공증하지 않은 앱이라 "손상됐다"는 경고가 뜨면 터미널에서
+          xattr -dr com.apple.quarantine "/Applications/CC Menubar.app"
+          SHA256은 같은 이름의 .sha256 파일과 비교하세요.
+          EOF
+          gh release create "$TAG" dist/*.zip dist/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "CC Menubar ${version}" \
+            --notes-file notes.md
