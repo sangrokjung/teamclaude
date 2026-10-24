@@ -1278,13 +1278,31 @@ struct CcusageAuxResolution {
     let failures: [CcusageAuxFailure]
 }
 
-/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰고, 해석 실패는 JSON 객체에
-/// 명령별 기간 배열(`weekly`·`monthly`)이 없거나 객체 배열이 아닐 때다(pickPeriod가 읽는 형태). 빈 배열은 기간 항목이 없는 정상 경우다.
+/// JSON 숫자인가. JSONSerialization은 true/false도 NSNumber로 주므로 불리언은 뺀다.
+func ccusageIsJSONNumber(_ value: Any?) -> Bool {
+    guard let number = value as? NSNumber else { return false }
+    return CFGetTypeID(number) != CFBooleanGetTypeID()
+}
+
+/// pickPeriod가 읽는 weekly·monthly 출력 형태인가. 명령별 기간 배열의 각 항목은 문자열 `period`와 숫자
+/// `totalCost`·`totalTokens`를 갖고, `totals`가 있으면 같은 두 숫자를 가진 객체여야 한다. 형식이 틀린 값을
+/// 해석기가 0으로 읽어 정상값처럼 그리지 않게, 여기서 실패로 가른다. 빈 배열은 기간 항목이 없는 정상 경우다.
+func ccusageAuxOutputMatchesSchema(_ data: Data, command: CcusageAuxCommand) -> Bool {
+    guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let entries = object[command.arrayKey] as? [[String: Any]] else { return false }
+    let entriesValid = entries.allSatisfy { entry in
+        entry["period"] is String && ccusageIsJSONNumber(entry["totalCost"]) && ccusageIsJSONNumber(entry["totalTokens"])
+    }
+    guard entriesValid else { return false }
+    guard let totals = object["totals"] else { return true }
+    guard let totalsObject = totals as? [String: Any] else { return false }
+    return ccusageIsJSONNumber(totalsObject["totalCost"]) && ccusageIsJSONNumber(totalsObject["totalTokens"])
+}
+
+/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰고, 해석 실패는 출력이
+/// `ccusageAuxOutputMatchesSchema`를 통과하지 못할 때다.
 func ccusageAuxFailure(_ run: CcusageRun, command: CcusageAuxCommand, timeoutSeconds: Double) -> CcusageFailure? {
-    let matchesSchema = run.successOutput.map { data -> Bool in
-        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
-        return object[command.arrayKey] is [[String: Any]]
-    } ?? false
+    let matchesSchema = run.successOutput.map { ccusageAuxOutputMatchesSchema($0, command: command) } ?? false
     let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
                                      exitStatus: run.exitStatus, outputBytes: run.output.count,
                                      parsedHasToday: matchesSchema ? true : nil, outputTooLarge: run.outputTooLarge)

@@ -484,8 +484,25 @@ extension UsageLoadOutcomeTests {
         precondition(scalars.failures == [CcusageAuxFailure(command: .weekly, failure: .unparsable)],
                      "객체가 아닌 배열을 받았다: \(scalars.failures)")
 
-        // 빈 배열은 정상(기간 항목 없음)이다.
-        let ok = resolveCcusageAux(weekly: run(#"{"weekly":[]}"#), monthly: run(#"{"monthly":[{"period":"2020-01"}]}"#),
+        // 기간 항목·누적 합계의 필드 형식이 틀리면 실패다(해석기가 0으로 읽어 정상값처럼 보이게 된다).
+        let malformed: [(String, String)] = [
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":"bad","totalTokens":1}]}"#, "비용이 문자열"),
+            (#"{"weekly":[{"period":123,"totalCost":999,"totalTokens":1}]}"#, "기간이 숫자"),
+            (#"{"weekly":[{"period":"2020-01-06","totalTokens":1}]}"#, "비용 없음"),
+            (#"{"weekly":[{"period":"2020-01-06","totalCost":1,"totalTokens":true}]}"#, "토큰이 불리언"),
+            (#"{"weekly":[],"totals":{"totalCost":"x","totalTokens":1}}"#, "합계 비용이 문자열"),
+            (#"{"weekly":[],"totals":[]}"#, "합계가 객체 아님"),
+        ]
+        for (json, why) in malformed {
+            let r = resolveCcusageAux(weekly: run(json), monthly: run(#"{"monthly":[]}"#),
+                                      previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
+            precondition(r.failures == [CcusageAuxFailure(command: .weekly, failure: .unparsable)],
+                         "형식이 틀린 보조 출력(\(why))을 받았다: \(r.failures)")
+        }
+
+        // 빈 배열, 필드가 맞는 항목과 합계는 정상이다.
+        let ok = resolveCcusageAux(weekly: run(#"{"weekly":[]}"#),
+                                   monthly: run(#"{"monthly":[{"period":"2020-01","totalCost":1.5,"totalTokens":10}],"totals":{"totalCost":1.5,"totalTokens":10}}"#),
                                    previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
         precondition(ok.failures.isEmpty, "정상 보조 출력을 실패로 봤다: \(ok.failures)")
     }
