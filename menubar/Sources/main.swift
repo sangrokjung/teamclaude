@@ -2543,7 +2543,8 @@ final class StatusMenuDashboardView: NSView {
         let bodies = sectionBodies(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
                                    burnModel: burnModel, notices: notices, summaries: [:])
         for (tab, list) in bodies {
-            heights[tab] = dashboardSectionLayout(startY: bodyInset, bodies: list).totalHeight + bodyInset
+            let layout = dashboardSectionLayout(startY: bodyInset, bodies: list)
+            heights[tab] = layout.sections.isEmpty ? PanelEmptyStateView.preferredHeight : layout.totalHeight + bodyInset
         }
         return heights
     }
@@ -2686,6 +2687,15 @@ final class StatusMenuDashboardView: NSView {
             let layout = dashboardSectionLayout(startY: Self.bodyInset, bodies: bodies[tab] ?? [])
             let document = PanelFlippedView(frame: NSRect(x: 0, y: 0, width: width, height: layout.totalHeight + Self.bodyInset))
             tabDocuments[tab] = document
+            if layout.sections.isEmpty {
+                // 그릴 데이터가 아직 없다(로딩 중이거나 연동 전). 빈 탭 대신 무엇이 올지 말한다.
+                let empty = PanelEmptyStateView(frame: NSRect(x: 0, y: 0, width: width, height: PanelEmptyStateView.preferredHeight))
+                empty.title = tab == .codex ? L10n.codexEmptyTitle : StatusVocabulary.checking
+                empty.detail = tab == .codex ? L10n.codexEmptyDetail : L10n.waitingForValue
+                empty.autoresizingMask = [.width]
+                document.frame.size.height = PanelEmptyStateView.preferredHeight
+                document.addSubview(empty)
+            }
             allSections += layout.sections
             for section in layout.sections {
                 let sectionHeader = DashboardSectionHeaderView(frame: NSRect(x: 0, y: section.y, width: width, height: dashboardSectionHeaderHeight))
@@ -6002,9 +6012,9 @@ if CommandLine.arguments.contains("--account-subscription-qa") || CommandLine.ar
                                  codexResetCreditsAt: index == 6 ? now.addingTimeInterval(-601) : now)
         }, resetCreditsEnabled: true, resetCreditsPolicy: "account"
     )
-    let view = CodexStatusView(frame: NSRect(x: 0, y: 0, width: 880, height: CodexStatusView.preferredHeight(for: pool)))
+    let view = CodexStatusView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: CodexStatusView.preferredHeight(for: pool)))
     view.pool = pool
-    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: min(view.bounds.height, 720)), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: min(view.bounds.height, 720)), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     window.title = resetQA ? "계정별 리셋권 검증" : "계정 구독 표시 검증"
     let scroll = NSScrollView(frame: window.contentView!.bounds)
     scroll.hasVerticalScroller = true
@@ -6119,7 +6129,7 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
         precondition(CodexStatusView.poolRowCount(for: health) == count)
         precondition(
             CodexStatusView.poolSectionHeight(for: health)
-                == 112 + CGFloat(max(1, count)) * 56
+                == CodexStatusView.poolHeaderHeight + CGFloat(max(1, count)) * CodexStatusView.poolRowHeight
         )
     }
 
@@ -6142,7 +6152,8 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
         view.layoutSubtreeIfNeeded()
         let subscriptions = view.subviews.compactMap { $0 as? AccountSubscriptionButton }
         precondition(subscriptions.count == count)
-        for button in subscriptions {
+        // 접힌 Claude 행의 기록 없는 구독 버튼은 숨는다(입력 진입점은 펼친 행에 있다). 보이는 버튼만 기하를 본다.
+        for button in subscriptions where !button.isHidden {
             precondition(view.bounds.contains(button.frame))
             precondition(button.attributedTitle.size().width < button.frame.width)
             precondition(button.accessibilityLabel()?.contains("결제일") == true)
@@ -6152,7 +6163,7 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
         }
     }
     let codexLayoutPool = pool(32)
-    let codexLayout = CodexStatusView(frame: NSRect(x: 0, y: 0, width: 880, height: CodexStatusView.preferredHeight(for: codexLayoutPool)))
+    let codexLayout = CodexStatusView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: CodexStatusView.preferredHeight(for: codexLayoutPool)))
     codexLayout.pool = codexLayoutPool
     verifySubscriptionLayout(codexLayout, count: 32)
     let claudeRows = (0..<16).map { index in
@@ -6170,6 +6181,16 @@ if CommandLine.arguments.contains("--teamcodex-dashboard-selftest") {
     let claudeLayout = TeamClaudeTableView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: StatusMenuDashboardView.teamContentHeight(claudeLayoutHealth)))
     claudeLayout.health = claudeLayoutHealth
     verifySubscriptionLayout(claudeLayout, count: 16)
+    // 행을 펼치면 그 행의 구독 버튼이 상세 칸에 온전한 폭으로 나타난다(기록이 없어도 입력 진입점은 사라지지 않는다).
+    claudeLayout.expandedAccount = claudeRows[0].name
+    claudeLayout.frame.size.height = TeamClaudeTableView.contentHeight(claudeLayoutHealth, expanded: claudeRows[0].name)
+    claudeLayout.needsLayout = true
+    verifySubscriptionLayout(claudeLayout, count: 16)
+    let expandedEntry = claudeLayout.subviews.compactMap { $0 as? AccountSubscriptionButton }[0]
+    precondition(!expandedEntry.isHidden && expandedEntry.frame.width > 200)
+    claudeLayout.expandedAccount = nil
+    claudeLayout.frame.size.height = StatusMenuDashboardView.teamContentHeight(claudeLayoutHealth)
+    claudeLayout.layoutSubtreeIfNeeded()
     let scrollCheck = NSScrollView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth, height: 400))
     scrollCheck.documentView = claudeLayout
     scrollCheck.contentView.scroll(to: NSPoint(x: 0, y: claudeLayout.bounds.height - 400))
@@ -6617,6 +6638,10 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     let health = (fixture["teamclaude"] as? [String: Any]).map {
         parseTeamClaudeHealth(config: nil, server: nil, status: $0, port: 3456)
     }
+    // Codex 풀은 프록시 status 모양 그대로 받아 실제 파서로 읽는다(make_dash_fixture.py --codex).
+    let teamCodex = (fixture["teamcodex"] as? [String: Any]).flatMap { raw in
+        (try? JSONSerialization.data(withJSONObject: raw)).flatMap { try? teamCodexPoolHealth(from: $0, port: 3457, serverPid: nil) }
+    }
     // 힉스필드 카드는 픽스처에 크레딧이 있을 때만 그린다. 지연 표시처럼 실패했을 때만
     // 나타나는 화면은 스냅샷이 다루지 않으면 눈으로 확인된 적이 없는 상태로 남는다.
     let higgsfield = (fixture["higgsfieldCredits"] as? NSNumber).map {
@@ -6628,13 +6653,13 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
         x: 0, y: 0,
         width: StatusMenuDashboardView.preferredWidth,
         height: StatusMenuDashboardView.preferredHeight(
-            teamClaude: health, codex: nil, teamCodex: nil, usage: nil,
+            teamClaude: health, codex: nil, teamCodex: teamCodex, usage: nil,
             higgsfield: higgsfield, burnModel: burnModel, notices: DashboardToolNotices(),
             maxBodyHeight: .greatestFiniteMagnitude
         )
     ))
     view.configure(
-        teamClaude: health, codex: nil, teamCodex: nil, usage: nil,
+        teamClaude: health, codex: nil, teamCodex: teamCodex, usage: nil,
         higgsfield: higgsfield,
         grok: GrokCardModel(headline: (fixture["grok"] as? String) ?? "Grok 21%", detail: nil),
         agy: AgyCardModel(message: nil, groups: []),

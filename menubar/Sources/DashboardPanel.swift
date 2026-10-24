@@ -351,3 +351,30 @@ final class DashboardActionListView: NSView {
         }
     }
 }
+
+/// 그릴 데이터가 없는 탭의 빈 상태: 정보 표시 · 제목 · 무엇이 여기 올지.
+final class PanelEmptyStateView: NSView {
+    static let preferredHeight: CGFloat = 150
+    var title = "" { didSet { needsDisplay = true; setAccessibilityLabel(title) } }
+    var detail = "" { didSet { needsDisplay = true; setAccessibilityHelp(detail) } }
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let badge = NSRect(x: 16, y: 32, width: 32, height: 32)
+        PanelDraw.fillRound(badge, TeamClaudePalette.overlay, 8)
+        let mark = "i"
+        let markFont = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        PanelDraw.text(mark, badge.midX - PanelDraw.width(mark, markFont) / 2, badge.minY + 7, markFont, TeamClaudePalette.fg2)
+        PanelDraw.text(title, 16, 76, NSFont.systemFont(ofSize: 15, weight: .semibold), TeamClaudePalette.fg)
+        PanelDraw.text(PanelDraw.clipped(detail, TeamClaudePalette.bodyFont, maxWidth: bounds.width - 32), 16, 100,
+                       TeamClaudePalette.bodyFont, TeamClaudePalette.fg2)
+    }
+}

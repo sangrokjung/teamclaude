@@ -232,6 +232,54 @@ enum L10n {
     static func exchangeRate(_ rate: String) -> String { t("환율 1 USD = ₩\(rate)", "Rate 1 USD = ₩\(rate)") }
     static var noModelData: String { t("이번 달 모델별 데이터가 아직 없습니다", "No per-model data this month yet") }
 
+    // MARK: Codex 탭
+
+    static var codexStatus: String { t("Codex 상태", "Codex status") }
+    static var codexRecommendationHelp: String {
+        t("GPT-5.6 작업 추천: 구현과 설계는 gpt-5.6 medium, 리뷰와 보안은 gpt-5.6-sol high, 탐색과 병렬 작업은 gpt-5.6-terra low, 분류와 반복 작업은 gpt-5.6-luna none 또는 low",
+          "GPT-5.6 picks: build and design gpt-5.6 medium, review and security gpt-5.6-sol high, exploration gpt-5.6-terra low, triage gpt-5.6-luna none or low")
+    }
+    static var teamCodexPool: String { t("TeamCodex 계정 풀", "TeamCodex pool") }
+    static func codexPoolUsable(pool: Int, excluded: Int) -> String {
+        t("/ \(pool) 사용 가능 · 제외 \(excluded)", "/ \(pool) available · \(excluded) excluded")
+    }
+    static var codexAccountsHead: String { t("계정", "Accounts") }
+    static var codexWindowsPerAccount: String { t("계정마다 창이 따로 돕니다", "Each account has its own windows") }
+    static var codexNoAccounts: String { t("TeamCodex에 등록된 계정이 없습니다", "No accounts in TeamCodex") }
+    static var codexCurrent: String { t("현재", "current") }
+    static var codexFiveHours: String { t("5시간", "5 hours") }
+    static var codexSevenDays: String { t("7일", "7 days") }
+    static func codexFacts(inflight: Int, maxConcurrent: Int, requests: Int, credits: String, tokens: String) -> String {
+        t("동시 \(inflight)/\(maxConcurrent) · 요청 \(requests) · 리셋권 \(credits) · 토큰 \(tokens)",
+          "concurrent \(inflight)/\(maxConcurrent) · requests \(requests) · resets \(credits) · tokens \(tokens)")
+    }
+    static var codexLocalTitle: String { t("이 맥의 Codex 사용량", "Codex usage on this Mac") }
+    static var codexLocalLoading: String { t("로컬 사용량 집계 중입니다", "Counting local usage") }
+    static func codexRecent(_ age: String) -> String { t("최근 \(age)", "last \(age)") }
+    static func codexInfoLine(auth: String, model: String, plan: String) -> String {
+        t("인증 \(auth)  ·  모델 \(model)  ·  플랜 \(plan)", "auth \(auth)  ·  model \(model)  ·  plan \(plan)")
+    }
+    static var codexCurrentFiveHours: String { t("현재 계정 · 5시간", "Current · 5h") }
+    static var codexCurrentSevenDays: String { t("현재 계정 · 7일", "Current · 7d") }
+    static var codexTodayTokens: String { t("오늘 토큰", "Tokens today") }
+    static var codexMonthlyCost: String { t("월 환산비용", "Monthly cost") }
+    static var codexNoLimitInfo: String { t("한도 정보 없음", "No limit info") }
+    static func codexCallCount(_ count: Int) -> String { t("\(count)회", "\(count) calls") }
+    static var codexColumnModel: String { t("모델", "Model") }
+    static var codexColumnCalls: String { t("호출", "Calls") }
+    static var codexColumnToday: String { t("오늘", "Today") }
+    static var codexColumnWeek: String { t("7일", "7d") }
+    static var codexColumnStatus: String { t("상태", "Status") }
+    static var codexColumnRecent: String { t("최근", "Last") }
+    static var codexNoSessions: String { t("Codex 세션 사용 기록 없음", "No Codex session history") }
+    static var codexRecommendationTitle: String { t("GPT-5.6 작업 추천", "GPT-5.6 picks") }
+    static func codexCurrentModel(_ model: String) -> String { t("현재 \(model)", "now \(model)") }
+    static var codexPromptHint: String { t("프롬프트: 목표 · 성공 기준 · 권한 · 검증만 명확하게", "Prompt: state goal, success criteria, permissions, checks") }
+    static var codexEmptyTitle: String { t("Codex 풀 데이터가 없습니다", "No Codex pool data") }
+    static var codexEmptyDetail: String {
+        t("연동되면 계정별 5시간·7일 사용량과 리셋 시각이 여기에 뜹니다.", "Once connected, each account's 5-hour and 7-day usage and resets appear here.")
+    }
+
     // MARK: CLI·빈 값 어휘
 
     static var grokChecking: String { t("Grok 확인 중", "Grok checking") }
