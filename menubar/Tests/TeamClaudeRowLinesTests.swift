@@ -33,50 +33,46 @@ struct TeamClaudeRowLinesTests {
         precondition(accountSubscriptionLineIsInformative(blank, appearance: .ended), "server-recorded end shows even with no local record")
         precondition(accountSubscriptionLineIsInformative(blank, appearance: .endDateReached))
 
-        // 3. 행 기하 — 세 줄 다 있으면 예전 고정 행(70 + 2)과 같고, 빠진 줄만큼 줄어든다.
+        // 3. 행 기하(A안 520pt) — 세 줄 다 있으면 예전 고정 행(70 + 2)과 같고, 빠진 줄만큼 줄어든다.
         precondition(teamClaudeRowHeight(.full) == 70)
         precondition(teamClaudeRowStride(.full) == 72)
-        precondition(teamClaudeRowHeight(.compact) == 28)
+        precondition(teamClaudeRowHeight(.compact) == 30)
         precondition(teamClaudeRowHeight(TeamClaudeRowLines(reason: true, subscription: false)) == 48)
-        precondition(teamClaudeRowHeight(TeamClaudeRowLines(reason: false, subscription: true)) == 50)
-        precondition(teamClaudeReasonLineY(.full) == 27)
-        precondition(teamClaudeSubscriptionLineY(.full) == 47, "full row keeps the pre-change button offset")
+        precondition(teamClaudeRowHeight(TeamClaudeRowLines(reason: false, subscription: true)) == 52)
+        precondition(teamClaudeReasonLineY(.full) == 26)
+        precondition(teamClaudeSubscriptionLineY(.full) == 44)
         precondition(teamClaudeReasonLineY(.compact) == nil && teamClaudeSubscriptionLineY(.compact) == nil)
-        precondition(teamClaudeSubscriptionLineY(TeamClaudeRowLines(reason: false, subscription: true)) == 27,
+        precondition(teamClaudeSubscriptionLineY(TeamClaudeRowLines(reason: false, subscription: true)) == 26,
                      "without a reason line the subscription line moves up into its slot")
         let rows: [TeamClaudeRowLines] = [.full, .compact, TeamClaudeRowLines(reason: true, subscription: false)]
-        precondition(teamClaudeRowOrigins(rows) == [0, 72, 102, 152])
-        precondition(teamClaudeRowsHeight(rows) == 152)
+        precondition(teamClaudeRowOrigins(rows) == [0, 72, 104, 154])
+        precondition(teamClaudeRowsHeight(rows) == 154)
         precondition(teamClaudeRowOrigins([]) == [0] && teamClaudeRowsHeight([]) == 0)
         precondition(teamClaudeRowsHeight(Array(repeating: .full, count: 17)) == 17 * 72, "all-full rows reproduce the legacy table height")
 
-        // 4. 구독 진입점 — 기록이 없어도 사라지지 않는다. 이름이 짧으면 이름 줄 안, 길면 3행으로 내려간다.
-        precondition(teamClaudeNameWidthUnits("acct-01") == 7)
-        precondition(teamClaudeNameWidthUnits("검증 계정 1") == 4 * 2 + 3, "non-ASCII glyphs take two cells in the monospaced row font")
-        precondition(teamClaudeSubscriptionEntryFitsInline(name: "acct-01"))
-        precondition(teamClaudeSubscriptionEntryFitsInline(name: String(repeating: "a", count: 20)))
-        precondition(!teamClaudeSubscriptionEntryFitsInline(name: String(repeating: "a", count: 21)), "a long name would collide with the inline button")
-        precondition(!teamClaudeSubscriptionEntryFitsInline(name: String(repeating: "가", count: 11)))
-        precondition(TeamClaudeSubscriptionEntry.inlineX + TeamClaudeSubscriptionEntry.inlineWidth <= 270,
-                     "the inline entry must end before the session column")
-        // 평상시엔 감춘다. 기록 없는 계정이 대다수라 옅게라도 남기면 같은 문구가 17행을 덮고,
-        // 그건 이번 정리가 걷어낸 반복 노이즈와 같다. 발견은 표 아래 안내 문장 한 줄이 맡고,
-        // 접근성 트리에는 alpha와 무관하게 남는다.
-        precondition(TeamClaudeSubscriptionEntry.restingAlpha == 0,
-                     "the inline entry stays hidden until the row is pointed at")
+        // 4. 펼친 행 — 상세 칸만큼 길어지고, 상세 칸은 보조 줄 바로 아래에서 시작한다.
+        //    기록 없는 계정의 구독 입력 진입점은 이 상세 칸에 있다(이름 줄의 투명 버튼은 없앴다).
+        precondition(teamClaudeRowHeight(.compact, expanded: true) == 30 + TeamClaudeRowMetrics.detailHeight)
+        precondition(teamClaudeDetailY(.full) == 70 && teamClaudeDetailY(.compact) == 30)
+        // 열은 겹치지 않고 표 폭(520 - 16) 안에 든다.
+        precondition(TeamClaudeColumns.nameX + TeamClaudeColumns.nameWidth <= TeamClaudeColumns.sessionX)
+        precondition(TeamClaudeColumns.sessionX + TeamClaudeColumns.meterWidth < TeamClaudeColumns.weeklyX)
+        precondition(TeamClaudeColumns.weeklyX + TeamClaudeColumns.meterWidth < TeamClaudeColumns.fableX)
+        precondition(TeamClaudeColumns.fableX + TeamClaudeColumns.meterWidth < TeamClaudeColumns.statusX)
+        precondition(TeamClaudeColumns.statusX + 60 <= 520 - TeamClaudeColumns.padding, "status column keeps room for a label")
 
-        // 5. 카드 기하 — 4pt 리듬. 행 시작 y와 행 없는 높이가 한 함수에서 나온다.
+        // 5. 표 상단 기하 — 4pt 리듬. 행 시작 y와 행 없는 높이가 한 함수에서 나온다.
         for value in [TeamClaudeCardMetrics.topInset, TeamClaudeCardMetrics.headerHeight, TeamClaudeCardMetrics.hostLineHeight,
                       TeamClaudeCardMetrics.stripHeight, TeamClaudeCardMetrics.stripGap, TeamClaudeCardMetrics.tableHeadHeight,
                       TeamClaudeCardMetrics.tableHeadGap, TeamClaudeCardMetrics.footerHeight, TeamClaudeCardMetrics.cardInset] {
             precondition(value.truncatingRemainder(dividingBy: 4) == 0, "card spacing follows a 4pt scale: \(value)")
         }
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false) == 144)
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: true) == 164)
-        precondition(teamClaudeCardBaseHeight(hostLine: false) == 192)
-        precondition(teamClaudeCardBaseHeight(hostLine: true) == 212, "the host line adds exactly its own height")
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false) == 120)
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: true) == 140)
+        precondition(teamClaudeCardBaseHeight(hostLine: false) == 156)
+        precondition(teamClaudeCardBaseHeight(hostLine: true) == 176, "the host line adds exactly its own height")
         precondition(teamClaudeCardBaseHeight(hostLine: false) < 256, "stage 2 removed the four stat tiles, so the base must shrink")
 
-        print("teamclaude row lines: reason/subscription gating, row geometry, inline entry and card metrics passed")
+        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns and card metrics passed")
     }
 }

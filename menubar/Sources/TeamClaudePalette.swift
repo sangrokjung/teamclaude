@@ -54,6 +54,7 @@ enum TeamClaudePalette {
     static let microFont = NSFont.systemFont(ofSize: 11)
     /// 범례·보조 설명(11.5pt).
     static let legendFont = NSFont.systemFont(ofSize: 11.5)
+    static let legendMediumFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
     /// 벌린 자간(0.04em)으로 그리는 메타 라벨.
     static let metaFont = NSFont.systemFont(ofSize: 11, weight: .medium)
     static let metaKern: CGFloat = 0.44
@@ -76,6 +77,6 @@ enum TeamClaudePalette {
         _ = (void, sheet, raised, overlay, graphite, lineStrong, fg, fg2, fg3, ash, ashInk, mint, amber, ember, sky, track)
         _ = (bg, panel, panel2, line, text, muted, green, yellow, red, blue, inactive)
         _ = (panelTitleFont, heroFont, heroUnitFont, laneValueFont, bodyFont, bodyMediumFont, captionFont, microFont,
-             metaFont, legendFont, buttonFont, keycapFont, nameFont, numberFont, titleFont, subFont, headFont, rowFont, smallFont)
+             metaFont, legendFont, legendMediumFont, buttonFont, keycapFont, nameFont, numberFont, titleFont, subFont, headFont, rowFont, smallFont)
     }
 }

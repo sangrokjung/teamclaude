@@ -4,9 +4,8 @@ import Cocoa
 struct DashboardSectionsTests {
     static func main() {
         testLayoutIsOneContinuousDocument()
-        testCurrentSectionFollowsScrollOffset()
         testHeaderDrawsOffscreen()
-        print("DashboardSectionsTests: layout, current section, header draw passed")
+        print("DashboardSectionsTests: layout, header draw passed")
     }
 
     static func bodies(higgsfield: CGFloat = 0) -> [(id: String, title: String, summary: String, height: CGFloat)] {
@@ -56,20 +55,9 @@ struct DashboardSectionsTests {
         precondition(empty.sections.isEmpty && empty.totalHeight == 404)
     }
 
-    static func testCurrentSectionFollowsScrollOffset() {
-        let sections = dashboardSectionLayout(startY: 404, bodies: bodies()).sections
-        precondition(dashboardCurrentSection(sections, scrollOffset: 0) == nil, "the summary card is still on top")
-        precondition(dashboardCurrentSection(sections, scrollOffset: 403) == nil)
-        precondition(dashboardCurrentSection(sections, scrollOffset: 404)?.id == "claude")
-        precondition(dashboardCurrentSection(sections, scrollOffset: 1843)?.id == "claude")
-        precondition(dashboardCurrentSection(sections, scrollOffset: 1844)?.id == "codex")
-        precondition(dashboardCurrentSection(sections, scrollOffset: 99_999)?.id == "usage")
-        precondition(dashboardCurrentSection([], scrollOffset: 99_999) == nil)
-    }
-
     static func testHeaderDrawsOffscreen() {
         _ = NSApplication.shared
-        let header = DashboardSectionHeaderView(frame: NSRect(x: 0, y: 0, width: 880, height: 28))
+        let header = DashboardSectionHeaderView(frame: NSRect(x: 0, y: 0, width: 520, height: 28))
         header.section = DashboardSection(id: "claude", title: "Claude 풀", summary: "계정 16 · 사용 가능 3", y: 404, height: 1440)
         header.layoutSubtreeIfNeeded()
         guard let representation = header.bitmapImageRepForCachingDisplay(in: header.bounds) else {

@@ -547,6 +547,7 @@ class SwiftMonitorTests(unittest.TestCase):
             r = subprocess.run(['/usr/bin/swiftc', '-j', '1', '-num-threads', '1',
                 str(ROOT / 'menubar/Sources/AccountSubscription.swift'),
                 str(ROOT / 'menubar/Sources/AccountSubscriptionButton.swift'),
+                str(ROOT / 'menubar/Sources/L10n.swift'),
                 str(ROOT / 'menubar/Tests/SubscriptionMonitorTests.swift'), '-framework', 'Cocoa', '-o', str(executable)],
                 capture_output=True, text=True, timeout=600)
             self.assertEqual(r.returncode, 0, r.stderr)

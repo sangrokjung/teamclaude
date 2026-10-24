@@ -200,6 +200,12 @@ final class CodexStatusView: NSView {
                            poolRect.minY + 42, NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .regular), fg3)
             PanelDraw.right(PanelDraw.clipped(pool.resetCreditSummary, caption, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 34, caption, fg2)
             PanelDraw.right(PanelDraw.clipped(pool.resetCreditPolicyLabel, micro, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 52, micro, fg3)
+            // 지금 배정 가능한 계정 이름(Claude 표의 "사용 가능" 묶음과 같은 정보).
+            let readyNames = pool.accounts
+                .filter { $0.isUsable(switchThresholdPercent: pool.switchThresholdPercent, now: pool.checkedAt) }
+                .map(\.name)
+            PanelDraw.text(PanelDraw.clipped(L10n.codexUsableNames(readyNames), micro, maxWidth: width / 2 - 8), poolRect.minX, poolRect.minY + 66,
+                           micro, readyNames.isEmpty ? TeamClaudePalette.amber : fg3)
 
             let headY = poolRect.minY + 84
             PanelDraw.meta(L10n.codexAccountsHead, poolRect.minX, headY)

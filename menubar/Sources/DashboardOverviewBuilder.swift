@@ -12,17 +12,6 @@ import Cocoa
 //  - 손볼 것 = 제외된 계정(구독 종료 제외) + Codex 되돌리기 제안(teamCodexAccountRecovery)
 //  - 소진 미리보기 = SubscriptionBurnModel의 레인별 전망·판정 문구
 
-/// 레인 id("claude"·"codex"·"agy"·"grok") → 화면 이름.
-func burnLaneDisplayName(_ lane: String) -> String {
-    switch lane {
-    case "claude": return "Claude"
-    case "codex": return "Codex"
-    case "agy": return "agy"
-    case "grok": return "Grok"
-    default: return lane
-    }
-}
-
 /// 리셋까지 남은 초. teamClaudeResetLabel과 같은 기준(리셋 시각이 있으면 그것, 없으면 확인 시각 기준 초).
 func teamClaudeRemainingSeconds(_ seconds: Int?, resetAt: Date?, checkedAt: Date, now: Date) -> Double? {
     if let resetAt { return resetAt.timeIntervalSince(now) }
@@ -88,6 +77,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     let claudeNotice = input.notices.sections["claude"]
     let codexNotice = input.notices.sections["codex"]
     model.claudeNotice = claudeNotice
+    model.codexNotice = codexNotice
 
     var fableReady = 0
     var total = 0

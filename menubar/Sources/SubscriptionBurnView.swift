@@ -35,6 +35,17 @@ func burnAmountLabel(_ monthly: Int?, accounts: Int, currency: String = "") -> S
     return currency + (burnNumberFormatter.string(from: NSNumber(value: total)) ?? "\(total)")
 }
 
+/// 레인 id("claude"·"codex"·"agy"·"grok") → 화면 이름.
+func burnLaneDisplayName(_ lane: String) -> String {
+    switch lane {
+    case "claude": return "Claude"
+    case "codex": return "Codex"
+    case "agy": return "agy"
+    case "grok": return "Grok"
+    default: return lane
+    }
+}
+
 private func burnPercent(_ value: Double) -> String { "\(Int((value * 100).rounded()))%" }
 
 /// 전망은 근거를 함께 말한다. 근거를 숨기면 추정이 실측으로 읽힌다.

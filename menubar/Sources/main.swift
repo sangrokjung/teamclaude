@@ -2175,8 +2175,7 @@ final class TeamClaudeTableView: NSView {
             case .excluded: tone = .error; title = L10n.groupExcluded; note = L10n.groupExcludedNote
             }
             PanelDraw.dot(left + 2, centerY: y + 7.5, tone.color)
-            let titleFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-            let titleW = PanelDraw.text(title, left + 16, y, titleFont, fg2)
+            let titleW = PanelDraw.text(title, left + 16, y, TeamClaudePalette.legendMediumFont, fg2)
             PanelDraw.text("\(heading.count)", left + 16 + titleW + 6, y + 0.5, TeamClaudePalette.smallFont, fg3)
             PanelDraw.right(note, rightEdge, y, NSFont.systemFont(ofSize: 11.5), fg3)
         }
@@ -2365,6 +2364,8 @@ final class StatusMenuDashboardView: NSView {
     private(set) var sections: [DashboardSection] = []
     private var headerViews: [DashboardSectionHeaderView] = []
     private var overviewModel = OverviewModel()
+    /// 펼친 Claude 계정. 구조 재구성(configure)을 지나도 펼친 행을 유지한다.
+    private var expandedClaudeAccount: String?
     private var renderedHiggsfieldHeight: CGFloat = 0
     private var renderedTeamHeight: CGFloat = 0
     /// 표가 행 높이 변화를 알리면 호출된다. 소유자(AppDelegate)가 갱신을 예약해 updateContent → 재구성으로 이어진다.
@@ -2727,6 +2728,8 @@ final class StatusMenuDashboardView: NSView {
                     table.onMeasure = onMeasureTeamClaude
                     table.onReauthenticate = onReauthenticateTeamClaude
                     table.onContentHeightChange = { [weak self] in self?.onTeamRowsChange?() }
+                    table.expandedAccount = expandedClaudeAccount
+                    table.onExpansionChange = { [weak self] in self?.relayoutClaudeTab() }
                     teamClaudeView = table
                     view = table
                 case "codex":
@@ -2773,16 +2776,28 @@ final class StatusMenuDashboardView: NSView {
             }
         }
         sections = allSections
+        if expandedClaudeAccount != nil { relayoutClaudeTab() }
         footer.context = footerContext(for: selectedTab)
         showSelectedTab(restoring: previousOrigin ?? .zero)
         needsLayout = true
     }
 
+    /// 행을 펼치거나 접으면 표와 Claude 탭 문서의 높이만 다시 잡는다(다른 탭·메뉴 항목 기하는 그대로).
+    private func relayoutClaudeTab() {
+        guard let table = teamClaudeView, let health = table.health, let document = tabDocuments[.claude] else { return }
+        expandedClaudeAccount = table.expandedAccount
+        table.frame.size.height = TeamClaudeTableView.contentHeight(health, expanded: table.expandedAccount)
+        document.frame.size.height = table.frame.maxY + dashboardSectionGap + Self.bodyInset
+        table.needsLayout = true
+        table.needsDisplay = true
+    }
+
     /// 개요에서 계정을 누르면 Claude 탭에서 그 행을 펼친다.
-    private func openAccount(_ name: String) {
+    func openAccount(_ name: String) {
         selectTab(.claude)
         guard let table = teamClaudeView, let document = tabDocuments[.claude] else { return }
         table.expandedAccount = name
+        relayoutClaudeTab()
         table.layoutSubtreeIfNeeded()
         if let rowRect = table.rowRect(named: name) {
             let target = table.convert(rowRect, to: document)
@@ -3119,137 +3134,6 @@ final class UsageDashboardView: NSView {
             PanelDraw.right(formatKRWShort(model.cost, rate: rate), providers.maxX - 88, y + 1, monoSmall, fg3)
             PanelDraw.right(formatCost(model.cost), providers.maxX - 12, y, mono, fg)
         }
-    }
-}
-
-final class MenuActionRowView: NSView {
-    static let preferredHeight: CGFloat = 46
-    let icon: String
-    let symbolName: String?
-    let title: String
-    var detail: String {
-        didSet {
-            setAccessibilityHelp(detail)
-            needsDisplay = true
-        }
-    }
-    let tone: NSColor
-    var onClick: (() -> Void)?
-    private var hovered = false
-    override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
-
-    init(frame frameRect: NSRect, icon: String, symbolName: String? = nil, title: String, detail: String, tone: NSColor) {
-        self.icon = icon
-        self.symbolName = symbolName
-        self.title = title
-        self.detail = detail
-        self.tone = tone
-        super.init(frame: frameRect)
-        setAccessibilityElement(true)
-        setAccessibilityRole(.button)
-        setAccessibilityLabel(title)
-        setAccessibilityHelp(detail)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach { removeTrackingArea($0) }
-        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self, userInfo: nil))
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        hovered = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hovered = false
-        needsDisplay = true
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        onClick?()
-    }
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 49 {
-            onClick?()
-        } else {
-            super.keyDown(with: event)
-        }
-    }
-
-    override func accessibilityPerformPress() -> Bool {
-        onClick?()
-        return true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let bg = hovered
-            ? NSColor(calibratedRed: 0.13, green: 0.16, blue: 0.21, alpha: 1.0)
-            : NSColor(calibratedRed: 0.075, green: 0.09, blue: 0.12, alpha: 0.98)
-        let line = hovered ? tone.withAlphaComponent(0.42) : NSColor(calibratedRed: 0.23, green: 0.27, blue: 0.34, alpha: 0.90)
-        let text = NSColor(calibratedRed: 0.92, green: 0.95, blue: 0.98, alpha: 1.0)
-        let muted = NSColor(calibratedRed: 0.55, green: 0.61, blue: 0.70, alpha: 1.0)
-        let card = bounds.insetBy(dx: 8, dy: 4)
-
-        bg.setFill()
-        NSBezierPath(roundedRect: card, xRadius: 8, yRadius: 8).fill()
-        line.setStroke()
-        let path = NSBezierPath(roundedRect: card, xRadius: 8, yRadius: 8)
-        path.lineWidth = 1
-        path.stroke()
-
-        let iconRect = NSRect(x: card.minX + 12, y: card.minY + 6, width: 28, height: 28)
-        tone.withAlphaComponent(0.16).setFill()
-        NSBezierPath(roundedRect: iconRect, xRadius: 7, yRadius: 7).fill()
-        tone.withAlphaComponent(0.30).setStroke()
-        let iconPath = NSBezierPath(roundedRect: iconRect, xRadius: 7, yRadius: 7)
-        iconPath.lineWidth = 1
-        iconPath.stroke()
-
-        if #available(macOS 11.0, *),
-           let symbolName = symbolName,
-           let baseImage = NSImage(systemSymbolName: symbolName, accessibilityDescription: title) {
-            let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
-            let image = baseImage.withSymbolConfiguration(config) ?? baseImage
-            let drawRect = iconRect.insetBy(dx: 6, dy: 6)
-            image.draw(in: drawRect, from: .zero, operation: .sourceOver, fraction: 1.0)
-            if let context = NSGraphicsContext.current {
-                let previousOperation = context.compositingOperation
-                context.compositingOperation = .sourceAtop
-                tone.setFill()
-                NSBezierPath(rect: drawRect).fill()
-                context.compositingOperation = previousOperation
-            }
-        } else {
-            let iconAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
-                .foregroundColor: tone,
-            ]
-            let iconSize = icon.size(withAttributes: iconAttrs)
-            icon.draw(
-                at: NSPoint(x: iconRect.midX - iconSize.width / 2, y: iconRect.midY - iconSize.height / 2 - 0.5),
-                withAttributes: iconAttrs
-            )
-        }
-
-        title.draw(at: NSPoint(x: card.minX + 54, y: card.minY + 11), withAttributes: [
-            .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
-            .foregroundColor: text,
-        ])
-        let detailAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: muted,
-        ]
-        let size = detail.size(withAttributes: detailAttrs)
-        detail.draw(at: NSPoint(x: card.maxX - size.width - 14, y: card.minY + 13), withAttributes: detailAttrs)
     }
 }
 
@@ -5368,25 +5252,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 하단 동작 막대의 동작 목록. 예전 메뉴의 동작 행을 하나도 빼지 않고 옮긴다.
     func dashboardActions(menu: NSMenu) -> [DashboardAction] {
-        weak var menu = menu
+        let closeMenu: () -> Void = { [weak menu] in menu?.cancelTracking() }
         var actions: [DashboardAction] = [
             DashboardAction(id: "refresh", group: .refresh, title: L10n.refresh, detail: refreshMenuDetailText(), keys: ["R"]) { [weak self] in
-                self?.refreshAction(); menu?.cancelTracking(); return nil
+                self?.refreshAction(); closeMenu(); return nil
             },
             DashboardAction(id: "measure", group: .refresh, title: L10n.actionMeasure, detail: measureMenuDetailText()) { [weak self] in
-                self?.measureTeamClaudeAction(); menu?.cancelTracking(); return nil
+                self?.measureTeamClaudeAction(); closeMenu(); return nil
             },
             DashboardAction(id: "import", group: .account, title: L10n.actionImport, detail: L10n.actionImportDetail) { [weak self] in
-                self?.importClaudeCodeAccountAction(); menu?.cancelTracking(); return nil
+                self?.importClaudeCodeAccountAction(); closeMenu(); return nil
             },
             DashboardAction(id: "claude-oauth", group: .account, title: L10n.actionClaudeOAuth, detail: L10n.actionWebLoginDetail) { [weak self] in
-                self?.addClaudeOAuthAccountAction(); menu?.cancelTracking(); return nil
+                self?.addClaudeOAuthAccountAction(); closeMenu(); return nil
             },
             DashboardAction(id: "codex-oauth", group: .account, title: L10n.actionCodexOAuth, detail: L10n.actionWebLoginDetail) { [weak self] in
-                self?.addCodexOAuthAccountAction(); menu?.cancelTracking(); return nil
+                self?.addCodexOAuthAccountAction(); closeMenu(); return nil
             },
             DashboardAction(id: "restart", group: .app, title: L10n.actionRestart, detail: L10n.actionRestartDetail) { [weak self] in
-                self?.restartTeamClaudeAction(); menu?.cancelTracking(); return nil
+                self?.restartTeamClaudeAction(); closeMenu(); return nil
             },
         ]
         // 외부 배포본(.app)에서만 보인다. 내부 설치는 install.py의 LaunchAgent가 로그인 시 띄운다.
@@ -6672,6 +6556,10 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
         isMeasuringTeamClaude: false, teamClaudeMeasureDetail: nil,
         onMeasureTeamClaude: nil
     )
+    // --expand <계정>이면 개요에서 그 계정을 누른 것처럼 Claude 탭에서 행을 펼친다(펼친 상세 칸 확인용).
+    if let expandIndex = CommandLine.arguments.firstIndex(of: "--expand"), CommandLine.arguments.indices.contains(expandIndex + 1) {
+        view.openAccount(CommandLine.arguments[expandIndex + 1])
+    }
     // --tab <id>면 그 탭 한 장, 아니면 탭 다섯 장(첫 장이 출력 경로, 나머지는 -<탭 id>).
     let tabs: [DashboardTab]
     if let tabIndex = CommandLine.arguments.firstIndex(of: "--tab"), CommandLine.arguments.indices.contains(tabIndex + 1) {

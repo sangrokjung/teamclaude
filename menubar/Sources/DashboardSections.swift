@@ -1,10 +1,10 @@
 import Cocoa
 
-/// 메뉴 대시보드의 한 섹션(제목 띠 + 본문 + 아래 간격). 좌표는 flipped 문서 기준이다.
-/// 배치와 "지금 어느 섹션인가" 판정은 순수 함수라 main.swift 없이 컴파일·테스트된다.
+/// 탭 본문 안의 한 섹션(머리 + 본문 + 아래 간격). 좌표는 flipped 탭 문서 기준이다.
+/// 배치는 순수 함수라 main.swift 없이 컴파일·테스트된다.
 struct DashboardSection: Equatable {
-    let id: String        // "claude" | "codex" | "higgsfield" | "cli" | "usage"
-    let title: String     // "Claude 풀" | "Codex 풀" | "Higgsfield" | "CLI 쿼터" | "사용량"
+    let id: String        // DashboardTab.sectionIDs 중 하나
+    let title: String     // L10n.section* 문구
     var summary: String   // one-line right-aligned summary, may be ""
     let y: CGFloat        // document y of the header strip (flipped coords)
     let height: CGFloat   // header + body + gap
@@ -13,7 +13,7 @@ struct DashboardSection: Equatable {
 let dashboardSectionHeaderHeight: CGFloat = 28
 let dashboardSectionGap: CGFloat = 4
 
-/// Builds the vertical layout. A body height of 0 omits that section. `startY` is where the first header goes (below the summary card).
+/// Builds the vertical layout of one tab. A body height of 0 omits that section. `startY` is where the first header goes.
 func dashboardSectionLayout(startY: CGFloat, bodies: [(id: String, title: String, summary: String, height: CGFloat)]) -> (sections: [DashboardSection], totalHeight: CGFloat) {
     var y = startY
     var out: [DashboardSection] = []
@@ -23,13 +23,6 @@ func dashboardSectionLayout(startY: CGFloat, bodies: [(id: String, title: String
         y += h
     }
     return (out, y)
-}
-
-/// The section whose header has scrolled under the pinned header. nil while the summary card (above the first section) is still visible at the top.
-func dashboardCurrentSection(_ sections: [DashboardSection], scrollOffset: CGFloat) -> DashboardSection? {
-    var current: DashboardSection?
-    for s in sections where s.y <= scrollOffset { current = s }
-    return current
 }
 
 /// Body origin inside a section (below its header strip).

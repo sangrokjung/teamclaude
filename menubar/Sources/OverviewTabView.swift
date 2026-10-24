@@ -57,6 +57,8 @@ struct OverviewBurnLine: Equatable {
 struct OverviewModel: Equatable {
     /// TeamClaude가 없으면 큰 숫자 대신 이 안내를 그린다(Phase 1 미설치).
     var claudeNotice: ToolNotice?
+    /// Codex·TeamCodex가 둘 다 없을 때의 안내. Codex 레인이 같은 문구를 그린다.
+    var codexNotice: ToolNotice?
     var routable = 0
     var total = 0
     var headline = ""
@@ -205,7 +207,8 @@ final class OverviewTabView: NSView {
             PanelDraw.text(notice.headline, x0, 44, NSFont.systemFont(ofSize: 20, weight: .semibold), TeamClaudePalette.fg2)
             PanelDraw.text(PanelDraw.clipped(notice.detail, TeamClaudePalette.captionFont, maxWidth: width), x0, 74,
                            TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
-            ToolNoticeDrawLog.record("overview-claude", notice)
+            // 예전 요약 띠와 같은 카드 id로 남긴다(빈 HOME 스냅샷이 소비 지점마다 같은 상태를 확인한다).
+            ToolNoticeDrawLog.record("summary-\(notice.tool.rawValue)", notice)
         } else {
             let number = "\(model.routable)"
             let numberWidth = PanelDraw.text(number, x0 - 2, 30, TeamClaudePalette.heroFont, TeamClaudePalette.fg)
@@ -218,6 +221,8 @@ final class OverviewTabView: NSView {
             PanelDraw.text(PanelDraw.clipped(model.resetLine, TeamClaudePalette.captionFont, maxWidth: textWidth), textX, 72,
                            TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
         }
+
+        if let notice = model.codexNotice { ToolNoticeDrawLog.record("summary-\(notice.tool.rawValue)", notice) }
 
         // 레인 4개
         let lanesRect = NSRect(x: x0, y: lanesTop, width: width, height: Self.lanesHeight)

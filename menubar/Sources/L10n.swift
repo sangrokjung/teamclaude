@@ -244,6 +244,10 @@ enum L10n {
         t("/ \(pool) 사용 가능 · 제외 \(excluded)", "/ \(pool) available · \(excluded) excluded")
     }
     static var codexAccountsHead: String { t("계정", "Accounts") }
+    static func codexUsableNames(_ names: [String]) -> String {
+        names.isEmpty ? t("사용 가능 계정: 없음 · 측정 또는 제한 상태 확인", "Usable accounts: none · check measurements or limits")
+            : t("사용 가능 계정: ", "Usable accounts: ") + names.joined(separator: " · ")
+    }
     static var codexWindowsPerAccount: String { t("계정마다 창이 따로 돕니다", "Each account has its own windows") }
     static var codexNoAccounts: String { t("TeamCodex에 등록된 계정이 없습니다", "No accounts in TeamCodex") }
     static var codexCurrent: String { t("현재", "current") }
