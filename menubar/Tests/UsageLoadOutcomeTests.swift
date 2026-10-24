@@ -127,6 +127,7 @@ struct UsageLoadOutcomeTests {
         outputCapChecks(delegate)
         pipeBoundChecks()
         partialRefreshChecks(delegate)
+        auxSchemaChecks()
 
         print("UsageLoadOutcomeTests: ok")
     }
@@ -455,5 +456,37 @@ extension UsageLoadOutcomeTests {
         runFull(delegate)
         precondition(delegate.dashboardStaleNotes["usage"] == nil, "회복 뒤에도 부분 실패 꼬리말이 남았다")
         delegate.ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
+    }
+
+    /// weekly·monthly가 종료 코드 0으로 JSON 객체를 냈어도 명령별 기간 배열이 없거나 형식이 틀리면 해석 실패다.
+    static func auxSchemaChecks() {
+        func run(_ json: String) -> CcusageRun {
+            CcusageRun(launched: true, timedOut: false, exitStatus: 0, outputTooLarge: false, output: Data(json.utf8))
+        }
+        let previous = Data(#"{"weekly":[],"totals":{"totalCost":1}}"#.utf8)
+        let bad = resolveCcusageAux(weekly: run(#"{"weekly":"invalid","totals":{"totalCost":999}}"#),
+                                    monthly: run(#"{"totals":{"totalCost":999}}"#),
+                                    previousWeekly: previous, previousMonthly: nil, timeoutSeconds: 60)
+        precondition(bad.failures == [CcusageAuxFailure(command: .weekly, failure: .unparsable),
+                                      CcusageAuxFailure(command: .monthly, failure: .unparsable)],
+                     "스키마가 틀린 보조 출력을 성공으로 받았다: \(bad.failures)")
+        precondition(bad.weekly == previous && bad.monthly == nil, "스키마 실패 뒤 이전 값·daily 폴백을 쓰지 않았다")
+
+        // 명령 키가 바뀌어 들어온 경우(주간 결과에 monthly 배열)도 실패다.
+        let swapped = resolveCcusageAux(weekly: run(#"{"monthly":[]}"#), monthly: run(#"{"monthly":[]}"#),
+                                        previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
+        precondition(swapped.failures == [CcusageAuxFailure(command: .weekly, failure: .unparsable)],
+                     "명령별 배열 키를 보지 않았다: \(swapped.failures)")
+
+        // 객체가 아닌 원소의 배열도 해석기가 읽지 못하므로 실패다.
+        let scalars = resolveCcusageAux(weekly: run(#"{"weekly":[1,2]}"#), monthly: run(#"{"monthly":[]}"#),
+                                        previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
+        precondition(scalars.failures == [CcusageAuxFailure(command: .weekly, failure: .unparsable)],
+                     "객체가 아닌 배열을 받았다: \(scalars.failures)")
+
+        // 빈 배열은 정상(기간 항목 없음)이다.
+        let ok = resolveCcusageAux(weekly: run(#"{"weekly":[]}"#), monthly: run(#"{"monthly":[{"period":"2020-01"}]}"#),
+                                   previousWeekly: nil, previousMonthly: nil, timeoutSeconds: 60)
+        precondition(ok.failures.isEmpty, "정상 보조 출력을 실패로 봤다: \(ok.failures)")
     }
 }

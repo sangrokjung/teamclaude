@@ -1278,13 +1278,16 @@ struct CcusageAuxResolution {
     let failures: [CcusageAuxFailure]
 }
 
-/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰되, 해석 실패는 JSON 객체가 아닐 때만이다
-/// (기간 항목이 없는 것은 해석이 daily 파생값으로 처리하는 정상 경우다).
-func ccusageAuxFailure(_ run: CcusageRun, timeoutSeconds: Double) -> CcusageFailure? {
-    let isObject = run.successOutput.map { (try? JSONSerialization.jsonObject(with: $0)) is [String: Any] } ?? false
+/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰고, 해석 실패는 JSON 객체에
+/// 명령별 기간 배열(`weekly`·`monthly`)이 없거나 객체 배열이 아닐 때다(pickPeriod가 읽는 형태). 빈 배열은 기간 항목이 없는 정상 경우다.
+func ccusageAuxFailure(_ run: CcusageRun, command: CcusageAuxCommand, timeoutSeconds: Double) -> CcusageFailure? {
+    let matchesSchema = run.successOutput.map { data -> Bool in
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        return object[command.arrayKey] is [[String: Any]]
+    } ?? false
     let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
                                      exitStatus: run.exitStatus, outputBytes: run.output.count,
-                                     parsedHasToday: isObject ? true : nil, outputTooLarge: run.outputTooLarge)
+                                     parsedHasToday: matchesSchema ? true : nil, outputTooLarge: run.outputTooLarge)
     if case .failed(let failure) = outcome { return failure }
     return nil
 }
@@ -1295,7 +1298,7 @@ func resolveCcusageAux(weekly: CcusageRun, monthly: CcusageRun, previousWeekly: 
                        timeoutSeconds: Double) -> CcusageAuxResolution {
     var failures: [CcusageAuxFailure] = []
     func pick(_ run: CcusageRun, _ command: CcusageAuxCommand, previous: Data?) -> Data? {
-        guard let failure = ccusageAuxFailure(run, timeoutSeconds: timeoutSeconds) else { return run.successOutput }
+        guard let failure = ccusageAuxFailure(run, command: command, timeoutSeconds: timeoutSeconds) else { return run.successOutput }
         failures.append(CcusageAuxFailure(command: command, failure: failure))
         print("CCUSAGE-PARTIAL[\(command.label)]: \(failure.label) · \(previous == nil ? "daily 파생값" : "이전 값") 사용")
         fflush(stdout)
@@ -1733,8 +1736,8 @@ func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly mon
     let weeklyTotalCost = recentDays.reduce(0.0) { $0 + $1.totalCost }
 
     // native weekly/monthly 에서 이번 주/이번 달 정확 집계
-    let weeklyPick = pickPeriod(weeklyData, key: thisMondayKey, arrayKey: "weekly")
-    let monthlyPick = pickPeriod(monthlyData, key: thisMonthKey, arrayKey: "monthly")
+    let weeklyPick = pickPeriod(weeklyData, key: thisMondayKey, arrayKey: CcusageAuxCommand.weekly.arrayKey)
+    let monthlyPick = pickPeriod(monthlyData, key: thisMonthKey, arrayKey: CcusageAuxCommand.monthly.arrayKey)
 
     // 이번 달 모델별 분해 (codex 포함)
     let modelBreakdown = parseModelBreakdown(monthlyData, monthKey: thisMonthKey)

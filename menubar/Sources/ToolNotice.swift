@@ -160,6 +160,14 @@ enum CcusageAuxCommand: Equatable {
         case .monthly: return "월간"
         }
     }
+
+    /// ccusage JSON에서 이 명령의 기간 배열 키.
+    var arrayKey: String {
+        switch self {
+        case .weekly: return "weekly"
+        case .monthly: return "monthly"
+        }
+    }
 }
 
 /// daily는 읽었는데 실패한 보조 명령과 그 원인.

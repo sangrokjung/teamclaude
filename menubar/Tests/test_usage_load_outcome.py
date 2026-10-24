@@ -19,7 +19,13 @@ ENTRY_MARKER = "// MARK: - 진입점"
 FAKE_NPX = """#!/bin/sh
 dir=$(dirname "$0")
 PYTHON=@PYTHON@
-case "$(cat "$dir/mode")" in
+mode=$(cat "$dir/mode")
+# 진짜 ccusage처럼 weekly·monthly는 자기 기간 배열을 낸다(항목 없음). daily 모양을 weekly에 내지 않는다.
+case "$mode" in
+  nodata|today|yesterday|slow|fixedday)
+    if [ "$3" != daily ]; then echo '{"'"$3"'":[]}'; exit 0; fi ;;
+esac
+case "$mode" in
   exit) echo partial; exit 3 ;;
   garbage) echo "not json at all"; exit 0 ;;
   empty) exit 0 ;;
@@ -27,8 +33,7 @@ case "$(cat "$dir/mode")" in
   today) cat "$dir/today.json" ;;
   yesterday) cat "$dir/yesterday.json" ;;
   slow)
-    if [ "$3" = daily ]; then head -c 20 "$dir/today.json"; sleep 0.5; tail -c +21 "$dir/today.json"
-    else echo '{}'; fi ;;
+    head -c 20 "$dir/today.json"; sleep 0.5; tail -c +21 "$dir/today.json" ;;
   hang) trap '' TERM; exec /bin/sleep 30 ;;
   flood)
     echo $$ > "$dir/flood.pid"
@@ -37,7 +42,7 @@ case "$(cat "$dir/mode")" in
     exec /bin/sleep 30 ;;
   burst) head -c 1048576 /dev/zero; exit 0 ;;
   fixedday)
-    if [ "$3" = daily ]; then cat "$dir/fixedday.json"; else echo '{}'; fi ;;
+    cat "$dir/fixedday.json" ;;
   bigwrite)
     # 한 번의 write()로 64MB를 낸다. 끝까지 써지면(파일로 받으면 그렇다) 표시 파일을 남긴다.
     echo $$ > "$dir/flood.pid"
