@@ -43,7 +43,7 @@ R9. 공개 게시 전 스윕: 사내 경로(`/Users/<이름>`), 기기 이름, �
 - A2. 기존 Swift/Python 테스트 전부 통과(`bash menubar/run-tests.sh`), `known-red.sh` 분류 외 신규 실패 0.
 - A3. `lipo -archs` 결과가 `x86_64 arm64`이고, `.app`의 `Info.plist`에 `LSUIElement`가 있다.
 - A4. 라벨 미등록 환경에서 재시작 버튼이 kickstart를 호출하지 않는다(단위 테스트).
-- A5. (Phase 2) 영어 로케일에서 스냅샷에 한글이 0자이고, 한국어 로케일에서는 기존 문구와 같다.
+- A5. (Phase 2) 영어 로케일에서 스냅샷에 한글이 0자이고, 한국어 로케일에서는 A안 문구가 그려진다(A안에 없는 화면은 기존 문구 그대로). (Phase 2 구현 중 조정: 처음 문구 "한국어 로케일에서는 기존 문구와 같다"는 승인된 A안 계획의 "한국어는 A안 문구"와 충돌해 고쳤다.)
 - A6. Release 워크플로가 태그 없이 `workflow_dispatch` 시험 실행으로 zip 산출물을 만든다(Release 게시는 하지 않음).
 - A7. R9 스윕 grep 결과 0건.
 
@@ -95,6 +95,8 @@ PR revert. Release는 draft로 만들어지므로 공개 전 삭제할 수 있�
 ## Verification
 
 Phase 1: `bash menubar/run-tests.sh`, 신규 빈 HOME 스냅샷 테스트, `lipo -archs`, 라벨 미등록 단위 테스트, workflow_dispatch 시험 실행, R9 grep, Codex astra gate receipt.
+
+Phase 2: `bash menubar/run-tests.sh`(qgate), 빈 HOME 스냅샷의 탭별 미설치 그리기(`TAB-DRAWN`), `Tests/snapshot_test_locale.py`(영어 한글 0자·한국어 A안 문구, 그려진 글자 기록으로 판정), A안 시안과 나란히 둔 실제 패널 PNG(`menubar/.build/`), Codex astra gate receipt.
 
 ## Open questions
 
