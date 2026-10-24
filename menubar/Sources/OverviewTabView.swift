@@ -120,10 +120,10 @@ func overviewStripSlots(_ columns: [OverviewStripColumn], maxColumns: Int) -> [O
         let members = Array(columns[start..<min(columns.count, start + perSlot)])
         let ready = members.filter { $0.tone == .ready }.count
         let wait = members.filter { $0.tone == .wait }.count
-        let counts = (ready, wait, members.count - ready - wait)
+        let excludedCount = members.count - ready - wait
         guard members.count > 1 else {
             return OverviewStripSlot(column: members[0], firstIndex: start, memberCount: 1,
-                                     readyCount: counts.0, waitCount: counts.1, excludedCount: counts.2)
+                                     readyCount: ready, waitCount: wait, excludedCount: excludedCount)
         }
         let routable = members.filter { !$0.excluded }
         let tone: PanelTone
@@ -142,7 +142,7 @@ func overviewStripSlots(_ columns: [OverviewStripColumn], maxColumns: Int) -> [O
             weeklyElapsed: overviewMean(routable.compactMap(\.weeklyElapsed)),
             excluded: routable.isEmpty, cap: cap)
         return OverviewStripSlot(column: column, firstIndex: start, memberCount: members.count,
-                                 readyCount: counts.0, waitCount: counts.1, excludedCount: counts.2)
+                                 readyCount: ready, waitCount: wait, excludedCount: excludedCount)
     }
 }
 
