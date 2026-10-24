@@ -1158,7 +1158,7 @@ struct CcusageRun {
     let launched: Bool
     let timedOut: Bool
     let exitStatus: Int32
-    /// stdout이 크기 상한을 넘었다. 그때 output은 비어 있다(넘친 출력은 읽지 않는다).
+    /// stdout이 크기 상한을 넘었다. 그때 output은 비어 있다(넘기 전까지 받은 출력도 버린다).
     let outputTooLarge: Bool
     let output: Data
 
@@ -1271,8 +1271,7 @@ func loadCcusageDaily(timeoutSeconds: Double, outputLimitBytes: Int = ccusageDef
                             now: now)
 }
 
-/// 전체 갱신의 weekly·monthly 결과를 해석에 넣을 값으로 정한다. 실패한 명령은 이전에 성공한 출력을 대신 쓰고
-/// (없으면 nil — 해석이 daily 파생값으로 폴백한다), 실패 원인은 부분 실패 꼬리말로 넘긴다.
+/// 전체 갱신에서 해석에 넣을 weekly·monthly 출력과 실패한 명령.
 struct CcusageAuxResolution {
     let weekly: Data?
     let monthly: Data?
@@ -1290,6 +1289,8 @@ func ccusageAuxFailure(_ run: CcusageRun, timeoutSeconds: Double) -> CcusageFail
     return nil
 }
 
+/// 전체 갱신의 weekly·monthly 결과를 해석에 넣을 값으로 정한다. 실패한 명령은 이전에 해석에 쓴 출력을 대신 쓰고
+/// (없으면 nil — 해석이 daily 파생값으로 폴백한다), 실패 원인은 부분 실패 꼬리말로 넘긴다.
 func resolveCcusageAux(weekly: CcusageRun, monthly: CcusageRun, previousWeekly: Data?, previousMonthly: Data?,
                        timeoutSeconds: Double) -> CcusageAuxResolution {
     var failures: [CcusageAuxFailure] = []
