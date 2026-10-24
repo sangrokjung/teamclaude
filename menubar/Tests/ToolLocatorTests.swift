@@ -109,6 +109,7 @@ struct ToolLocatorTests {
         _ = loginShellCommandPath("definitely-not-a-real-tool-cc-menubar", timeout: 2)
         precondition(Date().timeIntervalSince(started) < 4.5, "로그인 셸 조회가 시간 제한을 넘겼다")
         precondition(loginShellCommandPath("bad;name", timeout: 2) == nil)
+        loginShellProcessGroupChecks()
 
         // MARK: 기본 포트 재정의
         precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: [:]) == 3456)
@@ -117,6 +118,103 @@ struct ToolLocatorTests {
         precondition(menubarDefaultPort(envKey: "P", fallback: 3456, environment: ["P": "x"]) == 3456)
 
         print("ToolLocatorTests: ok")
+    }
+}
+
+// MARK: - 실제 로그인 셸 경로(loginShellCommandPath)의 프로세스 그룹 정리
+// shellLookup 스텁이 아니라 진짜 /bin/zsh -lc를 띄운다. ZDOTDIR을 임시 폴더로 돌려 사용자 셸 설정 대신
+// 통제된 .zshenv를 읽힌다. .zshenv가 TERM을 무시하는 자식을 띄우면, 시간 제한 안에 돌아오고 그 자식도 사라져야 한다.
+extension ToolLocatorTests {
+    static func openFileDescriptorCount() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
+    }
+
+    static func processExists(_ pid: pid_t) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// 자식이 죽은 뒤 launchd가 회수하기까지 잠깐 걸린다. 그 사이만 기다린다.
+    static func waitGone(_ pid: pid_t, within seconds: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if !processExists(pid) { return true }
+            usleep(20_000)
+        }
+        return !processExists(pid)
+    }
+
+    static func readPid(_ path: String, within seconds: TimeInterval) -> pid_t? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if let text = try? String(contentsOfFile: path, encoding: .utf8),
+               let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 0 {
+                return pid
+            }
+            usleep(20_000)
+        }
+        return nil
+    }
+
+    static func withShellEnvironment(_ zdotdir: String, path: String, _ body: () -> Void) {
+        let savedZdotdir = ProcessInfo.processInfo.environment["ZDOTDIR"]
+        let savedPath = ProcessInfo.processInfo.environment["PATH"]
+        setenv("ZDOTDIR", zdotdir, 1)
+        setenv("PATH", path, 1)
+        body()
+        if let savedZdotdir { setenv("ZDOTDIR", savedZdotdir, 1) } else { unsetenv("ZDOTDIR") }
+        if let savedPath { setenv("PATH", savedPath, 1) } else { unsetenv("PATH") }
+    }
+
+    static func loginShellProcessGroupChecks() {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "cc-menubar-login-shell-\(getpid())-\(UUID().uuidString)"
+        try! fm.createDirectory(atPath: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+        // TERM을 무시하고 stdout 파이프를 쥔 채 30초 자는 자식. pid를 파일로 남긴다.
+        func stubbornChild(_ pidFile: String) -> String {
+            "/bin/sh -c 'trap \"\" TERM; echo $$ > \"\(pidFile)\"; exec /bin/sleep 30' &\n"
+        }
+
+        // (가) 셸 자체가 TERM을 무시하고 멈춘다 → 시간 제한에 걸린다. 그룹 전체가 KILL로 정리돼야 한다.
+        let hung = root + "/hung"
+        try! fm.createDirectory(atPath: hung, withIntermediateDirectories: true)
+        try! ("trap '' TERM\n" + stubbornChild(hung + "/child.pid") + "/bin/sleep 30\n")
+            .write(toFile: hung + "/.zshenv", atomically: true, encoding: .utf8)
+        let fdsBefore = openFileDescriptorCount()
+        withShellEnvironment(hung, path: "/usr/bin:/bin") {
+            let started = Date()
+            let result = loginShellCommandPath("cc-menubar-fake-tool", timeout: 0.5)
+            let elapsed = Date().timeIntervalSince(started)
+            precondition(result == nil, "멈춘 셸은 결과가 없어야 한다: \(result ?? "nil")")
+            precondition(elapsed < 1.6, "시간 제한(0.5초) 뒤 정리까지 너무 오래 걸렸다: \(elapsed)")
+        }
+        guard let hungChild = readPid(hung + "/child.pid", within: 1) else {
+            preconditionFailure("셸 설정의 자식 pid 파일이 없다(ZDOTDIR이 안 먹었다)")
+        }
+        precondition(waitGone(hungChild, within: 1.5), "시간 제한 뒤 TERM을 무시하는 자식이 남았다 pid=\(hungChild)")
+        let fdsAfterHung = openFileDescriptorCount()
+        precondition(fdsAfterHung == fdsBefore, "파이프 FD가 샜다: \(fdsBefore) → \(fdsAfterHung)")
+
+        // (나) 셸은 정상 종료하지만 뒤에 남은 자식이 stdout 파이프를 쥐고 있다. 답은 돌려주고 자식은 정리한다.
+        let held = root + "/held"
+        try! fm.createDirectory(atPath: held + "/bin", withIntermediateDirectories: true)
+        let tool = held + "/bin/cc-menubar-fake-tool"
+        try! "#!/bin/sh\nexit 0\n".write(toFile: tool, atomically: true, encoding: .utf8)
+        chmod(tool, 0o755)
+        try! stubbornChild(held + "/child.pid").write(toFile: held + "/.zshenv", atomically: true, encoding: .utf8)
+        withShellEnvironment(held, path: held + "/bin:/usr/bin:/bin") {
+            let started = Date()
+            let result = loginShellCommandPath("cc-menubar-fake-tool", timeout: 2)
+            let elapsed = Date().timeIntervalSince(started)
+            precondition(result == tool, "파이프를 쥔 자식이 있어도 셸의 답은 돌려줘야 한다: \(result ?? "nil")")
+            precondition(elapsed < 1.5, "셸이 끝났는데 시간 제한까지 기다렸다: \(elapsed)")
+        }
+        guard let heldChild = readPid(held + "/child.pid", within: 1) else {
+            preconditionFailure("(나) 자식 pid 파일이 없다")
+        }
+        precondition(waitGone(heldChild, within: 1.5), "파이프를 쥔 자식이 남았다 pid=\(heldChild)")
+        let fdsAfterHeld = openFileDescriptorCount()
+        precondition(fdsAfterHeld == fdsBefore, "파이프 FD가 샜다: \(fdsBefore) → \(fdsAfterHeld)")
     }
 }
 
