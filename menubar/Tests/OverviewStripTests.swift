@@ -51,6 +51,7 @@ struct OverviewStripTests {
         testAccountsStayInsideTheView()
         testBucketKeepsStatusMeaning()
         testWaitingCaptionShowsRemainder()
+        testBucketClickOpensClaudeTab()
         L10n.language = .en
         precondition(L10n.andMore(4) == "+4 more", L10n.andMore(4))
         precondition(L10n.stripBucketNote(total: 250, perSlot: 4) == "250 accounts · 4 per bar", L10n.stripBucketNote(total: 250, perSlot: 4))
@@ -100,6 +101,23 @@ struct OverviewStripTests {
                 precondition(!caption.contains("…"), "\(accounts): caption must fit without clipping: \(caption)")
                 let maxWidth = viewWidth - OverviewTabView.padding * 2 - 20
                 precondition(PanelDraw.width(caption, TeamClaudePalette.captionFont) <= maxWidth, "\(accounts): caption too wide")
+            }
+        }
+    }
+
+    /// 한 계정짜리 칸은 그 계정을 열고, 여러 계정을 묶은 칸은 모든 구성원이 보이는 Claude 탭을 연다.
+    static func testBucketClickOpensClaudeTab() {
+        for accounts in [17, 250] {
+            let view = render(model(accounts: accounts))
+            let slots = overviewStripSlots(model(accounts: accounts).strip,
+                                           maxColumns: OverviewStripMetrics.maxColumns(chartWidth: viewWidth - OverviewTabView.padding * 2))
+            for (slot, (_, rect)) in zip(slots, view.columnRects) {
+                let target = view.stripClickTarget(at: NSPoint(x: rect.midX, y: rect.midY))
+                if slot.memberCount == 1 {
+                    precondition(target == .account(slot.column.name), "\(accounts): single column → \(String(describing: target))")
+                } else {
+                    precondition(target == .claudeTab, "\(accounts): bucket of \(slot.memberCount) → \(String(describing: target))")
+                }
             }
         }
     }

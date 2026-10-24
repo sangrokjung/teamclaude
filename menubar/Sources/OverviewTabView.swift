@@ -88,6 +88,12 @@ struct OverviewStripSlot: Equatable {
     let excludedCount: Int
 }
 
+/// 개요 띠 칸을 눌렀을 때 갈 곳. 한 계정짜리 칸은 그 계정, 여러 계정을 묶은 칸은 구성원이 모두 보이는 Claude 탭.
+enum OverviewStripTarget: Equatable {
+    case account(String)
+    case claudeTab
+}
+
 enum OverviewStripMetrics {
     static let gap: CGFloat = 3
     /// 칸이 이보다 얇아지면 묶는다. 띠 폭 안에 들어가는 칸 수가 여기서 정해진다.
@@ -207,7 +213,7 @@ final class OverviewTabView: NSView {
 
     private var laneRects: [(DashboardTab, NSRect)] = []
     /// 마지막으로 그린 띠 칸(이름, 사각형). 누르기와 테스트가 읽는다.
-    private(set) var columnRects: [(String, NSRect)] = []
+    private(set) var columnRects: [(OverviewStripTarget, NSRect)] = []
     private var todoButtons: [PanelButton] = []
     private var burnButton: PanelButton?
     private var todoRowRects: [(String, NSRect)] = []
@@ -285,9 +291,20 @@ final class OverviewTabView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if let lane = laneRects.first(where: { $0.1.contains(point) }) { onSelectTab?(lane.0); return }
-        if let column = columnRects.first(where: { $0.1.contains(point) }) { onOpenAccount?(column.0); return }
+        if let target = stripClickTarget(at: point) {
+            switch target {
+            case .account(let name): onOpenAccount?(name)
+            case .claudeTab: onSelectTab?(.claude)
+            }
+            return
+        }
         if let row = todoRowRects.first(where: { $0.1.contains(point) }) { onOpenAccount?(row.0); return }
         super.mouseDown(with: event)
+    }
+
+    /// 띠 칸 위의 점을 누르면 갈 곳. 칸 밖이면 nil.
+    func stripClickTarget(at point: NSPoint) -> OverviewStripTarget? {
+        columnRects.first(where: { $0.1.contains(point) })?.0
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -424,7 +441,7 @@ final class OverviewTabView: NSView {
         let bucketed = slots.count < model.strip.count
         for (index, (slot, rect)) in zip(slots, rects).enumerated() {
             let column = slot.column
-            columnRects.append((column.name, rect))
+            columnRects.append((slot.memberCount == 1 ? .account(column.name) : .claudeTab, rect))
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).addClip()
             NSColor.white.withAlphaComponent(0.06).setFill()
