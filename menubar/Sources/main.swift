@@ -1140,7 +1140,7 @@ func ccusageInstalled(home: String = NSHomeDirectory()) -> Bool {
 }
 
 /// npx ccusage <subcommand> --json --offline 을 실행해 stdout JSON Data 반환. 실패 시 nil.
-/// daily/weekly/monthly 공용 — 각 호출은 별도 tmp 파일(서브커맨드명 포함)로 redirect.
+/// daily/weekly/monthly 공용 — 각 호출은 자기 파이프로 stdout을 받는다.
 func runCcusageRaw(_ subcommand: String) -> Data? {
     runCcusageCommand(subcommand, timeoutSeconds: ccusageDefaultTimeoutSeconds).successOutput
 }
@@ -1149,8 +1149,8 @@ func runCcusageRaw(_ subcommand: String) -> Data? {
 let ccusageDefaultTimeoutSeconds: Double = 60
 
 /// ccusage stdout 한 번의 크기 상한. 실제 daily JSON은 수백 KB(오래 쓴 기록도 수 MB)라 32MB면 넉넉하다.
-/// 넘으면 오동작(CC_MENUBAR_NPX_BIN 오지정·무한 출력)으로 보고 자식을 그룹째 끊는다. 임시 파일이 디스크를 채우거나
-/// 출력 전량이 메모리에 올라가 메뉴바가 멈추는 것을 막는다.
+/// 넘으면 오동작(CC_MENUBAR_NPX_BIN 오지정·무한 출력)으로 보고 자식을 그룹째 끊는다. 출력 전량이 메모리에 올라가
+/// 메뉴바가 멈추는 것을 막는다.
 let ccusageDefaultOutputLimitBytes = 32 * 1024 * 1024
 
 /// ccusage 한 번 실행의 원 결과. 실패를 원인별로 가르려고 종료 코드·시간 초과·출력을 그대로 남긴다.
@@ -1161,29 +1161,13 @@ struct CcusageRun {
     /// stdout이 크기 상한을 넘었다. 그때 output은 비어 있다(넘친 출력은 읽지 않는다).
     let outputTooLarge: Bool
     let output: Data
-    /// 출력을 받았던 임시 파일(이미 지워졌다). 로그·검증용.
-    let outputPath: String?
 
     static let notLaunched = CcusageRun(launched: false, timedOut: false, exitStatus: -1, outputTooLarge: false,
-                                        output: Data(), outputPath: nil)
+                                        output: Data())
 
     var successOutput: Data? {
         launched && !timedOut && !outputTooLarge && exitStatus == 0 && !output.isEmpty ? output : nil
     }
-}
-
-/// ccusage 출력을 받을 호출별 임시 파일. FileManager.temporaryDirectory 아래에 mkstemps로 배타적으로 만든다(0600).
-/// 지우는 것은 부른 쪽 몫이다.
-func makeCcusageOutputFile(_ subcommand: String) -> (path: String, handle: FileHandle)? {
-    let safe = subcommand.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII }
-    let label = safe ? subcommand : "run"
-    let template = FileManager.default.temporaryDirectory
-        .appendingPathComponent("cc-menubar-ccusage-\(label)-XXXXXXXX.json").path
-    var buffer = Array(template.utf8CString)
-    let fd = buffer.withUnsafeMutableBufferPointer { mkstemps($0.baseAddress!, 5) }
-    guard fd >= 0 else { return nil }
-    let path = String(cString: buffer)
-    return (path, FileHandle(fileDescriptor: fd, closeOnDealloc: true))
 }
 
 func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double,
@@ -1207,68 +1191,33 @@ func runCcusageCommand(_ subcommand: String, timeoutSeconds: Double,
     env["HOME"] = home
     process.environment = env
 
-    // 142KB JSON > 64KB pipe buffer → 자식 write block deadlock 회피용 파일 redirect.
-    // 호출마다 사용자 임시 폴더에 배타적 파일을 새로 만든다. 전체 갱신과 quick 갱신이 같은 서브커맨드를 동시에
-    // 돌려도 서로의 출력을 덮거나 먼저 지우지 않는다(이름이 서브커맨드+pid뿐이면 겹친다).
-    guard let output = makeCcusageOutputFile(subcommand) else {
-        print("CCUSAGE-FAIL[\(subcommand)]: tmp 파일 생성 실패")
-        fflush(stdout)
-        return .notLaunched
-    }
-    let tmpPath = output.path
-    defer { try? FileManager.default.removeItem(atPath: tmpPath) }
-    let writeHandle = output.handle
-    process.standardOutput = writeHandle
-    guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else {
-        writeHandle.closeFile()
-        return .notLaunched
-    }
+    // stdout은 호출마다 새 파이프로 받아 읽는 쪽이 상한까지만 메모리에 모은다(142KB JSON도 읽으면서 받으니
+    // 파이프 버퍼에 막히지 않는다). 호출끼리 나누는 상태가 없어 전체·quick 갱신이 겹쳐도 서로의 출력을 섞지 않는다.
+    guard let nullError = FileHandle(forWritingAtPath: "/dev/null") else { return .notLaunched }
+    defer { nullError.closeFile() }
     process.standardError = nullError
 
     guard let result = runTrustedProcessInIsolatedGroup(
         process,
         timeoutSeconds: timeoutSeconds,
         terminationGraceMicroseconds: 700_000,
-        outputLimit: (descriptor: writeHandle.fileDescriptor, bytes: outputLimitBytes)
+        captureOutputLimitBytes: outputLimitBytes
     ) else {
         print("CCUSAGE-FAIL[\(subcommand)]: 격리 프로세스 실행 실패")
         fflush(stdout)
-        writeHandle.closeFile()
-        nullError.closeFile()
         return .notLaunched
     }
     if result.timedOut {
         print("CCUSAGE-TIMEOUT[\(subcommand)]: \(Int(timeoutSeconds))초 초과, 강제 종료")
-        fflush(stdout)
     }
-    writeHandle.closeFile()
-    nullError.closeFile()
-
-    // 폴링 사이에 다 쓰고 끝난 큰 출력도 여기서 거른다. 상한을 넘긴 출력은 통째로 버린다.
-    let read = result.outputExceeded
-        ? (data: Data(), tooLarge: true)
-        : readCcusageOutput(atPath: tmpPath, limitBytes: outputLimitBytes)
-    if read.tooLarge {
+    if result.outputExceeded {
         print("CCUSAGE-FAIL[\(subcommand)]: 출력이 \(outputLimitBytes)바이트 상한 초과, 출력 폐기")
     }
-    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(read.data.count)")
+    print("CCUSAGE[\(subcommand)]: exit=\(result.terminationStatus) bytes=\(result.output.count)")
     fflush(stdout)
 
     return CcusageRun(launched: true, timedOut: result.timedOut, exitStatus: result.terminationStatus,
-                      outputTooLarge: read.tooLarge, output: read.data, outputPath: tmpPath)
-}
-
-/// 임시 파일에서 상한까지만 읽는다. 크기가 상한을 넘으면 읽지 않고 tooLarge다.
-/// 정상 종료 뒤에도 남은 손자가 계속 쓸 수 있으므로 크기 확인 뒤에도 상한+1바이트까지만 읽어 넘침을 가린다.
-func readCcusageOutput(atPath path: String, limitBytes: Int) -> (data: Data, tooLarge: Bool) {
-    guard let handle = FileHandle(forReadingAtPath: path) else { return (Data(), false) }
-    defer { try? handle.close() }
-    var info = stat()
-    if fstat(handle.fileDescriptor, &info) == 0, info.st_size > off_t(limitBytes) {
-        return (Data(), true)
-    }
-    let data = (try? handle.read(upToCount: limitBytes + 1)) ?? Data()
-    return data.count > limitBytes ? (Data(), true) : (data, false)
+                      outputTooLarge: result.outputExceeded, output: result.output)
 }
 
 /// ccusage daily 한 번의 판정과 그 값. 전체·quick 로더가 같은 판정을 쓴다.
@@ -1325,14 +1274,10 @@ func loadCcusageDaily(timeoutSeconds: Double, outputLimitBytes: Int = ccusageDef
 struct IsolatedProcessResult {
     let terminationStatus: Int32
     let timedOut: Bool
-    /// 지정한 출력 파일이 상한을 넘어 그룹째 끊었다.
+    /// 캡처한 stdout이 상한을 넘어 그룹째 끊었다. 그때 output은 비어 있다.
     var outputExceeded = false
-}
-
-/// 자식 stdout을 받는 파일의 현재 크기가 상한을 넘었는가.
-private func outputFileExceeds(_ limit: (descriptor: Int32, bytes: Int)) -> Bool {
-    var info = stat()
-    return fstat(limit.descriptor, &info) == 0 && info.st_size > off_t(limit.bytes)
+    /// 캡처 모드에서 모은 stdout(상한 이하). 캡처하지 않았으면 비어 있다.
+    var output = Data()
 }
 
 private func withOwnedCStringArray<Result>(
@@ -1384,23 +1329,46 @@ private func reapChild(_ pid: pid_t) -> Int32? {
 }
 
 /// `setsid`/`setpgid`로 의도적으로 탈출하지 않는 QJC 고정 CLI만 실행합니다.
+/// captureOutputLimitBytes를 주면 stdout은 process.standardOutput 대신 이 호출만의 파이프로 받는다
+/// (awaitCapturedGroup 참고). 주지 않으면 process.standardOutput(FileHandle)에 그대로 쓴다.
 func runTrustedProcessInIsolatedGroup(
     _ process: Process,
     timeoutSeconds: Double,
     terminationGraceMicroseconds: useconds_t,
-    outputLimit: (descriptor: Int32, bytes: Int)? = nil
+    captureOutputLimitBytes: Int? = nil
 ) -> IsolatedProcessResult? {
     guard let executableURL = process.executableURL,
           executableURL.isFileURL,
-          let standardOutput = process.standardOutput as? FileHandle,
           let standardError = process.standardError as? FileHandle else { return nil }
+
+    // 캡처 파이프. 두 끝 모두 CLOEXEC라 다른 스레드가 동시에 띄우는 자식에 새지 않는다(새면 EOF가 늦어진다).
+    var pipeFDs: [Int32] = [-1, -1]
+    if captureOutputLimitBytes != nil {
+        guard pipe(&pipeFDs) == 0 else { return nil }
+        for fd in pipeFDs { _ = fcntl(fd, F_SETFD, FD_CLOEXEC) }
+    }
+    let captureRead = pipeFDs[0], captureWrite = pipeFDs[1]
+    defer { if captureRead >= 0 { close(captureRead) } }
+    var writeEndOpen = captureWrite >= 0
+    func closeWriteEnd() {
+        if writeEndOpen { close(captureWrite); writeEndOpen = false }
+    }
+    defer { closeWriteEnd() }
+    let stdoutFD: Int32
+    if captureOutputLimitBytes != nil {
+        stdoutFD = captureWrite
+    } else if let standardOutput = process.standardOutput as? FileHandle {
+        stdoutFD = standardOutput.fileDescriptor
+    } else {
+        return nil
+    }
 
     var fileActions: posix_spawn_file_actions_t?
     guard posix_spawn_file_actions_init(&fileActions) == 0 else { return nil }
     defer { posix_spawn_file_actions_destroy(&fileActions) }
     guard posix_spawn_file_actions_adddup2(
         &fileActions,
-        standardOutput.fileDescriptor,
+        stdoutFD,
         STDOUT_FILENO
     ) == 0,
     posix_spawn_file_actions_adddup2(
@@ -1436,18 +1404,19 @@ func runTrustedProcessInIsolatedGroup(
             }
         }
     }
+    // 부모 쪽 쓰기 끝을 닫아야 자식(과 손자)이 모두 닫았을 때 EOF가 온다.
+    closeWriteEnd()
     guard spawnResult == 0, childPid > 0 else { return nil }
+
+    if let captureOutputLimitBytes {
+        var capture = BoundedPipeCapture(fd: captureRead, limit: captureOutputLimitBytes)
+        return awaitCapturedGroup(childPid, capture: &capture, timeoutSeconds: timeoutSeconds,
+                                  terminationGraceMicroseconds: terminationGraceMicroseconds)
+    }
 
     let timeoutNanoseconds = UInt64(max(timeoutSeconds, 0) * 1_000_000_000)
     let startedAt = DispatchTime.now().uptimeNanoseconds
     while DispatchTime.now().uptimeNanoseconds - startedAt < timeoutNanoseconds {
-        // 출력 상한: 넘치면 유예 없이 그룹째 KILL한다. 디스크에 더 쓰이는 양은 폴링 한 번(50ms) 사이 분량뿐이다.
-        if let outputLimit, outputFileExceeds(outputLimit) {
-            _ = Darwin.killpg(childPid, SIGKILL)
-            return reapChild(childPid).map {
-                IsolatedProcessResult(terminationStatus: $0, timedOut: false, outputExceeded: true)
-            }
-        }
         guard let hasExited = childHasExitedWithoutReaping(childPid) else {
             _ = Darwin.killpg(childPid, SIGKILL)
             return reapChild(childPid).map {
@@ -1472,6 +1441,111 @@ func runTrustedProcessInIsolatedGroup(
     return reapChild(childPid).map {
         IsolatedProcessResult(terminationStatus: $0, timedOut: true)
     }
+}
+
+/// 캡처 파이프를 비차단으로 읽어 상한까지만 모은다. 상한을 넘기는 읽기가 오면 그 바이트는 버리고 exceeded를 세운다.
+/// 읽는 쪽이 멈추면 자식의 write()는 파이프 버퍼(수십 KB)에서 막히므로, 한 번의 큰 write()도 상한 너머로 쌓이지 않는다.
+private struct BoundedPipeCapture {
+    let fd: Int32
+    let limit: Int
+    var data = Data()
+    var reachedEOF = false
+    var exceeded = false
+    private var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+
+    init(fd: Int32, limit: Int) {
+        self.fd = fd
+        self.limit = max(limit, 0)
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+    }
+
+    /// 읽을 거리가 올 때까지 최대 milliseconds 기다린 뒤 지금 읽을 수 있는 만큼 읽는다. EOF 뒤에는 그냥 잔다.
+    mutating func waitAndDrain(milliseconds: Int32) {
+        guard !reachedEOF, !exceeded else {
+            usleep(useconds_t(milliseconds) * 1000)
+            return
+        }
+        var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        _ = poll(&poller, 1, milliseconds)
+        drain()
+    }
+
+    private mutating func drain() {
+        let fd = self.fd
+        while !reachedEOF && !exceeded {
+            let count = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if count > 0 {
+                guard data.count + count <= limit else {
+                    exceeded = true
+                    data = Data()
+                    return
+                }
+                data.append(contentsOf: buffer[0..<count])
+                continue
+            }
+            if count == 0 { reachedEOF = true; return }
+            if errno == EINTR { continue }
+            // EAGAIN은 지금 읽을 것이 없다는 뜻이다. 그 밖의 읽기 오류는 더 받을 수 없으니 EOF로 본다.
+            if errno != EAGAIN { reachedEOF = true }
+            return
+        }
+    }
+}
+
+/// 직접 자식이 끝나고 파이프가 EOF가 될 때(또는 끝난 뒤 짧은 유예가 지날 때)까지, 혹은 시간 제한까지 읽는다.
+/// 상한을 넘기면 유예 없이 그룹째 KILL한다. 그 밖에는 어떻게 끝났든 그룹 전체에 TERM을 보내고, 유예 안에
+/// 산 구성원이 남으면 KILL한 뒤에 직접 자식을 회수한다 — 같은 그룹의 손자가 살아남아 계속 쓰지 못한다.
+/// 직접 자식은 그룹 신호를 다 보낼 때까지 회수하지 않으므로 그동안 그룹 id가 재사용될 수 없다.
+private func awaitCapturedGroup(
+    _ childPid: pid_t,
+    capture: inout BoundedPipeCapture,
+    timeoutSeconds: Double,
+    terminationGraceMicroseconds: useconds_t
+) -> IsolatedProcessResult? {
+    // 직접 자식이 끝난 뒤 손자가 쥔 파이프의 EOF를 기다리는 최대 시간.
+    let drainGraceNanoseconds: UInt64 = 200_000_000
+    let timeoutNanoseconds = UInt64(max(timeoutSeconds, 0) * 1_000_000_000)
+    let startedAt = DispatchTime.now().uptimeNanoseconds
+    var exitedAt: UInt64?
+    var timedOut = false
+    func finish(_ status: Int32) -> IsolatedProcessResult {
+        IsolatedProcessResult(terminationStatus: status, timedOut: timedOut, outputExceeded: capture.exceeded,
+                              output: capture.exceeded ? Data() : capture.data)
+    }
+
+    while true {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now - startedAt >= timeoutNanoseconds { timedOut = true; break }
+        capture.waitAndDrain(milliseconds: 20)
+        if capture.exceeded {
+            _ = Darwin.killpg(childPid, SIGKILL)
+            return reapChild(childPid).map(finish)
+        }
+        if exitedAt == nil {
+            guard let hasExited = childHasExitedWithoutReaping(childPid) else {
+                _ = Darwin.killpg(childPid, SIGKILL)
+                return reapChild(childPid).map(finish)
+            }
+            if hasExited { exitedAt = DispatchTime.now().uptimeNanoseconds }
+        }
+        if let exitedAt,
+           capture.reachedEOF || DispatchTime.now().uptimeNanoseconds - exitedAt >= drainGraceNanoseconds {
+            break
+        }
+    }
+
+    // 파이프 EOF는 그룹이 비었다는 뜻이 아니다(stdout을 돌린 손자는 파이프를 닫고도 남는다).
+    // 산 구성원이 없으면 killpg(…, 0)은 실패한다(회수 전 직접 자식은 좀비라 산 구성원이 아니다).
+    func groupHasLiveMembers() -> Bool { Darwin.killpg(childPid, 0) == 0 }
+    _ = Darwin.killpg(childPid, SIGTERM)
+    let graceNanoseconds = UInt64(terminationGraceMicroseconds) * 1_000
+    let graceStartedAt = DispatchTime.now().uptimeNanoseconds
+    while DispatchTime.now().uptimeNanoseconds - graceStartedAt < graceNanoseconds, groupHasLiveMembers() {
+        capture.waitAndDrain(milliseconds: 10)
+        if capture.exceeded { break }
+    }
+    if groupHasLiveMembers() { _ = Darwin.killpg(childPid, SIGKILL) }
+    return reapChild(childPid).map(finish)
 }
 
 /// daily(필수) + weekly/monthly(정확도 향상, 실패 시 daily 파생 폴백) + 환율을 조합해 UsageData 반환.

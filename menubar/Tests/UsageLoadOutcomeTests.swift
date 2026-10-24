@@ -31,8 +31,8 @@ struct UsageLoadOutcomeTests {
         precondition(!delegate.isFetchingUsageQuick, "quick 사용량 로더가 끝나지 않았다")
     }
 
-    /// 앱과 같은 판정으로 대시보드 한 장을 그린다. 그려진 안내와 섹션 요약을 돌려준다.
-    static func render(_ delegate: AppDelegate) -> (drawn: String?, summary: String, cardNote: String?) {
+    /// 앱과 같은 판정으로 대시보드 한 장을 그린다. 그려진 안내·섹션 요약·카드 꼬리말·카드 접근성 라벨을 돌려준다.
+    static func render(_ delegate: AppDelegate) -> (drawn: String?, summary: String, cardNote: String?, label: String) {
         ToolNoticeDrawLog.reset()
         let notices = delegate.currentToolNotices
         let view = StatusMenuDashboardView(frame: NSRect(
@@ -50,7 +50,7 @@ struct UsageLoadOutcomeTests {
         view.cacheDisplay(in: view.bounds, to: rep)
         let summary = view.sections.first(where: { $0.id == "usage" })?.summary ?? ""
         let card = view.subviews.compactMap { $0 as? UsageDashboardView }.first
-        return (ToolNoticeDrawLog.drawn["usage"], summary, card?.staleNote)
+        return (ToolNoticeDrawLog.drawn["usage"], summary, card?.staleNote, card?.accessibilityLabel() ?? "")
     }
 
     static func main() {
@@ -125,6 +125,7 @@ struct UsageLoadOutcomeTests {
         missingTodayChecks(delegate)
         midnightChecks(delegate)
         outputCapChecks(delegate)
+        pipeBoundChecks()
 
         print("UsageLoadOutcomeTests: ok")
     }
@@ -138,7 +139,7 @@ extension UsageLoadOutcomeTests {
         func set(_ index: Int, _ load: CcusageDailyLoad) { lock.lock(); loads[index] = load; lock.unlock() }
     }
 
-    /// 전체 갱신과 quick 갱신이 동시에 daily를 돌려도 서로의 임시 파일을 덮거나 지우지 않는다.
+    /// 전체 갱신과 quick 갱신이 동시에 daily를 돌려도 서로의 출력을 섞거나 끊지 않는다.
     /// 가짜 npx(slow)는 daily JSON을 반으로 나눠 0.5초 사이를 두고 쓴다 — 두 실행이 반드시 겹친다.
     static func overlappingLoaderChecks(_ delegate: AppDelegate) {
         setMode("slow")
@@ -268,7 +269,7 @@ extension UsageLoadOutcomeTests {
 // MARK: - 출력 크기 상한
 extension UsageLoadOutcomeTests {
     /// 출력이 상한을 넘으면 시간 제한을 기다리지 않고 그룹째 끊고, 넘친 출력은 메모리에 올리지 않으며,
-    /// 임시 파일을 지우고, "출력 크기 상한 초과" 실패로 판정한다.
+    /// "출력 크기 상한 초과" 실패로 판정한다.
     /// 가짜 npx(flood)는 8MB를 64KB씩 흘린 뒤 TERM을 무시하고 30초 잔다. 상한은 256KB로 줄인다.
     static func outputCapChecks(_ delegate: AppDelegate) {
         let cap = 256 * 1024
@@ -290,8 +291,6 @@ extension UsageLoadOutcomeTests {
         precondition(flood.successOutput == nil, "상한을 넘긴 출력을 성공으로 넘겼다")
         precondition(flood.output.count <= cap, "상한을 넘긴 출력을 메모리에 올렸다: \(flood.output.count)바이트")
         precondition(flood.output.isEmpty, "상한을 넘긴 출력 일부를 남겼다: \(flood.output.count)바이트")
-        precondition(flood.outputPath.map { !FileManager.default.fileExists(atPath: $0) } == true,
-                     "임시 파일이 남았다: \(flood.outputPath ?? "nil")")
         // 쓰던 자식이 그룹째 사라졌다.
         let leader = (try? String(contentsOfFile: pidFile, encoding: .utf8))
             .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
@@ -305,12 +304,11 @@ extension UsageLoadOutcomeTests {
         }
         precondition(groupGone, "상한 초과 뒤 자식 그룹이 남았다")
 
-        // 끝난 뒤 보니 상한을 넘긴 출력(폴링 사이에 다 쓰고 정상 종료)도 같은 실패다.
+        // 상한을 넘긴 출력을 다 쓰고 정상 종료해도 같은 실패다.
         setMode("burst")
         let burst = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
         precondition(burst.outputTooLarge && burst.output.isEmpty && burst.successOutput == nil,
                      "정상 종료한 큰 출력: tooLarge=\(burst.outputTooLarge) bytes=\(burst.output.count)")
-        precondition(burst.outputPath.map { !FileManager.default.fileExists(atPath: $0) } == true)
 
         setMode("flood")
         let load = loadCcusageDaily(timeoutSeconds: 10, outputLimitBytes: cap)
@@ -334,5 +332,64 @@ extension UsageLoadOutcomeTests {
                      "카드 \(drawn.drawn ?? "nil") 요약 \(drawn.summary)")
         delegate.ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
         delegate.ccusageTimeoutSeconds = savedTimeout
+    }
+}
+
+// MARK: - 출력 상한은 실제 상한이다
+extension UsageLoadOutcomeTests {
+    /// 그룹이 사라질 때까지(KILL된 구성원이 거둬질 짧은 틈만) 기다린다. 남았으면 정리하고 false.
+    static func waitGroupGone(_ leader: pid_t, extra: pid_t? = nil) -> Bool {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            let groupGone = Darwin.killpg(leader, 0) == -1 && errno == ESRCH
+            let extraGone = extra.map { kill($0, 0) == -1 && errno == ESRCH } ?? true
+            if groupGone && extraGone { return true }
+            usleep(20_000)
+        }
+        // 실패한 실행이 무한히 쓰는 프로세스를 남기지 않게 치운다.
+        _ = Darwin.killpg(leader, SIGKILL)
+        if let extra { _ = kill(extra, SIGKILL) }
+        return false
+    }
+
+    static func readPid(_ name: String) -> pid_t? {
+        (try? String(contentsOfFile: fakeDir + "/" + name, encoding: .utf8))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    static func pipeBoundChecks() {
+        let cap = 256 * 1024
+
+        // 한 번의 큰 write()도 상한을 넘겨 받아 두지 못한다. 자식은 상한 근처에서 막혔다가 끊긴다
+        // (끝까지 썼다면 표시 파일이 남는다 — 파일로 받으면 한 번에 다 써진다).
+        setMode("bigwrite")
+        let done = fakeDir + "/bigwrite.done"
+        try? FileManager.default.removeItem(atPath: done)
+        let started = Date()
+        let big = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
+        let elapsed = Date().timeIntervalSince(started)
+        precondition(elapsed < 3, "한 번의 큰 출력을 바로 끊지 않았다: \(elapsed)초")
+        precondition(big.outputTooLarge && !big.timedOut && big.successOutput == nil,
+                     "한 번의 큰 출력 판정: tooLarge=\(big.outputTooLarge) timedOut=\(big.timedOut)")
+        precondition(big.output.isEmpty, "상한을 넘긴 출력 일부를 남겼다: \(big.output.count)바이트")
+        let bigLeader = readPid("flood.pid")
+        precondition(bigLeader != nil, "가짜 npx가 pid를 남기지 않았다")
+        precondition(waitGroupGone(bigLeader!), "큰 출력 뒤 자식 그룹이 남았다")
+        precondition(!FileManager.default.fileExists(atPath: done),
+                     "자식이 상한을 넘긴 64MB를 끝까지 썼다(출력이 상한 없이 받아졌다)")
+
+        // 직접 자식이 바로 끝나도 같은 그룹의 손자(TERM 무시, 계속 씀)까지 끝내고 곧 돌아온다.
+        setMode("orphan")
+        try? FileManager.default.removeItem(atPath: fakeDir + "/orphan.pid")
+        let orphanStarted = Date()
+        let orphan = runCcusageCommand("daily", timeoutSeconds: 10, outputLimitBytes: cap)
+        let orphanElapsed = Date().timeIntervalSince(orphanStarted)
+        precondition(orphan.launched && !orphan.timedOut, "손자 남김: timedOut=\(orphan.timedOut)")
+        precondition(orphanElapsed < 3, "손자를 정리하느라 늦었다: \(orphanElapsed)초")
+        let leader = readPid("flood.pid")
+        let grandchild = readPid("orphan.pid")
+        precondition(leader != nil && grandchild != nil, "가짜 npx가 pid를 남기지 않았다")
+        precondition(waitGroupGone(leader!, extra: grandchild), "직접 자식이 끝난 뒤 손자가 살아남았다")
+        precondition(orphan.output.count <= cap, "손자 출력이 상한을 넘겨 쌓였다: \(orphan.output.count)")
     }
 }
