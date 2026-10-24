@@ -106,7 +106,7 @@ enum L10n {
     static func sessionWindowIn(_ duration: String) -> String { t("세션 창 \(duration) 뒤", "session window in \(duration)") }
     static func weeklyWindowIn(_ duration: String) -> String { t("주간 창 \(duration) 뒤", "weekly window in \(duration)") }
     static func resetsAfter(_ parts: String) -> String { t("\(parts) 리셋", "Resets: \(parts)") }
-    static var fableLaneNote: String { t("Fable 주간까지 여유", "Room left on Fable weekly") }
+    static var fableLaneNote: String { t("Fable 주간까지 여유", "Fable weekly headroom") }
     static var codexLaneNote: String { t("지금 배정 가능", "Assignable now") }
     static var usageRate: String { t("사용률", "Used") }
     static func agyLaneNote(_ name: String) -> String { t("\(name) 주간", "\(name) weekly") }
@@ -360,6 +360,348 @@ enum L10n {
         t("조회 주기의 세 배가 지나도록 성공이 없으면 값 옆에 “N분째 갱신 없음”을 붙입니다.",
           "After three missed refresh cycles, a “no update for N min” note is added next to the value.")
     }
+
+    // MARK: 공통 로직 문구
+
+    static var vocabChecking: String { t("확인 중", "Checking") }
+    static var vocabNeedsCheck: String { t("확인 필요", "Needs check") }
+    static var vocabSyncing: String { t("동기화 중", "Syncing") }
+    static var vocabNotMeasured: String { t("측정 전", "Not measured") }
+    static var vocabNoData: String { t("데이터 없음", "No data") }
+    static func staleSuffix(_ minutes: Int) -> String { t("\(minutes)분째 갱신 없음", "no update for \(minutes) min") }
+    static var toolSubscriptionCollector: String { t("구독 수집기", "Plan collector") }
+    static func envHint(_ key: String) -> String { t("설치돼 있다면 \(key)로 경로를 지정하세요", "If it is installed, set its path with \(key)") }
+    static func noticeNoConfigOrServer(_ path: String) -> String {
+        t("설정 파일(\(path))과 실행 중인 서버가 없습니다", "No config file (\(path)) and no running server")
+    }
+    static var noticeNoCodex: String { t("~/.codex의 인증·설정·세션 기록이 없습니다", "No auth, config or session history in ~/.codex") }
+    static var noticeNoCodexSection: String { t("Codex CLI 기록과 TeamCodex 설정이 없습니다", "No Codex CLI history and no TeamCodex config") }
+    static func noticeNoNpx(_ hint: String) -> String { t("ccusage를 실행할 npx(Node.js)가 없습니다 · \(hint)", "No npx (Node.js) to run ccusage · \(hint)") }
+    static var noticeNoClaudeUsage: String { t("Claude Code 사용 기록이 아직 없습니다", "No Claude Code usage recorded yet") }
+    static var noticeCollectorHeadline: String { t("수집기 미설치(선택 기능)", "Collector not installed (optional)") }
+    static var noticeCollectorDetail: String {
+        t("구독 확인 수집기가 없어 결제 메일·청구 페이지 확인은 건너뜁니다", "No plan collector, so billing mail and invoice checks are skipped")
+    }
+    static var reasonFableReady: String { t("Fable 사용 가능", "Fable available") }
+    static var reasonOpusReady: String { t("Opus 사용 가능", "Opus available") }
+    static var reasonOffline: String { t("오프라인 · 확인 필요", "Offline · needs check") }
+    static var reasonThresholdUnknown: String { t("한도 기준 확인 필요", "Limit threshold unknown") }
+    static var reasonMeasurementStale: String { t("최신 한도 측정 필요", "Needs a fresh limit measure") }
+    static var reasonPlanEnded: String { t("구독 종료 · 이용 불가", "Plan ended · unavailable") }
+    static var reasonDisabled: String { t("비활성 · 직접 꺼 둔 계정", "Disabled · turned off by you") }
+    static var reasonNotClaude: String { t("Claude 계정 아님", "Not a Claude account") }
+    static var reasonServerState: String { t("서버 상태 확인 필요", "Check server state") }
+    static var reasonEndDatePassed: String { t("구독 종료일 경과 · 확인 필요", "Plan end date passed · check") }
+    static var reasonResetPassed: String { t("한도 리셋 경과 · 재측정 필요", "Limit reset passed · re-measure") }
+    static var reasonThrottled: String { t("일시 제한 해제 대기", "Waiting for a temporary limit to lift") }
+    static var reasonQuotaReset: String { t("사용 한도 리셋 대기", "Waiting for the quota reset") }
+    static var reasonProxyExcluded: String { t("프록시 라우팅 제외", "Excluded from proxy routing") }
+    static var reasonProxyUnknown: String { t("프록시 사용 가능 여부 미확인", "Proxy availability unknown") }
+    static var reasonConcurrencyUnknown: String { t("동시 요청 여유 미확인", "Concurrency headroom unknown") }
+    static var reasonConcurrencyBusy: String { t("동시 요청 처리 중", "Busy with concurrent requests") }
+    static func reasonErrorCheck(_ label: String) -> String { t("\(label) · 상태 확인 필요", "\(label) · check state") }
+    static var windowAllWeekly: String { t("전체 주간", "weekly") }
+    static func reasonWindowsBlocked(_ windows: String) -> String { t("\(windows) 한도 대기", "\(windows) at limit") }
+    static func reasonWindowCheck(_ window: String) -> String { t("\(window) 한도 확인 필요", "\(window) limit needs check") }
+    static var issueDisabledLong: String { t("비활성 계정", "Disabled account") }
+    static var issueNotSyncedLong: String { t("서버 동기화 필요", "Needs server sync") }
+    static var issueAccountErrorLong: String { t("인증 확인 필요", "Check authentication") }
+    static var issueExhaustedLong: String { t("사용 한도 초기화 대기", "Waiting for quota reset") }
+    static var issueStaleLong: String { t("세션 만료, 재측정 필요", "Session expired, re-measure") }
+    static var issueSessionMissingLong: String { t("세션 사용량 미측정", "Session usage not measured") }
+    static var issueWeeklyMissingLong: String { t("주간 사용량 미측정", "Weekly usage not measured") }
+    static var issueFableMissingLong: String { t("Fable 사용량 미측정", "Fable usage not measured") }
+    static var issueNotSyncedShort: String { t("동기화", "Sync") }
+    static var issueAccountErrorShort: String { t("인증확인", "Check auth") }
+    static var issueThrottledShort: String { t("제한대기", "Throttled") }
+    static var issueExhaustedShort: String { t("한도대기", "At limit") }
+    static var issueMeasureShort: String { t("지금측정", "Measure now") }
+    static var stateInactive: String { t("비활성", "Disabled") }
+    static var titleClaudeOffline: String { t("Claude 오프라인", "Claude offline") }
+    static func titleClaudeDrift(_ count: Int) -> String { t("Claude 연동 확인 \(count)", "Claude sync \(count)") }
+    static func titleClaudeMeasure(_ count: Int) -> String { t("Claude 측정 필요 \(count)", "Claude measure \(count)") }
+    static func titleClaudeFableLimit(_ over: Int, _ known: Int) -> String { t("Claude Fable 한도 \(over)/\(known)", "Claude Fable limit \(over)/\(known)") }
+    static func titleClaudeRouting(_ usable: Int, _ total: Int) -> String { t("Claude 라우팅 \(usable)/\(total)", "Claude routing \(usable)/\(total)") }
+    static func titleClaudeOK(_ active: Int, _ total: Int) -> String { t("Claude 정상 \(active)/\(total)", "Claude OK \(active)/\(total)") }
+    static func runtimeBuild(_ artifact: String) -> String { t("빌드 \(artifact)", "build \(artifact)") }
+    static var runtimeBuildUnknown: String { t("빌드 미상", "build unknown") }
+    static func runtimeUptime(_ text: String) -> String { t("가동 \(text)", "up \(text)") }
+    static func runtimeRestarts(_ count: Int) -> String { t("재시작 \(count)회", "\(count) restarts") }
+    static func runtimeWorkerRestarts(_ count: Int) -> String { t("워커 재시작 \(count)회", "\(count) worker restarts") }
+    static func runtimeLast(_ clock: String) -> String { t(" (마지막 \(clock))", " (last \(clock))") }
+    static func durationMinutes(_ minutes: Int) -> String { t("\(minutes)분", "\(minutes)m") }
+    static func durationDaysHours(_ days: Int, _ hours: Int) -> String { t("\(days)일 \(hours)시간", "\(days)d \(hours)h") }
+    static func durationHoursMinutes(_ hours: Int, _ minutes: Int) -> String { t("\(hours)시간 \(minutes)분", "\(hours)h \(minutes)m") }
+    static var errOrgBlocked: String { t("조직차단", "Org blocked") }
+    static var errPlanEnded: String { t("구독종료", "Plan ended") }
+    static var errAuthExpired: String { t("인증만료", "Auth expired") }
+    static var errAuthRejected: String { t("인증거부", "Auth rejected") }
+    static var errRefreshFailed: String { t("갱신실패", "Refresh failed") }
+    static var errSendFailed: String { t("송신실패", "Send failed") }
+    static var errGeneric: String { t("오류", "Error") }
+    static func creditCount(_ count: Int) -> String { t("\(count)장", "\(count)") }
+    static var unconfirmed: String { t("미확인", "Unknown") }
+    static func creditsUnknownAccounts(_ count: Int) -> String { t("활성 풀 리셋권 미확인 \(count)계정", "Active pool resets unknown for \(count) accounts") }
+    static func creditsTotal(_ total: Int) -> String { t("활성 풀 리셋권 \(total)장", "Active pool resets \(total)") }
+    static func creditsUnknownSuffix(_ count: Int) -> String { t(" · 미확인 \(count)계정", " · \(count) unknown") }
+    static var autoResetUnknown: String { t("자동 리셋 상태 미확인", "Auto reset state unknown") }
+    static var autoResetOff: String { t("자동 리셋 꺼짐", "Auto reset off") }
+    static var autoResetAccount: String { t("계정별 한도 소진 시 자동 리셋", "Auto reset when an account runs out") }
+    static var autoResetFleet: String { t("전체 풀 소진 시 자동 리셋", "Auto reset when the whole pool runs out") }
+    static var autoResetPolicyUnknown: String { t("자동 리셋 정책 미확인", "Auto reset policy unknown") }
+    static func creditsAccessibility(_ name: String, _ label: String) -> String { t("\(name) 리셋권 \(label)", "\(name) resets \(label)") }
+    static var poolOffline: String { t("오프라인", "Offline") }
+    static var poolExhausted: String { t("소진", "Exhausted") }
+    static var poolOnline: String { t("온라인", "Online") }
+    static var titleCodexOffline: String { t("Codex 오프라인", "Codex offline") }
+    static func titleCodexExhaustedUntil(_ clock: String) -> String { t("Codex 소진 · \(clock) 복구", "Codex out · back \(clock)") }
+    static func titleCodexExhausted(_ pool: Int) -> String { t("Codex 소진 0/\(pool)", "Codex out 0/\(pool)") }
+    static func teamCodexAccessibility(_ status: String, _ usable: Int, _ pool: Int, _ excluded: Int) -> String {
+        t("TeamCodex \(status), 지금 쓸 수 있는 계정 \(usable)개, 풀에 남은 계정 \(pool)개, 풀에서 빠진 계정 \(excluded)개",
+          "TeamCodex \(status), \(usable) accounts usable now, \(pool) in the pool, \(excluded) out of the pool")
+    }
+    static var timeNotMeasured: String { t("시각 미측정", "Time not measured") }
+    static var checkingRenewal: String { t("갱신 확인 중", "Checking renewal") }
+    static func inDuration(_ duration: String) -> String { t("\(duration) 후", "in \(duration)") }
+    static func durationHours(_ hours: Int) -> String { t("\(hours)시간", "\(hours)h") }
+    static func durationDays(_ days: Int) -> String { t("\(days)일", "\(days)d") }
+    static var codexStateEndCheck: String { t("종료확인중", "Checking end") }
+    static var codexStateExhausted: String { t("한도소진", "Exhausted") }
+    static var codexStatePaused: String { t("일시대기", "Paused") }
+    static var codexStateWaiting: String { t("대기", "Standby") }
+    static var codexStateConfigured: String { t("설정됨", "Configured") }
+    static var codexNoteRetired: String { t("돌아오지 않음", "Won't come back") }
+    static var codexNoteEndDate: String { t("종료일 지남 · 연결 확인 중", "End date passed · checking connection") }
+    static var codexNoteDisabled: String { t("직접 꺼 둔 계정", "Turned off by you") }
+    static var codexNoteEnding: String { t("구독 종료 예정", "Plan ending") }
+    static var codexEnableFollowUp: String {
+        t("다시 켠 뒤 터미널 안내를 확인하세요 · 반영되지 않으면 teamcodex restart", "After re-enabling, check the terminal · if it doesn't apply, run teamcodex restart")
+    }
+    static var codexEnableThenReauthFollowUp: String {
+        t("다시 켠 뒤에도 인증 오류면 재인증이 필요합니다 · 반영은 teamcodex restart",
+          "If auth still fails after re-enabling, re-auth is needed · apply with teamcodex restart")
+    }
+    static var reEnable: String { t("다시 켜기", "Turn on") }
+    static func reEnableLabel(_ name: String) -> String { t("다시 켜기: \(name)", "Turn on: \(name)") }
+    static func reEnableToolTip(_ name: String, _ note: String) -> String { t("\(name) 계정을 다시 풀에 넣습니다. \(note)", "Puts \(name) back in the pool. \(note)") }
+    static var reauthNeeded: String { t("재인증 필요", "Re-auth needed") }
+    static func codexReauthToolTip(_ name: String) -> String { t("\(name) 계정의 Codex 인증을 다시 연결합니다.", "Reconnects Codex auth for \(name).") }
+    static var codexTaskBuild: String { t("구현·설계", "Build·design") }
+    static var codexEffortBuild: String { t("medium · 복잡하면 high", "medium · high if complex") }
+    static var codexTaskReview: String { t("리뷰·보안", "Review·security") }
+    static var codexTaskExplore: String { t("탐색·병렬", "Explore·parallel") }
+    static var codexTaskTriage: String { t("분류·반복", "Triage·repeat") }
+    static var titleCodexReauth: String { t("Codex 재인증", "Codex re-auth") }
+    static var titleCodexLogin: String { t("Codex 로그인", "Codex login") }
+    static func titleCodexWarningCount(_ count: Int) -> String { t("Codex 주의 \(count)", "Codex warning \(count)") }
+    static var titleCodexWarning: String { t("Codex 주의", "Codex warning") }
+    static var statusWarning: String { t("주의", "Warning") }
+    static var statusOK: String { t("정상", "OK") }
+    static var justNow: String { t("방금", "just now") }
+    static func ago(_ value: String) -> String { t("\(value) 전", "\(value) ago") }
+    static func recErrorsFirst(_ count: Int) -> String { t("오류 \(count)개 재인증이 먼저", "Re-auth \(count) erroring accounts first") }
+    static func recUnsubscribed(_ count: Int) -> String { t("해지 \(count)개 풀에서 정리", "Remove \(count) cancelled accounts from the pool") }
+    static func recDisabled(_ count: Int) -> String { t("꺼 둔 \(count)개 유지 여부 결정", "Decide whether to keep \(count) turned-off accounts") }
+    static func recReduce(_ lane: String, _ count: Int) -> String { t("\(lane) \(count)개 줄일 여지", "\(lane): room to drop \(count)") }
+    static func recDowngrade(_ lane: String) -> String { t("\(lane) 다운그레이드 검토", "\(lane): consider a downgrade") }
+    static func remainingPercent(_ value: String) -> String { t("\(value)% 남음", "\(value)% left") }
+    static var agyGeminiModel: String { t("Gemini 모델", "Gemini models") }
+    static var resetSoon: String { t("곧 리셋", "resets soon") }
+    static func afterDuration(_ duration: String) -> String { t("\(duration) 뒤", "in \(duration)") }
+    static var agyWeeklyCheck: String { t("주간 확인 필요", "weekly needs check") }
+    static var agyFiveHourCheck: String { t("5시간 확인 필요", "5h needs check") }
+    static func grokCredits(_ label: String) -> String { t("크레딧 \(label)", "credits \(label)") }
+    static var switchOn: String { t("켜짐", "On") }
+    static var switchOff: String { t("꺼짐", "Off") }
+    static var dateFormatMonthDay: String { t("M월 d일", "MMM d") }
+    static var dateFormatMonthDayTime: String { t("M월 d일 HH:mm", "MMM d HH:mm") }
+    static func runFailed(_ bin: String, _ error: String) -> String { t("\(bin) 실행 실패: \(error)", "\(bin) failed to run: \(error)") }
+    static func higgsfieldTimeout(_ seconds: Int) -> String {
+        t("힉스필드 CLI가 \(seconds)초 안에 응답하지 않아 중단했습니다", "Higgsfield CLI did not answer within \(seconds)s and was stopped")
+    }
+    static func higgsfieldParseFailed(_ args: String) -> String { t("higgsfield \(args) JSON 파싱 실패", "higgsfield \(args): could not parse JSON") }
+    static func higgsfieldExitFailed(_ args: String, _ code: Int) -> String {
+        t("higgsfield \(args) 실행 실패 (종료 코드 \(code))", "higgsfield \(args) failed (exit code \(code))")
+    }
+    static var higgsfieldNotFound: String { t("higgsfield CLI를 찾지 못했습니다", "Could not find the higgsfield CLI") }
+    static var loginRequired: String { t("로그인 필요", "Login required") }
+    static var hintAuthParse: String { t("auth.json 파싱 실패", "Could not parse auth.json") }
+    static var hintNoAuthFile: String { t("Codex auth 파일 없음", "No Codex auth file") }
+    static var hintNoAuth: String { t("Codex 인증 정보 없음", "No Codex credentials") }
+    static var hintRefreshOld: String { t("마지막 refresh 14일 초과", "Last refresh over 14 days ago") }
+    static var hintNoConfig: String { t("config.toml 없음", "No config.toml") }
+    static var hintNoSessions: String { t("Codex 세션 로그 없음", "No Codex session logs") }
+    static func hintErrorEvents(_ count: Int) -> String { t("최근 7일 오류 이벤트 \(count)회", "\(count) error events in the last 7 days") }
+    static var refuseNoState: String { t("상태 파일 없음", "No state file") }
+    static var refuseOtherConfig: String { t("다른 설정 파일의 서버", "Server of another config file") }
+    static var refuseBadPid: String { t("상태 파일 pid 이상", "State file pid is invalid") }
+    static var refuseLaunchdMismatch: String { t("launchd 서비스 pid와 supervisor 불일치", "launchd service pid does not match the supervisor") }
+    static var refuseNoWorker: String { t("worker 기록 없음", "No worker record") }
+    static var refuseNotServer: String { t("teamclaude server 명령 아님", "Not a teamclaude server command") }
+    static var refuseNoWorkerProcess: String { t("worker 프로세스 없음", "No worker process") }
+    static var refuseWorkerMismatch: String { t("worker 프로세스가 기록과 다름", "Worker process differs from the record") }
+    static func restartInflight(_ count: Int) -> String { t("진행 중 요청 \(count)건이 끊깁니다.", "\(count) in-flight requests will be dropped.") }
+    static var restartNoInflight: String { t("진행 중 요청은 없습니다.", "No requests are in flight.") }
+    static var restartUnknownInflight: String {
+        t("서버 상태를 읽지 못해 진행 중 요청 수를 확인하지 못했습니다. 진행 중인 요청이 있으면 모두 끊깁니다.",
+          "Could not read the server state, so in-flight requests are unknown. Any in-flight requests will be dropped.")
+    }
+    static var restartTitle: String { t("TeamClaude 서버를 재시작할까요?", "Restart the TeamClaude server?") }
+    static var restartUsuallyUnneeded: String {
+        t("계정 추가·재인증·켜기/끄기는 재시작 없이 자동 반영되므로 보통은 필요하지 않습니다.",
+          "Adding, re-authenticating or toggling accounts applies without a restart, so this is usually not needed.")
+    }
+    static var restartConfirm: String { t("재시작", "Restart") }
+    static var cancel: String { t("취소", "Cancel") }
+    static var serverRunning: String { t("실행중", "Running") }
+    static var serverSlow: String { t("응답 지연", "Slow") }
+    static var driftPersists: String { t("재로딩 후에도 남음 · 재시작하지 않음", "Still there after reload · not restarting") }
+    static var driftSyncing: String { t("자동 동기화 중 · 서버 반영 확인", "Auto-syncing · checking the server") }
+
+    // MARK: 앱·제목·구독 문구
+
+    static func hostCores(_ cores: Int) -> String { t("\(cores)코어", "\(cores) cores") }
+    static var hostPrefix: String { t("호스트  ", "Host  ") }
+    static func titleClaudeFable(_ ready: Int, _ total: Int) -> String { t("Claude Fable 사용 가능 \(ready)/\(total)", "Claude Fable \(ready)/\(total)") }
+    static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
+    static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
+    static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
+    static var hintCheckConfig: String { t("teamclaude 계정 설정 파일 확인 필요", "Check the teamclaude account config") }
+    static var hintFableAllOver: String { t("Fable 주간 쿼터가 모든 확인 계정에서 임계치 이상", "Fable weekly quota is over the threshold on every checked account") }
+    static var hintFableSomeOver: String { t("일부 계정의 Fable 주간 쿼터가 임계치 이상", "Some accounts are over the Fable weekly threshold") }
+    static func hintMissingOnServer(_ count: Int) -> String { t("설정 계정 \(count)개 서버 미반영 · 재시작 필요", "\(count) configured accounts missing on the server · restart needed") }
+    static func hintExtraOnServer(_ count: Int) -> String { t("제거된 계정 \(count)개 서버 잔존 · 재시작 필요", "\(count) removed accounts still on the server · restart needed") }
+    static func hintStateMismatch(_ count: Int) -> String { t("계정 활성 상태 \(count)개 서버 불일치 · 재시작 필요", "\(count) accounts differ in enabled state · restart needed") }
+    static func hintMeasurePending(_ count: Int) -> String { t("사용량 미측정 계정 \(count)개 · 지금 측정 가능", "\(count) accounts unmeasured · measure now") }
+    static func hintUnavailable(_ count: Int) -> String { t("일시 제한 상태 확인이 필요한 계정 \(count)개", "\(count) accounts need a throttle check") }
+    static var hintReconnecting: String { t("서버 재연결 중 · 마지막 정상 주간/Fable 표시", "Reconnecting · showing the last good weekly/Fable values") }
+    static var hintPartialSync: String { t("일부 한도 동기화 중 · 계정 상태는 최신", "Some limits syncing · account state is current") }
+    static var terminalFollowUpCodex: String {
+        t("완료 후 위 실행 결과를 확인하세요 · 반영되지 않으면 teamcodex restart가 필요합니다.", "Check the output above when done · if it doesn't apply, run teamcodex restart.")
+    }
+    static var terminalFollowUpAuto: String { t("완료되면 상태바에 자동 반영됩니다.", "The menu bar updates automatically when done.") }
+    static var terminalPressAnyKey: String { t("닫으려면 아무 키나 누르세요", "Press any key to close") }
+    static func slotTokens(_ value: String) -> String { t("토큰 \(value)", "tokens \(value)") }
+    static func slotThisMonth(_ value: String) -> String { t("이번달 \(value)", "this month \(value)") }
+    static func slotTotal(_ value: String) -> String { t("총 \(value)", "total \(value)") }
+    static func tipMeasurement(_ pending: Int, _ unavailable: Int, _ limited: Int) -> String {
+        t(" · 측정 필요 \(pending) · 상태 확인 \(unavailable) · 한도 리셋 \(limited)", " · measure \(pending) · check \(unavailable) · limit reset \(limited)")
+    }
+    static var tipPrefix: String { t("Claude Code 사용량", "Claude Code usage") }
+    static var grokRefreshNeeded: String { t("Grok 갱신 필요", "Grok refresh needed") }
+    static var grokRefreshDetail: String { t("토큰 기한이 지났습니다. grok을 한 번 실행하면 갱신됩니다.", "The token expired. Run grok once to refresh it.") }
+    static var grokLogin: String { t("Grok 로그인", "Grok login") }
+    static var grokNeedsCheck: String { t("Grok 확인 필요", "Grok needs check") }
+    static var agyNoGeminiLane: String { t("agy Gemini 레인 없음", "agy has no Gemini lane") }
+    static var agyNeedsCheck: String { t("agy 확인 필요", "agy needs check") }
+    static var refreshingToday: String { t("오늘 사용량 갱신 중", "Refreshing today") }
+    static var refreshingAll: String { t("전체 사용량 갱신 중", "Refreshing all usage") }
+    static var refreshingStatus: String { t("상태 갱신 중", "Refreshing status") }
+    static var refreshNow: String { t("즉시 갱신", "Now") }
+    static var inProgress: String { t("진행 중", "In progress") }
+    static func measurableNow(_ count: Int) -> String { t("\(count)개 지금 측정 가능", "\(count) can be measured now") }
+    static func stateCheckCount(_ count: Int) -> String { t("\(count)개 상태 확인 필요", "\(count) need a state check") }
+    static func measuredWaiting(_ count: Int) -> String { t("측정 완료 · \(count)개 라우팅 한도 대기", "Measured · \(count) waiting on limits") }
+    static var allMeasured: String { t("모든 계정 측정 완료", "All accounts measured") }
+    static var oauthRefreshing: String { t("OAuth 갱신 중", "Refreshing OAuth") }
+    static var oauthRefreshFailed: String { t("OAuth 갱신 실패", "OAuth refresh failed") }
+    static var serverSyncing: String { t("서버 동기화 중", "Syncing with the server") }
+    static var serverSlowRetry: String { t("서버 응답 지연 · 잠시 후 다시 시도", "Server slow · try again shortly") }
+    static var serverConnectFailed: String { t("서버 연결 실패", "Could not reach the server") }
+    static func measureFailedRetry(_ count: Int) -> String { t("\(count)개 측정 실패 · 다시 시도", "\(count) failed to measure · try again") }
+    static func measuredCount(_ count: Int) -> String { t("\(count)개 계정 측정 완료", "\(count) accounts measured") }
+    static var terminalImport: String { t("현재 Claude Code 로그인 계정 가져오기", "Import the current Claude Code login") }
+    static func terminalClaudeReauth(_ name: String) -> String { t("Claude OAuth 재인증: \(name)", "Claude OAuth re-auth: \(name)") }
+    static var terminalCodexEnable: String { t("Codex 계정 다시 켜기", "Turn a Codex account back on") }
+    static var terminalCodexReauth: String { t("Codex OAuth 재인증", "Codex OAuth re-auth") }
+    static var restartNoExecutable: String {
+        t("teamclaude 실행 파일을 찾지 못했습니다. CC_MENUBAR_TEAMCLAUDE_BIN으로 경로를 지정하세요.", "Could not find the teamclaude executable. Set its path with CC_MENUBAR_TEAMCLAUDE_BIN.")
+    }
+    static func restartUnmanaged(_ label: String) -> String {
+        t("launchd 서비스(\(label))에 등록되지 않은 서버가 실행 중입니다. 앱은 이 서버를 재시작하지 않습니다. 실행한 터미널에서 직접 다시 시작하세요.",
+          "A server not registered with the launchd service (\(label)) is running. The app won't restart it. Restart it from the terminal that started it.")
+    }
+    static var restartUndetermined: String { t("launchd 상태를 확인하지 못해 아무것도 하지 않았습니다.", "Could not check launchd, so nothing was done.") }
+    static var restartNoticeTitle: String { t("TeamClaude 서버", "TeamClaude server") }
+    static var ok: String { t("확인", "OK") }
+    static var subPlanUnknown: String { t("구독 미확인", "Plan unknown") }
+    static var subEnteredPaymentPast: String { t("입력 결제일 지남 ", "entered payment date passed ") }
+    static var subEnteredPayment: String { t("입력 결제일 ", "entered payment date ") }
+    static var subCancelUnknown: String { t("해지 미확인", "cancellation unknown") }
+    static var subPaymentUnknown: String { t("결제일 미확인", "payment date unknown") }
+    static var subExpiryUnknown: String { t("만료일 미확인", "expiry unknown") }
+    static var subMailChecked: String { t("메일확인", "mail-checked") }
+    static var subChecked: String { t("확인", "checked") }
+    static var subRenewRecheckPast: String { t("갱신 재확인 · 지난 결제일", "recheck renewal · past payment date") }
+    static var subRenewRecheckRecorded: String { t("갱신 재확인 · 기록 결제일", "recheck renewal · recorded payment date") }
+    static var subRenewing: String { t("자동갱신 확인 · 다음 결제", "auto-renew confirmed · next payment") }
+    static var subEndPassed: String { t("종료일 경과 · 확인 필요", "end date passed · check") }
+    static var subCancelRecheck: String { t("해지 재확인 · 예정 종료", "recheck cancellation · ends") }
+    static var subCancelScheduled: String { t("해지 예약 · 이용 종료", "cancellation scheduled · ends") }
+    static var subEndRecheck: String { t("종료 재확인", "recheck end") }
+    static var subEndConfirmed: String { t("구독 종료 확인", "plan end confirmed") }
+    static var subExpiry: String { t("만료일", "expires") }
+    static var subEnter: String { t("입력", "enter") }
+    static var subPaymentPast: String { t("결제일 지남", "payment date passed") }
+    static var subNextPayment: String { t("다음 결제", "next payment") }
+    static var subMonitorDelayed: String { t("자동조회 지연", "Auto check delayed") }
+    static var subMonitorOK: String { t("메일 자동조회 완료", "Mail auto check done") }
+    static var subMonitorBusy: String { t("메일 사용 중 · 다음 회차 재시도", "Mail busy · retry next round") }
+    static var subMonitorLogin: String { t("메일 로그인 필요", "Mail login required") }
+    static var subMonitorUnsupported: String { t("이 메일 서비스는 자동 조회를 지원하지 않습니다", "This mail service does not support auto checks") }
+    static var subMonitorFailed: String { t("메일 자동조회 실패 · 마지막 확인 유지", "Mail auto check failed · keeping the last check") }
+    static var subStatusDelayed: String { t("조회 지연", "Check delayed") }
+    static var subStatusUnsupported: String { t("자동조회 미지원", "Auto check unsupported") }
+    static var subStatusWaiting: String { t("조회 대기", "Check waiting") }
+    static var subStatusFailed: String { t("조회 실패", "Check failed") }
+    static var subStatusMail: String { t("메일조회", "Mail check") }
+    static var subEverySixHours: String { t(" (6시간마다 확인).", " (checked every 6 hours).") }
+    static var subLastSuccess: String { t(" 마지막 성공 ", " Last success ") }
+    static var subRejoined: String { t(". 과거 해지 이후 재가입 확인 · 현재 갱신 여부는 미확인", ". Rejoined after a past cancellation · current renewal unknown") }
+    static var subStatusAuto: String { t("자동확인", "Auto-checked") }
+
+    // MARK: 구독 기록 대화상자
+
+    static var subRecheckMarker: String { t("재확인", "recheck") }
+    static var subToolTipClaude: String {
+        t("구독 관리 화면이나 해지 확인 메일의 내용을 기록합니다. 실제 구독은 변경하지 않습니다. Max/active만으로 해지 여부를 확인할 수 없습니다.",
+          "Records what the billing page or cancellation mail says. It does not change the real plan. Max/active alone can't tell whether it was cancelled.")
+    }
+    static var subToolTipCodex: String { t("결제일을 입력하거나 수정합니다. 자동 조회된 결제일이 아닙니다.", "Enter or edit the payment date. This is not an auto-detected date.") }
+    static var subSourceBilling: String { t("구독 관리 화면", "billing page") }
+    static var subSourceMail: String { t("확인 메일", "confirmation mail") }
+    static var subSourceProxy: String { t("TeamClaude 서버 구독 기록", "TeamClaude server record") }
+    static var subSourceManual: String { t("직접 입력", "entered by hand") }
+    static var subModeAuto: String { t("로그인된 메일에서 자동 확인했습니다.", "Checked automatically from the signed-in mailbox.") }
+    static var subModeProxy: String { t("서버에 기록된 구독 상태입니다.", "Plan state recorded on the server.") }
+    static var subModeManual: String { t("이 기록은 직접 확인한 내용입니다.", "This record was checked by hand.") }
+    static func subSourceLine(_ source: String, _ mode: String) -> String { t("출처: \(source). \(mode) ", "Source: \(source). \(mode) ") }
+    static func subStartLine(_ start: String) -> String { t("구독 시작일 \(start). ", "Plan started \(start). ") }
+    static func subDialogTitle(_ name: String) -> String { t("\(name) 구독 확인 기록", "\(name) plan record") }
+    static var subDialogBody: String {
+        t("구독 관리 화면이나 확인 메일에서 확인한 상태만 기록하세요. 실제 구독 변경·해지가 아닙니다. 자동갱신은 다음 결제일, 해지 예약은 마지막 이용일을 입력하세요. 날짜를 모르면 비워 두세요.",
+          "Record only what you saw on the billing page or in a confirmation mail. This does not change or cancel the plan. For auto-renew enter the next payment date; for a scheduled cancellation enter the last day of use. Leave the date empty if unknown.")
+    }
+    static var subSaveRecord: String { t("기록 저장", "Save record") }
+    static var subClearRecord: String { t("확인 기록 지우기", "Clear record") }
+    static var subEditPayment: String { t("입력 결제일 편집", "Edit payment date") }
+    static var subStateRenewing: String { t("자동갱신 확인", "Auto-renew confirmed") }
+    static var subStateScheduled: String { t("해지 예약", "Cancellation scheduled") }
+    static var subStateLabel: String { t("확인한 구독 상태", "Confirmed plan state") }
+    static var subDatePlaceholder: String { t("YYYY-MM-DD (미확인 시 비워 둠)", "YYYY-MM-DD (leave empty if unknown)") }
+    static var subDateLabel: String { t("다음 결제일 또는 마지막 이용일", "Next payment date or last day of use") }
+    static var subInvalidDateRecord: String {
+        t("날짜를 확인하세요. 실제 존재하는 YYYY-MM-DD 날짜만 기록할 수 있습니다. 실제 구독은 변경하지 않습니다.",
+          "Check the date. Only a real YYYY-MM-DD date can be recorded. The real plan is not changed.")
+    }
+    static func subPaymentTitle(_ name: String) -> String { t("\(name) 결제일", "\(name) payment date") }
+    static var subPaymentBody: String {
+        t("청구서 또는 구독 관리 화면에서 확인한 다음 결제일을 입력하세요. YYYY-MM-DD 형식입니다.", "Enter the next payment date from the invoice or billing page, as YYYY-MM-DD.")
+    }
+    static var save: String { t("저장", "Save") }
+    static var subClearDate: String { t("날짜 지우기", "Clear date") }
+    static var subNextPaymentDate: String { t("다음 결제일", "Next payment date") }
+    static var subInvalidDateSave: String { t("날짜를 확인하세요. 실제 존재하는 YYYY-MM-DD 날짜만 저장할 수 있습니다.", "Check the date. Only a real YYYY-MM-DD date can be saved.") }
 
     // MARK: 빈 값 어휘
 

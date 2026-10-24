@@ -48,5 +48,5 @@ func setMenubarLoginItem(enabled: Bool, executablePath: String, home: String) th
 }
 
 func menubarLoginItemDetail(enabled: Bool) -> String {
-    enabled ? "켜짐" : "꺼짐"
+    enabled ? L10n.switchOn : L10n.switchOff
 }

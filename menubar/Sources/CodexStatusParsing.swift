@@ -169,10 +169,10 @@ func formatCodexLimitPair(_ primary: Double?, _ secondary: Double?) -> String? {
 func formatCodexAge(_ date: Date?) -> String {
     guard let date = date else { return "-" }
     let seconds = max(0, Int(Date().timeIntervalSince(date)))
-    if seconds < 60 { return "방금" }
-    if seconds < 3_600 { return "\(seconds / 60)m 전" }
-    if seconds < 86_400 { return "\(seconds / 3_600)h 전" }
-    return "\(seconds / 86_400)d 전"
+    if seconds < 60 { return L10n.justNow }
+    if seconds < 3_600 { return L10n.ago("\(seconds / 60)m") }
+    if seconds < 86_400 { return L10n.ago("\(seconds / 3_600)h") }
+    return L10n.ago("\(seconds / 86_400)d")
 }
 
 func formatCodexReset(_ date: Date?) -> String {

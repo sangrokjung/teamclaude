@@ -181,9 +181,9 @@ struct TeamClaudeHealth {
         guard !parts.isEmpty else { return nil }
         var extras: [String] = []
         if let load = host.loadavg1, load.isFinite { extras.append(String(format: "load %.1f", load)) }
-        if let cores = host.cores { extras.append("\(cores)코어") }
+        if let cores = host.cores { extras.append(L10n.hostCores(cores)) }
         let suffix = extras.isEmpty ? "" : " (\(extras.joined(separator: " / ")))"
-        return "호스트  " + parts.joined(separator: " · ") + suffix
+        return L10n.hostPrefix + parts.joined(separator: " · ") + suffix
     }
 
     // CPU 또는 RAM 사용률이 90% 이상이면 경고 강조
@@ -209,9 +209,9 @@ struct TeamClaudeHealth {
     var titleSlot: String {
         let total = max(accountTotal, accountConfigured)
         if serverReachable && accountConfigDrift == 0 {
-            return "Claude Fable 사용 가능 \(fableAvailability().filter { $0.state == .ready }.count)/\(total)"
+            return L10n.titleClaudeFable(fableAvailability().filter { $0.state == .ready }.count, total)
         }
-        if !serverReachable && serverResponseDelayed { return "Claude 응답 지연" }
+        if !serverReachable && serverResponseDelayed { return L10n.titleClaudeSlow }
         return teamClaudeTitleSlot(TeamClaudeHeadlineInput(
             serverReachable: serverReachable,
             accountConfigDrift: accountConfigDrift,
@@ -226,9 +226,9 @@ struct TeamClaudeHealth {
     }
 
     var statusLabel: String {
-        if isError { return "오류" }
-        if isWarning { return "주의" }
-        return "정상"
+        if isError { return L10n.errGeneric }
+        if isWarning { return L10n.statusWarning }
+        return L10n.statusOK
     }
 }
 
@@ -733,30 +733,30 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
 
     var hints: [String] = []
     if !reachable {
-        hints.append("teamclaude 서버 연결 실패")
+        hints.append(L10n.hintServerConnectFailed)
     }
     if config == nil {
-        hints.append("teamclaude 계정 설정 파일 확인 필요")
+        hints.append(L10n.hintCheckConfig)
     }
     if fableAllOver {
-        hints.append("Fable 주간 쿼터가 모든 확인 계정에서 임계치 이상")
+        hints.append(L10n.hintFableAllOver)
     } else if fableOver > 0 {
-        hints.append("일부 계정의 Fable 주간 쿼터가 임계치 이상")
+        hints.append(L10n.hintFableSomeOver)
     }
     if !missingConfiguredRows.isEmpty {
-        hints.append("설정 계정 \(missingConfiguredRows.count)개 서버 미반영 · 재시작 필요")
+        hints.append(L10n.hintMissingOnServer(missingConfiguredRows.count))
     }
     if !accountDrift.extraOnServer.isEmpty {
-        hints.append("제거된 계정 \(accountDrift.extraOnServer.count)개 서버 잔존 · 재시작 필요")
+        hints.append(L10n.hintExtraOnServer(accountDrift.extraOnServer.count))
     }
     if !accountDrift.stateMismatch.isEmpty {
-        hints.append("계정 활성 상태 \(accountDrift.stateMismatch.count)개 서버 불일치 · 재시작 필요")
+        hints.append(L10n.hintStateMismatch(accountDrift.stateMismatch.count))
     }
     if measurementPending > 0 {
-        hints.append("사용량 미측정 계정 \(measurementPending)개 · 지금 측정 가능")
+        hints.append(L10n.hintMeasurePending(measurementPending))
     }
     if measurementUnavailable > 0 {
-        hints.append("일시 제한 상태 확인이 필요한 계정 \(measurementUnavailable)개")
+        hints.append(L10n.hintUnavailable(measurementUnavailable))
     }
 
     let retryAfter = computeTeamClaudeRetryAfterSeconds(
@@ -912,7 +912,7 @@ func teamClaudeRetainingQuota(
         quotaThresholdPercent: adjusted.quotaThresholdPercent,
         retryAfterSeconds: adjusted.retryAfterSeconds,
         accounts: adjusted.accounts,
-        hints: candidate.hints + ["서버 재연결 중 · 마지막 정상 주간/Fable 표시"],
+        hints: candidate.hints + [L10n.hintReconnecting],
         host: candidate.host
     )
     merged.runtimeSummary = candidate.runtimeSummary
@@ -1091,7 +1091,7 @@ func teamClaudeHealthMergingQuota(
         retryAfterSeconds: retryAfter,
         accounts: accounts,
         hints: retainedPreviousQuota
-            ? candidate.hints + ["일부 한도 동기화 중 · 계정 상태는 최신"]
+            ? candidate.hints + [L10n.hintPartialSync]
             : candidate.hints,
         host: candidate.host
     )
@@ -1586,6 +1586,12 @@ func formatKRWShort(_ usd: Double, rate: Double) -> String {
     let krw = (usd * rate).rounded()
     let absK = Swift.abs(krw)
     let sign = krw < 0 ? "-" : ""
+    // 영어 화면은 만·억 대신 K·M·B로 줄인다(값은 같다).
+    if L10n.language == .en {
+        if absK >= 1_000_000_000 { return sign + String(format: "₩%.1fB", absK / 1_000_000_000) }
+        if absK >= 1_000_000 { return sign + String(format: "₩%.1fM", absK / 1_000_000) }
+        if absK >= 10_000 { return sign + String(format: "₩%.0fK", absK / 1_000) }
+    }
     if absK >= 100_000_000 {
         return sign + String(format: absK >= 1_000_000_000 ? "₩%.0f억" : "₩%.1f억", absK / 100_000_000)
     }
@@ -2236,12 +2242,13 @@ final class TeamClaudeTableView: NSView {
             let chevron = isExpanded ? "⌃" : "⌄"
             PanelDraw.right(chevron, rightEdge, y + 6, NSFont.systemFont(ofSize: 11), fg3)
             let statusRight = rightEdge - 14
+            let statusWidth = statusRight - TeamClaudeColumns.statusX
             let canReauth = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
                                                         provider: row.provider, errorReason: row.errorReason)
             if canReauth, state.subscriptionAppearance != .ended {
                 // 버튼이 자리를 쓴다.
             } else if row.status == "error" {
-                PanelDraw.right(teamAccountErrorReasonLabel(row.errorReason), statusRight, y + 8, caption, ember)
+                PanelDraw.right(PanelDraw.clipped(teamAccountErrorReasonLabel(row.errorReason), caption, maxWidth: statusWidth), statusRight, y + 8, caption, ember)
             } else if let issue = row.measurementIssue, state.subscriptionAppearance != .ended {
                 if issue.canMeasureNow && !isMeasuring && !subscriptionMuted {
                     let chipWidth = PanelDraw.width(L10n.measure, TeamClaudePalette.buttonFont) + 20
@@ -2250,11 +2257,11 @@ final class TeamClaudeTableView: NSView {
                     PanelDraw.text(L10n.measure, chipRect.minX + 10, chipRect.minY + 4.5, TeamClaudePalette.buttonFont, fg)
                     measureRowRects.append(chipRect)
                 } else {
-                    PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: 80), statusRight, y + 9, micro, issue == .quotaBlocked ? ember : fg3)
+                    PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: statusWidth), statusRight, y + 9, micro, issue == .quotaBlocked ? ember : fg3)
                 }
             } else {
                 let label = row.isCurrent && state.state == .ready ? L10n.stateInUse : presentation.label
-                PanelDraw.right(PanelDraw.clipped(label, caption, maxWidth: 76), statusRight, y + 8, caption,
+                PanelDraw.right(PanelDraw.clipped(label, caption, maxWidth: statusWidth), statusRight, y + 8, caption,
                                 subscriptionMuted ? fg3 : presentation.tone.color)
             }
 
@@ -4077,15 +4084,15 @@ func teamClaudeTerminalCommand(
     // "Apply the change with: teamcodex restart"를 찍는다. 앱이 그 줄을
     // "자동 반영됩니다"로 덮으면 사용자는 재시작을 건너뛰고 반영 안 된 상태로 남는다.
     let closingNote = codexMode
-        ? "완료 후 위 실행 결과를 확인하세요 · 반영되지 않으면 teamcodex restart가 필요합니다."
-        : "완료되면 상태바에 자동 반영됩니다."
+        ? L10n.terminalFollowUpCodex
+        : L10n.terminalFollowUpAuto
     let commands = [
         "clear",
         "echo \(shellQuote("\(product): \(commandTitle)"))",
         "\(quotedExe) \(argString)",
         "echo",
         "echo \(shellQuote(closingNote))",
-        "read -n 1 -s -r -p \(shellQuote("닫으려면 아무 키나 누르세요"))",
+        "read -n 1 -s -r -p \(shellQuote(L10n.terminalPressAnyKey))",
     ]
     return commands.joined(separator: "; ")
 }
@@ -4111,11 +4118,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isFetchingHiggsfield = false
     private var lastHiggsfieldFetchedAt: Date?
     var currentGrokSlot: String?
-    var currentGrokCard = GrokCardModel(headline: "Grok 확인 중", detail: nil)
+    var currentGrokCard = GrokCardModel(headline: L10n.grokChecking, detail: nil)
     private var isFetchingGrok = false
     private var lastGrokFetchedAt: Date?
     var grokTimer: Timer?
-    var currentAgyCard = AgyCardModel(message: "agy 확인 중", groups: [])
+    var currentAgyCard = AgyCardModel(message: L10n.agyChecking, groups: [])
     private var isFetchingAgy = false
     private var lastAgyFetchedAt: Date?
     private var agyHasValue = false
@@ -4512,7 +4519,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 롤링 표시 슬롯 (5초마다 순환). 데이터 없으면 병렬 세션 수만 표시.
     func displaySlots() -> [String] {
         if isMeasuringTeamClaude {
-            return ["Claude 측정 중"]
+            return [L10n.titleClaudeMeasuring]
         }
         // 미설치 도구는 제목에 올리지 않는다. "로그인"·"오프라인"처럼 고칠 일이 있는 것으로 읽히면 안 된다.
         let teamClaudeSlot = teamClaudeNotice == nil ? currentTeamClaude?.titleSlot : nil
@@ -4520,7 +4527,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let teamCodexSlot = teamCodexNotice == nil ? currentTeamCodex?.titleSlot : nil
         // 데이터 없으면 최소 정보 — 병렬 세션 수만이라도 의미 있음
         guard let usage = currentData, let today = usage.today else {
-            return [teamClaudeSlot, teamCodexSlot, codexSlot, "병렬 \(parallelCount)"].compactMap { $0 }
+            return [teamClaudeSlot, teamCodexSlot, codexSlot, L10n.parallelSessions(parallelCount)].compactMap { $0 }
         }
         let todayTokens = today.inputTokens + today.cacheCreationTokens
                         + today.cacheReadTokens + today.outputTokens
@@ -4535,26 +4542,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             teamClaudeSlot,
             teamCodexSlot,
             codexSlot,
-            "오늘 \(formatCost(today.totalCost))",
-            "오늘 \(formatKRWShort(today.totalCost, rate: rate))",
-            "토큰 \(formatTokens(todayTokens))",
-            "주간 \(formatCost(usage.weeklyTotalCost))",
-            "이번주 \(formatCost(usage.thisWeekCost))",
-            "이번달 \(formatCost(usage.thisMonthCost))",
-            "이번달 \(formatKRWShort(usage.thisMonthCost, rate: rate))",
-            "누적 \(formatKRWShort(usage.allTimeCost, rate: rate))",
-            "총 \(formatTokens(usage.allTimeTokens))",
-            "병렬 \(parallelCount)",
+            "\(L10n.today) \(formatCost(today.totalCost))",
+            "\(L10n.today) \(formatKRWShort(today.totalCost, rate: rate))",
+            L10n.slotTokens(formatTokens(todayTokens)),
+            "\(L10n.weeklyShort) \(formatCost(usage.weeklyTotalCost))",
+            L10n.thisWeekShort(formatCost(usage.thisWeekCost)),
+            L10n.slotThisMonth(formatCost(usage.thisMonthCost)),
+            L10n.slotThisMonth(formatKRWShort(usage.thisMonthCost, rate: rate)),
+            "\(L10n.allTime) \(formatKRWShort(usage.allTimeCost, rate: rate))",
+            L10n.slotTotal(formatTokens(usage.allTimeTokens)),
+            L10n.parallelSessions(parallelCount),
         ].compactMap { $0 }
         // codex 사용이 있으면 별도 슬롯으로 노출
-        if codexCost > 0 { slots.append("코덱스 \(formatCost(codexCost))") }
+        if codexCost > 0 { slots.append("Codex \(formatCost(codexCost))") }
         slots.append(usage.modelBreakdown.first?.label ?? today.models.first ?? "Claude") // 최다 비용 모델
         return slots
     }
 
     func setLoading() {
         DispatchQueue.main.async { [weak self] in
-            self?.statusItem?.button?.title = "○ 로딩…"
+            self?.statusItem?.button?.title = "○ " + L10n.loading
         }
     }
 
@@ -4618,14 +4625,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let cliTip = cliSlots.isEmpty ? "" : " · " + cliSlots.joined(separator: " · ")
             if let health = self.currentTeamClaude {
                 let fable = health.fableKnown > 0 ? "Fable \(health.fableOver)/\(health.fableKnown)" : "Fable -"
-                let measurement = " · 측정 필요 \(health.measurementPendingCount) · 상태 확인 \(health.measurementUnavailableCount) · 한도 리셋 \(health.quotaLimitedCount)"
-                let integration = health.accountConfigDrift == 0 ? " · 계정 연동 정상" : " · 계정 연동 불일치 \(health.accountConfigDrift)"
+                let measurement = L10n.tipMeasurement(health.measurementPendingCount, health.measurementUnavailableCount, health.quotaLimitedCount)
+                let integration = " · " + (health.accountConfigDrift == 0 ? L10n.integrationOK : L10n.integrationDrift(health.accountConfigDrift))
                 let codex = self.currentCodex.map { " · codex \($0.statusLabel) · calls \($0.todayCalls)/\($0.weekCalls)" } ?? ""
-                button.toolTip = "Claude Code 사용량 · teamclaude \(health.statusLabel) · \(fable) · active \(health.accountActive)/\(max(health.accountTotal, health.accountConfigured))\(integration)\(measurement)\(codex)\(cliTip)"
+                button.toolTip = L10n.tipPrefix + " · teamclaude \(health.statusLabel) · \(fable) · active \(health.accountActive)/\(max(health.accountTotal, health.accountConfigured))\(integration)\(measurement)\(codex)\(cliTip)"
             } else if let codex = self.currentCodex {
-                button.toolTip = "Claude Code 사용량 · codex \(codex.statusLabel) · calls \(codex.todayCalls)/\(codex.weekCalls)\(cliTip)"
+                button.toolTip = L10n.tipPrefix + " · codex \(codex.statusLabel) · calls \(codex.todayCalls)/\(codex.weekCalls)\(cliTip)"
             } else if !cliSlots.isEmpty {
-                button.toolTip = "Claude Code 사용량\(cliTip)"
+                button.toolTip = L10n.tipPrefix + cliTip
             }
 
         }
@@ -4843,25 +4850,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     )
                     slot = outcome.slot
                 case .expired:
-                    self.currentGrokSlot = "Grok 갱신 필요"
+                    self.currentGrokSlot = L10n.grokRefreshNeeded
                     self.currentGrokCard = GrokCardModel(
-                        headline: "Grok 갱신 필요",
-                        detail: "토큰 기한이 지났습니다. grok을 한 번 실행하면 갱신됩니다."
+                        headline: L10n.grokRefreshNeeded,
+                        detail: L10n.grokRefreshDetail
                     )
-                    slot = "Grok 갱신 필요"
+                    slot = L10n.grokRefreshNeeded
                 case .login:
-                    self.currentGrokSlot = "Grok 로그인"
-                    self.currentGrokCard = GrokCardModel(headline: "Grok 로그인", detail: nil)
-                    slot = "Grok 로그인"
+                    self.currentGrokSlot = L10n.grokLogin
+                    self.currentGrokCard = GrokCardModel(headline: L10n.grokLogin, detail: nil)
+                    slot = L10n.grokLogin
                 case .unavailable:
                     if self.currentGrokSlot == nil
-                        || self.currentGrokSlot == "Grok 로그인"
-                        || self.currentGrokSlot == "Grok 갱신 필요"
-                        || self.currentGrokSlot == "Grok 확인 중" {
-                        self.currentGrokSlot = "Grok 확인 필요"
-                        self.currentGrokCard = GrokCardModel(headline: "Grok 확인 필요", detail: nil)
+                        || self.currentGrokSlot == L10n.grokLogin
+                        || self.currentGrokSlot == L10n.grokRefreshNeeded
+                        || self.currentGrokSlot == L10n.grokChecking {
+                        self.currentGrokSlot = L10n.grokNeedsCheck
+                        self.currentGrokCard = GrokCardModel(headline: L10n.grokNeedsCheck, detail: nil)
                     }
-                    slot = self.currentGrokSlot ?? "Grok 확인 필요"
+                    slot = self.currentGrokSlot ?? L10n.grokNeedsCheck
                 }
                 print("GROK-SLOT: \(slot)")
                 fflush(stdout)
@@ -4892,11 +4899,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if !lanes.isEmpty { self.agyLastSuccessAt = Date() }
                     self.agyHasValue = !lanes.isEmpty
                     self.currentAgyCard = lanes.isEmpty
-                        ? AgyCardModel(message: "agy Gemini 레인 없음", groups: [])
+                        ? AgyCardModel(message: L10n.agyNoGeminiLane, groups: [])
                         : AgyCardModel(message: nil, groups: lanes)
                 case .failed:
                     if !self.agyHasValue {
-                        self.currentAgyCard = AgyCardModel(message: "agy 확인 필요", groups: [])
+                        self.currentAgyCard = AgyCardModel(message: L10n.agyNeedsCheck, groups: [])
                     }
                 }
                 print("AGY: \(agyLogLine(self.currentAgyCard))")
@@ -5259,26 +5266,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func refreshMenuDetailText() -> String {
-        if isFetchingUsageQuick { return "오늘 사용량 갱신 중" }
-        if isFetching { return "전체 사용량 갱신 중" }
-        if isRefreshingStatus { return "상태 갱신 중" }
-        return "즉시 갱신"
+        if isFetchingUsageQuick { return L10n.refreshingToday }
+        if isFetching { return L10n.refreshingAll }
+        if isRefreshingStatus { return L10n.refreshingStatus }
+        return L10n.refreshNow
     }
 
     func measureMenuDetailText() -> String {
-        if isMeasuringTeamClaude { return teamClaudeMeasureDetail ?? "진행 중" }
+        if isMeasuringTeamClaude { return teamClaudeMeasureDetail ?? L10n.inProgress }
         if let teamClaudeMeasureDetail { return teamClaudeMeasureDetail }
 
         let unmeasuredCount = currentTeamClaude?.measurementPendingCount ?? 0
-        if unmeasuredCount > 0 { return "\(unmeasuredCount)개 지금 측정 가능" }
+        if unmeasuredCount > 0 { return L10n.measurableNow(unmeasuredCount) }
 
         let unavailableCount = currentTeamClaude?.measurementUnavailableCount ?? 0
-        if unavailableCount > 0 { return "\(unavailableCount)개 상태 확인 필요" }
+        if unavailableCount > 0 { return L10n.stateCheckCount(unavailableCount) }
 
         let quotaLimitedCount = currentTeamClaude?.quotaLimitedCount ?? 0
         return quotaLimitedCount > 0
-            ? "측정 완료 · \(quotaLimitedCount)개 라우팅 한도 대기"
-            : "모든 계정 측정 완료"
+            ? L10n.measuredWaiting(quotaLimitedCount)
+            : L10n.allMeasured
     }
 
     /// 패널 본문이 쓸 수 있는 최대 높이. 화면에서 머리·하단 막대와 여백을 뺀 값이다.
@@ -5529,7 +5536,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let config = currentTeamClaudeConfigPath().flatMap { readTeamClaudeJSON($0) }
         let proxyAuthorizationValue = tcString(tcDict(config?["proxy"])?["apiKey"])
         isMeasuringTeamClaude = true
-        teamClaudeMeasureDetail = "OAuth 갱신 중"
+        teamClaudeMeasureDetail = L10n.oauthRefreshing
         scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
         updateTitle()
 
@@ -5538,7 +5545,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard refreshExit == 0 else {
                 DispatchQueue.main.async {
                     self?.isMeasuringTeamClaude = false
-                    self?.teamClaudeMeasureDetail = "OAuth 갱신 실패"
+                    self?.teamClaudeMeasureDetail = L10n.oauthRefreshFailed
                     self?.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                     self?.updateTitle()
                 }
@@ -5546,7 +5553,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             DispatchQueue.main.async {
-                self?.teamClaudeMeasureDetail = "서버 동기화 중"
+                self?.teamClaudeMeasureDetail = L10n.serverSyncing
                 self?.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                 self?.updateTitle()
             }
@@ -5557,9 +5564,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard sync.health.serverReachable else {
                 let detail: String
                 if case .responseDelayed = sync.outcome {
-                    detail = "서버 응답 지연 · 잠시 후 다시 시도"
+                    detail = L10n.serverSlowRetry
                 } else {
-                    detail = "서버 연결 실패"
+                    detail = L10n.serverConnectFailed
                 }
                 DispatchQueue.main.async {
                     self?.isMeasuringTeamClaude = false
@@ -5571,7 +5578,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             DispatchQueue.main.async {
-                self?.teamClaudeMeasureDetail = "계정 사용량 측정 중"
+                self?.teamClaudeMeasureDetail = L10n.measuringTitle
                 self?.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                 self?.updateTitle()
             }
@@ -5595,13 +5602,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.commitTeamClaudeHealth(teamClaude)
                 self.isMeasuringTeamClaude = false
                 if pending > 0 {
-                    self.teamClaudeMeasureDetail = "\(pending)개 측정 실패 · 다시 시도"
+                    self.teamClaudeMeasureDetail = L10n.measureFailedRetry(pending)
                 } else if unavailable > 0 {
-                    self.teamClaudeMeasureDetail = "\(unavailable)개 상태 확인 필요"
+                    self.teamClaudeMeasureDetail = L10n.stateCheckCount(unavailable)
                 } else if quotaLimited > 0 {
-                    self.teamClaudeMeasureDetail = "측정 완료 · \(quotaLimited)개 라우팅 한도 대기"
+                    self.teamClaudeMeasureDetail = L10n.measuredWaiting(quotaLimited)
                 } else {
-                    self.teamClaudeMeasureDetail = "\(teamClaude.accounts.count)개 계정 측정 완료"
+                    self.teamClaudeMeasureDetail = L10n.measuredCount(teamClaude.accounts.count)
                 }
                 self.scheduleDashboardRefresh(reason: "measureTeamClaudeAction", immediate: true)
                 self.updateTitle()
@@ -5754,12 +5761,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func importClaudeCodeAccountAction() {
-        openTeamClaudeTerminal(commandTitle: "현재 Claude Code 로그인 계정 가져오기", arguments: ["import"])
+        openTeamClaudeTerminal(commandTitle: L10n.terminalImport, arguments: ["import"])
         watchTeamClaudeConfigAfterExternalCommand(reason: "import")
     }
 
     @objc func addClaudeOAuthAccountAction() {
-        openTeamClaudeTerminal(commandTitle: "Claude OAuth 계정 추가", arguments: ["login"])
+        openTeamClaudeTerminal(commandTitle: L10n.actionClaudeOAuth, arguments: ["login"])
         watchTeamClaudeConfigAfterExternalCommand(reason: "login")
     }
 
@@ -5784,7 +5791,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var arguments = ["reauth", name]
         if let expectedAccountUuid { arguments.append(contentsOf: ["--account-uuid", expectedAccountUuid]) }
         openTeamClaudeTerminal(
-            commandTitle: "Claude OAuth 재인증: \(name)",
+            commandTitle: L10n.terminalClaudeReauth(name),
             arguments: arguments
         )
         watchTeamClaudeConfigAfterExternalCommand(reason: "reauth \(name)")
@@ -5818,8 +5825,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let title = recovery.kind == .enable
-            ? "Codex 계정 다시 켜기"
-            : "Codex OAuth 재인증"
+            ? L10n.terminalCodexEnable
+            : L10n.terminalCodexReauth
         openTeamClaudeTerminal(
             commandTitle: title,
             arguments: recovery.arguments,
@@ -5834,7 +5841,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func addCodexOAuthAccountAction() {
         openTeamClaudeTerminal(
-            commandTitle: "Codex OAuth 계정 추가",
+            commandTitle: L10n.actionCodexOAuth,
             arguments: ["codex", "login"],
             codexMode: true
         )
@@ -5887,7 +5894,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 case .startDetached:
                     guard let executable = detachedExecutable else {
-                        self.showTeamClaudeRestartNotice("teamclaude 실행 파일을 찾지 못했습니다. CC_MENUBAR_TEAMCLAUDE_BIN으로 경로를 지정하세요.")
+                        self.showTeamClaudeRestartNotice(L10n.restartNoExecutable)
                         return
                     }
                     DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -5895,9 +5902,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self?.refreshStatusOnly() }
                     }
                 case .leaveRunning:
-                    self.showTeamClaudeRestartNotice("launchd 서비스(\(teamClaudeLaunchdLabel))에 등록되지 않은 서버가 실행 중입니다. 앱은 이 서버를 재시작하지 않습니다. 실행한 터미널에서 직접 다시 시작하세요.")
+                    self.showTeamClaudeRestartNotice(L10n.restartUnmanaged(teamClaudeLaunchdLabel))
                 case .undetermined:
-                    self.showTeamClaudeRestartNotice("launchd 상태를 확인하지 못해 아무것도 하지 않았습니다.")
+                    self.showTeamClaudeRestartNotice(L10n.restartUndetermined)
                 }
             }
         }
@@ -5906,9 +5913,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showTeamClaudeRestartNotice(_ message: String) {
         let notice = NSAlert()
         notice.alertStyle = .informational
-        notice.messageText = "TeamClaude 서버"
+        notice.messageText = L10n.restartNoticeTitle
         notice.informativeText = message
-        notice.addButton(withTitle: "확인")
+        notice.addButton(withTitle: L10n.ok)
         NSApp.activate(ignoringOtherApps: true)
         notice.runModal()
     }

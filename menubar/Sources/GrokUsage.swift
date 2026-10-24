@@ -156,7 +156,7 @@ func grokCardDetail(product: Double?, credit: Double?) -> String? {
     }
     if let credit, let label = grokPlainPercent(credit),
        product == nil || abs((product ?? 0) - credit) >= 0.05 {
-        parts.append("크레딧 \(label)")
+        parts.append(L10n.grokCredits(label))
     }
     return parts.isEmpty ? nil : parts.joined(separator: " · ")
 }

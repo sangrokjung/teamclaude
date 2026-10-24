@@ -65,7 +65,7 @@ struct TeamCodexPoolAccount {
     }
 
     func resetCreditLabel(at now: Date, online: Bool) -> String {
-        resetCreditCount(at: now, online: online).map { "\($0)장" } ?? "미확인"
+        resetCreditCount(at: now, online: online).map { L10n.creditCount($0) } ?? L10n.unconfirmed
     }
 
     func sessionUsagePercent(at now: Date) -> Double? {
@@ -157,22 +157,22 @@ struct TeamCodexPoolHealth {
             let result = sum.addingReportingOverflow(count)
             return result.overflow ? Int.max : result.partialValue
         }
-        if counts.isEmpty && unknown > 0 { return "활성 풀 리셋권 미확인 \(unknown)계정" }
-        return "활성 풀 리셋권 \(total)장" + (unknown > 0 ? " · 미확인 \(unknown)계정" : "")
+        if counts.isEmpty && unknown > 0 { return L10n.creditsUnknownAccounts(unknown) }
+        return L10n.creditsTotal(total) + (unknown > 0 ? L10n.creditsUnknownSuffix(unknown) : "")
     }
 
     var resetCreditPolicyLabel: String {
-        guard serverReachable, let enabled = resetCreditsEnabled else { return "자동 리셋 상태 미확인" }
-        if !enabled { return "자동 리셋 꺼짐" }
+        guard serverReachable, let enabled = resetCreditsEnabled else { return L10n.autoResetUnknown }
+        if !enabled { return L10n.autoResetOff }
         switch resetCreditsPolicy {
-        case "account": return "계정별 한도 소진 시 자동 리셋"
-        case "fleet": return "전체 풀 소진 시 자동 리셋"
-        default: return "자동 리셋 정책 미확인"
+        case "account": return L10n.autoResetAccount
+        case "fleet": return L10n.autoResetFleet
+        default: return L10n.autoResetPolicyUnknown
         }
     }
 
     var resetCreditAccessibilitySummary: String {
-        let rows = accounts.map { "\($0.name) 리셋권 \($0.resetCreditLabel(at: checkedAt, online: serverReachable))" }
+        let rows = accounts.map { L10n.creditsAccessibility($0.name, $0.resetCreditLabel(at: checkedAt, online: serverReachable)) }
         return ([resetCreditPolicyLabel, resetCreditSummary] + rows).joined(separator: ", ")
     }
 
@@ -217,17 +217,17 @@ struct TeamCodexPoolHealth {
     }
 
     var statusLabel: String {
-        if !serverReachable { return "오프라인" }
-        return isExhausted ? "소진" : "온라인"
+        if !serverReachable { return L10n.poolOffline }
+        return isExhausted ? L10n.poolExhausted : L10n.poolOnline
     }
 
     func titleSlot(timeZone: TimeZone = .current) -> String {
-        if !serverReachable { return "Codex 오프라인" }
+        if !serverReachable { return L10n.titleCodexOffline }
         if isExhausted {
             if let at = soonestQuotaRecoveryAt {
-                return "Codex 소진 · \(teamCodexShortClock(at, timeZone: timeZone)) 복구"
+                return L10n.titleCodexExhaustedUntil(teamCodexShortClock(at, timeZone: timeZone))
             }
-            return "Codex 소진 0/\(poolCount)"
+            return L10n.titleCodexExhausted(poolCount)
         }
         return "Codex \(usableCount)/\(poolCount)"
     }
@@ -235,8 +235,7 @@ struct TeamCodexPoolHealth {
     var titleSlot: String { titleSlot(timeZone: .current) }
 
     var accessibilitySummary: String {
-        "TeamCodex \(statusLabel), 지금 쓸 수 있는 계정 \(usableCount)개, "
-            + "풀에 남은 계정 \(poolCount)개, 풀에서 빠진 계정 \(excludedCount)개"
+        L10n.teamCodexAccessibility(statusLabel, usableCount, poolCount, excludedCount)
     }
 }
 
@@ -311,37 +310,37 @@ private func teamCodexTimestamp(_ value: Any?) -> Date? {
 }
 
 func formatTeamCodexResetRemaining(_ date: Date?, now: Date = Date()) -> String {
-    guard let date else { return "시각 미측정" }
+    guard let date else { return L10n.timeNotMeasured }
     let seconds = Int(date.timeIntervalSince(now))
-    if seconds <= 0 { return "갱신 확인 중" }
+    if seconds <= 0 { return L10n.checkingRenewal }
 
     let minutes = seconds / 60
-    if minutes < 60 { return "\(max(1, minutes))분 후" }
+    if minutes < 60 { return L10n.inDuration(L10n.durationMinutes(max(1, minutes))) }
 
     let hours = minutes / 60
     let remainingMinutes = minutes % 60
     if hours < 24 {
         return remainingMinutes == 0
-            ? "\(hours)시간 후"
-            : "\(hours)시간 \(remainingMinutes)분 후"
+            ? L10n.inDuration(L10n.durationHours(hours))
+            : L10n.inDuration(L10n.durationHoursMinutes(hours, remainingMinutes))
     }
 
     let days = hours / 24
     let remainingHours = hours % 24
     return remainingHours == 0
-        ? "\(days)일 후"
-        : "\(days)일 \(remainingHours)시간 후"
+        ? L10n.inDuration(L10n.durationDays(days))
+        : L10n.inDuration(L10n.durationDaysHours(days, remainingHours))
 }
 
 func teamAccountErrorReasonLabel(_ reason: String?) -> String {
     switch reason {
-    case "subscription-disabled": return "조직차단"
-    case "subscription-ended": return "구독종료"
-    case "auth-revoked": return "인증만료"
-    case "auth-rejected": return "인증거부"
-    case "refresh-failed": return "갱신실패"
-    case "send-failed": return "송신실패"
-    default: return "오류"
+    case "subscription-disabled": return L10n.errOrgBlocked
+    case "subscription-ended": return L10n.errPlanEnded
+    case "auth-revoked": return L10n.errAuthExpired
+    case "auth-rejected": return L10n.errAuthRejected
+    case "refresh-failed": return L10n.errRefreshFailed
+    case "send-failed": return L10n.errSendFailed
+    default: return L10n.errGeneric
     }
 }
 
@@ -396,22 +395,22 @@ func teamCodexAccountStateLabel(
     errorReason: String?
 ) -> String {
     switch state {
-    case .retired: return "구독종료"
+    case .retired: return L10n.errPlanEnded
     // Claude 풀 표(TeamClaudeMeasurementIssue.disabled)와 같은 낱말을 쓴다.
     // 한 창에서 두 표를 읽는 사람이 같은 개념에 두 단어를 배우게 하지 않는다.
-    case .excluded: return "비활성"
+    case .excluded: return L10n.stateInactive
     case .failed: return teamAccountErrorReasonLabel(errorReason)
-    case .endDateReached: return "종료확인중"
-    case .limited: return "한도소진"
-    case .paused: return "일시대기"
-    case .serving: return "사용 중"
+    case .endDateReached: return L10n.codexStateEndCheck
+    case .limited: return L10n.codexStateExhausted
+    case .paused: return L10n.codexStatePaused
+    case .serving: return L10n.stateInUse
     case .other:
         switch status {
-        case "available": return "대기"
-        case "configured": return "설정됨"
-        case "disabled": return "비활성"
-        case "exhausted": return "한도소진"
-        case "throttled": return "일시대기"
+        case "available": return L10n.codexStateWaiting
+        case "configured": return L10n.codexStateConfigured
+        case "disabled": return L10n.stateInactive
+        case "exhausted": return L10n.codexStateExhausted
+        case "throttled": return L10n.codexStatePaused
         default: return status
         }
     }
@@ -439,13 +438,13 @@ func teamCodexAccountNote(
     switchThresholdPercent: Double,
     now: Date = Date()
 ) -> String? {
-    if account.isSubscriptionRetired(now: now) { return "돌아오지 않음" }
-    if account.isSubscriptionEndDateReached(now: now) { return "종료일 지남 · 연결 확인 중" }
+    if account.isSubscriptionRetired(now: now) { return L10n.codexNoteRetired }
+    if account.isSubscriptionEndDateReached(now: now) { return L10n.codexNoteEndDate }
     // 오류가 상태 칸을 가져가더라도 "직접 껐다"는 사실은 보조줄이 계속 말한다.
-    if !account.enabled { return "직접 꺼 둔 계정" }
+    if !account.enabled { return L10n.codexNoteDisabled }
     guard account.isSubscriptionEnding(now: now) else { return nil }
-    guard let endsAt = account.subscriptionEndsAt, endsAt > now else { return "구독 종료 예정" }
-    return "구독 종료 예정 · " + formatTeamCodexResetRemaining(endsAt, now: now)
+    guard let endsAt = account.subscriptionEndsAt, endsAt > now else { return L10n.codexNoteEnding }
+    return L10n.codexNoteEnding + " · " + formatTeamCodexResetRemaining(endsAt, now: now)
 }
 
 /// 풀에서 빠진 계정을 그 자리에서 되돌리는 방법.
@@ -470,11 +469,11 @@ struct TeamCodexAccountRecovery: Equatable {
 
 /// 다시 켠 계정이 실행 중 서버에 즉시 반영된다는 보장이 없다.
 /// CLI는 워커에 SIGHUP을 시도하고, 실패하면 "Apply the change with: teamcodex restart"를 찍는다.
-let teamCodexEnableFollowUpNote = "다시 켠 뒤 터미널 안내를 확인하세요 · 반영되지 않으면 teamcodex restart"
+var teamCodexEnableFollowUpNote: String { L10n.codexEnableFollowUp }
 
 /// 꺼져 있으면서 인증까지 깨진 계정. 다시 켜도 빨간 상태가 남는다는 사실을 먼저 말한다.
 /// (다시 켜기 전에는 CLI reauth가 disabled 계정을 거부하므로 버튼은 여전히 "다시 켜기" 하나뿐이다.)
-let teamCodexEnableThenReauthFollowUpNote = "다시 켠 뒤에도 인증 오류면 재인증이 필요합니다 · 반영은 teamcodex restart"
+var teamCodexEnableThenReauthFollowUpNote: String { L10n.codexEnableThenReauthFollowUp }
 
 /// 계정 한 줄에 어떤 되돌리기 버튼을 붙일지 정한다. 붙일 것이 없으면 nil.
 ///
@@ -522,10 +521,10 @@ func teamCodexAccountRecovery(
             : teamCodexEnableFollowUpNote
         return TeamCodexAccountRecovery(
             kind: .enable,
-            title: "다시 켜기",
+            title: L10n.reEnable,
             arguments: ["codex", "enable", account.name],
-            accessibilityLabel: "다시 켜기: \(account.name)",
-            toolTip: "\(account.name) 계정을 다시 풀에 넣습니다. \(followUpNote)",
+            accessibilityLabel: L10n.reEnableLabel(account.name),
+            toolTip: L10n.reEnableToolTip(account.name, followUpNote),
             followUpNote: followUpNote
         )
     }
@@ -544,10 +543,10 @@ func teamCodexAccountRecovery(
     // 같은 동작에 두 낱말을 배우게 하지 않는다(버튼 폭은 양쪽 다 이 제목이 들어간다).
     return TeamCodexAccountRecovery(
         kind: .reauth,
-        title: "재인증 필요",
+        title: L10n.reauthNeeded,
         arguments: ["codex", "reauth", account.name, "--account-uuid", accountUuid],
-        accessibilityLabel: "재인증 필요: \(account.name)",
-        toolTip: "\(account.name) 계정의 Codex 인증을 다시 연결합니다.",
+        accessibilityLabel: L10n.reauthNeededLabel(account.name),
+        toolTip: L10n.codexReauthToolTip(account.name),
         followUpNote: nil
     )
 }

@@ -30,7 +30,7 @@ private let burnNumberFormatter: NumberFormatter = {
 
 /// 단가가 없으면 숫자를 만들지 않는다.
 func burnAmountLabel(_ monthly: Int?, accounts: Int, currency: String = "") -> String {
-    guard let monthly else { return "미입력" }
+    guard let monthly else { return L10n.notEntered }
     let total = monthly * max(accounts, 0)
     return currency + (burnNumberFormatter.string(from: NSNumber(value: total)) ?? "\(total)")
 }
@@ -41,30 +41,30 @@ private func burnPercent(_ value: Double) -> String { "\(Int((value * 100).round
 func burnProjectionLabel(_ projection: BurnProjection) -> String {
     switch projection.basis {
     case .collecting:
-        return "수집 중"
+        return L10n.burnCollecting
     case .unmeasured:
         return StatusVocabulary.notMeasured
     case .history(let cycles):
         guard let projected = projection.projected else { return StatusVocabulary.notMeasured }
-        let base = "최근 \(cycles)주 평균 \(burnPercent(projected))"
+        let base = L10n.burnHistory(cycles: cycles, percent: burnPercent(projected))
         guard let range = projection.range else { return base }
         return "\(base) · \(burnPercent(range.lowerBound))~\(burnPercent(range.upperBound))"
     case .extrapolation(let confidence):
         guard let current = projection.current, let projected = projection.projected else {
             return StatusVocabulary.notMeasured
         }
-        let base = "\(burnPercent(current)) → \(burnPercent(projected)) 추정"
-        return confidence == .low ? "\(base) · 신뢰 낮음" : base
+        let base = L10n.burnEstimate(burnPercent(current), burnPercent(projected))
+        return confidence == .low ? "\(base) · \(L10n.lowConfidence)" : base
     }
 }
 
 func burnVerdictLabel(_ verdict: BurnVerdict) -> String {
     switch verdict {
-    case .blocked: return "부족"
-    case .onTarget: return "달성"
-    case .near: return "근접"
-    case .slack: return "여유"
-    case .excess: return "과다"
+    case .blocked: return L10n.verdictBlocked
+    case .onTarget: return L10n.verdictOnTarget
+    case .near: return L10n.verdictNear
+    case .slack: return L10n.verdictSlack
+    case .excess: return L10n.verdictExcess
     case .unknown: return StatusVocabulary.notMeasured
     }
 }

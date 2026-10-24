@@ -6,12 +6,12 @@ struct CodexModelRecommendation: Equatable {
     let effort: String
 }
 
-let codexModelRecommendations = [
-    CodexModelRecommendation(task: "구현·설계", model: "gpt-5.6", effort: "medium · 복잡하면 high"),
-    CodexModelRecommendation(task: "리뷰·보안", model: "gpt-5.6-sol", effort: "high / xhigh"),
-    CodexModelRecommendation(task: "탐색·병렬", model: "gpt-5.6-terra", effort: "low / medium"),
-    CodexModelRecommendation(task: "분류·반복", model: "gpt-5.6-luna", effort: "none / low"),
-]
+var codexModelRecommendations: [CodexModelRecommendation] { [
+    CodexModelRecommendation(task: L10n.codexTaskBuild, model: "gpt-5.6", effort: L10n.codexEffortBuild),
+    CodexModelRecommendation(task: L10n.codexTaskReview, model: "gpt-5.6-sol", effort: "high / xhigh"),
+    CodexModelRecommendation(task: L10n.codexTaskExplore, model: "gpt-5.6-terra", effort: "low / medium"),
+    CodexModelRecommendation(task: L10n.codexTaskTriage, model: "gpt-5.6-luna", effort: "none / low"),
+] }
 
 struct CodexProfileHealth {
     let profile: String
@@ -90,17 +90,17 @@ struct CodexHealth {
     var isError: Bool { overallStatus == "error" }
 
     var titleSlot: String {
-        if isError { return "Codex 재인증" }
-        if !authPresent || (!hasApiKey && !hasTokens) { return "Codex 로그인" }
-        if errorEvents > 0 { return "Codex 주의 \(errorEvents)" }
-        if isWarning && todayTokens == 0 { return "Codex 주의" }
+        if isError { return L10n.titleCodexReauth }
+        if !authPresent || (!hasApiKey && !hasTokens) { return L10n.titleCodexLogin }
+        if errorEvents > 0 { return L10n.titleCodexWarningCount(errorEvents) }
+        if isWarning && todayTokens == 0 { return L10n.titleCodexWarning }
         return "Codex \(formatCodexTokens(todayTokens))/d"
     }
 
     var statusLabel: String {
-        if isError { return "재인증" }
-        if isWarning { return "주의" }
-        return "정상"
+        if isError { return L10n.reauthenticate }
+        if isWarning { return L10n.statusWarning }
+        return L10n.statusOK
     }
 
     var accessibilitySummary: String {

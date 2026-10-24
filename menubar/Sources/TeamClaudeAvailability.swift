@@ -25,35 +25,35 @@ func teamClaudeFableAvailability(
             subscriptionAppearance: appearance ?? subscriptionAppearance)
     }
     if subscription.confirmation?.state == .ended || row.errorReason == "subscription-ended" {
-        return result(.excluded, "구독 종료 · 이용 불가", .ended)
+        return result(.excluded, L10n.reasonPlanEnded, .ended)
     }
     if row.status == "error" {
         return result(.excluded, teamAccountErrorReasonLabel(row.errorReason), .standard)
     }
     if let reason = row.errorReason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return result(.unconfirmed, teamAccountErrorReasonLabel(reason) + " · 상태 확인 필요", .standard)
+        return result(.unconfirmed, L10n.reasonErrorCheck(teamAccountErrorReasonLabel(reason)), .standard)
     }
-    if !row.enabled { return result(.excluded, "비활성 · 직접 꺼 둔 계정") }
+    if !row.enabled { return result(.excluded, L10n.reasonDisabled) }
     if let provider = row.provider, provider != "anthropic" {
-        return result(.excluded, "Claude 계정 아님")
+        return result(.excluded, L10n.reasonNotClaude)
     }
     if !health.serverReachable { return result(.unconfirmed, TeamClaudeRowReason.offline) }
     guard ["active", "throttled", "exhausted"].contains(row.status) else {
-        return result(.unconfirmed, "서버 상태 확인 필요")
+        return result(.unconfirmed, L10n.reasonServerState)
     }
     if subscriptionAppearance == .endDateReached {
-        return result(.unconfirmed, "구독 종료일 경과 · 확인 필요", .endDateReached)
+        return result(.unconfirmed, L10n.reasonEndDatePassed, .endDateReached)
     }
     if subscription.appearance(now: now) == .endDateReached {
-        return result(.unconfirmed, "구독 종료일 경과 · 확인 필요", .endDateReached)
+        return result(.unconfirmed, L10n.reasonEndDatePassed, .endDateReached)
     }
     let elapsed = now.timeIntervalSince(health.checkedAt)
     guard elapsed >= 0, elapsed < 60, row.fableMeasurementCurrent else {
         return result(.unconfirmed, TeamClaudeRowReason.measurementStale)
     }
     var windows: [(String, Double?, Int?)] = [
-        ("세션", row.sessionPercent, row.sessionResetSeconds),
-        ("전체 주간", row.weeklyPercent, row.weeklyResetSeconds)
+        (L10n.sessionShort, row.sessionPercent, row.sessionResetSeconds),
+        (L10n.windowAllWeekly, row.weeklyPercent, row.weeklyResetSeconds)
     ]
     if includeFable { windows.append(("Fable", row.fablePercent, row.fableResetSeconds)) }
     let threshold = health.quotaThresholdPercent
@@ -61,28 +61,28 @@ func teamClaudeFableAvailability(
         return result(.unconfirmed, TeamClaudeRowReason.thresholdUnknown)
     }
     if [row.sessionResetAt, row.weeklyResetAt, includeFable ? row.fableResetAt : nil].compactMap({ $0 }).contains(where: { now >= $0 }) {
-        return result(.unconfirmed, "한도 리셋 경과 · 재측정 필요")
+        return result(.unconfirmed, L10n.reasonResetPassed)
     }
     if windows.contains(where: { _, _, reset in reset.map { Double($0) <= elapsed } ?? false }) {
-        return result(.unconfirmed, "한도 리셋 경과 · 재측정 필요")
+        return result(.unconfirmed, L10n.reasonResetPassed)
     }
-    if row.status == "throttled" { return result(.limited, "일시 제한 해제 대기") }
-    if row.status == "exhausted" { return result(.limited, "사용 한도 리셋 대기") }
+    if row.status == "throttled" { return result(.limited, L10n.reasonThrottled) }
+    if row.status == "exhausted" { return result(.limited, L10n.reasonQuotaReset) }
     let blocked = windows.filter { _, percent, reset in
         guard let percent, percent.isFinite, let reset, reset > 0 else { return false }
         return percent >= threshold
     }.map { $0.0 }
-    if !blocked.isEmpty { return result(.limited, blocked.joined(separator: "·") + " 한도 대기") }
-    if row.usableFromProxy == false { return result(.excluded, "프록시 라우팅 제외") }
-    guard row.usableFromProxy == true else { return result(.unconfirmed, "프록시 사용 가능 여부 미확인") }
+    if !blocked.isEmpty { return result(.limited, L10n.reasonWindowsBlocked(blocked.joined(separator: "·"))) }
+    if row.usableFromProxy == false { return result(.excluded, L10n.reasonProxyExcluded) }
+    guard row.usableFromProxy == true else { return result(.unconfirmed, L10n.reasonProxyUnknown) }
     guard let inflight = row.inflightCount, inflight >= 0,
           let capacity = row.concurrentCapacity, capacity > 0 else {
-        return result(.unconfirmed, "동시 요청 여유 미확인")
+        return result(.unconfirmed, L10n.reasonConcurrencyUnknown)
     }
-    if inflight >= capacity { return result(.limited, "동시 요청 처리 중") }
+    if inflight >= capacity { return result(.limited, L10n.reasonConcurrencyBusy) }
     for (name, percent, reset) in windows {
         guard let percent, percent.isFinite, percent >= 0,
-              let reset, reset > 0 else { return result(.unconfirmed, name + " 한도 확인 필요") }
+              let reset, reset > 0 else { return result(.unconfirmed, L10n.reasonWindowCheck(name)) }
     }
     return result(.ready, includeFable ? TeamClaudeRowReason.fableReady : TeamClaudeRowReason.opusReady)
 }
@@ -90,7 +90,7 @@ func teamClaudeFableAvailability(
 func teamClaudeResetLabel(_ seconds: Int?, checkedAt: Date, now: Date, resetAt: Date? = nil) -> String {
     guard let seconds else { return formatTeamClaudeDuration(nil) }
     let remaining = resetAt?.timeIntervalSince(now) ?? (Double(seconds) - max(0, now.timeIntervalSince(checkedAt)))
-    return remaining > 0 ? formatTeamClaudeDuration(Int(remaining.rounded(.up))) : "재측정"
+    return remaining > 0 ? formatTeamClaudeDuration(Int(remaining.rounded(.up))) : L10n.remeasure
 }
 
 extension TeamClaudeHealth {

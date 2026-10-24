@@ -11,16 +11,16 @@ import Foundation
 /// 정보가 없어 행에서 빼도 되는 사유 문구.
 /// TeamClaudeAvailability가 같은 상수를 쓰므로 문자열이 두 군데서 따로 바뀌지 않는다.
 enum TeamClaudeRowReason {
-    static let fableReady = "Fable 사용 가능"
-    static let opusReady = "Opus 사용 가능"
-    static let offline = "오프라인 · 확인 필요"
-    static let thresholdUnknown = "한도 기준 확인 필요"
-    static let measurementStale = "최신 한도 측정 필요"
+    static var fableReady: String { L10n.reasonFableReady }
+    static var opusReady: String { L10n.reasonOpusReady }
+    static var offline: String { L10n.reasonOffline }
+    static var thresholdUnknown: String { L10n.reasonThresholdUnknown }
+    static var measurementStale: String { L10n.reasonMeasurementStale }
 
     /// 상태 점(초록)이나 헤더 요약("N개 계정 확인 필요")이 이미 말하는 문구, 또는 계정별 원인이 아니라
     /// 서버 전체 조건(오프라인·한도 기준 없음·측정 지연)이라 모든 행에 똑같이 찍히는 문구.
     /// 오류·인증 거부·비활성·한도 초과·구독 종료 같은 계정별 문제 사유는 여기 넣지 않는다 — 그 문구가 이 표의 핵심이다.
-    static let uninformative: Set<String> = [fableReady, opusReady, offline, thresholdUnknown, measurementStale]
+    static var uninformative: Set<String> { [fableReady, opusReady, offline, thresholdUnknown, measurementStale] }
 }
 
 /// 2행(사유)을 그릴지. 위 목록 밖의 문구는 전부 그린다.
@@ -65,13 +65,13 @@ enum TeamClaudeRowMetrics {
 enum TeamClaudeColumns {
     static let padding: CGFloat = 16
     static let nameX: CGFloat = 16
-    static let nameWidth: CGFloat = 140
-    static let meterWidth: CGFloat = 82
-    static let sessionX: CGFloat = 164
-    static let weeklyX: CGFloat = 254
-    static let fableX: CGFloat = 344
-    /// 상태 열 오른쪽 끝은 표 폭 - padding.
-    static let statusX: CGFloat = 434
+    static let nameWidth: CGFloat = 120
+    static let meterWidth: CGFloat = 80
+    static let sessionX: CGFloat = 144
+    static let weeklyX: CGFloat = 232
+    static let fableX: CGFloat = 320
+    /// 상태 열은 여기서 표 폭 - padding까지(오른쪽 정렬, 맨 끝 14pt는 펼침 표시).
+    static let statusX: CGFloat = 408
 }
 
 /// 행을 묶는 상태(사용 가능 · 한도 대기 · 확인 필요 · 제외). 표는 이 순서로 묶어 그린다.

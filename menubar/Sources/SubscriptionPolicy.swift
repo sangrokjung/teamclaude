@@ -76,18 +76,18 @@ func burnNeededAccounts(_ usage: LaneUsage) -> Int? {
 func burnRecommendations(_ usages: [LaneUsage]) -> [String] {
     var lines: [String] = []
     let errors = usages.reduce(0) { $0 + $1.errorAccounts }
-    if errors > 0 { lines.append("오류 \(errors)개 재인증이 먼저") }
+    if errors > 0 { lines.append(L10n.recErrorsFirst(errors)) }
     // 해지된 계정은 살릴 수 없다. "재인증"이라고 하면 없는 계정을 살리려 든다.
     let unsubscribed = usages.reduce(0) { $0 + $1.unsubscribedAccounts }
-    if unsubscribed > 0 { lines.append("해지 \(unsubscribed)개 풀에서 정리") }
+    if unsubscribed > 0 { lines.append(L10n.recUnsubscribed(unsubscribed)) }
     let disabled = usages.reduce(0) { $0 + $1.disabledAccounts }
-    if disabled > 0 { lines.append("꺼 둔 \(disabled)개 유지 여부 결정") }
+    if disabled > 0 { lines.append(L10n.recDisabled(disabled)) }
     for usage in usages where burnVerdict(usage) == .excess {
         if usage.paidAccounts > 1, let needed = burnNeededAccounts(usage),
            needed < usage.contributingAccounts {
-            lines.append("\(usage.lane) \(usage.contributingAccounts - needed)개 줄일 여지")
+            lines.append(L10n.recReduce(usage.lane, usage.contributingAccounts - needed))
         } else if usage.paidAccounts == 1 {
-            lines.append("\(usage.lane) 다운그레이드 검토")
+            lines.append(L10n.recDowngrade(usage.lane))
         }
     }
     return lines

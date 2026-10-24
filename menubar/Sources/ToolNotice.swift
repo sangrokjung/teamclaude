@@ -14,10 +14,10 @@ enum MenubarTool: String, CaseIterable {
         case .teamcodex: return "TeamCodex"
         case .codex: return "Codex"
         case .higgsfield: return "Higgsfield"
-        case .ccusage: return "사용량"
+        case .ccusage: return L10n.sectionUsage
         case .grok: return "Grok"
         case .agy: return "agy"
-        case .subscription: return "구독 수집기"
+        case .subscription: return L10n.toolSubscriptionCollector
         }
     }
 }
@@ -42,25 +42,25 @@ private func notInstalled(_ tool: MenubarTool, detail: String) -> ToolNotice {
 }
 
 private func envHint(_ key: String) -> String {
-    "설치돼 있다면 \(key)로 경로를 지정하세요"
+    L10n.envHint(key)
 }
 
 /// 설정 파일도, 응답하는 서버도, 계정도 없으면 TeamClaude를 쓰지 않는 맥이다.
 /// 설정이 있는데 서버만 꺼졌으면 기존 "오프라인" 화면이 맞으므로 nil.
 func teamClaudeToolNotice(configPresent: Bool, serverReachable: Bool, accountCount: Int) -> ToolNotice? {
     guard !configPresent, !serverReachable, accountCount == 0 else { return nil }
-    return notInstalled(.teamclaude, detail: "설정 파일(~/.config/teamclaude.json)과 실행 중인 서버가 없습니다")
+    return notInstalled(.teamclaude, detail: L10n.noticeNoConfigOrServer("~/.config/teamclaude.json"))
 }
 
 func teamCodexToolNotice(configPresent: Bool, serverReachable: Bool, accountCount: Int) -> ToolNotice? {
     guard !configPresent, !serverReachable, accountCount == 0 else { return nil }
-    return notInstalled(.teamcodex, detail: "설정 파일(~/.config/teamcodex.json)과 실행 중인 서버가 없습니다")
+    return notInstalled(.teamcodex, detail: L10n.noticeNoConfigOrServer("~/.config/teamcodex.json"))
 }
 
 /// Codex CLI의 인증·설정·세션 기록도, 호출 기록(calls.jsonl)도 없으면 미설치다.
 func codexToolNotice(authPresent: Bool, configPresent: Bool, scannedLogFiles: Int, totalCalls: Int) -> ToolNotice? {
     guard !authPresent, !configPresent, scannedLogFiles == 0, totalCalls == 0 else { return nil }
-    return notInstalled(.codex, detail: "~/.codex의 인증·설정·세션 기록이 없습니다")
+    return notInstalled(.codex, detail: L10n.noticeNoCodex)
 }
 
 /// Codex 섹션은 로컬 Codex와 TeamCodex 풀을 함께 그린다. 둘 다 없을 때만 섹션을 안내로 바꾼다.
@@ -68,7 +68,7 @@ func codexSectionToolNotice(codex: ToolNotice?, teamCodex: ToolNotice?) -> ToolN
     guard codex != nil, teamCodex != nil else { return nil }
     return ToolNotice(tool: .codex, kind: .notInstalled,
                       headline: "Codex·TeamCodex \(StatusVocabulary.notInstalled)",
-                      detail: "Codex CLI 기록과 TeamCodex 설정이 없습니다")
+                      detail: L10n.noticeNoCodexSection)
 }
 
 func higgsfieldToolNotice(installed: Bool) -> ToolNotice? {
@@ -80,13 +80,13 @@ func higgsfieldToolNotice(installed: Bool) -> ToolNotice? {
 func ccusageToolNotice(installed: Bool, loadFinished: Bool, hasData: Bool) -> ToolNotice? {
     if !installed {
         return ToolNotice(tool: .ccusage, kind: .notInstalled,
-                          headline: "사용량 \(StatusVocabulary.notInstalled)",
-                          detail: "ccusage를 실행할 npx(Node.js)가 없습니다 · \(envHint("CC_MENUBAR_NPX_BIN"))")
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.notInstalled)",
+                          detail: L10n.noticeNoNpx(envHint("CC_MENUBAR_NPX_BIN")))
     }
     guard loadFinished, !hasData else { return nil }
     return ToolNotice(tool: .ccusage, kind: .noData,
-                      headline: "사용량 \(StatusVocabulary.noData)",
-                      detail: "Claude Code 사용 기록이 아직 없습니다")
+                      headline: "\(L10n.sectionUsage) \(StatusVocabulary.noData)",
+                      detail: L10n.noticeNoClaudeUsage)
 }
 
 /// grok CLI도 인증 파일도 없을 때만 미설치. CLI가 있으면 기존 "Grok 로그인"이 맞다.
@@ -102,8 +102,8 @@ func agyToolNotice() -> ToolNotice {
 /// R4: 구독 수집기는 우리 맥에서만 켜는 선택 기능이다. 상태 파일이 없으면 오류가 아니라 안내다.
 func subscriptionCollectorToolNotice(stateFileExists: Bool) -> ToolNotice? {
     stateFileExists ? nil : ToolNotice(tool: .subscription, kind: .notInstalled,
-                                       headline: "수집기 미설치(선택 기능)",
-                                       detail: "구독 확인 수집기가 없어 결제 메일·청구 페이지 확인은 건너뜁니다")
+                                       headline: L10n.noticeCollectorHeadline,
+                                       detail: L10n.noticeCollectorDetail)
 }
 
 func subscriptionCollectorToolNotice(home: String) -> ToolNotice? {
