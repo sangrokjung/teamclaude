@@ -65,6 +65,10 @@ struct ToolNoticeTests {
         precondition(ccusageStaleNote(outcome: .failed(.timeout(seconds: 60)), hasData: false) == nil)
         precondition(ccusageStaleNote(outcome: .loaded, hasData: true) == nil)
         precondition(ccusageStaleNote(outcome: nil, hasData: true) == nil)
+        // 지난 기록은 있는데 오늘 날짜 항목이 없으면 오늘이 0으로 보이는 이유를 붙인다. 기록이 아예 없으면 안내 카드 몫.
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true) == "오늘 사용 기록 없음")
+        precondition(ccusageStaleNote(outcome: .noData, hasData: false) == nil)
+        precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: true) == nil)
 
         // 판정 순서: 실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석. 해석한 빈 결과만 noData.
         func outcome(launched: Bool = true, timedOut: Bool = false, exit: Int32 = 0, bytes: Int = 10,

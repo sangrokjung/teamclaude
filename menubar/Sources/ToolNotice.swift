@@ -144,10 +144,15 @@ func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: B
     }
 }
 
-/// 이전 값을 남긴 채 갱신이 실패했을 때 사용량 카드·헤더에 붙는 꼬리말. 그 외에는 nil.
+/// 사용량 카드·헤더에 붙는 꼬리말. 이전 값을 남긴 채 갱신이 실패했거나, 지난 기록은 읽었는데 오늘 날짜 항목이
+/// 없을 때(오늘은 0으로 보인다). 그 외에는 nil.
 func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool) -> String? {
-    guard hasData, case .failed(let failure)? = outcome else { return nil }
-    return "갱신 실패(\(failure.label)) · 이전 값"
+    guard hasData, let outcome else { return nil }
+    switch outcome {
+    case .loaded: return nil
+    case .noData: return "오늘 사용 기록 없음"
+    case .failed(let failure): return "갱신 실패(\(failure.label)) · 이전 값"
+    }
 }
 
 /// grok CLI도 인증 파일도 없을 때만 미설치. CLI가 있으면 기존 "Grok 로그인"이 맞다.

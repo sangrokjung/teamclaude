@@ -1249,15 +1249,34 @@ struct CcusageDailyLoad {
     let rate: Double
 }
 
+/// ccusage가 쓰는 날짜 키(로컬 시간 yyyy-MM-dd).
+func ccusageDayKey(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd"
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    return formatter.string(from: date)
+}
+
+/// ccusage daily 원시 JSON에 그 날짜 항목이 정확히 있는가. 해석하지 못하면 nil.
+func ccusageDailyHasEntry(_ data: Data, period: String) -> Bool? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let daily = json["daily"] as? [[String: Any]] else { return nil }
+    return daily.contains { ($0["period"] as? String) == period }
+}
+
 /// daily를 실행하고 실행 실패·시간 초과·종료 코드·빈 출력·해석 실패를 "데이터 없음"과 갈라 판정한다.
 func loadCcusageDaily(timeoutSeconds: Double) -> CcusageDailyLoad {
+    let todayKey = ccusageDayKey(Date())
     let run = runCcusageCommand("daily", timeoutSeconds: timeoutSeconds)
     let output = run.successOutput
     let rate = output == nil ? 0 : fetchUsdKrwRate()
     let quick = output.flatMap { parseUsageData(daily: $0, weekly: nil, monthly: nil, rate: rate) }
+    // "오늘 읽었다"는 원시 daily에 정확히 오늘 날짜 항목이 있을 때만이다. quick.today는 표시용 값이라
+    // (지난 기록만 있으면 0원짜리 오늘) 판정에 쓰지 않는다.
+    let hasExactToday = quick == nil ? nil : output.flatMap { ccusageDailyHasEntry($0, period: todayKey) }
     let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
                                      exitStatus: run.exitStatus, outputBytes: run.output.count,
-                                     parsedHasToday: quick.map { $0.today != nil })
+                                     parsedHasToday: hasExactToday)
     if case .failed(let failure) = outcome {
         print("CCUSAGE-FAIL[daily]: \(failure.label)")
         fflush(stdout)
@@ -1538,8 +1557,12 @@ func parseUsageData(daily dailyData: Data, weekly weeklyData: Data?, monthly mon
         ))
     }
 
-    // 오늘 데이터
-    let today = days.first(where: { $0.period == todayStr }) ?? days.last
+    // 오늘 데이터 — 정확히 오늘 날짜 항목만 오늘로 쓴다. 마지막 항목(어제일 수 있다)을 오늘로 쓰지 않는다.
+    // ccusage daily는 기록이 있는 날만 내므로, 지난 기록은 있는데 오늘 항목이 없으면 오늘 사용은 0이다.
+    // 그때는 0원짜리 오늘을 두어 주·월·누적 같은 지난 기록 표시는 유지한다. 기록이 아예 없으면 nil(데이터 없음).
+    let today = days.first(where: { $0.period == todayStr })
+        ?? (days.isEmpty ? nil : DailyUsage(period: todayStr, totalCost: 0, inputTokens: 0, cacheCreationTokens: 0,
+                                            cacheReadTokens: 0, outputTokens: 0, models: []))
 
     // 주간 비용: 최근 7일
     let recentDays = Array(days.suffix(7))

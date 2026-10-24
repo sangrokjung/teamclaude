@@ -22,6 +22,10 @@ case "$(cat "$dir/mode")" in
   empty) exit 0 ;;
   nodata) echo '{"daily":[],"totals":{}}' ;;
   today) cat "$dir/today.json" ;;
+  yesterday) cat "$dir/yesterday.json" ;;
+  slow)
+    if [ "$3" = daily ]; then head -c 20 "$dir/today.json"; sleep 0.5; tail -c +21 "$dir/today.json"
+    else echo '{}'; fi ;;
   hang) trap '' TERM; exec /bin/sleep 30 ;;
 esac
 """
@@ -53,6 +57,12 @@ class UsageLoadOutcomeTests(unittest.TestCase):
                 "daily": [{"period": today, "totalCost": 1.25, "inputTokens": 10, "outputTokens": 5,
                            "cacheCreationTokens": 0, "cacheReadTokens": 0}],
                 "totals": {"totalCost": 1.25, "totalTokens": 15},
+            }))
+            yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+            (fake / "yesterday.json").write_text(json.dumps({
+                "daily": [{"period": yesterday, "totalCost": 7.77, "inputTokens": 70, "outputTokens": 7,
+                           "cacheCreationTokens": 0, "cacheReadTokens": 0}],
+                "totals": {"totalCost": 7.77, "totalTokens": 77},
             }))
             home = folder / "home"
             home.mkdir()
