@@ -10,7 +10,7 @@
 - 테스트: 빈 HOME 스냅샷(A1).
 
 ## Task 2: CLI 탐색 일반화 (R2)
-- 공용 `ToolLocator`: env 재정의 → 로그인 셸 `command -v`(2초 제한, 프로세스 수명 동안 캐시) → 기존 후보 + npm prefix·nvm·Volta. 기존 개별 탐색 함수는 이 locator를 호출한다. 후보 목록은 지금 것을 모두 포함한다.
+- 공용 `ToolLocator`: env 재정의 → 기존 후보 → 로그인 셸 `command -v`(2초 제한, 프로세스 수명 동안 캐시, 기존 후보가 없을 때만) → Homebrew·npm prefix·fnm·nvm·Volta·`~/.local/bin`. 기존 개별 탐색 함수는 이 locator를 호출한다. 후보 목록은 지금 것을 모두 포함한다.
 - 테스트: env 재정의, 후보 순서, 시간 제한 대체.
 
 ## Task 3: launchd 라벨 일반화 (R3)

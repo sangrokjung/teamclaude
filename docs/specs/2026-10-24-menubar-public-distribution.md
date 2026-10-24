@@ -28,7 +28,7 @@
 ## Requirements
 
 R1. 도구별 카드(Agy·Grok·Higgsfield·ccusage·TeamClaude·TeamCodex·Codex 호출 기록·구독)는 도구나 데이터가 없을 때 하나의 공통 "미설치/데이터 없음" 상태를 그린다. 크래시, 빈 카드, 원시 오류 문자열을 보여 주지 않는다.
-R2. CLI 탐색 순서를 일반화한다. 환경변수 재정의(`CC_MENUBAR_<TOOL>_BIN`) → 로그인 셸 PATH(`/bin/zsh -lc 'command -v <tool>'`, 시간 제한 있음) → Homebrew(`/opt/homebrew`, `/usr/local`) → npm 전역 prefix → fnm·nvm·Volta 기본 별칭 → `~/.local/bin`. 기존 경로 후보는 모두 유지한다.
+R2. CLI 탐색 순서를 일반화한다. 환경변수 재정의(`CC_MENUBAR_<TOOL>_BIN`) → 기존 경로 후보(내부 설치 결과 불변) → 로그인 셸 PATH(`/bin/zsh -lc 'command -v <tool>'`, 2초 제한, 기존 후보가 하나도 없을 때만) → Homebrew(`/opt/homebrew`, `/usr/local`) → npm 전역 prefix → fnm·nvm·Volta 기본 별칭 → `~/.local/bin`. 기존 경로 후보는 모두 유지한다. (구현 중 조정: 기존 후보를 로그인 셸보다 앞에 둔다. 내부 맥의 탐색 결과를 그대로 두고, launchd 아래 zsh 정지 위험을 줄이기 위해서다.)
 R3. launchd 라벨은 `CC_MENUBAR_TEAMCLAUDE_LABEL` 환경변수 또는 UserDefaults로 바꿀 수 있고, 기본값은 `com.qjc.teamclaude`로 둔다. 라벨이 launchd에 등록돼 있지 않으면 kickstart 대신 `teamclaude server`를 분리 실행해 시작만 한다. 살아 있는 프록시를 강제로 재시작하지 않는다는 PR #64의 불변식은 유지한다.
 R4. 구독 수집기 상태 파일(`~/.local/state/cc-menubar/subscription-monitor.json`)이 없으면 구독 영역에 "수집기 미설치(선택 기능)"를 표시한다.
 R5. 화면 문구를 한국어·영어로 제공하고 시스템 선호 언어로 고른다(`Locale.preferredLanguages`의 첫 항목이 `ko`로 시작하면 한국어, 아니면 영어). 사용자 노출 문자열은 하나의 테이블에서 관리한다. README는 영문 `menubar/README.md`와 한국어 `menubar/README.ko.md`를 둔다. **Phase 2**에서 디자인 이식과 함께 한다.
