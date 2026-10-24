@@ -423,16 +423,29 @@ func triggerTeamClaudeQuotaProbe(port: Int, model: String) -> Int? {
     return statusCode
 }
 
-func resolveClaudeExecutable() -> String {
-    let candidates = [
+func claudeSpec(home: String = NSHomeDirectory()) -> ToolSpec {
+    ToolSpec(name: "claude", envKey: "CC_MENUBAR_CLAUDE_BIN", preferred: [
         "/opt/homebrew/bin/claude",
         "/usr/local/bin/claude",
-        "\(NSHomeDirectory())/.local/bin/claude",
-    ]
-    for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-        return candidate
+        "\(home)/.local/bin/claude",
+    ])
+}
+
+/// 시작 로그에 도구별 탐색 결과를 한 줄씩 남긴다. 백그라운드에서 돌려 로그인 셸 조회 캐시도 미리 채운다.
+func logToolLocations() {
+    DispatchQueue.global(qos: .utility).async {
+        let home = NSHomeDirectory()
+        let specs = [agySpec(home: home), higgsfieldSpec(home: home), npxSpec(home: home), grokSpec(home: home),
+                     claudeSpec(home: home), teamClaudeSpec(home: home), teamCodexSpec(home: home)]
+        for spec in specs {
+            print(toolLocatorLogLine(spec.name, ToolLocator.shared.resolve(spec)))
+        }
+        fflush(stdout)
     }
-    return "/usr/bin/env"
+}
+
+func resolveClaudeExecutable() -> String {
+    ToolLocator.shared.resolve(claudeSpec()).path ?? "/usr/bin/env"
 }
 
 func runTeamClaudeBareClaudeProbe(port: Int, apiKey: String?, model: String) -> Int32? {
@@ -1103,19 +1116,27 @@ func teamClaudeHealthMergingQuota(
 // 실행 시 npx는 같은 디렉토리의 node 바이너리를 찾으므로 PATH에 모든 후보 bin 디렉토리 명시.
 
 // 존재하는 첫 npx 절대경로 + 그 bin 디렉토리 반환. 못 찾으면 PATH 의존 "npx" 폴백.
-func resolveNpx(home: String) -> (exec: String, bin: String) {
+func npxSpec(home: String) -> ToolSpec {
     let fnmBin = "\(home)/.local/share/fnm/aliases/default/bin"
-    let candidates = [
+    return ToolSpec(name: "npx", envKey: "CC_MENUBAR_NPX_BIN", preferred: [
         "\(fnmBin)/npx",          // fnm default symlink
         "/opt/homebrew/bin/npx",  // Homebrew (Apple Silicon)
         "/usr/local/bin/npx",     // Homebrew (Intel) / 공식 Node installer
-    ]
-    let fm = FileManager.default
-    for c in candidates where fm.fileExists(atPath: c) {
-        return (c, (c as NSString).deletingLastPathComponent)
+    ])
+}
+
+func resolveNpx(home: String) -> (exec: String, bin: String) {
+    let fnmBin = "\(home)/.local/share/fnm/aliases/default/bin"
+    if let path = ToolLocator.shared.resolve(npxSpec(home: home)).path {
+        return (path, (path as NSString).deletingLastPathComponent)
     }
     // 모두 없으면 PATH 의존 (env PATH 가 npx 를 찾도록)
     return ("/usr/bin/env", fnmBin)
+}
+
+/// ccusage는 npx로 돈다. npx를 못 찾으면(재정의가 틀린 경우 포함) 미설치다.
+func ccusageInstalled(home: String = NSHomeDirectory()) -> Bool {
+    ToolLocator.shared.resolve(npxSpec(home: home)).path != nil
 }
 
 /// npx ccusage <subcommand> --json --offline 을 실행해 stdout JSON Data 반환. 실패 시 nil.
@@ -3104,8 +3125,7 @@ final class MenuActionRowView: NSView {
     }
 }
 
-func resolveTeamClaudeExecutable() -> String {
-    let home = NSHomeDirectory()
+func teamClaudeSpec(home: String = NSHomeDirectory()) -> ToolSpec {
     var candidates = [
         "\(home)/.local/share/fnm/aliases/default/bin/teamclaude",
         "\(home)/.local/bin/teamclaude",
@@ -3122,10 +3142,11 @@ func resolveTeamClaudeExecutable() -> String {
         }.sorted { $0.1 > $1.1 }.map(\.0)
         candidates.append(contentsOf: installed)
     }
-    for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-        return candidate
-    }
-    return "teamclaude"
+    return ToolSpec(name: "teamclaude", envKey: "CC_MENUBAR_TEAMCLAUDE_BIN", preferred: candidates)
+}
+
+func resolveTeamClaudeExecutable() -> String {
+    ToolLocator.shared.resolve(teamClaudeSpec()).path ?? "teamclaude"
 }
 
 /// codex 하위 명령은 teamcodex 진입점으로만 보낸다.
@@ -3134,8 +3155,7 @@ func resolveTeamClaudeExecutable() -> String {
 /// `resolveTeamClaudeExecutable()`로 보내면 리터럴 "teamclaude"로 떨어져
 /// command not found로 죽는다. teamcodex는 `~/.local/bin/teamcodex`와
 /// fnm 설치본으로 실재하며 codex 풀 CLI를 담당한다.
-func resolveTeamCodexExecutable() -> String {
-    let home = NSHomeDirectory()
+func teamCodexSpec(home: String = NSHomeDirectory()) -> ToolSpec {
     var candidates = [
         "\(home)/.local/bin/teamcodex",
         "\(home)/.local/share/fnm/aliases/default/bin/teamcodex",
@@ -3152,10 +3172,11 @@ func resolveTeamCodexExecutable() -> String {
         }.sorted { $0.1 > $1.1 }.map(\.0)
         candidates.append(contentsOf: installed)
     }
-    for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-        return candidate
-    }
-    return resolveTeamClaudeExecutable()
+    return ToolSpec(name: "teamcodex", envKey: "CC_MENUBAR_TEAMCODEX_BIN", preferred: candidates)
+}
+
+func resolveTeamCodexExecutable() -> String {
+    ToolLocator.shared.resolve(teamCodexSpec()).path ?? resolveTeamClaudeExecutable()
 }
 
 func teamClaudeConfigSignature() -> String {
@@ -4159,6 +4180,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         trimLogIfNeeded("\(NSHomeDirectory())/.claude/cache/cc-menubar.log")
+        logToolLocations()
         if let snapshot = teamCodexConfigSnapshot() {
             teamCodexConfigWatchState.seed(snapshot)
         }

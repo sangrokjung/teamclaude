@@ -39,6 +39,15 @@ struct GrokBillingParts: Equatable {
     var headline: Double
 }
 
+/// grok CLI. 사용량은 CLI가 아니라 인증 파일+청구 API로 읽으므로, 이 탐색은 "설치 여부" 판정에만 쓴다.
+func grokSpec(home: String = NSHomeDirectory()) -> ToolSpec {
+    ToolSpec(name: "grok", envKey: "CC_MENUBAR_GROK_BIN", preferred: [
+        "\(home)/.local/bin/grok",
+        "/opt/homebrew/bin/grok",
+        "/usr/local/bin/grok",
+    ])
+}
+
 func grokAuthFileURL() -> URL {
     if let override = ProcessInfo.processInfo.environment["CC_MENUBAR_GROK_AUTH"], !override.isEmpty {
         return URL(fileURLWithPath: override)

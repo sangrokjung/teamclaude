@@ -30,20 +30,17 @@ enum AgyFetchOutcome: Equatable {
     case failed
 }
 
-func agyExecutableURL() -> URL? {
-    if let override = ProcessInfo.processInfo.environment["CC_MENUBAR_AGY_BIN"], !override.isEmpty {
-        return FileManager.default.isExecutableFile(atPath: override) ? URL(fileURLWithPath: override) : nil
-    }
-    let home = NSHomeDirectory()
-    let candidates = [
+func agySpec(home: String = NSHomeDirectory()) -> ToolSpec {
+    ToolSpec(name: "agy", envKey: "CC_MENUBAR_AGY_BIN", preferred: [
         "\(home)/bin/agy",
         "/opt/homebrew/bin/agy",
         "/usr/local/bin/agy",
-    ]
-    for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-        return URL(fileURLWithPath: path)
-    }
-    return nil
+    ])
+}
+
+/// 재정의(CC_MENUBAR_AGY_BIN)가 틀렸으면 다른 후보로 넘어가지 않고 nil(예전 동작 유지).
+func agyExecutableURL() -> URL? {
+    ToolLocator.shared.resolve(agySpec()).path.map { URL(fileURLWithPath: $0) }
 }
 
 func agyFiniteFraction(_ value: Any?) -> Double? {

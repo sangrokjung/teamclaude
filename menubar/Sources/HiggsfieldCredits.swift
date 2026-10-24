@@ -330,13 +330,25 @@ func higgsfieldFormatDateTime(_ date: Date?) -> String {
 // MARK: - CLI 호출
 
 /// 힉스필드 CLI 실행 파일 후보. 메뉴바 앱은 GUI라 shell PATH를 상속하지 않는다.
-func higgsfieldBinCandidates() -> [String] {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return [
+func higgsfieldSpec(home: String = FileManager.default.homeDirectoryForCurrentUser.path) -> ToolSpec {
+    ToolSpec(name: "higgsfield", envKey: "CC_MENUBAR_HIGGSFIELD_BIN", preferred: [
         "\(home)/.local/share/fnm/aliases/default/bin/higgsfield",
         "/opt/homebrew/bin/higgsfield",
         "/usr/local/bin/higgsfield",
-    ]
+    ])
+}
+
+/// 실행해 볼 순서. 공용 탐색기가 고른 경로를 먼저, 그 뒤 기존 후보(실행 실패 시 다음 후보로 넘어가던 동작 유지).
+/// 재정의 경로가 틀렸거나 아무것도 없으면 빈 목록이다(미설치).
+func higgsfieldBinCandidates() -> [String] {
+    let spec = higgsfieldSpec()
+    switch ToolLocator.shared.resolve(spec) {
+    case .found(let path, let source):
+        if source == .environment { return [path] }
+        return [path] + spec.preferred.filter { $0 != path }
+    case .overrideInvalid, .missing:
+        return []
+    }
 }
 
 /// CLI에 넘길 PATH.
@@ -345,6 +357,13 @@ func higgsfieldBinCandidates() -> [String] {
 func higgsfieldPathEnv() -> String {
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\(home)/.local/share/fnm/aliases/default/bin"
+}
+
+/// 찾은 실행 파일의 폴더(nvm·Volta 등)가 기존 PATH에 없으면 맨 뒤에 붙인다. 기존 순서는 그대로 둔다.
+func higgsfieldPathEnv(binary: String) -> String {
+    let base = higgsfieldPathEnv()
+    let dir = (binary as NSString).deletingLastPathComponent
+    return base.split(separator: ":").contains(Substring(dir)) ? base : base + ":" + dir
 }
 
 /// CLI 한 번 호출에 허용하는 시간.
@@ -369,7 +388,7 @@ private func runHiggsfieldRaw(_ args: [String]) -> HiggsfieldRunResult {
         process.executableURL = URL(fileURLWithPath: bin)
         process.arguments = args
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = higgsfieldPathEnv()
+        env["PATH"] = higgsfieldPathEnv(binary: bin)
         process.environment = env
 
         let outPipe = Pipe()
