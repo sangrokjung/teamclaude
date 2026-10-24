@@ -204,21 +204,21 @@ func teamClaudeWorkerSignalDecision(
     launchd: TeamClaudeLaunchdProbe,
     observedWorker: TeamClaudeProcessIdentity?
 ) -> TeamClaudeWorkerSignalDecision {
-    guard let state else { return .refuse("상태 파일 없음") }
-    guard state.configPath == expectedConfigPath else { return .refuse("다른 설정 파일의 서버") }
+    guard let state else { return .refuse(L10n.refuseNoState) }
+    guard state.configPath == expectedConfigPath else { return .refuse(L10n.refuseOtherConfig) }
     guard let supervisorPid = state.supervisorPid, supervisorPid > 1,
           let workerPid = state.workerPid, workerPid > 1, workerPid != supervisorPid else {
-        return .refuse("상태 파일 pid 이상")
+        return .refuse(L10n.refuseBadPid)
     }
     guard case .running(let launchdPid) = launchd, launchdPid == supervisorPid else {
-        return .refuse("launchd 서비스 pid와 supervisor 불일치")
+        return .refuse(L10n.refuseLaunchdMismatch)
     }
     guard let recorded = state.recordedWorker, recorded.pid == workerPid, recorded.ppid == supervisorPid else {
-        return .refuse("worker 기록 없음")
+        return .refuse(L10n.refuseNoWorker)
     }
-    guard teamClaudeIsServerCommand(recorded.command) else { return .refuse("teamclaude server 명령 아님") }
-    guard let observedWorker else { return .refuse("worker 프로세스 없음") }
-    guard observedWorker == recorded else { return .refuse("worker 프로세스가 기록과 다름") }
+    guard teamClaudeIsServerCommand(recorded.command) else { return .refuse(L10n.refuseNotServer) }
+    guard let observedWorker else { return .refuse(L10n.refuseNoWorkerProcess) }
+    guard observedWorker == recorded else { return .refuse(L10n.refuseWorkerMismatch) }
     return .signal(pid: workerPid)
 }
 
@@ -227,28 +227,28 @@ func teamClaudeRestartConfirmation(inflight: Int?, serverReachable: Bool) -> Tea
     let impact: String
     if serverReachable, let inflight, inflight >= 0 {
         impact = inflight > 0
-            ? "진행 중 요청 \(inflight)건이 끊깁니다."
-            : "진행 중 요청은 없습니다."
+            ? L10n.restartInflight(inflight)
+            : L10n.restartNoInflight
     } else {
-        impact = "서버 상태를 읽지 못해 진행 중 요청 수를 확인하지 못했습니다. 진행 중인 요청이 있으면 모두 끊깁니다."
+        impact = L10n.restartUnknownInflight
     }
     return TeamClaudeRestartConfirmation(
-        title: "TeamClaude 서버를 재시작할까요?",
-        message: impact + "\n계정 추가·재인증·켜기/끄기는 재시작 없이 자동 반영되므로 보통은 필요하지 않습니다.",
-        confirmTitle: "재시작",
-        cancelTitle: "취소"
+        title: L10n.restartTitle,
+        message: impact + "\n" + L10n.restartUsuallyUnneeded,
+        confirmTitle: L10n.restartConfirm,
+        cancelTitle: L10n.cancel
     )
 }
 
 func teamClaudeServerPillLabel(serverReachable: Bool, responseDelayed: Bool) -> String {
-    if serverReachable { return "실행중" }
-    return responseDelayed ? "응답 지연" : "오프라인"
+    if serverReachable { return L10n.serverRunning }
+    return responseDelayed ? L10n.serverSlow : L10n.poolOffline
 }
 
 func teamClaudeDriftActionDetail(persistsAfterReload: Bool) -> String {
     persistsAfterReload
-        ? "재로딩 후에도 남음 · 재시작하지 않음"
-        : "자동 동기화 중 · 서버 반영 확인"
+        ? L10n.driftPersists
+        : L10n.driftSyncing
 }
 
 // 프록시 `getConfigPath()`/`getServerStatePath()`와 같은 규칙으로 설정·상태 파일 경로를 정한다.

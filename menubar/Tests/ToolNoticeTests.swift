@@ -185,6 +185,30 @@ struct ToolNoticeTests {
         render(card)
         precondition(ToolNoticeDrawLog.drawn.isEmpty)
 
+        // MARK: 영어 화면(A5) — ccusage 실패·낡은 값·부분 실패 문구도 한글 0자
+        L10n.language = .en
+        func hangulFree(_ value: String?) -> Bool {
+            guard let value, !value.isEmpty else { return false }
+            return !value.unicodeScalars.contains { (0xAC00...0xD7A3).contains($0.value) || (0x3131...0x318E).contains($0.value) }
+        }
+        let failures: [CcusageFailure] = [.launch, .timeout(seconds: 60), .exitStatus(3), .emptyOutput, .unparsable, .outputTooLarge]
+        for failure in failures {
+            let notice = ccusageToolNotice(installed: true, outcome: .failed(failure), hasData: false)
+            precondition(hangulFree(notice?.headline) && hangulFree(notice?.detail), notice?.line ?? "nil")
+            precondition(hangulFree(ccusageStaleNote(outcome: .failed(failure), hasData: true)), failure.label)
+        }
+        let enPartial = [CcusageAuxFailure(command: .weekly, failure: .timeout(seconds: 60)),
+                         CcusageAuxFailure(command: .monthly, failure: .outputTooLarge)]
+        precondition(hangulFree(ccusageStaleNote(outcome: .noData, hasData: true, partial: enPartial)))
+        precondition(hangulFree(ccusageToolNotice(installed: true, outcome: .noData, hasData: false)?.line))
+        precondition(ccusageToolNotice(installed: true, outcome: .failed(.exitStatus(3)), hasData: false)?.headline == "Usage Needs check")
+        precondition(ccusageStaleNote(outcome: .failed(.exitStatus(3)), hasData: true) == "refresh failed (exit code 3) · previous values")
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true) == "no usage recorded today")
+        precondition(ccusagePartialNote([CcusageAuxFailure(command: .weekly, failure: .exitStatus(3)),
+                                         CcusageAuxFailure(command: .monthly, failure: .exitStatus(3))])
+                     == "partial refresh failed (weekly/monthly: exit code 3) · only daily is current")
+        L10n.language = .ko
+
         print("ToolNoticeTests: ok")
     }
 }

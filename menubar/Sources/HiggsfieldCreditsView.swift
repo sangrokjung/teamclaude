@@ -23,7 +23,7 @@ final class HiggsfieldCreditsView: NSView {
 
     override var isFlipped: Bool { true }
 
-    static let normalHeight: CGFloat = 148
+    static let normalHeight: CGFloat = 176
     static let errorHeight: CGFloat = 96
 
     static func preferredHeight(for data: HiggsfieldCreditsData?) -> CGFloat {
@@ -35,7 +35,7 @@ final class HiggsfieldCreditsView: NSView {
         super.init(frame: frameRect)
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        setAccessibilityLabel("힉스필드 크레딧")
+        setAccessibilityLabel(L10n.higgsfieldTitle)
     }
 
     required init?(coder: NSCoder) {
@@ -45,93 +45,54 @@ final class HiggsfieldCreditsView: NSView {
     private func updateAccessibility() {
         guard let data = data else { return }
         if let error = data.error {
-            setAccessibilityLabel("힉스필드 크레딧 조회 실패: \(error)")
+            setAccessibilityLabel(L10n.higgsfieldFailed(error))
             return
         }
         let cycle = higgsfieldEstimateCycle(data.transactions, now: Date())
-        var label = "힉스필드 크레딧 \(higgsfieldFormatCredits(data.credits)), 다음 리셋 \(higgsfieldFormatDday(cycle.daysRemaining))"
+        var label = L10n.higgsfieldAccessibility(higgsfieldFormatCredits(data.credits), higgsfieldFormatDday(cycle.daysRemaining))
         if let staleNote { label += ", \(staleNote)" }
         setAccessibilityLabel(label)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-
-        let panel = NSColor(calibratedRed: 0.095, green: 0.115, blue: 0.15, alpha: 1.0)
-        let line = NSColor(calibratedRed: 0.23, green: 0.27, blue: 0.34, alpha: 1.0)
-        let text = NSColor(calibratedRed: 0.92, green: 0.95, blue: 0.98, alpha: 1.0)
-        let muted = NSColor(calibratedRed: 0.55, green: 0.61, blue: 0.70, alpha: 1.0)
-        let dim = NSColor(calibratedRed: 0.40, green: 0.46, blue: 0.55, alpha: 1.0)
-        let green = NSColor(calibratedRed: 0.18, green: 0.82, blue: 0.48, alpha: 1.0)
-        let yellow = NSColor(calibratedRed: 0.93, green: 0.76, blue: 0.22, alpha: 1.0)
-        let red = NSColor(calibratedRed: 0.96, green: 0.26, blue: 0.32, alpha: 1.0)
-        let blue = NSColor(calibratedRed: 0.28, green: 0.55, blue: 0.90, alpha: 1.0)
-
-        let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        let bigFont = NSFont.monospacedDigitSystemFont(ofSize: 26, weight: .bold)
-        let ddayFont = NSFont.monospacedDigitSystemFont(ofSize: 22, weight: .bold)
-        let bodyFont = NSFont.systemFont(ofSize: 12, weight: .medium)
-        let smallFont = NSFont.systemFont(ofSize: 11, weight: .medium)
-
-        func attrs(_ font: NSFont, _ color: NSColor) -> [NSAttributedString.Key: Any] {
-            [.font: font, .foregroundColor: color]
-        }
-        func drawText(_ value: String, _ x: CGFloat, _ y: CGFloat, _ font: NSFont, _ color: NSColor) {
-            value.draw(at: NSPoint(x: x, y: y), withAttributes: attrs(font, color))
-        }
-        func drawRight(_ value: String, _ x: CGFloat, _ y: CGFloat, _ font: NSFont, _ color: NSColor) {
-            let a = attrs(font, color)
-            let s = value.size(withAttributes: a)
-            value.draw(at: NSPoint(x: x - s.width, y: y), withAttributes: a)
-        }
-        func fillRound(_ rect: NSRect, _ color: NSColor, _ radius: CGFloat) {
-            color.setFill()
-            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
-        }
-        func strokeRound(_ rect: NSRect, _ color: NSColor, _ radius: CGFloat) {
-            color.setStroke()
-            let p = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
-            p.lineWidth = 1
-            p.stroke()
-        }
-        func pill(_ value: String, rightX: CGFloat, y: CGFloat, color: NSColor) {
-            let a = attrs(smallFont, color)
-            let s = value.size(withAttributes: a)
-            let rect = NSRect(x: rightX - s.width - 16, y: y, width: s.width + 16, height: 20)
-            fillRound(rect, color.withAlphaComponent(0.14), 10)
-            strokeRound(rect, color.withAlphaComponent(0.38), 10)
-            value.draw(at: NSPoint(x: rect.minX + 8, y: y + 3), withAttributes: a)
-        }
+        let fg = TeamClaudePalette.fg, fg2 = TeamClaudePalette.fg2, fg3 = TeamClaudePalette.fg3
+        let amber = TeamClaudePalette.amber, ember = TeamClaudePalette.ember, mint = TeamClaudePalette.mint
+        let titleFont = TeamClaudePalette.bodyMediumFont
+        let bigFont = NSFont.monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
+        let ddayFont = NSFont.monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+        let bodyFont = TeamClaudePalette.captionFont
+        let smallFont = TeamClaudePalette.microFont
 
         let pad: CGFloat = 14
-        let card = NSRect(x: 8, y: 0, width: bounds.width - 16, height: bounds.height - 4)
-        fillRound(card, panel, 10)
-        strokeRound(card, line, 10)
-
+        let card = NSRect(x: 16, y: 0, width: bounds.width - 32, height: bounds.height - 4)
+        PanelDraw.card(card)
         let left = card.minX + pad
         let right = card.maxX - pad
-        var y = card.minY + 10
+        var y = card.minY + 12
 
-        drawText("힉스필드 크레딧", left, y, titleFont, text)
+        PanelDraw.text(L10n.higgsfieldTitle, left, y, titleFont, fg)
 
         guard let data = data else {
-            drawText("불러오는 중...", left, y + 26, bodyFont, muted)
+            PanelDraw.text(L10n.loading, left, y + 26, bodyFont, fg3)
             return
         }
 
         if let plan = data.planType, !plan.isEmpty {
-            pill(plan.uppercased(), rightX: right, y: y - 2, color: blue)
+            let label = plan.uppercased()
+            let w = PanelDraw.width(label, smallFont) + 14
+            let rect = NSRect(x: right - w, y: y - 1, width: w, height: 18)
+            PanelDraw.strokeRound(rect, TeamClaudePalette.lineStrong, 6)
+            PanelDraw.text(label, rect.minX + 7, rect.minY + 2, smallFont, fg2)
         }
-        y += 24
+        y += 26
 
         // 실패 상태: 사유와 복구 방법만 말한다.
         if let error = data.error {
-            drawText(error, left, y, bodyFont, red)
+            PanelDraw.text(PanelDraw.clipped(error, bodyFont, maxWidth: right - left), left, y, bodyFont, ember)
             y += 20
-            let hint = higgsfieldLooksLikeAuthFailure(error)
-                ? "터미널에서 higgsfield auth login 으로 로그인한 뒤 새로고침하세요"
-                : "CLI 설치 확인: npm i -g @higgsfield/cli"
-            drawText(hint, left, y, smallFont, dim)
+            let hint = higgsfieldLooksLikeAuthFailure(error) ? L10n.higgsfieldLoginHint : L10n.higgsfieldInstallHint
+            PanelDraw.text(PanelDraw.clipped(hint, smallFont, maxWidth: right - left), left, y, smallFont, fg3)
             return
         }
 
@@ -147,87 +108,81 @@ final class HiggsfieldCreditsView: NSView {
         )
 
         let ddayColor: NSColor = {
-            guard let days = cycle.daysRemaining else { return muted }
-            if days <= 3 { return red }
-            if days <= 7 { return yellow }
-            return blue
+            guard let days = cycle.daysRemaining else { return fg3 }
+            if days <= 3 { return ember }
+            if days <= 7 { return amber }
+            return fg
         }()
 
         // 잔액 · D-day
-        drawText(higgsfieldFormatCredits(data.credits), left, y, bigFont, text)
+        let creditsWidth = PanelDraw.text(higgsfieldFormatCredits(data.credits), left, y, bigFont, fg)
         if let staleNote {
             // 크레딧 숫자 옆에 붙인다. 숫자만 크게 남기면 낡은 값이 최신값으로 읽힌다.
-            let used = higgsfieldFormatCredits(data.credits).size(withAttributes: [.font: bigFont]).width
-            drawText(staleNote, left + used + 12, y + 8,
-                     NSFont.systemFont(ofSize: 11, weight: .medium), muted)
+            PanelDraw.text(staleNote, left + creditsWidth + 12, y + 8, smallFont, fg3)
         }
-        drawRight(higgsfieldFormatDday(cycle.daysRemaining), right, y + 3, ddayFont, ddayColor)
-        y += 32
+        PanelDraw.right(higgsfieldFormatDday(cycle.daysRemaining), right, y + 3, ddayFont, ddayColor)
+        y += 34
 
-        let grantText = cycle.grantAmount.map { "주기 지급 \(higgsfieldFormatCredits($0))" } ?? "주기 지급 미상"
-        drawText(grantText, left, y, smallFont, dim)
+        let grantText = cycle.grantAmount.map { L10n.higgsfieldGrant(higgsfieldFormatCredits($0)) } ?? L10n.higgsfieldGrantUnknown
+        let grantWidth = PanelDraw.text(grantText, left, y, smallFont, fg3)
         let renewText = cycle.nextRenewalAt != nil
-            ? "\(higgsfieldFormatDateTime(cycle.nextRenewalAt)) 갱신 예정"
-            : "갱신 이력이 없어 예정일을 계산할 수 없습니다"
-        drawRight(renewText, right, y, smallFont, muted)
+            ? L10n.higgsfieldRenewal(higgsfieldFormatDateTime(cycle.nextRenewalAt))
+            : L10n.higgsfieldNoRenewal
+        PanelDraw.right(PanelDraw.clipped(renewText, smallFont, maxWidth: right - left - grantWidth - 12), right, y, smallFont, fg2)
         y += 20
 
-        // 주기 진행바
+        // 주기 진행바(창 경과와 같은 뜻이라 하늘색 눈금으로 끝을 표시한다)
         let barRect = NSRect(x: left, y: y, width: right - left, height: 6)
-        fillRound(barRect, NSColor(calibratedRed: 0.16, green: 0.19, blue: 0.24, alpha: 1.0), 3)
-        if let ratio = cycle.elapsedRatio, ratio > 0 {
-            let filled = NSRect(x: left, y: y, width: max((right - left) * CGFloat(ratio), 3), height: 6)
-            fillRound(filled, blue, 3)
-        }
-        y += 12
+        PanelDraw.meter(barRect, percent: cycle.elapsedRatio.map { $0 * 100 }, elapsed: cycle.elapsedRatio, thresholdPercent: 101)
+        y += 14
 
         let elapsedText: String = {
-            guard let elapsed = cycle.elapsedDays else { return "갱신 이력 없음" }
-            if elapsed < 0 { return "지급 시각이 미래입니다 · 시계 확인 필요" }
-            return "\(Int(elapsed))일 경과 / \(cycle.cycleDays)일"
+            guard let elapsed = cycle.elapsedDays else { return L10n.higgsfieldNoHistory }
+            if elapsed < 0 { return L10n.higgsfieldFutureGrant }
+            return L10n.higgsfieldElapsed(Int(elapsed), cycle.cycleDays)
         }()
-        drawText(elapsedText, left, y, smallFont, dim)
+        let elapsedWidth = PanelDraw.text(elapsedText, left, y, smallFont, fg3)
 
         let basisText: String = {
-            if cycle.lastGrantAt == nil { return "지급 기록 없음" }
-            if cycle.assumedCycle { return "주기 미실측 · 기본 \(cycle.cycleDays)일 가정" }
-            return "\(cycle.cycleDays)일 주기 · 갱신 \(cycle.grantCount)건 실측"
+            if cycle.lastGrantAt == nil { return L10n.higgsfieldNoGrant }
+            if cycle.assumedCycle { return L10n.higgsfieldAssumedCycle(cycle.cycleDays) }
+            return L10n.higgsfieldMeasuredCycle(cycle.cycleDays, cycle.grantCount)
         }()
-        drawRight(basisText, right, y, smallFont, dim)
-        y += 20
+        PanelDraw.right(PanelDraw.clipped(basisText, smallFont, maxWidth: right - left - elapsedWidth - 12), right, y, smallFont, fg3)
+        y += 22
 
         // 이번 주기 사용 · 소멸 예상
         let expiryColor: NSColor = {
-            guard let expiry = projection.projectedExpiry else { return muted }
-            return expiry > 0 ? yellow : green
+            guard let expiry = projection.projectedExpiry else { return fg3 }
+            return expiry > 0 ? amber : mint
         }()
-        drawText("이번 주기 사용 \(higgsfieldFormatCredits(spent))", left, y, bodyFont, muted)
+        let spentWidth = PanelDraw.text(L10n.higgsfieldSpent(higgsfieldFormatCredits(spent)), left, y, bodyFont, fg2)
 
         let expiryText: String = {
             if let gap = projection.gap {
-                return gap == .noGrantHistory ? "소멸 예상 계산 불가" : "소멸 예상 측정 중"
+                return gap == .noGrantHistory ? L10n.higgsfieldExpiryUnknown : L10n.higgsfieldExpiryMeasuring
             }
             let amount = higgsfieldFormatCredits(projection.projectedExpiry)
             if let ratio = projection.projectedExpiryRatio {
-                return "소멸 예상 \(amount) (지급분 \(Int((ratio * 100).rounded()))%)"
+                return L10n.higgsfieldExpiryRatio(amount, Int((ratio * 100).rounded()))
             }
-            return "소멸 예상 \(amount)"
+            return L10n.higgsfieldExpiry(amount)
         }()
-        drawRight(expiryText, right, y, bodyFont, expiryColor)
-        y += 19
+        PanelDraw.right(PanelDraw.clipped(expiryText, bodyFont, maxWidth: right - left - spentWidth - 12), right, y, bodyFont, expiryColor)
+        y += 20
 
         // 근거 한 줄: 추정이라는 사실과 직전 실제 소멸을 같이 말한다.
         var footnotes: [String] = []
         if let reset = higgsfieldSubscriptionResets(data.transactions).first {
-            footnotes.append("직전 갱신(\(higgsfieldFormatDate(reset.createdAt)))에 \(higgsfieldFormatCredits(abs(reset.credits))) 소멸")
+            footnotes.append(L10n.higgsfieldLastReset(higgsfieldFormatDate(reset.createdAt), higgsfieldFormatCredits(abs(reset.credits))))
         }
-        footnotes.append("갱신일은 API 미제공 · 지급 이력으로 추정")
+        footnotes.append(L10n.higgsfieldEstimated)
         if !unknown.isEmpty {
-            footnotes.append("처음 보는 거래 유형(\(unknown.joined(separator: ", ")))")
+            footnotes.append(L10n.higgsfieldUnknownActions(unknown.joined(separator: ", ")))
         }
         if let partial = data.partialError, !partial.isEmpty {
-            footnotes.append("일부만 조회됨")
+            footnotes.append(L10n.higgsfieldPartial)
         }
-        drawText(footnotes.joined(separator: " · "), left, y, smallFont, dim)
+        PanelDraw.text(PanelDraw.clipped(footnotes.joined(separator: " · "), smallFont, maxWidth: right - left), left, y, smallFont, fg3)
     }
 }

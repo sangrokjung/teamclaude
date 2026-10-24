@@ -48,5 +48,14 @@ func setMenubarLoginItem(enabled: Bool, executablePath: String, home: String) th
 }
 
 func menubarLoginItemDetail(enabled: Bool) -> String {
-    enabled ? "켜짐" : "꺼짐"
+    enabled ? L10n.switchOn : L10n.switchOff
+}
+
+/// ⌘K 목록의 "로그인 시 열기" 항목. 메뉴를 닫지 않고, toggle이 돌려준 상태 문구로 그 자리의 detail을 바꾼다
+/// (onRun이 run()의 반환값을 updateDetail로 넘긴다). 반환값을 버리면 열린 목록에 이전 상태가 남는다.
+func menubarLoginItemAction(enabled: Bool, toggle: @escaping () -> String?) -> DashboardAction {
+    DashboardAction(id: "login-item", group: .app, title: L10n.actionLoginItem,
+                    detail: menubarLoginItemDetail(enabled: enabled), closesMenu: false) {
+        return toggle()
+    }
 }

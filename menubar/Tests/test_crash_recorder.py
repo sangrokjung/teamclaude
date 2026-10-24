@@ -29,7 +29,7 @@ class CrashRecorderWiringTests(unittest.TestCase):
 
     def test_team_claude_table_draw_leaves_breadcrumbs(self):
         match = re.search(
-            r"final class TeamClaudeTableView: NSView \{(?P<body>.*?)\nfinal class ServiceAvailabilitySummaryView",
+            r"final class TeamClaudeTableView: NSView \{(?P<body>.*?)\nfinal class DashboardRefreshPhases",
             self.source,
             re.DOTALL,
         )
@@ -37,20 +37,17 @@ class CrashRecorderWiringTests(unittest.TestCase):
         crumbs = re.findall(r'markDraw\("TeamClaudeTableView\.[a-z]+"\)', match.group("body"))
         self.assertGreaterEqual(len(crumbs), 4, crumbs)
 
-    def test_availability_summary_uses_the_static_palette(self):
-        match = re.search(
-            r"final class ServiceAvailabilitySummaryView.*?(?=\nfinal class )",
-            self.source,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
-        body = match.group(0)
-        self.assertNotIn("NSColor(calibrated", body)
-        self.assertNotIn("NSFont.", body)
-        self.assertIn("TeamClaudePalette.summaryTitleFont", body)
-        self.assertIn("TeamClaudePalette.inactive", body)
+    def test_panel_views_use_the_static_palette(self):
+        # 예전 요약 띠(ServiceAvailabilitySummaryView)는 개요 탭(OverviewTabView)이 대신한다. 개요·셸도 팔레트만 쓴다.
+        self.assertNotIn("final class ServiceAvailabilitySummaryView", self.source)
+        sources = ROOT / "menubar" / "Sources"
+        for name in ("OverviewTabView.swift", "DashboardPanel.swift", "PanelDrawing.swift"):
+            with self.subTest(file=name):
+                body = (sources / name).read_text()
+                self.assertNotIn("NSColor(calibrated", body)
+                self.assertIn("TeamClaudePalette.", body)
         palette = PALETTE_SOURCE.read_text()
-        for member in ("summaryTitleFont", "summaryBodyFont", "summaryValueFont", "summaryNameFont", "summaryFootFont"):
+        for member in ("sheet", "fg3", "mint", "amber", "ember", "sky", "heroFont", "metaFont"):
             self.assertIn(f"static let {member}", palette)
             self.assertRegex(palette, r"_ = \([^)]*\b" + member + r"\b")
 
@@ -61,14 +58,14 @@ class CrashRecorderWiringTests(unittest.TestCase):
         self.assertIn("static func prewarm()", palette)
         self.assertNotIn("enum TeamClaudePalette", self.source)
         match = re.search(
-            r"final class TeamClaudeTableView: NSView \{(?P<body>.*?)\nfinal class ServiceAvailabilitySummaryView",
+            r"final class TeamClaudeTableView: NSView \{(?P<body>.*?)\nfinal class DashboardRefreshPhases",
             self.source,
             re.DOTALL,
         )
         body = match.group("body")
         self.assertNotIn("let titleFont = NSFont.systemFont", body)
         self.assertNotIn("let bg = NSColor(calibratedRed", body)
-        self.assertIn("TeamClaudePalette.titleFont", body)
+        self.assertIn("TeamClaudePalette.panelTitleFont", body)
         self.assertIn("TeamClaudePalette.prewarm()", self.source)
         self.assertLess(self.source.rfind("installCrashRecorder()"), self.source.rfind("TeamClaudePalette.prewarm()"),
                         "the recorder must be installed before the palette is pre-warmed")

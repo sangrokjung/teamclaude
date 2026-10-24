@@ -304,7 +304,7 @@ private let higgsfieldDateLabelFormatter: DateFormatter = {
     f.calendar = Calendar(identifier: .gregorian)
     f.locale = Locale(identifier: "ko_KR")
     f.timeZone = higgsfieldDisplayTimeZone
-    f.dateFormat = "M월 d일"
+    f.dateFormat = L10n.dateFormatMonthDay
     return f
 }()
 
@@ -313,7 +313,7 @@ private let higgsfieldDateTimeLabelFormatter: DateFormatter = {
     f.calendar = Calendar(identifier: .gregorian)
     f.locale = Locale(identifier: "ko_KR")
     f.timeZone = higgsfieldDisplayTimeZone
-    f.dateFormat = "M월 d일 HH:mm"
+    f.dateFormat = L10n.dateFormatMonthDayTime
     return f
 }()
 
@@ -399,7 +399,7 @@ private func runHiggsfieldRaw(_ args: [String]) -> HiggsfieldRunResult {
         do {
             try process.run()
         } catch {
-            execError = execError ?? "\(bin) 실행 실패: \(error.localizedDescription)"
+            execError = execError ?? L10n.runFailed(bin, error.localizedDescription)
             continue
         }
 
@@ -432,14 +432,14 @@ private func runHiggsfieldRaw(_ args: [String]) -> HiggsfieldRunResult {
                 kill(pid, SIGKILL)
                 _ = group.wait(timeout: .now() + 2)
             }
-            return .failure("힉스필드 CLI가 \(Int(higgsfieldTimeout))초 안에 응답하지 않아 중단했습니다")
+            return .failure(L10n.higgsfieldTimeout(Int(higgsfieldTimeout)))
         }
         process.waitUntilExit()
         _ = group.wait(timeout: .now() + 3)
 
         if process.terminationStatus == 0 {
             guard let json = try? JSONSerialization.jsonObject(with: outData) else {
-                return .failure("higgsfield \(args.joined(separator: " ")) JSON 파싱 실패")
+                return .failure(L10n.higgsfieldParseFailed(args.joined(separator: " ")))
             }
             return .success(json)
         }
@@ -447,12 +447,12 @@ private func runHiggsfieldRaw(_ args: [String]) -> HiggsfieldRunResult {
         if execError == nil {
             let stderr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             execError = stderr.isEmpty
-                ? "higgsfield \(args.joined(separator: " ")) 실행 실패 (종료 코드 \(process.terminationStatus))"
+                ? L10n.higgsfieldExitFailed(args.joined(separator: " "), Int(process.terminationStatus))
                 : stderr
         }
     }
 
-    return .failure(execError ?? "higgsfield CLI를 찾지 못했습니다")
+    return .failure(execError ?? L10n.higgsfieldNotFound)
 }
 
 private let higgsfieldISOFormatters: [ISO8601DateFormatter] = {

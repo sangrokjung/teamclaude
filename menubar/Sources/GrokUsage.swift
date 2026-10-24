@@ -156,7 +156,7 @@ func grokCardDetail(product: Double?, credit: Double?) -> String? {
     }
     if let credit, let label = grokPlainPercent(credit),
        product == nil || abs((product ?? 0) - credit) >= 0.05 {
-        parts.append("크레딧 \(label)")
+        parts.append(L10n.grokCredits(label))
     }
     return parts.isEmpty ? nil : parts.joined(separator: " · ")
 }
@@ -213,4 +213,12 @@ func fetchGrokMenuOutcome(now: Date = Date(), authURL: URL = grokAuthFileURL(), 
             )))
         }
     }
+}
+
+/// "Grok 24%" 형태의 제목 슬롯에서 숫자만 떼어낸다. 상태 문구("Grok 로그인" 등)면 없다.
+func burnGrokPercent(_ slot: String) -> Double? {
+    guard let range = slot.range(of: #"[0-9]+(\.[0-9]+)?(?=%)"#, options: .regularExpression) else {
+        return nil
+    }
+    return Double(slot[range])
 }

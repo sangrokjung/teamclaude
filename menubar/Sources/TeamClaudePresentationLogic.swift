@@ -29,18 +29,18 @@ struct TeamClaudeHeadlineInput: Equatable {
 }
 
 func teamClaudeTitleSlot(_ input: TeamClaudeHeadlineInput) -> String {
-    if !input.serverReachable { return "Claude 오프라인" }
-    if input.accountConfigDrift > 0 { return "Claude 연동 확인 \(input.accountConfigDrift)" }
-    if input.measurementPendingCount > 0 { return "Claude 측정 필요 \(input.measurementPendingCount)" }
+    if !input.serverReachable { return L10n.titleClaudeOffline }
+    if input.accountConfigDrift > 0 { return L10n.titleClaudeDrift(input.accountConfigDrift) }
+    if input.measurementPendingCount > 0 { return L10n.titleClaudeMeasure(input.measurementPendingCount) }
     if input.fableKnown > 0,
        input.fableOver == input.fableKnown,
        input.fableKnown >= input.totalAccounts {
-        return "Claude Fable 한도 \(input.fableOver)/\(input.fableKnown)"
+        return L10n.titleClaudeFableLimit(input.fableOver, input.fableKnown)
     }
     if input.quotaLimitedCount > 0 {
-        return "Claude 라우팅 \(input.accountUsable)/\(input.totalAccounts)"
+        return L10n.titleClaudeRouting(input.accountUsable, input.totalAccounts)
     }
-    return "Claude 정상 \(input.accountActive)/\(input.totalAccounts)"
+    return L10n.titleClaudeOK(input.accountActive, input.totalAccounts)
 }
 
 /// 프록시 status의 `runtime` 블록을 한 줄로. TeamClaude 표와 TeamCodex 카드가 같은 문구를 쓴다.
@@ -49,23 +49,23 @@ func teamRuntimeSummary(_ raw: Any?, short: Bool = false, timeZone: TimeZone = .
     guard let runtime = raw as? [String: Any] else { return nil }
     let build: String
     if let artifact = runtime["artifact"] as? String, !artifact.isEmpty {
-        build = "빌드 \(artifact)"
+        build = L10n.runtimeBuild(artifact)
     } else if let version = runtime["version"] as? String, !version.isEmpty {
         build = "v\(version)"
     } else {
-        build = "빌드 미상"
+        build = L10n.runtimeBuildUnknown
     }
     var parts = [build]
     if !short, let uptime = (runtime["uptimeMs"] as? NSNumber)?.doubleValue {
-        parts.append("가동 \(teamRuntimeUptimeText(uptime))")
+        parts.append(L10n.runtimeUptime(teamRuntimeUptimeText(uptime)))
     }
     if let restarts = (runtime["workerRestarts"] as? NSNumber)?.intValue {
         if short {
-            parts.append("재시작 \(restarts)회")
+            parts.append(L10n.runtimeRestarts(restarts))
         } else {
-            var text = "워커 재시작 \(restarts)회"
+            var text = L10n.runtimeWorkerRestarts(restarts)
             if let iso = runtime["lastWorkerRestartAt"] as? String, let date = teamRuntimeDate(iso) {
-                text += " (마지막 \(teamRuntimeClock(date, timeZone: timeZone)))"
+                text += L10n.runtimeLast(teamRuntimeClock(date, timeZone: timeZone))
             }
             parts.append(text)
         }
@@ -84,14 +84,14 @@ func teamServerLine(base: String, full: String?, short: String?, maxWidth: CGFlo
 }
 
 func teamRuntimeUptimeText(_ milliseconds: Double) -> String {
-    guard milliseconds.isFinite else { return "0분" }
+    guard milliseconds.isFinite else { return L10n.durationMinutes(0) }
     let minutes = max(0, Int(min(milliseconds, 1e15) / 60_000))
     let days = minutes / 1440
     let hours = (minutes % 1440) / 60
     let remainder = minutes % 60
-    if days > 0 { return "\(days)일 \(hours)시간" }
-    if hours > 0 { return "\(hours)시간 \(remainder)분" }
-    return "\(remainder)분"
+    if days > 0 { return L10n.durationDaysHours(days, hours) }
+    if hours > 0 { return L10n.durationHoursMinutes(hours, remainder) }
+    return L10n.durationMinutes(remainder)
 }
 
 func teamRuntimeDate(_ iso: String) -> Date? {

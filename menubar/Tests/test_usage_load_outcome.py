@@ -131,7 +131,9 @@ class UsageLoadOutcomeTests(unittest.TestCase):
             home = folder / "home"
             home.mkdir()
             env = {key: value for key, value in os.environ.items() if not key.startswith("CC_MENUBAR_")}
-            env.update(HOME=str(home), CFFIXED_USER_HOME=str(home), CC_MENUBAR_NPX_BIN=str(npx))
+            # 아래 기대 문구는 한국어다. 기계의 시스템 언어(CI는 영어)와 무관하게 판정하도록 고정한다.
+            env.update(HOME=str(home), CFFIXED_USER_HOME=str(home), CC_MENUBAR_NPX_BIN=str(npx),
+                       CC_MENUBAR_LANG="ko")
             result = subprocess.run([str(binary), str(fake)], capture_output=True, text=True, timeout=120,
                                     env=env, cwd=str(home))
             self.assertEqual(result.returncode, 0, result.stdout[-4000:] + result.stderr[-4000:])

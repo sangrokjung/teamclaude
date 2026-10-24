@@ -1,7 +1,7 @@
 # menubar/Tests/test_dashboard_wiring.py
-"""연속 페이지 배선 회귀(소스 정규식). 대시보드는 한 겹 스크롤이고, 섹션 배치는 DashboardSections.swift의
-순수 함수가 맡으며, 고정 헤더는 addFloatingSubview로 얹는다. 섹션별 안쪽 NSScrollView와 936/596 상한이
-되살아나면 여기서 잡는다."""
+"""패널 배선 회귀(소스 정규식). A안 패널은 머리·탭 5개·하단 막대가 고정이고 탭 본문만 안쪽 스크롤 뷰 하나에서
+움직인다. 탭 안 섹션 배치는 DashboardSections.swift의 순수 함수가 맡는다. 섹션별 안쪽 NSScrollView와 936/596
+상한, 탭 전환 때 메뉴 항목 뷰를 갈아 끼우는 코드가 되살아나면 여기서 잡는다."""
 from pathlib import Path
 import re
 import unittest
@@ -27,24 +27,29 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertNotIn("maxTeamHeight", self.main)
         self.assertNotIn("maxMenuDashboardHeight", self.main)
 
-    def test_dashboard_view_has_no_inner_scroll_view(self):
+    def test_panel_body_is_the_only_scroll_view(self):
         body = class_body(self.main, "StatusMenuDashboardView")
-        self.assertNotIn("NSScrollView(", body, "the account table must render at full height inside the one page")
+        self.assertEqual(1, body.count("NSScrollView("), "the tab body is the one scroll view; sections render at full height")
         self.assertNotIn("enclosingScrollView", body)
         self.assertIn("private(set) var sections: [DashboardSection]", body)
         self.assertIn("DashboardSectionHeaderView(", body)
         self.assertIn("dashboardSectionLayout(startY:", body)
         self.assertIn("dashboardSectionBodyY(", body)
+        # 탭을 바꾸면 스크롤 뷰의 문서만 갈아 끼운다. 메뉴 항목의 뷰는 그대로다.
+        select = body[body.index("    func selectTab("):]
+        select = select[:select.index("\n    }\n")]
+        self.assertNotIn("item.view", select)
+        self.assertIn("showSelectedTab(", select)
 
-    def test_menu_hosting_is_one_helper_with_a_pinned_header(self):
+    def test_menu_hosting_is_one_helper(self):
         self.assertEqual(1, self.main.count("func hostDashboard("), "both hosting sites must share one helper")
-        self.assertIn("addFloatingSubview(", self.main)
+        host = self.main[self.main.index("    func hostDashboard("):]
+        host = host[:host.index("\n    }\n")]
+        self.assertIn("if item.view !== dashboard {", host)
+        self.assertIn("dashboard.restoreBodyScroll(previousScrollOrigin)", host)
+        self.assertNotIn("NSScrollView(", host)
         self.assertIn("verticalScrollElasticity = .allowed", self.main)
         self.assertNotIn("verticalScrollElasticity = .none", self.main)
-        self.assertIn("DashboardSectionHeaderView(", self.main)
-        self.assertIn("dashboardCurrentSection(", self.main)
-        self.assertIn("NSView.boundsDidChangeNotification", self.main)
-        self.assertIn("postsBoundsChangedNotifications = true", self.main)
         for site in ("func updateCachedMenuPresentation()", "func menuWillOpen(_ menu: NSMenu)"):
             self.assertIn(site, self.main)
         rebuild = self.main.split("func menuWillOpen(_ menu: NSMenu)", 1)[1].split("func menuDidClose", 1)[0]
@@ -52,12 +57,22 @@ class DashboardWiringTests(unittest.TestCase):
         refresh = self.main.split("func updateCachedMenuPresentation()", 1)[1].split("func menuWillOpen", 1)[0]
         self.assertIn("hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)", refresh)
 
+    def test_panel_height_fits_the_screen(self):
+        # 높이는 가장 긴 탭에 맞추되 화면을 넘지 않는다. 공유 파라미터에 기본값을 두지 않는다(호출부가 화면 상한을 잊지 않게).
+        signature = self.main[self.main.index("    static func preferredHeight(teamClaude:"):]
+        signature = signature[:signature.index("{")]
+        self.assertIn("maxBodyHeight: CGFloat, tab: DashboardTab? = nil", signature)
+        self.assertNotIn("maxBodyHeight: CGFloat =", signature)
+        self.assertIn("func dashboardMaxBodyHeight() -> CGFloat", self.main)
+        self.assertGreaterEqual(self.main.count("maxBodyHeight: dashboardMaxBodyHeight()")
+                                + self.main.count("dashboard.maxBodyHeight = dashboardMaxBodyHeight()"), 1)
+
     def test_sections_file_uses_the_palette_only(self):
         sections = SECTIONS.read_text()
         self.assertNotIn("NSColor(", sections)
         self.assertNotIn("NSFont.", sections)
         self.assertIn("TeamClaudePalette.", sections)
-        for symbol in ("struct DashboardSection", "func dashboardSectionLayout(", "func dashboardCurrentSection(",
+        for symbol in ("struct DashboardSection", "func dashboardSectionLayout(",
                        "func dashboardSectionBodyY(", "final class DashboardSectionHeaderView"):
             self.assertIn(symbol, sections)
 
@@ -66,14 +81,21 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertIn("enum TeamClaudePalette", PALETTE.read_text())
         self.assertNotIn("enum TeamClaudePalette", self.main)
 
-    def test_section_order_is_the_same_in_layout_and_configure(self):
+    def test_height_and_configure_share_one_section_list(self):
         body = class_body(self.main, "StatusMenuDashboardView")
-        ids = re.findall(r'\(id: "([a-z]+)", title: "([^"]+)"', body)
-        self.assertEqual(len(ids), 12, "preferredHeight and configure each list the six sections")
-        expected = [("burn", "구독·소진"), ("claude", "Claude 풀"), ("codex", "Codex 풀"),
-                    ("higgsfield", "Higgsfield"), ("cli", "CLI 쿼터"), ("usage", "사용량")]
-        self.assertEqual(ids[:6], expected)
-        self.assertEqual(ids[6:], expected)
+        bodies = body[body.index("    static func sectionBodies("):]
+        bodies = bodies[:bodies.index("\n    }\n")]
+        ids = re.findall(r'\(id: "([a-z]+)", title: ', bodies)
+        self.assertEqual(ids, ["claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary"],
+                         "every former dashboard section keeps a place in one tab")
+        self.assertIn("sectionBodies(", body[body.index("    static func tabContentHeights("):])
+        configure = body[body.index("    func configure("):]
+        configure = configure[:configure.index("\n    }\n")]
+        self.assertIn("Self.sectionBodies(", configure)
+        self.assertIn("Self.overviewModel(", configure)
+        tabs = (SOURCES / "DashboardPanel.swift").read_text()
+        for section in ("overview", "claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary"):
+            self.assertIn(f'"{section}"', tabs[tabs.index("var sectionIDs"):tabs.index("static func containing")])
 
 
 class DashboardRefreshCostTests(unittest.TestCase):
@@ -124,7 +146,7 @@ class DashboardRefreshCostTests(unittest.TestCase):
         self.assertEqual(1, body.count("dashboard.updateContent("))
         host_start = self.main.index("    func hostDashboard(")
         host_end = self.main.index("\n    }\n", host_start)
-        self.assertIn("existing.documentView === dashboard", self.main[host_start:host_end])
+        self.assertIn("if item.view !== dashboard {", self.main[host_start:host_end])
 
 class HiggsfieldTimerWiringTests(unittest.TestCase):
     """힉스필드 조회는 주기 타이머가 있어야 한다.
@@ -195,7 +217,7 @@ class CliLaneHealthWiringTests(unittest.TestCase):
         self.assertIn("var staleNote: String?", higgs)
         # 그리기와 접근성 둘 다에 반영돼야 한다.
         self.assertIn("if let staleNote { label +=", higgs)
-        self.assertIn("drawText(staleNote,", higgs)
+        self.assertIn("PanelDraw.text(staleNote,", higgs)
 
     def test_stale_tail_survives_the_empty_agy_path(self):
         # 기동 후 한 번도 성공하지 못한 경우가 조기 반환으로 빠져나가던 자리다.
@@ -211,21 +233,26 @@ class CliLaneHealthWiringTests(unittest.TestCase):
 
     def test_empty_state_words_are_unified(self):
         vocab = (SOURCES / "StatusVocabulary.swift").read_text()
-        for word in ("확인 중", "확인 필요", "측정 전"):
-            self.assertIn(word, vocab)
+        table = (SOURCES / "L10n.swift").read_text()
+        for key, word in (("vocabChecking", "확인 중"), ("vocabNeedsCheck", "확인 필요"), ("vocabNotMeasured", "측정 전")):
+            self.assertIn(f"L10n.{key}", vocab)
+            self.assertIn(f't("{word}", ', table)
         # 띄어쓰기가 갈린 옛 표기가 되살아나면 잡는다.
         # 화면에 그리는 자리에서 옛 붙여쓰기 표기가 되살아나면 잡는다(진단 출력 문자열은 대상이 아니다).
         for old in ('percentText(sessionPercent) : "확인필요"', ': "측정전",', ': "동기화중",'):
             self.assertNotIn(old, self.main)
 
-    def test_quiet_entry_is_invisible_until_hover(self):
-        # 기록 없는 계정이 대다수라 옅게 남겨도 행마다 같은 문구가 반복된다.
-        rows = (SOURCES / "TeamClaudeRowLines.swift").read_text()
-        self.assertIn("static let restingAlpha: CGFloat = 0", rows)
-        self.assertIn("hoveredRow", self.main)
-        self.assertIn("NSTrackingArea(", self.main)
-        # 감춘 진입점은 발견 경로가 한 줄 있어야 한다.
-        self.assertIn("행에 마우스를 올리면 구독 기록", self.main)
+    def test_subscription_entry_lives_in_the_expanded_row(self):
+        # 기록 없는 계정이 대다수라 행마다 같은 문구를 남기면 노이즈가 된다. 입력 진입점은 펼친 행의 상세 칸에 둔다.
+        table = class_body(self.main, "TeamClaudeTableView")
+        self.assertIn("var expandedAccount: String?", table)
+        self.assertIn("} else if index == expanded {", table)
+        self.assertIn("L10n.subscriptionRecord", table)
+        self.assertIn("openRecordDialog()", table)
+        self.assertIn("func openRecordDialog()", (SOURCES / "AccountSubscriptionButton.swift").read_text())
+        # 발견 경로 한 줄: 범례가 "행을 누르면 구독·동시 요청"을 말한다.
+        self.assertIn("L10n.legendRowClick", table)
+        self.assertIn("행을 누르면 구독", (SOURCES / "L10n.swift").read_text())
 
     def test_config_reads_are_cached(self):
         # 계정마다 설정 파일을 읽고 파싱하면 1초 타이머가 도는 동안 메인 스레드에서
@@ -270,7 +297,8 @@ class CliLaneHealthWiringTests(unittest.TestCase):
         grok = (SOURCES / "GrokUsage.swift").read_text()
         self.assertIn("case expired", grok)
         self.assertIn("candidates.isEmpty ? .login : .expired", grok)
-        self.assertIn("Grok 갱신 필요", self.main)
+        self.assertIn("L10n.grokRefreshNeeded", self.main)
+        self.assertIn('t("Grok 갱신 필요", ', (SOURCES / "L10n.swift").read_text())
 
 
 class AccountRowLinesWiringTests(unittest.TestCase):
@@ -291,27 +319,28 @@ class AccountRowLinesWiringTests(unittest.TestCase):
 
     def test_height_layout_and_draw_share_one_judgement(self):
         height = self._method(self.dashboard, "static func teamContentHeight(")
-        self.assertIn("teamClaudeRowsHeight(health.rowLines(now: now))", height)
+        self.assertIn("TeamClaudeTableView.contentHeight(health, expanded: nil, now: now)", height)
+        content = self._method(self.table, "static func contentHeight(")
+        self.assertIn("health.rowLines(now: now, availability: availability)", content)
+        self.assertIn("teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup)", content)
+        self.assertIn("teamClaudeCardBaseHeight(hostLine:", content)
         self.assertNotIn("* 72", height, "row height is per row now, not a fixed multiple")
         self.assertNotIn("* 72", self.table)
         layout = self._method(self.table, "override func layout()")
         self.assertIn("health.rowLines(now: evaluatedAt)", layout)
-        self.assertIn("teamClaudeRowOrigins(lines)", layout)
+        self.assertIn("teamClaudeGroupedLayout(", layout)
         self.assertIn("teamClaudeSubscriptionLineY(lines[index])", layout)
-        self.assertNotIn("isHidden", layout, "stage 2: an empty subscription record is an entry point, never hidden")
-        self.assertIn("button.setQuietEntry(true)", layout)
-        self.assertIn("button.setQuietEntry(false)", layout)
         draw = self.table[self.table.index("override func draw("):]
         self.assertIn("health.rowLines(now: evaluatedAt, availability: availability)", draw)
-        self.assertIn("teamClaudeRowOrigins(lines)", draw)
-        self.assertIn("teamClaudeRowHeight(lines[i])", draw)
+        self.assertIn("teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded)", draw)
+        self.assertIn("teamClaudeRowHeight(lines[i], expanded: isExpanded)", draw)
         self.assertIn("teamClaudeReasonLineY(lines[i])", draw)
 
     def test_judgement_lives_outside_main(self):
         rows = (SOURCES / "TeamClaudeRowLines.swift").read_text()
         for symbol in ("func teamClaudeReasonLineIsInformative(", "func accountSubscriptionLineIsInformative(",
                        "func teamClaudeRowHeight(", "func teamClaudeRowOrigins(", "func teamClaudeRowsHeight(",
-                       "enum TeamClaudeRowReason"):
+                       "func teamClaudeGroupedLayout(", "enum TeamClaudeRowReason", "enum TeamClaudeColumns"):
             self.assertIn(symbol, rows)
         availability = (SOURCES / "TeamClaudeAvailability.swift").read_text()
         self.assertIn("func rowLines(", availability)
@@ -323,7 +352,10 @@ class AccountRowLinesWiringTests(unittest.TestCase):
     def test_row_height_change_is_relayed_to_the_dashboard(self):
         # 시간 경과·구독 자동 조회로 줄 판정이 바뀌면 표 혼자 못 늘어난다. 대시보드 재구성까지 이어져야 한다.
         self.assertIn("onContentHeightChange", self.table)
-        self.assertIn("view.onContentHeightChange = { [weak self] in self?.onTeamRowsChange?() }", self.dashboard)
+        self.assertIn("table.onContentHeightChange = { [weak self] in self?.onTeamRowsChange?() }", self.dashboard)
+        # 행을 펼치면 표·Claude 탭 문서 높이를 다시 잡는다(펼친 행은 재구성을 지나도 유지).
+        self.assertIn("table.onExpansionChange = { [weak self] in self?.relayoutClaudeTab() }", self.dashboard)
+        self.assertIn("table.expandedAccount = expandedClaudeAccount", self.dashboard)
         self.assertIn("Self.teamContentHeight(teamClaude) != renderedTeamHeight", self.dashboard)
         self.assertIn('scheduleDashboardRefresh(reason: "team-rows")', self.main)
 
@@ -339,81 +371,58 @@ class AccountRowLinesWiringTests(unittest.TestCase):
 
 
 
-class Stage2StructureTests(unittest.TestCase):
-    """2단계: 맨 위 요약은 한 줄 밴드, 표 마지막 열은 내용에 맞는 제목, 구독 진입점은 조용히 남고, 숫자는 우측 정렬.
-    카드 상단 기하는 TeamClaudeCardMetrics 하나에서 나와 높이·배치·그리기가 같은 값을 쓴다."""
+class PanelStructureTests(unittest.TestCase):
+    """A안 구조: 맨 위 요약 띠 대신 개요 탭, 표는 상태별 묶음, 리셋은 열 머리에 한 번, 경고색은 98% 라우팅 문턱.
+    표 상단 기하는 TeamClaudeCardMetrics 하나에서 나와 높이·배치·그리기가 같은 값을 쓴다."""
 
     def setUp(self):
         self.main = MAIN.read_text()
         self.table = class_body(self.main, "TeamClaudeTableView")
-        self.summary = class_body(self.main, "ServiceAvailabilitySummaryView")
         self.dashboard = class_body(self.main, "StatusMenuDashboardView")
-        self.rows = (SOURCES / "TeamClaudeRowLines.swift").read_text()
+        self.overview = (SOURCES / "OverviewTabView.swift").read_text()
+        self.builder = (SOURCES / "DashboardOverviewBuilder.swift").read_text()
         self.palette = PALETTE.read_text()
 
-    def test_summary_is_a_single_band_not_three_cards(self):
-        height = re.search(r"static let preferredHeight: CGFloat = (\d+)", self.summary)
-        self.assertIsNotNone(height)
-        self.assertLessEqual(int(height.group(1)), 64, "the band must stay a single line, not a quarter of the screen")
-        self.assertNotIn('"사용 가능 현황"', self.summary.split("override func draw(")[1], "no big title in the band")
-        self.assertNotIn('"0개 사용 가능"', self.summary, "the 32pt count text is gone")
-        for name in ("Claude Fable", "Claude Opus", "Codex"):
-            self.assertIn(f'"{name}"', self.summary)
-        self.assertIn("ofSize: 15", self.palette.split("summaryValueFont")[1].split("\n")[0])
-        self.assertNotIn("ofSize: 32", self.palette)
-        self.assertNotIn("ofSize: 24", self.palette)
+    def test_overview_replaces_the_summary_band(self):
+        self.assertNotIn("final class ServiceAvailabilitySummaryView", self.main)
+        self.assertIn("final class OverviewTabView", self.overview)
+        # 예전 띠의 세 숫자(Claude Fable · Claude Opus · Codex)가 개요에 그대로 있다.
+        self.assertIn("health.opusAvailability(now: now)", self.builder)
+        self.assertIn("fableReady = availability.filter { $0.state == .ready }.count", self.builder)
+        self.assertIn("pool.usableCount", self.builder)
+        for lane in ('name: "Claude Fable"', 'name: "Codex"', 'name: "Grok"', 'name: "agy"'):
+            self.assertIn(lane, self.builder)
+        self.assertIn("ofSize: 52", self.palette, "the hero number is the one big figure")
 
-    def test_card_does_not_repeat_the_available_count(self):
+    def test_table_groups_rows_and_states_resets_once(self):
         draw = self.table[self.table.index("override func draw("):]
-        self.assertNotIn('stat("Fable 사용 가능"', draw)
-        self.assertNotIn("func stat(", self.table, "the four stat tiles are gone")
-        self.assertNotIn("statValueProminentFont", self.main)
-        # 대기·제외·확인 필요 분류 수는 밴드에 없으므로 카드가 계속 말한다.
-        for label in ('"한도·요청 대기"', '"구독·오류·비활성"', '"확인 필요"'):
-            self.assertIn(label, draw)
-        self.assertIn('"사용 가능 계정 없음"', draw)
-
-    def test_last_column_title_matches_its_content(self):
-        draw = self.table[self.table.index("override func draw("):]
-        self.assertIn('drawText("상태", innerX + 790', draw)
-        self.assertNotIn('"측정", innerX + 790, tableY', draw)
-        self.assertNotIn("row.source.map", draw, "the credential type (oauth) is neither a measurement nor a status")
-        self.assertIn("formatTeamClaudeProbe(row.probedAt)", draw)
+        self.assertIn("teamClaudeRowGroup", draw)
+        for title in ("L10n.groupReady", "L10n.groupLimited", "L10n.groupCheck", "L10n.groupExcluded"):
+            self.assertIn(title, draw)
+        self.assertIn("L10n.resetIn(", draw, "column heads carry the reset")
         # 계정별 문제 사유는 어떤 경우에도 그린다.
         self.assertIn("teamAccountErrorReasonLabel(row.errorReason)", draw)
         self.assertIn("issue.compactText", draw)
+        self.assertIn("formatTeamClaudeProbe(row.probedAt)", draw)
+        self.assertNotIn("row.source.map", draw, "the credential type (oauth) is neither a measurement nor a status")
 
-    def test_subscription_entry_survives_without_a_record(self):
-        availability = (SOURCES / "TeamClaudeAvailability.swift").read_text()
-        self.assertIn("!teamClaudeSubscriptionEntryFitsInline(name: row.name)", availability,
-                      "rowLines alone decides between the third line and the inline entry")
-        for symbol in ("func teamClaudeSubscriptionEntryFitsInline(", "enum TeamClaudeSubscriptionEntry", "static let restingAlpha"):
-            self.assertIn(symbol, self.rows)
-        button = (SOURCES / "AccountSubscriptionButton.swift").read_text()
-        self.assertIn("func setQuietEntry(", button)
-        self.assertIn('setAccessibilityLabel("\\(accountName): \\(title)")', button, "assistive tech still hears the full record")
-        self.assertIn("TeamClaudeSubscriptionEntry.inlineX", self.table)
-        self.assertIn("override func mouseMoved(", self.table)
-        self.assertIn("override func mouseExited(", self.table)
-        self.assertIn("TeamClaudeSubscriptionEntry.restingAlpha : 1", self.table)
+    def test_warning_color_follows_the_routing_threshold(self):
+        drawing = (SOURCES / "PanelDrawing.swift").read_text()
+        self.assertIn("let panelRoutingThresholdPercent: Double = 98", drawing)
+        self.assertIn("percent >= thresholdPercent", drawing)
+        draw = self.table[self.table.index("override func draw("):]
+        self.assertNotIn("percent >= 90", draw)
+        self.assertNotIn("percent >= 70", draw)
+        self.assertIn("thresholdPercent: threshold", draw)
 
     def test_numbers_are_right_aligned(self):
+        drawing = (SOURCES / "PanelDrawing.swift").read_text()
+        meter = drawing[drawing.index("static func meterWithValue("):]
+        self.assertIn("right(value, rect.maxX", meter[:meter.index("\n    }\n")])
         draw = self.table[self.table.index("override func draw("):]
-        for call in ("drawRight(percentText(sessionPercent), innerX + 306",
-                     "drawRight(wkPercent != nil ? percentText(wkPercent) : StatusVocabulary.syncing, innerX + 486",
-                     "drawRight(fbPercent != nil ? percentText(fbPercent) : StatusVocabulary.notMeasured, innerX + 674",
-                     "drawRight(sessionDetail, innerX + 442",
-                     "resetAt: row.weeklyResetAt), innerX + 612",
-                     "resetAt: row.fableResetAt), innerX + 780"):
-            self.assertIn(call, draw)
-        self.assertNotIn("drawText(percentText(", draw)
+        self.assertIn("PanelDraw.meterWithValue(cell", draw)
 
     def test_card_metrics_are_shared_by_height_layout_and_draw(self):
-        height = self.dashboard[self.dashboard.index("static func teamContentHeight("):]
-        height = height[:height.index("\n    }\n")]
-        self.assertIn("teamClaudeCardBaseHeight(hostLine:", height)
-        self.assertNotIn("276", height)
-        self.assertNotIn("256", height)
         layout = self.table[self.table.index("override func layout()"):]
         layout = layout[:layout.index("\n    }\n")]
         self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLine:", layout)
@@ -421,9 +430,27 @@ class Stage2StructureTests(unittest.TestCase):
         self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLine:", draw)
         self.assertIn("TeamClaudeCardMetrics.stripY(hostLine:", draw)
         self.assertIn("TeamClaudeCardMetrics.tableHeadY(hostLine:", draw)
-        for literal in ("tableY + 34", "statY + 88", "topY + 14"):
+        for literal in ("tableY + 34", "statY + 88", "topY + 14", "innerX + 790"):
             self.assertNotIn(literal, self.table, f"a hard-coded offset would diverge from the shared metrics: {literal}")
 
+    def test_actions_moved_to_the_footer_list(self):
+        # 예전 동작 행(새로고침·측정·가져오기·OAuth 두 가지·서버 재시작·로그인 시 열기·종료)이 하나도 빠지지 않는다.
+        actions = self.main[self.main.index("    func dashboardActions(menu: NSMenu)"):]
+        actions = actions[:actions.index("\n    }\n")]
+        for target in ("refreshAction()", "measureTeamClaudeAction()", "importClaudeCodeAccountAction()",
+                       "addClaudeOAuthAccountAction()", "addCodexOAuthAccountAction()", "restartTeamClaudeAction()",
+                       "toggleLoginItem()", "quitAction()"):
+            self.assertIn(target, actions)
+        self.assertIn("menubarLoginItemAvailable(bundlePath: Bundle.main.bundlePath)", actions)
+        # 로그인 시 열기는 메뉴를 닫지 않으므로 토글 결과 문구를 돌려줘야 열린 목록의 detail이 바뀐다(LoginItemTests가 동작을 본다).
+        self.assertIn("menubarLoginItemAction(", actions)
+        self.assertIn("return self?.toggleLoginItem()", actions)
+        on_run = self.main[self.main.index("actionList.onRun = {"):]
+        on_run = on_run[:on_run.index("\n        }\n")]
+        self.assertIn("let detail = action.run()", on_run)
+        self.assertIn("self.actionList.updateDetail(id: action.id, detail: detail)", on_run)
+        self.assertNotIn("final class MenuActionRowView", self.main)
+        self.assertIn("addDashboardShortcutItems(to: menu)", self.main)
 
 
 class SubscriptionBurnWiringTests(unittest.TestCase):
@@ -438,7 +465,8 @@ class SubscriptionBurnWiringTests(unittest.TestCase):
 
     def test_section_is_registered_in_both_lists(self):
         # 높이 계산과 배치가 같은 섹션 목록을 봐야 섹션이 잘리지 않는다.
-        self.assertEqual(self.main.count('(id: "burn", title: "구독·소진"'), 2)
+        self.assertEqual(self.main.count('(id: "burn", title: L10n.sectionBurn'), 1, "one list feeds height and layout")
+        self.assertIn("sectionBodies(", self.main[self.main.index("    static func tabContentHeights("):])
 
     def test_every_height_call_passes_the_model(self):
         """높이 계산과 그리기가 다른 모델을 보면 화면이 그만큼 잘린다.

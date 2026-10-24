@@ -14,10 +14,10 @@ enum MenubarTool: String, CaseIterable {
         case .teamcodex: return "TeamCodex"
         case .codex: return "Codex"
         case .higgsfield: return "Higgsfield"
-        case .ccusage: return "사용량"
+        case .ccusage: return L10n.sectionUsage
         case .grok: return "Grok"
         case .agy: return "agy"
-        case .subscription: return "구독 수집기"
+        case .subscription: return L10n.toolSubscriptionCollector
         }
     }
 }
@@ -44,25 +44,25 @@ private func notInstalled(_ tool: MenubarTool, detail: String) -> ToolNotice {
 }
 
 private func envHint(_ key: String) -> String {
-    "설치돼 있다면 \(key)로 경로를 지정하세요"
+    L10n.envHint(key)
 }
 
 /// 설정 파일도, 응답하는 서버도, 계정도 없으면 TeamClaude를 쓰지 않는 맥이다.
 /// 설정이 있는데 서버만 꺼졌으면 기존 "오프라인" 화면이 맞으므로 nil.
 func teamClaudeToolNotice(configPresent: Bool, serverReachable: Bool, accountCount: Int) -> ToolNotice? {
     guard !configPresent, !serverReachable, accountCount == 0 else { return nil }
-    return notInstalled(.teamclaude, detail: "설정 파일(~/.config/teamclaude.json)과 실행 중인 서버가 없습니다")
+    return notInstalled(.teamclaude, detail: L10n.noticeNoConfigOrServer("~/.config/teamclaude.json"))
 }
 
 func teamCodexToolNotice(configPresent: Bool, serverReachable: Bool, accountCount: Int) -> ToolNotice? {
     guard !configPresent, !serverReachable, accountCount == 0 else { return nil }
-    return notInstalled(.teamcodex, detail: "설정 파일(~/.config/teamcodex.json)과 실행 중인 서버가 없습니다")
+    return notInstalled(.teamcodex, detail: L10n.noticeNoConfigOrServer("~/.config/teamcodex.json"))
 }
 
 /// Codex CLI의 인증·설정·세션 기록도, 호출 기록(calls.jsonl)도 없으면 미설치다.
 func codexToolNotice(authPresent: Bool, configPresent: Bool, scannedLogFiles: Int, totalCalls: Int) -> ToolNotice? {
     guard !authPresent, !configPresent, scannedLogFiles == 0, totalCalls == 0 else { return nil }
-    return notInstalled(.codex, detail: "~/.codex의 인증·설정·세션 기록이 없습니다")
+    return notInstalled(.codex, detail: L10n.noticeNoCodex)
 }
 
 /// Codex 섹션은 로컬 Codex와 TeamCodex 풀을 함께 그린다. 둘 다 없을 때만 섹션을 안내로 바꾼다.
@@ -70,7 +70,7 @@ func codexSectionToolNotice(codex: ToolNotice?, teamCodex: ToolNotice?) -> ToolN
     guard codex != nil, teamCodex != nil else { return nil }
     return ToolNotice(tool: .codex, kind: .notInstalled,
                       headline: "Codex·TeamCodex \(StatusVocabulary.notInstalled)",
-                      detail: "Codex CLI 기록과 TeamCodex 설정이 없습니다")
+                      detail: L10n.noticeNoCodexSection)
 }
 
 func higgsfieldToolNotice(installed: Bool) -> ToolNotice? {
@@ -89,12 +89,12 @@ enum CcusageFailure: Equatable {
 
     var label: String {
         switch self {
-        case .launch: return "실행하지 못함"
-        case .timeout(let seconds): return "\(seconds)초 시간 초과"
-        case .exitStatus(let code): return "종료 코드 \(code)"
-        case .emptyOutput: return "빈 출력"
-        case .unparsable: return "출력 해석 실패"
-        case .outputTooLarge: return "출력 크기 상한 초과"
+        case .launch: return L10n.ccusageFailLaunch
+        case .timeout(let seconds): return L10n.ccusageFailTimeout(seconds)
+        case .exitStatus(let code): return L10n.ccusageFailExit(code)
+        case .emptyOutput: return L10n.ccusageFailEmpty
+        case .unparsable: return L10n.ccusageFailUnparsable
+        case .outputTooLarge: return L10n.ccusageFailTooLarge
         }
     }
 }
@@ -131,8 +131,8 @@ func ccusageLoadOutcome(launched: Bool, timedOut: Bool, timeoutSeconds: Double, 
 func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: Bool) -> ToolNotice? {
     if !installed {
         return ToolNotice(tool: .ccusage, kind: .notInstalled,
-                          headline: "사용량 \(StatusVocabulary.notInstalled)",
-                          detail: "ccusage를 실행할 npx(Node.js)가 없습니다 · \(envHint("CC_MENUBAR_NPX_BIN"))")
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.notInstalled)",
+                          detail: L10n.noticeNoNpx(envHint("CC_MENUBAR_NPX_BIN")))
     }
     guard let outcome, !hasData else { return nil }
     switch outcome {
@@ -140,12 +140,12 @@ func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: B
         return nil
     case .noData:
         return ToolNotice(tool: .ccusage, kind: .noData,
-                          headline: "사용량 \(StatusVocabulary.noData)",
-                          detail: "Claude Code 사용 기록이 아직 없습니다")
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.noData)",
+                          detail: L10n.noticeNoClaudeUsage)
     case .failed(let failure):
         return ToolNotice(tool: .ccusage, kind: .loadFailed,
-                          headline: "사용량 \(StatusVocabulary.needsCheck)",
-                          detail: "ccusage \(failure.label) · 다음 갱신 때 다시 시도합니다")
+                          headline: "\(L10n.sectionUsage) \(StatusVocabulary.needsCheck)",
+                          detail: L10n.noticeUsageLoadFailed(failure.label))
     }
 }
 
@@ -156,8 +156,8 @@ enum CcusageAuxCommand: Equatable {
 
     var label: String {
         switch self {
-        case .weekly: return "주간"
-        case .monthly: return "월간"
+        case .weekly: return L10n.ccusageWeekly
+        case .monthly: return L10n.ccusageMonthly
         }
     }
 
@@ -208,7 +208,7 @@ func ccusagePartialNote(_ failures: [CcusageAuxFailure]) -> String? {
         }
     }
     let body = groups.map { "\($0.commands.joined(separator: "/")): \($0.cause)" }.joined(separator: ", ")
-    return "일부 갱신 실패(\(body)) · 일별만 최신"
+    return L10n.ccusagePartialNote(body)
 }
 
 /// 사용량 카드·헤더에 붙는 꼬리말. 이전 값을 남긴 채 갱신이 실패했거나, 지난 기록은 읽었는데 오늘 날짜 항목이
@@ -218,8 +218,8 @@ func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool, partial: [Ccu
     guard hasData, let outcome else { return nil }
     switch outcome {
     case .loaded: return ccusagePartialNote(partial)
-    case .noData: return ["오늘 사용 기록 없음", ccusagePartialNote(partial)].compactMap { $0 }.joined(separator: " · ")
-    case .failed(let failure): return "갱신 실패(\(failure.label)) · 이전 값"
+    case .noData: return [L10n.ccusageNoTodayUsage, ccusagePartialNote(partial)].compactMap { $0 }.joined(separator: " · ")
+    case .failed(let failure): return L10n.ccusageStaleFailed(failure.label)
     }
 }
 
@@ -236,8 +236,8 @@ func agyToolNotice() -> ToolNotice {
 /// R4: 구독 수집기는 우리 맥에서만 켜는 선택 기능이다. 상태 파일이 없으면 오류가 아니라 안내다.
 func subscriptionCollectorToolNotice(stateFileExists: Bool) -> ToolNotice? {
     stateFileExists ? nil : ToolNotice(tool: .subscription, kind: .notInstalled,
-                                       headline: "수집기 미설치(선택 기능)",
-                                       detail: "구독 확인 수집기가 없어 결제 메일·청구 페이지 확인은 건너뜁니다")
+                                       headline: L10n.noticeCollectorHeadline,
+                                       detail: L10n.noticeCollectorDetail)
 }
 
 func subscriptionCollectorToolNotice(home: String) -> ToolNotice? {

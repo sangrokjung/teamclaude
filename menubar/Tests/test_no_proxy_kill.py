@@ -97,7 +97,8 @@ class NoProxyKillTests(unittest.TestCase):
     def test_delay_and_drift_states_reach_display(self):
         self.assertIn("teamClaudeServerPillLabel(", self.main)
         self.assertIn("teamClaudeDriftActionDetail(", self.main)
-        self.assertIn('"Claude 응답 지연"', self.main)
+        self.assertIn("L10n.titleClaudeSlow", self.main)
+        self.assertIn('t("Claude 응답 지연", "Claude slow")', (SOURCES / "L10n.swift").read_text())
         commit = function_body(self.main, "func commitTeamClaudeHealth(")
         self.assertIn("serverResponseDelayed", commit)
         self.assertIn("driftPersistsAfterReload", commit)

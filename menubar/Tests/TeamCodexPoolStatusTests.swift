@@ -691,9 +691,10 @@ struct TeamCodexPoolStatusTests {
             hasPool: true,
             localUsageLoaded: true
         )
-        precondition(loadingLayout.poolY == 72)
+        // A안: 풀이 탭 맨 위, 이 맥의 사용량은 그 아래. 로컬 사용량 로딩 여부는 풀 위치를 바꾸지 않는다.
+        precondition(loadingLayout.poolY == 14)
         precondition(loadedLayout.poolY == loadingLayout.poolY)
-        precondition(loadedLayout.metricsY == 168)
+        precondition(loadedLayout.metricsY == 14 + 86 + 16)
 
         // ── 되돌리기 버튼 자격 판정 ───────────────────────────────────────────
         // 실제 CLI(운영 아티팩트 6b538222)가 거부하는 조합에는 버튼을 붙이지 않는다.

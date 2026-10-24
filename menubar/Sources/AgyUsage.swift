@@ -69,15 +69,15 @@ func agyRemainingLabel(_ fraction: Double) -> String? {
     guard let fraction = agyFiniteFraction(fraction) else { return nil }
     let tenth = (fraction * 1000).rounded() / 10
     if abs(tenth - tenth.rounded()) < 0.001 {
-        return "\(Int(tenth.rounded()))% 남음"
+        return L10n.remainingPercent("\(Int(tenth.rounded()))")
     }
     let formatted = String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"), tenth)
-    return "\(formatted)% 남음"
+    return L10n.remainingPercent(formatted)
 }
 
 func agyDisplayName(_ name: String) -> String {
     let folded = name.lowercased()
-    if folded.contains("gemini") { return "Gemini 모델" }
+    if folded.contains("gemini") { return L10n.agyGeminiModel }
     if folded.contains("claude") || folded.contains("gpt") { return "Claude·GPT" }
     return name
 }
@@ -85,12 +85,12 @@ func agyDisplayName(_ name: String) -> String {
 func agyResetHint(_ date: Date?, now: Date) -> String? {
     guard let date else { return nil }
     let seconds = date.timeIntervalSince(now)
-    if seconds <= 0 { return "곧 리셋" }
+    if seconds <= 0 { return L10n.resetSoon }
     let minutes = Int(seconds / 60)
-    if minutes < 60 { return "\(max(minutes, 1))분 뒤" }
+    if minutes < 60 { return L10n.afterDuration(L10n.durationMinutes(max(minutes, 1))) }
     let hours = minutes / 60
-    if hours < 48 { return "\(hours)시간 뒤" }
-    return "\(hours / 24)일 뒤"
+    if hours < 48 { return L10n.afterDuration(L10n.durationHours(hours)) }
+    return L10n.afterDuration(L10n.durationDays(hours / 24))
 }
 
 /// 화면에 올릴 레인만 남긴다.
@@ -103,11 +103,11 @@ func agyVisibleGroups(_ groups: [AgyQuotaGroup]) -> [AgyQuotaGroup] {
 
 func agyLogLine(_ card: AgyCardModel) -> String {
     if card.groups.isEmpty {
-        return card.message ?? "agy 확인 중"
+        return card.message ?? L10n.agyChecking
     }
     return card.groups.prefix(2).map { group in
-        let weekly = group.weekly.flatMap { agyRemainingLabel($0.remaining) } ?? "주간 확인 필요"
-        let fiveHour = group.fiveHour.flatMap { agyRemainingLabel($0.remaining) } ?? "5시간 확인 필요"
+        let weekly = group.weekly.flatMap { agyRemainingLabel($0.remaining) } ?? L10n.agyWeeklyCheck
+        let fiveHour = group.fiveHour.flatMap { agyRemainingLabel($0.remaining) } ?? L10n.agyFiveHourCheck
         return "\(agyDisplayName(group.name)) \(weekly) / \(fiveHour)"
     }.joined(separator: " · ")
 }

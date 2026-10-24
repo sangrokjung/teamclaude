@@ -237,28 +237,28 @@ enum TeamClaudeMeasurementIssue: Equatable {
 
     var displayText: String {
         switch self {
-        case .disabled: return "비활성 계정"
-        case .serverNotSynced: return "서버 동기화 필요"
-        case .accountError: return "인증 확인 필요"
-        case .throttled: return "일시 제한 해제 대기"
-        case .exhausted: return "사용 한도 초기화 대기"
-        case .quotaBlocked: return "사용 한도 리셋 대기"
-        case .staleSession: return "세션 만료, 재측정 필요"
-        case .sessionMissing: return "세션 사용량 미측정"
-        case .weeklyMissing: return "주간 사용량 미측정"
-        case .fableMissing: return "Fable 사용량 미측정"
+        case .disabled: return L10n.issueDisabledLong
+        case .serverNotSynced: return L10n.issueNotSyncedLong
+        case .accountError: return L10n.issueAccountErrorLong
+        case .throttled: return L10n.reasonThrottled
+        case .exhausted: return L10n.issueExhaustedLong
+        case .quotaBlocked: return L10n.reasonQuotaReset
+        case .staleSession: return L10n.issueStaleLong
+        case .sessionMissing: return L10n.issueSessionMissingLong
+        case .weeklyMissing: return L10n.issueWeeklyMissingLong
+        case .fableMissing: return L10n.issueFableMissingLong
         }
     }
 
     var compactText: String {
         switch self {
-        case .disabled: return "비활성"
-        case .serverNotSynced: return "동기화"
-        case .accountError: return "인증확인"
-        case .throttled: return "제한대기"
-        case .exhausted: return "한도대기"
-        case .quotaBlocked: return "한도리셋"
-        case .staleSession, .sessionMissing, .weeklyMissing, .fableMissing: return "지금측정"
+        case .disabled: return L10n.stateInactive
+        case .serverNotSynced: return L10n.issueNotSyncedShort
+        case .accountError: return L10n.issueAccountErrorShort
+        case .throttled: return L10n.issueThrottledShort
+        case .exhausted: return L10n.issueExhaustedShort
+        case .quotaBlocked: return L10n.quotaReset
+        case .staleSession, .sessionMissing, .weeklyMissing, .fableMissing: return L10n.issueMeasureShort
         }
     }
 }

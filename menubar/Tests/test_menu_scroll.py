@@ -10,16 +10,16 @@ class MenuScrollRegressionTests(unittest.TestCase):
     def test_cached_dashboard_refresh_preserves_existing_scroll_offset(self):
         source = SOURCE.read_text()
         match = re.search(
-            r"    func updateCachedMenuPresentation\(\) \{(?P<body>.*?)\n    \}\n\n    func menuWillOpen",
+            r"    func updateCachedMenuPresentation\(\) \{(?P<body>.*?)\n    \}\n\n",
             source,
             re.DOTALL,
         )
         self.assertIsNotNone(match, "cached dashboard presentation method must remain discoverable")
         body = match.group("body")
         self.assertIn(
-            "let previousScrollOrigin = (dashboardItem.view as? NSScrollView)?.contentView.bounds.origin",
+            "let previousScrollOrigin = dashboard.bodyScrollOrigin",
             body,
-            "refresh must capture the user's existing dashboard scroll position",
+            "refresh must capture the user's existing tab-body scroll position",
         )
         self.assertIn(
             "hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)",
@@ -33,13 +33,16 @@ class MenuScrollRegressionTests(unittest.TestCase):
         )
         self.assertIsNotNone(host, "the shared dashboard hosting helper must remain discoverable")
         self.assertIn(
-            "scrollView.contentView.scroll(to: NSPoint(x: previousScrollOrigin.x",
+            "dashboard.restoreBodyScroll(previousScrollOrigin)",
             host.group("body"),
-            "hosting must restore the captured position after replacing the document view",
+            "hosting must restore the captured position after a rebuild",
         )
+        restore = source[source.index("    func restoreBodyScroll("):]
+        restore = restore[:restore.index("\n    }\n")]
+        self.assertIn("min(max(origin.y, 0), maximumY)", restore, "the restored offset is clamped to the document")
         for text in (body, host.group("body")):
             self.assertNotIn(
-                "scrollView.contentView.scroll(to: .zero)",
+                "scroll(to: .zero)",
                 text,
                 "periodic status refresh must not force the open menu back to the top",
             )
@@ -83,24 +86,25 @@ class MenuScrollRegressionTests(unittest.TestCase):
         self.assertNotIn("updateCachedMenuPresentation()", open_path, "the open menu must not rebuild geometry")
         self.assertNotIn("documentView", open_path)
 
-    def test_team_account_list_is_part_of_the_single_page(self):
-        # 계정 표는 더 이상 자기 스크롤 뷰를 갖지 않는다. 표의 스크롤 위치는 곧 페이지의 스크롤 위치이고,
-        # 그것은 updateCachedMenuPresentation → hostDashboard가 보존한다.
+    def test_tab_body_is_one_scroll_view_with_full_height_sections(self):
+        # 계정 표는 자기 스크롤 뷰를 갖지 않는다. 탭 본문 하나가 스크롤되고, 그 위치는
+        # updateCachedMenuPresentation → hostDashboard가 보존한다. 탭 전환은 문서만 갈아 끼운다.
         source = SOURCE.read_text()
         match = re.search(
-            r"    func updateContent\((?P<body>.*?)\n    \}\n}\n\nfinal class UsageDashboardView",
+            r"    func updateContent\((?P<body>.*?)\n    \}\n",
             source,
             re.DOTALL,
         )
         self.assertIsNotNone(match, "dashboard update method must remain discoverable")
-        body = match.group("body")
         self.assertNotIn(
             "enclosingScrollView",
-            body,
+            match.group("body"),
             "the account table has no inner scroll view to capture or restore",
         )
         dashboard_class = source.split("final class StatusMenuDashboardView", 1)[1].split("\nfinal class ", 1)[0]
-        self.assertNotIn("NSScrollView(", dashboard_class, "the dashboard must be one continuous document")
+        self.assertEqual(1, dashboard_class.count("NSScrollView("), "only the tab body scrolls")
+        table_class = source.split("final class TeamClaudeTableView", 1)[1].split("\nfinal class ", 1)[0]
+        self.assertNotIn("NSScrollView(", table_class)
 
 
 if __name__ == "__main__":

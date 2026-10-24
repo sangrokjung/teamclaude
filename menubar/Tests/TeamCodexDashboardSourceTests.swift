@@ -11,6 +11,8 @@ struct TeamCodexDashboardSourceTests {
         let source = try String(contentsOfFile: sourcePath, encoding: .utf8)
         let codexStatusViewPath = "\(CommandLine.arguments[1])/menubar/Sources/CodexStatusView.swift"
         let codexStatusView = try String(contentsOfFile: codexStatusViewPath, encoding: .utf8)
+        // 화면 문구는 L10n.swift 한 표에 있다(R5). 문구 단언은 표에서, 배선 단언은 소스에서 본다.
+        let table = try String(contentsOfFile: "\(CommandLine.arguments[1])/menubar/Sources/L10n.swift", encoding: .utf8)
 
         let tick = try functionBody(
             named: "func tick()",
@@ -49,13 +51,17 @@ struct TeamCodexDashboardSourceTests {
                 && codexStatusView.contains("teamAccountErrorReasonLabel(account.errorReason)"),
             "Both TeamClaude renderers must share the canonical error-reason label"
         )
+        // Claude 표는 "사용 가능" 묶음이 그 계정 이름들을 행으로 보이고, Codex 풀은 머리에 이름을 한 줄로 보인다.
         precondition(
-            source.contains("사용 가능 계정:") && codexStatusView.contains("사용 가능 계정:"),
+            source.contains("case .ready: tone = .ready; title = L10n.groupReady")
+                && codexStatusView.contains("L10n.codexUsableNames(")
+                && table.contains("사용 가능 계정:"),
             "Both account pools must show the names of currently usable accounts"
         )
         precondition(
             source.contains("teamClaudeCanReauthenticate(")
-                && source.contains("button.title = \"재인증 필요\"")
+                && source.contains("button.setAccessibilityLabel(L10n.reauthNeededLabel(row.name))")
+                && table.contains("재인증 필요: ")
                 && source.contains("onReauthenticateTeamClaude"),
             "The graphical TeamClaude table must expose eligible re-auth buttons in the accessibility tree"
         )
@@ -74,7 +80,7 @@ struct TeamCodexDashboardSourceTests {
             "The Codex pool table must build recovery buttons and report clicks through onRecover"
         )
         precondition(
-            source.contains("view.onRecover = onRecoverTeamCodex")
+            source.contains("codexStatus.onRecover = onRecoverTeamCodex")
                 && source.contains("codexView?.onRecover = onRecoverTeamCodex")
                 && source.contains("self?.recoverTeamCodexAccount(name, expectedAccountUuid: accountUuid, kind: kind)"),
             "Both the first render and the update path must wire the Codex recovery callback"
@@ -96,7 +102,8 @@ struct TeamCodexDashboardSourceTests {
             in: source
         )
         precondition(
-            terminalCommand.contains("teamcodex restart가 필요합니다")
+            terminalCommand.contains("L10n.terminalFollowUpCodex")
+                && table.contains("teamcodex restart가 필요합니다")
                 && terminalCommand.contains("let closingNote = codexMode"),
             "A codex-mode terminal must not overwrite the CLI restart warning with an auto-apply promise"
         )

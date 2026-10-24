@@ -12,6 +12,7 @@ class AccountSubscriptionTest(unittest.TestCase):
             result = subprocess.run(['/usr/bin/swiftc', '-j', '1', '-num-threads', '1',
                 str(ROOT / 'menubar/Sources/AccountSubscription.swift'),
                 str(ROOT / 'menubar/Sources/AccountSubscriptionButton.swift'),
+                str(ROOT / 'menubar/Sources/L10n.swift'),
                 '-framework', 'Cocoa',
                 str(ROOT / 'menubar/Tests/AccountSubscriptionTests.swift'),
                 '-o', str(executable)], capture_output=True, text=True, timeout=600)

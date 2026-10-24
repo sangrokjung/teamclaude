@@ -847,29 +847,29 @@ func loadCodexHealth() -> CodexHealth {
     } else if authMode?.lowercased().contains("api") == true || hasApiKey {
         authLabel = "API Key"
     } else {
-        authLabel = "로그인 필요"
+        authLabel = L10n.loginRequired
     }
 
     let staleRefresh = lastRefresh.map { $0 < Date().addingTimeInterval(TimeInterval(-14 * 86_400)) } ?? false
     var hints: [String] = []
     if authMalformed {
-        hints.append("auth.json 파싱 실패")
+        hints.append(L10n.hintAuthParse)
     } else if !authFileExists {
-        hints.append("Codex auth 파일 없음")
+        hints.append(L10n.hintNoAuthFile)
     } else if !hasApiKey && !hasTokens {
-        hints.append("Codex 인증 정보 없음")
+        hints.append(L10n.hintNoAuth)
     }
     if staleRefresh {
-        hints.append("마지막 refresh 14일 초과")
+        hints.append(L10n.hintRefreshOld)
     }
     if !config.present {
-        hints.append("config.toml 없음")
+        hints.append(L10n.hintNoConfig)
     }
     if stats.scannedLogFiles == 0 {
-        hints.append("Codex 세션 로그 없음")
+        hints.append(L10n.hintNoSessions)
     }
     if stats.errorEvents > 0 {
-        hints.append("최근 7일 오류 이벤트 \(stats.errorEvents)회")
+        hints.append(L10n.hintErrorEvents(stats.errorEvents))
     }
 
 

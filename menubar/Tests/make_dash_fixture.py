@@ -46,7 +46,8 @@ def build():
     accounts.append(account("acct-16", session=0.99, weekly=0.995, usable=False))
     accounts.append(account("acct-17", session=0.98, weekly=0.99, usable=False))
     fixture = {
-        "teamclaude": {"accounts": accounts, "usableCount": 12, "totalCount": len(accounts)},
+        # switchThreshold는 프록시 기본값(0.98). 없으면 앱이 "한도 기준 확인 필요"로 모든 계정을 미확인 처리한다.
+        "teamclaude": {"accounts": accounts, "usableCount": 12, "totalCount": len(accounts), "switchThreshold": 0.98},
         "grok": "Grok 21%",
     }
     fixture["higgsfieldCredits"] = 1494
@@ -77,6 +78,36 @@ def build():
             "claude": {"plan": "Max 20x", "monthly": 280000},
             "codex": {"plan": "Pro", "monthly": 290000},
             "grok": {"plan": "SuperGrok", "monthly": 45000},
+        }
+    if "--codex" in sys.argv:
+        # Codex 풀(TeamCodex status 모양). 계정마다 창이 따로 돈다 — 리셋 시각을 서로 다르게 둔다.
+        now_ms = int(time.time() * 1000)
+
+        def codex(name, five, week, five_h, week_h, status="active", enabled=True, error=None, state=None):
+            row = {
+                "name": name, "accountUuid": f"{name}-uuid", "type": "oauth", "provider": "codex",
+                "status": status, "enabled": enabled, "errorReason": error, "planType": "plus",
+                "usable": status == "active" and enabled and error is None,
+                "quota": {"unified5h": None if five is None else five / 100, "unified7d": None if week is None else week / 100,
+                          "unified5hReset": now_ms + int(five_h * HOUR_MS), "unified7dReset": now_ms + int(week_h * HOUR_MS),
+                          "codexResetCredits": 2, "codexResetCreditsAt": now_ms},
+                "inflight": 0, "maxConcurrent": 3,
+                "usage": {"totalRequests": 12, "totalInputTokens": 30000, "totalOutputTokens": 10000},
+            }
+            if state:
+                row["subscription"] = {"state": state}
+            return row
+
+        fixture["teamcodex"] = {
+            "currentAccount": "codex-01", "switchThreshold": 0.98,
+            "resetCredits": {"enabled": True, "policy": "account"},
+            "accounts": [
+                codex("codex-01", 31, 44, 3.4, 52),
+                codex("codex-02", 12, 27, 4.6, 101),
+                codex("codex-03", 0, 63, 5, 20),
+                codex("codex-04", 100, 71, 1.67, 77, status="exhausted"),
+                codex("codex-05", None, None, 1, 1, status="error", error="auth-rejected"),
+            ],
         }
     if "--stale" in sys.argv:
         # 실패 화면은 실패했을 때만 나타나서 평소 스냅샷에 걸리지 않는다. 그래서 따로 그린다.

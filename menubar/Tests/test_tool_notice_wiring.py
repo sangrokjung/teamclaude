@@ -60,17 +60,26 @@ class ToolNoticeWiringTests(unittest.TestCase):
         self.assertIn("var currentToolNotices: DashboardToolNotices", self.main)
 
     def test_section_layout_and_summary_use_the_notices(self):
+        # 탭 본문 높이와 배치가 같은 한 목록(sectionBodies)을 본다. 섹션마다 미설치면 안내 카드 높이를 쓴다.
         self.assertEqual(self.main.count('height: bodyHeight("claude"'), 1)
-        self.assertEqual(self.main.count('height: Self.bodyHeight("claude"'), 1)
         for section in ("codex", "higgsfield", "usage"):
             self.assertIn(f'bodyHeight("{section}"', self.main)
         self.assertIn("ToolNoticeView(frame:", self.main)
         self.assertIn("|| notices != renderedNotices", self.main)
         self.assertIn("dashboardNoticeSummary(", self.main)
 
-    def test_summary_band_receives_notices_on_build_and_refresh(self):
-        self.assertIn("summary.notices = notices", self.main)
-        self.assertIn("summaryView?.notices = notices", self.main)
+    def test_overview_receives_notices_on_build_and_refresh(self):
+        # 예전 요약 띠 자리(개요 탭)도 같은 판정을 받는다. 빌드·갱신 두 경로 모두.
+        configure = function_body(self.main, "    func configure(")
+        update = function_body(self.main, "    func updateContent(")
+        for body in (configure, update):
+            self.assertIn("Self.overviewModel(teamClaude: teamClaude, teamCodex: teamCodex, grok: grok, agy: agy,", body)
+            self.assertIn("burnModel: burnModel, notices: notices, now: now)", body)
+        builder = (SOURCES / "DashboardOverviewBuilder.swift").read_text()
+        self.assertIn('let claudeNotice = input.notices.sections["claude"]', builder)
+        self.assertIn('let codexNotice = input.notices.sections["codex"]', builder)
+        overview = (SOURCES / "OverviewTabView.swift").read_text()
+        self.assertIn('ToolNoticeDrawLog.record("summary-\\(notice.tool.rawValue)", notice)', overview)
 
     def test_title_omits_missing_tools(self):
         slots = function_body(self.main, "func displaySlots(")
@@ -108,7 +117,8 @@ class ToolNoticeWiringTests(unittest.TestCase):
         self.assertIn("laneStaleNotes: laneStaleNotes,", update)
         self.assertIn('usageView?.staleNote = laneStaleNotes["usage"]', update)
         configure = function_body(self.main, "func configure(\n        teamClaude: TeamClaudeHealth?")
-        self.assertIn('view.staleNote = laneStaleNotes["usage"]', configure)
+        # Phase 2: 사용량 카드는 소진 탭 문서 안에서 usageDashboard로 만든다(그리는 자리만 옮겼다).
+        self.assertIn('usageDashboard.staleNote = laneStaleNotes["usage"]', configure)
         self.assertEqual(self.main.count("notices: notices, staleNotes: laneStaleNotes)"), 2)
 
     def test_subscription_collector_reaches_the_burn_model(self):

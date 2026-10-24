@@ -34,6 +34,15 @@ EXPECTED_DRAWN = {
     "summary-codex": "Codex·TeamCodex 미설치",
 }
 
+# A안 탭마다 그 탭의 미설치 안내가 실제로 그려져야 한다(탭에 숨은 카드가 오류·빈 카드로 남지 않게).
+EXPECTED_TAB_DRAWN = {
+    "overview": {"summary-teamclaude", "summary-codex"},
+    "claude": {"claude"},
+    "codex": {"codex"},
+    "burn": {"subscription", "usage"},
+    "cli": {"grok", "agy", "higgsfield"},
+}
+
 EXPECTED_SECTIONS = {
     "burn": "수집기 미설치(선택 기능)",
     "claude": "TeamClaude 미설치",
@@ -55,6 +64,8 @@ def isolated_env(home):
                                                                 "NPM_CONFIG_PREFIX", "npm_config_prefix")}
     env["HOME"] = home
     env["CFFIXED_USER_HOME"] = home
+    # 아래 기대 문구는 한국어다. 기계의 시스템 언어(CI는 영어)와 무관하게 판정하도록 고정한다. 영어는 snapshot_test_locale.py가 본다.
+    env["CC_MENUBAR_LANG"] = "ko"
     for tool in TOOLS:
         env[f"CC_MENUBAR_{tool}_BIN"] = f"{home}/missing/{tool.lower()}"
     env["CC_MENUBAR_TEAMCLAUDE_PORT"] = str(closed_port())
@@ -103,6 +114,13 @@ class EmptyHomeSnapshotTests(unittest.TestCase):
         for card, headline in EXPECTED_DRAWN.items():
             with self.subTest(card=card):
                 self.assertEqual(headline, drawn.get(card), self.result.stdout)
+
+    def test_each_tab_draws_its_not_installed_cards(self):
+        tabs = {key: set(filter(None, value.split(","))) for key, value in parse(self.result.stdout, "TAB-DRAWN").items()}
+        self.assertEqual(set(EXPECTED_TAB_DRAWN), set(tabs), self.result.stdout)
+        for tab, cards in EXPECTED_TAB_DRAWN.items():
+            with self.subTest(tab=tab):
+                self.assertTrue(cards <= tabs[tab], f"{tab}: {tabs[tab]}")
 
     def test_section_headers_say_the_same_state(self):
         sections = parse(self.result.stdout, "SECTION")

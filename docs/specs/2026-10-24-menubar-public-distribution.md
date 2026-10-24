@@ -43,7 +43,7 @@ R9. 공개 게시 전 스윕: 사내 경로(`/Users/<이름>`), 기기 이름, �
 - A2. 기존 Swift/Python 테스트 전부 통과(`bash menubar/run-tests.sh`), `known-red.sh` 분류 외 신규 실패 0.
 - A3. `lipo -archs` 결과가 `x86_64 arm64`이고, `.app`의 `Info.plist`에 `LSUIElement`가 있다.
 - A4. 라벨 미등록 환경에서 재시작 버튼이 kickstart를 호출하지 않는다(단위 테스트).
-- A5. (Phase 2) 영어 로케일에서 스냅샷에 한글이 0자이고, 한국어 로케일에서는 기존 문구와 같다.
+- A5. (Phase 2) 영어 로케일에서 스냅샷에 한글이 0자이고, 한국어 로케일에서는 A안 문구가 그려진다(A안에 없는 화면은 기존 문구 그대로). (Phase 2 구현 중 조정: 처음 문구 "한국어 로케일에서는 기존 문구와 같다"는 승인된 A안 계획의 "한국어는 A안 문구"와 충돌해 고쳤다.)
 - A6. Release 워크플로가 태그 없이 `workflow_dispatch` 시험 실행으로 zip 산출물을 만든다(Release 게시는 하지 않음).
 - A7. R9 스윕 grep 결과 0건.
 
@@ -104,6 +104,15 @@ Phase 1 결과 (2026-10-25, HEAD 3479094):
 - A6: 머지 뒤 workflow_dispatch 시험 실행으로 확인한다(Release 게시 없음).
 - A7: diff 추가 줄과 바이너리 문자열 스윕 0건.
 - Codex astra 9라운드 끝에 APPROVE. 그 과정에서 로그인 셸 조회의 프로세스 그룹 정리, ccusage 실패·오늘 항목 없음·자정 경계·출력 상한(파이프)·weekly/monthly 부분 실패와 스키마(실제 날짜·월요일·값 범위·modelBreakdowns) 처리를 보강했다. 실제 ccusage weekly·monthly 출력이 새 검사를 통과함을 실제 Swift 함수로 확인했다.
+
+Phase 2: `bash menubar/run-tests.sh`(qgate), 빈 HOME 스냅샷의 탭별 미설치 그리기(`TAB-DRAWN`), `Tests/snapshot_test_locale.py`(영어 한글 0자·한국어 A안 문구, 그려진 글자 기록으로 판정), A안 시안과 나란히 둔 실제 패널 PNG(`menubar/.build/`), Codex astra gate receipt.
+
+Phase 2 결과 (2026-10-25, HEAD 368b65a):
+- A2: `menubar tests: ran=49 failed=0 known_red=1`(known-red 그대로). `build.sh` 스냅샷 3종 통과.
+- A1: 빈 HOME에서 탭마다 미설치가 그려진다(`test_each_tab_draws_its_not_installed_cards`).
+- A5: 영어는 5개 탭 826개 그려진 문자열에 한글 0자, Phase 1 ccusage 문구 영어판도 포함. 한국어는 A안 문구.
+- 계정 17·100·250개 개요 띠가 패널 밖으로 넘치지 않고 묶음 칸은 Claude 탭을 연다. Codex 행 구독 버튼과 보조 줄이 겹치지 않음을 실제 그리기로 확인.
+- Codex astra APPROVE. 미확인: 실제 메뉴를 열어 단축키(R·1–5·⌘K) 누르기, 실제 GUI 실행. Concerns 3의 디자인 사이클 ③마감·④비평(웹용 emil·impeccable 단계)은 네이티브 AppKit 이식이라 돌리지 않았다(UNVERIFIED).
 
 ## Open questions
 

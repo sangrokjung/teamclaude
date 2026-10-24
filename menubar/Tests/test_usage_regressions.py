@@ -14,7 +14,8 @@ class UsageRegressionTests(unittest.TestCase):
     def run_swift(self, source_names, test_name):
         with tempfile.TemporaryDirectory(prefix="menubar-usage-check-") as folder:
             binary = Path(folder) / "tests"
-            argv = ["swiftc", "-j", "1", *[str(ROOT / "menubar/Sources" / name) for name in source_names],
+            # 화면 문구 표(L10n.swift)는 문구를 쓰는 모든 소스가 함께 컴파일해야 한다(R5).
+            argv = ["swiftc", "-j", "1", *[str(ROOT / "menubar/Sources" / name) for name in [*source_names, "L10n.swift"]],
                     str(ROOT / "menubar/Tests" / test_name), "-o", str(binary)]
             subprocess.run(argv, check=True, capture_output=True, text=True, timeout=600)
             env = dict(os.environ, CFFIXED_USER_HOME=folder, CC_MENUBAR_CODEX_HOME=folder + "/.codex",

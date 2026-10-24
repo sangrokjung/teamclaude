@@ -18,18 +18,25 @@ SRC="$ROOT/menubar/Sources"
 TESTS="$ROOT/menubar/Tests"
 OUT="$ROOT/menubar/.build/tests"
 mkdir -p "$OUT"
+# 화면 문구 언어(R5). 기존 테스트가 한국어 문구를 단언하므로 러너는 한국어로 고정한다.
+# CI 러너의 시스템 언어는 영어라 고정하지 않으면 같은 트리가 기계마다 다르게 판정된다. 영어 화면은 스냅샷 테스트가 따로 본다.
+export CC_MENUBAR_LANG="${CC_MENUBAR_LANG:-ko}"
 
 # main.swift는 최상위 코드가 있어 -parse-as-library 바이너리에 못 들어간다.
-# 아래 두 파일은 main.swift의 TeamClaudeHealth / UsageData에 의존한다.
-EXCLUDE_SOURCES=(main.swift TeamClaudeAvailability.swift CodexStatusView.swift)
+# 아래 세 파일은 main.swift의 TeamClaudeHealth / UsageData에 의존한다.
+EXCLUDE_SOURCES=(main.swift TeamClaudeAvailability.swift CodexStatusView.swift DashboardOverviewBuilder.swift)
 # main.swift 심볼을 쓰는 테스트. main.swift 분할(후속 계획) 전까지 러너에서 못 돌린다.
 # (세 파일 모두 짝이 되는 test_*.py가 main.swift의 진입점 앞부분을 잘라 붙여 직접 컴파일·실행하므로 실제로는 돈다.)
 SKIP_TESTS=(AccountSubscriptionLayoutTests.swift TeamClaudeAvailabilityTests.swift TeamCodexDashboardSourceTests.swift)
+# makeOverviewModel(DashboardOverviewBuilder.swift)도 main.swift 타입을 읽는다. test_dashboard_overview_builder.py가 같은 방식으로 돌린다.
+SKIP_TESTS+=(DashboardOverviewBuilderTests.swift)
 # CodexStatusLoaderTests는 $TMPDIR 아래 menubar-usage-check-* 격리 홈(CFFIXED_USER_HOME + CC_MENUBAR_CODEX_* 3종)이
 # 없으면 "Refusing fixture writes"로 exit 2 한다. 그 격리 홈은 test_usage_regressions.py가 만들어 돌린다.
 SKIP_TESTS+=(CodexStatusLoaderTests.swift)
 # UsageLoadOutcomeTests는 main.swift의 AppDelegate·대시보드를 쓴다. test_usage_load_outcome.py가 선언부와 함께 컴파일해 돌린다.
 SKIP_TESTS+=(UsageLoadOutcomeTests.swift)
+# CodexPoolRowLayoutTests는 CodexStatusView(main.swift 타입 의존)를 실제로 그린다. test_codex_pool_row_layout.py가 선언부와 함께 컴파일해 돌린다.
+SKIP_TESTS+=(CodexPoolRowLayoutTests.swift)
 # 실제 외부 표면(브라우저 탭·브라우저 도구 바이너리·메일함 dry-run)을 건드리는 테스트.
 # 게이트는 트리만의 함수여야 하므로 CC_MENUBAR_LIVE_SURFACES=1일 때만 돌리고, 아니면 env-skip으로 표시한다.
 LIVE_SURFACE_TESTS=(test_live_subscription_surface.py)

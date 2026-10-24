@@ -90,45 +90,45 @@ func accountSubscriptionLabel(_ details: AccountSubscriptionDetails, now: Date =
 }
 
 private func accountSubscriptionBaseLabel(_ details: AccountSubscriptionDetails, now: Date) -> String {
-    let plan = details.plan ?? "구독 미확인"
+    let plan = details.plan ?? L10n.subPlanUnknown
     if details.tracksCancellation {
         guard let confirmed = details.confirmation else {
             let payment = details.paymentDate.flatMap { accountSubscriptionDate($0) == nil ? nil : $0 }
             let past = payment.flatMap(accountSubscriptionDate).map {
                 Calendar.current.startOfDay(for: $0) < Calendar.current.startOfDay(for: now)
             } ?? false
-            let label = past ? "입력 결제일 지남 " : "입력 결제일 "
-            return "\(plan) · 해지 미확인 · \(payment.map { label + $0 } ?? "결제일 미확인") · 만료일 미확인"
+            let label = past ? L10n.subEnteredPaymentPast : L10n.subEnteredPayment
+            return "\(plan) · \(L10n.subCancelUnknown) · \(payment.map { label + $0 } ?? L10n.subPaymentUnknown) · \(L10n.subExpiryUnknown)"
         }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ko_KR")
         formatter.dateFormat = "MM/dd HH:mm"
-        let checked = "\(formatter.string(from: confirmed.checkedAt)) \(details.automaticallyConfirmed ? "메일확인" : "확인")"
+        let checked = "\(formatter.string(from: confirmed.checkedAt)) \(details.automaticallyConfirmed ? L10n.subMailChecked : L10n.subChecked)"
         let stale = now.timeIntervalSince(confirmed.checkedAt) >= 24 * 3600
-        let date = confirmed.date ?? "미확인"
+        let date = confirmed.date ?? L10n.unconfirmed
         switch confirmed.state {
         case .renewing:
             let past = confirmed.date.flatMap(accountSubscriptionDate).map {
                 Calendar.current.startOfDay(for: $0) < Calendar.current.startOfDay(for: now)
             } ?? false
-            let label = past ? "갱신 재확인 · 지난 결제일"
-                : (stale ? "갱신 재확인 · 기록 결제일" : "자동갱신 확인 · 다음 결제")
-            return "\(plan) · \(label) \(date) · 만료일 미확인 · \(checked)"
+            let label = past ? L10n.subRenewRecheckPast
+                : (stale ? L10n.subRenewRecheckRecorded : L10n.subRenewing)
+            return "\(plan) · \(label) \(date) · \(L10n.subExpiryUnknown) · \(checked)"
         case .scheduled:
             let past = confirmed.date.flatMap(accountSubscriptionDate).map {
                 Calendar.current.startOfDay(for: $0) < Calendar.current.startOfDay(for: now)
             } ?? false
-            let label = past ? "종료일 경과 · 확인 필요" : (stale ? "해지 재확인 · 예정 종료" : "해지 예약 · 이용 종료")
-            return "\(plan) · \(label) \(date)\(confirmed.date == nil ? " · 만료일 미확인" : "") · \(checked)"
+            let label = past ? L10n.subEndPassed : (stale ? L10n.subCancelRecheck : L10n.subCancelScheduled)
+            return "\(plan) · \(label) \(date)\(confirmed.date == nil ? " · \(L10n.subExpiryUnknown)" : "") · \(checked)"
         case .ended:
-            return "\(plan) · \(stale ? "종료 재확인" : "구독 종료 확인") · 만료일 \(date) · \(checked)"
+            return "\(plan) · \(stale ? L10n.subEndRecheck : L10n.subEndConfirmed) · \(L10n.subExpiry) \(date) · \(checked)"
         }
     }
     guard let raw = details.paymentDate, let date = accountSubscriptionDate(raw) else {
-        return "\(plan) · 결제일 미확인 · 입력"
+        return "\(plan) · \(L10n.subPaymentUnknown) · \(L10n.subEnter)"
     }
     let past = Calendar.current.startOfDay(for: date) < Calendar.current.startOfDay(for: now)
-    return "\(plan) · \(past ? "결제일 지남" : "다음 결제") \(raw) (입력)"
+    return "\(plan) · \(past ? L10n.subPaymentPast : L10n.subNextPayment) \(raw) (\(L10n.subEnter))"
 }
 
 func accountSubscriptionProfile(_ payload: [String: Any], expectedUuid: String) -> AccountSubscriptionDetails? {
@@ -378,26 +378,26 @@ func accountSubscriptionMonitored(_ saved: AccountSubscriptionDetails, uuid: Str
     }
     guard let attempted = date(root["checkedAt"]) else { return result }
     let statusText: String
-    if now.timeIntervalSince(attempted) > 7 * 3600 { statusText = "자동조회 지연" }
+    if now.timeIntervalSince(attempted) > 7 * 3600 { statusText = L10n.subMonitorDelayed }
     else {
         switch status {
-        case "ok": statusText = "메일 자동조회 완료"
-        case "busy": statusText = "메일 사용 중 · 다음 회차 재시도"
-        case "login-required": statusText = "메일 로그인 필요"
-        case "unsupported": statusText = "이 메일 서비스는 자동 조회를 지원하지 않습니다"
-        default: statusText = "메일 자동조회 실패 · 마지막 확인 유지"
+        case "ok": statusText = L10n.subMonitorOK
+        case "busy": statusText = L10n.subMonitorBusy
+        case "login-required": statusText = L10n.subMonitorLogin
+        case "unsupported": statusText = L10n.subMonitorUnsupported
+        default: statusText = L10n.subMonitorFailed
         }
     }
-    if now.timeIntervalSince(attempted) > 7 * 3600 { result.monitorStatus = "조회 지연" }
+    if now.timeIntervalSince(attempted) > 7 * 3600 { result.monitorStatus = L10n.subStatusDelayed }
     else if status != "ok" {
-        result.monitorStatus = status == "unsupported" ? "자동조회 미지원" : (status == "login-required" ? "로그인 필요" : (status == "busy" ? "조회 대기" : "조회 실패"))
-    } else { result.monitorStatus = "메일조회" }
-    result.monitorNote = statusText + " (6시간마다 확인)."
+        result.monitorStatus = status == "unsupported" ? L10n.subStatusUnsupported : (status == "login-required" ? L10n.loginRequired : (status == "busy" ? L10n.subStatusWaiting : L10n.subStatusFailed))
+    } else { result.monitorStatus = L10n.subStatusMail }
+    result.monitorNote = statusText + L10n.subEverySixHours
     guard let checked = date(row["lastSuccessAt"]) else { return result }
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "ko_KR")
     formatter.dateFormat = "MM/dd HH:mm"
-    result.monitorNote = (result.monitorNote ?? "") + " 마지막 성공 " + formatter.string(from: checked)
+    result.monitorNote = (result.monitorNote ?? "") + L10n.subLastSuccess + formatter.string(from: checked)
     guard checked <= attempted, let event = row["event"] as? [String: Any],
           let eventAt = date(event["eventAt"]), eventAt <= checked,
           let kind = event["kind"] as? String, ["cancel", "join"].contains(kind) else { return result }
@@ -412,11 +412,11 @@ func accountSubscriptionMonitored(_ saved: AccountSubscriptionDetails, uuid: Str
     if kind == "join" {
         result.confirmation = nil
         result.paymentDate = nil
-        result.monitorNote = (result.monitorNote ?? "") + ". 과거 해지 이후 재가입 확인 · 현재 갱신 여부는 미확인"
+        result.monitorNote = (result.monitorNote ?? "") + L10n.subRejoined
     } else {
         result.confirmation = AccountSubscriptionConfirmation(state: .scheduled, date: end, checkedAt: checked, source: "confirmation-email")
         result.automaticallyConfirmed = true
-        if status == "ok" && now.timeIntervalSince(attempted) <= 7 * 3600 { result.monitorStatus = "자동확인" }
+        if status == "ok" && now.timeIntervalSince(attempted) <= 7 * 3600 { result.monitorStatus = L10n.subStatusAuto }
     }
     return result
 }

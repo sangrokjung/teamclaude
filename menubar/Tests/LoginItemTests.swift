@@ -1,5 +1,5 @@
 // menubar/Tests/LoginItemTests.swift
-import Foundation
+import Cocoa
 
 // "로그인 시 열기"(외부 배포 R8) 회귀 검사. 사용자 LaunchAgent 파일만 만들고 지운다.
 // 내부 설치(com.qjc.cc-menubar, install.py)는 건드리지 않는다. 실제 홈 대신 임시 폴더에서만 쓴다.
@@ -62,6 +62,23 @@ struct LoginItemTests {
 
         precondition(menubarLoginItemDetail(enabled: true) == "켜짐")
         precondition(menubarLoginItemDetail(enabled: false) == "꺼짐")
+
+        // ⌘K 항목: 메뉴를 닫지 않고, 토글이 돌려준 상태 문구가 그 자리의 detail이 된다(Phase 2 리뷰 Minor).
+        var toggled = false
+        let action = menubarLoginItemAction(enabled: false) {
+            toggled.toggle()
+            return menubarLoginItemDetail(enabled: toggled)
+        }
+        precondition(action.id == "login-item" && !action.closesMenu, "결과를 그 자리에서 보여야 하므로 메뉴를 닫지 않는다")
+        precondition(action.detail == "꺼짐")
+        let list = DashboardActionListView(frame: NSRect(x: 0, y: 0, width: DashboardActionListView.width, height: 120))
+        list.actions = [action]
+        for expected in ["켜짐", "꺼짐"] {
+            guard let detail = list.actions[0].run() else { preconditionFailure("토글 결과 문구를 버리면 detail이 낡는다") }
+            precondition(detail == expected, detail)
+            list.updateDetail(id: action.id, detail: detail)
+            precondition(list.actions[0].detail == expected, "열린 목록의 detail이 \(expected)로 바뀌어야 한다")
+        }
 
         print("LoginItemTests: ok")
     }

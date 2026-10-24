@@ -39,18 +39,43 @@ struct UsageLoadOutcomeTests {
             x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth,
             height: StatusMenuDashboardView.preferredHeight(
                 teamClaude: nil, codex: nil, teamCodex: nil, usage: delegate.currentData, higgsfield: nil,
-                burnModel: delegate.currentBurnModel, notices: notices)))
+                burnModel: delegate.currentBurnModel, notices: notices, maxBodyHeight: .greatestFiniteMagnitude)))
         view.configure(teamClaude: nil, codex: nil, teamCodex: nil, usage: delegate.currentData, higgsfield: nil,
                        burnModel: delegate.currentBurnModel, notices: notices,
                        laneStaleNotes: delegate.dashboardStaleNotes,
                        parallelCount: 0, active: false, isMeasuringTeamClaude: false,
                        teamClaudeMeasureDetail: nil, onMeasureTeamClaude: nil)
+        // Phase 2: 사용량 카드와 안내는 소진 탭 문서에 있다. 그 탭을 띄워 실제로 그린다.
+        view.selectTab(.burn)
+        view.frame.size.height = StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(.burn), 120)
         view.layoutSubtreeIfNeeded()
+        ToolNoticeDrawLog.reset()
+        DrawnTextRecorder.install()
+        DrawnTextRecorder.reset()
         let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
         view.cacheDisplay(in: view.bounds, to: rep)
+        let texts = DrawnTextRecorder.strings
+        // 폭이 모자라면 PanelDraw.clipped가 뒤를 "…"로 줄인다(전문은 도움말 풍선·접근성 라벨). 그때도 앞부분은 그려져야 한다.
+        func drawn(_ value: String) -> Bool {
+            texts.contains { $0 == value || ($0.hasSuffix("…") && $0.count > 1 && value.hasPrefix(String($0.dropLast()))) }
+        }
         let summary = view.sections.first(where: { $0.id == "usage" })?.summary ?? ""
-        let card = view.subviews.compactMap { $0 as? UsageDashboardView }.first
+        // 헤더 요약은 값만이 아니라 실제로 그려져야 한다(소진 탭의 섹션 헤더).
+        if !summary.isEmpty {
+            precondition(drawn(summary), "헤더 요약이 그려지지 않았다: \(summary)")
+            let header = allSubviews(view).compactMap { $0 as? DashboardSectionHeaderView }.first { $0.section?.id == "usage" }
+            precondition(header?.toolTip == summary, "헤더 도움말 풍선에 요약 전문이 없다")
+        }
+        let card = allSubviews(view).compactMap { $0 as? UsageDashboardView }.first
+        if let note = card?.staleNote, card?.usage?.today != nil {
+            precondition(drawn(note), "카드 꼬리말이 그려지지 않았다: \(note)")
+            precondition(card?.toolTip == note, "카드 도움말 풍선에 꼬리말 전문이 없다")
+        }
         return (ToolNoticeDrawLog.drawn["usage"], summary, card?.staleNote, card?.accessibilityLabel() ?? "")
+    }
+
+    static func allSubviews(_ root: NSView) -> [NSView] {
+        root.subviews + root.subviews.flatMap { allSubviews($0) }
     }
 
     static func main() {

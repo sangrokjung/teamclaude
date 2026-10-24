@@ -125,7 +125,7 @@ BYOK 표면도, Codex 리셋 크레딧도, 계정 재인증도, 401 캐스케이
 
 이 저장소는 프록시·터미널 TUI·macOS 네이티브 메뉴바를 함께 관리합니다.
 메뉴바를 클릭하면 계정과 사용량 대시보드가 열립니다. 별도 데스크톱 앱은 필요하지 않습니다.
-소스와 설치 방법은 [menubar/README.md](menubar/README.md)를 참고하세요.
+소스와 설치 방법은 [menubar/README.ko.md](menubar/README.ko.md)를 참고하세요.
 
 ```bash
 npm run menubar:build
