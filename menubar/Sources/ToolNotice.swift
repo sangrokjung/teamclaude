@@ -149,13 +149,48 @@ func ccusageToolNotice(installed: Bool, outcome: CcusageLoadOutcome?, hasData: B
     }
 }
 
+/// 전체 갱신에서 daily 뒤에 돌리는 보조 명령. 실패해도 daily 값은 보이므로 부분 실패로 따로 센다.
+enum CcusageAuxCommand: Equatable {
+    case weekly
+    case monthly
+
+    var label: String {
+        switch self {
+        case .weekly: return "주간"
+        case .monthly: return "월간"
+        }
+    }
+}
+
+/// daily는 읽었는데 실패한 보조 명령과 그 원인.
+struct CcusageAuxFailure: Equatable {
+    let command: CcusageAuxCommand
+    let failure: CcusageFailure
+}
+
+/// 보조 명령 실패 꼬리말. 같은 원인은 "주간/월간: 원인"으로 묶고, 다르면 쉼표로 나눈다. 실패가 없으면 nil.
+func ccusagePartialNote(_ failures: [CcusageAuxFailure]) -> String? {
+    guard !failures.isEmpty else { return nil }
+    var groups: [(cause: String, commands: [String])] = []
+    for item in failures {
+        if let index = groups.firstIndex(where: { $0.cause == item.failure.label }) {
+            groups[index].commands.append(item.command.label)
+        } else {
+            groups.append((item.failure.label, [item.command.label]))
+        }
+    }
+    let body = groups.map { "\($0.commands.joined(separator: "/")): \($0.cause)" }.joined(separator: ", ")
+    return "일부 갱신 실패(\(body)) · 일별만 최신"
+}
+
 /// 사용량 카드·헤더에 붙는 꼬리말. 이전 값을 남긴 채 갱신이 실패했거나, 지난 기록은 읽었는데 오늘 날짜 항목이
-/// 없을 때(오늘은 0으로 보인다). 그 외에는 nil.
-func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool) -> String? {
+/// 없을 때(오늘은 0으로 보인다), daily는 읽었는데 weekly·monthly가 실패했을 때(partial). 그 외에는 nil.
+/// daily 자체가 실패했으면 그 꼬리말만 쓴다(보이는 값 전체가 이전 값이다).
+func ccusageStaleNote(outcome: CcusageLoadOutcome?, hasData: Bool, partial: [CcusageAuxFailure] = []) -> String? {
     guard hasData, let outcome else { return nil }
     switch outcome {
-    case .loaded: return nil
-    case .noData: return "오늘 사용 기록 없음"
+    case .loaded: return ccusagePartialNote(partial)
+    case .noData: return ["오늘 사용 기록 없음", ccusagePartialNote(partial)].compactMap { $0 }.joined(separator: " · ")
     case .failed(let failure): return "갱신 실패(\(failure.label)) · 이전 값"
     }
 }

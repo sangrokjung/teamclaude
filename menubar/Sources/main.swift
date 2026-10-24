@@ -1271,6 +1271,40 @@ func loadCcusageDaily(timeoutSeconds: Double, outputLimitBytes: Int = ccusageDef
                             now: now)
 }
 
+/// 전체 갱신의 weekly·monthly 결과를 해석에 넣을 값으로 정한다. 실패한 명령은 이전에 성공한 출력을 대신 쓰고
+/// (없으면 nil — 해석이 daily 파생값으로 폴백한다), 실패 원인은 부분 실패 꼬리말로 넘긴다.
+struct CcusageAuxResolution {
+    let weekly: Data?
+    let monthly: Data?
+    let failures: [CcusageAuxFailure]
+}
+
+/// weekly·monthly 한 번의 실패 원인. 성공이면 nil. daily와 같은 판정 순서를 쓰되, 해석 실패는 JSON 객체가 아닐 때만이다
+/// (기간 항목이 없는 것은 해석이 daily 파생값으로 처리하는 정상 경우다).
+func ccusageAuxFailure(_ run: CcusageRun, timeoutSeconds: Double) -> CcusageFailure? {
+    let isObject = run.successOutput.map { (try? JSONSerialization.jsonObject(with: $0)) is [String: Any] } ?? false
+    let outcome = ccusageLoadOutcome(launched: run.launched, timedOut: run.timedOut, timeoutSeconds: timeoutSeconds,
+                                     exitStatus: run.exitStatus, outputBytes: run.output.count,
+                                     parsedHasToday: isObject ? true : nil, outputTooLarge: run.outputTooLarge)
+    if case .failed(let failure) = outcome { return failure }
+    return nil
+}
+
+func resolveCcusageAux(weekly: CcusageRun, monthly: CcusageRun, previousWeekly: Data?, previousMonthly: Data?,
+                       timeoutSeconds: Double) -> CcusageAuxResolution {
+    var failures: [CcusageAuxFailure] = []
+    func pick(_ run: CcusageRun, _ command: CcusageAuxCommand, previous: Data?) -> Data? {
+        guard let failure = ccusageAuxFailure(run, timeoutSeconds: timeoutSeconds) else { return run.successOutput }
+        failures.append(CcusageAuxFailure(command: command, failure: failure))
+        print("CCUSAGE-PARTIAL[\(command.label)]: \(failure.label) · \(previous == nil ? "daily 파생값" : "이전 값") 사용")
+        fflush(stdout)
+        return previous
+    }
+    let weeklyData = pick(weekly, .weekly, previous: previousWeekly)
+    let monthlyData = pick(monthly, .monthly, previous: previousMonthly)
+    return CcusageAuxResolution(weekly: weeklyData, monthly: monthlyData, failures: failures)
+}
+
 struct IsolatedProcessResult {
     let terminationStatus: Int32
     let timedOut: Bool
@@ -4266,6 +4300,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ccusageInstalledState: Bool?
     /// 마지막으로 끝난 ccusage daily 판정. nil이면 아직 한 번도 끝나지 않았다.
     var usageLoadOutcome: CcusageLoadOutcome?
+    /// 마지막 전체 갱신에서 daily는 읽었는데 실패한 weekly·monthly. 다음 전체 갱신이 다시 정한다.
+    var usagePartialFailures: [CcusageAuxFailure] = []
+    /// 마지막으로 해석에 쓴 weekly·monthly 출력. 다음 전체 갱신에서 그 명령이 실패하면 이 값을 대신 쓴다.
+    var lastCcusageWeeklyData: Data?
+    var lastCcusageMonthlyData: Data?
     /// ccusage 한 번의 시간 제한. 운영은 기본값, 테스트는 짧게 줄인다.
     var ccusageTimeoutSeconds = ccusageDefaultTimeoutSeconds
     /// ccusage 해석이 볼 "지금". 운영은 실제 시각, 테스트는 자정 경계를 넘기는 시계로 바꾼다.
@@ -4465,7 +4504,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 대시보드에 넘기는 꼬리말. CLI 레인(laneStaleNotes)에 사용량 갱신 실패(이전 값 표시 중)를 더한다.
     var dashboardStaleNotes: [String: String] {
         var notes = laneStaleNotes
-        notes["usage"] = ccusageStaleNote(outcome: usageLoadOutcome, hasData: currentData?.today != nil)
+        notes["usage"] = ccusageStaleNote(outcome: usageLoadOutcome, hasData: currentData?.today != nil,
+                                          partial: usagePartialFailures)
         return notes
     }
 
@@ -5313,6 +5353,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let timeout = ccusageTimeoutSeconds
         let outputLimit = ccusageOutputLimitBytes
         let clock = ccusageClock
+        let previousWeekly = lastCcusageWeeklyData
+        let previousMonthly = lastCcusageMonthlyData
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard ccusageInstalled() else {
                 DispatchQueue.main.async {
@@ -5350,10 +5392,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
 
-            let weeklyData = runCcusageCommand("weekly", timeoutSeconds: timeout, outputLimitBytes: outputLimit).successOutput
-            let monthlyData = runCcusageCommand("monthly", timeoutSeconds: timeout, outputLimitBytes: outputLimit).successOutput
+            // weekly·monthly 실패는 조용히 daily 파생값으로 바꾸지 않는다. 이전 값을 두고 부분 실패로 표시한다.
+            let aux = resolveCcusageAux(
+                weekly: runCcusageCommand("weekly", timeoutSeconds: timeout, outputLimitBytes: outputLimit),
+                monthly: runCcusageCommand("monthly", timeoutSeconds: timeout, outputLimitBytes: outputLimit),
+                previousWeekly: previousWeekly, previousMonthly: previousMonthly, timeoutSeconds: timeout)
             // weekly·monthly가 자정을 넘겨도 판정과 같은 날을 본다(기본값 Date()를 쓰면 오늘이 새 날의 0원으로 덮인다).
-            let data = parseUsageData(daily: dailyData, weekly: weeklyData, monthly: monthlyData, rate: rate,
+            let data = parseUsageData(daily: dailyData, weekly: aux.weekly, monthly: aux.monthly, rate: rate,
                                       now: daily.now)
             print("CCUSAGE-FULL: today=\(data?.today?.period ?? "nil") cost=\(data?.today?.totalCost ?? -1) thisMonth=\(data?.thisMonthCost ?? -1) rate=\(rate)")
             fflush(stdout)
@@ -5363,6 +5408,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.isFetching = false
                 self.ccusageInstalledState = true
                 self.usageLoadOutcome = daily.outcome
+                self.usagePartialFailures = aux.failures
+                self.lastCcusageWeeklyData = aux.weekly
+                self.lastCcusageMonthlyData = aux.monthly
                 self.lastFullUsageCompletedAt = Date()
                 if let data = data {
                     var finalData = data

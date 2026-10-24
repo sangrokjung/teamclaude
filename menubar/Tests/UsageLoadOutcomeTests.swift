@@ -126,6 +126,7 @@ struct UsageLoadOutcomeTests {
         midnightChecks(delegate)
         outputCapChecks(delegate)
         pipeBoundChecks()
+        partialRefreshChecks(delegate)
 
         print("UsageLoadOutcomeTests: ok")
     }
@@ -391,5 +392,68 @@ extension UsageLoadOutcomeTests {
         precondition(leader != nil && grandchild != nil, "가짜 npx가 pid를 남기지 않았다")
         precondition(waitGroupGone(leader!, extra: grandchild), "직접 자식이 끝난 뒤 손자가 살아남았다")
         precondition(orphan.output.count <= cap, "손자 출력이 상한을 넘겨 쌓였다: \(orphan.output.count)")
+    }
+}
+
+// MARK: - weekly·monthly만 실패한 부분 갱신
+extension UsageLoadOutcomeTests {
+    static func partialRefreshChecks(_ delegate: AppDelegate) {
+        let cap = 256 * 1024
+
+        // 이전 weekly·monthly 값이 없으면 daily 파생값을 쓰되, 부분 실패라고 알린다.
+        let fresh = AppDelegate()
+        fresh.ccusageTimeoutSeconds = 10
+        fresh.ccusageOutputLimitBytes = cap
+        setMode("monthlyexit")
+        runFull(fresh)
+        precondition(fresh.usageLoadOutcome == .loaded, "부분 실패 판정: \(String(describing: fresh.usageLoadOutcome))")
+        precondition(fresh.currentData?.thisWeekCost == 3.0, "새 weekly가 반영되지 않았다: \(fresh.currentData?.thisWeekCost ?? -1)")
+        precondition(fresh.currentData?.thisMonthCost == 1.25,
+                     "이전 값이 없으면 daily 파생값이어야 한다: \(fresh.currentData?.thisMonthCost ?? -1)")
+        let monthlyExitNote = "일부 갱신 실패(월간: 종료 코드 3) · 일별만 최신"
+        precondition(fresh.currentToolNotices.sections["usage"] == nil, "부분 실패가 본문을 안내로 바꿨다")
+        let noPrevious = render(fresh)
+        precondition(noPrevious.cardNote == monthlyExitNote, "카드 꼬리말: \(noPrevious.cardNote ?? "nil")")
+        precondition(noPrevious.summary.hasPrefix("오늘 ") && noPrevious.summary.contains(monthlyExitNote),
+                     "헤더 요약: \(noPrevious.summary)")
+        precondition(noPrevious.label.contains(monthlyExitNote), "접근성 라벨: \(noPrevious.label)")
+
+        // 이전 값이 있으면 monthly가 넘쳐도 이전 월간 합계·모델 분해·누적을 두고, 부분 실패라고 알린다.
+        delegate.ccusageTimeoutSeconds = 10
+        delegate.ccusageOutputLimitBytes = cap
+        setMode("native")
+        runFull(delegate)
+        precondition(delegate.currentData?.thisMonthCost == 9.5, "native monthly: \(delegate.currentData?.thisMonthCost ?? -1)")
+        precondition(delegate.dashboardStaleNotes["usage"] == nil, "정상 전체 갱신에 꼬리말이 붙었다")
+        setMode("monthlyflood")
+        let started = Date()
+        runFull(delegate)
+        precondition(Date().timeIntervalSince(started) < 4, "monthly 상한 초과를 바로 끊지 않았다")
+        let data = delegate.currentData
+        precondition(data?.today?.totalCost == 1.25, "오늘 값: \(data?.today?.totalCost ?? -1)")
+        precondition(data?.thisMonthCost == 9.5, "이전 월간 합계를 daily 파생값으로 바꿨다: \(data?.thisMonthCost ?? -1)")
+        precondition(data?.modelBreakdown.first?.model == "claude-opus-4-8", "이전 모델 분해를 버렸다")
+        precondition(data?.allTimeCost == 20.0, "이전 누적을 버렸다: \(data?.allTimeCost ?? -1)")
+        precondition(data?.thisWeekCost == 3.0, "weekly: \(data?.thisWeekCost ?? -1)")
+        let floodNote = "일부 갱신 실패(월간: 출력 크기 상한 초과) · 일별만 최신"
+        let flooded = render(delegate)
+        precondition(flooded.cardNote == floodNote, "카드 꼬리말: \(flooded.cardNote ?? "nil")")
+        precondition(flooded.summary.hasPrefix("오늘 ") && flooded.summary.contains(floodNote),
+                     "헤더 요약: \(flooded.summary)")
+        precondition(flooded.label.contains(floodNote), "접근성 라벨: \(flooded.label)")
+
+        // 둘 다 같은 원인으로 실패하면 한 번에 적는다. 이전 weekly도 둔다.
+        setMode("auxexit")
+        runFull(delegate)
+        precondition(delegate.currentData?.thisWeekCost == 3.0 && delegate.currentData?.thisMonthCost == 9.5,
+                     "이전 주간·월간 값을 잃었다")
+        precondition(delegate.dashboardStaleNotes["usage"] == "일부 갱신 실패(주간/월간: 종료 코드 3) · 일별만 최신",
+                     "둘 다 실패: \(delegate.dashboardStaleNotes["usage"] ?? "nil")")
+
+        // 다시 다 읽으면 꼬리말이 사라진다.
+        setMode("native")
+        runFull(delegate)
+        precondition(delegate.dashboardStaleNotes["usage"] == nil, "회복 뒤에도 부분 실패 꼬리말이 남았다")
+        delegate.ccusageOutputLimitBytes = ccusageDefaultOutputLimitBytes
     }
 }

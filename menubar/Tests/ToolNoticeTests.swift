@@ -70,6 +70,26 @@ struct ToolNoticeTests {
         precondition(ccusageStaleNote(outcome: .noData, hasData: false) == nil)
         precondition(ccusageToolNotice(installed: true, outcome: .noData, hasData: true) == nil)
 
+        // daily는 읽었는데 weekly·monthly가 실패하면 부분 결과라고 밝힌다. 같은 원인은 한 번에, 다르면 나눠 적는다.
+        let monthlyFlood = [CcusageAuxFailure(command: .monthly, failure: .outputTooLarge)]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: monthlyFlood)
+                     == "일부 갱신 실패(월간: 출력 크기 상한 초과) · 일별만 최신")
+        let bothExit = [CcusageAuxFailure(command: .weekly, failure: .exitStatus(3)),
+                        CcusageAuxFailure(command: .monthly, failure: .exitStatus(3))]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: bothExit)
+                     == "일부 갱신 실패(주간/월간: 종료 코드 3) · 일별만 최신")
+        let mixed = [CcusageAuxFailure(command: .weekly, failure: .timeout(seconds: 60)),
+                     CcusageAuxFailure(command: .monthly, failure: .unparsable)]
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: mixed)
+                     == "일부 갱신 실패(주간: 60초 시간 초과, 월간: 출력 해석 실패) · 일별만 최신")
+        // 오늘 항목 없음과 겹치면 둘 다 적는다. daily 자체가 실패했으면 그 꼬리말이 우선한다. 값이 없으면 안내 카드 몫.
+        precondition(ccusageStaleNote(outcome: .noData, hasData: true, partial: monthlyFlood)
+                     == "오늘 사용 기록 없음 · 일부 갱신 실패(월간: 출력 크기 상한 초과) · 일별만 최신")
+        precondition(ccusageStaleNote(outcome: .failed(.exitStatus(3)), hasData: true, partial: monthlyFlood)
+                     == "갱신 실패(종료 코드 3) · 이전 값")
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: false, partial: monthlyFlood) == nil)
+        precondition(ccusageStaleNote(outcome: .loaded, hasData: true, partial: []) == nil)
+
         // 판정 순서: 실행 → 시간 초과 → 종료 코드 → 빈 출력 → 해석. 해석한 빈 결과만 noData.
         func outcome(launched: Bool = true, timedOut: Bool = false, exit: Int32 = 0, bytes: Int = 10,
                      parsed: Bool? = true, tooLarge: Bool = false) -> CcusageLoadOutcome {
