@@ -1,13 +1,24 @@
 import Cocoa
 
 /// Codex 탭(A안). 위는 TeamCodex 계정 풀(계정마다 창이 따로 돌아 리셋을 행마다 둔다), 아래는 이 맥의 Codex 사용량.
-/// 행 기하는 poolRowHeight 하나로 정하고 배치(layout)·그리기(draw)·높이(preferredHeight)가 같은 값을 쓴다.
+/// 행 기하는 아래 행 상수(보조 줄·구독 줄 위치와 poolRowHeight)로 정하고 배치(layout)·그리기(draw)·높이(preferredHeight)가 같은 값을 쓴다.
 final class CodexStatusView: NSView {
     static let padding: CGFloat = 16
     /// 풀 머리(제목 줄 + 큰 숫자 + 리셋권 줄 + 계정 머리).
     static let poolHeaderHeight: CGFloat = 112
+    /// 행 원점 기준 보조 줄(노트 · 동시 · 요청 · 리셋권 · 토큰)의 y. 막대(rowY+42, 높이 14) 바로 아래.
+    static let rowFactsY: CGFloat = 60
+    /// 보조 줄 글자(micro)가 실제로 차지하는 높이. 한글 대체 글꼴까지 넣어 잰다.
+    static let rowMicroLineHeight: CGFloat =
+        ceil(("Ag 한글" as NSString).size(withAttributes: [.font: TeamClaudePalette.microFont]).height)
+    /// 보조 줄과 구독 줄 사이 틈.
+    static let rowSubscriptionGap: CGFloat = 2
+    static let rowSubscriptionHeight: CGFloat = 20
+    /// 구독 줄은 보조 줄 아래 자기 띠에 앉는다. 같은 띠에 두면 버튼이 보조 줄 글자를 덮는다.
+    static let rowSubscriptionY: CGFloat = rowFactsY + rowMicroLineHeight + rowSubscriptionGap
+    static let rowBottomInset: CGFloat = 4
     /// 계정 한 행: 이름 줄 · 막대 줄 · 보조 줄 · 구독 줄.
-    static let poolRowHeight: CGFloat = 92
+    static let poolRowHeight: CGFloat = rowSubscriptionY + rowSubscriptionHeight + rowBottomInset
     /// 이 맥의 Codex 사용량 블록(제목·정보 줄·지표 4개·모델 표 3행·작업 추천·꼬리말).
     static let baseHeight: CGFloat = 470
 
@@ -161,8 +172,8 @@ final class CodexStatusView: NSView {
                                   width: button.fittingWidth, height: PanelButton.height)
         }
         for (index, button) in subscriptionButtons.enumerated() {
-            button.frame = NSRect(x: poolRect.minX + 15, y: poolRowY(poolRect, index) + 64,
-                                  width: poolRect.width - 15, height: 20)
+            button.frame = NSRect(x: poolRect.minX + 15, y: poolRowY(poolRect, index) + Self.rowSubscriptionY,
+                                  width: poolRect.width - 15, height: Self.rowSubscriptionHeight)
         }
     }
 
@@ -283,10 +294,10 @@ final class CodexStatusView: NSView {
                                             requests: account.totalRequests,
                                             credits: account.resetCreditLabel(at: pool.checkedAt, online: pool.serverReachable),
                                             tokens: formatCodexTokens(account.totalTokens))
-                let factsWidth = PanelDraw.right(facts, poolRect.maxX, rowY + 47 + 13, micro, credits == nil && !muted ? amber : fg3)
+                let factsWidth = PanelDraw.right(facts, poolRect.maxX, rowY + Self.rowFactsY, micro, credits == nil && !muted ? amber : fg3)
                 if !notes.isEmpty {
                     PanelDraw.text(PanelDraw.clipped(notes.joined(separator: " · "), micro, maxWidth: factsWidth - poolRect.minX - 15 - 12),
-                                   poolRect.minX + 15, rowY + 60, micro, tone == .error ? ember : fg3)
+                                   poolRect.minX + 15, rowY + Self.rowFactsY, micro, tone == .error ? ember : fg3)
                 }
             }
         }
