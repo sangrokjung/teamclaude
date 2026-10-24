@@ -84,8 +84,8 @@ struct ProcessGroupRun {
 }
 
 /// 명령을 자기 프로세스 그룹(그룹 id = 자식 pid)에서 띄우고 stdout을 모은다.
-/// 셸 설정(.zprofile 등)이 띄운 자식은 같은 그룹에 든다. 시간 제한을 넘기거나, 셸은 끝났는데
-/// 남은 자식이 stdout 파이프를 drainGrace 넘게 쥐고 있으면 그룹 전체에 TERM, killGrace 뒤 KILL을 보낸다.
+/// 셸 설정(.zprofile 등)이 띄운 자식은 같은 그룹에 든다. 셸이 끝나면(EOF 또는 drainGrace 경과) 또는
+/// 시간 제한을 넘기면 언제나 그룹 전체에 TERM을 보내고, killGrace 안에 안 사라진 구성원에는 KILL을 보낸다.
 /// 셸 pid는 그룹 신호를 다 보낼 때까지 회수하지 않는다 — 그동안 그룹 id가 재사용될 수 없다.
 /// 읽기와 대기를 이 스레드 한 곳에서 하고 파이프는 직접 닫는다(떠도는 읽기 스레드·FD가 남지 않는다).
 func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
@@ -163,16 +163,18 @@ func runInOwnProcessGroup(_ argv: [String], timeout: TimeInterval,
         }
     }
 
-    // 셸이 끝나고 파이프도 닫혔으면 그룹을 건드리지 않는다. 아니면 그룹 전체를 끝낸다.
-    if !(exitedAt != nil && reachedEOF) {
-        _ = killpg(pid, SIGTERM)
-        let graceEnd = Date().addingTimeInterval(max(killGrace, 0))
-        while Date() < graceEnd {
-            if !reachedEOF { reachedEOF = drain() }
-            usleep(20_000)
-        }
-        _ = killpg(pid, SIGKILL)
+    // 셸이 어떻게 끝났든 그룹 전체를 끝낸다. 파이프 EOF는 자식 부재가 아니다 — 셸 설정이 stdout을
+    // /dev/null로 돌린 백그라운드 자식은 파이프를 닫고도 같은 그룹에 남는다.
+    // TERM 뒤 그룹에 산 구성원이 없어질 때까지 killGrace만 기다리고, 남았으면 KILL.
+    // (회수 전 셸 pid는 좀비로 그룹에 남지만 killpg(…, 0)은 산 구성원이 없으면 실패한다 — macOS는 EPERM, 그 뒤 ESRCH.)
+    func groupHasLiveMembers() -> Bool { killpg(pid, 0) == 0 }
+    _ = killpg(pid, SIGTERM)
+    let graceEnd = Date().addingTimeInterval(max(killGrace, 0))
+    while Date() < graceEnd, groupHasLiveMembers() {
+        if !reachedEOF { reachedEOF = drain() }
+        usleep(10_000)
     }
+    if groupHasLiveMembers() { _ = killpg(pid, SIGKILL) }
     var status: Int32 = 0
     while waitpid(pid, &status, 0) == -1, errno == EINTR {}
     let signal = status & 0x7f

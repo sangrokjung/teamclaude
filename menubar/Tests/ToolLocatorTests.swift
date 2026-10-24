@@ -215,6 +215,31 @@ extension ToolLocatorTests {
         precondition(waitGone(heldChild, within: 1.5), "파이프를 쥔 자식이 남았다 pid=\(heldChild)")
         let fdsAfterHeld = openFileDescriptorCount()
         precondition(fdsAfterHeld == fdsBefore, "파이프 FD가 샜다: \(fdsBefore) → \(fdsAfterHeld)")
+
+        // (다) 셸은 정상 종료하고 파이프도 닫혔다(EOF). 그런데 자식이 stdout을 /dev/null로 돌린 채 TERM을 무시하고
+        //      같은 그룹에 남아 있다. EOF는 자식 부재가 아니다. 답은 돌려주고 그룹 정리로 자식도 없애야 한다.
+        let detached = root + "/detached"
+        try! fm.createDirectory(atPath: detached + "/bin", withIntermediateDirectories: true)
+        let detachedTool = detached + "/bin/cc-menubar-fake-tool"
+        try! "#!/bin/sh\nexit 0\n".write(toFile: detachedTool, atomically: true, encoding: .utf8)
+        chmod(detachedTool, 0o755)
+        let detachedPidFile = detached + "/child.pid"
+        try! ("/bin/sh -c 'trap \"\" TERM; echo $$ > \"\(detachedPidFile)\"; exec /bin/sleep 30' >/dev/null 2>&1 </dev/null &\n")
+            .write(toFile: detached + "/.zshenv", atomically: true, encoding: .utf8)
+        withShellEnvironment(detached, path: detached + "/bin:/usr/bin:/bin") {
+            let started = Date()
+            let result = loginShellCommandPath("cc-menubar-fake-tool", timeout: 2)
+            let elapsed = Date().timeIntervalSince(started)
+            precondition(result == detachedTool, "(다) 셸의 답을 돌려줘야 한다: \(result ?? "nil")")
+            precondition(elapsed < 1.5, "(다) 셸이 끝났는데 시간 제한까지 기다렸다: \(elapsed)")
+        }
+        guard let detachedChild = readPid(detachedPidFile, within: 1) else {
+            preconditionFailure("(다) 자식 pid 파일이 없다")
+        }
+        precondition(waitGone(detachedChild, within: 1.5),
+                     "(다) stdout을 닫고 TERM을 무시하는 자식이 남았다 pid=\(detachedChild)")
+        let fdsAfterDetached = openFileDescriptorCount()
+        precondition(fdsAfterDetached == fdsBefore, "(다) 파이프 FD가 샜다: \(fdsBefore) → \(fdsAfterDetached)")
     }
 }
 
