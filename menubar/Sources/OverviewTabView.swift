@@ -71,9 +71,106 @@ struct OverviewModel: Equatable {
     var elapsedCaption: String?
     var todos: [OverviewTodo] = []
     var waitingNames: [String] = []
+    /// 있으면 "기다리면 풀림" 줄을 그린다. 그리는 문구는 overviewWaitingCaption이 폭에 맞춰 waitingNames로 다시 만든다.
     var waitingCaption: String?
     var burnAside: String?
     var burnLines: [OverviewBurnLine] = []
+}
+
+/// 띠의 칸 하나. 계정이 칸 수보다 많으면 이웃한 계정 여럿을 한 칸으로 묶는다(그리기만의 일 — 값은 고르고 평균만 낸다).
+struct OverviewStripSlot: Equatable {
+    /// 그릴 값. 한 계정이면 그 계정 그대로, 묶음이면 합친 값.
+    let column: OverviewStripColumn
+    let firstIndex: Int
+    let memberCount: Int
+    let readyCount: Int
+    let waitCount: Int
+    let excludedCount: Int
+}
+
+enum OverviewStripMetrics {
+    static let gap: CGFloat = 3
+    /// 칸이 이보다 얇아지면 묶는다. 띠 폭 안에 들어가는 칸 수가 여기서 정해진다.
+    static let minColumnWidth: CGFloat = 4
+
+    static func maxColumns(chartWidth: CGFloat) -> Int {
+        max(1, Int(((chartWidth + gap) / (minColumnWidth + gap)).rounded(.down)))
+    }
+
+    /// 칸 사각형. 그리기·누르기·테스트가 같은 값을 쓴다.
+    static func columnRects(count: Int, chart: NSRect) -> [NSRect] {
+        guard count > 0 else { return [] }
+        let width = (chart.width - gap * CGFloat(count - 1)) / CGFloat(count)
+        return (0..<count).map {
+            NSRect(x: chart.minX + CGFloat($0) * (width + gap), y: chart.minY, width: width, height: chart.height)
+        }
+    }
+}
+
+private func overviewMean(_ values: [Double]) -> Double? {
+    values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+}
+
+/// 계정을 칸에 나눠 담는다. maxColumns 안이면 한 계정 한 칸, 넘으면 이웃한 계정을 같은 수씩 묶는다.
+/// 묶음 칸의 색은 뜻을 지킨다: 대기 계정이 하나라도 있으면 호박색, 전부 빠졌으면 흐리게, 오류가 있으면 빨간 띠.
+func overviewStripSlots(_ columns: [OverviewStripColumn], maxColumns: Int) -> [OverviewStripSlot] {
+    guard !columns.isEmpty else { return [] }
+    let perSlot = max(1, Int((Double(columns.count) / Double(max(1, maxColumns))).rounded(.up)))
+    return stride(from: 0, to: columns.count, by: perSlot).map { start in
+        let members = Array(columns[start..<min(columns.count, start + perSlot)])
+        let ready = members.filter { $0.tone == .ready }.count
+        let wait = members.filter { $0.tone == .wait }.count
+        let counts = (ready, wait, members.count - ready - wait)
+        guard members.count > 1 else {
+            return OverviewStripSlot(column: members[0], firstIndex: start, memberCount: 1,
+                                     readyCount: counts.0, waitCount: counts.1, excludedCount: counts.2)
+        }
+        let routable = members.filter { !$0.excluded }
+        let tone: PanelTone
+        if routable.isEmpty {
+            tone = members.contains { $0.tone == .error } ? .error : members[0].tone
+        } else {
+            tone = routable.contains { $0.tone == .wait } ? .wait
+                : (routable.contains { $0.tone == .ready } ? .ready : routable[0].tone)
+        }
+        let cap: PanelTone? = members.contains { $0.cap == .error } ? .error
+            : (members.allSatisfy { $0.cap != nil } ? members[0].cap : nil)
+        let column = OverviewStripColumn(
+            name: members[0].name, label: L10n.stripBucketLabel(members.count), tone: tone,
+            weeklyPercent: overviewMean((routable.isEmpty ? members : routable).compactMap(\.weeklyPercent)),
+            sessionPercent: nil, fablePercent: nil,
+            weeklyElapsed: overviewMean(routable.compactMap(\.weeklyElapsed)),
+            excluded: routable.isEmpty, cap: cap)
+        return OverviewStripSlot(column: column, firstIndex: start, memberCount: members.count,
+                                 readyCount: counts.0, waitCount: counts.1, excludedCount: counts.2)
+    }
+}
+
+/// "기다리면 풀림" 한 줄. 이름이 다 안 들어가면 앞에서부터 들어가는 만큼 + "외 N개".
+/// 이름 하나도 안 들어가면 첫 이름을 줄여서라도 남은 개수는 남긴다.
+func overviewWaitingCaption(_ names: [String], font: NSFont, maxWidth: CGFloat) -> String {
+    guard !names.isEmpty else { return "" }
+    func fits(_ value: String) -> Bool { PanelDraw.width(value, font) <= maxWidth }
+    let all = L10n.waitingCaption(names.joined(separator: " · "))
+    if fits(all) { return all }
+    func caption(_ shown: Int) -> String {
+        L10n.waitingCaption(names.prefix(shown).joined(separator: " · ") + " " + L10n.andMore(names.count - shown))
+    }
+    var best: String?
+    for shown in 1..<names.count {
+        let candidate = caption(shown)
+        guard fits(candidate) else { break }
+        best = candidate
+    }
+    if let best { return best }
+    let suffix = names.count > 1 ? " " + L10n.andMore(names.count - 1) : ""
+    var first = names[0]
+    while !first.isEmpty {
+        first.removeLast()
+        let candidate = L10n.waitingCaption(first + "…" + suffix)
+        if fits(candidate) { return candidate }
+    }
+    return PanelDraw.clipped(all, font, maxWidth: maxWidth)
 }
 
 final class OverviewTabView: NSView {
@@ -109,7 +206,8 @@ final class OverviewTabView: NSView {
     var onTodo: ((OverviewTodo) -> Void)?
 
     private var laneRects: [(DashboardTab, NSRect)] = []
-    private var columnRects: [(String, NSRect)] = []
+    /// 마지막으로 그린 띠 칸(이름, 사각형). 누르기와 테스트가 읽는다.
+    private(set) var columnRects: [(String, NSRect)] = []
     private var todoButtons: [PanelButton] = []
     private var burnButton: PanelButton?
     private var todoRowRects: [(String, NSRect)] = []
@@ -280,11 +378,11 @@ final class OverviewTabView: NSView {
                     todoRowRects.append((todo.name, NSRect(x: row.minX, y: row.minY, width: row.width - buttonWidth, height: row.height)))
                 }
             }
-            if let caption = model.waitingCaption {
+            if model.waitingCaption != nil {
                 let y = todoRowRect(model.todos.count).minY + 4
                 PanelDraw.dot(x0 + 4, centerY: y + 8, TeamClaudePalette.amber)
-                PanelDraw.text(PanelDraw.clipped(caption, TeamClaudePalette.captionFont, maxWidth: width - 20), x0 + 18, y,
-                               TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+                PanelDraw.text(overviewWaitingCaption(model.waitingNames, font: TeamClaudePalette.captionFont, maxWidth: width - 20),
+                               x0 + 18, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
             }
         }
 
@@ -320,11 +418,12 @@ final class OverviewTabView: NSView {
         }
 
         let chart = NSRect(x: x0, y: top + 28, width: width, height: 56)
-        let count = CGFloat(model.strip.count)
-        let gap: CGFloat = 3
-        let columnWidth = max(2, (chart.width - gap * (count - 1)) / count)
-        for (index, column) in model.strip.enumerated() {
-            let rect = NSRect(x: chart.minX + CGFloat(index) * (columnWidth + gap), y: chart.minY, width: columnWidth, height: chart.height)
+        let slots = overviewStripSlots(model.strip, maxColumns: OverviewStripMetrics.maxColumns(chartWidth: chart.width))
+        let rects = OverviewStripMetrics.columnRects(count: slots.count, chart: chart)
+        let gap = OverviewStripMetrics.gap
+        let bucketed = slots.count < model.strip.count
+        for (index, (slot, rect)) in zip(slots, rects).enumerated() {
+            let column = slot.column
             columnRects.append((column.name, rect))
             NSGraphicsContext.saveGraphicsState()
             NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).addClip()
@@ -348,17 +447,31 @@ final class OverviewTabView: NSView {
                 TeamClaudePalette.sky.withAlphaComponent(0.9).setFill()
                 NSRect(x: rect.minX - (index == 0 ? 0 : gap / 2), y: y, width: rect.width + gap, height: 2).fill()
             }
-            let tip = "\(column.name) · \(column.label) · \(L10n.weeklyShort) \(panelPercentText(column.weeklyPercent))"
-                + " · \(L10n.sessionShort) \(panelPercentText(column.sessionPercent))"
-                + (column.fablePercent.map { " · Fable \(panelPercentText($0))" } ?? "")
+            let tip: String
+            if slot.memberCount > 1 {
+                tip = String(format: "%02d–%02d", slot.firstIndex + 1, slot.firstIndex + slot.memberCount) + " · \(column.label)"
+                    + " · \(L10n.legendReady(slot.readyCount)) · \(L10n.legendWait(slot.waitCount)) · \(L10n.legendExcluded(slot.excludedCount))"
+                    + " · \(L10n.weeklyShort) \(panelPercentText(column.weeklyPercent))"
+            } else {
+                tip = "\(column.name) · \(column.label) · \(L10n.weeklyShort) \(panelPercentText(column.weeklyPercent))"
+                    + " · \(L10n.sessionShort) \(panelPercentText(column.sessionPercent))"
+                    + (column.fablePercent.map { " · Fable \(panelPercentText($0))" } ?? "")
+            }
             addToolTip(rect, owner: tip as NSString, userData: nil)
+            guard !bucketed else { continue }
             let label = String(format: "%02d", index + 1)
             let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-            let showLabel = count <= 20 || index == 0 || index == model.strip.count - 1 || (index + 1) % 5 == 0
+            let showLabel = slots.count <= 20 || index == 0 || index == slots.count - 1 || (index + 1) % 5 == 0
             if showLabel {
                 let w = PanelDraw.width(label, labelFont)
                 PanelDraw.text(label, rect.midX - w / 2, chart.maxY + 6, labelFont, TeamClaudePalette.fg3)
             }
+        }
+        // 묶은 칸에는 번호 대신 묶음 안내를 그린다(칸마다 몇 개인지는 툴팁이 범위로 보여 준다).
+        if bucketed {
+            let note = L10n.stripBucketNote(total: model.strip.count, perSlot: slots.map(\.memberCount).max() ?? 1)
+            PanelDraw.text(PanelDraw.clipped(note, TeamClaudePalette.legendFont, maxWidth: width), x0, chart.maxY + 5,
+                           TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
         }
         if let caption = model.elapsedCaption {
             let y = chart.maxY + 26

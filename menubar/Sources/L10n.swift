@@ -114,6 +114,13 @@ enum L10n {
     static func legendReady(_ count: Int) -> String { t("사용 가능 \(count)", "Available \(count)") }
     static func legendWait(_ count: Int) -> String { t("대기 \(count)", "Waiting \(count)") }
     static func legendExcluded(_ count: Int) -> String { t("제외 \(count)", "Excluded \(count)") }
+    /// 계정이 띠 칸 수보다 많아 이웃한 계정을 한 칸으로 묶었을 때의 안내.
+    static func stripBucketNote(total: Int, perSlot: Int) -> String {
+        t("계정 \(total)개 · 칸마다 \(perSlot)개 계정 묶음", "\(total) accounts · \(perSlot) per bar")
+    }
+    static func stripBucketLabel(_ count: Int) -> String { t("\(count)개 계정 묶음", "\(count)-account group") }
+    /// 목록 뒤에 붙이는 남은 개수("외 3개").
+    static func andMore(_ count: Int) -> String { t("외 \(count)개", "+\(count) more") }
     static func weekElapsedCaption(_ percent: Int) -> String {
         t("주간 창 \(percent)% 경과 — 선보다 높은 칸은 리셋 전에 찰 속도입니다.",
           "Weekly window \(percent)% elapsed — bars above the line will fill before reset.")
