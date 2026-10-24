@@ -161,14 +161,24 @@ enum CcusageAuxCommand: Equatable {
         }
     }
 
-    /// ccusage가 내는 기간 형식인가(주간은 주 시작일 YYYY-MM-DD, 월간은 YYYY-MM).
+    /// ccusage가 내는 기간인가. 월간은 실제 있는 달의 YYYY-MM, 주간은 실제 있는 날짜의 YYYY-MM-DD이면서
+    /// 월요일이어야 한다(해석기가 이번 주를 월요일 키로 찾는다). 정규식만으로는 2026-13·2026-02-30을 걸러내지 못한다.
     func periodMatches(_ period: String) -> Bool {
-        let pattern: String
-        switch self {
-        case .weekly: pattern = #"^\d{4}-\d{2}-\d{2}$"#
-        case .monthly: pattern = #"^\d{4}-\d{2}$"#
+        let parts = period.split(separator: "-", omittingEmptySubsequences: false)
+        let expected = self == .weekly ? [4, 2, 2] : [4, 2]
+        guard parts.count == expected.count,
+              zip(parts, expected).allSatisfy({ $0.count == $1 && $0.allSatisfy(\.isASCII) && $0.allSatisfy(\.isNumber) }) else {
+            return false
         }
-        return period.range(of: pattern, options: .regularExpression) != nil
+        let numbers = parts.compactMap { Int($0) }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let components = DateComponents(year: numbers[0], month: numbers[1], day: self == .weekly ? numbers[2] : 1)
+        guard let date = calendar.date(from: components),
+              calendar.component(.year, from: date) == components.year,
+              calendar.component(.month, from: date) == components.month,
+              calendar.component(.day, from: date) == components.day else { return false }
+        return self == .monthly || calendar.component(.weekday, from: date) == 2
     }
 
     /// ccusage JSON에서 이 명령의 기간 배열 키.
