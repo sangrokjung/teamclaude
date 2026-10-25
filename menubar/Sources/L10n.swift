@@ -182,10 +182,10 @@ enum L10n {
     static func excludedTitle(_ count: Int) -> String { t("\(count)개 계정 이용 제외", "\(count) accounts excluded") }
     static var excludedDetail: String { t("아래에서 구독·인증·비활성 상태 확인", "Check plan, auth and disabled state below") }
     static func limitedTitle(_ count: Int) -> String { t("\(count)개 계정 한도·요청 대기", "\(count) accounts waiting on limits") }
-    static var limitedDetail: String { t("세션·전체 주간·Fable 모두 여유가 필요합니다", "Session, weekly and Fable all need headroom") }
-    static func fableReadyTitle(_ count: Int) -> String { t("\(count)개 계정 Fable 사용 가능", "\(count) accounts ready for Fable") }
+    static var limitedDetail: String { t("세션·전체 주간 여유가 생기면 돌아옵니다", "Back when session and weekly headroom returns") }
+    static func routableReadyTitle(_ count: Int) -> String { t("\(count)개 계정 라우팅 가능", "\(count) accounts routable") }
     static var noAccounts: String { t("등록된 계정이 없습니다", "No accounts registered") }
-    static var allWindowsDetail: String { t("세션·전체 주간·Fable 한도를 함께 확인", "Session, weekly and Fable limits checked together") }
+    static var allWindowsDetail: String { t("세션·전체 주간 한도와 프록시 판정을 함께 확인 · Fable은 열에서", "Session and weekly limits checked with the proxy · Fable in its column") }
     static func accountsCount(_ count: Int) -> String { t("계정 \(count)", "Accounts \(count)") }
     static var columnSession: String { t("세션 5시간", "Session 5h") }
     static var columnWeekly: String { t("주간", "Weekly") }

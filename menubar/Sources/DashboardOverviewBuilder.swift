@@ -4,7 +4,8 @@ import Cocoa
 // TeamClaudeHealth(main.swift)를 읽으므로 테스트 러너의 라이브러리 묶음 밖이다(run-tests.sh EXCLUDE_SOURCES).
 //
 // 숫자의 출처:
-//  - 큰 숫자 = opusAvailability(세션·주간 여유, 프록시 라우팅 가능) — 지금 요청을 받는 계정
+//  - 큰 숫자 = opusAvailability(세션·주간 여유, 프록시 라우팅 가능) — 지금 요청을 받는 계정.
+//    띠·범례·기다리면 풀림·손볼 것도 같은 routingAvailability를 쓴다(Claude 탭 묶음·제목 라우팅 슬롯도 같다)
 //  - Claude Fable 레인 = fableAvailability(.ready) — 예전 요약 띠의 "Claude Fable"
 //  - Codex 레인 = TeamCodexPoolHealth.usableCount / poolCount
 //  - Grok·agy 레인 = 카드 모델의 문구

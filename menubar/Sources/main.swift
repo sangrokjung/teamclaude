@@ -260,6 +260,10 @@ struct TeamClaudeAccountHealth {
     let measurementIssue: TeamClaudeMeasurementIssue?
     var usableFromProxy: Bool? = nil
     var fableMeasurementCurrent = false
+    /// 세션·주간 측정이 이번 응답 것인가. 라우팅 판정(Fable을 보지 않는다)은 이것만 요구한다.
+    /// fableMeasurementCurrent는 Fable 창까지 요구해, 프록시 재시작 뒤 Fable이 비면 라우팅까지 "측정 필요"로 떨어뜨렸다.
+    /// nil이면(병합을 거치지 않은 행) fableMeasurementCurrent를 따른다.
+    var routingMeasurementCurrent: Bool? = nil
     var inflightCount: Int? = nil
     var concurrentCapacity: Int? = nil
     var subscriptionConfirmation: AccountSubscriptionConfirmation? = nil
@@ -997,6 +1001,9 @@ func teamClaudeAccountMergingQuota(
             && candidate.sessionPercent != nil && candidate.weeklyPercent != nil && candidate.fablePercent != nil
             && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0
             && (candidate.fableResetSeconds ?? 0) > 0,
+        routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
+            && candidate.sessionPercent != nil && candidate.weeklyPercent != nil
+            && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0,
         inflightCount: candidate.inflightCount,
         concurrentCapacity: candidate.concurrentCapacity,
         subscriptionConfirmation: candidate.subscriptionConfirmation,
@@ -2067,8 +2074,9 @@ final class TeamClaudeTableView: NSView {
         evaluatedAt = now
         guard let health else { return }
         let total = max(health.accountTotal, health.accountConfigured)
-        let availability = health.fableAvailability(now: now)
-        let ready = availability.filter { $0.state == .ready }.count
+        let availability = health.routingAvailability(now: now)
+        // 접근성 문장의 "Fable 사용 가능"은 Fable 레인 판정, "라우팅 가능"은 표 묶음과 같은 라우팅 판정이다.
+        let ready = health.fableAvailability(now: now).filter { $0.state == .ready }.count
         setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.routableCount,
                                                            drift: health.accountConfigDrift, pending: health.measurementPendingCount,
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
@@ -2130,7 +2138,7 @@ final class TeamClaudeTableView: NSView {
 
     /// 높이 = 표 상단 + 묶음 행. 대시보드의 teamContentHeight와 이 표의 layout·draw가 같은 계산을 쓴다.
     static func contentHeight(_ health: TeamClaudeHealth, expanded: String?, now: Date = Date()) -> CGFloat {
-        let availability = health.fableAvailability(now: now)
+        let availability = health.routingAvailability(now: now)
         let lines = health.rowLines(now: now, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
                                              expanded: expanded.flatMap { name in health.accounts.firstIndex { $0.name == name } })
@@ -2145,7 +2153,7 @@ final class TeamClaudeTableView: NSView {
     /// 그 계정 행의 사각형(표 좌표). 개요에서 계정을 눌러 들어올 때 스크롤 위치를 잡는다.
     func rowRect(named name: String) -> NSRect? {
         guard let health, let index = health.accounts.firstIndex(where: { $0.name == name }) else { return nil }
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex)
         guard let y = layout.origins[index] else { return nil }
@@ -2156,7 +2164,7 @@ final class TeamClaudeTableView: NSView {
 
     private func reauthenticationRows() -> [(index: Int, name: String, accountUuid: String?)] {
         guard let health else { return [] }
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         return health.accounts.enumerated().compactMap { index, row in
             guard availability[index].subscriptionAppearance != .ended else { return nil }
             return teamClaudeCanReauthenticate(
@@ -2249,7 +2257,7 @@ final class TeamClaudeTableView: NSView {
         refreshTime(now: evaluatedAt)
         guard let health else { return }
         let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt)
         let expanded = expandedIndex
         let grouped = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expanded)
@@ -2361,7 +2369,7 @@ final class TeamClaudeTableView: NSView {
         }
 
         // 측정·연동 안내
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         subscriptionButtons.forEach { $0.refreshTitle(now: evaluatedAt) }
         let ready = availability.filter { $0.state == .ready }.count
         let limited = availability.filter { $0.state == .limited }.count
@@ -2401,7 +2409,7 @@ final class TeamClaudeTableView: NSView {
             actionDetail = L10n.limitedDetail
         } else {
             actionTone = ready > 0 ? .ready : .off
-            actionTitle = ready > 0 ? L10n.fableReadyTitle(ready) : L10n.noAccounts
+            actionTitle = ready > 0 ? L10n.routableReadyTitle(ready) : L10n.noAccounts
             actionDetail = L10n.allWindowsDetail
         }
         let strip = NSRect(x: left, y: TeamClaudeCardMetrics.stripY(hostLine: hostLineShown), width: rightEdge - left,
@@ -6835,6 +6843,18 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     }
     if arguments.contains("--print-text") { printDashboardTabTexts(results) }
     print("TITLE-SLOTS \(delegate.displaySlots().joined(separator: " | "))")
+    // 패널 숫자와 프록시 판정을 나란히 낸다(계정 이름 없이 순번만). 큰 숫자 = routable, 프록시 = proxyUsable.
+    if let health = delegate.currentTeamClaude {
+        let routing = health.routingAvailability()
+        let proxyUsable = health.accounts.filter { $0.usableFromProxy == true }.count
+        print("LIVE-CLAUDE proxyUsable=\(proxyUsable) routable=\(health.routableCount) total=\(health.accounts.count) reachable=\(health.serverReachable)")
+        for (index, pair) in zip(health.accounts, routing).enumerated() {
+            let (row, state) = pair
+            print("LIVE-CLAUDE-ROW \(index + 1) proxyUsable=\(row.usableFromProxy.map(String.init) ?? "nil") state=\(state.state)"
+                  + " busy=\(state.busy.map { "\($0.inflight)/\($0.capacity)" } ?? "-") grace=\(state.graceWindows.joined(separator: "·"))"
+                  + " reason=\(state.reason)")
+        }
+    }
     print("LIVE-SNAPSHOT: \(outputPath) panel=\(Int(view.bounds.width))x\(Int(panelHeight)) maxBody=\(Int(view.maxBodyHeight))")
     exit(0)
 }

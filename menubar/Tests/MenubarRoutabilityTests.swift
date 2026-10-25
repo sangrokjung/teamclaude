@@ -201,6 +201,12 @@ struct MenubarRoutabilityTests {
         table.health = committed
         table.refreshTime(now: now)
         precondition(table.accessibilityLabel()?.contains("라우팅 가능 2") == true, table.accessibilityLabel() ?? "nil")
+        let routingLines = committed.rowLines(now: now, availability: routing)
+        let expectedHeight = teamClaudeCardBaseHeight(hostLine: committed.hostSummaryText != nil)
+            + teamClaudeGroupedLayout(groups: routing.map(teamClaudeRowGroup), lines: routingLines, expanded: nil).height
+        precondition(TeamClaudeTableView.contentHeight(committed, expanded: nil, now: now) == expectedHeight,
+                     "the Claude table groups by the routing judgment")
+        precondition(committed.rowLines(now: now) == routingLines, "rowLines defaults to the routing judgment")
     }
 
     // MARK: 2. 패널 높이

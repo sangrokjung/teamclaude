@@ -58,7 +58,7 @@ func teamClaudeFableAvailability(
         return result(.unconfirmed, L10n.reasonEndDatePassed, .endDateReached)
     }
     let elapsed = now.timeIntervalSince(health.checkedAt)
-    guard elapsed >= 0, elapsed < 60, row.fableMeasurementCurrent else {
+    guard elapsed >= 0, elapsed < 60, includeFable ? row.fableMeasurementCurrent : (row.routingMeasurementCurrent ?? row.fableMeasurementCurrent) else {
         return result(.unconfirmed, TeamClaudeRowReason.measurementStale)
     }
     var windows: [(String, Double?, Int?)] = [
@@ -146,10 +146,11 @@ extension TeamClaudeHealth {
     /// 각 계정 행에 그릴 보조 줄. 높이 계산과 그리기가 이 한 함수의 답을 나눠 쓴다(TeamClaudeRowLines.swift).
     /// 구독 판정은 행의 AccountSubscriptionButton이 제목을 만들 때와 같은 details(로컬 설정 플랜 폴백 포함)로 해야
     /// 버튼이 보이는데 줄 높이가 없거나, 높이는 있는데 버튼이 숨는 어긋남이 없다.
-    /// draw()처럼 이미 fableAvailability를 계산한 호출자는 availability를 넘겨 같은 시각의 판정을 재사용한다.
+    /// draw()처럼 이미 판정(routingAvailability)을 계산한 호출자는 availability를 넘겨 같은 시각의 판정을 재사용한다.
     func rowLines(store: AccountSubscriptionStore = .shared, now: Date = Date(),
                   availability: [TeamClaudeFableAvailability]? = nil) -> [TeamClaudeRowLines] {
-        let availability = availability ?? fableAvailability(store: store, now: now)
+        // Claude 표 묶음과 같은 라우팅 판정이 기본이다(표의 높이·배치·그리기가 같은 답을 써야 한다).
+        let availability = availability ?? routingAvailability(store: store, now: now)
         return zip(accounts, availability).map { row, state in
             let local = accountSubscriptionLocalAccount(provider: "anthropic", uuid: row.accountUuid, name: row.name)
             let details = store.details(provider: "anthropic", uuid: local.uuid, fallbackPlan: local.plan,
