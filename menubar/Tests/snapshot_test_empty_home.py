@@ -180,9 +180,8 @@ class LiveSnapshotReadOnlyTests(unittest.TestCase):
         self.assertIn("LIVE-SNAPSHOT: ", self.result.stdout)
 
     def test_read_only_home(self):
-        # 읽기 전용: HOME 아래에 쿼터 이력·캐시·로그·설정 파일을 만들지 않는다. (macOS가 만드는 Library 기본 폴더는 셈하지 않는다.)
-        created = [str(path.relative_to(self.home)) for path in self.home.rglob("*")
-                   if path.is_file() and not str(path.relative_to(self.home)).startswith("Library/")]
+        # 읽기 전용: HOME 아래에 쿼터 이력·캐시·로그·설정·UserDefaults 파일을 하나도 만들지 않는다.
+        created = [str(path.relative_to(self.home)) for path in self.home.rglob("*")]
         self.assertEqual([], created, self.result.stdout[-2000:])
 
 
