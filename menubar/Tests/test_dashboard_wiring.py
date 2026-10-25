@@ -58,7 +58,7 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertIn("hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)", refresh)
 
     def test_panel_height_fits_the_screen(self):
-        # 높이는 가장 긴 탭에 맞추되 화면을 넘지 않는다. 공유 파라미터에 기본값을 두지 않는다(호출부가 화면 상한을 잊지 않게).
+        # 높이는 개요 탭 자연 높이에 맞추되 화면을 넘지 않는다(긴 탭은 본문 안에서 스크롤). 공유 파라미터에 기본값을 두지 않는다(호출부가 화면 상한을 잊지 않게).
         signature = self.main[self.main.index("    static func preferredHeight(teamClaude:"):]
         signature = signature[:signature.index("{")]
         self.assertIn("maxBodyHeight: CGFloat, tab: DashboardTab? = nil", signature)

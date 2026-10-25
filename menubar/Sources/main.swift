@@ -2616,7 +2616,8 @@ func dashboardThreadCPUMs() -> Double {
 }
 
 /// 메뉴 대시보드 패널(A안, menubar/DESIGN.md). 머리(제목·기준 시각·손볼 것)와 탭 5개, 본문, 하단 동작 막대.
-/// 패널 높이는 가장 긴 탭에 맞추되 화면 높이(maxBodyHeight)를 넘지 않고, 탭 본문만 안쪽 스크롤 뷰에서 움직인다.
+/// 패널 높이는 개요 탭의 자연 높이(최소 minimumBodyHeight, 화면 높이 maxBodyHeight 이하)다. 그보다 긴 탭(계정이 많은 Claude 탭 등)은
+/// 본문 안쪽 스크롤 뷰에서 움직인다. 예전엔 가장 긴 탭에 맞춰 계정 20개면 개요 아래 절반이 비었다(실사용 QA 2026-10-25).
 /// 탭을 바꾸면 그 스크롤 뷰의 문서만 갈아 끼운다 — 메뉴 항목의 뷰와 기하는 그대로라 열린 메뉴가 흔들리지 않는다.
 final class StatusMenuDashboardView: NSView {
     var lastRefreshPhases: DashboardRefreshPhases?
@@ -2638,6 +2639,9 @@ final class StatusMenuDashboardView: NSView {
     private(set) var actionsOpen = false
     /// 본문이 차지할 수 있는 최대 높이. 호스트(AppDelegate)가 화면 높이로 정한다.
     var maxBodyHeight: CGFloat = .greatestFiniteMagnitude
+    /// 메뉴가 열려 있는 동안 참이다. 그동안은 갱신이 구조를 바꿔도 패널 높이를 바꾸지 않는다(열린 메뉴가 흔들리지 않게).
+    /// 호스트가 menuWillOpen에서 켜고 menuDidClose에서 끈 뒤 닫힌 상태의 높이로 다시 맞춘다.
+    var heightFrozen = false
     var onRefresh: (() -> Void)?
     var actions: [DashboardAction] = [] {
         didSet { actionList.actions = actions; needsLayout = true }
@@ -2834,15 +2838,15 @@ final class StatusMenuDashboardView: NSView {
         return heights
     }
 
-    /// 패널 높이 = 머리 + 본문(가장 긴 탭, 최소 minimumBodyHeight, 최대 maxBodyHeight) + 하단 막대.
-    /// tab을 주면 그 탭 내용에 맞춘다(스냅샷).
+    /// 패널 높이 = 머리 + 본문(개요 탭 자연 높이, 최소 minimumBodyHeight, 최대 maxBodyHeight) + 하단 막대.
+    /// 다른 탭은 이 높이 안에서 스크롤한다. tab을 주면 그 탭 내용에 맞춘다(스냅샷).
     static func preferredHeight(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData? = nil,
                                 burnModel: SubscriptionBurnModel, notices: DashboardToolNotices, maxBodyHeight: CGFloat, tab: DashboardTab? = nil) -> CGFloat {
         let overview = overviewModel(teamClaude: teamClaude, teamCodex: teamCodex, grok: GrokCardModel(headline: "", detail: nil),
                                      agy: AgyCardModel(message: nil, groups: []), burnModel: burnModel, notices: notices)
         let heights = tabContentHeights(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
                                         burnModel: burnModel, notices: notices, overview: overview)
-        let content = tab.flatMap { heights[$0] } ?? max(heights.values.max() ?? 0, minimumBodyHeight)
+        let content = tab.flatMap { heights[$0] } ?? max(heights[.overview] ?? 0, minimumBodyHeight)
         return chromeHeight + min(content, maxBodyHeight)
     }
 
@@ -3144,8 +3148,10 @@ final class StatusMenuDashboardView: NSView {
             // 가장 비싼 경로다. 여기서도 단계 시간을 남긴다(예전엔 phases=- 로 비어 보였다).
             let structurePhases = DashboardRefreshPhases()
             lastRefreshPhases = structurePhases
-            frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
-                                                     burnModel: burnModel, notices: notices, maxBodyHeight: maxBodyHeight)
+            if !heightFrozen {
+                frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
+                                                         burnModel: burnModel, notices: notices, maxBodyHeight: maxBodyHeight)
+            }
             structurePhases.mark("height")
             configure(
                 teamClaude: teamClaude,
@@ -5556,7 +5562,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             maxBodyHeight: dashboard.maxBodyHeight
         )
         dashboard.lastRefreshPhases?.mark("height")
-        dashboard.frame.size.height = contentHeight
+        if !dashboard.heightFrozen { dashboard.frame.size.height = contentHeight }
         dashboard.lastRefreshPhases?.mark("frame")
         hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)
         dashboard.lastRefreshPhases?.mark("host")
@@ -5642,6 +5648,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            cachedDashboardItem != nil,
            !menu.items.isEmpty {
             flushPendingDashboardRefresh(reason: "menuWillOpen")
+            cachedDashboardView.heightFrozen = true
             openDashboardView = cachedDashboardView
             refreshActionDetails()
             loadFastStatusInBackground()
@@ -5684,6 +5691,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.recoverTeamCodexAccount(name, expectedAccountUuid: accountUuid, kind: kind)
             }
         )
+        dashboard.heightFrozen = true
         openDashboardView = dashboard
         cachedDashboardView = dashboard
         let dashboardItem = NSMenuItem()
@@ -5699,6 +5707,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuDidClose(_ menu: NSMenu) {
         openDashboardView = nil
+        // 닫혔으니 다음 열림을 위해 높이를 지금 내용에 맞춘다(아래 updateCachedMenuPresentation).
+        cachedDashboardView?.heightFrozen = false
         // 다음에 열 때는 "지금 쓸 수 있나"부터 답한다(개요). 닫힌 동안 바꿔 두면 여는 순간 비용이 없다.
         cachedDashboardView?.setActionsOpen(false)
         cachedDashboardView?.selectTab(.overview)
