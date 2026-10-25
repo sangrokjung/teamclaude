@@ -50,6 +50,48 @@ struct GrokUsageTests {
         precondition(grokCredential(from: Data("{}".utf8), now: now) == .login,
                      "자격이 없으면 login이어야 한다")
 
+        // 갱신 필요(실사용 QA 2026-10-25): 제목 슬롯과 카드가 한 판정에서 나오고, 레인에는 할 일을 짧게 말한다.
+        // 예전엔 제목이 "Grok 갱신 필요"인데 개요 레인은 보조 줄 없는 "확인 필요"였다.
+        let checking = GrokCardModel(headline: L10n.grokChecking, detail: nil)
+        let refresh = grokPresentation(.expired, previousSlot: nil, previousCard: checking)
+        precondition(refresh.slot == L10n.grokRefreshNeeded && refresh.card.headline == refresh.slot,
+                     "title slot and card must share the refresh-needed wording: \(String(describing: refresh.slot)) / \(refresh.card.headline)")
+        precondition(refresh.card.detail == L10n.grokRefreshDetail)
+        precondition(refresh.card.laneNote == L10n.grokRefreshLaneNote && !(refresh.card.laneNote ?? "").isEmpty,
+                     "the lane must say what to do")
+        // 토큰이 기한 안인데 청구 API가 401·403이면 서버가 토큰을 거절한 것이다. "확인 필요"가 아니라 갱신 필요다.
+        precondition(grokMenuOutcome(billing: nil, statusCode: 401) == .expired)
+        precondition(grokMenuOutcome(billing: nil, statusCode: 403) == .expired)
+        precondition(grokMenuOutcome(billing: nil, statusCode: 500) == .unavailable)
+        precondition(grokMenuOutcome(billing: nil, statusCode: nil) == .unavailable)
+        if case .percent(let outcome) = grokMenuOutcome(billing: billing, statusCode: 200) {
+            precondition(outcome.slot == "Grok 2%")
+        } else { preconditionFailure("200 with billing must be a percent") }
+        // 갱신 필요 뒤의 실패는 토큰이 아니라 네트워크·서버 쪽이다(401·403은 .expired로 온다). 제목과 카드가 함께 확인 필요가 된다.
+        let afterRefresh = grokPresentation(.unavailable, previousSlot: refresh.slot, previousCard: refresh.card)
+        precondition(afterRefresh.slot == L10n.grokNeedsCheck && afterRefresh.card.headline == afterRefresh.slot,
+                     "title and card move together")
+        // 처음부터 실패면 확인 필요. 제목과 카드가 같은 말이다.
+        let failed = grokPresentation(.unavailable, previousSlot: nil, previousCard: checking)
+        precondition(failed.slot == L10n.grokNeedsCheck && failed.card.headline == L10n.grokNeedsCheck)
+        // 앞서 값이 있었으면 그 값을 지킨다.
+        let percent = grokPresentation(.percent(GrokPercentOutcome(slot: "Grok 24%", productPercent: 24, creditPercent: nil)),
+                                       previousSlot: nil, previousCard: checking)
+        precondition(percent.slot == "Grok 24%" && percent.card.headline == "Grok 24%")
+        let kept = grokPresentation(.unavailable, previousSlot: percent.slot, previousCard: percent.card)
+        precondition(kept.slot == "Grok 24%" && kept.card == percent.card)
+        let login = grokPresentation(.login, previousSlot: percent.slot, previousCard: percent.card)
+        precondition(login.slot == L10n.grokLogin && login.card.headline == L10n.grokLogin)
+        // 영어 화면에는 한글이 없다.
+        let previousLanguage = L10n.language
+        L10n.language = .en
+        let english = grokPresentation(.expired, previousSlot: nil, previousCard: checking)
+        for text in [english.slot ?? "", english.card.headline, english.card.detail ?? "", english.card.laneNote ?? ""] {
+            precondition(!text.isEmpty && text.range(of: "[가-힣]", options: .regularExpression) == nil, "Hangul in English: \(text)")
+        }
+        precondition(english.slot == "Grok refresh needed")
+        L10n.language = previousLanguage
+
         print("Grok title usage test passed")
     }
 }

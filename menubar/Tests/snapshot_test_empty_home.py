@@ -150,5 +150,6 @@ class EmptyHomeSnapshotTests(unittest.TestCase):
         self.assertFalse((self.home / ".config" / "teamcodex.json").exists())
 
 
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,9 @@ It is a native Swift/AppKit executable with no Electron, Tauri, React or npm run
 ## The panel
 
 Clicking the menu-bar item opens a 520pt panel. The header shows the title, the time of the data, and how many accounts
-need a person ("To fix N"). Below it are five tabs.
+need a person ("To fix N"). Below it are five tabs. The panel is as tall as the overview tab (at least 400pt of body, at most
+the screen); a longer tab, such as the Claude tab with many accounts, scrolls inside the body. The height does not change while
+the menu is open.
 
 | Tab | Contents |
 |---|---|

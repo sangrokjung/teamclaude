@@ -4,7 +4,8 @@ import Cocoa
 // TeamClaudeHealth(main.swift)를 읽으므로 테스트 러너의 라이브러리 묶음 밖이다(run-tests.sh EXCLUDE_SOURCES).
 //
 // 숫자의 출처:
-//  - 큰 숫자 = opusAvailability(세션·주간 여유, 프록시 라우팅 가능) — 지금 요청을 받는 계정
+//  - 큰 숫자 = opusAvailability(세션·주간 여유, 프록시 라우팅 가능) — 지금 요청을 받는 계정.
+//    띠·범례·기다리면 풀림·손볼 것도 같은 routingAvailability를 쓴다(Claude 탭 묶음·제목 라우팅 슬롯도 같다)
 //  - Claude Fable 레인 = fableAvailability(.ready) — 예전 요약 띠의 "Claude Fable"
 //  - Codex 레인 = TeamCodexPoolHealth.usableCount / poolCount
 //  - Grok·agy 레인 = 카드 모델의 문구
@@ -36,7 +37,9 @@ func teamClaudeRowPresentation(_ row: TeamClaudeAccountHealth, _ state: TeamClau
     }
     switch state.state {
     case .ready:
-        return TeamClaudeRowPresentation(tone: .ready, label: L10n.stateReady, excluded: false, cap: nil)
+        // 동시 요청이 가득 차도 라우팅 중이다. 대기로 그리지 않고 "사용 중 3/3"이라고 말한다(같은 민트 톤, 라우팅 가능으로 센다).
+        let label = state.busy.map { L10n.stateBusy($0.inflight, $0.capacity) } ?? L10n.stateReady
+        return TeamClaudeRowPresentation(tone: .ready, label: label, excluded: false, cap: nil)
     case .limited:
         return TeamClaudeRowPresentation(tone: .wait, label: L10n.stateLimited, excluded: false, cap: nil)
     case .unconfirmed:
@@ -82,8 +85,11 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     var fableReady = 0
     var total = 0
     if let health = input.teamClaude, claudeNotice == nil {
+        // 띠·범례·기다리면 풀림·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
+        // 서로 다른 판정을 보면 한쪽만 고쳐도 어긋난다). Fable 레인 숫자만 Fable 창까지 보는 판정이다.
         let availability = health.fableAvailability(now: now)
         let opus = health.opusAvailability(now: now)
+        let routing = health.routingAvailability(now: now)
         total = max(health.accountTotal, health.accountConfigured, health.accounts.count)
         fableReady = availability.filter { $0.state == .ready }.count
         model.routable = opus.count
@@ -94,7 +100,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         var soonestSession: Double?
         var soonestWeekly: Double?
         var elapsedValues: [Double] = []
-        for (row, state) in zip(health.accounts, availability) {
+        for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
                                                              checkedAt: health.checkedAt, now: now)
@@ -184,7 +190,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         grokLane = OverviewLane(name: "Grok", value: "\(panelPercentNumber(percent))%", unit: "", note: L10n.usageRate, tab: .cli, quiet: false)
     } else {
         let value = input.grok.headline.hasPrefix("Grok ") ? String(input.grok.headline.dropFirst(5)) : input.grok.headline
-        grokLane = OverviewLane(name: "Grok", value: value, unit: "", note: input.grok.detail ?? "", tab: .cli, quiet: true)
+        grokLane = OverviewLane(name: "Grok", value: value, unit: "", note: input.grok.laneNote ?? input.grok.detail ?? "", tab: .cli, quiet: true)
     }
     let agyLane: OverviewLane
     if let notice = input.agy.notice {
@@ -200,10 +206,10 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
 
     // 소진 미리보기: 레인별 전망과 판정(소진 탭의 표와 같은 문구).
     model.burnLines = input.burn.usages.map { usage in
-        let verdict = burnVerdict(usage)
+        let verdict = burnVerdictDisplay(usage)
         return OverviewBurnLine(lane: burnLaneDisplayName(usage.lane),
                                 projection: burnProjectionLabel(burnBindingProjection(usage)),
-                                verdict: burnVerdictLabel(verdict), verdictColor: burnVerdictColor(verdict))
+                                verdict: verdict.label, verdictColor: verdict.color)
     }
     if input.burn.usages.contains(where: {
         if case .extrapolation(let confidence) = burnBindingProjection($0).basis { return confidence == .low }

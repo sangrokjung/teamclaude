@@ -56,6 +56,39 @@ struct BurnProjectionTests {
         let none = burnProject(current: nil, windowSeconds: week, resetAt: nil, history: [], now: now)
         precondition(none.basis == .collecting)
 
+        // 신뢰 낮은 외삽이 100%를 넘으면 원시 숫자(예: 423%)를 쓰지 않는다(실사용 QA 2026-10-25:
+        // "Codex 3% → 423% 추정 · 신뢰 낮음"·"달성"). 계산은 그대로 두고 표시만 바꾼다.
+        let wild = BurnProjection(current: 0.03, projected: 4.23, range: nil, basis: .extrapolation(confidence: .low))
+        let wildLabel = burnProjectionLabel(wild)
+        precondition(!wildLabel.contains("423%"), wildLabel)
+        precondition(wildLabel.contains("3%") && wildLabel.contains(L10n.burnOverHundred) && wildLabel.contains(L10n.lowConfidence), wildLabel)
+        // 신뢰 높은 외삽은 그대로 숫자를 쓴다(값은 손대지 않는다).
+        let sure = BurnProjection(current: 0.6, projected: 1.2, range: nil, basis: .extrapolation(confidence: .normal))
+        precondition(burnProjectionLabel(sure).contains("120%"), burnProjectionLabel(sure))
+        // 100% 이하 신뢰 낮음은 숫자를 쓴다.
+        let lowSmall = BurnProjection(current: 0.03, projected: 0.4, range: nil, basis: .extrapolation(confidence: .low))
+        precondition(burnProjectionLabel(lowSmall).contains("40%"), burnProjectionLabel(lowSmall))
+        // 판정도 같은 말을 한다: 신뢰 낮은 전망은 "달성"이라 단정하지 않고 추정이라 쓴다.
+        func lane(_ projection: BurnProjection, blocked: Int = 0) -> LaneUsage {
+            LaneUsage(lane: "codex", paidAccounts: 1, contributingAccounts: 1, errorAccounts: 0, disabledAccounts: 0,
+                      weekly: projection, session: BurnProjection(current: nil, projected: nil, range: nil, basis: .collecting),
+                      blockedMoments: blocked)
+        }
+        precondition(burnVerdict(lane(wild)) == .onTarget, "the verdict math is unchanged")
+        let wildVerdict = burnVerdictDisplay(lane(wild))
+        precondition(wildVerdict.label == L10n.verdictTentative(L10n.verdictOnTarget) && wildVerdict.label != L10n.verdictOnTarget,
+                     wildVerdict.label)
+        precondition(burnVerdictDisplay(lane(sure)).label == L10n.verdictOnTarget)
+        // 관측된 부족은 추정이 아니다.
+        precondition(burnVerdictDisplay(lane(wild, blocked: 1)).label == L10n.verdictBlocked)
+        let previousLanguage = L10n.language
+        L10n.language = .en
+        for text in [burnProjectionLabel(wild), burnVerdictDisplay(lane(wild)).label] {
+            precondition(text.range(of: "[가-힣]", options: .regularExpression) == nil, "Hangul in English: \(text)")
+        }
+        precondition(burnProjectionLabel(wild).contains("over 100%"), burnProjectionLabel(wild))
+        L10n.language = previousLanguage
+
         print("BurnProjectionTests: 통과")
     }
 }

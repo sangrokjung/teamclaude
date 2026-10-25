@@ -208,21 +208,28 @@ struct TeamClaudeHealth {
 
     var titleSlot: String {
         let total = max(accountTotal, accountConfigured)
+        // 평소 경로도 개요 큰 숫자와 같은 라우팅 수(프록시 usable 포함)를 쓴다. Fable 주간 여유는 패널의 Fable 레인이 보여 준다.
         if serverReachable && accountConfigDrift == 0 {
-            return L10n.titleClaudeFable(fableAvailability().filter { $0.state == .ready }.count, total)
+            return L10n.titleClaudeRouting(routableCount, total)
         }
         if !serverReachable && serverResponseDelayed { return L10n.titleClaudeSlow }
-        return teamClaudeTitleSlot(TeamClaudeHeadlineInput(
+        return teamClaudeTitleSlot(titleRoutingInput)
+    }
+
+    /// 제목 슬롯 판정 입력. "Claude 라우팅 N/M"의 N은 개요 큰 숫자와 같은 라우팅 판정(프록시 usable 포함)이다.
+    /// 예전엔 로컬 문턱 계산(accountUsable)이라 프록시가 유예 차선으로 보내는 계정을 0으로 셌다(실사용 QA 2026-10-25).
+    var titleRoutingInput: TeamClaudeHeadlineInput {
+        TeamClaudeHeadlineInput(
             serverReachable: serverReachable,
             accountConfigDrift: accountConfigDrift,
             measurementPendingCount: measurementPendingCount,
             quotaLimitedCount: quotaLimitedCount,
             fableKnown: fableKnown,
             fableOver: fableOver,
-            totalAccounts: total,
-            accountUsable: accountUsable,
+            totalAccounts: max(accountTotal, accountConfigured),
+            accountUsable: routableCount,
             accountActive: accountActive
-        ))
+        )
     }
 
     var statusLabel: String {
@@ -254,6 +261,10 @@ struct TeamClaudeAccountHealth {
     let measurementIssue: TeamClaudeMeasurementIssue?
     var usableFromProxy: Bool? = nil
     var fableMeasurementCurrent = false
+    /// 세션·주간 측정이 이번 응답 것인가. 라우팅 판정(Fable을 보지 않는다)은 이것만 요구한다.
+    /// fableMeasurementCurrent는 Fable 창까지 요구해, 프록시 재시작 뒤 Fable이 비면 라우팅까지 "측정 필요"로 떨어뜨렸다.
+    /// nil이면(병합을 거치지 않은 행) fableMeasurementCurrent를 따른다.
+    var routingMeasurementCurrent: Bool? = nil
     var inflightCount: Int? = nil
     var concurrentCapacity: Int? = nil
     var subscriptionConfirmation: AccountSubscriptionConfirmation? = nil
@@ -991,6 +1002,9 @@ func teamClaudeAccountMergingQuota(
             && candidate.sessionPercent != nil && candidate.weeklyPercent != nil && candidate.fablePercent != nil
             && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0
             && (candidate.fableResetSeconds ?? 0) > 0,
+        routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
+            && candidate.sessionPercent != nil && candidate.weeklyPercent != nil
+            && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0,
         inflightCount: candidate.inflightCount,
         concurrentCapacity: candidate.concurrentCapacity,
         subscriptionConfirmation: candidate.subscriptionConfirmation,
@@ -2061,9 +2075,10 @@ final class TeamClaudeTableView: NSView {
         evaluatedAt = now
         guard let health else { return }
         let total = max(health.accountTotal, health.accountConfigured)
-        let availability = health.fableAvailability(now: now)
-        let ready = availability.filter { $0.state == .ready }.count
-        setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.accountUsable,
+        let availability = health.routingAvailability(now: now)
+        // 접근성 문장의 "Fable 사용 가능"은 Fable 레인 판정, "라우팅 가능"은 표 묶음과 같은 라우팅 판정이다.
+        let ready = health.fableAvailability(now: now).filter { $0.state == .ready }.count
+        setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.routableCount,
                                                            drift: health.accountConfigDrift, pending: health.measurementPendingCount,
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
                                                            fableOver: health.fableOver, status: health.statusLabel))
@@ -2124,7 +2139,7 @@ final class TeamClaudeTableView: NSView {
 
     /// 높이 = 표 상단 + 묶음 행. 대시보드의 teamContentHeight와 이 표의 layout·draw가 같은 계산을 쓴다.
     static func contentHeight(_ health: TeamClaudeHealth, expanded: String?, now: Date = Date()) -> CGFloat {
-        let availability = health.fableAvailability(now: now)
+        let availability = health.routingAvailability(now: now)
         let lines = health.rowLines(now: now, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
                                              expanded: expanded.flatMap { name in health.accounts.firstIndex { $0.name == name } })
@@ -2139,7 +2154,7 @@ final class TeamClaudeTableView: NSView {
     /// 그 계정 행의 사각형(표 좌표). 개요에서 계정을 눌러 들어올 때 스크롤 위치를 잡는다.
     func rowRect(named name: String) -> NSRect? {
         guard let health, let index = health.accounts.firstIndex(where: { $0.name == name }) else { return nil }
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex)
         guard let y = layout.origins[index] else { return nil }
@@ -2150,7 +2165,7 @@ final class TeamClaudeTableView: NSView {
 
     private func reauthenticationRows() -> [(index: Int, name: String, accountUuid: String?)] {
         guard let health else { return [] }
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         return health.accounts.enumerated().compactMap { index, row in
             guard availability[index].subscriptionAppearance != .ended else { return nil }
             return teamClaudeCanReauthenticate(
@@ -2243,7 +2258,7 @@ final class TeamClaudeTableView: NSView {
         refreshTime(now: evaluatedAt)
         guard let health else { return }
         let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt)
         let expanded = expandedIndex
         let grouped = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expanded)
@@ -2355,7 +2370,7 @@ final class TeamClaudeTableView: NSView {
         }
 
         // 측정·연동 안내
-        let availability = health.fableAvailability(now: evaluatedAt)
+        let availability = health.routingAvailability(now: evaluatedAt)
         subscriptionButtons.forEach { $0.refreshTitle(now: evaluatedAt) }
         let ready = availability.filter { $0.state == .ready }.count
         let limited = availability.filter { $0.state == .limited }.count
@@ -2395,7 +2410,7 @@ final class TeamClaudeTableView: NSView {
             actionDetail = L10n.limitedDetail
         } else {
             actionTone = ready > 0 ? .ready : .off
-            actionTitle = ready > 0 ? L10n.fableReadyTitle(ready) : L10n.noAccounts
+            actionTitle = ready > 0 ? L10n.routableReadyTitle(ready) : L10n.noAccounts
             actionDetail = L10n.allWindowsDetail
         }
         let strip = NSRect(x: left, y: TeamClaudeCardMetrics.stripY(hostLine: hostLineShown), width: rightEdge - left,
@@ -2542,7 +2557,8 @@ final class TeamClaudeTableView: NSView {
                     PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: statusWidth), statusRight, y + 9, micro, issue == .quotaBlocked ? ember : fg3)
                 }
             } else {
-                let label = row.isCurrent && state.state == .ready ? L10n.stateInUse : presentation.label
+                // 동시 요청이 가득 찬 행은 "사용 중 3/3"(presentation)이 이긴다. 현재 계정의 "사용 중"보다 정보가 많다.
+                let label = row.isCurrent && state.state == .ready && state.busy == nil ? L10n.stateInUse : presentation.label
                 PanelDraw.right(PanelDraw.clipped(label, caption, maxWidth: statusWidth), statusRight, y + 8, caption,
                                 subscriptionMuted ? fg3 : presentation.tone.color)
             }
@@ -2609,7 +2625,8 @@ func dashboardThreadCPUMs() -> Double {
 }
 
 /// 메뉴 대시보드 패널(A안, menubar/DESIGN.md). 머리(제목·기준 시각·손볼 것)와 탭 5개, 본문, 하단 동작 막대.
-/// 패널 높이는 가장 긴 탭에 맞추되 화면 높이(maxBodyHeight)를 넘지 않고, 탭 본문만 안쪽 스크롤 뷰에서 움직인다.
+/// 패널 높이는 개요 탭의 자연 높이(최소 minimumBodyHeight, 화면 높이 maxBodyHeight 이하)다. 그보다 긴 탭(계정이 많은 Claude 탭 등)은
+/// 본문 안쪽 스크롤 뷰에서 움직인다. 예전엔 가장 긴 탭에 맞춰 계정 20개면 개요 아래 절반이 비었다(실사용 QA 2026-10-25).
 /// 탭을 바꾸면 그 스크롤 뷰의 문서만 갈아 끼운다 — 메뉴 항목의 뷰와 기하는 그대로라 열린 메뉴가 흔들리지 않는다.
 final class StatusMenuDashboardView: NSView {
     var lastRefreshPhases: DashboardRefreshPhases?
@@ -2631,6 +2648,9 @@ final class StatusMenuDashboardView: NSView {
     private(set) var actionsOpen = false
     /// 본문이 차지할 수 있는 최대 높이. 호스트(AppDelegate)가 화면 높이로 정한다.
     var maxBodyHeight: CGFloat = .greatestFiniteMagnitude
+    /// 메뉴가 열려 있는 동안 참이다. 그동안은 갱신이 구조를 바꿔도 패널 높이를 바꾸지 않는다(열린 메뉴가 흔들리지 않게).
+    /// 호스트가 menuWillOpen에서 켜고 menuDidClose에서 끈 뒤 닫힌 상태의 높이로 다시 맞춘다.
+    var heightFrozen = false
     var onRefresh: (() -> Void)?
     var actions: [DashboardAction] = [] {
         didSet { actionList.actions = actions; needsLayout = true }
@@ -2827,15 +2847,15 @@ final class StatusMenuDashboardView: NSView {
         return heights
     }
 
-    /// 패널 높이 = 머리 + 본문(가장 긴 탭, 최소 minimumBodyHeight, 최대 maxBodyHeight) + 하단 막대.
-    /// tab을 주면 그 탭 내용에 맞춘다(스냅샷).
+    /// 패널 높이 = 머리 + 본문(개요 탭 자연 높이, 최소 minimumBodyHeight, 최대 maxBodyHeight) + 하단 막대.
+    /// 다른 탭은 이 높이 안에서 스크롤한다. tab을 주면 그 탭 내용에 맞춘다(스냅샷).
     static func preferredHeight(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData? = nil,
                                 burnModel: SubscriptionBurnModel, notices: DashboardToolNotices, maxBodyHeight: CGFloat, tab: DashboardTab? = nil) -> CGFloat {
         let overview = overviewModel(teamClaude: teamClaude, teamCodex: teamCodex, grok: GrokCardModel(headline: "", detail: nil),
                                      agy: AgyCardModel(message: nil, groups: []), burnModel: burnModel, notices: notices)
         let heights = tabContentHeights(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
                                         burnModel: burnModel, notices: notices, overview: overview)
-        let content = tab.flatMap { heights[$0] } ?? max(heights.values.max() ?? 0, minimumBodyHeight)
+        let content = tab.flatMap { heights[$0] } ?? max(heights[.overview] ?? 0, minimumBodyHeight)
         return chromeHeight + min(content, maxBodyHeight)
     }
 
@@ -2857,8 +2877,8 @@ final class StatusMenuDashboardView: NSView {
     private static func naturalSectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?) -> [String: String] {
         var out: [String: String] = [:]
         if let teamClaude {
-            // 개요와 같은 숫자: 전체 계정 수, Fable 기준 지금 요청을 받을 수 있는 계정 수.
-            let usable = teamClaude.fableAvailability(now: Date()).filter { $0.state == .ready }.count
+            // 개요 큰 숫자와 같은 숫자: 전체 계정 수, 지금 라우팅 가능한 계정 수(프록시 usable·동시 요청 가득 포함).
+            let usable = teamClaude.routableCount
             out["claude"] = L10n.claudeSectionSummary(accounts: teamClaude.accounts.count, usable: usable)
         }
         if let teamCodex {
@@ -3137,8 +3157,10 @@ final class StatusMenuDashboardView: NSView {
             // 가장 비싼 경로다. 여기서도 단계 시간을 남긴다(예전엔 phases=- 로 비어 보였다).
             let structurePhases = DashboardRefreshPhases()
             lastRefreshPhases = structurePhases
-            frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
-                                                     burnModel: burnModel, notices: notices, maxBodyHeight: maxBodyHeight)
+            if !heightFrozen {
+                frame.size.height = Self.preferredHeight(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
+                                                         burnModel: burnModel, notices: notices, maxBodyHeight: maxBodyHeight)
+            }
             structurePhases.mark("height")
             configure(
                 teamClaude: teamClaude,
@@ -5049,37 +5071,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isFetchingGrok = false
-                let slot: String
-                switch outcome {
-                case .percent(let outcome):
-                    self.grokLastSuccessAt = Date()
-                    self.currentGrokSlot = outcome.slot
-                    self.currentGrokCard = GrokCardModel(
-                        headline: outcome.slot,
-                        detail: grokCardDetail(product: outcome.productPercent, credit: outcome.creditPercent)
-                    )
-                    slot = outcome.slot
-                case .expired:
-                    self.currentGrokSlot = L10n.grokRefreshNeeded
-                    self.currentGrokCard = GrokCardModel(
-                        headline: L10n.grokRefreshNeeded,
-                        detail: L10n.grokRefreshDetail
-                    )
-                    slot = L10n.grokRefreshNeeded
-                case .login:
-                    self.currentGrokSlot = L10n.grokLogin
-                    self.currentGrokCard = GrokCardModel(headline: L10n.grokLogin, detail: nil)
-                    slot = L10n.grokLogin
-                case .unavailable:
-                    if self.currentGrokSlot == nil
-                        || self.currentGrokSlot == L10n.grokLogin
-                        || self.currentGrokSlot == L10n.grokRefreshNeeded
-                        || self.currentGrokSlot == L10n.grokChecking {
-                        self.currentGrokSlot = L10n.grokNeedsCheck
-                        self.currentGrokCard = GrokCardModel(headline: L10n.grokNeedsCheck, detail: nil)
-                    }
-                    slot = self.currentGrokSlot ?? L10n.grokNeedsCheck
-                }
+                if case .percent = outcome { self.grokLastSuccessAt = Date() }
+                // 제목 슬롯과 카드는 한 판정(grokPresentation)에서 함께 나온다.
+                let presented = grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)
+                self.currentGrokSlot = presented.slot
+                self.currentGrokCard = presented.card
+                let slot = presented.slot ?? L10n.grokNeedsCheck
                 print("GROK-SLOT: \(slot)")
                 fflush(stdout)
                 self.updateTitle()
@@ -5574,7 +5571,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             maxBodyHeight: dashboard.maxBodyHeight
         )
         dashboard.lastRefreshPhases?.mark("height")
-        dashboard.frame.size.height = contentHeight
+        if !dashboard.heightFrozen { dashboard.frame.size.height = contentHeight }
         dashboard.lastRefreshPhases?.mark("frame")
         hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)
         dashboard.lastRefreshPhases?.mark("host")
@@ -5660,6 +5657,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            cachedDashboardItem != nil,
            !menu.items.isEmpty {
             flushPendingDashboardRefresh(reason: "menuWillOpen")
+            cachedDashboardView.heightFrozen = true
             openDashboardView = cachedDashboardView
             refreshActionDetails()
             loadFastStatusInBackground()
@@ -5702,6 +5700,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.recoverTeamCodexAccount(name, expectedAccountUuid: accountUuid, kind: kind)
             }
         )
+        dashboard.heightFrozen = true
         openDashboardView = dashboard
         cachedDashboardView = dashboard
         let dashboardItem = NSMenuItem()
@@ -5717,6 +5716,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuDidClose(_ menu: NSMenu) {
         openDashboardView = nil
+        // 닫혔으니 다음 열림을 위해 높이를 지금 내용에 맞춘다(아래 updateCachedMenuPresentation).
+        cachedDashboardView?.heightFrozen = false
         // 다음에 열 때는 "지금 쓸 수 있나"부터 답한다(개요). 닫힌 동안 바꿔 두면 여는 순간 비용이 없다.
         cachedDashboardView?.setActionsOpen(false)
         cachedDashboardView?.selectTab(.overview)
@@ -6170,32 +6171,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 installCrashRecorder()
 
 /// 대시보드를 탭마다 한 장씩 그린다(탭 본문은 스크롤 없이 통째로). 첫 탭은 outputPath, 나머지는 "-<탭 id>"를 붙인 경로다.
+/// panelHeight를 주면 모든 탭을 그 높이(메뉴가 실제로 여는 패널 높이)로 그린다 — 긴 탭은 본문 위쪽만 보이고 나머지는 스크롤 아래다.
 /// 탭별로 실제로 그려진 글자(DrawnTextRecorder)와 미설치 안내 카드(ToolNoticeDrawLog)를 함께 돌려준다.
-func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab])
-    -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
-    DrawnTextRecorder.install()
-    var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
+/// renderDashboardTabs가 이 탭 목록으로 쓸 이름(첫 탭은 outputPath 그대로, 나머지는 "-<탭>" 접미). 그리기와 정리가 같은 규칙을 쓴다.
+func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [DashboardTab]) -> String {
+    guard tab != tabs.first else { return outputPath }
     let url = URL(fileURLWithPath: outputPath)
+    return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
+}
+
+func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil)
+    -> (texts: [String], notices: [String: String])? {
+    DrawnTextRecorder.install()
+    view.selectTab(tab)
+    view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
+    view.layoutSubtreeIfNeeded()
+    ToolNoticeDrawLog.reset()
+    DrawnTextRecorder.reset()
+    guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+        fputs("DASHBOARD-TABS: bitmap 생성 실패 \(tab.id)\n", stderr)
+        return nil
+    }
+    view.cacheDisplay(in: view.bounds, to: rep)
+    DrawnTextRecorder.collectControlTitles(in: view)
+    guard let png = rep.representation(using: .png, properties: [:]),
+          (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
+        fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
+        return nil
+    }
+    return (DrawnTextRecorder.strings, ToolNoticeDrawLog.drawn)
+}
+
+/// 픽스처 스냅샷용: 첫 탭은 outputPath 그대로, 나머지는 "-<탭>" 접미. 실패하면 1로 끝낸다.
+func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab], panelHeight: CGFloat? = nil)
+    -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
+    var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
     for tab in tabs {
-        view.selectTab(tab)
-        view.frame.size.height = StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
-        view.layoutSubtreeIfNeeded()
-        ToolNoticeDrawLog.reset()
-        DrawnTextRecorder.reset()
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
-            fputs("DASHBOARD-TABS: bitmap 생성 실패 \(tab.id)\n", stderr)
-            exit(1)
-        }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        DrawnTextRecorder.collectControlTitles(in: view)
-        let path = tab == tabs.first ? outputPath
-            : url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
-        guard let png = rep.representation(using: .png, properties: [:]),
-              (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
-            fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
-            exit(1)
-        }
-        results.append((tab, path, DrawnTextRecorder.strings, ToolNoticeDrawLog.drawn))
+        let path = dashboardTabOutputPath(outputPath, tab: tab, tabs: tabs)
+        guard let drawn = renderDashboardTab(view, tab: tab, path: path, panelHeight: panelHeight) else { exit(1) }
+        results.append((tab, path, drawn.texts, drawn.notices))
     }
     return results
 }

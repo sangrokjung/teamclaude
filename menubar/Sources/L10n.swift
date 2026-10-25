@@ -144,6 +144,8 @@ enum L10n {
 
     static var stateReady: String { t("사용 가능", "Available") }
     static var stateInUse: String { t("사용 중", "In use") }
+    /// 프록시가 라우팅 중인데 동시 요청 칸이 다 찼다. 대기가 아니라 바쁜 것이다(새 요청은 줄을 선다).
+    static func stateBusy(_ inflight: Int, _ capacity: Int) -> String { t("사용 중 \(inflight)/\(capacity)", "In use \(inflight)/\(capacity)") }
     static var stateLimited: String { t("한도 대기", "At limit") }
     static var stateCheck: String { t("확인 필요", "Needs check") }
     static var stateDisabled: String { t("꺼 둠", "Off") }
@@ -180,10 +182,10 @@ enum L10n {
     static func excludedTitle(_ count: Int) -> String { t("\(count)개 계정 이용 제외", "\(count) accounts excluded") }
     static var excludedDetail: String { t("아래에서 구독·인증·비활성 상태 확인", "Check plan, auth and disabled state below") }
     static func limitedTitle(_ count: Int) -> String { t("\(count)개 계정 한도·요청 대기", "\(count) accounts waiting on limits") }
-    static var limitedDetail: String { t("세션·전체 주간·Fable 모두 여유가 필요합니다", "Session, weekly and Fable all need headroom") }
-    static func fableReadyTitle(_ count: Int) -> String { t("\(count)개 계정 Fable 사용 가능", "\(count) accounts ready for Fable") }
+    static var limitedDetail: String { t("세션·전체 주간 여유가 생기면 돌아옵니다", "Back when session and weekly headroom returns") }
+    static func routableReadyTitle(_ count: Int) -> String { t("\(count)개 계정 라우팅 가능", "\(count) accounts routable") }
     static var noAccounts: String { t("등록된 계정이 없습니다", "No accounts registered") }
-    static var allWindowsDetail: String { t("세션·전체 주간·Fable 한도를 함께 확인", "Session, weekly and Fable limits checked together") }
+    static var allWindowsDetail: String { t("세션·전체 주간 한도와 프록시 판정을 함께 확인 · Fable은 열에서", "Session and weekly limits checked with the proxy · Fable in its column") }
     static func accountsCount(_ count: Int) -> String { t("계정 \(count)", "Accounts \(count)") }
     static var columnSession: String { t("세션 5시간", "Session 5h") }
     static var columnWeekly: String { t("주간", "Weekly") }
@@ -312,11 +314,16 @@ enum L10n {
     static var burnCollecting: String { t("수집 중", "Collecting") }
     static func burnHistory(cycles: Int, percent: String) -> String { t("최근 \(cycles)주 평균 \(percent)", "avg of last \(cycles) weeks \(percent)") }
     static func burnEstimate(_ current: String, _ projected: String) -> String { t("\(current) → \(projected) 추정", "\(current) → \(projected) est.") }
+    /// 신뢰 낮은 외삽이 100%를 넘을 때. 원시 숫자(예: 423%)는 근거가 약해 쓰지 않는다.
+    static var burnOverHundred: String { t("100% 넘을", "over 100%") }
+    static func burnEstimateOver(_ current: String) -> String { t("\(current) → 100% 넘을 추정", "\(current) → over 100% est.") }
     static var verdictBlocked: String { t("부족", "Short") }
     static var verdictOnTarget: String { t("달성", "On target") }
     static var verdictNear: String { t("근접", "Close") }
     static var verdictSlack: String { t("여유", "Slack") }
     static var verdictExcess: String { t("과다", "Excess") }
+    /// 신뢰 낮은 전망의 판정. 단정하지 않는다.
+    static func verdictTentative(_ verdict: String) -> String { t("\(verdict) 추정", "\(verdict) (est.)") }
 
     // MARK: CLI·Higgsfield
 
@@ -425,6 +432,8 @@ enum L10n {
     static var reasonProxyUnknown: String { t("프록시 사용 가능 여부 미확인", "Proxy availability unknown") }
     static var reasonConcurrencyUnknown: String { t("동시 요청 여유 미확인", "Concurrency headroom unknown") }
     static var reasonConcurrencyBusy: String { t("동시 요청 처리 중", "Busy with concurrent requests") }
+    /// 로컬 창은 문턱을 넘었지만 프록시가 usable로 라우팅 중(5시간 한도 유예 차선). 라우팅은 프록시를 믿고 창 정보는 남긴다.
+    static func reasonProxyGrace(_ windows: String) -> String { t("프록시 라우팅 중 · \(windows) 문턱 넘음(유예)", "Proxy still routing · \(windows) past threshold (grace)") }
     static func reasonErrorCheck(_ label: String) -> String { t("\(label) · 상태 확인 필요", "\(label) · check state") }
     static var windowAllWeekly: String { t("전체 주간", "weekly") }
     static func reasonWindowsBlocked(_ windows: String) -> String { t("\(windows) 한도 대기", "\(windows) at limit") }
@@ -588,7 +597,6 @@ enum L10n {
 
     static func hostCores(_ cores: Int) -> String { t("\(cores)코어", "\(cores) cores") }
     static var hostPrefix: String { t("호스트  ", "Host  ") }
-    static func titleClaudeFable(_ ready: Int, _ total: Int) -> String { t("Claude Fable 사용 가능 \(ready)/\(total)", "Claude Fable \(ready)/\(total)") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
@@ -616,6 +624,8 @@ enum L10n {
     static var tipPrefix: String { t("Claude Code 사용량", "Claude Code usage") }
     static var grokRefreshNeeded: String { t("Grok 갱신 필요", "Grok refresh needed") }
     static var grokRefreshDetail: String { t("토큰 기한이 지났습니다. grok을 한 번 실행하면 갱신됩니다.", "The token expired. Run grok once to refresh it.") }
+    /// 개요 레인 한 줄(폭 약 100pt). 할 일만 말한다.
+    static var grokRefreshLaneNote: String { t("grok 한 번 실행", "Run grok once") }
     static var grokLogin: String { t("Grok 로그인", "Grok login") }
     static var grokNeedsCheck: String { t("Grok 확인 필요", "Grok needs check") }
     static var agyNoGeminiLane: String { t("agy Gemini 레인 없음", "agy has no Gemini lane") }

@@ -58,7 +58,7 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertIn("hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: previousScrollOrigin)", refresh)
 
     def test_panel_height_fits_the_screen(self):
-        # 높이는 가장 긴 탭에 맞추되 화면을 넘지 않는다. 공유 파라미터에 기본값을 두지 않는다(호출부가 화면 상한을 잊지 않게).
+        # 높이는 개요 탭 자연 높이에 맞추되 화면을 넘지 않는다(긴 탭은 본문 안에서 스크롤). 공유 파라미터에 기본값을 두지 않는다(호출부가 화면 상한을 잊지 않게).
         signature = self.main[self.main.index("    static func preferredHeight(teamClaude:"):]
         signature = signature[:signature.index("{")]
         self.assertIn("maxBodyHeight: CGFloat, tab: DashboardTab? = nil", signature)
@@ -297,7 +297,9 @@ class CliLaneHealthWiringTests(unittest.TestCase):
         grok = (SOURCES / "GrokUsage.swift").read_text()
         self.assertIn("case expired", grok)
         self.assertIn("candidates.isEmpty ? .login : .expired", grok)
-        self.assertIn("L10n.grokRefreshNeeded", self.main)
+        # 제목 슬롯과 카드는 grokPresentation 한 판정에서 나온다(실사용 QA 2026-10-25). 앱은 그 함수를 부른다.
+        self.assertIn("L10n.grokRefreshNeeded", grok)
+        self.assertIn("grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)", self.main)
         self.assertIn('t("Grok 갱신 필요", ', (SOURCES / "L10n.swift").read_text())
 
 
