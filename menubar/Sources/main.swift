@@ -6908,19 +6908,17 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let panelHeight = view.frame.height
-    // 임시 폴더 이름을 정해 처리기에 먼저 등록한 뒤 만든다. 같은 이름이 있으면 새 이름으로 다시 한다.
-    var stagingDirectory = ""
-    for _ in 0..<16 {
-        let candidate = (parentDirectory as NSString).appendingPathComponent(
-            ".cc-menubar-live-\(String(UInt64.random(in: 0...UInt64.max), radix: 16))")
-        registerLiveSnapshotStaging(directory: candidate,
-            files: tabs.map { (candidate as NSString).appendingPathComponent("\($0.id).png") })
-        if mkdir(candidate, 0o700) == 0 { stagingDirectory = candidate; break }
+    // 임시 폴더 이름을 정해 처리기에 먼저 등록한 뒤 만든다. 이름에 이 프로세스 번호를 넣어, 살아 있는 다른 실행과는
+    // 이름이 겹칠 수 없다(등록한 이름은 이 실행만 쓴다). 그래도 이미 있으면 남의 것일 수 있으니 재시도하지 않고,
+    // 등록을 지운 뒤 실패로 끝낸다(지우기 전 신호가 와도 처리기는 비어 있는 폴더만 rmdir하고 파일은 이 실행 이름만 지운다).
+    let stagingDirectory = (parentDirectory as NSString).appendingPathComponent(
+        ".cc-menubar-live-\(getpid())-\(String(UInt64.random(in: 0...UInt64.max), radix: 16))")
+    registerLiveSnapshotStaging(directory: stagingDirectory,
+        files: tabs.map { (stagingDirectory as NSString).appendingPathComponent("\($0.id).png") })
+    guard mkdir(stagingDirectory, 0o700) == 0 else {
+        let reason = errno
         liveStagingCleanupCount = 0
-        guard errno == EEXIST else { break }
-    }
-    guard !stagingDirectory.isEmpty else {
-        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory): \(String(cString: strerror(errno)))\n", stderr)
+        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(stagingDirectory): \(String(cString: strerror(reason)))\n", stderr)
         exit(1)
     }
     func failAndClean(_ message: String, status: Int32 = 1) -> Never {

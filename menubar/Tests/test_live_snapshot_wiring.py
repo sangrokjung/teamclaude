@@ -67,7 +67,7 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
         block = main[start:main.index("exit(0)", start)]
         self.assertIn("lstat(outputDirectory", block)
-        self.assertIn("mkdir(candidate, 0o700)", block)
+        self.assertIn("mkdir(stagingDirectory, 0o700)", block)
         self.assertIn("renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL))", block)
         self.assertLess(block.index("renderDashboardTab(view"), block.index("renamex_np("))
 
@@ -80,7 +80,10 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         self.assertLess(block.index("installLiveSnapshotSignalHandlers()"), block.index("NSApplication.shared"))
         self.assertNotIn("sigprocmask", block)
         # 임시 폴더 이름을 먼저 처리기에 등록한 뒤 만든다(어느 순간 신호가 와도 처리기가 지울 대상을 안다).
-        self.assertLess(block.index("registerLiveSnapshotStaging("), block.index("mkdir(candidate"))
+        self.assertLess(block.index("registerLiveSnapshotStaging("), block.index("mkdir(stagingDirectory"))
+        # 이름에 프로세스 번호를 넣고, 이미 있으면 재시도하지 않는다(남의 폴더를 등록하지 않는다).
+        self.assertIn("getpid()", block[block.index("let stagingDirectory"):block.index("registerLiveSnapshotStaging(")])
+        self.assertNotIn("EEXIST else", block)
         helper = main[main.index("func installLiveSnapshotSignalHandlers("):]
         helper = helper[:helper.index("\n}\n")]
         for signal_name in ("SIGTERM", "SIGINT", "SIGHUP"):
