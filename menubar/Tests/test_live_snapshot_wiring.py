@@ -61,6 +61,13 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         self.assertLess(body.index("MenubarRunMode.readOnly"), body.index("cc-menubar-crash.log"),
                         "read-only(--live-snapshot)에서는 크래시 기록 파일을 만들기 전에 빠져야 한다")
 
+    def test_read_only_is_set_before_appkit_init(self):
+        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
+        start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
+        block = main[start:main.index("exit(0)", start)]
+        self.assertLess(block.index("MenubarRunMode.readOnly = true"), block.index("NSApplication.shared"),
+                        "AppKit 초기화 중 예외도 읽기 전용으로 다뤄지게 플래그를 먼저 세운다")
+
 
 if __name__ == "__main__":
     unittest.main()

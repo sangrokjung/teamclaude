@@ -6189,6 +6189,13 @@ installCrashRecorder()
 /// 대시보드를 탭마다 한 장씩 그린다(탭 본문은 스크롤 없이 통째로). 첫 탭은 outputPath, 나머지는 "-<탭 id>"를 붙인 경로다.
 /// panelHeight를 주면 모든 탭을 그 높이(메뉴가 실제로 여는 패널 높이)로 그린다 — 긴 탭은 본문 위쪽만 보이고 나머지는 스크롤 아래다.
 /// 탭별로 실제로 그려진 글자(DrawnTextRecorder)와 미설치 안내 카드(ToolNoticeDrawLog)를 함께 돌려준다.
+/// renderDashboardTabs가 outputPath로 쓸 수 있는 모든 이름(첫 탭은 그 이름 그대로, 나머지는 "-<탭>" 접미).
+func dashboardTabOutputPaths(_ outputPath: String) -> [String] {
+    let url = URL(fileURLWithPath: outputPath)
+    let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension
+    return [outputPath] + DashboardTab.allCases.map { url.deletingPathExtension().path + "-\($0.id)." + ext }
+}
+
 func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab], panelHeight: CGFloat? = nil)
     -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
     DrawnTextRecorder.install()
@@ -6818,8 +6825,9 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         tabs = [tab]
     }
     let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
-    _ = NSApplication.shared
+    // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
     MenubarRunMode.readOnly = true
+    _ = NSApplication.shared
     let delegate = AppDelegate()
     // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
     delegate.refresh()
@@ -6832,7 +6840,9 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
           + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
     // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 이미지를 쓰지 않고 3으로 끝낸다.
     guard unfinished.isEmpty else {
-        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다\n", stderr)
+        // 같은 출력 이름으로 앞서 성공한 이미지가 남아 있으면 새것으로 오인된다. 이 실행이 쓸 수 있는 이름을 모두 지운다.
+        for path in dashboardTabOutputPaths(outputPath) { try? FileManager.default.removeItem(atPath: path) }
+        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다(이전 이미지도 지웠다)\n", stderr)
         exit(3)
     }
     // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).

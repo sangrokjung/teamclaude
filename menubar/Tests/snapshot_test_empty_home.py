@@ -197,13 +197,18 @@ class LiveSnapshotTimeoutTests(unittest.TestCase):
             home.mkdir()
             out = pathlib.Path(temp) / "out"
             out.mkdir()
+            # 이전 성공 실행이 남긴 이미지는 실패 때 지워져야 한다(낡은 스냅샷을 새것으로 오인하지 않게).
+            for stale in ("live.png", "live-claude.png", "live-burn.png"):
+                (out / stale).write_bytes(b"stale")
+            keep = out / "unrelated.txt"
+            keep.write_text("keep")
             env = isolated_env(str(home))
             env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = "0"
             result = subprocess.run([str(BINARY), "--live-snapshot", str(out / "live.png")], cwd=str(home),
                                     capture_output=True, text=True, timeout=120, env=env)
             self.assertEqual(3, result.returncode, result.stdout[-2000:] + result.stderr[-2000:])
             self.assertIn("still loading=", result.stdout)
-            self.assertEqual([], sorted(path.name for path in out.iterdir()))
+            self.assertEqual(["unrelated.txt"], sorted(path.name for path in out.iterdir()))
 
 
 if __name__ == "__main__":
