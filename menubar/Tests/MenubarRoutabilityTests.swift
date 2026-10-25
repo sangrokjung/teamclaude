@@ -17,6 +17,7 @@ struct MenubarRoutabilityTests {
         let now = Date()
         testAvailabilityTrustsProxy(now: now)
         testConsumersAgree(now: now)
+        testCommitPathWithoutFable(now: now)
         testPanelHeight(now: now)
         testGrokLane(now: now)
         testBurnLine(now: now)
@@ -155,6 +156,51 @@ struct MenubarRoutabilityTests {
         let graceReason = single(account("grace-en", usable: true, session: 0.98, weekly: 0.76, now: now), now: now).reason
         precondition(graceReason.range(of: "[가-힣]", options: .regularExpression) == nil, graceReason)
         L10n.language = .ko
+    }
+
+    // MARK: 1. 실제 앱 경로(커밋 병합) — --live-snapshot이 찾았다
+
+    /// 앱은 파서 결과를 그대로 쓰지 않고 commitTeamClaudeHealth → teamClaudeHealthMergingQuota를 지난다.
+    /// 프록시는 재시작 후 Fable(7d_oi) 창을 복원하지 않으므로 Fable이 모두 비어 있을 수 있다. 그때 병합이
+    /// fableMeasurementCurrent를 끄면서 세션·주간 라우팅 판정까지 "최신 한도 측정 필요"로 떨어져 0/20이 됐다
+    /// (실사용 QA 2026-10-25: 프록시 usable 2, 패널 0). 픽스처 경로(파서 직접)는 이 병합을 지나지 않아 가려졌다.
+    static func testCommitPathWithoutFable(now: Date) {
+        var rows = [account("acct-01", usable: true, session: 0.1, weekly: 0.79, fable: nil, inflight: 3, capacity: 3, now: now)]
+        for index in 2...16 {
+            rows.append(account(String(format: "acct-%02d", index), usable: false, session: 0, weekly: 1.0, fable: nil, now: now))
+        }
+        rows.append(account("acct-17", usable: true, session: 0.1, weekly: 0.79, fable: nil, inflight: 3, capacity: 3, now: now))
+        for index in 18...20 {
+            rows.append(account(String(format: "acct-%02d", index), usable: false, session: 0, weekly: 1.0, fable: nil, now: now))
+        }
+        let committed = teamClaudeHealthMergingQuota(candidate: health(rows, now: now), previous: nil)
+        precondition(committed.routableCount == 2, "commit path routable \(committed.routableCount) (proxy usable 2)")
+        let routing = committed.routingAvailability(now: now)
+        precondition(routing[0].state == .ready && routing[0].busy == TeamClaudeConcurrencyLoad(inflight: 3, capacity: 3),
+                     "\(routing[0].state) \(routing[0].reason)")
+        precondition(routing[1].state == .limited, "\(routing[1].state) \(routing[1].reason)")
+        // Fable 레인은 Fable이 비어 있으니 확인 필요다(그 의미는 지킨다).
+        precondition(committed.fableAvailability(now: now)[0].state == .unconfirmed)
+        let model = makeOverviewModel(DashboardOverviewInput(
+            teamClaude: committed, teamCodex: nil, grok: GrokCardModel(headline: "Grok 21%", detail: nil),
+            agy: AgyCardModel(message: nil, groups: []),
+            burn: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
+            notices: DashboardToolNotices(), now: now))
+        precondition(model.routable == 2 && model.readyCount == 2 && model.waitCount == 18,
+                     "overview \(model.routable) ready \(model.readyCount) wait \(model.waitCount)")
+        // Claude 탭 묶음도 라우팅 판정이다: 프록시가 보내는 두 계정은 "사용 가능 · 라우팅 중"에 있다(Fable 측정 전은 열에서 보인다).
+        let groups = committed.routingAvailability(now: now).map(teamClaudeRowGroup)
+        precondition(groups.filter { $0 == .ready }.count == 2, "\(groups)")
+        precondition(committed.rowLines(now: now).count == 20)
+        let summaries = StatusMenuDashboardView.sectionSummaries(teamClaude: committed, codex: nil, teamCodex: nil, usage: nil,
+                                                                higgsfield: nil, notices: DashboardToolNotices(), staleNotes: [:])
+        precondition(summaries["claude"] == L10n.claudeSectionSummary(accounts: 20, usable: 2), summaries["claude"] ?? "nil")
+        // 표의 높이·묶음은 라우팅 판정으로 잰다(그리기와 같은 판정).
+        let table = TeamClaudeTableView(frame: NSRect(x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth,
+                                                      height: TeamClaudeTableView.contentHeight(committed, expanded: nil, now: now)))
+        table.health = committed
+        table.refreshTime(now: now)
+        precondition(table.accessibilityLabel()?.contains("라우팅 가능 2") == true, table.accessibilityLabel() ?? "nil")
     }
 
     // MARK: 2. 패널 높이
