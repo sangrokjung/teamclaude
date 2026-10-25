@@ -22,6 +22,8 @@ func installCrashRecorder() {
         }
         let data = Data(line.utf8)
         FileHandle.standardError.write(data)
+        // 읽기 전용(--live-snapshot)은 HOME에 아무것도 만들지 않는다. stderr로만 남긴다.
+        if MenubarRunMode.readOnly { return }
         let path = "\(NSHomeDirectory())/.claude/cache/cc-menubar-crash.log"
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile()
@@ -6828,6 +6830,11 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let unfinished = delegate.lanesStillLoading
     print("LIVE-SNAPSHOT-LOAD: \(Int(Date().timeIntervalSince(startedAt)))s"
           + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
+    // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 이미지를 쓰지 않고 3으로 끝낸다.
+    guard unfinished.isEmpty else {
+        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다\n", stderr)
+        exit(3)
+    }
     // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).
     let menu = NSMenu()
     delegate.menuWillOpen(menu)

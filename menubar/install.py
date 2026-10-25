@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import fcntl
 import os
 from pathlib import Path
 import platform
@@ -10,6 +11,8 @@ import tempfile
 import time
 
 LABEL = "com.qjc.cc-menubar"
+# 설치 전체(백업·bootout·교체·bootstrap·롤백)를 한 번에 하나만 돌게 하는 잠금 파일. 설치 폴더 안에 둔다.
+LOCK_NAME = ".install.lock"
 ROOT = Path(__file__).resolve().parent
 
 
@@ -50,6 +53,14 @@ def bootstrap(domain, service, plist, attempts=5, interval=0.5):
 
 
 def install(binary, directory, home=None):
+    """동시에 두 설치가 돌면 서로의 파일을 덮고 진 쪽이 이긴 쪽 결과를 롤백할 수 있다. 잠금을 쥔 채 설치한다."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / LOCK_NAME, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _install_locked(binary, directory, home)
+
+
+def _install_locked(binary, directory, home=None):
     home = Path.home() if home is None else home
     binary = binary.resolve(strict=True)
     if not binary.is_file() or not os.access(binary, os.X_OK):

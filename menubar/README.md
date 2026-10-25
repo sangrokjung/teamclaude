@@ -92,6 +92,7 @@ menubar/.build/cc-menubar --live-snapshot /tmp/live.png --tab claude --full-heig
 By default every tab is drawn at the height the menu actually opens with (tall tabs show their top; the rest scrolls).
 `--full-height` draws whole tab bodies, `--print-text` adds the drawn strings as `TEXT <tab>=` lines, and
 `CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT` (seconds, default 180) bounds the wait for slow lanes such as ccusage.
+If any lane is still loading when that limit passes, no image is written and the command exits with status 3.
 The images and text contain real account names. Keep them outside the repository and do not commit them.
 
 ## Install from a release

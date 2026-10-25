@@ -51,5 +51,16 @@ class LiveSnapshotWiringTests(unittest.TestCase):
             self.assertIn("--live-snapshot", text, readme)
 
 
+
+class CrashRecorderReadOnlyTests(unittest.TestCase):
+    def test_read_only_skips_crash_log_file(self):
+        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
+        start = main.index("func installCrashRecorder()")
+        body = main[start:main.index("\n}\n", start)]
+        self.assertIn("MenubarRunMode.readOnly", body)
+        self.assertLess(body.index("MenubarRunMode.readOnly"), body.index("cc-menubar-crash.log"),
+                        "read-only(--live-snapshot)에서는 크래시 기록 파일을 만들기 전에 빠져야 한다")
+
+
 if __name__ == "__main__":
     unittest.main()

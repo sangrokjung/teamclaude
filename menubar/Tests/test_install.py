@@ -108,6 +108,51 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((directory / "cc-menubar").read_bytes(), b"new-binary")
             self.assertTrue(state["loaded"])
 
+    def test_concurrent_install_waits_for_lock(self):
+        # 두 설치가 동시에 돌면 서로의 파일을 덮고, 진 쪽이 이긴 쪽 결과를 롤백할 수 있었다. 설치 전체를 잠근다.
+        import fcntl
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            directory = home / "apps"
+            directory.mkdir(parents=True)
+            (directory / "cc-menubar").write_bytes(b"old-binary")
+            plist = home / "Library/LaunchAgents/com.qjc.cc-menubar.plist"
+            plist.parent.mkdir(parents=True)
+            plist.write_bytes(plistlib.dumps({"Label": installer.LABEL}))
+            candidate = home / "candidate"
+            candidate.write_bytes(b"new-binary")
+            candidate.chmod(0o700)
+            loaded = {"value": False}
+
+            def launch(args, **kwargs):
+                if args[1] == "print":
+                    return subprocess.CompletedProcess(args, 0 if loaded["value"] else 113)
+                if args[1] == "bootout":
+                    loaded["value"] = False
+                if args[1] == "bootstrap":
+                    loaded["value"] = True
+                return subprocess.CompletedProcess(args, 0)
+
+            lock_path = directory / installer.LOCK_NAME
+            with open(lock_path, "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                done = threading.Event()
+
+                def run():
+                    with patch.object(installer.subprocess, "run", side_effect=launch), \
+                            patch.object(installer.time, "sleep", lambda _: None):
+                        installer.install(candidate, directory, home)
+                    done.set()
+
+                worker = threading.Thread(target=run)
+                worker.start()
+                self.assertFalse(done.wait(0.5), "다른 설치가 잠금을 쥔 동안 설치가 진행됐다")
+                self.assertEqual((directory / "cc-menubar").read_bytes(), b"old-binary")
+            worker.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual((directory / "cc-menubar").read_bytes(), b"new-binary")
+
     def test_no_desktop_launcher_or_dependency(self):
         main = (ROOT / "Sources/main.swift").read_text()
         self.assertNotIn("openCCVisualizer", main)

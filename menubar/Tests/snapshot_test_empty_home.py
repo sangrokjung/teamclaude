@@ -185,5 +185,26 @@ class LiveSnapshotReadOnlyTests(unittest.TestCase):
         self.assertEqual([], created, self.result.stdout[-2000:])
 
 
+
+class LiveSnapshotTimeoutTests(unittest.TestCase):
+    """로더가 시간 안에 끝나지 않으면 부분 데이터를 정상 스냅샷처럼 내놓지 않는다: 이미지를 쓰지 않고 3으로 끝난다."""
+
+    def test_unfinished_lanes_fail_without_images(self):
+        if not BINARY.exists():
+            self.skipTest(f"{BINARY} missing (EmptyHomeSnapshotTests builds it)")
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-timeout-") as temp:
+            home = pathlib.Path(temp) / "home"
+            home.mkdir()
+            out = pathlib.Path(temp) / "out"
+            out.mkdir()
+            env = isolated_env(str(home))
+            env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = "0"
+            result = subprocess.run([str(BINARY), "--live-snapshot", str(out / "live.png")], cwd=str(home),
+                                    capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(3, result.returncode, result.stdout[-2000:] + result.stderr[-2000:])
+            self.assertIn("still loading=", result.stdout)
+            self.assertEqual([], sorted(path.name for path in out.iterdir()))
+
+
 if __name__ == "__main__":
     unittest.main()
