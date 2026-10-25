@@ -297,7 +297,9 @@ class CliLaneHealthWiringTests(unittest.TestCase):
         grok = (SOURCES / "GrokUsage.swift").read_text()
         self.assertIn("case expired", grok)
         self.assertIn("candidates.isEmpty ? .login : .expired", grok)
-        self.assertIn("L10n.grokRefreshNeeded", self.main)
+        # 제목 슬롯과 카드는 grokPresentation 한 판정에서 나온다(실사용 QA 2026-10-25). 앱은 그 함수를 부른다.
+        self.assertIn("L10n.grokRefreshNeeded", grok)
+        self.assertIn("grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)", self.main)
         self.assertIn('t("Grok 갱신 필요", ', (SOURCES / "L10n.swift").read_text())
 
 
