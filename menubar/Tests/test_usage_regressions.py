@@ -60,7 +60,7 @@ class UsageRegressionTests(unittest.TestCase):
             return result.stdout
 
     def test_loader_separates_model_limits_and_rejects_old_cache(self):
-        output = self.run_swift(["CodexStatusModels.swift", "CodexStatusParsing.swift", "CodexStatusLoader.swift"],
+        output = self.run_swift(["CodexStatusModels.swift", "CodexStatusParsing.swift", "CodexStatusLoader.swift", "ReadOnlyMode.swift"],
                                 "CodexStatusLoaderTests.swift")
         self.assertIn("all usage regressions passed", output)
         self.assertIn("Legacy quota cache rejected", output)

@@ -13,6 +13,7 @@ class AccountSubscriptionTest(unittest.TestCase):
                 str(ROOT / 'menubar/Sources/AccountSubscription.swift'),
                 str(ROOT / 'menubar/Sources/AccountSubscriptionButton.swift'),
                 str(ROOT / 'menubar/Sources/L10n.swift'),
+                str(ROOT / 'menubar/Sources/ReadOnlyMode.swift'),
                 '-framework', 'Cocoa',
                 str(ROOT / 'menubar/Tests/AccountSubscriptionTests.swift'),
                 '-o', str(executable)], capture_output=True, text=True, timeout=600)
