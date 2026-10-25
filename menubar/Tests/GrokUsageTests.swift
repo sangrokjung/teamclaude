@@ -67,10 +67,10 @@ struct GrokUsageTests {
         if case .percent(let outcome) = grokMenuOutcome(billing: billing, statusCode: 200) {
             precondition(outcome.slot == "Grok 2%")
         } else { preconditionFailure("200 with billing must be a percent") }
-        // 이미 갱신 필요를 말하는 중에 일시 실패가 오면 갱신 필요를 지킨다(제목과 카드가 같이).
+        // 갱신 필요 뒤의 실패는 토큰이 아니라 네트워크·서버 쪽이다(401·403은 .expired로 온다). 제목과 카드가 함께 확인 필요가 된다.
         let afterRefresh = grokPresentation(.unavailable, previousSlot: refresh.slot, previousCard: refresh.card)
-        precondition(afterRefresh.slot == L10n.grokRefreshNeeded && afterRefresh.card == refresh.card,
-                     "a transient failure must not flip refresh-needed into needs-check")
+        precondition(afterRefresh.slot == L10n.grokNeedsCheck && afterRefresh.card.headline == afterRefresh.slot,
+                     "title and card move together")
         // 처음부터 실패면 확인 필요. 제목과 카드가 같은 말이다.
         let failed = grokPresentation(.unavailable, previousSlot: nil, previousCard: checking)
         precondition(failed.slot == L10n.grokNeedsCheck && failed.card.headline == L10n.grokNeedsCheck)

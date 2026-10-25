@@ -26,6 +26,8 @@ struct GrokCardModel: Equatable {
     var detail: String?
     /// 도구가 없을 때의 공통 안내(R1). 있으면 레인이 같은 문구를 그린다.
     var notice: ToolNotice? = nil
+    /// 개요 레인의 보조 한 줄(폭이 좁다). 없으면 detail을 쓴다.
+    var laneNote: String? = nil
 }
 
 enum GrokMenuOutcome: Equatable {
@@ -171,7 +173,8 @@ func grokPercentSlot(_ value: Double) -> String? {
     return "Grok \(formatted)%"
 }
 
-func grokFetchBilling(token: String, session: URLSession = URLSession(configuration: .ephemeral), completion: @escaping (Data?) -> Void) {
+func grokFetchBilling(token: String, session: URLSession = URLSession(configuration: .ephemeral),
+                      completion: @escaping (Data?, Int?) -> Void) {
     var request = URLRequest(url: grokBillingURL)
     request.timeoutInterval = 8
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -179,13 +182,45 @@ func grokFetchBilling(token: String, session: URLSession = URLSession(configurat
 
     let task = session.dataTask(with: request) { data, response, _ in
         defer { session.finishTasksAndInvalidate() }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            completion(nil)
-            return
-        }
-        completion(data)
+        let status = (response as? HTTPURLResponse)?.statusCode
+        completion(status == 200 ? data : nil, status)
     }
     task.resume()
+}
+
+/// 청구 API 응답 → 결과. 기한 안의 토큰을 서버가 401·403으로 거절하면 "확인 필요"가 아니라 갱신 필요다
+/// (grok을 한 번 부르면 토큰이 갱신된다). 그 밖의 실패는 확인 필요다.
+func grokMenuOutcome(billing: Data?, statusCode: Int?) -> GrokMenuOutcome {
+    if statusCode == 401 || statusCode == 403 { return .expired }
+    guard statusCode == 200, let billing,
+          let parts = grokBillingParts(fromBilling: billing),
+          let slot = grokPercentSlot(parts.headline) else {
+        return .unavailable
+    }
+    return .percent(GrokPercentOutcome(slot: slot, productPercent: parts.productPercent, creditPercent: parts.creditPercent))
+}
+
+/// 결과 → 제목 슬롯과 카드. 둘을 한 판정에서 만들어 제목과 패널이 다른 말을 하지 않게 한다
+/// (실사용 QA 2026-10-25: 제목은 "Grok 갱신 필요", 개요 레인은 보조 줄 없는 "확인 필요").
+/// 일시 실패(.unavailable)는 앞선 사용률만 지킨다(깜빡임 방지). 로그인·갱신 필요·확인 중 뒤의 실패는 확인 필요다 —
+/// 401·403은 이미 .expired로 왔으니, 여기 오는 실패는 토큰이 아니라 네트워크·서버 쪽이다.
+func grokPresentation(_ outcome: GrokMenuOutcome, previousSlot: String?, previousCard: GrokCardModel)
+    -> (slot: String?, card: GrokCardModel) {
+    switch outcome {
+    case .percent(let percent):
+        return (percent.slot, GrokCardModel(headline: percent.slot,
+                                            detail: grokCardDetail(product: percent.productPercent, credit: percent.creditPercent)))
+    case .expired:
+        return (L10n.grokRefreshNeeded, GrokCardModel(headline: L10n.grokRefreshNeeded, detail: L10n.grokRefreshDetail,
+                                                      laneNote: L10n.grokRefreshLaneNote))
+    case .login:
+        return (L10n.grokLogin, GrokCardModel(headline: L10n.grokLogin, detail: nil))
+    case .unavailable:
+        if let previousSlot, burnGrokPercent(previousSlot) != nil, previousCard.headline == previousSlot {
+            return (previousSlot, previousCard)
+        }
+        return (L10n.grokNeedsCheck, GrokCardModel(headline: L10n.grokNeedsCheck, detail: nil))
+    }
 }
 
 func fetchGrokMenuOutcome(now: Date = Date(), authURL: URL = grokAuthFileURL(), completion: @escaping (GrokMenuOutcome) -> Void) {
@@ -199,18 +234,8 @@ func fetchGrokMenuOutcome(now: Date = Date(), authURL: URL = grokAuthFileURL(), 
     case .expired:
         completion(.expired)
     case .usable(let token):
-        grokFetchBilling(token: token) { billing in
-            guard let billing,
-                  let parts = grokBillingParts(fromBilling: billing),
-                  let slot = grokPercentSlot(parts.headline) else {
-                completion(.unavailable)
-                return
-            }
-            completion(.percent(GrokPercentOutcome(
-                slot: slot,
-                productPercent: parts.productPercent,
-                creditPercent: parts.creditPercent
-            )))
+        grokFetchBilling(token: token) { billing, status in
+            completion(grokMenuOutcome(billing: billing, statusCode: status))
         }
     }
 }

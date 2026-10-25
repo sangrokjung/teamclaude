@@ -5056,37 +5056,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isFetchingGrok = false
-                let slot: String
-                switch outcome {
-                case .percent(let outcome):
-                    self.grokLastSuccessAt = Date()
-                    self.currentGrokSlot = outcome.slot
-                    self.currentGrokCard = GrokCardModel(
-                        headline: outcome.slot,
-                        detail: grokCardDetail(product: outcome.productPercent, credit: outcome.creditPercent)
-                    )
-                    slot = outcome.slot
-                case .expired:
-                    self.currentGrokSlot = L10n.grokRefreshNeeded
-                    self.currentGrokCard = GrokCardModel(
-                        headline: L10n.grokRefreshNeeded,
-                        detail: L10n.grokRefreshDetail
-                    )
-                    slot = L10n.grokRefreshNeeded
-                case .login:
-                    self.currentGrokSlot = L10n.grokLogin
-                    self.currentGrokCard = GrokCardModel(headline: L10n.grokLogin, detail: nil)
-                    slot = L10n.grokLogin
-                case .unavailable:
-                    if self.currentGrokSlot == nil
-                        || self.currentGrokSlot == L10n.grokLogin
-                        || self.currentGrokSlot == L10n.grokRefreshNeeded
-                        || self.currentGrokSlot == L10n.grokChecking {
-                        self.currentGrokSlot = L10n.grokNeedsCheck
-                        self.currentGrokCard = GrokCardModel(headline: L10n.grokNeedsCheck, detail: nil)
-                    }
-                    slot = self.currentGrokSlot ?? L10n.grokNeedsCheck
-                }
+                if case .percent = outcome { self.grokLastSuccessAt = Date() }
+                // 제목 슬롯과 카드는 한 판정(grokPresentation)에서 함께 나온다.
+                let presented = grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)
+                self.currentGrokSlot = presented.slot
+                self.currentGrokCard = presented.card
+                let slot = presented.slot ?? L10n.grokNeedsCheck
                 print("GROK-SLOT: \(slot)")
                 fflush(stdout)
                 self.updateTitle()

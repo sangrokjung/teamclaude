@@ -64,9 +64,27 @@ func burnProjectionLabel(_ projection: BurnProjection) -> String {
         guard let current = projection.current, let projected = projection.projected else {
             return StatusVocabulary.notMeasured
         }
-        let base = L10n.burnEstimate(burnPercent(current), burnPercent(projected))
-        return confidence == .low ? "\(base) · \(L10n.lowConfidence)" : base
+        // 신뢰 낮은 외삽이 100%를 넘으면 숫자(예: 423%)를 쓰지 않는다. 주기 초반의 작은 값을 경과율로 나눈 값이라
+        // 근거가 약하고, 큰 숫자가 실측처럼 읽힌다(실사용 QA 2026-10-25). 계산은 그대로 두고 말만 바꾼다.
+        guard confidence == .low else { return L10n.burnEstimate(burnPercent(current), burnPercent(projected)) }
+        let base = projected > 1 ? L10n.burnEstimateOver(burnPercent(current))
+            : L10n.burnEstimate(burnPercent(current), burnPercent(projected))
+        return "\(base) · \(L10n.lowConfidence)"
     }
+}
+
+/// 판정을 단정하지 않을 전망인가. 신뢰 낮은 외삽은 "달성"이 아니라 "달성 추정"이다.
+func burnVerdictIsTentative(_ projection: BurnProjection) -> Bool {
+    projection.basis == .extrapolation(confidence: .low)
+}
+
+/// 화면에 그릴 판정 문구와 색. 개요 미리보기·소진 탭 표·접근성이 같은 함수를 쓴다.
+/// 관측된 부족(.blocked)과 잴 수 없음(.unknown)은 추정이 아니므로 그대로 둔다.
+func burnVerdictDisplay(_ usage: LaneUsage) -> (label: String, color: NSColor) {
+    let verdict = burnVerdict(usage)
+    let tentative = burnVerdictIsTentative(burnBindingProjection(usage)) && verdict != .blocked && verdict != .unknown
+    guard tentative else { return (burnVerdictLabel(verdict), burnVerdictColor(verdict)) }
+    return (L10n.verdictTentative(burnVerdictLabel(verdict)), TeamClaudePalette.muted)
 }
 
 func burnVerdictLabel(_ verdict: BurnVerdict) -> String {
@@ -141,7 +159,7 @@ final class SubscriptionBurnView: NSView {
     private var accessibilityText: String {
         let lanes = model.usages.map { usage in
             L10n.burnLaneAccessibility(lane: burnLaneDisplayName(usage.lane), paid: usage.paidAccounts, contributing: usage.contributingAccounts)
-            + ", \(burnProjectionLabel(burnBindingProjection(usage))), \(burnVerdictLabel(burnVerdict(usage)))"
+            + ", \(burnProjectionLabel(burnBindingProjection(usage))), \(burnVerdictDisplay(usage).label)"
         }
         let collector = model.collectorNotice.map { [$0.headline] } ?? []
         return ([L10n.burnAccessibilityTitle] + lanes + model.recommendations + collector).joined(separator: "; ")
@@ -204,7 +222,7 @@ final class SubscriptionBurnView: NSView {
         }
         for (index, usage) in model.usages.enumerated() {
             if index > 0 { PanelDraw.hairline(x0, x0 + width, y) }
-            let verdict = burnVerdict(usage)
+            let verdict = burnVerdictDisplay(usage)
             PanelDraw.text(burnLaneDisplayName(usage.lane), x0, y + 10, TeamClaudePalette.bodyMediumFont, fg)
             // 돈 내는 수와 실제 기여하는 수가 다른 것이 이 화면의 핵심이라 붙여 둔다.
             let seats = usage.paidAccounts == usage.contributingAccounts
@@ -214,8 +232,7 @@ final class SubscriptionBurnView: NSView {
             PanelDraw.text(PanelDraw.clipped(burnAmountLabel(monthly, accounts: usage.paidAccounts, currency: model.currency), number,
                                              maxWidth: columnBurn - columnSpend - 8),
                            columnSpend, y + 10, number, monthly == nil ? fg3 : fg)
-            let verdictLabel = burnVerdictLabel(verdict)
-            let verdictLeft = PanelDraw.right(verdictLabel, x0 + width, y + 10, body, burnVerdictColor(verdict))
+            let verdictLeft = PanelDraw.right(verdict.label, x0 + width, y + 10, body, verdict.color)
             PanelDraw.text(PanelDraw.clipped(burnProjectionLabel(burnBindingProjection(usage)), number, maxWidth: verdictLeft - columnBurn - 10),
                            columnBurn, y + 10, number, fg)
             y += Self.rowHeight

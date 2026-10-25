@@ -189,7 +189,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         grokLane = OverviewLane(name: "Grok", value: "\(panelPercentNumber(percent))%", unit: "", note: L10n.usageRate, tab: .cli, quiet: false)
     } else {
         let value = input.grok.headline.hasPrefix("Grok ") ? String(input.grok.headline.dropFirst(5)) : input.grok.headline
-        grokLane = OverviewLane(name: "Grok", value: value, unit: "", note: input.grok.detail ?? "", tab: .cli, quiet: true)
+        grokLane = OverviewLane(name: "Grok", value: value, unit: "", note: input.grok.laneNote ?? input.grok.detail ?? "", tab: .cli, quiet: true)
     }
     let agyLane: OverviewLane
     if let notice = input.agy.notice {
@@ -205,10 +205,10 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
 
     // 소진 미리보기: 레인별 전망과 판정(소진 탭의 표와 같은 문구).
     model.burnLines = input.burn.usages.map { usage in
-        let verdict = burnVerdict(usage)
+        let verdict = burnVerdictDisplay(usage)
         return OverviewBurnLine(lane: burnLaneDisplayName(usage.lane),
                                 projection: burnProjectionLabel(burnBindingProjection(usage)),
-                                verdict: burnVerdictLabel(verdict), verdictColor: burnVerdictColor(verdict))
+                                verdict: verdict.label, verdictColor: verdict.color)
     }
     if input.burn.usages.contains(where: {
         if case .extrapolation(let confidence) = burnBindingProjection($0).basis { return confidence == .low }
