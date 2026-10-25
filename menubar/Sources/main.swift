@@ -6196,68 +6196,37 @@ func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [Dash
     return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
 }
 
-/// 출력 경로의 부모 폴더를 심볼릭 링크까지 풀어 실제 경로로 바꾼다. 잠금·정리·게시가 같은 실제 이름을 본다.
-func liveSnapshotResolvedOutput(_ outputPath: String) -> String {
-    let url = URL(fileURLWithPath: outputPath).standardizedFileURL
-    let parent = url.deletingLastPathComponent().resolvingSymlinksInPath()
-    return parent.appendingPathComponent(url.lastPathComponent).path
-}
-
-/// 임시 폴더(staged)에 다 그린 이미지를 실제 이름으로 옮긴다. 파일마다 rename(같은 폴더라 원자적)이고, 도중에 실패하면
-/// 이미 옮긴 것까지 지워 반쪽 결과를 남기지 않는다. 성공하면 실제 경로 목록을 돌려준다.
-func publishLiveSnapshot(stagedOutput: String, resolvedOutput: String, tabs: [DashboardTab]) -> [String]? {
-    var published: [String] = []
-    for tab in tabs {
-        let from = dashboardTabOutputPath(stagedOutput, tab: tab, tabs: tabs)
-        let to = dashboardTabOutputPath(resolvedOutput, tab: tab, tabs: tabs)
-        if rename(from, to) != 0 {
-            fputs("LIVE-SNAPSHOT: 게시 실패 \(to): \(String(cString: strerror(errno)))\n", stderr)
-            for path in published { try? FileManager.default.removeItem(atPath: path) }
-            return nil
-        }
-        published.append(to)
+/// 탭 하나를 그려 path에 PNG로 쓴다. 실패하면 이유를 stderr에 남기고 nil(호출자가 정리·종료를 정한다).
+func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil)
+    -> (texts: [String], notices: [String: String])? {
+    DrawnTextRecorder.install()
+    view.selectTab(tab)
+    view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
+    view.layoutSubtreeIfNeeded()
+    ToolNoticeDrawLog.reset()
+    DrawnTextRecorder.reset()
+    guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+        fputs("DASHBOARD-TABS: bitmap 생성 실패 \(tab.id)\n", stderr)
+        return nil
     }
-    return published
-}
-
-/// 같은 출력 이름으로 도는 --live-snapshot 실행을 하나씩 돌게 하는 잠금. 한 실행의 실패 정리가 다른 실행의 성공 이미지를
-/// 지우지 않게 한다. 잠금 파일은 HOME 밖 임시 폴더에 출력 경로별로 둔다(읽기 전용 계약). 프로세스가 끝나면 풀린다.
-func liveSnapshotOutputLock(_ outputPath: String) -> Int32 {
-    let absolute = URL(fileURLWithPath: outputPath).standardizedFileURL.path
-    var hash: UInt64 = 14_695_981_039_346_656_037
-    for byte in absolute.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
-    let lockPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("cc-menubar-live-\(String(hash, radix: 16)).lock")
-    let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
-    guard fd >= 0, flock(fd, LOCK_EX) == 0 else {
-        fputs("LIVE-SNAPSHOT: 출력 잠금을 얻지 못했다 \(lockPath)\n", stderr)
-        exit(1)
+    view.cacheDisplay(in: view.bounds, to: rep)
+    DrawnTextRecorder.collectControlTitles(in: view)
+    guard let png = rep.representation(using: .png, properties: [:]),
+          (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
+        fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
+        return nil
     }
-    return fd
+    return (DrawnTextRecorder.strings, ToolNoticeDrawLog.drawn)
 }
 
+/// 픽스처 스냅샷용: 첫 탭은 outputPath 그대로, 나머지는 "-<탭>" 접미. 실패하면 1로 끝낸다.
 func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab], panelHeight: CGFloat? = nil)
     -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
-    DrawnTextRecorder.install()
     var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
     for tab in tabs {
-        view.selectTab(tab)
-        view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
-        view.layoutSubtreeIfNeeded()
-        ToolNoticeDrawLog.reset()
-        DrawnTextRecorder.reset()
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
-            fputs("DASHBOARD-TABS: bitmap 생성 실패 \(tab.id)\n", stderr)
-            exit(1)
-        }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        DrawnTextRecorder.collectControlTitles(in: view)
         let path = dashboardTabOutputPath(outputPath, tab: tab, tabs: tabs)
-        guard let png = rep.representation(using: .png, properties: [:]),
-              (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
-            fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
-            exit(1)
-        }
-        results.append((tab, path, DrawnTextRecorder.strings, ToolNoticeDrawLog.drawn))
+        guard let drawn = renderDashboardTab(view, tab: tab, path: path, panelHeight: panelHeight) else { exit(1) }
+        results.append((tab, path, drawn.texts, drawn.notices))
     }
     return results
 }
@@ -6842,16 +6811,19 @@ if let recoveryLayoutIndex = CommandLine.arguments.firstIndex(of: "--teamcodex-r
 // 실데이터 경로 스냅샷(실사용 QA 2026-10-25). 픽스처가 아니라 실행 중인 앱과 같은 AppDelegate 로더(refresh():
 // 프록시 status·TeamCodex·Codex 세션·ccusage·힉스필드·Grok·agy, 그 결과로 소진 전망)로 읽고, 메뉴를 여는 경로(menuWillOpen)로
 // 패널을 만든 뒤 탭마다 PNG를 쓰고 끝난다. 읽기 전용이다(MenubarRunMode.readOnly): 동작·재시작·자동 동기화·캐시/이력 쓰기 없음.
-// 실행: cc-menubar --live-snapshot <out.png> [--tab <id>] [--full-height] [--print-text]
+// 실행: cc-menubar --live-snapshot <아직 없는 폴더> [--tab <id>] [--full-height] [--print-text]
+//  - 출력은 새 폴더 하나다. 같은 부모 폴더의 숨은 임시 폴더에 탭마다 <탭>.png를 다 그린 뒤, 그 폴더를 한 번의 rename
+//    (RENAME_EXCL)으로 출력 이름에 올린다. 그래서 낡은 이미지·반쪽 결과·동시 실행 덮어쓰기·링크 우회가 생기지 않는다.
+//    출력이 이미 있거나(링크 포함) 부모 폴더가 없으면 2, 로더 시간 초과면 3(아무것도 만들지 않음), 그리기·게시 실패면 1.
 //  - 기본은 메뉴가 실제로 여는 패널 높이로 그린다(긴 탭은 위쪽만). --full-height면 탭 본문을 통째로 그린다.
 //  - 이미지와 --print-text 출력에는 실제 계정 이름이 들어간다. 저장소 밖에 두고 커밋하지 않는다.
 if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let arguments = CommandLine.arguments
     guard arguments.indices.contains(liveIndex + 1), !arguments[liveIndex + 1].hasPrefix("--") else {
-        fputs("LIVE-SNAPSHOT: usage --live-snapshot <out.png> [--tab <id>] [--full-height] [--print-text]\n", stderr)
+        fputs("LIVE-SNAPSHOT: usage --live-snapshot <new-dir> [--tab <id>] [--full-height] [--print-text]\n", stderr)
         exit(2)
     }
-    let outputPath = arguments[liveIndex + 1]
+    let outputDirectory = URL(fileURLWithPath: arguments[liveIndex + 1]).standardizedFileURL.path
     var tabs = DashboardTab.allCases
     if let tabIndex = arguments.firstIndex(of: "--tab") {
         guard arguments.indices.contains(tabIndex + 1),
@@ -6861,12 +6833,21 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         }
         tabs = [tab]
     }
+    // 출력은 아직 없는 이름이어야 한다(심볼릭 링크도 "있음"). 부모 폴더는 있어야 한다.
+    var existing = stat()
+    if lstat(outputDirectory, &existing) == 0 {
+        fputs("LIVE-SNAPSHOT: 출력이 이미 있다(새 폴더 이름을 주세요): \(outputDirectory)\n", stderr)
+        exit(2)
+    }
+    let parentDirectory = (outputDirectory as NSString).deletingLastPathComponent
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: parentDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
+        fputs("LIVE-SNAPSHOT: 부모 폴더가 없다: \(parentDirectory)\n", stderr)
+        exit(2)
+    }
     let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
     // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
     MenubarRunMode.readOnly = true
-    let resolvedOutput = liveSnapshotResolvedOutput(outputPath)
-    let outputLock = liveSnapshotOutputLock(resolvedOutput)
-    defer { close(outputLock) }
     _ = NSApplication.shared
     let delegate = AppDelegate()
     // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
@@ -6878,21 +6859,9 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let unfinished = delegate.lanesStillLoading
     print("LIVE-SNAPSHOT-LOAD: \(Int(Date().timeIntervalSince(startedAt)))s"
           + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
-    // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 이미지를 쓰지 않고 3으로 끝낸다.
+    // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 아무것도 만들지 않고 3으로 끝낸다.
     guard unfinished.isEmpty else {
-        // 같은 이름으로 앞서 성공한 이미지가 남으면 새것으로 오인된다. 이번 실행이 쓸 이름만 지우고(다른 탭 파일은 남긴다),
-        // 지우지 못한 것이 있으면 낡은 이미지가 남았다는 뜻이라 따로 4로 끝낸다.
-        var leftovers: [String] = []
-        for tab in tabs {
-            let path = dashboardTabOutputPath(resolvedOutput, tab: tab, tabs: tabs)
-            guard FileManager.default.fileExists(atPath: path) else { continue }
-            if (try? FileManager.default.removeItem(atPath: path)) == nil { leftovers.append(path) }
-        }
-        guard leftovers.isEmpty else {
-            fputs("LIVE-SNAPSHOT: 로더 시간 초과, 이전 이미지를 지우지 못했다: \(leftovers.joined(separator: ", "))\n", stderr)
-            exit(4)
-        }
-        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다(이번 실행 이름의 이전 이미지도 지웠다)\n", stderr)
+        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 만들지 않았다\n", stderr)
         exit(3)
     }
     // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).
@@ -6903,22 +6872,29 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let panelHeight = view.frame.height
-    // 같은 폴더의 숨은 임시 폴더에 다 그린 뒤 옮긴다. 렌더 도중 실패(exit 1)해도 실제 이름에는 반쪽 결과가 남지 않는다.
-    let parentDirectory = (resolvedOutput as NSString).deletingLastPathComponent
     var stagingTemplate = Array(((parentDirectory as NSString).appendingPathComponent(".cc-menubar-live-XXXXXX")).utf8CString)
     guard let stagingPointer = mkdtemp(&stagingTemplate) else {
         fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory)\n", stderr)
         exit(1)
     }
     let stagingDirectory = String(cString: stagingPointer)
-    let stagedOutput = (stagingDirectory as NSString).appendingPathComponent((resolvedOutput as NSString).lastPathComponent)
-    let staged = renderDashboardTabs(view, outputPath: stagedOutput, tabs: tabs,
-                                     panelHeight: arguments.contains("--full-height") ? nil : panelHeight)
-    let publishedPaths = publishLiveSnapshot(stagedOutput: stagedOutput, resolvedOutput: resolvedOutput, tabs: tabs)
-    try? FileManager.default.removeItem(atPath: stagingDirectory)
-    guard let publishedPaths else { exit(1) }
-    let results = zip(staged, publishedPaths).map { result, path in
-        (tab: result.tab, path: path, texts: result.texts, notices: result.notices)
+    func failAndClean(_ message: String) -> Never {
+        try? FileManager.default.removeItem(atPath: stagingDirectory)
+        fputs("LIVE-SNAPSHOT: \(message)\n", stderr)
+        exit(1)
+    }
+    var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
+    for tab in tabs {
+        let staged = (stagingDirectory as NSString).appendingPathComponent("\(tab.id).png")
+        guard let drawn = renderDashboardTab(view, tab: tab, path: staged,
+                                             panelHeight: arguments.contains("--full-height") ? nil : panelHeight) else {
+            failAndClean("\(tab.id) 탭을 그리지 못했다")
+        }
+        results.append((tab, (outputDirectory as NSString).appendingPathComponent("\(tab.id).png"), drawn.texts, drawn.notices))
+    }
+    // 폴더째 한 번에 올린다. 그사이 누가 같은 이름을 만들었으면 덮지 않고 실패한다.
+    guard renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL)) == 0 else {
+        failAndClean("게시 실패 \(outputDirectory): \(String(cString: strerror(errno)))")
     }
     for result in results {
         print("TAB \(result.tab.id)=\(result.path) document=\(Int(view.snapshotDocumentHeight(result.tab)))")
@@ -6937,7 +6913,7 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
                   + " reason=\(state.reason)")
         }
     }
-    print("LIVE-SNAPSHOT: \(outputPath) panel=\(Int(view.bounds.width))x\(Int(panelHeight)) maxBody=\(Int(view.maxBodyHeight))")
+    print("LIVE-SNAPSHOT: \(outputDirectory) panel=\(Int(view.bounds.width))x\(Int(panelHeight)) maxBody=\(Int(view.maxBodyHeight))")
     exit(0)
 }
 

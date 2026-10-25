@@ -152,7 +152,7 @@ class EmptyHomeSnapshotTests(unittest.TestCase):
 
 
 class LiveSnapshotReadOnlyTests(unittest.TestCase):
-    """--live-snapshot(실데이터 경로 스냅샷)은 실행 중인 앱과 같은 로더로 읽고 탭 다섯 장을 쓴 뒤 끝난다.
+    """--live-snapshot <새 폴더>는 실행 중인 앱과 같은 로더로 읽고, 그 폴더를 새로 만들어 탭 다섯 장을 넣은 뒤 끝난다.
     빈 HOME(도구 없음, 프록시 포트 닫힘)에서도 멈추지 않고, 출력 폴더 밖에는 아무 파일도 만들지 않는다(읽기 전용)."""
 
     @classmethod
@@ -162,22 +162,23 @@ class LiveSnapshotReadOnlyTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="cc-menubar-live-home-")
         cls.home = pathlib.Path(cls.tmp.name) / "home"
         cls.home.mkdir()
-        cls.out = pathlib.Path(cls.tmp.name) / "out"
-        cls.out.mkdir()
-        cls.result = subprocess.run([str(BINARY), "--live-snapshot", str(cls.out / "live.png")], cwd=str(cls.home),
+        cls.parent = pathlib.Path(cls.tmp.name) / "parent"
+        cls.parent.mkdir()
+        cls.out = cls.parent / "snap"
+        cls.result = subprocess.run([str(BINARY), "--live-snapshot", str(cls.out)], cwd=str(cls.home),
                                     capture_output=True, text=True, timeout=240, env=isolated_env(str(cls.home)))
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_writes_five_tabs_and_exits(self):
+    def test_writes_five_tabs_into_new_folder(self):
         self.assertEqual(0, self.result.returncode, self.result.stdout[-2000:] + self.result.stderr[-2000:])
         names = sorted(path.name for path in self.out.iterdir())
-        self.assertEqual(["live-burn.png", "live-claude.png", "live-cli.png", "live-codex.png", "live.png"], names)
-        self.assertIn("LIVE-SNAPSHOT-LOAD:", self.result.stdout)
+        self.assertEqual(["burn.png", "claude.png", "cli.png", "codex.png", "overview.png"], names)
+        # 임시 폴더는 게시(이름 바꾸기) 뒤 남지 않는다.
+        self.assertEqual(["snap"], sorted(path.name for path in self.parent.iterdir()))
         self.assertIn("all lanes loaded", self.result.stdout)
-        self.assertIn("LIVE-SNAPSHOT: ", self.result.stdout)
 
     def test_read_only_home(self):
         # 읽기 전용: HOME 아래에 쿼터 이력·캐시·로그·설정·UserDefaults 파일을 하나도 만들지 않는다.
@@ -185,70 +186,50 @@ class LiveSnapshotReadOnlyTests(unittest.TestCase):
         self.assertEqual([], created, self.result.stdout[-2000:])
 
 
-
-class LiveSnapshotTimeoutTests(unittest.TestCase):
-    """로더가 시간 안에 끝나지 않으면 부분 데이터를 정상 스냅샷처럼 내놓지 않는다: 이미지를 쓰지 않고 3으로 끝난다."""
-
-    def test_unfinished_lanes_fail_without_images(self):
-        if not BINARY.exists():
-            self.skipTest(f"{BINARY} missing (EmptyHomeSnapshotTests builds it)")
-        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-timeout-") as temp:
-            home = pathlib.Path(temp) / "home"
-            home.mkdir()
-            out = pathlib.Path(temp) / "out"
-            out.mkdir()
-            # 이전 성공 실행이 남긴 이미지는 실패 때 지워져야 한다(낡은 스냅샷을 새것으로 오인하지 않게).
-            for stale in ("live.png", "live-claude.png", "live-burn.png"):
-                (out / stale).write_bytes(b"stale")
-            keep = out / "unrelated.txt"
-            keep.write_text("keep")
-            env = isolated_env(str(home))
-            env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = "0"
-            result = subprocess.run([str(BINARY), "--live-snapshot", str(out / "live.png")], cwd=str(home),
-                                    capture_output=True, text=True, timeout=120, env=env)
-            self.assertEqual(3, result.returncode, result.stdout[-2000:] + result.stderr[-2000:])
-            self.assertIn("still loading=", result.stdout)
-            self.assertEqual(["unrelated.txt"], sorted(path.name for path in out.iterdir()))
-
-
-class LiveSnapshotCleanupScopeTests(unittest.TestCase):
-    """실패 정리는 이번 실행이 쓸 이름만 지우고, 지우지 못하면 4로 끝난다."""
-
-    def run_timeout(self, out, *extra):
-        home = out.parent / "home"
-        home.mkdir(exist_ok=True)
-        env = isolated_env(str(home))
-        env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = "0"
-        return subprocess.run([str(BINARY), "--live-snapshot", str(out / "live.png"), *extra], cwd=str(home),
-                              capture_output=True, text=True, timeout=120, env=env)
+class LiveSnapshotContractTests(unittest.TestCase):
+    """출력은 아직 없는 새 폴더여야 하고, 실패하면 그 폴더도 임시 폴더도 남지 않는다."""
 
     def setUp(self):
         if not BINARY.exists():
             self.skipTest(f"{BINARY} missing (EmptyHomeSnapshotTests builds it)")
 
-    def test_single_tab_failure_keeps_other_tab_files(self):
-        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-scope-") as temp:
-            out = pathlib.Path(temp) / "out"
-            out.mkdir()
-            for name in ("live.png", "live-claude.png", "live-burn.png"):
-                (out / name).write_bytes(b"stale")
-            result = self.run_timeout(out, "--tab", "claude")
-            self.assertEqual(3, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
-            # --tab claude가 쓰는 이름은 live.png 하나다. 다른 탭 파일은 이 실행의 것이 아니므로 남긴다.
-            self.assertEqual(["live-burn.png", "live-claude.png"], sorted(p.name for p in out.iterdir()))
+    def run_live(self, temp, out, timeout=None):
+        home = pathlib.Path(temp) / "home"
+        home.mkdir(exist_ok=True)
+        env = isolated_env(str(home))
+        if timeout is not None:
+            env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = timeout
+        return subprocess.run([str(BINARY), "--live-snapshot", str(out)], cwd=str(home),
+                              capture_output=True, text=True, timeout=120, env=env)
 
-    def test_failed_delete_exits_4(self):
-        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-nodelete-") as temp:
-            out = pathlib.Path(temp) / "out"
+    def test_existing_output_is_refused_untouched(self):
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-exists-") as temp:
+            out = pathlib.Path(temp) / "snap"
             out.mkdir()
-            (out / "live.png").write_bytes(b"stale")
-            out.chmod(0o555)
-            try:
-                result = self.run_timeout(out, "--tab", "overview")
-            finally:
-                out.chmod(0o755)
-            self.assertEqual(4, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
-            self.assertIn("지우지 못했다", result.stderr)
+            (out / "overview.png").write_bytes(b"earlier")
+            result = self.run_live(temp, out)
+            self.assertEqual(2, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
+            self.assertEqual(b"earlier", (out / "overview.png").read_bytes())
+
+    def test_symlink_output_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-link-") as temp:
+            real = pathlib.Path(temp) / "real"
+            real.mkdir()
+            link = pathlib.Path(temp) / "link"
+            link.symlink_to(real)
+            result = self.run_live(temp, link)
+            self.assertEqual(2, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
+            self.assertEqual([], list(real.iterdir()))
+
+    def test_timeout_leaves_nothing(self):
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-timeout-") as temp:
+            parent = pathlib.Path(temp) / "parent"
+            parent.mkdir()
+            out = parent / "snap"
+            result = self.run_live(temp, out, timeout="0")
+            self.assertEqual(3, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
+            self.assertIn("still loading=", result.stdout)
+            self.assertEqual([], list(parent.iterdir()))
 
 
 if __name__ == "__main__":

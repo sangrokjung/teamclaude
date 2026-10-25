@@ -61,31 +61,15 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         self.assertLess(body.index("MenubarRunMode.readOnly"), body.index("cc-menubar-crash.log"),
                         "read-only(--live-snapshot)에서는 크래시 기록 파일을 만들기 전에 빠져야 한다")
 
-    def test_same_output_runs_are_serialized(self):
+    def test_publishes_whole_folder_once_without_overwrite(self):
+        # 새 폴더 계약: 임시 폴더에 다 그린 뒤 RENAME_EXCL로 한 번에 올린다(덮어쓰기·반쪽 게시 없음).
         main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
         block = main[start:main.index("exit(0)", start)]
-        self.assertIn("liveSnapshotOutputLock(", block)
-        self.assertLess(block.index("liveSnapshotOutputLock("), block.index("delegate.refresh()"),
-                        "같은 출력 이름의 실행은 갱신 전부터 렌더·정리 끝까지 잠금을 쥐어야 한다")
-
-    def test_renders_into_staging_then_publishes(self):
-        # 렌더 중간에 실패해도 이번 실행 이름에 반쯤 그린 결과가 남지 않게, 임시 폴더에 다 그린 뒤 옮긴다.
-        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
-        start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
-        block = main[start:main.index("exit(0)", start)]
-        self.assertIn("renderDashboardTabs(view, outputPath: stagedOutput", block)
-        self.assertIn("publishLiveSnapshot(", block)
-
-    def test_lock_and_names_use_resolved_path(self):
-        # 심볼릭 링크로 같은 폴더를 다른 이름으로 가리켜도 같은 잠금을 얻어야 한다.
-        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
-        start = main.index("func liveSnapshotResolvedOutput(")
-        body = main[start:main.index("\n}\n", start)]
-        self.assertIn("resolvingSymlinksInPath", body)
-        block_start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
-        block = main[block_start:main.index("exit(0)", block_start)]
-        self.assertIn("liveSnapshotOutputLock(resolvedOutput)", block)
+        self.assertIn("lstat(outputDirectory", block)
+        self.assertIn("mkdtemp(", block)
+        self.assertIn("renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL))", block)
+        self.assertLess(block.index("renderDashboardTab(view"), block.index("renamex_np("))
 
     def test_read_only_is_set_before_appkit_init(self):
         main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
