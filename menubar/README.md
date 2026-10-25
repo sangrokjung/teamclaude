@@ -79,22 +79,6 @@ menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png 
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
-A fixture can hide what the real data path does. To check the panel against this Mac's real data, use the live snapshot.
-It runs the same loaders the running app uses (proxy status, TeamCodex pool, Codex sessions, ccusage, Higgsfield, Grok,
-agy, and the burn outlook built from them), builds the panel through the same menu-open path, writes one PNG per tab and
-exits. It is read-only: no actions, no proxy sync or restart, no plan-profile lookups, and no quota-history or cache writes.
-
-```sh
-menubar/.build/cc-menubar --live-snapshot /tmp/menubar-live                # new folder with overview.png … cli.png
-menubar/.build/cc-menubar --live-snapshot /tmp/menubar-live-2 --tab claude --full-height
-```
-
-By default every tab is drawn at the height the menu actually opens with (tall tabs show their top; the rest scrolls).
-`--full-height` draws whole tab bodies, `--print-text` adds the drawn strings as `TEXT <tab>=` lines, and
-`CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT` (seconds, default 180) bounds the wait for slow lanes such as ccusage.
-The output must be a folder that does not exist yet: the tabs are drawn into a hidden sibling folder and published with one rename, so a run never leaves stale or partial images. Exit status 2 means the output already exists (symlinks included) or its parent is missing, 3 means a lane was still loading when the limit passed (nothing is created), 1 means drawing or publishing failed.
-The images and text contain real account names. Keep them outside the repository and do not commit them.
-
 ## Install from a release
 
 Download from GitHub Releases. macOS 13 or later, universal (Apple Silicon and Intel).

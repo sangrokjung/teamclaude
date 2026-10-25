@@ -22,8 +22,6 @@ func installCrashRecorder() {
         }
         let data = Data(line.utf8)
         FileHandle.standardError.write(data)
-        // 읽기 전용(--live-snapshot)은 HOME에 아무것도 만들지 않는다. stderr로만 남긴다.
-        if MenubarRunMode.readOnly { return }
         let path = "\(NSHomeDirectory())/.claude/cache/cc-menubar-crash.log"
         if let handle = FileHandle(forWritingAtPath: path) {
             handle.seekToEndOfFile()
@@ -4381,8 +4379,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : quotaCycleBoundary(previous: previous, current: observation, now: now)
         if let closed {
             quotaHistory = quotaHistoryTrimmed(quotaHistory + [closed], keepPerLane: 256)
-            // 읽기 전용 실행(--live-snapshot)은 이력 파일을 쓰지 않는다.
-            if !MenubarRunMode.readOnly, let data = quotaHistoryEncode(quotaHistory) {
+            if let data = quotaHistoryEncode(quotaHistory) {
                 try? FileManager.default.createDirectory(
                     at: quotaHistoryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? data.write(to: quotaHistoryURL, options: [.atomic])
@@ -4886,19 +4883,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadAgyUsageInBackground(force: true)
     }
 
-    /// 아직 도는 로더 이름. 읽기 전용 스냅샷(--live-snapshot)이 refresh() 뒤 이 목록이 빌 때까지 기다린다.
-    var lanesStillLoading: [String] {
-        var lanes: [String] = []
-        if isRefreshingTeamClaude { lanes.append("teamclaude") }
-        if isRefreshingTeamCodex { lanes.append("teamcodex") }
-        if isRefreshingCodex { lanes.append("codex") }
-        if isFetching || isFetchingUsageQuick { lanes.append("ccusage") }
-        if isFetchingHiggsfield { lanes.append("higgsfield") }
-        if isFetchingGrok { lanes.append("grok") }
-        if isFetchingAgy { lanes.append("agy") }
-        return lanes
-    }
-
     /// 힉스필드 크레딧 조회. CLI 왕복이라 느릴 수 있어 단일 실행만 허용하고 10분 간격으로 제한한다.
     /// 크레딧은 생성할 때만 움직여서 더 촘촘히 볼 이유가 없다.
     func loadHiggsfieldInBackground(force: Bool = false) {
@@ -5193,8 +5177,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             let outageDuration = outageStartedAt.map { max(0, observedAt - $0) } ?? 0
             var syncReason = forcedSyncReason
-            // 읽기 전용 실행은 프록시를 건드리지 않는다(재로딩·시작 없음). 판정만 그대로 그린다.
-            if syncReason == nil, !MenubarRunMode.readOnly,
+            if syncReason == nil,
                let recovery = teamClaudeRecoveryReason(
                    serverReachable: teamClaude.serverReachable,
                    configPresent: teamClaude.configPresent,
@@ -5225,7 +5208,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 자동 경로는 supervisor를 재시작하지 않는다(재시작은 진행 중 요청을 모두 끊는다).
             var syncAttempted = false
             var syncOutcome: TeamClaudeSyncOutcome?
-            if let syncReason, !MenubarRunMode.readOnly, forcedSyncReason != nil || autoSyncAllowed {
+            if let syncReason, forcedSyncReason != nil || autoSyncAllowed {
                 syncAttempted = true
                 let result = syncTeamClaudeServerWithoutRestart(current: teamClaude)
                 teamClaude = result.health
@@ -6196,43 +6179,8 @@ func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [Dash
     return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
 }
 
-/// --live-snapshot 임시 폴더 정리용(신호 처리기에서 읽는다). C 문자열 포인터만 두고, 처리기는 unlink·rmdir만 부른다.
-/// 처리기는 보조 스레드가 생기기 전에 프로세스 전체로 걸고(installLiveSnapshotSignalHandlers), 폴더는 이름을 먼저 등록한
-/// 뒤에 만든다(registerLiveSnapshotStaging → mkdir). 그래서 어느 스레드가 언제 신호를 받아도 처리기가 지울 대상을 안다.
-var liveStagingCleanupPaths: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
-var liveStagingCleanupCount: Int = 0
-
-func installLiveSnapshotSignalHandlers() {
-    for signalNumber in [SIGTERM, SIGINT, SIGHUP] {
-        var action = sigaction()
-        action.__sigaction_u.__sa_handler = { received in
-            let count = liveStagingCleanupCount
-            if let paths = liveStagingCleanupPaths, count > 0 {
-                for index in 0..<(count - 1) { if let path = paths[index] { unlink(path) } }
-                if let directory = paths[count - 1] { rmdir(directory) }
-            }
-            signal(received, SIG_DFL)
-            raise(received)
-        }
-        sigemptyset(&action.sa_mask)
-        sigaction(signalNumber, &action, nil)
-    }
-}
-
-/// 임시 폴더와 그 안에 생길 파일 이름을 처리기에 등록한다(파일들, 마지막에 폴더). 개수는 포인터를 다 채운 뒤에 세운다.
-func registerLiveSnapshotStaging(directory: String, files: [String]) {
-    liveStagingCleanupCount = 0
-    let paths = files + [directory]
-    let buffer = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: paths.count)
-    for (index, path) in paths.enumerated() { buffer[index] = strdup(path) }
-    liveStagingCleanupPaths = buffer
-    liveStagingCleanupCount = paths.count
-}
-
-/// atomically: 기본은 숨은 임시 파일에 쓴 뒤 바꿔 넣는다. 이미 사적인 임시 폴더에 쓰는 --live-snapshot은 false로 직접 쓴다
-/// (폴더에 예정된 이름만 생겨야 신호 처리기가 폴더를 비울 수 있다).
-func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil,
-                        atomically: Bool = true) -> (texts: [String], notices: [String: String])? {
+func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil)
+    -> (texts: [String], notices: [String: String])? {
     DrawnTextRecorder.install()
     view.selectTab(tab)
     view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
@@ -6246,7 +6194,7 @@ func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path
     view.cacheDisplay(in: view.bounds, to: rep)
     DrawnTextRecorder.collectControlTitles(in: view)
     guard let png = rep.representation(using: .png, properties: [:]),
-          (try? png.write(to: URL(fileURLWithPath: path), options: atomically ? .atomic : [])) != nil else {
+          (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
         fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
         return nil
     }
@@ -6839,136 +6787,6 @@ if let recoveryLayoutIndex = CommandLine.arguments.firstIndex(of: "--teamcodex-r
             exit(1)
         }
     }
-    exit(0)
-}
-
-// 실데이터 경로 스냅샷(실사용 QA 2026-10-25). 픽스처가 아니라 실행 중인 앱과 같은 AppDelegate 로더(refresh():
-// 프록시 status·TeamCodex·Codex 세션·ccusage·힉스필드·Grok·agy, 그 결과로 소진 전망)로 읽고, 메뉴를 여는 경로(menuWillOpen)로
-// 패널을 만든 뒤 탭마다 PNG를 쓰고 끝난다. 읽기 전용이다(MenubarRunMode.readOnly): 동작·재시작·자동 동기화·캐시/이력 쓰기 없음.
-// 실행: cc-menubar --live-snapshot <아직 없는 폴더> [--tab <id>] [--full-height] [--print-text]
-//  - 출력은 새 폴더 하나다. 같은 부모 폴더의 숨은 임시 폴더에 탭마다 <탭>.png를 다 그린 뒤, 그 폴더를 한 번의 rename
-//    (RENAME_EXCL)으로 출력 이름에 올린다. 그래서 낡은 이미지·반쪽 결과·동시 실행 덮어쓰기·링크 우회가 생기지 않는다.
-//    출력이 이미 있거나(링크 포함) 부모 폴더가 없으면 2, 로더 시간 초과면 3(아무것도 만들지 않음), 그리기·게시 실패면 1.
-//  - 기본은 메뉴가 실제로 여는 패널 높이로 그린다(긴 탭은 위쪽만). --full-height면 탭 본문을 통째로 그린다.
-//  - 이미지와 --print-text 출력에는 실제 계정 이름이 들어간다. 저장소 밖에 두고 커밋하지 않는다.
-if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
-    let arguments = CommandLine.arguments
-    guard arguments.indices.contains(liveIndex + 1), !arguments[liveIndex + 1].hasPrefix("--") else {
-        fputs("LIVE-SNAPSHOT: usage --live-snapshot <new-dir> [--tab <id>] [--full-height] [--print-text]\n", stderr)
-        exit(2)
-    }
-    let outputDirectory = URL(fileURLWithPath: arguments[liveIndex + 1]).standardizedFileURL.path
-    var tabs = DashboardTab.allCases
-    if let tabIndex = arguments.firstIndex(of: "--tab") {
-        guard arguments.indices.contains(tabIndex + 1),
-              let tab = DashboardTab.allCases.first(where: { $0.id == arguments[tabIndex + 1] }) else {
-            fputs("LIVE-SNAPSHOT: --tab은 \(DashboardTab.allCases.map(\.id).joined(separator: "|")) 중 하나\n", stderr)
-            exit(2)
-        }
-        tabs = [tab]
-    }
-    // 출력은 아직 없는 이름이어야 한다(심볼릭 링크도 "있음"). 부모 폴더는 있어야 한다.
-    var existing = stat()
-    if lstat(outputDirectory, &existing) == 0 {
-        fputs("LIVE-SNAPSHOT: 출력이 이미 있다(새 폴더 이름을 주세요): \(outputDirectory)\n", stderr)
-        exit(2)
-    }
-    let parentDirectory = (outputDirectory as NSString).deletingLastPathComponent
-    var isDirectory: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: parentDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
-        fputs("LIVE-SNAPSHOT: 부모 폴더가 없다: \(parentDirectory)\n", stderr)
-        exit(2)
-    }
-    let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
-    // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
-    MenubarRunMode.readOnly = true
-    // 보조 스레드가 생기기 전에 정리 처리기를 프로세스 전체로 건다(등록된 임시 폴더가 없으면 아무것도 지우지 않는다).
-    installLiveSnapshotSignalHandlers()
-    _ = NSApplication.shared
-    let delegate = AppDelegate()
-    // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
-    delegate.refresh()
-    let startedAt = Date()
-    while !delegate.lanesStillLoading.isEmpty, Date().timeIntervalSince(startedAt) < timeout {
-        _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
-    }
-    let unfinished = delegate.lanesStillLoading
-    print("LIVE-SNAPSHOT-LOAD: \(Int(Date().timeIntervalSince(startedAt)))s"
-          + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
-    // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 아무것도 만들지 않고 3으로 끝낸다.
-    guard unfinished.isEmpty else {
-        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 만들지 않았다\n", stderr)
-        exit(3)
-    }
-    // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).
-    let menu = NSMenu()
-    delegate.menuWillOpen(menu)
-    guard let view = delegate.cachedDashboardView else {
-        fputs("LIVE-SNAPSHOT: 대시보드를 만들지 못했다\n", stderr)
-        exit(1)
-    }
-    let panelHeight = view.frame.height
-    // 임시 폴더 이름을 정해 처리기에 먼저 등록한 뒤 만든다. 이름에 이 프로세스 번호를 넣어, 살아 있는 다른 실행과는
-    // 이름이 겹칠 수 없다(등록한 이름은 이 실행만 쓴다). 그래도 이미 있으면 남의 것일 수 있으니 재시도하지 않고,
-    // 등록을 지운 뒤 실패로 끝낸다(지우기 전 신호가 와도 처리기는 비어 있는 폴더만 rmdir하고 파일은 이 실행 이름만 지운다).
-    let stagingDirectory = (parentDirectory as NSString).appendingPathComponent(
-        ".cc-menubar-live-\(getpid())-\(String(UInt64.random(in: 0...UInt64.max), radix: 16))")
-    registerLiveSnapshotStaging(directory: stagingDirectory,
-        files: tabs.map { (stagingDirectory as NSString).appendingPathComponent("\($0.id).png") })
-    guard mkdir(stagingDirectory, 0o700) == 0 else {
-        let reason = errno
-        liveStagingCleanupCount = 0
-        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(stagingDirectory): \(String(cString: strerror(reason)))\n", stderr)
-        exit(1)
-    }
-    func failAndClean(_ message: String, status: Int32 = 1) -> Never {
-        do {
-            try FileManager.default.removeItem(atPath: stagingDirectory)
-        } catch {
-            fputs("LIVE-SNAPSHOT: 임시 폴더를 지우지 못했다 \(stagingDirectory): \(error.localizedDescription)\n", stderr)
-        }
-        fputs("LIVE-SNAPSHOT: \(message)\n", stderr)
-        exit(status)
-    }
-    var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
-    for tab in tabs {
-        let staged = (stagingDirectory as NSString).appendingPathComponent("\(tab.id).png")
-        guard let drawn = renderDashboardTab(view, tab: tab, path: staged,
-                                             panelHeight: arguments.contains("--full-height") ? nil : panelHeight,
-                                             atomically: false) else {
-            failAndClean("\(tab.id) 탭을 그리지 못했다")
-        }
-        results.append((tab, (outputDirectory as NSString).appendingPathComponent("\(tab.id).png"), drawn.texts, drawn.notices))
-    }
-    // 폴더째 한 번에 올린다. 그사이 누가 같은 이름을 만들었으면 덮지 않고 실패한다.
-    guard renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL)) == 0 else {
-        let reason = errno
-        // 같은 새 이름으로 동시에 돈 다른 실행이 먼저 올렸다: 계약대로 '이미 있음'(2).
-        if reason == EEXIST || reason == ENOTEMPTY {
-            failAndClean("출력이 이미 있다(다른 실행이 먼저 만들었다): \(outputDirectory)", status: 2)
-        }
-        failAndClean("게시 실패 \(outputDirectory): \(String(cString: strerror(reason)))")
-    }
-    // 게시 뒤에는 임시 폴더가 없다. 신호 처리기가 지울 것도 없게 비운다.
-    liveStagingCleanupCount = 0
-    for result in results {
-        print("TAB \(result.tab.id)=\(result.path) document=\(Int(view.snapshotDocumentHeight(result.tab)))")
-    }
-    if arguments.contains("--print-text") { printDashboardTabTexts(results) }
-    print("TITLE-SLOTS \(delegate.displaySlots().joined(separator: " | "))")
-    // 패널 숫자와 프록시 판정을 나란히 낸다(계정 이름 없이 순번만). 큰 숫자 = routable, 프록시 = proxyUsable.
-    if let health = delegate.currentTeamClaude {
-        let routing = health.routingAvailability()
-        let proxyUsable = health.accounts.filter { $0.usableFromProxy == true }.count
-        print("LIVE-CLAUDE proxyUsable=\(proxyUsable) routable=\(health.routableCount) total=\(health.accounts.count) reachable=\(health.serverReachable)")
-        for (index, pair) in zip(health.accounts, routing).enumerated() {
-            let (row, state) = pair
-            print("LIVE-CLAUDE-ROW \(index + 1) proxyUsable=\(row.usableFromProxy.map(String.init) ?? "nil") state=\(state.state)"
-                  + " busy=\(state.busy.map { "\($0.inflight)/\($0.capacity)" } ?? "-") grace=\(state.graceWindows.joined(separator: "·"))"
-                  + " reason=\(state.reason)")
-        }
-    }
-    print("LIVE-SNAPSHOT: \(outputDirectory) panel=\(Int(view.bounds.width))x\(Int(panelHeight)) maxBody=\(Int(view.maxBodyHeight))")
     exit(0)
 }
 

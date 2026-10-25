@@ -158,7 +158,7 @@ struct MenubarRoutabilityTests {
         L10n.language = .ko
     }
 
-    // MARK: 1. 실제 앱 경로(커밋 병합) — --live-snapshot이 찾았다
+    // MARK: 1. 실제 앱 경로(커밋 병합) — 실제 맥에서 찾았다
 
     /// 앱은 파서 결과를 그대로 쓰지 않고 commitTeamClaudeHealth → teamClaudeHealthMergingQuota를 지난다.
     /// 프록시는 재시작 후 Fable(7d_oi) 창을 복원하지 않으므로 Fable이 모두 비어 있을 수 있다. 그때 병합이

@@ -302,8 +302,6 @@ final class AccountSubscriptionStore {
 
     func refreshProfile(provider: String, uuid: String?, completion: @escaping () -> Void) {
         precondition(Thread.isMainThread)
-        // 읽기 전용 실행은 저장된 기록만 그린다(네트워크 조회·시도 시각 기록 없음).
-        guard !MenubarRunMode.readOnly else { return }
         guard provider == "anthropic", let uuid, !uuid.isEmpty else { return }
         let key = key(provider: provider, uuid: uuid)
         if pending[key] != nil {

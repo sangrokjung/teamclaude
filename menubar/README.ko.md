@@ -76,20 +76,6 @@ menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png 
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
-픽스처로는 실제 데이터 경로의 결함이 가려질 수 있습니다. 이 맥의 실제 데이터로 패널을 확인하려면 실데이터 스냅샷을 씁니다.
-실행 중인 앱과 같은 로더(프록시 status, TeamCodex 풀, Codex 세션, ccusage, Higgsfield, Grok, agy, 그 값으로 만든 소진 전망)로 읽고,
-메뉴를 여는 것과 같은 경로로 패널을 만든 뒤 탭마다 PNG를 쓰고 끝납니다. 읽기 전용입니다. 동작을 실행하지 않고, 프록시 동기화·재시작,
-구독 프로필 조회, 쿼터 이력·캐시 쓰기를 하지 않습니다.
-
-```sh
-menubar/.build/cc-menubar --live-snapshot /tmp/menubar-live                # 새 폴더에 overview.png … cli.png
-menubar/.build/cc-menubar --live-snapshot /tmp/menubar-live-2 --tab claude --full-height
-```
-
-기본은 모든 탭을 메뉴가 실제로 여는 높이로 그립니다(긴 탭은 위쪽만 보이고 나머지는 스크롤 아래). `--full-height`는 탭 본문을 통째로,
-`--print-text`는 그려진 글자를 `TEXT <탭>=` 줄로 함께 냅니다. `CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT`(초, 기본 180)은 ccusage처럼 느린
-레인을 기다리는 상한입니다. 출력은 아직 없는 새 폴더여야 합니다. 같은 부모 폴더의 숨은 임시 폴더에 탭을 다 그린 뒤 이름 바꾸기 한 번으로 올리므로 낡은 이미지나 반쪽 결과가 남지 않습니다. 종료 코드 2는 출력이 이미 있거나(링크 포함) 부모 폴더가 없을 때, 3은 상한까지 끝나지 않은 레인이 있을 때(아무것도 만들지 않음), 1은 그리기·게시 실패입니다. 이미지와 글자에는 실제 계정 이름이 들어 있으니 저장소 밖에 두고 커밋하지 않습니다.
-
 ## 외부 사용자 설치
 
 GitHub Releases에서 받는 배포본입니다. macOS 13 이상, Apple Silicon·Intel 공용(유니버설)입니다.
