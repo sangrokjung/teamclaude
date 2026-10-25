@@ -6196,6 +6196,30 @@ func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [Dash
     return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
 }
 
+/// 출력 경로의 부모 폴더를 심볼릭 링크까지 풀어 실제 경로로 바꾼다. 잠금·정리·게시가 같은 실제 이름을 본다.
+func liveSnapshotResolvedOutput(_ outputPath: String) -> String {
+    let url = URL(fileURLWithPath: outputPath).standardizedFileURL
+    let parent = url.deletingLastPathComponent().resolvingSymlinksInPath()
+    return parent.appendingPathComponent(url.lastPathComponent).path
+}
+
+/// 임시 폴더(staged)에 다 그린 이미지를 실제 이름으로 옮긴다. 파일마다 rename(같은 폴더라 원자적)이고, 도중에 실패하면
+/// 이미 옮긴 것까지 지워 반쪽 결과를 남기지 않는다. 성공하면 실제 경로 목록을 돌려준다.
+func publishLiveSnapshot(stagedOutput: String, resolvedOutput: String, tabs: [DashboardTab]) -> [String]? {
+    var published: [String] = []
+    for tab in tabs {
+        let from = dashboardTabOutputPath(stagedOutput, tab: tab, tabs: tabs)
+        let to = dashboardTabOutputPath(resolvedOutput, tab: tab, tabs: tabs)
+        if rename(from, to) != 0 {
+            fputs("LIVE-SNAPSHOT: 게시 실패 \(to): \(String(cString: strerror(errno)))\n", stderr)
+            for path in published { try? FileManager.default.removeItem(atPath: path) }
+            return nil
+        }
+        published.append(to)
+    }
+    return published
+}
+
 /// 같은 출력 이름으로 도는 --live-snapshot 실행을 하나씩 돌게 하는 잠금. 한 실행의 실패 정리가 다른 실행의 성공 이미지를
 /// 지우지 않게 한다. 잠금 파일은 HOME 밖 임시 폴더에 출력 경로별로 둔다(읽기 전용 계약). 프로세스가 끝나면 풀린다.
 func liveSnapshotOutputLock(_ outputPath: String) -> Int32 {
@@ -6840,7 +6864,8 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
     // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
     MenubarRunMode.readOnly = true
-    let outputLock = liveSnapshotOutputLock(outputPath)
+    let resolvedOutput = liveSnapshotResolvedOutput(outputPath)
+    let outputLock = liveSnapshotOutputLock(resolvedOutput)
     defer { close(outputLock) }
     _ = NSApplication.shared
     let delegate = AppDelegate()
@@ -6859,7 +6884,7 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         // 지우지 못한 것이 있으면 낡은 이미지가 남았다는 뜻이라 따로 4로 끝낸다.
         var leftovers: [String] = []
         for tab in tabs {
-            let path = dashboardTabOutputPath(outputPath, tab: tab, tabs: tabs)
+            let path = dashboardTabOutputPath(resolvedOutput, tab: tab, tabs: tabs)
             guard FileManager.default.fileExists(atPath: path) else { continue }
             if (try? FileManager.default.removeItem(atPath: path)) == nil { leftovers.append(path) }
         }
@@ -6878,8 +6903,23 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let panelHeight = view.frame.height
-    let results = renderDashboardTabs(view, outputPath: outputPath, tabs: tabs,
-                                      panelHeight: arguments.contains("--full-height") ? nil : panelHeight)
+    // 같은 폴더의 숨은 임시 폴더에 다 그린 뒤 옮긴다. 렌더 도중 실패(exit 1)해도 실제 이름에는 반쪽 결과가 남지 않는다.
+    let parentDirectory = (resolvedOutput as NSString).deletingLastPathComponent
+    var stagingTemplate = Array(((parentDirectory as NSString).appendingPathComponent(".cc-menubar-live-XXXXXX")).utf8CString)
+    guard let stagingPointer = mkdtemp(&stagingTemplate) else {
+        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory)\n", stderr)
+        exit(1)
+    }
+    let stagingDirectory = String(cString: stagingPointer)
+    let stagedOutput = (stagingDirectory as NSString).appendingPathComponent((resolvedOutput as NSString).lastPathComponent)
+    let staged = renderDashboardTabs(view, outputPath: stagedOutput, tabs: tabs,
+                                     panelHeight: arguments.contains("--full-height") ? nil : panelHeight)
+    let publishedPaths = publishLiveSnapshot(stagedOutput: stagedOutput, resolvedOutput: resolvedOutput, tabs: tabs)
+    try? FileManager.default.removeItem(atPath: stagingDirectory)
+    guard let publishedPaths else { exit(1) }
+    let results = zip(staged, publishedPaths).map { result, path in
+        (tab: result.tab, path: path, texts: result.texts, notices: result.notices)
+    }
     for result in results {
         print("TAB \(result.tab.id)=\(result.path) document=\(Int(view.snapshotDocumentHeight(result.tab)))")
     }
