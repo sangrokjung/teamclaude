@@ -67,7 +67,7 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
         block = main[start:main.index("exit(0)", start)]
         self.assertIn("lstat(outputDirectory", block)
-        self.assertIn("mkdtemp(", block)
+        self.assertIn("mkdir(candidate, 0o700)", block)
         self.assertIn("renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL))", block)
         self.assertLess(block.index("renderDashboardTab(view"), block.index("renamex_np("))
 
@@ -75,20 +75,20 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
         block = main[start:main.index("exit(0)", start)]
-        # 강제 종료(TERM·INT·HUP) 때도 임시 폴더를 지운다. 신호 처리기 안에서는 unlink·rmdir만 쓴다.
-        self.assertIn("installLiveSnapshotStagingCleanup(", block)
-        self.assertLess(block.index("installLiveSnapshotStagingCleanup("), block.index("renderDashboardTab(view"))
-        helper = main[main.index("func installLiveSnapshotStagingCleanup("):]
+        # 처리기는 보조 스레드가 생기기 전(AppKit·갱신 전)에 프로세스 전체로 건다. 스레드별 sigprocmask에 기대지 않는다.
+        self.assertIn("installLiveSnapshotSignalHandlers()", block)
+        self.assertLess(block.index("installLiveSnapshotSignalHandlers()"), block.index("NSApplication.shared"))
+        self.assertNotIn("sigprocmask", block)
+        # 임시 폴더 이름을 먼저 처리기에 등록한 뒤 만든다(어느 순간 신호가 와도 처리기가 지울 대상을 안다).
+        self.assertLess(block.index("registerLiveSnapshotStaging("), block.index("mkdir(candidate"))
+        helper = main[main.index("func installLiveSnapshotSignalHandlers("):]
         helper = helper[:helper.index("\n}\n")]
         for signal_name in ("SIGTERM", "SIGINT", "SIGHUP"):
             self.assertIn(signal_name, helper)
-        self.assertIn("unlink(", main)
-        self.assertIn("rmdir(", main)
+        self.assertIn("unlink(", helper)
+        self.assertIn("rmdir(", helper)
         # 임시 폴더 안에는 예정된 이름만 생겨야 처리기가 폴더를 비울 수 있다(.atomic 쓰기는 숨은 임시 파일을 만든다).
         self.assertIn("atomically: false", block)
-        # mkdtemp와 처리기 설치 사이에는 신호를 막는다.
-        self.assertLess(block.index("sigprocmask(SIG_BLOCK"), block.index("mkdtemp("))
-        self.assertLess(block.index("installLiveSnapshotStagingCleanup("), block.index("sigprocmask(SIG_SETMASK"))
         # 동시에 같은 새 이름으로 돌아 진 쪽은 '이미 있음'(2)으로 끝난다.
         publish = block[block.index("renamex_np("):]
         self.assertIn("EEXIST", publish[:600])

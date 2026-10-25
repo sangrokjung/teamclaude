@@ -221,6 +221,25 @@ class LiveSnapshotContractTests(unittest.TestCase):
             self.assertEqual(2, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
             self.assertEqual([], list(real.iterdir()))
 
+    def test_terminate_leaves_no_staging(self):
+        # 실제 TERM을 여러 시점에 보내도 부모 폴더에 숨은 임시 폴더가 남지 않는다.
+        import signal
+        import time
+        for delay in (0.3, 1.0, 2.5):
+            with tempfile.TemporaryDirectory(prefix="cc-menubar-live-term-") as temp:
+                parent = pathlib.Path(temp) / "parent"
+                parent.mkdir()
+                home = pathlib.Path(temp) / "home"
+                home.mkdir()
+                process = subprocess.Popen([str(BINARY), "--live-snapshot", str(parent / "snap")], cwd=str(home),
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           env=isolated_env(str(home)))
+                time.sleep(delay)
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=60)
+                leftovers = [p.name for p in parent.iterdir() if p.name.startswith(".cc-menubar-live-")]
+                self.assertEqual([], leftovers, f"delay={delay} rc={process.returncode}")
+
     def test_timeout_leaves_nothing(self):
         with tempfile.TemporaryDirectory(prefix="cc-menubar-live-timeout-") as temp:
             parent = pathlib.Path(temp) / "parent"

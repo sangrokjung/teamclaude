@@ -6197,23 +6197,19 @@ func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [Dash
 }
 
 /// --live-snapshot 임시 폴더 정리용(신호 처리기에서 읽는다). C 문자열 포인터만 두고, 처리기는 unlink·rmdir만 부른다.
+/// 처리기는 보조 스레드가 생기기 전에 프로세스 전체로 걸고(installLiveSnapshotSignalHandlers), 폴더는 이름을 먼저 등록한
+/// 뒤에 만든다(registerLiveSnapshotStaging → mkdir). 그래서 어느 스레드가 언제 신호를 받아도 처리기가 지울 대상을 안다.
 var liveStagingCleanupPaths: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
 var liveStagingCleanupCount: Int = 0
 
-/// 강제 종료(TERM·INT·HUP)에도 임시 폴더가 남지 않게, 그 안에 생길 파일들과 폴더 자체를 지우는 처리기를 건다.
-/// files는 폴더 안에 쓸 수 있는 모든 이름이다(없는 파일의 unlink 실패는 무시된다). 마지막에 폴더를 rmdir한다.
-func installLiveSnapshotStagingCleanup(directory: String, files: [String]) {
-    let paths = files + [directory]
-    let buffer = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: paths.count)
-    for (index, path) in paths.enumerated() { buffer[index] = strdup(path) }
-    liveStagingCleanupPaths = buffer
-    liveStagingCleanupCount = paths.count
+func installLiveSnapshotSignalHandlers() {
     for signalNumber in [SIGTERM, SIGINT, SIGHUP] {
         var action = sigaction()
         action.__sigaction_u.__sa_handler = { received in
-            if let paths = liveStagingCleanupPaths, liveStagingCleanupCount > 0 {
-                for index in 0..<(liveStagingCleanupCount - 1) { if let path = paths[index] { unlink(path) } }
-                if let directory = paths[liveStagingCleanupCount - 1] { rmdir(directory) }
+            let count = liveStagingCleanupCount
+            if let paths = liveStagingCleanupPaths, count > 0 {
+                for index in 0..<(count - 1) { if let path = paths[index] { unlink(path) } }
+                if let directory = paths[count - 1] { rmdir(directory) }
             }
             signal(received, SIG_DFL)
             raise(received)
@@ -6223,7 +6219,16 @@ func installLiveSnapshotStagingCleanup(directory: String, files: [String]) {
     }
 }
 
-/// 탭 하나를 그려 path에 PNG로 쓴다. 실패하면 이유를 stderr에 남기고 nil(호출자가 정리·종료를 정한다).
+/// 임시 폴더와 그 안에 생길 파일 이름을 처리기에 등록한다(파일들, 마지막에 폴더). 개수는 포인터를 다 채운 뒤에 세운다.
+func registerLiveSnapshotStaging(directory: String, files: [String]) {
+    liveStagingCleanupCount = 0
+    let paths = files + [directory]
+    let buffer = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: paths.count)
+    for (index, path) in paths.enumerated() { buffer[index] = strdup(path) }
+    liveStagingCleanupPaths = buffer
+    liveStagingCleanupCount = paths.count
+}
+
 /// atomically: 기본은 숨은 임시 파일에 쓴 뒤 바꿔 넣는다. 이미 사적인 임시 폴더에 쓰는 --live-snapshot은 false로 직접 쓴다
 /// (폴더에 예정된 이름만 생겨야 신호 처리기가 폴더를 비울 수 있다).
 func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil,
@@ -6877,6 +6882,8 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
     // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
     MenubarRunMode.readOnly = true
+    // 보조 스레드가 생기기 전에 정리 처리기를 프로세스 전체로 건다(등록된 임시 폴더가 없으면 아무것도 지우지 않는다).
+    installLiveSnapshotSignalHandlers()
     _ = NSApplication.shared
     let delegate = AppDelegate()
     // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
@@ -6901,21 +6908,21 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let panelHeight = view.frame.height
-    // 임시 폴더를 만들고 정리 처리기를 거는 사이에 신호가 오면 폴더가 남는다. 그 짧은 구간은 신호를 막는다.
-    var blockedSignals = sigset_t()
-    sigemptyset(&blockedSignals)
-    for signalNumber in [SIGTERM, SIGINT, SIGHUP] { sigaddset(&blockedSignals, signalNumber) }
-    var previousSignals = sigset_t()
-    sigprocmask(SIG_BLOCK, &blockedSignals, &previousSignals)
-    var stagingTemplate = Array(((parentDirectory as NSString).appendingPathComponent(".cc-menubar-live-XXXXXX")).utf8CString)
-    guard let stagingPointer = mkdtemp(&stagingTemplate) else {
-        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory)\n", stderr)
+    // 임시 폴더 이름을 정해 처리기에 먼저 등록한 뒤 만든다. 같은 이름이 있으면 새 이름으로 다시 한다.
+    var stagingDirectory = ""
+    for _ in 0..<16 {
+        let candidate = (parentDirectory as NSString).appendingPathComponent(
+            ".cc-menubar-live-\(String(UInt64.random(in: 0...UInt64.max), radix: 16))")
+        registerLiveSnapshotStaging(directory: candidate,
+            files: tabs.map { (candidate as NSString).appendingPathComponent("\($0.id).png") })
+        if mkdir(candidate, 0o700) == 0 { stagingDirectory = candidate; break }
+        liveStagingCleanupCount = 0
+        guard errno == EEXIST else { break }
+    }
+    guard !stagingDirectory.isEmpty else {
+        fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory): \(String(cString: strerror(errno)))\n", stderr)
         exit(1)
     }
-    let stagingDirectory = String(cString: stagingPointer)
-    installLiveSnapshotStagingCleanup(directory: stagingDirectory,
-        files: tabs.map { (stagingDirectory as NSString).appendingPathComponent("\($0.id).png") })
-    sigprocmask(SIG_SETMASK, &previousSignals, nil)
     func failAndClean(_ message: String, status: Int32 = 1) -> Never {
         do {
             try FileManager.default.removeItem(atPath: stagingDirectory)
