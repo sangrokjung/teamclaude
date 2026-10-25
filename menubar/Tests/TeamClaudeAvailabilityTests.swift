@@ -40,8 +40,11 @@ struct TeamClaudeAvailabilityTests {
             checks += 1
         }
         expect(row(), .ready)
-        expect(row(weekly: 100, fable: 5), .limited)
-        expect(row(session: 98, weekly: 10, fable: 10), .limited)
+        // 프록시가 라우팅에서 뺀 계정의 창 한도는 대기다. usable=true면 프록시를 믿는다(유예 차선, 실사용 QA 2026-10-25).
+        expect(row(weekly: 100, fable: 5, proxy: false), .limited)
+        expect(row(session: 98, weekly: 10, fable: 10, proxy: false), .limited)
+        expect(row(weekly: 100, fable: 5), .ready)
+        expect(row(session: 98, weekly: 10, fable: 10), .ready)
         expect(row(fable: 98), .limited)
         expect(row(fable: 97.99), .ready)
         expect(row(fable: 90), .limited, threshold: 90)
@@ -94,7 +97,8 @@ struct TeamClaudeAvailabilityTests {
         }
         precondition(teamClaudeResetLabel(30, checkedAt: now, now: now.addingTimeInterval(20)) == "10s")
         precondition(teamClaudeResetLabel(30, checkedAt: now, now: now.addingTimeInterval(30)) == "재측정")
-        expect(row(inflight: 3), .limited)
+        // 동시 요청이 가득 찬 것은 대기가 아니라 바쁨이다(라우팅 가능으로 센다).
+        expect(row(inflight: 3), .ready)
         expect(row(inflight: 2), .ready)
         expect(row(), .excluded, details: subscription(.ended, date: "2026-09-01"))
         expect(row(reason: "subscription-ended"), .excluded)

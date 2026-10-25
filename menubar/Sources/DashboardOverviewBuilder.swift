@@ -36,7 +36,9 @@ func teamClaudeRowPresentation(_ row: TeamClaudeAccountHealth, _ state: TeamClau
     }
     switch state.state {
     case .ready:
-        return TeamClaudeRowPresentation(tone: .ready, label: L10n.stateReady, excluded: false, cap: nil)
+        // 동시 요청이 가득 차도 라우팅 중이다. 대기로 그리지 않고 "사용 중 3/3"이라고 말한다(같은 민트 톤, 라우팅 가능으로 센다).
+        let label = state.busy.map { L10n.stateBusy($0.inflight, $0.capacity) } ?? L10n.stateReady
+        return TeamClaudeRowPresentation(tone: .ready, label: label, excluded: false, cap: nil)
     case .limited:
         return TeamClaudeRowPresentation(tone: .wait, label: L10n.stateLimited, excluded: false, cap: nil)
     case .unconfirmed:
@@ -82,8 +84,11 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     var fableReady = 0
     var total = 0
     if let health = input.teamClaude, claudeNotice == nil {
+        // 띠·범례·기다리면 풀림·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
+        // 서로 다른 판정을 보면 한쪽만 고쳐도 어긋난다). Fable 레인 숫자만 Fable 창까지 보는 판정이다.
         let availability = health.fableAvailability(now: now)
         let opus = health.opusAvailability(now: now)
+        let routing = health.routingAvailability(now: now)
         total = max(health.accountTotal, health.accountConfigured, health.accounts.count)
         fableReady = availability.filter { $0.state == .ready }.count
         model.routable = opus.count
@@ -94,7 +99,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         var soonestSession: Double?
         var soonestWeekly: Double?
         var elapsedValues: [Double] = []
-        for (row, state) in zip(health.accounts, availability) {
+        for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
                                                              checkedAt: health.checkedAt, now: now)

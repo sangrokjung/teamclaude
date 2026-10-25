@@ -212,17 +212,23 @@ struct TeamClaudeHealth {
             return L10n.titleClaudeFable(fableAvailability().filter { $0.state == .ready }.count, total)
         }
         if !serverReachable && serverResponseDelayed { return L10n.titleClaudeSlow }
-        return teamClaudeTitleSlot(TeamClaudeHeadlineInput(
+        return teamClaudeTitleSlot(titleRoutingInput)
+    }
+
+    /// 제목 슬롯 판정 입력. "Claude 라우팅 N/M"의 N은 개요 큰 숫자와 같은 라우팅 판정(프록시 usable 포함)이다.
+    /// 예전엔 로컬 문턱 계산(accountUsable)이라 프록시가 유예 차선으로 보내는 계정을 0으로 셌다(실사용 QA 2026-10-25).
+    var titleRoutingInput: TeamClaudeHeadlineInput {
+        TeamClaudeHeadlineInput(
             serverReachable: serverReachable,
             accountConfigDrift: accountConfigDrift,
             measurementPendingCount: measurementPendingCount,
             quotaLimitedCount: quotaLimitedCount,
             fableKnown: fableKnown,
             fableOver: fableOver,
-            totalAccounts: total,
-            accountUsable: accountUsable,
+            totalAccounts: max(accountTotal, accountConfigured),
+            accountUsable: routableCount,
             accountActive: accountActive
-        ))
+        )
     }
 
     var statusLabel: String {
@@ -2063,7 +2069,7 @@ final class TeamClaudeTableView: NSView {
         let total = max(health.accountTotal, health.accountConfigured)
         let availability = health.fableAvailability(now: now)
         let ready = availability.filter { $0.state == .ready }.count
-        setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.accountUsable,
+        setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.routableCount,
                                                            drift: health.accountConfigDrift, pending: health.measurementPendingCount,
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
                                                            fableOver: health.fableOver, status: health.statusLabel))
@@ -2542,7 +2548,8 @@ final class TeamClaudeTableView: NSView {
                     PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: statusWidth), statusRight, y + 9, micro, issue == .quotaBlocked ? ember : fg3)
                 }
             } else {
-                let label = row.isCurrent && state.state == .ready ? L10n.stateInUse : presentation.label
+                // 동시 요청이 가득 찬 행은 "사용 중 3/3"(presentation)이 이긴다. 현재 계정의 "사용 중"보다 정보가 많다.
+                let label = row.isCurrent && state.state == .ready && state.busy == nil ? L10n.stateInUse : presentation.label
                 PanelDraw.right(PanelDraw.clipped(label, caption, maxWidth: statusWidth), statusRight, y + 8, caption,
                                 subscriptionMuted ? fg3 : presentation.tone.color)
             }
@@ -2857,8 +2864,8 @@ final class StatusMenuDashboardView: NSView {
     private static func naturalSectionSummaries(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData?) -> [String: String] {
         var out: [String: String] = [:]
         if let teamClaude {
-            // 개요와 같은 숫자: 전체 계정 수, Fable 기준 지금 요청을 받을 수 있는 계정 수.
-            let usable = teamClaude.fableAvailability(now: Date()).filter { $0.state == .ready }.count
+            // 개요 큰 숫자와 같은 숫자: 전체 계정 수, 지금 라우팅 가능한 계정 수(프록시 usable·동시 요청 가득 포함).
+            let usable = teamClaude.routableCount
             out["claude"] = L10n.claudeSectionSummary(accounts: teamClaude.accounts.count, usable: usable)
         }
         if let teamCodex {
