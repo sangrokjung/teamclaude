@@ -140,8 +140,8 @@ struct MenubarRoutabilityTests {
         precondition(model.waitingCaption != nil)
         // Fable 레인: 그 계정의 Fable 주간은 40% → 1
         precondition(model.lanes[0].value == "1", "fable lane \(model.lanes[0].value)")
-        // 메뉴바 제목 슬롯(평소 경로 = Fable)과 라우팅 슬롯 입력
-        precondition(pool.titleSlot == L10n.titleClaudeFable(1, 20), pool.titleSlot)
+        // 메뉴바 제목 슬롯: 평소 경로도 개요 큰 숫자와 같은 라우팅 수를 쓴다(Fable 문턱·미측정과 무관, 실사용 QA 2026-10-25)
+        precondition(pool.titleSlot == L10n.titleClaudeRouting(model.routable, 20), pool.titleSlot)
         precondition(pool.titleRoutingInput.accountUsable == 1, "title routing slot must count what the proxy routes")
         // Claude 탭 묶음·라벨·헤더 요약
         let tab = pool.fableAvailability(now: now)

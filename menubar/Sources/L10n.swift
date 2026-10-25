@@ -597,7 +597,6 @@ enum L10n {
 
     static func hostCores(_ cores: Int) -> String { t("\(cores)코어", "\(cores) cores") }
     static var hostPrefix: String { t("호스트  ", "Host  ") }
-    static func titleClaudeFable(_ ready: Int, _ total: Int) -> String { t("Claude Fable 사용 가능 \(ready)/\(total)", "Claude Fable \(ready)/\(total)") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }

@@ -208,8 +208,9 @@ struct TeamClaudeHealth {
 
     var titleSlot: String {
         let total = max(accountTotal, accountConfigured)
+        // 평소 경로도 개요 큰 숫자와 같은 라우팅 수(프록시 usable 포함)를 쓴다. Fable 주간 여유는 패널의 Fable 레인이 보여 준다.
         if serverReachable && accountConfigDrift == 0 {
-            return L10n.titleClaudeFable(fableAvailability().filter { $0.state == .ready }.count, total)
+            return L10n.titleClaudeRouting(routableCount, total)
         }
         if !serverReachable && serverResponseDelayed { return L10n.titleClaudeSlow }
         return teamClaudeTitleSlot(titleRoutingInput)
