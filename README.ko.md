@@ -123,9 +123,17 @@ BYOK 표면도, Codex 리셋 크레딧도, 계정 재인증도, 401 캐스케이
 
 ## 실시간 대시보드
 
-이 저장소는 프록시·터미널 TUI·macOS 네이티브 메뉴바를 함께 관리합니다.
-메뉴바를 클릭하면 계정과 사용량 대시보드가 열립니다. 별도 데스크톱 앱은 필요하지 않습니다.
+이 저장소는 프록시·터미널 TUI와 함께 macOS 네이티브 메뉴바 앱 **CC Menubar**를 관리합니다.
+메뉴바를 클릭하면 Claude·Codex 풀의 계정별 5시간·주간 사용량, 손봐야 할 계정, 주간 소진 전망,
+Grok·Antigravity·Higgsfield·ccusage 사용량이 한 패널에 열립니다. 쓰지 않는 도구는 "미설치"로 보입니다.
 소스와 설치 방법은 [menubar/README.ko.md](menubar/README.ko.md)를 참고하세요.
+
+**다운로드(베타):** [CC Menubar 0.1.0-beta.1](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.1) · Apple Silicon·Intel 유니버설 · macOS 13 이상
+
+<p align="center">
+  <img src="docs/assets/menubar-panel-ko.png" alt="CC Menubar 개요 탭: Claude 계정 17개 중 12개 라우팅 가능, 레인, 주간 사용량 띠, 손볼 것" width="49%">
+  <img src="docs/assets/menubar-panel-ko-claude.png" alt="CC Menubar Claude 탭: 상태별로 묶은 계정과 세션·주간·Fable 사용량 막대" width="49%">
+</p>
 
 ```bash
 npm run menubar:build
