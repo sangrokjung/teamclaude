@@ -84,6 +84,11 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
             self.assertIn(signal_name, helper)
         self.assertIn("unlink(", main)
         self.assertIn("rmdir(", main)
+        # 임시 폴더 안에는 예정된 이름만 생겨야 처리기가 폴더를 비울 수 있다(.atomic 쓰기는 숨은 임시 파일을 만든다).
+        self.assertIn("atomically: false", block)
+        # mkdtemp와 처리기 설치 사이에는 신호를 막는다.
+        self.assertLess(block.index("sigprocmask(SIG_BLOCK"), block.index("mkdtemp("))
+        self.assertLess(block.index("installLiveSnapshotStagingCleanup("), block.index("sigprocmask(SIG_SETMASK"))
         # 동시에 같은 새 이름으로 돌아 진 쪽은 '이미 있음'(2)으로 끝난다.
         publish = block[block.index("renamex_np("):]
         self.assertIn("EEXIST", publish[:600])

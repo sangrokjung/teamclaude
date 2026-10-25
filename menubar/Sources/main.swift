@@ -6224,8 +6224,10 @@ func installLiveSnapshotStagingCleanup(directory: String, files: [String]) {
 }
 
 /// 탭 하나를 그려 path에 PNG로 쓴다. 실패하면 이유를 stderr에 남기고 nil(호출자가 정리·종료를 정한다).
-func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil)
-    -> (texts: [String], notices: [String: String])? {
+/// atomically: 기본은 숨은 임시 파일에 쓴 뒤 바꿔 넣는다. 이미 사적인 임시 폴더에 쓰는 --live-snapshot은 false로 직접 쓴다
+/// (폴더에 예정된 이름만 생겨야 신호 처리기가 폴더를 비울 수 있다).
+func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil,
+                        atomically: Bool = true) -> (texts: [String], notices: [String: String])? {
     DrawnTextRecorder.install()
     view.selectTab(tab)
     view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
@@ -6239,7 +6241,7 @@ func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path
     view.cacheDisplay(in: view.bounds, to: rep)
     DrawnTextRecorder.collectControlTitles(in: view)
     guard let png = rep.representation(using: .png, properties: [:]),
-          (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
+          (try? png.write(to: URL(fileURLWithPath: path), options: atomically ? .atomic : [])) != nil else {
         fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
         return nil
     }
@@ -6899,6 +6901,12 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let panelHeight = view.frame.height
+    // 임시 폴더를 만들고 정리 처리기를 거는 사이에 신호가 오면 폴더가 남는다. 그 짧은 구간은 신호를 막는다.
+    var blockedSignals = sigset_t()
+    sigemptyset(&blockedSignals)
+    for signalNumber in [SIGTERM, SIGINT, SIGHUP] { sigaddset(&blockedSignals, signalNumber) }
+    var previousSignals = sigset_t()
+    sigprocmask(SIG_BLOCK, &blockedSignals, &previousSignals)
     var stagingTemplate = Array(((parentDirectory as NSString).appendingPathComponent(".cc-menubar-live-XXXXXX")).utf8CString)
     guard let stagingPointer = mkdtemp(&stagingTemplate) else {
         fputs("LIVE-SNAPSHOT: 임시 폴더를 만들지 못했다 \(parentDirectory)\n", stderr)
@@ -6907,6 +6915,7 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let stagingDirectory = String(cString: stagingPointer)
     installLiveSnapshotStagingCleanup(directory: stagingDirectory,
         files: tabs.map { (stagingDirectory as NSString).appendingPathComponent("\($0.id).png") })
+    sigprocmask(SIG_SETMASK, &previousSignals, nil)
     func failAndClean(_ message: String, status: Int32 = 1) -> Never {
         do {
             try FileManager.default.removeItem(atPath: stagingDirectory)
@@ -6920,7 +6929,8 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     for tab in tabs {
         let staged = (stagingDirectory as NSString).appendingPathComponent("\(tab.id).png")
         guard let drawn = renderDashboardTab(view, tab: tab, path: staged,
-                                             panelHeight: arguments.contains("--full-height") ? nil : panelHeight) else {
+                                             panelHeight: arguments.contains("--full-height") ? nil : panelHeight,
+                                             atomically: false) else {
             failAndClean("\(tab.id) 탭을 그리지 못했다")
         }
         results.append((tab, (outputDirectory as NSString).appendingPathComponent("\(tab.id).png"), drawn.texts, drawn.notices))
