@@ -6196,6 +6196,33 @@ func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [Dash
     return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
 }
 
+/// --live-snapshot 임시 폴더 정리용(신호 처리기에서 읽는다). C 문자열 포인터만 두고, 처리기는 unlink·rmdir만 부른다.
+var liveStagingCleanupPaths: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+var liveStagingCleanupCount: Int = 0
+
+/// 강제 종료(TERM·INT·HUP)에도 임시 폴더가 남지 않게, 그 안에 생길 파일들과 폴더 자체를 지우는 처리기를 건다.
+/// files는 폴더 안에 쓸 수 있는 모든 이름이다(없는 파일의 unlink 실패는 무시된다). 마지막에 폴더를 rmdir한다.
+func installLiveSnapshotStagingCleanup(directory: String, files: [String]) {
+    let paths = files + [directory]
+    let buffer = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: paths.count)
+    for (index, path) in paths.enumerated() { buffer[index] = strdup(path) }
+    liveStagingCleanupPaths = buffer
+    liveStagingCleanupCount = paths.count
+    for signalNumber in [SIGTERM, SIGINT, SIGHUP] {
+        var action = sigaction()
+        action.__sigaction_u.__sa_handler = { received in
+            if let paths = liveStagingCleanupPaths, liveStagingCleanupCount > 0 {
+                for index in 0..<(liveStagingCleanupCount - 1) { if let path = paths[index] { unlink(path) } }
+                if let directory = paths[liveStagingCleanupCount - 1] { rmdir(directory) }
+            }
+            signal(received, SIG_DFL)
+            raise(received)
+        }
+        sigemptyset(&action.sa_mask)
+        sigaction(signalNumber, &action, nil)
+    }
+}
+
 /// 탭 하나를 그려 path에 PNG로 쓴다. 실패하면 이유를 stderr에 남기고 nil(호출자가 정리·종료를 정한다).
 func renderDashboardTab(_ view: StatusMenuDashboardView, tab: DashboardTab, path: String, panelHeight: CGFloat? = nil)
     -> (texts: [String], notices: [String: String])? {
@@ -6878,10 +6905,16 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
         exit(1)
     }
     let stagingDirectory = String(cString: stagingPointer)
-    func failAndClean(_ message: String) -> Never {
-        try? FileManager.default.removeItem(atPath: stagingDirectory)
+    installLiveSnapshotStagingCleanup(directory: stagingDirectory,
+        files: tabs.map { (stagingDirectory as NSString).appendingPathComponent("\($0.id).png") })
+    func failAndClean(_ message: String, status: Int32 = 1) -> Never {
+        do {
+            try FileManager.default.removeItem(atPath: stagingDirectory)
+        } catch {
+            fputs("LIVE-SNAPSHOT: 임시 폴더를 지우지 못했다 \(stagingDirectory): \(error.localizedDescription)\n", stderr)
+        }
         fputs("LIVE-SNAPSHOT: \(message)\n", stderr)
-        exit(1)
+        exit(status)
     }
     var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
     for tab in tabs {
@@ -6894,8 +6927,15 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     }
     // 폴더째 한 번에 올린다. 그사이 누가 같은 이름을 만들었으면 덮지 않고 실패한다.
     guard renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL)) == 0 else {
-        failAndClean("게시 실패 \(outputDirectory): \(String(cString: strerror(errno)))")
+        let reason = errno
+        // 같은 새 이름으로 동시에 돈 다른 실행이 먼저 올렸다: 계약대로 '이미 있음'(2).
+        if reason == EEXIST || reason == ENOTEMPTY {
+            failAndClean("출력이 이미 있다(다른 실행이 먼저 만들었다): \(outputDirectory)", status: 2)
+        }
+        failAndClean("게시 실패 \(outputDirectory): \(String(cString: strerror(reason)))")
     }
+    // 게시 뒤에는 임시 폴더가 없다. 신호 처리기가 지울 것도 없게 비운다.
+    liveStagingCleanupCount = 0
     for result in results {
         print("TAB \(result.tab.id)=\(result.path) document=\(Int(view.snapshotDocumentHeight(result.tab)))")
     }

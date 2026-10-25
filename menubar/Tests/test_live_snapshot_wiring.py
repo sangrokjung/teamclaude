@@ -71,6 +71,24 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         self.assertIn("renamex_np(stagingDirectory, outputDirectory, UInt32(RENAME_EXCL))", block)
         self.assertLess(block.index("renderDashboardTab(view"), block.index("renamex_np("))
 
+    def test_staging_is_cleaned_on_signals_and_race_returns_2(self):
+        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
+        start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
+        block = main[start:main.index("exit(0)", start)]
+        # 강제 종료(TERM·INT·HUP) 때도 임시 폴더를 지운다. 신호 처리기 안에서는 unlink·rmdir만 쓴다.
+        self.assertIn("installLiveSnapshotStagingCleanup(", block)
+        self.assertLess(block.index("installLiveSnapshotStagingCleanup("), block.index("renderDashboardTab(view"))
+        helper = main[main.index("func installLiveSnapshotStagingCleanup("):]
+        helper = helper[:helper.index("\n}\n")]
+        for signal_name in ("SIGTERM", "SIGINT", "SIGHUP"):
+            self.assertIn(signal_name, helper)
+        self.assertIn("unlink(", main)
+        self.assertIn("rmdir(", main)
+        # 동시에 같은 새 이름으로 돌아 진 쪽은 '이미 있음'(2)으로 끝난다.
+        publish = block[block.index("renamex_np("):]
+        self.assertIn("EEXIST", publish[:600])
+        self.assertIn("status: 2", publish[:900])
+
     def test_read_only_is_set_before_appkit_init(self):
         main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
