@@ -245,6 +245,8 @@ private func loadCodexPersistentFileCacheIfNeeded(timeZone: String) {
 }
 
 private func persistCodexSessionFileStatsCache(timeZone: String) {
+    // 읽기 전용 실행은 운영 앱의 캐시 파일을 덮어쓰지 않는다(메모리 캐시만 쓴다).
+    guard !MenubarRunMode.readOnly else { return }
     codexSessionStatsCacheLock.lock()
     let entries = codexSessionFileStatsCache.mapValues { entry in
         CodexPersistentFileCacheEntry(

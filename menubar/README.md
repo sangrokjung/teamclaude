@@ -19,7 +19,9 @@ It is a native Swift/AppKit executable with no Electron, Tauri, React or npm run
 ## The panel
 
 Clicking the menu-bar item opens a 520pt panel. The header shows the title, the time of the data, and how many accounts
-need a person ("To fix N"). Below it are five tabs.
+need a person ("To fix N"). Below it are five tabs. The panel is as tall as the overview tab (at least 400pt of body, at most
+the screen); a longer tab, such as the Claude tab with many accounts, scrolls inside the body. The height does not change while
+the menu is open.
 
 | Tab | Contents |
 |---|---|
@@ -76,6 +78,21 @@ python3 menubar/Tests/make_dash_fixture.py /tmp/fixture.json --codex
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png            # five tabs
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
+
+A fixture can hide what the real data path does. To check the panel against this Mac's real data, use the live snapshot.
+It runs the same loaders the running app uses (proxy status, TeamCodex pool, Codex sessions, ccusage, Higgsfield, Grok,
+agy, and the burn outlook built from them), builds the panel through the same menu-open path, writes one PNG per tab and
+exits. It is read-only: no actions, no proxy sync or restart, no plan-profile lookups, and no quota-history or cache writes.
+
+```sh
+menubar/.build/cc-menubar --live-snapshot /tmp/live.png                  # five tabs at the real panel height
+menubar/.build/cc-menubar --live-snapshot /tmp/live.png --tab claude --full-height
+```
+
+By default every tab is drawn at the height the menu actually opens with (tall tabs show their top; the rest scrolls).
+`--full-height` draws whole tab bodies, `--print-text` adds the drawn strings as `TEXT <tab>=` lines, and
+`CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT` (seconds, default 180) bounds the wait for slow lanes such as ccusage.
+The images and text contain real account names. Keep them outside the repository and do not commit them.
 
 ## Install from a release
 

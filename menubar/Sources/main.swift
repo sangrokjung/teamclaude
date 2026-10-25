@@ -4371,7 +4371,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : quotaCycleBoundary(previous: previous, current: observation, now: now)
         if let closed {
             quotaHistory = quotaHistoryTrimmed(quotaHistory + [closed], keepPerLane: 256)
-            if let data = quotaHistoryEncode(quotaHistory) {
+            // 읽기 전용 실행(--live-snapshot)은 이력 파일을 쓰지 않는다.
+            if !MenubarRunMode.readOnly, let data = quotaHistoryEncode(quotaHistory) {
                 try? FileManager.default.createDirectory(
                     at: quotaHistoryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? data.write(to: quotaHistoryURL, options: [.atomic])
@@ -4875,6 +4876,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadAgyUsageInBackground(force: true)
     }
 
+    /// 아직 도는 로더 이름. 읽기 전용 스냅샷(--live-snapshot)이 refresh() 뒤 이 목록이 빌 때까지 기다린다.
+    var lanesStillLoading: [String] {
+        var lanes: [String] = []
+        if isRefreshingTeamClaude { lanes.append("teamclaude") }
+        if isRefreshingTeamCodex { lanes.append("teamcodex") }
+        if isRefreshingCodex { lanes.append("codex") }
+        if isFetching || isFetchingUsageQuick { lanes.append("ccusage") }
+        if isFetchingHiggsfield { lanes.append("higgsfield") }
+        if isFetchingGrok { lanes.append("grok") }
+        if isFetchingAgy { lanes.append("agy") }
+        return lanes
+    }
+
     /// 힉스필드 크레딧 조회. CLI 왕복이라 느릴 수 있어 단일 실행만 허용하고 10분 간격으로 제한한다.
     /// 크레딧은 생성할 때만 움직여서 더 촘촘히 볼 이유가 없다.
     func loadHiggsfieldInBackground(force: Bool = false) {
@@ -5169,7 +5183,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             let outageDuration = outageStartedAt.map { max(0, observedAt - $0) } ?? 0
             var syncReason = forcedSyncReason
-            if syncReason == nil,
+            // 읽기 전용 실행은 프록시를 건드리지 않는다(재로딩·시작 없음). 판정만 그대로 그린다.
+            if syncReason == nil, !MenubarRunMode.readOnly,
                let recovery = teamClaudeRecoveryReason(
                    serverReachable: teamClaude.serverReachable,
                    configPresent: teamClaude.configPresent,
@@ -5200,7 +5215,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 자동 경로는 supervisor를 재시작하지 않는다(재시작은 진행 중 요청을 모두 끊는다).
             var syncAttempted = false
             var syncOutcome: TeamClaudeSyncOutcome?
-            if let syncReason, forcedSyncReason != nil || autoSyncAllowed {
+            if let syncReason, !MenubarRunMode.readOnly, forcedSyncReason != nil || autoSyncAllowed {
                 syncAttempted = true
                 let result = syncTeamClaudeServerWithoutRestart(current: teamClaude)
                 teamClaude = result.health
@@ -6162,15 +6177,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 installCrashRecorder()
 
 /// 대시보드를 탭마다 한 장씩 그린다(탭 본문은 스크롤 없이 통째로). 첫 탭은 outputPath, 나머지는 "-<탭 id>"를 붙인 경로다.
+/// panelHeight를 주면 모든 탭을 그 높이(메뉴가 실제로 여는 패널 높이)로 그린다 — 긴 탭은 본문 위쪽만 보이고 나머지는 스크롤 아래다.
 /// 탭별로 실제로 그려진 글자(DrawnTextRecorder)와 미설치 안내 카드(ToolNoticeDrawLog)를 함께 돌려준다.
-func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab])
+func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab], panelHeight: CGFloat? = nil)
     -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
     DrawnTextRecorder.install()
     var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
     let url = URL(fileURLWithPath: outputPath)
     for tab in tabs {
         view.selectTab(tab)
-        view.frame.size.height = StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
+        view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
         view.layoutSubtreeIfNeeded()
         ToolNoticeDrawLog.reset()
         DrawnTextRecorder.reset()
@@ -6766,6 +6782,60 @@ if let recoveryLayoutIndex = CommandLine.arguments.firstIndex(of: "--teamcodex-r
             exit(1)
         }
     }
+    exit(0)
+}
+
+// 실데이터 경로 스냅샷(실사용 QA 2026-10-25). 픽스처가 아니라 실행 중인 앱과 같은 AppDelegate 로더(refresh():
+// 프록시 status·TeamCodex·Codex 세션·ccusage·힉스필드·Grok·agy, 그 결과로 소진 전망)로 읽고, 메뉴를 여는 경로(menuWillOpen)로
+// 패널을 만든 뒤 탭마다 PNG를 쓰고 끝난다. 읽기 전용이다(MenubarRunMode.readOnly): 동작·재시작·자동 동기화·캐시/이력 쓰기 없음.
+// 실행: cc-menubar --live-snapshot <out.png> [--tab <id>] [--full-height] [--print-text]
+//  - 기본은 메뉴가 실제로 여는 패널 높이로 그린다(긴 탭은 위쪽만). --full-height면 탭 본문을 통째로 그린다.
+//  - 이미지와 --print-text 출력에는 실제 계정 이름이 들어간다. 저장소 밖에 두고 커밋하지 않는다.
+if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
+    let arguments = CommandLine.arguments
+    guard arguments.indices.contains(liveIndex + 1), !arguments[liveIndex + 1].hasPrefix("--") else {
+        fputs("LIVE-SNAPSHOT: usage --live-snapshot <out.png> [--tab <id>] [--full-height] [--print-text]\n", stderr)
+        exit(2)
+    }
+    let outputPath = arguments[liveIndex + 1]
+    var tabs = DashboardTab.allCases
+    if let tabIndex = arguments.firstIndex(of: "--tab") {
+        guard arguments.indices.contains(tabIndex + 1),
+              let tab = DashboardTab.allCases.first(where: { $0.id == arguments[tabIndex + 1] }) else {
+            fputs("LIVE-SNAPSHOT: --tab은 \(DashboardTab.allCases.map(\.id).joined(separator: "|")) 중 하나\n", stderr)
+            exit(2)
+        }
+        tabs = [tab]
+    }
+    let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
+    _ = NSApplication.shared
+    MenubarRunMode.readOnly = true
+    let delegate = AppDelegate()
+    // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
+    delegate.refresh()
+    let startedAt = Date()
+    while !delegate.lanesStillLoading.isEmpty, Date().timeIntervalSince(startedAt) < timeout {
+        _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.1))
+    }
+    let unfinished = delegate.lanesStillLoading
+    print("LIVE-SNAPSHOT-LOAD: \(Int(Date().timeIntervalSince(startedAt)))s"
+          + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
+    // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).
+    let menu = NSMenu()
+    delegate.menuWillOpen(menu)
+    guard let view = delegate.cachedDashboardView else {
+        fputs("LIVE-SNAPSHOT: 대시보드를 만들지 못했다\n", stderr)
+        exit(1)
+    }
+    let panelHeight = view.frame.height
+    let results = renderDashboardTabs(view, outputPath: outputPath, tabs: tabs,
+                                      panelHeight: arguments.contains("--full-height") ? nil : panelHeight)
+    for result in results {
+        print("TAB \(result.tab.id)=\(result.path) document=\(Int(view.snapshotDocumentHeight(result.tab)))")
+    }
+    if arguments.contains("--print-text") { printDashboardTabTexts(results) }
+    print("TITLE-SLOTS \(delegate.displaySlots().joined(separator: " | "))")
+    print("LIVE-SNAPSHOT: \(outputPath) panel=\(Int(view.bounds.width))x\(Int(panelHeight)) maxBody=\(Int(view.maxBodyHeight))")
     exit(0)
 }
 

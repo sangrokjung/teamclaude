@@ -150,5 +150,41 @@ class EmptyHomeSnapshotTests(unittest.TestCase):
         self.assertFalse((self.home / ".config" / "teamcodex.json").exists())
 
 
+
+class LiveSnapshotReadOnlyTests(unittest.TestCase):
+    """--live-snapshot(실데이터 경로 스냅샷)은 실행 중인 앱과 같은 로더로 읽고 탭 다섯 장을 쓴 뒤 끝난다.
+    빈 HOME(도구 없음, 프록시 포트 닫힘)에서도 멈추지 않고, 출력 폴더 밖에는 아무 파일도 만들지 않는다(읽기 전용)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not BINARY.exists():
+            raise unittest.SkipTest(f"{BINARY} missing (EmptyHomeSnapshotTests builds it)")
+        cls.tmp = tempfile.TemporaryDirectory(prefix="cc-menubar-live-home-")
+        cls.home = pathlib.Path(cls.tmp.name) / "home"
+        cls.home.mkdir()
+        cls.out = pathlib.Path(cls.tmp.name) / "out"
+        cls.out.mkdir()
+        cls.result = subprocess.run([str(BINARY), "--live-snapshot", str(cls.out / "live.png")], cwd=str(cls.home),
+                                    capture_output=True, text=True, timeout=240, env=isolated_env(str(cls.home)))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_writes_five_tabs_and_exits(self):
+        self.assertEqual(0, self.result.returncode, self.result.stdout[-2000:] + self.result.stderr[-2000:])
+        names = sorted(path.name for path in self.out.iterdir())
+        self.assertEqual(["live-burn.png", "live-claude.png", "live-cli.png", "live-codex.png", "live.png"], names)
+        self.assertIn("LIVE-SNAPSHOT-LOAD:", self.result.stdout)
+        self.assertIn("all lanes loaded", self.result.stdout)
+        self.assertIn("LIVE-SNAPSHOT: ", self.result.stdout)
+
+    def test_read_only_home(self):
+        # 읽기 전용: HOME 아래에 쿼터 이력·캐시·로그·설정 파일을 만들지 않는다. (macOS가 만드는 Library 기본 폴더는 셈하지 않는다.)
+        created = [str(path.relative_to(self.home)) for path in self.home.rglob("*")
+                   if path.is_file() and not str(path.relative_to(self.home)).startswith("Library/")]
+        self.assertEqual([], created, self.result.stdout[-2000:])
+
+
 if __name__ == "__main__":
     unittest.main()
