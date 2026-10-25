@@ -211,5 +211,45 @@ class LiveSnapshotTimeoutTests(unittest.TestCase):
             self.assertEqual(["unrelated.txt"], sorted(path.name for path in out.iterdir()))
 
 
+class LiveSnapshotCleanupScopeTests(unittest.TestCase):
+    """실패 정리는 이번 실행이 쓸 이름만 지우고, 지우지 못하면 4로 끝난다."""
+
+    def run_timeout(self, out, *extra):
+        home = out.parent / "home"
+        home.mkdir(exist_ok=True)
+        env = isolated_env(str(home))
+        env["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"] = "0"
+        return subprocess.run([str(BINARY), "--live-snapshot", str(out / "live.png"), *extra], cwd=str(home),
+                              capture_output=True, text=True, timeout=120, env=env)
+
+    def setUp(self):
+        if not BINARY.exists():
+            self.skipTest(f"{BINARY} missing (EmptyHomeSnapshotTests builds it)")
+
+    def test_single_tab_failure_keeps_other_tab_files(self):
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-scope-") as temp:
+            out = pathlib.Path(temp) / "out"
+            out.mkdir()
+            for name in ("live.png", "live-claude.png", "live-burn.png"):
+                (out / name).write_bytes(b"stale")
+            result = self.run_timeout(out, "--tab", "claude")
+            self.assertEqual(3, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
+            # --tab claude가 쓰는 이름은 live.png 하나다. 다른 탭 파일은 이 실행의 것이 아니므로 남긴다.
+            self.assertEqual(["live-burn.png", "live-claude.png"], sorted(p.name for p in out.iterdir()))
+
+    def test_failed_delete_exits_4(self):
+        with tempfile.TemporaryDirectory(prefix="cc-menubar-live-nodelete-") as temp:
+            out = pathlib.Path(temp) / "out"
+            out.mkdir()
+            (out / "live.png").write_bytes(b"stale")
+            out.chmod(0o555)
+            try:
+                result = self.run_timeout(out, "--tab", "overview")
+            finally:
+                out.chmod(0o755)
+            self.assertEqual(4, result.returncode, result.stdout[-1500:] + result.stderr[-1500:])
+            self.assertIn("지우지 못했다", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

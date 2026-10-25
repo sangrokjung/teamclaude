@@ -61,6 +61,14 @@ class CrashRecorderReadOnlyTests(unittest.TestCase):
         self.assertLess(body.index("MenubarRunMode.readOnly"), body.index("cc-menubar-crash.log"),
                         "read-only(--live-snapshot)에서는 크래시 기록 파일을 만들기 전에 빠져야 한다")
 
+    def test_same_output_runs_are_serialized(self):
+        main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
+        start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')
+        block = main[start:main.index("exit(0)", start)]
+        self.assertIn("liveSnapshotOutputLock(", block)
+        self.assertLess(block.index("liveSnapshotOutputLock("), block.index("delegate.refresh()"),
+                        "같은 출력 이름의 실행은 갱신 전부터 렌더·정리 끝까지 잠금을 쥐어야 한다")
+
     def test_read_only_is_set_before_appkit_init(self):
         main = (pathlib.Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text()
         start = main.index('if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot")')

@@ -6189,18 +6189,32 @@ installCrashRecorder()
 /// 대시보드를 탭마다 한 장씩 그린다(탭 본문은 스크롤 없이 통째로). 첫 탭은 outputPath, 나머지는 "-<탭 id>"를 붙인 경로다.
 /// panelHeight를 주면 모든 탭을 그 높이(메뉴가 실제로 여는 패널 높이)로 그린다 — 긴 탭은 본문 위쪽만 보이고 나머지는 스크롤 아래다.
 /// 탭별로 실제로 그려진 글자(DrawnTextRecorder)와 미설치 안내 카드(ToolNoticeDrawLog)를 함께 돌려준다.
-/// renderDashboardTabs가 outputPath로 쓸 수 있는 모든 이름(첫 탭은 그 이름 그대로, 나머지는 "-<탭>" 접미).
-func dashboardTabOutputPaths(_ outputPath: String) -> [String] {
+/// renderDashboardTabs가 이 탭 목록으로 쓸 이름(첫 탭은 outputPath 그대로, 나머지는 "-<탭>" 접미). 그리기와 정리가 같은 규칙을 쓴다.
+func dashboardTabOutputPath(_ outputPath: String, tab: DashboardTab, tabs: [DashboardTab]) -> String {
+    guard tab != tabs.first else { return outputPath }
     let url = URL(fileURLWithPath: outputPath)
-    let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension
-    return [outputPath] + DashboardTab.allCases.map { url.deletingPathExtension().path + "-\($0.id)." + ext }
+    return url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
+}
+
+/// 같은 출력 이름으로 도는 --live-snapshot 실행을 하나씩 돌게 하는 잠금. 한 실행의 실패 정리가 다른 실행의 성공 이미지를
+/// 지우지 않게 한다. 잠금 파일은 HOME 밖 임시 폴더에 출력 경로별로 둔다(읽기 전용 계약). 프로세스가 끝나면 풀린다.
+func liveSnapshotOutputLock(_ outputPath: String) -> Int32 {
+    let absolute = URL(fileURLWithPath: outputPath).standardizedFileURL.path
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in absolute.utf8 { hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211 }
+    let lockPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("cc-menubar-live-\(String(hash, radix: 16)).lock")
+    let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+    guard fd >= 0, flock(fd, LOCK_EX) == 0 else {
+        fputs("LIVE-SNAPSHOT: 출력 잠금을 얻지 못했다 \(lockPath)\n", stderr)
+        exit(1)
+    }
+    return fd
 }
 
 func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, tabs: [DashboardTab], panelHeight: CGFloat? = nil)
     -> [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] {
     DrawnTextRecorder.install()
     var results: [(tab: DashboardTab, path: String, texts: [String], notices: [String: String])] = []
-    let url = URL(fileURLWithPath: outputPath)
     for tab in tabs {
         view.selectTab(tab)
         view.frame.size.height = panelHeight ?? StatusMenuDashboardView.chromeHeight + max(view.snapshotDocumentHeight(tab), 120)
@@ -6213,8 +6227,7 @@ func renderDashboardTabs(_ view: StatusMenuDashboardView, outputPath: String, ta
         }
         view.cacheDisplay(in: view.bounds, to: rep)
         DrawnTextRecorder.collectControlTitles(in: view)
-        let path = tab == tabs.first ? outputPath
-            : url.deletingPathExtension().path + "-\(tab.id)." + (url.pathExtension.isEmpty ? "png" : url.pathExtension)
+        let path = dashboardTabOutputPath(outputPath, tab: tab, tabs: tabs)
         guard let png = rep.representation(using: .png, properties: [:]),
               (try? png.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil else {
             fputs("DASHBOARD-TABS: 쓰기 실패 \(path)\n", stderr)
@@ -6827,6 +6840,8 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
     let timeout = ProcessInfo.processInfo.environment["CC_MENUBAR_LIVE_SNAPSHOT_TIMEOUT"].flatMap(Double.init) ?? 180
     // AppKit 초기화 중 예외도 읽기 전용(크래시 파일 안 씀)으로 다뤄지게 플래그를 먼저 세운다.
     MenubarRunMode.readOnly = true
+    let outputLock = liveSnapshotOutputLock(outputPath)
+    defer { close(outputLock) }
     _ = NSApplication.shared
     let delegate = AppDelegate()
     // 앱 기동(applicationDidFinishLaunching)과 같은 첫 갱신. 상태 막대 항목이 없어 제목 갱신은 그리지 않는다.
@@ -6840,9 +6855,19 @@ if let liveIndex = CommandLine.arguments.firstIndex(of: "--live-snapshot") {
           + (unfinished.isEmpty ? " all lanes loaded" : " still loading=\(unfinished.joined(separator: ","))"))
     // 부분·오래된 데이터를 정상 스냅샷처럼 내놓지 않는다. 이미지를 쓰지 않고 3으로 끝낸다.
     guard unfinished.isEmpty else {
-        // 같은 출력 이름으로 앞서 성공한 이미지가 남아 있으면 새것으로 오인된다. 이 실행이 쓸 수 있는 이름을 모두 지운다.
-        for path in dashboardTabOutputPaths(outputPath) { try? FileManager.default.removeItem(atPath: path) }
-        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다(이전 이미지도 지웠다)\n", stderr)
+        // 같은 이름으로 앞서 성공한 이미지가 남으면 새것으로 오인된다. 이번 실행이 쓸 이름만 지우고(다른 탭 파일은 남긴다),
+        // 지우지 못한 것이 있으면 낡은 이미지가 남았다는 뜻이라 따로 4로 끝낸다.
+        var leftovers: [String] = []
+        for tab in tabs {
+            let path = dashboardTabOutputPath(outputPath, tab: tab, tabs: tabs)
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            if (try? FileManager.default.removeItem(atPath: path)) == nil { leftovers.append(path) }
+        }
+        guard leftovers.isEmpty else {
+            fputs("LIVE-SNAPSHOT: 로더 시간 초과, 이전 이미지를 지우지 못했다: \(leftovers.joined(separator: ", "))\n", stderr)
+            exit(4)
+        }
+        fputs("LIVE-SNAPSHOT: \(Int(timeout))초 안에 끝나지 않은 로더가 있어 이미지를 쓰지 않았다(이번 실행 이름의 이전 이미지도 지웠다)\n", stderr)
         exit(3)
     }
     // 메뉴를 처음 여는 경로 그대로(높이 = 화면 상한 안의 개요 자연 높이).
