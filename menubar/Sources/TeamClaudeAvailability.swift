@@ -18,6 +18,8 @@ struct TeamClaudeFableAvailability {
     var busy: TeamClaudeConcurrencyLoad? = nil
     /// .ready인데 로컬 창 사용률이 문턱 이상인 창 이름들. 프록시가 usable=true로 라우팅 중이라 프록시를 믿었다(유예 차선).
     var graceWindows: [String] = []
+    /// .limited인데 문턱 이상이라 막힌 창 이름들. 비어 있으면 창이 아닌 이유(throttled·exhausted)로 기다린다.
+    var blockedWindows: [String] = []
 }
 
 func teamClaudeFableAvailability(
@@ -88,7 +90,11 @@ func teamClaudeFableAvailability(
     let proxyRouting = row.usableFromProxy == true
     let grace = proxyRouting ? overThreshold.filter { $0 != fableWindow } : []
     let blocked = proxyRouting ? overThreshold.filter { $0 == fableWindow } : overThreshold
-    if !blocked.isEmpty { return result(.limited, L10n.reasonWindowsBlocked(blocked.joined(separator: "·"))) }
+    if !blocked.isEmpty {
+        var limited = result(.limited, L10n.reasonWindowsBlocked(blocked.joined(separator: "·")))
+        limited.blockedWindows = blocked
+        return limited
+    }
     if row.usableFromProxy == false { return result(.excluded, L10n.reasonProxyExcluded) }
     guard proxyRouting else { return result(.unconfirmed, L10n.reasonProxyUnknown) }
     guard let inflight = row.inflightCount, inflight >= 0,

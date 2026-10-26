@@ -102,6 +102,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         var elapsedValues: [Double] = []
         var waitSession: (count: Int, soonest: Double?) = (0, nil)
         var waitWeekly: (count: Int, soonest: Double?) = (0, nil)
+        var waitOther = 0
         for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
@@ -125,13 +126,16 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             }
             if state.state == .limited {
                 model.waitingNames.append(row.name)
-                // 주간 창이 찼으면 며칠, 아니면 세션 창이 막은 것이라 몇 시간 안에 돌아온다.
-                if (row.weeklyPercent ?? 0) >= panelRoutingThresholdPercent {
+                // 판정이 막힌 창으로 나눈다: 주간 창이면 며칠, 세션 창만이면 몇 시간. 창이 아닌 이유
+                // (throttled·exhausted)는 언제 풀릴지 창으로 말할 수 없어 따로 센다(검토 지적 2026-10-26).
+                if state.blockedWindows.contains(L10n.windowAllWeekly) {
                     waitWeekly.count += 1
                     if let w = weeklyRemaining, w > 0 { waitWeekly.soonest = min(waitWeekly.soonest ?? w, w) }
-                } else {
+                } else if state.blockedWindows.contains(L10n.sessionShort) {
                     waitSession.count += 1
                     if let s = sessionRemaining, s > 0 { waitSession.soonest = min(waitSession.soonest ?? s, s) }
+                } else {
+                    waitOther += 1
                 }
             }
 
@@ -161,6 +165,9 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         }
         if waitWeekly.count > 0 {
             model.waitGroups.append(OverviewWaitGroup(window: .weekly, count: waitWeekly.count, soonestSeconds: waitWeekly.soonest))
+        }
+        if waitOther > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .other, count: waitOther, soonestSeconds: nil))
         }
         if !model.waitingNames.isEmpty {
             model.waitingCaption = model.waitGroups.isEmpty

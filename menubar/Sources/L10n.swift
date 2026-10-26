@@ -133,6 +133,7 @@ enum L10n {
         soonest.map { t("세션 한도 \(count)개 \($0) 뒤부터", "\(count) on session limit, from \($0)") }
             ?? t("세션 한도 \(count)개", "\(count) on session limit")
     }
+    static func waitGroupOther(_ count: Int) -> String { t("일시 대기 \(count)개", "\(count) paused") }
     static func waitGroupWeekly(_ count: Int, _ soonest: String?) -> String {
         soonest.map { t("주간 한도 \(count)개 \($0) 뒤부터", "\(count) on weekly limit, from \($0)") }
             ?? t("주간 한도 \(count)개", "\(count) on weekly limit")

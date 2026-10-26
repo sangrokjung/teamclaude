@@ -138,5 +138,18 @@ struct DashboardOverviewBuilderTests {
         let column = model.strip.first { $0.name == "acct-17" }!
         precondition(column.tone == .wait && overviewStripStateBand(column.tone) == .wait)
         precondition(overviewStripStateBand(.ready) == .ready && overviewStripStateBand(.error) == nil)
+
+        // 사용률과 무관하게 throttled로 기다리는 계정은 세션 한도로 세지 않고 일시 대기로 센다(검토 지적).
+        accounts[index]["status"] = "throttled"
+        quota["unified5h"] = 0.43
+        quota["unified7d"] = 0.20
+        accounts[index]["quota"] = quota
+        status["accounts"] = accounts
+        let throttledHealth = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        let throttled = makeOverviewModel(DashboardOverviewInput(teamClaude: throttledHealth, teamCodex: input.teamCodex,
+                                                                 grok: input.grok, agy: input.agy, burn: input.burn,
+                                                                 notices: input.notices, now: now))
+        precondition(throttled.waitGroups.map(\.window) == [.weekly, .other], "\(throttled.waitGroups)")
+        precondition(throttled.waitingCaption?.contains("일시 대기 1개") == true, throttled.waitingCaption ?? "nil")
     }
 }

@@ -87,7 +87,7 @@ func overviewStripStateBand(_ tone: PanelTone) -> PanelTone? {
     }
 }
 
-enum OverviewWaitWindow: Equatable { case session, weekly }
+enum OverviewWaitWindow: Equatable { case session, weekly, other }
 
 struct OverviewWaitGroup: Equatable {
     let window: OverviewWaitWindow
@@ -102,6 +102,7 @@ func overviewWaitGroupsCaption(_ groups: [OverviewWaitGroup]) -> String {
         switch group.window {
         case .session: return L10n.waitGroupSession(group.count, duration)
         case .weekly: return L10n.waitGroupWeekly(group.count, duration)
+        case .other: return L10n.waitGroupOther(group.count)
         }
     }
     return L10n.waitGroupsCaption(parts.joined(separator: " · "))
@@ -169,8 +170,10 @@ func overviewStripSlots(_ columns: [OverviewStripColumn], maxColumns: Int) -> [O
             tone = routable.contains { $0.tone == .wait } ? .wait
                 : (routable.contains { $0.tone == .ready } ? .ready : routable[0].tone)
         }
+        // 묶인 칸의 띠는 오류 > 대기 > 사용 가능 > 꺼 둠 순으로 하나만 그린다(각 수는 툴팁이 말한다).
+        // 오류는 사람이 손봐야 하니 다른 상태에 가려지지 않게 맨 앞이다.
         let cap: PanelTone? = members.contains { $0.cap == .error } ? .error
-            : (members.allSatisfy { $0.cap != nil } ? members[0].cap : nil)
+            : (routable.isEmpty ? members[0].cap : nil)
         let column = OverviewStripColumn(
             name: members[0].name, label: L10n.stripBucketLabel(members.count), tone: tone,
             weeklyPercent: overviewMean((routable.isEmpty ? members : routable).compactMap(\.weeklyPercent)),
