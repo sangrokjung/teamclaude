@@ -37,6 +37,18 @@ The footer has Refresh (R) and the action list (⌘K): measure accounts, import 
 OAuth accounts, restart the TeamClaude server, open at login (.app builds only), and quit. Number keys 1–5 switch tabs.
 The visual rules (colors, type, spacing) are in [DESIGN.md](DESIGN.md).
 
+## QA hook
+
+The hook is disabled by default. Enable it only for a local QA session:
+
+```sh
+menubar/qa.sh enable
+menubar/qa.sh run                  # or: menubar/qa.sh run steps.json
+menubar/qa.sh disable
+```
+
+Results are written below `~/Library/Application Support/cc-menubar/qa/out/<id>/`. Captures are rendered from the live panel without AppleScript, accessibility permission, or screen-recording permission. Captured PNGs can contain account information; treat and share them carefully.
+
 ## Language
 
 The UI is in Korean or English. If the first preferred language in System Settings is Korean, the panel is Korean;

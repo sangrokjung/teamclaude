@@ -35,6 +35,18 @@ Swift/AppKit 네이티브 실행 파일이며 Electron, Tauri, React, npm 런타
 TeamClaude 서버 재시작, 로그인 시 열기(.app 배포본만), 종료를 실행합니다. 숫자 키 1–5는 탭을 옮깁니다.
 화면 규칙(색·글자·간격)은 [DESIGN.md](DESIGN.md)에 있습니다.
 
+## QA 훅
+
+QA 훅은 기본적으로 꺼져 있습니다. 로컬 QA 세션에서만 켜십시오.
+
+```sh
+menubar/qa.sh enable
+menubar/qa.sh run                  # 또는: menubar/qa.sh run steps.json
+menubar/qa.sh disable
+```
+
+결과는 `~/Library/Application Support/cc-menubar/qa/out/<id>/` 아래에 저장됩니다. 캡처는 AppleScript·접근성 권한·화면 기록 권한 없이 실행 중인 패널을 직접 렌더합니다. PNG에 계정 정보가 담길 수 있으므로 공유할 때 주의하십시오.
+
 ## 언어
 
 화면 문구는 한국어와 영어로 나옵니다. 시스템 설정의 선호 언어 첫 항목이 한국어면 한국어, 아니면 영어입니다.

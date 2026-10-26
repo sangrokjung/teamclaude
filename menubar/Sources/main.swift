@@ -2761,6 +2761,13 @@ final class StatusMenuDashboardView: NSView {
         }
     }
 
+    func qaSnapshot(statusTitle: String, menuOpen: Bool, teamCodex: TeamCodexPoolHealth?) -> QAStateSnapshot {
+        QAStateSnapshot(statusTitle: statusTitle, selectedTab: selectedTab.id,
+                        claudeRoutable: overviewModel.routable, claudeTotal: overviewModel.total,
+                        teamCodexUsable: teamCodex?.usableCount ?? 0, teamCodexTotal: teamCodex?.poolCount ?? 0,
+                        menuOpen: menuOpen, panelWidth: Double(bounds.width), panelHeight: Double(bounds.height))
+    }
+
     func updateActionDetail(id: String, detail: String) {
         actionList.updateDetail(id: id, detail: detail)
     }
@@ -4354,6 +4361,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
     /// 로그 347분 동안 조회 1회). 10분 주기로 다시 부른다 — 함수 자체가 중복 실행을 막는다.
     var higgsfieldTimer: Timer?
+    var qaTimer: Timer?
+    private var qaExecution: QAExecution?
+    private lazy var qaRuntime = QAAppRuntime(delegate: self)
     /// 레인별 마지막 성공 시각. 조회 시도 시각(last*FetchedAt)과 달리 실패는 갱신하지 않는다.
     var grokLastSuccessAt: Date?
     var agyLastSuccessAt: Date?
@@ -4689,6 +4699,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.loadHiggsfieldInBackground(force: true)
         }
         if let t = higgsfieldTimer { RunLoop.main.add(t, forMode: .common) }
+
+        qaTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollQARequest()
+        }
+        if let t = qaTimer { RunLoop.main.add(t, forMode: .common) }
     }
 
     // MARK: - Tick (1초마다 호출)
@@ -4703,6 +4718,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if tickCount % 60 == 0 { reportStaleLanes() }
         updateTitle()
+    }
+
+    func pollQARequest() {
+        guard qaExecution == nil else { return }
+        let paths = QAPaths.current()
+        guard QAFileSafety.isEnabled(paths) else { return }
+        guard QAFileSafety.isOwnedRegularFile(paths.requestFile) else { return }
+        guard let data = try? Data(contentsOf: paths.requestFile) else {
+            try? FileManager.default.removeItem(at: paths.requestFile)
+            return
+        }
+        if data.count > QARequestValidator.maxRequestBytes {
+            rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
+            try? FileManager.default.removeItem(at: paths.requestFile)
+            return
+        }
+        let claimed = paths.root.appendingPathComponent(".request-\(UUID().uuidString)")
+        guard (try? FileManager.default.moveItem(at: paths.requestFile, to: claimed)) != nil else { return }
+        defer { try? FileManager.default.removeItem(at: claimed) }
+        let request: QARequest
+        do {
+            request = try QARequestValidator.decode(data)
+        } catch {
+            rejectQARequest(data: data, reason: String(describing: error))
+            return
+        }
+        if !QAFileSafety.pathExists(paths.outputRoot) {
+            do { try FileManager.default.createDirectory(at: paths.outputRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
+            catch { return }
+        }
+        guard QAFileSafety.isOwnedDirectory(paths.outputRoot) else { return }
+        let output = paths.outputRoot.appendingPathComponent(request.id, isDirectory: true)
+        guard !QAFileSafety.pathExists(output) else { return }
+        do {
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        } catch { return }
+        let execution = QAExecution(request: request, outputDirectory: output, runtime: qaRuntime)
+        qaExecution = execution
+        execution.start { [weak self] _ in
+            self?.qaExecution = nil
+        }
+    }
+
+    private func rejectQARequest(data: Data, reason: String) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = object["id"] as? String, QARequestValidator.validName(id, maxLength: 64) else { return }
+        let paths = QAPaths.current()
+        if !QAFileSafety.pathExists(paths.outputRoot) {
+            try? FileManager.default.createDirectory(at: paths.outputRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        }
+        guard QAFileSafety.isOwnedDirectory(paths.outputRoot) else { return }
+        let output = paths.outputRoot.appendingPathComponent(id, isDirectory: true)
+        guard !QAFileSafety.pathExists(output),
+              (try? FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])) != nil else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let result = QAResult(id: id, startedAt: stamp, endedAt: stamp, completed: false, timeout: false,
+                              steps: [QAStepResult(index: 0, kind: "request", ok: false, error: reason)])
+        try? QAFileSafety.atomicWrite(try JSONEncoder.qaEncoder.encode(result), to: output.appendingPathComponent("result.json"))
     }
 
     /// 갱신이 끊긴 CLI 레인을 로그로 드러낸다. 값이 낡았는데 화면은 멀쩡해 보이는 상태가
@@ -5659,6 +5732,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             flushPendingDashboardRefresh(reason: "menuWillOpen")
             cachedDashboardView.heightFrozen = true
             openDashboardView = cachedDashboardView
+            qaRuntime.menuDidOpen()
             refreshActionDetails()
             loadFastStatusInBackground()
             return
@@ -5702,6 +5776,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         dashboard.heightFrozen = true
         openDashboardView = dashboard
+        qaRuntime.menuDidOpen()
         cachedDashboardView = dashboard
         let dashboardItem = NSMenuItem()
         hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: nil)
