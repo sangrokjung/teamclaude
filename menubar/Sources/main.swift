@@ -2761,6 +2761,13 @@ final class StatusMenuDashboardView: NSView {
         }
     }
 
+    func qaSnapshot(statusTitle: String, menuOpen: Bool, teamCodex: TeamCodexPoolHealth?) -> QAStateSnapshot {
+        QAStateSnapshot(statusTitle: statusTitle, selectedTab: selectedTab.id,
+                        claudeRoutable: overviewModel.routable, claudeTotal: overviewModel.total,
+                        teamCodexUsable: teamCodex?.usableCount ?? 0, teamCodexTotal: teamCodex?.poolCount ?? 0,
+                        menuOpen: menuOpen, panelWidth: Double(bounds.width), panelHeight: Double(bounds.height))
+    }
+
     func updateActionDetail(id: String, detail: String) {
         actionList.updateDetail(id: id, detail: detail)
     }
@@ -4354,6 +4361,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
     /// 로그 347분 동안 조회 1회). 10분 주기로 다시 부른다 — 함수 자체가 중복 실행을 막는다.
     var higgsfieldTimer: Timer?
+    var qaTimer: Timer?
+    private var qaExecution: QAExecution?
+    private lazy var qaRuntime = QAAppRuntime(delegate: self)
     /// 레인별 마지막 성공 시각. 조회 시도 시각(last*FetchedAt)과 달리 실패는 갱신하지 않는다.
     var grokLastSuccessAt: Date?
     var agyLastSuccessAt: Date?
@@ -4689,6 +4699,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.loadHiggsfieldInBackground(force: true)
         }
         if let t = higgsfieldTimer { RunLoop.main.add(t, forMode: .common) }
+
+        qaTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.pollQARequest()
+        }
+        if let t = qaTimer { RunLoop.main.add(t, forMode: .common) }
     }
 
     // MARK: - Tick (1초마다 호출)
@@ -4703,6 +4718,135 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if tickCount % 60 == 0 { reportStaleLanes() }
         updateTitle()
+    }
+
+    func pollQARequest() {
+        guard qaExecution == nil else { return }
+        let paths = QAPaths.current()
+        guard QAFileSafety.isEnabled(paths) else { return }
+        recoverOrphanQAClaims(paths)
+        guard QAFileSafety.pathExists(paths.requestFile) else { return }
+        let claimed = paths.root.appendingPathComponent(".request-\(UUID().uuidString)")
+        guard (try? FileManager.default.moveItem(at: paths.requestFile, to: claimed)) != nil else { return }
+        // 결과(실행 결과든 거부 결과든)를 남긴 요청만 지운다. 남기지 못했으면 요청을 failed-*.json으로 보존해
+        // 조용히 사라지지 않게 한다(검토 지적 2026-10-26).
+        var reported = false
+        var handedOff = false
+        defer { if !handedOff { settleQAClaim(claimed, reported: reported, paths: paths) } }
+        guard QAFileSafety.isOwnedRegularFile(claimed),
+              let fileSize = QAFileSafety.regularFileSize(claimed) else { return }
+        guard let handle = FileHandle(forReadingAtPath: claimed.path) else { return }
+        let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
+        handle.closeFile()
+        if fileSize > off_t(QARequestValidator.maxRequestBytes) || data.count > QARequestValidator.maxRequestBytes {
+            reported = rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
+            return
+        }
+        let request: QARequest
+        do {
+            request = try QARequestValidator.decode(data)
+        } catch {
+            reported = rejectQARequest(data: data, reason: String(describing: error))
+            return
+        }
+        guard ensureQAOutputRoot(paths) else { return }
+        let output = paths.outputRoot.appendingPathComponent(request.id, isDirectory: true)
+        guard !QAFileSafety.pathExists(output) else {
+            reported = writeQARejection(id: request.id, reason: QAValidationError.outputAlreadyExists.description, paths: paths)
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        } catch {
+            reported = writeQARejection(id: request.id, reason: "could not create output directory: \(error.localizedDescription)", paths: paths)
+            return
+        }
+        // 실행이 끝나 result.json을 저장할 때까지 요청 원문을 붙잡아 둔다. 저장에 실패하면 보존한다.
+        handedOff = true
+        let execution = QAExecution(request: request, outputDirectory: output, runtime: qaRuntime)
+        qaExecution = execution
+        execution.start { [weak self, weak execution] _ in
+            self?.settleQAClaim(claimed, reported: execution?.resultSaved ?? false, paths: paths)
+            self?.qaExecution = nil
+        }
+    }
+
+    /// 결과(실행·거부)를 남긴 요청만 지우고, 아니면 qa/failed-<uuid>.json으로 옮긴다.
+    /// 옮기지 못하면 claim이 남고, 다음 폴링의 recoverOrphanQAClaims가 다시 옮긴다.
+    private func settleQAClaim(_ claimed: URL, reported: Bool, paths: QAPaths,
+                               reason: String = "menubar app could not save a result for this request") {
+        // 결과를 남기지 못한 요청은 경로와 상관없이 그 id로 거부 결과를 먼저 쓴다 — 기다리는 qa.sh가 바로 끝난다.
+        let reported = reported || rejectQAClaim(claimed, reason: reason, paths: paths)
+        if reported {
+            do { try FileManager.default.removeItem(at: claimed) }
+            catch { print("QA: could not remove handled request \(claimed.lastPathComponent): \(error.localizedDescription)") }
+            fflush(stdout)
+            return
+        }
+        let kept = paths.root.appendingPathComponent("failed-\(UUID().uuidString).json")
+        do {
+            try FileManager.default.moveItem(at: claimed, to: kept)
+            print("QA: request kept without result → \(kept.lastPathComponent)")
+        } catch {
+            print("QA: could not keep request \(claimed.lastPathComponent) (retry on next poll): \(error.localizedDescription)")
+        }
+        fflush(stdout)
+    }
+
+    /// 실행 중이 아닐 때 남아 있는 .request-* claim은 주인이 없다(실행 중 앱 종료·정산 실패).
+    /// 결과를 남기지 못한 요청이므로 그 id로 거부 결과를 쓰고, id를 못 찾으면 failed-*.json으로 보존한다.
+    private func recoverOrphanQAClaims(_ paths: QAPaths) {
+        guard qaExecution == nil,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: paths.root.path) else { return }
+        for name in names where name.hasPrefix(".request-") {
+            settleQAClaim(paths.root.appendingPathComponent(name), reported: false, paths: paths,
+                          reason: "menubar app stopped before the request finished")
+        }
+    }
+
+    /// claim 원문에서 id를 찾아 거부 결과를 쓴다. 실행이 끝나 result.json이 이미 있으면 결과가 있는 것으로 본다.
+    private func rejectQAClaim(_ claim: URL, reason: String, paths: QAPaths) -> Bool {
+        guard QAFileSafety.isOwnedRegularFile(claim), let handle = FileHandle(forReadingAtPath: claim.path) else { return false }
+        let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
+        handle.closeFile()
+        let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+        guard let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
+                ?? QARequestValidator.salvageID(from: data) else { return false }
+        let finished = paths.outputRoot.appendingPathComponent(id, isDirectory: true).appendingPathComponent("result.json")
+        return QAFileSafety.isOwnedRegularFile(finished) || writeQARejection(id: id, reason: reason, paths: paths)
+    }
+
+    private func ensureQAOutputRoot(_ paths: QAPaths) -> Bool {
+        if !QAFileSafety.pathExists(paths.outputRoot) {
+            try? FileManager.default.createDirectory(at: paths.outputRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        }
+        return QAFileSafety.isOwnedDirectory(paths.outputRoot)
+    }
+
+    /// 거부 결과를 남겼으면 true.
+    private func rejectQARequest(data: Data, reason: String) -> Bool {
+        let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+        guard let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
+                ?? QARequestValidator.salvageID(from: data) else { return false }
+        return writeQARejection(id: id, reason: reason, paths: QAPaths.current())
+    }
+
+    /// 거부한 요청도 결과를 남긴다. 결과 폴더를 만들 수 없으면(이미 있음 등) 옆에 `<id>.rejected.json`을 쓴다 —
+    /// 결과 없이 지우면 qa.sh가 시간 초과까지 기다린다. 어느 쪽도 쓰지 못하면 false(요청은 보존된다).
+    private func writeQARejection(id: String, reason: String, paths: QAPaths) -> Bool {
+        guard ensureQAOutputRoot(paths) else { return false }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let result = QAResult(id: id, startedAt: stamp, endedAt: stamp, completed: false, timeout: false,
+                              steps: [QAStepResult(index: 0, kind: "request", ok: false, error: reason)])
+        guard let data = try? JSONEncoder.qaEncoder.encode(result) else { return false }
+        let output = paths.outputRoot.appendingPathComponent(id, isDirectory: true)
+        if !QAFileSafety.pathExists(output),
+           (try? FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])) != nil {
+            return (try? QAFileSafety.atomicWrite(data, to: output.appendingPathComponent("result.json"))) != nil
+        }
+        let sidecar = paths.outputRoot.appendingPathComponent("\(id).rejected.json")
+        guard !QAFileSafety.pathExists(sidecar) else { return false }
+        return (try? QAFileSafety.atomicWrite(data, to: sidecar)) != nil
     }
 
     /// 갱신이 끊긴 CLI 레인을 로그로 드러낸다. 값이 낡았는데 화면은 멀쩡해 보이는 상태가
@@ -5659,6 +5803,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             flushPendingDashboardRefresh(reason: "menuWillOpen")
             cachedDashboardView.heightFrozen = true
             openDashboardView = cachedDashboardView
+            qaRuntime.menuDidOpen()
             refreshActionDetails()
             loadFastStatusInBackground()
             return
@@ -5702,6 +5847,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         dashboard.heightFrozen = true
         openDashboardView = dashboard
+        qaRuntime.menuDidOpen()
         cachedDashboardView = dashboard
         let dashboardItem = NSMenuItem()
         hostDashboard(dashboard, in: dashboardItem, previousScrollOrigin: nil)

@@ -24,7 +24,7 @@ export CC_MENUBAR_LANG="${CC_MENUBAR_LANG:-ko}"
 
 # main.swift는 최상위 코드가 있어 -parse-as-library 바이너리에 못 들어간다.
 # 아래 세 파일은 main.swift의 TeamClaudeHealth / UsageData에 의존한다.
-EXCLUDE_SOURCES=(main.swift TeamClaudeAvailability.swift CodexStatusView.swift DashboardOverviewBuilder.swift)
+EXCLUDE_SOURCES=(main.swift TeamClaudeAvailability.swift CodexStatusView.swift DashboardOverviewBuilder.swift QAAppRuntime.swift)
 # main.swift 심볼을 쓰는 테스트. main.swift 분할(후속 계획) 전까지 러너에서 못 돌린다.
 # (세 파일 모두 짝이 되는 test_*.py가 main.swift의 진입점 앞부분을 잘라 붙여 직접 컴파일·실행하므로 실제로는 돈다.)
 SKIP_TESTS=(AccountSubscriptionLayoutTests.swift TeamClaudeAvailabilityTests.swift TeamCodexDashboardSourceTests.swift)
