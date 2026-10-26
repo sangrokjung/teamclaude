@@ -202,7 +202,7 @@ struct CodexStatusLoaderTests {
         precondition(health.todayTokens == 400)
         precondition(health.quotaEvents == 1, "General quota history remains available")
         precondition(!health.hints.contains { $0.contains("쿼터") })
-        precondition(health.titleSlot == "Codex 400/d")
+        precondition(health.titleSlot == "Codex 오늘 400 토큰", health.titleSlot)
 
         try FileManager.default.removeItem(at: sessions.appendingPathComponent("old-account.jsonl"))
         let callLog = URL(fileURLWithPath: codexCallLogPath())

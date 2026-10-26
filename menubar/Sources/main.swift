@@ -2554,7 +2554,7 @@ final class TeamClaudeTableView: NSView {
                     PanelDraw.text(L10n.measure, chipRect.minX + 10, chipRect.minY + 4.5, TeamClaudePalette.buttonFont, fg)
                     measureRowRects.append(chipRect)
                 } else {
-                    PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: statusWidth), statusRight, y + 9, micro, issue == .quotaBlocked ? ember : fg3)
+                    PanelDraw.right(PanelDraw.clipped(issue.compactText, micro, maxWidth: statusWidth), statusRight, y + 9, micro, issue == .quotaBlocked ? amber : fg3)
                 }
             } else {
                 // 동시 요청이 가득 찬 행은 "사용 중 3/3"(presentation)이 이긴다. 현재 계정의 "사용 중"보다 정보가 많다.

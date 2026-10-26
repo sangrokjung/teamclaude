@@ -14,7 +14,7 @@ struct CodexTitleQuotaTests {
                 quotaEvents: 5, errorEvents: 0, lastCallAt: Date(), planType: "pro",
                 scannedLogFiles: 1, scannedLogBytes: 100, profiles: [], hints: []
             )
-            precondition(health.titleSlot == (tokens == 0 ? "Codex 0/d" : "Codex 123.5K/d"), "The token title must retain both positive and real zero usage")
+            precondition(health.titleSlot == (tokens == 0 ? "Codex 오늘 0 토큰" : "Codex 오늘 123.5K 토큰"), "The token title must retain both positive and real zero usage")
         }
         print("Codex title token usage test passed")
     }

@@ -54,6 +54,8 @@ func burnProjectionLabel(_ projection: BurnProjection) -> String {
     case .collecting:
         return L10n.burnCollecting
     case .unmeasured:
+        // 지금 값은 있는데 주기(리셋 시각)를 몰라 전망만 못 내는 레인(Grok). "측정 전"이라 쓰면 CLI 탭의 값과 어긋난다.
+        if let current = projection.current { return L10n.burnCurrentOnly(burnPercent(current)) }
         return StatusVocabulary.notMeasured
     case .history(let cycles):
         guard let projected = projection.projected else { return StatusVocabulary.notMeasured }
@@ -84,7 +86,12 @@ func burnVerdictIsTentative(_ projection: BurnProjection) -> Bool {
 /// 관측된 부족(.blocked)과 잴 수 없음(.unknown)은 추정이 아니므로 그대로 둔다.
 func burnVerdictDisplay(_ usage: LaneUsage) -> (label: String, color: NSColor) {
     let verdict = burnVerdict(usage)
-    let tentative = burnVerdictIsTentative(burnBindingProjection(usage)) && verdict != .blocked && verdict != .unknown
+    let binding = burnBindingProjection(usage)
+    // 값은 있는데 전망을 못 내면 "측정 전"이 아니라 "전망 불가"다(값은 이미 쟀다).
+    if verdict == .unknown, binding.basis == .unmeasured, binding.current != nil {
+        return (L10n.verdictNoForecast, TeamClaudePalette.muted)
+    }
+    let tentative = burnVerdictIsTentative(binding) && verdict != .blocked && verdict != .unknown
     guard tentative else { return (burnVerdictLabel(verdict), burnVerdictColor(verdict)) }
     return (L10n.verdictTentative(burnVerdictLabel(verdict)), TeamClaudePalette.muted)
 }

@@ -212,7 +212,7 @@ enum L10n {
     static var groupCheckNote: String { t("측정·상태를 확인하면 돌아옴", "Back after a measure or check") }
     static var groupExcluded: String { t("제외", "Excluded") }
     static var groupExcludedNote: String { t("사람이 손봐야 돌아옴", "Needs a person") }
-    static var quotaReset: String { t("한도리셋", "Limit reset") }
+    static var quotaReset: String { t("리셋 대기", "Until reset") }
     static var remeasure: String { t("재측정", "Re-measure") }
     static var sessionShort: String { t("세션", "Session") }
     static var weeklyShort: String { t("주간", "Weekly") }
@@ -324,6 +324,8 @@ enum L10n {
     static var burnFirstStepsAside: String { t("고칠 수 있는 것부터", "Fixable things first") }
     static var burnRecordsLink: String { t("계정별 구독 기록은 Claude 탭에서 행을 펼쳐 ↗", "Per-account plan records: expand a row in Claude ↗") }
     static var burnCollecting: String { t("수집 중", "Collecting") }
+    static func burnCurrentOnly(_ percent: String) -> String { t("지금 \(percent) · 주기 모름", "now \(percent) · cycle unknown") }
+    static var verdictNoForecast: String { t("전망 불가", "No forecast") }
     static func burnHistory(cycles: Int, percent: String) -> String { t("최근 \(cycles)주 평균 \(percent)", "avg of last \(cycles) weeks \(percent)") }
     static func burnEstimate(_ current: String, _ projected: String) -> String { t("\(current) → \(projected) 추정", "\(current) → \(projected) est.") }
     /// 신뢰 낮은 외삽이 100%를 넘을 때. 원시 숫자(예: 423%)는 근거가 약해 쓰지 않는다.
@@ -538,6 +540,7 @@ enum L10n {
     static var codexTaskReview: String { t("리뷰·보안", "Review·security") }
     static var codexTaskExplore: String { t("탐색·병렬", "Explore·parallel") }
     static var codexTaskTriage: String { t("분류·반복", "Triage·repeat") }
+    static func titleCodexTodayTokens(_ tokens: String) -> String { t("Codex 오늘 \(tokens) 토큰", "Codex \(tokens) tok today") }
     static var titleCodexReauth: String { t("Codex 재인증", "Codex re-auth") }
     static var titleCodexLogin: String { t("Codex 로그인", "Codex login") }
     static func titleCodexWarningCount(_ count: Int) -> String { t("Codex 주의 \(count)", "Codex warning \(count)") }

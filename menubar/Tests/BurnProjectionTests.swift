@@ -86,6 +86,12 @@ struct BurnProjectionTests {
         precondition(burnVerdictDisplay(lane(sure)).label == L10n.verdictOnTarget)
         // 관측된 부족은 추정이 아니다.
         precondition(burnVerdictDisplay(lane(wild, blocked: 1)).label == L10n.verdictBlocked)
+        // 값은 있는데 리셋 시각을 몰라 전망을 못 내는 레인(Grok)은 "측정 전"이 아니라 지금 값을 말한다(실사용 QA 2026-10-26).
+        let currentOnly = BurnProjection(current: 0.77, projected: nil, range: nil, basis: .unmeasured)
+        precondition(burnProjectionLabel(currentOnly) == L10n.burnCurrentOnly("77%"), burnProjectionLabel(currentOnly))
+        precondition(burnVerdictDisplay(lane(currentOnly)).label == L10n.verdictNoForecast, burnVerdictDisplay(lane(currentOnly)).label)
+        let nothing = BurnProjection(current: nil, projected: nil, range: nil, basis: .unmeasured)
+        precondition(burnProjectionLabel(nothing) == StatusVocabulary.notMeasured)
         let previousLanguage = L10n.language
         L10n.language = .en
         for text in [burnProjectionLabel(wild), burnVerdictDisplay(lane(wild)).label] {
