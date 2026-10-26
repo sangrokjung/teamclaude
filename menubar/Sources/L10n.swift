@@ -126,6 +126,18 @@ enum L10n {
           "Weekly window \(percent)% elapsed — bars above the line will fill before reset.")
     }
     static var todoAside: String { t("사람이 움직여야 풀리는 계정", "Accounts that need a person") }
+    static func waitGroupsCaption(_ parts: String) -> String {
+        t("기다리면 풀림 — \(parts)", "Clears on its own — \(parts)")
+    }
+    static func waitGroupSession(_ count: Int, _ soonest: String?) -> String {
+        soonest.map { t("세션 한도 \(count)개 \($0) 뒤부터", "\(count) on session limit, from \($0)") }
+            ?? t("세션 한도 \(count)개", "\(count) on session limit")
+    }
+    static func waitGroupOther(_ count: Int) -> String { t("일시 대기 \(count)개", "\(count) paused") }
+    static func waitGroupWeekly(_ count: Int, _ soonest: String?) -> String {
+        soonest.map { t("주간 한도 \(count)개 \($0) 뒤부터", "\(count) on weekly limit, from \($0)") }
+            ?? t("주간 한도 \(count)개", "\(count) on weekly limit")
+    }
     static func waitingCaption(_ names: String) -> String {
         t("기다리면 풀림 — \(names) · 리셋되면 돌아옵니다.", "Clears on its own — \(names) · back after reset.")
     }

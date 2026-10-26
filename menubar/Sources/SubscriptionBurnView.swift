@@ -58,7 +58,9 @@ func burnProjectionLabel(_ projection: BurnProjection) -> String {
     case .history(let cycles):
         guard let projected = projection.projected else { return StatusVocabulary.notMeasured }
         let base = L10n.burnHistory(cycles: cycles, percent: burnPercent(projected))
-        guard let range = projection.range else { return base }
+        // 범위의 두 끝이 같은 숫자로 보이면 덧붙이지 않는다("100%~100%"는 정보가 없다).
+        guard let range = projection.range,
+              burnPercent(range.lowerBound) != burnPercent(range.upperBound) else { return base }
         return "\(base) · \(burnPercent(range.lowerBound))~\(burnPercent(range.upperBound))"
     case .extrapolation(let confidence):
         guard let current = projection.current, let projected = projection.projected else {

@@ -52,6 +52,7 @@ struct OverviewStripTests {
         testBucketKeepsStatusMeaning()
         testWaitingCaptionShowsRemainder()
         testBucketClickOpensClaudeTab()
+        testBucketBandPriority()
         L10n.language = .en
         precondition(L10n.andMore(4) == "+4 more", L10n.andMore(4))
         precondition(L10n.stripBucketNote(total: 250, perSlot: 4) == "250 accounts · 4 per bar", L10n.stripBucketNote(total: 250, perSlot: 4))
@@ -174,5 +175,21 @@ struct OverviewStripTests {
         let narrow = overviewWaitingCaption(long, font: font, maxWidth: 260)
         precondition(PanelDraw.width(narrow, font) <= 260 && narrow.contains("외 2개") && narrow.contains("…"), narrow)
         precondition(overviewWaitingCaption([], font: font, maxWidth: 400).isEmpty)
+    }
+
+    /// 묶인 칸의 띠: 오류 > 대기 > 사용 가능 > 꺼 둠(검토 지적 2026-10-26 — 혼합 묶음에서 색이 사라졌다).
+    static func testBucketBandPriority() {
+        func member(_ tone: PanelTone, excluded: Bool = false, cap: PanelTone? = nil) -> OverviewStripColumn {
+            OverviewStripColumn(name: "m", label: "", tone: tone, weeklyPercent: 50, sessionPercent: nil, fablePercent: nil,
+                                weeklyElapsed: 0.4, excluded: excluded, cap: cap)
+        }
+        func band(_ members: [OverviewStripColumn]) -> PanelTone? {
+            let slot = overviewStripSlots(members, maxColumns: 1)[0].column
+            return slot.cap ?? overviewStripStateBand(slot.tone)
+        }
+        precondition(band([member(.ready), member(.error, excluded: true, cap: .error)]) == .error)
+        precondition(band([member(.ready), member(.wait)]) == .wait)
+        precondition(band([member(.ready), member(.off, excluded: true, cap: .off)]) == .ready)
+        precondition(band([member(.off, excluded: true, cap: .off), member(.off, excluded: true, cap: .off)]) == .off)
     }
 }

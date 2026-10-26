@@ -100,6 +100,9 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         var soonestSession: Double?
         var soonestWeekly: Double?
         var elapsedValues: [Double] = []
+        var waitSession: (count: Int, soonest: Double?) = (0, nil)
+        var waitWeekly: (count: Int, soonest: Double?) = (0, nil)
+        var waitOther = 0
         for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
@@ -121,7 +124,22 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             case .wait: model.waitCount += 1
             default: model.excludedCount += 1
             }
-            if state.state == .limited { model.waitingNames.append(row.name) }
+            if state.state == .limited {
+                model.waitingNames.append(row.name)
+                // 판정이 막힌 창으로 나눈다: 주간 창이면 며칠, 세션 창만이면 몇 시간. 창이 아닌 이유
+                // (throttled·exhausted)는 언제 풀릴지 창으로 말할 수 없어 따로 센다(검토 지적 2026-10-26).
+                // 세션·주간이 함께 막혔으면 주간으로 센다: 세션 창이 먼저 풀려도 주간이 풀릴 때까지 못 쓰므로
+                // 복귀 시각은 주간 리셋이다. 세션의 더 이른 시각을 보이면 틀린 안내가 된다.
+                if state.blockedWindows.contains(L10n.windowAllWeekly) {
+                    waitWeekly.count += 1
+                    if let w = weeklyRemaining, w > 0 { waitWeekly.soonest = min(waitWeekly.soonest ?? w, w) }
+                } else if state.blockedWindows.contains(L10n.sessionShort) {
+                    waitSession.count += 1
+                    if let s = sessionRemaining, s > 0 { waitSession.soonest = min(waitSession.soonest ?? s, s) }
+                } else {
+                    waitOther += 1
+                }
+            }
 
             // 손볼 것: 사람이 움직여야 풀리는 계정. 구독이 끝난 계정은 정리 대상이라 여기 넣지 않는다.
             guard state.state == .excluded, state.subscriptionAppearance != .ended else { continue }
@@ -144,8 +162,19 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             let mean = elapsedValues.reduce(0, +) / Double(elapsedValues.count)
             model.elapsedCaption = L10n.weekElapsedCaption(panelPercentNumber(mean * 100))
         }
+        if waitSession.count > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .session, count: waitSession.count, soonestSeconds: waitSession.soonest))
+        }
+        if waitWeekly.count > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .weekly, count: waitWeekly.count, soonestSeconds: waitWeekly.soonest))
+        }
+        if waitOther > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .other, count: waitOther, soonestSeconds: nil))
+        }
         if !model.waitingNames.isEmpty {
-            model.waitingCaption = L10n.waitingCaption(model.waitingNames.joined(separator: " · "))
+            model.waitingCaption = model.waitGroups.isEmpty
+                ? L10n.waitingCaption(model.waitingNames.joined(separator: " · "))
+                : overviewWaitGroupsCaption(model.waitGroups)
         }
     }
 
