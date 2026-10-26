@@ -22,31 +22,35 @@ final class QAExecution {
     private var stepResults: [QAStepResult] = []
     private var nextIndex = 0
     private var finished = false
-    private var timeoutWork: DispatchWorkItem?
-    private let startedDate = Date()
+    private var timeoutTimer: Timer?
+    private let startedDate: Date
 
     init(request: QARequest, outputDirectory: URL, runtime: QAExecutionRuntime,
          now: @escaping () -> Date = { Date() },
          delay: @escaping (TimeInterval, @escaping () -> Void) -> Void = { seconds, action in
-             DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: action)
+             let timer = Timer(timeInterval: seconds, repeats: false) { _ in action() }
+             RunLoop.main.add(timer, forMode: .common)
          }) {
         self.request = request
         self.outputDirectory = outputDirectory
         self.runtime = runtime
         self.now = now
         self.delay = delay
+        self.startedDate = now()
     }
 
     func start(completion: @escaping (QAResult) -> Void) {
-        let deadline = DispatchWorkItem { [weak self] in self?.finish(timeout: true, completion: completion) }
-        timeoutWork = deadline
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: deadline)
+        let deadline = Timer(timeInterval: 120, repeats: false) { [weak self] _ in
+            self?.finish(timeout: true, completion: completion)
+        }
+        timeoutTimer = deadline
+        RunLoop.main.add(deadline, forMode: .common)
         advance(completion: completion)
     }
 
     private func advance(completion: @escaping (QAResult) -> Void) {
         guard !finished else { return }
-        if now().timeIntervalSince(startedDate) > 120 {
+        if now().timeIntervalSince(startedDate) >= 120 {
             finish(timeout: true, completion: completion)
             return
         }
@@ -109,8 +113,11 @@ final class QAExecution {
     private func finish(timeout: Bool, completion: @escaping (QAResult) -> Void) {
         guard !finished else { return }
         finished = true
-        timeoutWork?.cancel()
+        timeoutTimer?.invalidate()
         if timeout { _ = runtime.closeMenu() }
+        if timeout {
+            stepResults.append(QAStepResult(index: nextIndex, kind: "timeout", ok: false, error: "execution exceeded 120 seconds"))
+        }
         let ended = now()
         let result = QAResult(id: request.id, startedAt: QAExecution.iso8601(startedDate), endedAt: QAExecution.iso8601(ended), completed: !timeout, timeout: timeout, steps: stepResults)
         do {

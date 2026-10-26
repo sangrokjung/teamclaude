@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import stat
 import sys
 import tempfile
 import time
@@ -12,10 +13,34 @@ OUT = ROOT / "out"
 
 
 def ensure_root():
-    ROOT.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(ROOT):
+        root_stat = ROOT.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
+            raise SystemExit(f"unsafe QA directory: {ROOT}")
+    else:
+        ROOT.mkdir(parents=True, mode=0o700)
     os.chmod(ROOT, 0o700)
-    OUT.mkdir(exist_ok=True)
+    if os.path.lexists(OUT):
+        out_stat = OUT.lstat()
+        if not stat.S_ISDIR(out_stat.st_mode) or out_stat.st_uid != os.getuid():
+            raise SystemExit(f"unsafe QA output directory: {OUT}")
+    else:
+        OUT.mkdir(mode=0o700)
     os.chmod(OUT, 0o700)
+
+
+def is_enabled():
+    if not os.path.lexists(ROOT) or not os.path.lexists(ROOT / "ENABLED"):
+        return False
+    root_stat = ROOT.lstat()
+    enabled_stat = (ROOT / "ENABLED").lstat()
+    return (stat.S_ISDIR(root_stat.st_mode) and root_stat.st_uid == os.getuid()
+            and stat.S_IMODE(root_stat.st_mode) == 0o700
+            and stat.S_ISREG(enabled_stat.st_mode) and enabled_stat.st_uid == os.getuid())
+
+
+def path_exists_without_following(path):
+    return os.path.lexists(path)
 
 
 def default_steps():
@@ -36,18 +61,20 @@ def default_steps():
 
 def write_request(request):
     ensure_root()
-    if not (ROOT / "ENABLED").is_file():
+    if not is_enabled():
         raise SystemExit("QA is disabled; run 'menubar/qa.sh enable' first")
     request_id = request["id"]
     destination = OUT / request_id
-    if destination.exists():
+    if path_exists_without_following(destination):
         raise SystemExit(f"output already exists: {destination}")
+    if path_exists_without_following(REQUEST):
+        raise SystemExit(f"request already pending: {REQUEST}")
     fd, temporary = tempfile.mkstemp(prefix=".request-", dir=ROOT)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(request, handle, separators=(",", ":"))
             handle.write("\n")
-        os.chmod(temporary, 0o600)
         os.replace(temporary, REQUEST)
     finally:
         try:
@@ -59,8 +86,11 @@ def write_request(request):
 
 def run(argument=None):
     if argument:
-        with open(argument, encoding="utf-8") as handle:
-            steps = json.load(handle)
+        try:
+            with open(argument, encoding="utf-8") as handle:
+                steps = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(f"could not read steps JSON: {error}")
     else:
         steps = default_steps()
     if not isinstance(steps, list):
@@ -81,6 +111,7 @@ def run(argument=None):
             except (OSError, json.JSONDecodeError):
                 pass
         time.sleep(0.25)
+    print(destination)
     print(f"timed out waiting for {destination}", file=sys.stderr)
     return 1
 
@@ -90,8 +121,17 @@ def main():
     if command == "enable":
         ensure_root()
         enabled = ROOT / "ENABLED"
-        enabled.touch(exist_ok=True)
-        os.chmod(enabled, 0o600)
+        flags = os.O_CREAT | os.O_WRONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(enabled, flags, 0o600)
+        except OSError as error:
+            raise SystemExit(f"unsafe ENABLED file: {error}")
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         print(ROOT)
         return 0
     if command == "disable":

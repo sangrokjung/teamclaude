@@ -40,6 +40,7 @@ The visual rules (colors, type, spacing) are in [DESIGN.md](DESIGN.md).
 ## QA hook
 
 The hook is disabled by default. Enable it only for a local QA session:
+The app accepts requests only while this user-owned directory is mode `0700` and contains the `ENABLED` file; otherwise it ignores the request file.
 
 ```sh
 menubar/qa.sh enable

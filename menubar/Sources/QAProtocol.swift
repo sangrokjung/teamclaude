@@ -129,8 +129,8 @@ struct QARequestValidator {
         guard request.steps.count <= maxSteps else { throw QAValidationError.tooManySteps }
         for step in request.steps {
             switch step {
-            case .key:
-                break
+            case .key(let key):
+                guard supportedKeys.contains(key) else { throw QAValidationError.invalidKey(key) }
             case .wait(let seconds): guard seconds.isFinite, seconds >= 0, seconds <= 10 else { throw QAValidationError.waitOutOfRange }
             case .capture(let name), .state(let name): guard validName(name, maxLength: 40) else { throw QAValidationError.invalidName(name) }
             case .open, .close: break
@@ -202,15 +202,27 @@ struct QAFileSafety {
         return (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == uid
     }
 
+    static func regularFileSize(_ url: URL) -> off_t? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return info.st_size
+    }
+
     static func isEnabled(_ paths: QAPaths = .current()) -> Bool {
         isOwnedDirectory(paths.root) && isOwnedRegularFile(paths.enabledFile)
     }
 
     static func atomicWrite(_ data: Data, to url: URL, permissions: Int = 0o600) throws {
         let temporary = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try data.write(to: temporary, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: temporary.path)
-        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
-        try FileManager.default.moveItem(at: temporary, to: url)
+        do {
+            try data.write(to: temporary)
+            try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: temporary.path)
+            guard Darwin.rename(temporary.path, url.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
     }
 }

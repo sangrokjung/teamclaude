@@ -22,26 +22,53 @@ final class QAAppRuntime: QAExecutionRuntime {
     }
 
     func menuDidOpen() {
-        pendingOpen?(.success(()))
+        guard let completion = pendingOpen else { return }
         pendingOpen = nil
+        let timer = Timer(timeInterval: 0, repeats: false) { _ in
+            completion(.success(()))
+        }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     func sendKey(_ key: String) -> Result<Void, Error> {
         guard let menu = delegate?.statusItem?.menu, menuIsOpen else {
             return .failure(QAExecutionError(description: "menu is not open"))
         }
-        if key == "escape" {
-            menu.cancelTracking()
-            return .success(())
-        }
         let command = key == "cmd+k"
-        let characters = command ? "k" : key
+        let characters: String
+        switch key {
+        case "cmd+k": characters = "k"
+        case "escape": characters = "\u{1b}"
+        default: characters = key
+        }
+        let keyCode: UInt16
+        switch key {
+        case "1": keyCode = 18
+        case "2": keyCode = 19
+        case "3": keyCode = 20
+        case "4": keyCode = 21
+        case "5": keyCode = 23
+        case "r": keyCode = 15
+        case "cmd+k": keyCode = 40
+        case "escape": keyCode = 53
+        default:
+            return .failure(QAExecutionError(description: "unsupported key: \(key)"))
+        }
         let modifiers: NSEvent.ModifierFlags = command ? [.command] : []
-        let keyCode: UInt16 = characters == "r" ? 15 : (command ? 40 : UInt16(characters.utf8.first ?? 0))
         guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
                                            timestamp: 0, windowNumber: menu.window?.windowNumber ?? 0, context: nil,
                                            characters: characters, charactersIgnoringModifiers: characters,
-                                           isARepeat: false, keyCode: keyCode), menu.performKeyEquivalent(with: event) else {
+                                           isARepeat: false, keyCode: keyCode) else {
+            return .failure(QAExecutionError(description: "unsupported key: \(key)"))
+        }
+        if key == "escape" {
+            guard let window = menu.window else {
+                return .failure(QAExecutionError(description: "menu window is unavailable"))
+            }
+            window.sendEvent(event)
+            return .success(())
+        }
+        guard menu.performKeyEquivalent(with: event) else {
             return .failure(QAExecutionError(description: "unsupported key: \(key)"))
         }
         return .success(())

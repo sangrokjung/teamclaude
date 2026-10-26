@@ -4724,19 +4724,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard qaExecution == nil else { return }
         let paths = QAPaths.current()
         guard QAFileSafety.isEnabled(paths) else { return }
-        guard QAFileSafety.isOwnedRegularFile(paths.requestFile) else { return }
-        guard let data = try? Data(contentsOf: paths.requestFile) else {
-            try? FileManager.default.removeItem(at: paths.requestFile)
-            return
-        }
-        if data.count > QARequestValidator.maxRequestBytes {
-            rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
-            try? FileManager.default.removeItem(at: paths.requestFile)
-            return
-        }
+        guard QAFileSafety.pathExists(paths.requestFile) else { return }
         let claimed = paths.root.appendingPathComponent(".request-\(UUID().uuidString)")
         guard (try? FileManager.default.moveItem(at: paths.requestFile, to: claimed)) != nil else { return }
         defer { try? FileManager.default.removeItem(at: claimed) }
+        guard QAFileSafety.isOwnedRegularFile(claimed),
+              let fileSize = QAFileSafety.regularFileSize(claimed) else { return }
+        guard let handle = FileHandle(forReadingAtPath: claimed.path) else { return }
+        let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
+        handle.closeFile()
+        if fileSize > off_t(QARequestValidator.maxRequestBytes) || data.count > QARequestValidator.maxRequestBytes {
+            rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
+            return
+        }
         let request: QARequest
         do {
             request = try QARequestValidator.decode(data)
