@@ -66,6 +66,11 @@ struct QAProtocolTests {
         truncated.append(Data(repeating: 32, count: QARequestValidator.maxRequestBytes))
         precondition(QARequestValidator.salvageID(from: truncated.prefix(QARequestValidator.maxRequestBytes + 1)) == "big-1")
         precondition(QARequestValidator.salvageID(from: Data("{\"id\":\"bad/\"".utf8)) == nil)
+        // id가 256바이트 뒤에 있어도 읽은 범위 안이면 찾는다(검토 지적 2026-10-26).
+        var late = Data("{\"steps\":[".utf8)
+        late.append(Data(repeating: 32, count: 4096))
+        late.append(Data("],\"id\":\"late-1\"".utf8))
+        precondition(QARequestValidator.salvageID(from: late) == "late-1")
         precondition(QARequestValidator.salvageID(from: oversized) == nil)
     }
 

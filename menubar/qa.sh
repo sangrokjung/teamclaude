@@ -146,7 +146,7 @@ def run(argument=None):
                 pass
         time.sleep(0.25)
     print(destination)
-    print(f"timed out waiting for {destination}", file=sys.stderr)
+    print(f"timed out waiting for {destination} (if the app could not write a result, the request is kept as {ROOT}/failed-*.json)", file=sys.stderr)
     return 1
 
 

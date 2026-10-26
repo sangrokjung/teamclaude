@@ -143,9 +143,9 @@ struct QARequestValidator {
         }
     }
 
-    /// 잘렸거나 깨진 요청에서도 결과를 돌려줄 id를 찾는다(qa.sh는 id를 맨 앞에 쓴다).
+    /// 잘렸거나 깨진 요청에서도 결과를 돌려줄 id를 찾는다. 읽은 범위(최대 64KiB+1) 전체에서 첫 "id"를 본다.
     static func salvageID(from data: Data) -> String? {
-        let prefix = String(decoding: data.prefix(256), as: UTF8.self)
+        let prefix = String(decoding: data.prefix(maxRequestBytes + 1), as: UTF8.self)
         guard let range = prefix.range(of: #"\"id\"\s*:\s*\"([A-Za-z0-9_-]{1,64})\""#, options: .regularExpression) else { return nil }
         let match = String(prefix[range])
         guard let open = match.dropLast().lastIndex(of: "\"") else { return nil }

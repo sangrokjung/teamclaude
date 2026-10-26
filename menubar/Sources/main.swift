@@ -4727,39 +4727,48 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard QAFileSafety.pathExists(paths.requestFile) else { return }
         let claimed = paths.root.appendingPathComponent(".request-\(UUID().uuidString)")
         guard (try? FileManager.default.moveItem(at: paths.requestFile, to: claimed)) != nil else { return }
-        defer { try? FileManager.default.removeItem(at: claimed) }
+        // 결과(실행 결과든 거부 결과든)를 남긴 요청만 지운다. 남기지 못했으면 요청을 failed-*.json으로 보존해
+        // 조용히 사라지지 않게 한다(검토 지적 2026-10-26).
+        var reported = false
+        defer {
+            if reported {
+                try? FileManager.default.removeItem(at: claimed)
+            } else {
+                let kept = paths.root.appendingPathComponent("failed-\(UUID().uuidString).json")
+                try? FileManager.default.moveItem(at: claimed, to: kept)
+                print("QA: request kept without result → \(kept.lastPathComponent)")
+                fflush(stdout)
+            }
+        }
         guard QAFileSafety.isOwnedRegularFile(claimed),
               let fileSize = QAFileSafety.regularFileSize(claimed) else { return }
         guard let handle = FileHandle(forReadingAtPath: claimed.path) else { return }
         let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
         handle.closeFile()
         if fileSize > off_t(QARequestValidator.maxRequestBytes) || data.count > QARequestValidator.maxRequestBytes {
-            rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
+            reported = rejectQARequest(data: data, reason: QAValidationError.requestTooLarge.description)
             return
         }
         let request: QARequest
         do {
             request = try QARequestValidator.decode(data)
         } catch {
-            rejectQARequest(data: data, reason: String(describing: error))
+            reported = rejectQARequest(data: data, reason: String(describing: error))
             return
         }
-        if !QAFileSafety.pathExists(paths.outputRoot) {
-            do { try FileManager.default.createDirectory(at: paths.outputRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
-            catch { return }
-        }
-        guard QAFileSafety.isOwnedDirectory(paths.outputRoot) else { return }
+        guard ensureQAOutputRoot(paths) else { return }
         let output = paths.outputRoot.appendingPathComponent(request.id, isDirectory: true)
         guard !QAFileSafety.pathExists(output) else {
-            writeQARejection(id: request.id, reason: QAValidationError.outputAlreadyExists.description, paths: paths)
+            reported = writeQARejection(id: request.id, reason: QAValidationError.outputAlreadyExists.description, paths: paths)
             return
         }
         do {
             try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         } catch {
-            writeQARejection(id: request.id, reason: "could not create output directory: \(error.localizedDescription)", paths: paths)
+            reported = writeQARejection(id: request.id, reason: "could not create output directory: \(error.localizedDescription)", paths: paths)
             return
         }
+        reported = true
         let execution = QAExecution(request: request, outputDirectory: output, runtime: qaRuntime)
         qaExecution = execution
         execution.start { [weak self] _ in
@@ -4767,33 +4776,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func rejectQARequest(data: Data, reason: String) {
-        let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
-        guard let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
-                ?? QARequestValidator.salvageID(from: data) else { return }
-        writeQARejection(id: id, reason: reason, paths: QAPaths.current())
-    }
-
-    /// 거부한 요청도 결과를 남긴다. 결과 폴더를 만들 수 없으면(이미 있음 등) 옆에 `<id>.rejected.json`을 쓴다 —
-    /// 결과 없이 지우면 qa.sh가 시간 초과까지 기다린다.
-    private func writeQARejection(id: String, reason: String, paths: QAPaths) {
+    private func ensureQAOutputRoot(_ paths: QAPaths) -> Bool {
         if !QAFileSafety.pathExists(paths.outputRoot) {
             try? FileManager.default.createDirectory(at: paths.outputRoot, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         }
-        guard QAFileSafety.isOwnedDirectory(paths.outputRoot) else { return }
+        return QAFileSafety.isOwnedDirectory(paths.outputRoot)
+    }
+
+    /// 거부 결과를 남겼으면 true.
+    private func rejectQARequest(data: Data, reason: String) -> Bool {
+        let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+        guard let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
+                ?? QARequestValidator.salvageID(from: data) else { return false }
+        return writeQARejection(id: id, reason: reason, paths: QAPaths.current())
+    }
+
+    /// 거부한 요청도 결과를 남긴다. 결과 폴더를 만들 수 없으면(이미 있음 등) 옆에 `<id>.rejected.json`을 쓴다 —
+    /// 결과 없이 지우면 qa.sh가 시간 초과까지 기다린다. 어느 쪽도 쓰지 못하면 false(요청은 보존된다).
+    private func writeQARejection(id: String, reason: String, paths: QAPaths) -> Bool {
+        guard ensureQAOutputRoot(paths) else { return false }
         let stamp = ISO8601DateFormatter().string(from: Date())
         let result = QAResult(id: id, startedAt: stamp, endedAt: stamp, completed: false, timeout: false,
                               steps: [QAStepResult(index: 0, kind: "request", ok: false, error: reason)])
-        guard let data = try? JSONEncoder.qaEncoder.encode(result) else { return }
+        guard let data = try? JSONEncoder.qaEncoder.encode(result) else { return false }
         let output = paths.outputRoot.appendingPathComponent(id, isDirectory: true)
         if !QAFileSafety.pathExists(output),
            (try? FileManager.default.createDirectory(at: output, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])) != nil {
-            try? QAFileSafety.atomicWrite(data, to: output.appendingPathComponent("result.json"))
-            return
+            return (try? QAFileSafety.atomicWrite(data, to: output.appendingPathComponent("result.json"))) != nil
         }
         let sidecar = paths.outputRoot.appendingPathComponent("\(id).rejected.json")
-        guard !QAFileSafety.pathExists(sidecar) else { return }
-        try? QAFileSafety.atomicWrite(data, to: sidecar)
+        guard !QAFileSafety.pathExists(sidecar) else { return false }
+        return (try? QAFileSafety.atomicWrite(data, to: sidecar)) != nil
     }
 
     /// 갱신이 끊긴 CLI 레인을 로그로 드러낸다. 값이 낡았는데 화면은 멀쩡해 보이는 상태가
