@@ -65,6 +65,11 @@ struct BurnProjectionTests {
         // 신뢰 높은 외삽은 그대로 숫자를 쓴다(값은 손대지 않는다).
         let sure = BurnProjection(current: 0.6, projected: 1.2, range: nil, basis: .extrapolation(confidence: .normal))
         precondition(burnProjectionLabel(sure).contains("120%"), burnProjectionLabel(sure))
+        // 과거 주기 범위의 두 끝이 같은 숫자면 덧붙이지 않는다(실사용 QA 2026-10-26: "평균 100% · 100%~100%").
+        let flat = BurnProjection(current: 1, projected: 1, range: 0.999...1.0, basis: .history(cycles: 12))
+        precondition(!burnProjectionLabel(flat).contains("~"), burnProjectionLabel(flat))
+        let spread = BurnProjection(current: 0.9, projected: 0.9, range: 0.7...1.0, basis: .history(cycles: 12))
+        precondition(burnProjectionLabel(spread).contains("70%~100%"), burnProjectionLabel(spread))
         // 100% 이하 신뢰 낮음은 숫자를 쓴다.
         let lowSmall = BurnProjection(current: 0.03, projected: 0.4, range: nil, basis: .extrapolation(confidence: .low))
         precondition(burnProjectionLabel(lowSmall).contains("40%"), burnProjectionLabel(lowSmall))

@@ -73,8 +73,38 @@ struct OverviewModel: Equatable {
     var waitingNames: [String] = []
     /// 있으면 "기다리면 풀림" 줄을 그린다. 그리는 문구는 overviewWaitingCaption이 폭에 맞춰 waitingNames로 다시 만든다.
     var waitingCaption: String?
+    /// 한도 대기를 세션 창(몇 시간)과 주간 창(며칠)으로 나눈 묶음. 막대는 주간만 그려서
+    /// 주간이 낮은데 대기인 칸(세션 창이 찬 계정)이 왜 기다리는지 여기서 말한다.
+    var waitGroups: [OverviewWaitGroup] = []
     var burnAside: String?
     var burnLines: [OverviewBurnLine] = []
+}
+
+func overviewStripStateBand(_ tone: PanelTone) -> PanelTone? {
+    switch tone {
+    case .ready, .wait: return tone
+    default: return nil
+    }
+}
+
+enum OverviewWaitWindow: Equatable { case session, weekly }
+
+struct OverviewWaitGroup: Equatable {
+    let window: OverviewWaitWindow
+    let count: Int
+    /// 그 묶음에서 가장 먼저 돌아오는 계정까지 남은 초. 모르면 nil.
+    let soonestSeconds: Double?
+}
+
+func overviewWaitGroupsCaption(_ groups: [OverviewWaitGroup]) -> String {
+    let parts = groups.map { group -> String in
+        let duration = group.soonestSeconds.map { L10n.duration(seconds: Int($0)) }
+        switch group.window {
+        case .session: return L10n.waitGroupSession(group.count, duration)
+        case .weekly: return L10n.waitGroupWeekly(group.count, duration)
+        }
+    }
+    return L10n.waitGroupsCaption(parts.joined(separator: " · "))
 }
 
 /// 띠의 칸 하나. 계정이 칸 수보다 많으면 이웃한 계정 여럿을 한 칸으로 묶는다(그리기만의 일 — 값은 고르고 평균만 낸다).
@@ -398,8 +428,10 @@ final class OverviewTabView: NSView {
             if model.waitingCaption != nil {
                 let y = todoRowRect(model.todos.count).minY + 4
                 PanelDraw.dot(x0 + 4, centerY: y + 8, TeamClaudePalette.amber)
-                PanelDraw.text(overviewWaitingCaption(model.waitingNames, font: TeamClaudePalette.captionFont, maxWidth: width - 20),
-                               x0 + 18, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+                let caption = model.waitGroups.isEmpty
+                    ? overviewWaitingCaption(model.waitingNames, font: TeamClaudePalette.captionFont, maxWidth: width - 20)
+                    : PanelDraw.clipped(overviewWaitGroupsCaption(model.waitGroups), TeamClaudePalette.captionFont, maxWidth: width - 20)
+                PanelDraw.text(caption, x0 + 18, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
             }
         }
 
@@ -448,12 +480,14 @@ final class OverviewTabView: NSView {
             rect.fill()
             if let weekly = column.weeklyPercent {
                 let share = CGFloat(max(0, min(100, weekly)) / 100)
+                // 채움 색은 주간 사용률만 말한다(98% 문턱부터 호박색, DESIGN.md "막대"). 상태는 위 띠가 말한다.
                 let fill = column.excluded ? TeamClaudePalette.graphite
-                    : column.tone == .wait ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.85)
+                    : weekly >= panelRoutingThresholdPercent ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.85)
                 fill.setFill()
                 NSRect(x: rect.minX, y: rect.maxY - rect.height * share, width: rect.width, height: rect.height * share).fill()
             }
-            if let cap = column.cap {
+            // 위 띠는 범례 점과 같은 색으로 상태를 말한다(사용 가능 민트·대기 호박·제외 빨강·꺼 둠 회색).
+            if let cap = column.cap ?? overviewStripStateBand(column.tone) {
                 cap.color.setFill()
                 NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 3).fill()
             }

@@ -30,6 +30,7 @@ struct DashboardOverviewBuilderTests {
         testFixtureModel(makeOverviewModel(input))
         testNoticesReplaceLanes(input)
         testMissingSources(input)
+        testWaitGroupsSplitSessionFromWeekly(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -52,6 +53,9 @@ struct DashboardOverviewBuilderTests {
         // 기다리면 풀림: 한도에 걸린 두 계정
         precondition(model.waitingNames == ["acct-16", "acct-17"], "\(model.waitingNames)")
         precondition(model.waitingCaption != nil)
+        // 두 계정 모두 주간 창이 찼다 → 주간 한도 묶음 하나(며칠 뒤 복귀)
+        precondition(model.waitGroups.map(\.window) == [.weekly] && model.waitGroups[0].count == 2, "\(model.waitGroups)")
+        precondition(model.waitingCaption?.hasPrefix("기다리면 풀림 — 주간 한도 2개 ") == true, model.waitingCaption ?? "nil")
 
         // 레인 4개
         precondition(model.lanes.map(\.name) == ["Claude Fable", "Codex", "Grok", "agy"])
@@ -105,5 +109,34 @@ struct DashboardOverviewBuilderTests {
         precondition(model.lanes[0].value == StatusVocabulary.checking && model.lanes[0].quiet)
         precondition(model.lanes[1].value == StatusVocabulary.none && model.lanes[1].quiet)
         precondition(model.burnLines.isEmpty && model.burnAside == nil)
+    }
+
+    /// 실사용 QA 2026-10-26: 주간 43%인데 세션 창이 찬 계정이 막대에서 "왜 대기인지" 보이지 않았다.
+    /// 세션 창이 막은 계정은 세션 한도 묶음(몇 시간)으로, 주간이 찬 계정은 주간 한도 묶음(며칠)으로 센다.
+    static func testWaitGroupsSplitSessionFromWeekly(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]],
+              let index = accounts.firstIndex(where: { $0["name"] as? String == "acct-17" }),
+              var quota = accounts[index]["quota"] as? [String: Any] else {
+            preconditionFailure("fixture must carry acct-17")
+        }
+        quota["unified7d"] = 0.43
+        accounts[index]["quota"] = quota
+        status["accounts"] = accounts
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        let model = makeOverviewModel(DashboardOverviewInput(teamClaude: health, teamCodex: input.teamCodex,
+                                                             grok: input.grok, agy: input.agy, burn: input.burn,
+                                                             notices: input.notices, now: now))
+        precondition(model.waitingNames == ["acct-16", "acct-17"], "\(model.waitingNames)")
+        precondition(model.waitGroups.map(\.window) == [.session, .weekly], "\(model.waitGroups)")
+        precondition(model.waitGroups.map(\.count) == [1, 1], "\(model.waitGroups)")
+        // 세션 창은 픽스처에서 4시간 뒤, 주간 창은 6일 뒤에 리셋된다.
+        let caption = model.waitingCaption ?? ""
+        precondition(caption.contains("세션 한도 1개 3시간") || caption.contains("세션 한도 1개 4시간"), caption)
+        precondition(caption.contains("주간 한도 1개 5일") || caption.contains("주간 한도 1개 6일"), caption)
+        // 주간 43% 칸의 채움은 호박색이 아니다(색은 주간 문턱만 말한다) — 상태는 위 띠가 대기로 말한다.
+        let column = model.strip.first { $0.name == "acct-17" }!
+        precondition(column.tone == .wait && overviewStripStateBand(column.tone) == .wait)
+        precondition(overviewStripStateBand(.ready) == .ready && overviewStripStateBand(.error) == nil)
     }
 }

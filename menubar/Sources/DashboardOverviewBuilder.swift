@@ -100,6 +100,8 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         var soonestSession: Double?
         var soonestWeekly: Double?
         var elapsedValues: [Double] = []
+        var waitSession: (count: Int, soonest: Double?) = (0, nil)
+        var waitWeekly: (count: Int, soonest: Double?) = (0, nil)
         for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
@@ -121,7 +123,17 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             case .wait: model.waitCount += 1
             default: model.excludedCount += 1
             }
-            if state.state == .limited { model.waitingNames.append(row.name) }
+            if state.state == .limited {
+                model.waitingNames.append(row.name)
+                // 주간 창이 찼으면 며칠, 아니면 세션 창이 막은 것이라 몇 시간 안에 돌아온다.
+                if (row.weeklyPercent ?? 0) >= panelRoutingThresholdPercent {
+                    waitWeekly.count += 1
+                    if let w = weeklyRemaining, w > 0 { waitWeekly.soonest = min(waitWeekly.soonest ?? w, w) }
+                } else {
+                    waitSession.count += 1
+                    if let s = sessionRemaining, s > 0 { waitSession.soonest = min(waitSession.soonest ?? s, s) }
+                }
+            }
 
             // 손볼 것: 사람이 움직여야 풀리는 계정. 구독이 끝난 계정은 정리 대상이라 여기 넣지 않는다.
             guard state.state == .excluded, state.subscriptionAppearance != .ended else { continue }
@@ -144,8 +156,16 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             let mean = elapsedValues.reduce(0, +) / Double(elapsedValues.count)
             model.elapsedCaption = L10n.weekElapsedCaption(panelPercentNumber(mean * 100))
         }
+        if waitSession.count > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .session, count: waitSession.count, soonestSeconds: waitSession.soonest))
+        }
+        if waitWeekly.count > 0 {
+            model.waitGroups.append(OverviewWaitGroup(window: .weekly, count: waitWeekly.count, soonestSeconds: waitWeekly.soonest))
+        }
         if !model.waitingNames.isEmpty {
-            model.waitingCaption = L10n.waitingCaption(model.waitingNames.joined(separator: " · "))
+            model.waitingCaption = model.waitGroups.isEmpty
+                ? L10n.waitingCaption(model.waitingNames.joined(separator: " · "))
+                : overviewWaitGroupsCaption(model.waitGroups)
         }
     }
 
