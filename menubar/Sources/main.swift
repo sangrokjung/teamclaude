@@ -4773,7 +4773,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 결과(실행·거부)를 남긴 요청만 지우고, 아니면 qa/failed-<uuid>.json으로 옮긴다.
     /// 옮기지 못하면 claim이 남고, 다음 폴링의 recoverOrphanQAClaims가 다시 옮긴다.
-    private func settleQAClaim(_ claimed: URL, reported: Bool, paths: QAPaths) {
+    private func settleQAClaim(_ claimed: URL, reported: Bool, paths: QAPaths,
+                               reason: String = "menubar app could not save a result for this request") {
+        // 결과를 남기지 못한 요청은 경로와 상관없이 그 id로 거부 결과를 먼저 쓴다 — 기다리는 qa.sh가 바로 끝난다.
+        let reported = reported || rejectQAClaim(claimed, reason: reason, paths: paths)
         if reported {
             do { try FileManager.default.removeItem(at: claimed) }
             catch { print("QA: could not remove handled request \(claimed.lastPathComponent): \(error.localizedDescription)") }
@@ -4791,28 +4794,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 실행 중이 아닐 때 남아 있는 .request-* claim은 주인이 없다(실행 중 앱 종료·정산 실패).
-    /// 결과를 남기지 못한 요청이므로 failed-*.json으로 옮겨 보이게 한다.
+    /// 결과를 남기지 못한 요청이므로 그 id로 거부 결과를 쓰고, id를 못 찾으면 failed-*.json으로 보존한다.
     private func recoverOrphanQAClaims(_ paths: QAPaths) {
         guard qaExecution == nil,
               let names = try? FileManager.default.contentsOfDirectory(atPath: paths.root.path) else { return }
         for name in names where name.hasPrefix(".request-") {
-            let claim = paths.root.appendingPathComponent(name)
-            // 기다리는 qa.sh가 바로 끝나도록 그 id로 결과를 남긴다(결과 폴더가 이미 있으면 <id>.rejected.json).
-            // 실행이 끝나 result.json까지 저장된 뒤 정산만 실패한 claim이면 결과가 이미 있다.
-            var reported = false
-            if QAFileSafety.isOwnedRegularFile(claim), let handle = FileHandle(forReadingAtPath: claim.path) {
-                let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
-                handle.closeFile()
-                let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
-                if let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
-                    ?? QARequestValidator.salvageID(from: data) {
-                    let finished = paths.outputRoot.appendingPathComponent(id, isDirectory: true).appendingPathComponent("result.json")
-                    reported = QAFileSafety.isOwnedRegularFile(finished)
-                        || writeQARejection(id: id, reason: "menubar app stopped before the request finished", paths: paths)
-                }
-            }
-            settleQAClaim(claim, reported: reported, paths: paths)
+            settleQAClaim(paths.root.appendingPathComponent(name), reported: false, paths: paths,
+                          reason: "menubar app stopped before the request finished")
         }
+    }
+
+    /// claim 원문에서 id를 찾아 거부 결과를 쓴다. 실행이 끝나 result.json이 이미 있으면 결과가 있는 것으로 본다.
+    private func rejectQAClaim(_ claim: URL, reason: String, paths: QAPaths) -> Bool {
+        guard QAFileSafety.isOwnedRegularFile(claim), let handle = FileHandle(forReadingAtPath: claim.path) else { return false }
+        let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
+        handle.closeFile()
+        let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+        guard let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
+                ?? QARequestValidator.salvageID(from: data) else { return false }
+        let finished = paths.outputRoot.appendingPathComponent(id, isDirectory: true).appendingPathComponent("result.json")
+        return QAFileSafety.isOwnedRegularFile(finished) || writeQARejection(id: id, reason: reason, paths: paths)
     }
 
     private func ensureQAOutputRoot(_ paths: QAPaths) -> Bool {
