@@ -31,8 +31,12 @@ struct SubscriptionBurnLayoutTests {
 
         precondition(burnProjectionLabel(
             BurnProjection(current: nil, projected: nil, range: nil, basis: .collecting)) == "수집 중")
+        // 값은 있는데 주기를 몰라 전망만 못 내면 지금 값을 말한다(2026-10-26: Grok이 CLI 탭 77%인데 "측정 전"이었다).
         precondition(burnProjectionLabel(
             BurnProjection(current: 0.9, projected: nil, range: nil, basis: .unmeasured))
+            == "지금 90% · 주기 모름")
+        precondition(burnProjectionLabel(
+            BurnProjection(current: nil, projected: nil, range: nil, basis: .unmeasured))
             == StatusVocabulary.notMeasured)
 
         // 판정 문구

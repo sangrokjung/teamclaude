@@ -45,6 +45,10 @@ struct LaneUsage: Equatable {
 
 /// 주간과 세션 중 사용률이 높은 쪽이 병목이고, 병목이 판정을 지배해야 한다.
 func burnBindingProjection(_ usage: LaneUsage) -> BurnProjection {
+    // 둘 다 전망이 없으면 지금 값으로 고른다 — 지금 값만 보이는 화면이 덜 찬 창을 말하지 않게(검토 지적 2026-10-26).
+    if usage.weekly.projected == nil, usage.session.projected == nil {
+        return (usage.session.current ?? -1) > (usage.weekly.current ?? -1) ? usage.session : usage.weekly
+    }
     let weekly = usage.weekly.projected ?? -1
     let session = usage.session.projected ?? -1
     return session > weekly ? usage.session : usage.weekly

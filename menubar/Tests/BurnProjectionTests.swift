@@ -86,6 +86,19 @@ struct BurnProjectionTests {
         precondition(burnVerdictDisplay(lane(sure)).label == L10n.verdictOnTarget)
         // 관측된 부족은 추정이 아니다.
         precondition(burnVerdictDisplay(lane(wild, blocked: 1)).label == L10n.verdictBlocked)
+        // 값은 있는데 리셋 시각을 몰라 전망을 못 내는 레인(Grok)은 "측정 전"이 아니라 지금 값을 말한다(실사용 QA 2026-10-26).
+        let currentOnly = BurnProjection(current: 0.77, projected: nil, range: nil, basis: .unmeasured)
+        precondition(burnProjectionLabel(currentOnly) == L10n.burnCurrentOnly("77%"), burnProjectionLabel(currentOnly))
+        precondition(burnVerdictDisplay(lane(currentOnly)).label == L10n.verdictNoForecast, burnVerdictDisplay(lane(currentOnly)).label)
+        // 두 창 모두 전망이 없으면 지금 값이 높은 창이 병목이다(주간 20%·세션 90% → 세션).
+        let weeklyLow = BurnProjection(current: 0.20, projected: nil, range: nil, basis: .unmeasured)
+        let sessionHigh = BurnProjection(current: 0.90, projected: nil, range: nil, basis: .unmeasured)
+        let bothCurrentOnly = LaneUsage(lane: "codex", paidAccounts: 1, contributingAccounts: 1, errorAccounts: 0, disabledAccounts: 0,
+                                        weekly: weeklyLow, session: sessionHigh, blockedMoments: 0)
+        precondition(burnBindingProjection(bothCurrentOnly) == sessionHigh)
+        precondition(burnProjectionLabel(burnBindingProjection(bothCurrentOnly)) == L10n.burnCurrentOnly("90%"))
+        let nothing = BurnProjection(current: nil, projected: nil, range: nil, basis: .unmeasured)
+        precondition(burnProjectionLabel(nothing) == StatusVocabulary.notMeasured)
         let previousLanguage = L10n.language
         L10n.language = .en
         for text in [burnProjectionLabel(wild), burnVerdictDisplay(lane(wild)).label] {

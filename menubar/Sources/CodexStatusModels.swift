@@ -94,7 +94,8 @@ struct CodexHealth {
         if !authPresent || (!hasApiKey && !hasTokens) { return L10n.titleCodexLogin }
         if errorEvents > 0 { return L10n.titleCodexWarningCount(errorEvents) }
         if isWarning && todayTokens == 0 { return L10n.titleCodexWarning }
-        return "Codex \(formatCodexTokens(todayTokens))/d"
+        // "Codex 3/6"(계정 풀)과 같은 꼴이면 계정 수로 읽힌다 — 이 맥에서 오늘 쓴 토큰이라고 말한다(실사용 QA 2026-10-26).
+        return L10n.titleCodexTodayTokens(formatCodexTokens(todayTokens))
     }
 
     var statusLabel: String {
