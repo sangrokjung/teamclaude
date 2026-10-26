@@ -90,6 +90,13 @@ struct BurnProjectionTests {
         let currentOnly = BurnProjection(current: 0.77, projected: nil, range: nil, basis: .unmeasured)
         precondition(burnProjectionLabel(currentOnly) == L10n.burnCurrentOnly("77%"), burnProjectionLabel(currentOnly))
         precondition(burnVerdictDisplay(lane(currentOnly)).label == L10n.verdictNoForecast, burnVerdictDisplay(lane(currentOnly)).label)
+        // 두 창 모두 전망이 없으면 지금 값이 높은 창이 병목이다(주간 20%·세션 90% → 세션).
+        let weeklyLow = BurnProjection(current: 0.20, projected: nil, range: nil, basis: .unmeasured)
+        let sessionHigh = BurnProjection(current: 0.90, projected: nil, range: nil, basis: .unmeasured)
+        let bothCurrentOnly = LaneUsage(lane: "codex", paidAccounts: 1, contributingAccounts: 1, errorAccounts: 0, disabledAccounts: 0,
+                                        weekly: weeklyLow, session: sessionHigh, blockedMoments: 0)
+        precondition(burnBindingProjection(bothCurrentOnly) == sessionHigh)
+        precondition(burnProjectionLabel(burnBindingProjection(bothCurrentOnly)) == L10n.burnCurrentOnly("90%"))
         let nothing = BurnProjection(current: nil, projected: nil, range: nil, basis: .unmeasured)
         precondition(burnProjectionLabel(nothing) == StatusVocabulary.notMeasured)
         let previousLanguage = L10n.language
