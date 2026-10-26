@@ -4796,7 +4796,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard qaExecution == nil,
               let names = try? FileManager.default.contentsOfDirectory(atPath: paths.root.path) else { return }
         for name in names where name.hasPrefix(".request-") {
-            settleQAClaim(paths.root.appendingPathComponent(name), reported: false, paths: paths)
+            let claim = paths.root.appendingPathComponent(name)
+            // 기다리는 qa.sh가 바로 끝나도록 그 id로 결과를 남긴다(결과 폴더가 이미 있으면 <id>.rejected.json).
+            // 실행이 끝나 result.json까지 저장된 뒤 정산만 실패한 claim이면 결과가 이미 있다.
+            var reported = false
+            if QAFileSafety.isOwnedRegularFile(claim), let handle = FileHandle(forReadingAtPath: claim.path) {
+                let data = handle.readData(ofLength: QARequestValidator.maxRequestBytes + 1)
+                handle.closeFile()
+                let parsedID = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["id"] as? String
+                if let id = parsedID.flatMap({ QARequestValidator.validName($0, maxLength: 64) ? $0 : nil })
+                    ?? QARequestValidator.salvageID(from: data) {
+                    let finished = paths.outputRoot.appendingPathComponent(id, isDirectory: true).appendingPathComponent("result.json")
+                    reported = QAFileSafety.isOwnedRegularFile(finished)
+                        || writeQARejection(id: id, reason: "menubar app stopped before the request finished", paths: paths)
+                }
+            }
+            settleQAClaim(claim, reported: reported, paths: paths)
         }
     }
 
