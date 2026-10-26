@@ -128,16 +128,21 @@ struct QARequestValidator {
     static func validate(_ request: QARequest) throws {
         guard validName(request.id, maxLength: 64) else { throw QAValidationError.invalidID }
         guard request.steps.count <= maxSteps else { throw QAValidationError.tooManySteps }
-        // 산출물 이름은 요청 안에서 한 번만 쓴다. 같은 이름이 두 번 오면 앞 파일이 조용히 덮인다.
-        var usedNames: Set<String> = ["result"]
+        // 산출물 이름은 종류마다 요청 안에서 한 번만 쓴다(capture는 .png, state는 .json — result.json은 예약).
+        // 같은 이름이 두 번 오면 앞 파일이 조용히 덮인다.
+        var captureNames: Set<String> = []
+        var stateNames: Set<String> = ["result"]
         for step in request.steps {
             switch step {
             case .key(let key):
                 guard supportedKeys.contains(key) else { throw QAValidationError.invalidKey(key) }
             case .wait(let seconds): guard seconds.isFinite, seconds >= 0, seconds <= 10 else { throw QAValidationError.waitOutOfRange }
-            case .capture(let name), .state(let name):
+            case .capture(let name):
                 guard validName(name, maxLength: 40) else { throw QAValidationError.invalidName(name) }
-                guard usedNames.insert(name).inserted else { throw QAValidationError.duplicateName(name) }
+                guard captureNames.insert(name).inserted else { throw QAValidationError.duplicateName(name) }
+            case .state(let name):
+                guard validName(name, maxLength: 40) else { throw QAValidationError.invalidName(name) }
+                guard stateNames.insert(name).inserted else { throw QAValidationError.duplicateName(name) }
             case .open, .close: break
             }
         }

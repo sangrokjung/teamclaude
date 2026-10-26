@@ -47,10 +47,14 @@ class QACliTests(unittest.TestCase):
         self.assertTrue(before.startswith(b'{"id":"first"'))
 
     def test_duplicate_or_reserved_names_fail_before_publishing(self):
-        for steps in ([{"capture": "x"}, {"capture": "x"}], [{"capture": "x"}, {"state": "x"}], [{"state": "result"}]):
+        for steps in ([{"capture": "x"}, {"capture": "x"}], [{"state": "x"}, {"state": "x"}], [{"state": "result"}]):
             with self.assertRaises(SystemExit):
                 self.qa.write_request({"id": "dup", "steps": steps})
             self.assertFalse(os.path.lexists(self.qa.REQUEST))
+
+    def test_default_scenario_passes_the_same_name_rules(self):
+        # 기본 시나리오가 capture·state에 같은 이름을 써서 기본 실행이 거부됐다(2026-10-26 머지 후 실측).
+        self.qa.encode_request({"id": "default", "steps": self.qa.default_steps()})
 
     def test_oversized_request_fails_before_publishing(self):
         steps = [{"capture": f"n{i}"} for i in range(4000)]

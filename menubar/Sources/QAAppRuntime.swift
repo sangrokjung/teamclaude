@@ -62,10 +62,10 @@ final class QAAppRuntime: QAExecutionRuntime {
             return .failure(QAExecutionError(description: "unsupported key: \(key)"))
         }
         if key == "escape" {
-            guard let window = delegate?.openDashboardView?.window else {
-                return .failure(QAExecutionError(description: "menu window is unavailable"))
-            }
-            window.sendEvent(event)
+            // 메뉴가 열린 동안 Esc는 macOS 메뉴 추적 루프가 받아 메뉴를 닫는다(앱에 따로 처리하는 곳이 없다).
+            // 창에 합성 이벤트를 보내면 그 루프를 지나지 않아 아무 일도 없었다(2026-10-26 실측) — 같은 결과인 닫기로 보낸다.
+            _ = event
+            menu.cancelTracking()
             return .success(())
         }
         guard menu.performKeyEquivalent(with: event) else {

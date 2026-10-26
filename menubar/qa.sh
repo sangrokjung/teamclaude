@@ -48,7 +48,7 @@ def default_steps():
     return [
         {"open": True},
         {"capture": "overview"},
-        {"state": "overview"},
+        {"state": "overview-state"},
         {"key": "2"}, {"capture": "claude"},
         {"key": "3"}, {"capture": "codex"},
         {"key": "4"}, {"capture": "burn"},
@@ -56,7 +56,7 @@ def default_steps():
         {"key": "1"}, {"key": "r"}, {"wait": 2}, {"open": True},
         {"capture": "refreshed"}, {"key": "cmd+k"},
         {"capture": "actions"}, {"key": "escape"}, {"close": True},
-        {"state": "closed"},
+        {"state": "closed-state"},
     ]
 
 
@@ -65,15 +65,15 @@ MAX_REQUEST_BYTES = 64 * 1024
 
 def encode_request(request):
     """앱이 받는 것과 같은 상한·이름 규칙을 먼저 본다. 앱이 거부하면 결과를 기다리지 않고 바로 실패한다."""
-    used = {"result"}
+    used = {"capture": set(), "state": {"result"}}
     for step in request["steps"]:
         if isinstance(step, dict):
             for kind in ("capture", "state"):
                 name = step.get(kind)
                 if isinstance(name, str):
-                    if name in used:
+                    if name in used[kind]:
                         raise SystemExit(f"output name used twice or reserved: {name}")
-                    used.add(name)
+                    used[kind].add(name)
     # id를 맨 앞에 둔다 — 앱이 잘린 요청에서도 id를 찾아 거부 결과를 돌려줄 수 있다.
     data = (json.dumps({"id": request["id"], "steps": request["steps"]}, separators=(",", ":")) + "\n").encode("utf-8")
     if len(data) > MAX_REQUEST_BYTES:
