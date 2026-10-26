@@ -96,7 +96,7 @@ def write_request(request):
             raise SystemExit(f"output already exists: {destination}")
         if path_exists_without_following(REQUEST):
             raise SystemExit(f"request already pending: {REQUEST}")
-        fd, temporary = tempfile.mkstemp(prefix=".request-", dir=ROOT)
+        fd, temporary = tempfile.mkstemp(prefix=".publish-", dir=ROOT)
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as handle:

@@ -4724,6 +4724,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard qaExecution == nil else { return }
         let paths = QAPaths.current()
         guard QAFileSafety.isEnabled(paths) else { return }
+        recoverOrphanQAClaims(paths)
         guard QAFileSafety.pathExists(paths.requestFile) else { return }
         let claimed = paths.root.appendingPathComponent(".request-\(UUID().uuidString)")
         guard (try? FileManager.default.moveItem(at: paths.requestFile, to: claimed)) != nil else { return }
@@ -4771,15 +4772,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// 결과(실행·거부)를 남긴 요청만 지우고, 아니면 qa/failed-<uuid>.json으로 옮긴다.
+    /// 옮기지 못하면 claim이 남고, 다음 폴링의 recoverOrphanQAClaims가 다시 옮긴다.
     private func settleQAClaim(_ claimed: URL, reported: Bool, paths: QAPaths) {
         if reported {
-            try? FileManager.default.removeItem(at: claimed)
+            do { try FileManager.default.removeItem(at: claimed) }
+            catch { print("QA: could not remove handled request \(claimed.lastPathComponent): \(error.localizedDescription)") }
+            fflush(stdout)
             return
         }
         let kept = paths.root.appendingPathComponent("failed-\(UUID().uuidString).json")
-        try? FileManager.default.moveItem(at: claimed, to: kept)
-        print("QA: request kept without result → \(kept.lastPathComponent)")
+        do {
+            try FileManager.default.moveItem(at: claimed, to: kept)
+            print("QA: request kept without result → \(kept.lastPathComponent)")
+        } catch {
+            print("QA: could not keep request \(claimed.lastPathComponent) (retry on next poll): \(error.localizedDescription)")
+        }
         fflush(stdout)
+    }
+
+    /// 실행 중이 아닐 때 남아 있는 .request-* claim은 주인이 없다(실행 중 앱 종료·정산 실패).
+    /// 결과를 남기지 못한 요청이므로 failed-*.json으로 옮겨 보이게 한다.
+    private func recoverOrphanQAClaims(_ paths: QAPaths) {
+        guard qaExecution == nil,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: paths.root.path) else { return }
+        for name in names where name.hasPrefix(".request-") {
+            settleQAClaim(paths.root.appendingPathComponent(name), reported: false, paths: paths)
+        }
     }
 
     private func ensureQAOutputRoot(_ paths: QAPaths) -> Bool {
