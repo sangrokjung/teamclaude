@@ -86,7 +86,7 @@ extension QAStep: Codable {
 
 enum QAValidationError: Error, Equatable, CustomStringConvertible {
     case invalidJSON, invalidRequest, invalidID, invalidStep
-    case invalidKey(String), invalidName(String), tooManySteps, waitOutOfRange
+    case invalidKey(String), invalidName(String), duplicateName(String), tooManySteps, waitOutOfRange
     case requestTooLarge, notRegularFile(String), notEnabled, outputAlreadyExists, requestAlreadyClaimed
 
     var description: String {
@@ -97,6 +97,7 @@ enum QAValidationError: Error, Equatable, CustomStringConvertible {
         case .invalidStep: return "step must contain exactly one supported operation"
         case .invalidKey(let key): return "unsupported key: \(key)"
         case .invalidName(let name): return "invalid output name: \(name)"
+        case .duplicateName(let name): return "output name used twice or reserved: \(name)"
         case .tooManySteps: return "steps must contain at most 50 items"
         case .waitOutOfRange: return "wait must be between 0 and 10 seconds"
         case .requestTooLarge: return "request.json exceeds 64 KiB"
@@ -127,15 +128,29 @@ struct QARequestValidator {
     static func validate(_ request: QARequest) throws {
         guard validName(request.id, maxLength: 64) else { throw QAValidationError.invalidID }
         guard request.steps.count <= maxSteps else { throw QAValidationError.tooManySteps }
+        // 산출물 이름은 요청 안에서 한 번만 쓴다. 같은 이름이 두 번 오면 앞 파일이 조용히 덮인다.
+        var usedNames: Set<String> = ["result"]
         for step in request.steps {
             switch step {
             case .key(let key):
                 guard supportedKeys.contains(key) else { throw QAValidationError.invalidKey(key) }
             case .wait(let seconds): guard seconds.isFinite, seconds >= 0, seconds <= 10 else { throw QAValidationError.waitOutOfRange }
-            case .capture(let name), .state(let name): guard validName(name, maxLength: 40) else { throw QAValidationError.invalidName(name) }
+            case .capture(let name), .state(let name):
+                guard validName(name, maxLength: 40) else { throw QAValidationError.invalidName(name) }
+                guard usedNames.insert(name).inserted else { throw QAValidationError.duplicateName(name) }
             case .open, .close: break
             }
         }
+    }
+
+    /// 잘렸거나 깨진 요청에서도 결과를 돌려줄 id를 찾는다(qa.sh는 id를 맨 앞에 쓴다).
+    static func salvageID(from data: Data) -> String? {
+        let prefix = String(decoding: data.prefix(256), as: UTF8.self)
+        guard let range = prefix.range(of: #"\"id\"\s*:\s*\"([A-Za-z0-9_-]{1,64})\""#, options: .regularExpression) else { return nil }
+        let match = String(prefix[range])
+        guard let open = match.dropLast().lastIndex(of: "\"") else { return nil }
+        let id = String(match[match.index(after: open)..<match.index(before: match.endIndex)])
+        return validName(id, maxLength: 64) ? id : nil
     }
 
     static func validName(_ value: String, maxLength: Int) -> Bool {

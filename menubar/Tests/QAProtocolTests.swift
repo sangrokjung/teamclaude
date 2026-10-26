@@ -53,6 +53,20 @@ struct QAProtocolTests {
         precondition((try? QARequestValidator.decode(Data("{\"id\":\"ok\",\"steps\":[{\"wait\":10.1}]}".utf8))) == nil)
         let oversized = Data(repeating: 65, count: QARequestValidator.maxRequestBytes + 1)
         precondition((try? QARequestValidator.decode(oversized)) == nil)
+        // 같은 산출물 이름이 두 번 오면(또는 result) 앞 파일이 덮이므로 요청을 거부한다(검토 지적 2026-10-26).
+        for steps in ["[{\"capture\":\"x\"},{\"capture\":\"x\"}]", "[{\"capture\":\"x\"},{\"state\":\"x\"}]", "[{\"state\":\"result\"}]"] {
+            let duplicate = Data("{\"id\":\"ok\",\"steps\":\(steps)}".utf8)
+            do { _ = try QARequestValidator.decode(duplicate); preconditionFailure("accepted \(steps)") }
+            catch let error as QAValidationError {
+                guard case .duplicateName = error else { preconditionFailure("\(error)") }
+            } catch { preconditionFailure("\(error)") }
+        }
+        // 잘린 큰 요청에서도 id를 찾아 거부 결과를 돌려준다(결과 없이 지우면 qa.sh가 150초 기다린다).
+        var truncated = Data("{\"id\":\"big-1\",\"steps\":[".utf8)
+        truncated.append(Data(repeating: 32, count: QARequestValidator.maxRequestBytes))
+        precondition(QARequestValidator.salvageID(from: truncated.prefix(QARequestValidator.maxRequestBytes + 1)) == "big-1")
+        precondition(QARequestValidator.salvageID(from: Data("{\"id\":\"bad/\"".utf8)) == nil)
+        precondition(QARequestValidator.salvageID(from: oversized) == nil)
     }
 
     static func testFileSafety() {
