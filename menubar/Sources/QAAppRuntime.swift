@@ -56,13 +56,13 @@ final class QAAppRuntime: QAExecutionRuntime {
         }
         let modifiers: NSEvent.ModifierFlags = command ? [.command] : []
         guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: modifiers,
-                                           timestamp: 0, windowNumber: menu.window?.windowNumber ?? 0, context: nil,
+                                           timestamp: 0, windowNumber: delegate?.openDashboardView?.window?.windowNumber ?? 0, context: nil,
                                            characters: characters, charactersIgnoringModifiers: characters,
                                            isARepeat: false, keyCode: keyCode) else {
             return .failure(QAExecutionError(description: "unsupported key: \(key)"))
         }
         if key == "escape" {
-            guard let window = menu.window else {
+            guard let window = delegate?.openDashboardView?.window else {
                 return .failure(QAExecutionError(description: "menu window is unavailable"))
             }
             window.sendEvent(event)
