@@ -4730,16 +4730,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 결과(실행 결과든 거부 결과든)를 남긴 요청만 지운다. 남기지 못했으면 요청을 failed-*.json으로 보존해
         // 조용히 사라지지 않게 한다(검토 지적 2026-10-26).
         var reported = false
-        defer {
-            if reported {
-                try? FileManager.default.removeItem(at: claimed)
-            } else {
-                let kept = paths.root.appendingPathComponent("failed-\(UUID().uuidString).json")
-                try? FileManager.default.moveItem(at: claimed, to: kept)
-                print("QA: request kept without result → \(kept.lastPathComponent)")
-                fflush(stdout)
-            }
-        }
+        var handedOff = false
+        defer { if !handedOff { settleQAClaim(claimed, reported: reported, paths: paths) } }
         guard QAFileSafety.isOwnedRegularFile(claimed),
               let fileSize = QAFileSafety.regularFileSize(claimed) else { return }
         guard let handle = FileHandle(forReadingAtPath: claimed.path) else { return }
@@ -4768,12 +4760,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             reported = writeQARejection(id: request.id, reason: "could not create output directory: \(error.localizedDescription)", paths: paths)
             return
         }
-        reported = true
+        // 실행이 끝나 result.json을 저장할 때까지 요청 원문을 붙잡아 둔다. 저장에 실패하면 보존한다.
+        handedOff = true
         let execution = QAExecution(request: request, outputDirectory: output, runtime: qaRuntime)
         qaExecution = execution
-        execution.start { [weak self] _ in
+        execution.start { [weak self, weak execution] _ in
+            self?.settleQAClaim(claimed, reported: execution?.resultSaved ?? false, paths: paths)
             self?.qaExecution = nil
         }
+    }
+
+    /// 결과(실행·거부)를 남긴 요청만 지우고, 아니면 qa/failed-<uuid>.json으로 옮긴다.
+    private func settleQAClaim(_ claimed: URL, reported: Bool, paths: QAPaths) {
+        if reported {
+            try? FileManager.default.removeItem(at: claimed)
+            return
+        }
+        let kept = paths.root.appendingPathComponent("failed-\(UUID().uuidString).json")
+        try? FileManager.default.moveItem(at: claimed, to: kept)
+        print("QA: request kept without result → \(kept.lastPathComponent)")
+        fflush(stdout)
     }
 
     private func ensureQAOutputRoot(_ paths: QAPaths) -> Bool {

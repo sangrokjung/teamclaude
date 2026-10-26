@@ -110,6 +110,14 @@ struct QAProtocolTests {
         precondition(FileManager.default.fileExists(atPath: directory.appendingPathComponent("shot.png").path))
         precondition(FileManager.default.fileExists(atPath: directory.appendingPathComponent("state.json").path))
         precondition(FileManager.default.fileExists(atPath: directory.appendingPathComponent("result.json").path))
+        precondition(execution.resultSaved)
+        // 결과 폴더가 사라져 result.json을 못 쓰면 resultSaved가 false라 호출자가 요청을 보존한다(검토 지적 2026-10-26).
+        let gone = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("qa-gone-\(UUID().uuidString)")
+        let lost = QAExecution(request: QARequest(id: "run-2", steps: [.close]), outputDirectory: gone,
+                               runtime: QAProtocolFakeRuntime(), delay: { _, action in action() })
+        var lostResult: QAResult?
+        lost.start { lostResult = $0 }
+        precondition(lostResult != nil && !lost.resultSaved)
         try? FileManager.default.removeItem(at: directory)
     }
 }

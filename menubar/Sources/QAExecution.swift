@@ -23,6 +23,8 @@ final class QAExecution {
     private var stepResults: [QAStepResult] = []
     private var nextIndex = 0
     private var finished = false
+    /// result.json을 실제로 저장했는가. 못 했으면 호출자가 요청 원문을 보존한다.
+    private(set) var resultSaved = false
     private var timeoutTimer: Timer?
     private let startedDate: Date
 
@@ -126,10 +128,12 @@ final class QAExecution {
         } catch {
             let failed = QAResult(id: request.id, startedAt: result.startedAt, endedAt: result.endedAt, completed: false, timeout: timeout,
                                   steps: result.steps + [QAStepResult(index: nextIndex, kind: "result", ok: false, error: error.localizedDescription)])
-            try? QAFileSafety.atomicWrite(try JSONEncoder.qaEncoder.encode(failed), to: outputDirectory.appendingPathComponent("result.json"))
+            resultSaved = (try? QAFileSafety.atomicWrite(try JSONEncoder.qaEncoder.encode(failed),
+                                                          to: outputDirectory.appendingPathComponent("result.json"))) != nil
             completion(failed)
             return
         }
+        resultSaved = true
         completion(result)
     }
 
