@@ -52,7 +52,7 @@ def default_steps():
         {"key": "3"}, {"capture": "codex"},
         {"key": "4"}, {"capture": "burn"},
         {"key": "5"}, {"capture": "cli"},
-        {"key": "1"}, {"key": "r"}, {"wait": 2},
+        {"key": "1"}, {"key": "r"}, {"wait": 2}, {"open": True},
         {"capture": "refreshed"}, {"key": "cmd+k"},
         {"capture": "actions"}, {"key": "escape"}, {"close": True},
         {"state": "closed"},

@@ -9,8 +9,9 @@ protocol QAExecutionRuntime: AnyObject {
     func stateSnapshot() -> Result<QAStateSnapshot, Error>
 }
 
-struct QAExecutionError: Error, CustomStringConvertible {
+struct QAExecutionError: LocalizedError, CustomStringConvertible {
     let description: String
+    var errorDescription: String? { description }
 }
 
 final class QAExecution {
