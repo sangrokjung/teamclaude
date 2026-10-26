@@ -139,6 +139,13 @@ struct DashboardOverviewBuilderTests {
         precondition(column.tone == .wait && overviewStripStateBand(column.tone) == .wait)
         precondition(overviewStripStateBand(.ready) == .ready && overviewStripStateBand(.error) == nil)
 
+        // 세션·주간이 함께 막힌 계정은 주간으로 센다(복귀 시각은 주간 리셋 — 세션이 먼저 풀려도 못 쓴다).
+        // 픽스처 acct-16이 세션 99%·주간 99.5%로 둘 다 막혀 있다.
+        let both = model.strip.first { $0.name == "acct-16" }!
+        precondition((both.sessionPercent ?? 0) >= 98 && (both.weeklyPercent ?? 0) >= 98)
+        precondition(model.waitGroups.first { $0.window == .weekly }?.count == 1, "\(model.waitGroups)")
+        precondition(!caption.contains("세션 한도 2개"), caption)
+
         // 사용률과 무관하게 throttled로 기다리는 계정은 세션 한도로 세지 않고 일시 대기로 센다(검토 지적).
         accounts[index]["status"] = "throttled"
         quota["unified5h"] = 0.43

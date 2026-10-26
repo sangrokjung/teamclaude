@@ -128,6 +128,8 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
                 model.waitingNames.append(row.name)
                 // 판정이 막힌 창으로 나눈다: 주간 창이면 며칠, 세션 창만이면 몇 시간. 창이 아닌 이유
                 // (throttled·exhausted)는 언제 풀릴지 창으로 말할 수 없어 따로 센다(검토 지적 2026-10-26).
+                // 세션·주간이 함께 막혔으면 주간으로 센다: 세션 창이 먼저 풀려도 주간이 풀릴 때까지 못 쓰므로
+                // 복귀 시각은 주간 리셋이다. 세션의 더 이른 시각을 보이면 틀린 안내가 된다.
                 if state.blockedWindows.contains(L10n.windowAllWeekly) {
                     waitWeekly.count += 1
                     if let w = weeklyRemaining, w > 0 { waitWeekly.soonest = min(waitWeekly.soonest ?? w, w) }
