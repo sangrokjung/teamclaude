@@ -25,7 +25,7 @@ the menu is open.
 
 | Tab | Contents |
 |---|---|
-| Overview | Accounts routable now, four lanes (Claude Fable, Codex, Grok, agy), the Claude pool's weekly usage strip, accounts to fix, weekly burn outlook |
+| Overview | Accounts routable now with per-state counts and the next return, four lanes (Claude Fable, Codex, Grok, agy), the Claude ledger (session bars for accounts taking requests, accounts coming back, excluded), accounts to fix, weekly burn outlook |
 | Claude | Accounts grouped by state. Resets are stated once in the column heads. Click a row to expand plan, concurrency, request count, per-window resets and the re-auth, measure and plan-record actions |
 | Codex | The TeamCodex pool (5-hour and 7-day bars with their own resets per account), recovery buttons, and Codex usage on this Mac |
 | Burn | Subscription spend and per-service verdicts, what to do first, ccusage usage (cost) |
