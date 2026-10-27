@@ -110,37 +110,59 @@ enum L10n {
     static var usageRate: String { t("사용률", "Used") }
     static func agyLaneNote(_ name: String) -> String { t("\(name) 주간", "\(name) weekly") }
     static var waitingForValue: String { t("값을 기다리는 중", "Waiting for a value") }
-    static var stripTitle: String { t("Claude 풀 · 주간 사용률", "Claude pool · weekly usage") }
+    // 개요 Claude 영역(상태별 목록, 2026-10-27 웹랩 시안 A).
     static func legendReady(_ count: Int) -> String { t("사용 가능 \(count)", "Available \(count)") }
-    static func legendWait(_ count: Int) -> String { t("대기 \(count)", "Waiting \(count)") }
+    static func legendSessionWait(_ count: Int) -> String { t("세션 대기 \(count)", "Session wait \(count)") }
+    static func legendWeeklyWait(_ count: Int) -> String { t("주간 대기 \(count)", "Weekly wait \(count)") }
+    static func legendOtherWait(_ count: Int) -> String { t("일시 대기 \(count)", "Paused \(count)") }
     static func legendExcluded(_ count: Int) -> String { t("제외 \(count)", "Excluded \(count)") }
-    /// 계정이 띠 칸 수보다 많아 이웃한 계정을 한 칸으로 묶었을 때의 안내.
-    static func stripBucketNote(total: Int, perSlot: Int) -> String {
-        t("계정 \(total)개 · 칸마다 \(perSlot)개 계정 묶음", "\(total) accounts · \(perSlot) per bar")
+    static func nextReturn(_ name: String, _ duration: String, _ clock: String?) -> String {
+        clock.map { t("다음 복귀 \(name) \(duration) 뒤 · \($0)", "Next back: \(name) in \(duration) · \($0)") }
+            ?? t("다음 복귀 \(name) \(duration) 뒤", "Next back: \(name) in \(duration)")
     }
-    static func stripBucketLabel(_ count: Int) -> String { t("\(count)개 계정 묶음", "\(count)-account group") }
-    /// 목록 뒤에 붙이는 남은 개수("외 3개").
-    static func andMore(_ count: Int) -> String { t("외 \(count)개", "+\(count) more") }
-    static func weekElapsedCaption(_ percent: Int) -> String {
-        t("주간 창 \(percent)% 경과 — 선보다 높은 칸은 리셋 전에 찰 속도입니다.",
-          "Weekly window \(percent)% elapsed — bars above the line will fill before reset.")
+    static var liveSectionTitle: String { t("지금 받는 계정", "Taking requests now") }
+    static var liveSectionHint: String { t("세션 많이 찬 순", "Fullest session first") }
+    static var noLiveAccounts: String { t("지금 요청을 받을 수 있는 계정이 없습니다.", "No account can take requests right now.") }
+    static var waitingSectionTitle: String { t("복귀 대기", "Coming back") }
+    static var waitingSectionHint: String { t("빠른 순", "Soonest first") }
+    static func waitingSoonHint(_ count: Int) -> String {
+        t("5시간 안에 \(count)개 복귀 · 빠른 순", "\(count) back within 5h · soonest first")
+    }
+    static var excludedSectionTitle: String { t("제외", "Excluded") }
+    static func excludedInTodosHint(_ count: Int) -> String { t("\(count)개는 아래 손볼 것에", "\(count) listed under To fix") }
+    /// 목록을 접었을 때 남은 계정 한 줄(누르면 Claude 탭).
+    static func moreInClaudeTab(_ count: Int) -> String {
+        t("외 \(count)개 · Claude 탭에서 전부", "+\(count) more · all in the Claude tab")
+    }
+    static var tagSessionFull: String { t("세션 가득", "Session full") }
+    static var tagWeeklyFull: String { t("주간 가득", "Weekly full") }
+    static var tagPaused: String { t("일시 대기", "Paused") }
+    /// "2시간 20분 뒤"
+    static func durationAhead(_ duration: String) -> String { t("\(duration) 뒤", "in \(duration)") }
+    /// "오후 11:13 리셋"
+    static func resetAtClock(_ clock: String) -> String { t("\(clock) 리셋", "resets \(clock)") }
+    /// 지금 속도면 리셋 전에 98%에 닿는 계정의 한 줄 경고.
+    static func paceWarning(_ hitsIn: String, _ earlierBy: String) -> String {
+        t("지금 속도면 약 \(hitsIn) 뒤 98% · 리셋보다 \(earlierBy) 이름", "At this pace ~\(hitsIn) to 98% · \(earlierBy) before reset")
+    }
+    private static var clockFormatters: [String: DateFormatter] = [:]
+    /// 벽시계 시각. 오늘이면 "오후 9:48"(en "9:48 PM"), 다른 날이면 요일을 붙인다("수 오전 1:53", en "Wed 1:53 AM").
+    static func clockTime(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+        let sameDay = calendar.isDate(date, inSameDayAs: now)
+        let key = "\(language == .ko ? "ko" : "en")-\(sameDay)"
+        let formatter: DateFormatter
+        if let cached = clockFormatters[key] {
+            formatter = cached
+        } else {
+            formatter = DateFormatter()
+            formatter.locale = Locale(identifier: language == .ko ? "ko_KR" : "en_US_POSIX")
+            formatter.dateFormat = language == .ko ? (sameDay ? "a h:mm" : "E a h:mm") : (sameDay ? "h:mm a" : "EEE h:mm a")
+            clockFormatters[key] = formatter
+        }
+        formatter.timeZone = calendar.timeZone
+        return formatter.string(from: date)
     }
     static var todoAside: String { t("사람이 움직여야 풀리는 계정", "Accounts that need a person") }
-    static func waitGroupsCaption(_ parts: String) -> String {
-        t("기다리면 풀림 — \(parts)", "Clears on its own — \(parts)")
-    }
-    static func waitGroupSession(_ count: Int, _ soonest: String?) -> String {
-        soonest.map { t("세션 한도 \(count)개 \($0) 뒤부터", "\(count) on session limit, from \($0)") }
-            ?? t("세션 한도 \(count)개", "\(count) on session limit")
-    }
-    static func waitGroupOther(_ count: Int) -> String { t("일시 대기 \(count)개", "\(count) paused") }
-    static func waitGroupWeekly(_ count: Int, _ soonest: String?) -> String {
-        soonest.map { t("주간 한도 \(count)개 \($0) 뒤부터", "\(count) on weekly limit, from \($0)") }
-            ?? t("주간 한도 \(count)개", "\(count) on weekly limit")
-    }
-    static func waitingCaption(_ names: String) -> String {
-        t("기다리면 풀림 — \(names) · 리셋되면 돌아옵니다.", "Clears on its own — \(names) · back after reset.")
-    }
     static var burnPreviewTitle: String { t("주간 소진 전망", "Weekly burn outlook") }
     static var burnDetailsLink: String { t("구독·소진에서 자세히 ↗", "Details in Burn ↗") }
     static var lowConfidence: String { t("신뢰 낮음", "Low confidence") }

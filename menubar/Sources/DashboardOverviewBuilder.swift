@@ -5,11 +5,12 @@ import Cocoa
 //
 // 숫자의 출처:
 //  - 큰 숫자 = opusAvailability(세션·주간 여유, 프록시 라우팅 가능) — 지금 요청을 받는 계정.
-//    띠·범례·기다리면 풀림·손볼 것도 같은 routingAvailability를 쓴다(Claude 탭 묶음·제목 라우팅 슬롯도 같다)
+//    상태별 수·상태별 목록(지금 받는 계정·복귀 대기·제외)·손볼 것도 같은 routingAvailability를 쓴다(Claude 탭 묶음·제목 라우팅 슬롯도 같다)
 //  - Claude Fable 레인 = fableAvailability(.ready) — 예전 요약 띠의 "Claude Fable"
 //  - Codex 레인 = TeamCodexPoolHealth.usableCount / poolCount
 //  - Grok·agy 레인 = 카드 모델의 문구
-//  - 띠 = 계정별 주간 사용률(weeklyPercent)과 주간 창 경과(weeklyResetAt / weeklyResetSeconds)
+//  - 상태별 목록 = 계정별 세션 사용률·창 경과(sessionResetAt / sessionResetSeconds), 주간·Fable 사용률과 리셋,
+//    대기 원인(판정의 blockedWindows)과 복귀 시각
 //  - 손볼 것 = 제외된 계정(구독 종료 제외) + Codex 되돌리기 제안(teamCodexAccountRecovery)
 //  - 소진 미리보기 = SubscriptionBurnModel의 레인별 전망·판정 문구
 
@@ -21,7 +22,6 @@ func teamClaudeRemainingSeconds(_ seconds: Int?, resetAt: Date?, checkedAt: Date
 }
 
 let teamClaudeWeekSeconds: Double = 7 * 86_400
-let teamClaudeSessionSeconds: Double = 5 * 3_600
 
 /// 한 계정 행의 표시용 상태(톤·짧은 라벨). 판정은 fableAvailability가 이미 했고, 여기는 낱말만 고른다.
 struct TeamClaudeRowPresentation {
@@ -85,7 +85,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     var fableReady = 0
     var total = 0
     if let health = input.teamClaude, claudeNotice == nil {
-        // 띠·범례·기다리면 풀림·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
+        // 상태별 수·목록·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
         // 서로 다른 판정을 보면 한쪽만 고쳐도 어긋난다). Fable 레인 숫자만 Fable 창까지 보는 판정이다.
         let availability = health.fableAvailability(now: now)
         let opus = health.opusAvailability(now: now)
@@ -99,50 +99,65 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
 
         var soonestSession: Double?
         var soonestWeekly: Double?
-        var elapsedValues: [Double] = []
-        var waitSession: (count: Int, soonest: Double?) = (0, nil)
-        var waitWeekly: (count: Int, soonest: Double?) = (0, nil)
-        var waitOther = 0
+        var live: [OverviewLiveAccount] = []
+        var waiting: [OverviewWaitingAccount] = []
+        var excluded: [OverviewExcludedAccount] = []
+        func clock(_ remaining: Double?) -> String? {
+            remaining.flatMap { $0 > 0 ? L10n.clockTime(now.addingTimeInterval($0), now: now) : nil }
+        }
+        func positive(_ value: Double?) -> Double? { value.flatMap { $0 > 0 ? $0 : nil } }
         for (row, state) in zip(health.accounts, routing) {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
                                                              checkedAt: health.checkedAt, now: now)
             let sessionRemaining = teamClaudeRemainingSeconds(row.sessionResetSeconds, resetAt: row.sessionResetAt,
                                                               checkedAt: health.checkedAt, now: now)
-            let elapsed = panelWindowElapsed(remainingSeconds: weeklyRemaining, windowSeconds: teamClaudeWeekSeconds)
-            if !presentation.excluded, let elapsed { elapsedValues.append(elapsed) }
+            let fableRemaining = teamClaudeRemainingSeconds(row.fableResetSeconds, resetAt: row.fableResetAt,
+                                                            checkedAt: health.checkedAt, now: now)
             if state.state == .ready {
                 if let s = sessionRemaining, s > 0 { soonestSession = min(soonestSession ?? s, s) }
                 if let w = weeklyRemaining, w > 0 { soonestWeekly = min(soonestWeekly ?? w, w) }
             }
-            model.strip.append(OverviewStripColumn(
-                name: row.name, label: presentation.label, tone: presentation.tone,
-                weeklyPercent: row.weeklyPercent, sessionPercent: row.sessionPercent, fablePercent: row.fablePercent,
-                weeklyElapsed: elapsed, excluded: presentation.excluded, cap: presentation.cap))
+            // 상태별 묶음은 범례와 같은 톤(routingAvailability → teamClaudeRowPresentation)으로 나눈다.
             switch presentation.tone {
-            case .ready: model.readyCount += 1
-            case .wait: model.waitCount += 1
-            default: model.excludedCount += 1
-            }
-            if state.state == .limited {
-                model.waitingNames.append(row.name)
-                // 판정이 막힌 창으로 나눈다: 주간 창이면 며칠, 세션 창만이면 몇 시간. 창이 아닌 이유
-                // (throttled·exhausted)는 언제 풀릴지 창으로 말할 수 없어 따로 센다(검토 지적 2026-10-26).
-                // 세션·주간이 함께 막혔으면 주간으로 센다: 세션 창이 먼저 풀려도 주간이 풀릴 때까지 못 쓰므로
-                // 복귀 시각은 주간 리셋이다. 세션의 더 이른 시각을 보이면 틀린 안내가 된다.
-                if state.blockedWindows.contains(L10n.windowAllWeekly) {
-                    waitWeekly.count += 1
-                    if let w = weeklyRemaining, w > 0 { waitWeekly.soonest = min(waitWeekly.soonest ?? w, w) }
-                } else if state.blockedWindows.contains(L10n.sessionShort) {
-                    waitSession.count += 1
-                    if let s = sessionRemaining, s > 0 { waitSession.soonest = min(waitSession.soonest ?? s, s) }
-                } else {
-                    waitOther += 1
+            case .ready:
+                model.readyCount += 1
+                let elapsed = panelWindowElapsed(remainingSeconds: sessionRemaining, windowSeconds: teamClaudeSessionSeconds)
+                live.append(OverviewLiveAccount(
+                    name: row.name, label: presentation.label, busy: state.busy != nil,
+                    sessionPercent: row.sessionPercent, sessionElapsed: elapsed,
+                    sessionRemainingSeconds: positive(sessionRemaining), sessionResetClock: clock(sessionRemaining),
+                    weekly: OverviewMiniWindow(label: L10n.weeklyShort, percent: row.weeklyPercent, remainingSeconds: positive(weeklyRemaining)),
+                    fable: OverviewMiniWindow(label: "Fable", percent: row.fablePercent, remainingSeconds: positive(fableRemaining)),
+                    projection: overviewSessionProjection(percent: row.sessionPercent, elapsed: elapsed,
+                                                          remainingSeconds: positive(sessionRemaining))))
+            case .wait:
+                model.waitCount += 1
+                // 판정이 막힌 창으로 나눈다: 주간 창이 들었으면 주간(복귀 시각은 주간 리셋 — 세션이 먼저 풀려도 못 쓴다),
+                // 세션 창만이면 세션. 창이 아닌 이유(throttled·exhausted·확인 필요)는 창으로 복귀 시각을 말할 수 없어
+                // 일시 대기로 센다(검토 지적 2026-10-26).
+                let cause: OverviewWaitCause = state.state == .limited ? overviewWaitCause(blockedWindows: state.blockedWindows) : .other
+                let returnSeconds: Double?
+                switch cause {
+                case .weekly: model.weeklyWaitCount += 1; returnSeconds = positive(weeklyRemaining)
+                case .session: model.sessionWaitCount += 1; returnSeconds = positive(sessionRemaining)
+                case .other: model.otherWaitCount += 1; returnSeconds = nil
                 }
+                waiting.append(OverviewWaitingAccount(
+                    name: row.name, cause: cause, weeklyPercent: cause == .session ? row.weeklyPercent : nil,
+                    returnSeconds: returnSeconds, returnClock: clock(returnSeconds),
+                    note: returnSeconds == nil ? presentation.label : nil))
+            default:
+                model.excludedCount += 1
             }
 
             // 손볼 것: 사람이 움직여야 풀리는 계정. 구독이 끝난 계정은 정리 대상이라 여기 넣지 않는다.
-            guard state.state == .excluded, state.subscriptionAppearance != .ended else { continue }
+            let isTodo = state.state == .excluded && state.subscriptionAppearance != .ended
+            if presentation.tone != .ready && presentation.tone != .wait {
+                excluded.append(OverviewExcludedAccount(name: row.name, reason: presentation.label, tone: presentation.tone,
+                                                        inTodos: isTodo))
+            }
+            guard isTodo else { continue }
             let canReauth = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
                                                         provider: row.provider, errorReason: row.errorReason)
             let orgBlocked = row.errorReason == "subscription-disabled"
@@ -154,28 +169,14 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         }
         // 오류를 먼저, 꺼 둔 계정은 그다음(SubscriptionPolicy의 권고 순서).
         model.todos.sort { ($0.tone == .error ? 0 : 1) < ($1.tone == .error ? 0 : 1) }
+        model.live = overviewSortLive(live)
+        model.waiting = overviewSortWaiting(waiting)
+        model.excluded = excluded
+        model.nextReturn = model.waiting.first { $0.returnSeconds != nil }
         var resetParts: [String] = []
         if let soonestSession { resetParts.append(L10n.sessionWindowIn(L10n.duration(seconds: Int(soonestSession)))) }
         if let soonestWeekly { resetParts.append(L10n.weeklyWindowIn(L10n.duration(seconds: Int(soonestWeekly)))) }
         model.resetLine = resetParts.isEmpty ? "" : L10n.resetsAfter(resetParts.joined(separator: " · "))
-        if !elapsedValues.isEmpty {
-            let mean = elapsedValues.reduce(0, +) / Double(elapsedValues.count)
-            model.elapsedCaption = L10n.weekElapsedCaption(panelPercentNumber(mean * 100))
-        }
-        if waitSession.count > 0 {
-            model.waitGroups.append(OverviewWaitGroup(window: .session, count: waitSession.count, soonestSeconds: waitSession.soonest))
-        }
-        if waitWeekly.count > 0 {
-            model.waitGroups.append(OverviewWaitGroup(window: .weekly, count: waitWeekly.count, soonestSeconds: waitWeekly.soonest))
-        }
-        if waitOther > 0 {
-            model.waitGroups.append(OverviewWaitGroup(window: .other, count: waitOther, soonestSeconds: nil))
-        }
-        if !model.waitingNames.isEmpty {
-            model.waitingCaption = model.waitGroups.isEmpty
-                ? L10n.waitingCaption(model.waitingNames.joined(separator: " · "))
-                : overviewWaitGroupsCaption(model.waitGroups)
-        }
     }
 
     // Codex 되돌리기 제안도 손볼 것이다(재인증·다시 켜기).

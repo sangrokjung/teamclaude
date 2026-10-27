@@ -48,6 +48,8 @@ enum TeamClaudePalette {
     static let heroFont = NSFont.monospacedDigitSystemFont(ofSize: 52, weight: .semibold)
     static let heroUnitFont = NSFont.monospacedDigitSystemFont(ofSize: 17, weight: .medium)
     static let laneValueFont = NSFont.monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+    /// 개요 "지금 받는 계정" 칸의 세션 퍼센트(15pt medium).
+    static let sessionValueFont = NSFont.monospacedDigitSystemFont(ofSize: 15, weight: .medium)
     static let bodyFont = NSFont.systemFont(ofSize: 13)
     static let bodyMediumFont = NSFont.systemFont(ofSize: 13, weight: .medium)
     static let captionFont = NSFont.systemFont(ofSize: 12)
@@ -76,7 +78,7 @@ enum TeamClaudePalette {
     static func prewarm() {
         _ = (void, sheet, raised, overlay, graphite, lineStrong, fg, fg2, fg3, ash, ashInk, mint, amber, ember, sky, track)
         _ = (bg, panel, panel2, line, text, muted, green, yellow, red, blue, inactive)
-        _ = (panelTitleFont, heroFont, heroUnitFont, laneValueFont, bodyFont, bodyMediumFont, captionFont, microFont,
+        _ = (panelTitleFont, heroFont, heroUnitFont, laneValueFont, sessionValueFont, bodyFont, bodyMediumFont, captionFont, microFont,
              metaFont, legendFont, legendMediumFont, buttonFont, keycapFont, nameFont, numberFont, titleFont, subFont, headFont, rowFont, smallFont)
     }
 }
