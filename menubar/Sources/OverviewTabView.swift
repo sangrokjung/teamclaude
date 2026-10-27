@@ -247,6 +247,10 @@ final class OverviewTabView: NSView {
     private var laneRects: [(DashboardTab, NSRect)] = []
     /// 마지막으로 그린 띠 칸(이름, 사각형). 누르기와 테스트가 읽는다.
     private(set) var columnRects: [(OverviewStripTarget, NSRect)] = []
+    /// 띠 칸 툴팁 문구(툴팁 번호 → 문구). 주인은 이 뷰 자신이다.
+    /// 예전에는 `tip as NSString`을 owner로 넘겼는데 addToolTip은 owner를 붙잡지 않아,
+    /// 툴팁이 뜨는 순간 해제된 문자열에 메시지를 보내 앱이 죽었다(2026-10-26 충돌 3건, NSToolTipManager displayToolTip).
+    private(set) var stripToolTips: [NSView.ToolTipTag: String] = [:]
     private var todoButtons: [PanelButton] = []
     private var burnButton: PanelButton?
     private var todoRowRects: [(String, NSRect)] = []
@@ -348,6 +352,7 @@ final class OverviewTabView: NSView {
         columnRects = []
         todoRowRects = []
         removeAllToolTips()
+        stripToolTips = [:]
 
         // 1. 지금 몇 개가 되는가
         PanelDraw.meta(L10n.routableNow, x0, 18)
@@ -511,7 +516,7 @@ final class OverviewTabView: NSView {
                     + " · \(L10n.sessionShort) \(panelPercentText(column.sessionPercent))"
                     + (column.fablePercent.map { " · Fable \(panelPercentText($0))" } ?? "")
             }
-            addToolTip(rect, owner: tip as NSString, userData: nil)
+            stripToolTips[addToolTip(rect, owner: self, userData: nil)] = tip
             guard !bucketed else { continue }
             let label = String(format: "%02d", index + 1)
             let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
@@ -534,5 +539,11 @@ final class OverviewTabView: NSView {
             PanelDraw.text(PanelDraw.clipped(caption, TeamClaudePalette.legendFont, maxWidth: width - 24), x0 + 24, y,
                            TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
         }
+    }
+}
+
+extension OverviewTabView: NSViewToolTipOwner {
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        stripToolTips[tag] ?? ""
     }
 }
