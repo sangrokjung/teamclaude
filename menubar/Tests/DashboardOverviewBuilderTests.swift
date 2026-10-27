@@ -30,7 +30,8 @@ struct DashboardOverviewBuilderTests {
         testFixtureModel(makeOverviewModel(input))
         testNoticesReplaceLanes(input)
         testMissingSources(input)
-        testWaitGroupsSplitSessionFromWeekly(fixture: fixture, input: input, now: now)
+        testWaitingSortedByReturn(fixture: fixture, input: input, now: now)
+        testProjectionOnlyForFastAccounts(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -42,20 +43,29 @@ struct DashboardOverviewBuilderTests {
                      model.resetLine)
         precondition(model.claudeNotice == nil && model.codexNotice == nil)
 
-        // 띠: 계정마다 한 칸, 상태별 수
-        precondition(model.strip.count == 17)
-        precondition(model.strip.map(\.name) == (1...17).map { String(format: "acct-%02d", $0) })
+        // 상태별 수: 큰 숫자와 같은 라우팅 판정
         precondition(model.readyCount == 12 && model.waitCount == 2 && model.excludedCount == 3,
                      "ready \(model.readyCount) wait \(model.waitCount) excluded \(model.excludedCount)")
-        precondition(model.strip.filter(\.excluded).map(\.name) == ["acct-13", "acct-14", "acct-15"])
-        precondition(model.elapsedCaption?.hasPrefix("주간 창 ") == true, model.elapsedCaption ?? "nil")
+        precondition(model.sessionWaitCount == 0 && model.weeklyWaitCount == 2 && model.otherWaitCount == 0)
+        precondition(model.hasLedger)
 
-        // 기다리면 풀림: 한도에 걸린 두 계정
-        precondition(model.waitingNames == ["acct-16", "acct-17"], "\(model.waitingNames)")
-        precondition(model.waitingCaption != nil)
-        // 두 계정 모두 주간 창이 찼다 → 주간 한도 묶음 하나(며칠 뒤 복귀)
-        precondition(model.waitGroups.map(\.window) == [.weekly] && model.waitGroups[0].count == 2, "\(model.waitGroups)")
-        precondition(model.waitingCaption?.hasPrefix("기다리면 풀림 — 주간 한도 2개 ") == true, model.waitingCaption ?? "nil")
+        // 지금 받는 계정: 세션 많이 찬 순(acct-12 68% … acct-01 24%). 세션 창은 4시간 뒤 리셋 → 20% 지남.
+        precondition(model.live.map(\.name) == (1...12).reversed().map { String(format: "acct-%02d", $0) }, "\(model.live.map(\.name))")
+        let top = model.live[0]
+        precondition(abs((top.sessionElapsed ?? 0) - 0.2) < 0.01, "\(String(describing: top.sessionElapsed))")
+        precondition(top.sessionResetClock != nil && (top.sessionRemainingSeconds ?? 0) > 3.9 * 3_600)
+        precondition(top.weekly.label == L10n.weeklyShort && top.weekly.percent != nil && top.fable.label == "Fable")
+        // 68%를 20% 지난 창에서 썼다 → 리셋 전에 98%에 닿는다.
+        precondition(top.projection != nil, "acct-12 must warn")
+
+        // 제외: 손볼 것과 같은 세 계정이라 목록은 다시 그리지 않는다.
+        precondition(model.excluded.map(\.name) == ["acct-13", "acct-14", "acct-15"], "\(model.excluded.map(\.name))")
+        precondition(model.excluded.allSatisfy(\.inTodos))
+
+        // 복귀 대기: 한도에 걸린 두 계정, 둘 다 주간 창까지 찼다 → 주간 가득(6일 뒤 복귀)
+        precondition(model.waiting.map(\.name) == ["acct-16", "acct-17"], "\(model.waiting.map(\.name))")
+        precondition(model.waiting.allSatisfy { $0.cause == .weekly && ($0.returnSeconds ?? 0) > 5 * 86_400 && $0.returnClock != nil })
+        precondition(model.nextReturn?.name == "acct-16")
 
         // 레인 4개
         precondition(model.lanes.map(\.name) == ["Claude Fable", "Codex", "Grok", "agy"])
@@ -94,7 +104,7 @@ struct DashboardOverviewBuilderTests {
                                                              grok: input.grok, agy: input.agy, burn: input.burn,
                                                              notices: notices, now: input.now))
         precondition(model.claudeNotice == claudeNotice && model.codexNotice == codexNotice)
-        precondition(model.strip.isEmpty && model.routable == 0 && model.waitingNames.isEmpty)
+        precondition(!model.hasLedger && model.routable == 0 && model.waiting.isEmpty)
         precondition(model.lanes[0].value == L10n.notInstalled && model.lanes[0].quiet)
         precondition(model.lanes[1].value == L10n.notInstalled && model.lanes[1].quiet)
         precondition(model.todos.isEmpty, "a notice hides the section's todos too: \(model.todos.map(\.name))")
@@ -105,58 +115,77 @@ struct DashboardOverviewBuilderTests {
         let model = makeOverviewModel(DashboardOverviewInput(teamClaude: nil, teamCodex: nil, grok: input.grok, agy: input.agy,
                                                              burn: SubscriptionBurnModel(usages: [], rates: [:], recommendations: []),
                                                              notices: DashboardToolNotices(), now: input.now))
-        precondition(model.strip.isEmpty && model.todos.isEmpty && model.total == 0)
+        precondition(!model.hasLedger && model.todos.isEmpty && model.total == 0)
         precondition(model.lanes[0].value == StatusVocabulary.checking && model.lanes[0].quiet)
         precondition(model.lanes[1].value == StatusVocabulary.none && model.lanes[1].quiet)
         precondition(model.burnLines.isEmpty && model.burnAside == nil)
     }
 
-    /// 실사용 QA 2026-10-26: 주간 43%인데 세션 창이 찬 계정이 막대에서 "왜 대기인지" 보이지 않았다.
-    /// 세션 창이 막은 계정은 세션 한도 묶음(몇 시간)으로, 주간이 찬 계정은 주간 한도 묶음(며칠)으로 센다.
-    static func testWaitGroupsSplitSessionFromWeekly(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+    static func rebuilt(_ status: [String: Any], input: DashboardOverviewInput, now: Date) -> OverviewModel {
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        return makeOverviewModel(DashboardOverviewInput(teamClaude: health, teamCodex: input.teamCodex,
+                                                        grok: input.grok, agy: input.agy, burn: input.burn,
+                                                        notices: input.notices, now: now))
+    }
+
+    /// 복귀 대기는 빨리 풀리는 순이다. 원인 태그는 판정의 blockedWindows로 나눈다:
+    /// 세션만 → 세션 가득(세션 리셋에 복귀), 주간 포함 → 주간 가득(주간 리셋), 막힌 창 없음(throttled) → 일시 대기(복귀 시각 모름, 맨 뒤).
+    static func testWaitingSortedByReturn(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
         guard var status = fixture["teamclaude"] as? [String: Any],
               var accounts = status["accounts"] as? [[String: Any]],
               let index = accounts.firstIndex(where: { $0["name"] as? String == "acct-17" }),
               var quota = accounts[index]["quota"] as? [String: Any] else {
             preconditionFailure("fixture must carry acct-17")
         }
+        // acct-17: 세션 98%만 막혔다(주간 43%) → 4시간 뒤 복귀. acct-16은 세션·주간이 함께 막혀 6일 뒤 복귀.
         quota["unified7d"] = 0.43
         accounts[index]["quota"] = quota
         status["accounts"] = accounts
-        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
-        let model = makeOverviewModel(DashboardOverviewInput(teamClaude: health, teamCodex: input.teamCodex,
-                                                             grok: input.grok, agy: input.agy, burn: input.burn,
-                                                             notices: input.notices, now: now))
-        precondition(model.waitingNames == ["acct-16", "acct-17"], "\(model.waitingNames)")
-        precondition(model.waitGroups.map(\.window) == [.session, .weekly], "\(model.waitGroups)")
-        precondition(model.waitGroups.map(\.count) == [1, 1], "\(model.waitGroups)")
-        // 세션 창은 픽스처에서 4시간 뒤, 주간 창은 6일 뒤에 리셋된다.
-        let caption = model.waitingCaption ?? ""
-        precondition(caption.contains("세션 한도 1개 3시간") || caption.contains("세션 한도 1개 4시간"), caption)
-        precondition(caption.contains("주간 한도 1개 5일") || caption.contains("주간 한도 1개 6일"), caption)
-        // 주간 43% 칸의 채움은 호박색이 아니다(색은 주간 문턱만 말한다) — 상태는 위 띠가 대기로 말한다.
-        let column = model.strip.first { $0.name == "acct-17" }!
-        precondition(column.tone == .wait && overviewStripStateBand(column.tone) == .wait)
-        precondition(overviewStripStateBand(.ready) == .ready && overviewStripStateBand(.error) == nil)
+        let model = rebuilt(status, input: input, now: now)
+        precondition(model.waiting.map(\.name) == ["acct-17", "acct-16"], "sooner first: \(model.waiting.map(\.name))")
+        precondition(model.waiting.map(\.cause) == [.session, .weekly], "\(model.waiting.map(\.cause))")
+        precondition(model.sessionWaitCount == 1 && model.weeklyWaitCount == 1 && model.otherWaitCount == 0)
+        let session = model.waiting[0]
+        precondition(session.weeklyPercent == 43, "session-full rows carry the weekly percent: \(String(describing: session.weeklyPercent))")
+        precondition((session.returnSeconds ?? 0) > 3.9 * 3_600 && (session.returnSeconds ?? 0) <= 4 * 3_600, "\(String(describing: session.returnSeconds))")
+        precondition(model.waiting[1].weeklyPercent == nil, "weekly-full rows do not repeat the weekly bar")
+        precondition(model.nextReturn?.name == "acct-17")
+        precondition(OverviewWaitCause.session.tag == "세션 가득" && OverviewWaitCause.weekly.tag == "주간 가득")
 
-        // 세션·주간이 함께 막힌 계정은 주간으로 센다(복귀 시각은 주간 리셋 — 세션이 먼저 풀려도 못 쓴다).
-        // 픽스처 acct-16이 세션 99%·주간 99.5%로 둘 다 막혀 있다.
-        let both = model.strip.first { $0.name == "acct-16" }!
-        precondition((both.sessionPercent ?? 0) >= 98 && (both.weeklyPercent ?? 0) >= 98)
-        precondition(model.waitGroups.first { $0.window == .weekly }?.count == 1, "\(model.waitGroups)")
-        precondition(!caption.contains("세션 한도 2개"), caption)
-
-        // 사용률과 무관하게 throttled로 기다리는 계정은 세션 한도로 세지 않고 일시 대기로 센다(검토 지적).
+        // 사용률과 무관하게 throttled로 기다리는 계정은 일시 대기 — 복귀 시각을 창으로 말할 수 없어 맨 뒤.
         accounts[index]["status"] = "throttled"
         quota["unified5h"] = 0.43
         quota["unified7d"] = 0.20
         accounts[index]["quota"] = quota
         status["accounts"] = accounts
-        let throttledHealth = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
-        let throttled = makeOverviewModel(DashboardOverviewInput(teamClaude: throttledHealth, teamCodex: input.teamCodex,
-                                                                 grok: input.grok, agy: input.agy, burn: input.burn,
-                                                                 notices: input.notices, now: now))
-        precondition(throttled.waitGroups.map(\.window) == [.weekly, .other], "\(throttled.waitGroups)")
-        precondition(throttled.waitingCaption?.contains("일시 대기 1개") == true, throttled.waitingCaption ?? "nil")
+        let throttled = rebuilt(status, input: input, now: now)
+        precondition(throttled.waiting.map(\.name) == ["acct-16", "acct-17"], "\(throttled.waiting.map(\.name))")
+        precondition(throttled.waiting.map(\.cause) == [.weekly, .other], "\(throttled.waiting.map(\.cause))")
+        precondition(throttled.waiting[1].returnSeconds == nil && throttled.waiting[1].note == L10n.stateLimited)
+        precondition(throttled.otherWaitCount == 1 && throttled.waitCount == 2)
+        precondition(OverviewWaitCause.other.tag == "일시 대기")
+    }
+
+    /// 속도 경고: 지금 속도(세션 사용률 ÷ 지난 비율)로 리셋 전에 98%에 닿는 계정만.
+    static func testProjectionOnlyForFastAccounts(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]],
+              let index = accounts.firstIndex(where: { $0["name"] as? String == "acct-01" }),
+              var quota = accounts[index]["quota"] as? [String: Any] else {
+            preconditionFailure("fixture must carry acct-01")
+        }
+        // 20% 지난 창에서 5% → 리셋 때 25%. 경고하지 않는다.
+        quota["unified5h"] = 0.05
+        accounts[index]["quota"] = quota
+        status["accounts"] = accounts
+        let model = rebuilt(status, input: input, now: now)
+        guard let slow = model.live.first(where: { $0.name == "acct-01" }),
+              let fast = model.live.first(where: { $0.name == "acct-12" }) else { preconditionFailure("live accounts") }
+        precondition(slow.projection == nil, "slow account must not warn: \(String(describing: slow.projection))")
+        guard let projection = fast.projection else { preconditionFailure("fast account must warn") }
+        // 68% / 0.2 → 창 끝이면 340%. 98%에는 창의 28.8% 지점(=지금부터 약 26분 뒤)에 닿는다.
+        precondition(abs(projection.hitsLimitInSeconds - (0.98 / 3.4 - 0.2) * 5 * 3_600) < 120, "\(projection.hitsLimitInSeconds)")
+        precondition(projection.earlierBySeconds > 3 * 3_600)
+        precondition(model.live.last?.name == "acct-01", "lowest session last: \(model.live.map(\.name))")
     }
 }

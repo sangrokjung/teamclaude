@@ -133,11 +133,11 @@ struct MenubarRoutabilityTests {
         precondition(model.readyCount == 1 && model.waitCount == 19 && model.excludedCount == 0,
                      "legend ready \(model.readyCount) wait \(model.waitCount) excluded \(model.excludedCount)")
         precondition(model.readyCount == model.routable, "legend must agree with the big number")
-        // 그 계정 칸은 바쁨 라벨(사용 중 3/3), 대기 아님
-        let first = model.strip[0]
-        precondition(first.label == L10n.stateBusy(3, 3) && first.tone == .ready, "\(first.label) \(first.tone)")
-        precondition(!model.waitingNames.contains("acct-01") && model.waitingNames.count == 19, "\(model.waitingNames)")
-        precondition(model.waitingCaption != nil)
+        // 그 계정 칸은 바쁨 라벨(사용 중 3/3)로 지금 받는 계정에 있고, 대기 아님
+        precondition(model.live.map(\.name) == ["acct-01"], "\(model.live.map(\.name))")
+        let first = model.live[0]
+        precondition(first.label == L10n.stateBusy(3, 3) && first.busy, "\(first.label)")
+        precondition(!model.waiting.contains { $0.name == "acct-01" } && model.waiting.count == 19, "\(model.waiting.map(\.name))")
         // Fable 레인: 그 계정의 Fable 주간은 40% → 1
         precondition(model.lanes[0].value == "1", "fable lane \(model.lanes[0].value)")
         // 메뉴바 제목 슬롯: 평소 경로도 개요 큰 숫자와 같은 라우팅 수를 쓴다(Fable 문턱·미측정과 무관, 실사용 QA 2026-10-25)

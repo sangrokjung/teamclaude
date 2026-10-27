@@ -23,7 +23,7 @@ struct L10nTests {
         // 표 전체의 한글 0자 검사는 test_l10n_table.py가 소스에서 한다. 여기서는 대표 항목만 본다.
         L10n.language = .en
         for value in [L10n.tabOverview, L10n.tabClaude, L10n.tabBurn, L10n.routableNow, L10n.todoBadge(3),
-                      L10n.refresh, L10n.actions, L10n.notInstalled, L10n.waitingCaption("a")] {
+                      L10n.refresh, L10n.actions, L10n.notInstalled, L10n.moreInClaudeTab(3), L10n.paceWarning("1h", "2h")] {
             precondition(!containsHangul(value) && !value.isEmpty, value)
         }
         precondition(L10n.tabOverview == "Overview")
@@ -37,7 +37,8 @@ struct L10nTests {
         precondition(L10n.todoBadge(3) == "손볼 것 3")
         precondition(L10n.refresh == "새로고침")
         precondition(L10n.actions == "동작")
-        precondition(L10n.waitingCaption("acct-16").hasPrefix("기다리면 풀림 — acct-16"))
+        precondition(L10n.moreInClaudeTab(3) == "외 3개 · Claude 탭에서 전부")
+        precondition(L10n.durationAhead("2시간 20분") == "2시간 20분 뒤" && L10n.resetAtClock("오후 11:13") == "오후 11:13 리셋")
         precondition(L10n.notInstalled == "미설치")
 
         // 시간 길이: 큰 단위 두 개만.
