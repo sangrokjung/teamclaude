@@ -1,8 +1,9 @@
 import Cocoa
 
-// 개요 탭(menubar/DESIGN.md "탭"): 지금 라우팅 가능 큰 숫자 → 레인 4개 → Claude 풀 주간 사용률 띠 →
-// 손볼 것 → 기다리면 풀림 → 주간 소진 전망 미리보기. 값은 모두 기존 로더·판정이 만든 것을
-// DashboardOverviewBuilder.swift가 옮겨 담는다. 이 파일은 그리기만 한다(새 계산 없음).
+// 개요 탭(menubar/DESIGN.md "탭"): 지금 라우팅 가능 큰 숫자(+ 상태별 수·다음 복귀) → 레인 4개 →
+// Claude 상태별 목록(지금 받는 계정 · 복귀 대기 · 제외) → 손볼 것 → 주간 소진 전망 미리보기.
+// 값은 모두 기존 로더·판정이 만든 것을 DashboardOverviewBuilder.swift가 옮겨 담는다. 이 파일은 그리기와
+// 그리기에 딸린 작은 계산(속도 경고·정렬·접기)만 한다.
 
 struct OverviewLane: Equatable {
     let name: String
@@ -12,20 +13,6 @@ struct OverviewLane: Equatable {
     let tab: DashboardTab
     /// 숫자가 아닌 값("확인 중"·"미설치")은 작게 그린다.
     let quiet: Bool
-}
-
-struct OverviewStripColumn: Equatable {
-    let name: String
-    let label: String
-    let tone: PanelTone
-    let weeklyPercent: Double?
-    let sessionPercent: Double?
-    let fablePercent: Double?
-    let weeklyElapsed: Double?
-    /// 라우팅에서 빠진 계정(막대를 흐리게).
-    let excluded: Bool
-    /// 칸 위 3pt 띠(오류 빨강, 꺼 둠 회색). 없으면 nil.
-    let cap: PanelTone?
 }
 
 enum OverviewTodoAction: Equatable {
@@ -54,6 +41,76 @@ struct OverviewBurnLine: Equatable {
     let verdictColor: NSColor
 }
 
+// MARK: Claude 상태별 목록(2026-10-27 웹랩 시안 A "상태별 목록")
+
+/// 작은 막대 하나(주간·Fable).
+struct OverviewMiniWindow: Equatable {
+    let label: String
+    let percent: Double?
+    /// 리셋까지 남은 초. 모르면 nil.
+    let remainingSeconds: Double?
+}
+
+/// 지금 속도면 세션 리셋 전에 98%에 닿는다는 경고.
+struct OverviewSessionProjection: Equatable {
+    /// 98%에 닿기까지 남은 초.
+    let hitsLimitInSeconds: Double
+    /// 리셋보다 몇 초 이른가.
+    let earlierBySeconds: Double
+}
+
+/// 지금 요청을 받는 계정 한 칸. 세션 창(5시간)을 크게, 주간·Fable은 작게.
+struct OverviewLiveAccount: Equatable {
+    let name: String
+    /// 표시 라벨("사용 가능" 또는 동시 요청이 가득 찬 "사용 중 3/3").
+    let label: String
+    let busy: Bool
+    let sessionPercent: Double?
+    /// 세션 창이 지난 비율(0~1). 막대 안 세로 눈금.
+    let sessionElapsed: Double?
+    let sessionRemainingSeconds: Double?
+    /// 세션 리셋 벽시계 시각("오후 11:13").
+    let sessionResetClock: String?
+    let weekly: OverviewMiniWindow
+    let fable: OverviewMiniWindow
+    let projection: OverviewSessionProjection?
+}
+
+/// 기다리는 이유. 판정의 blockedWindows로 나눈다(overviewWaitCause).
+enum OverviewWaitCause: Equatable {
+    case session, weekly, other
+
+    var tag: String {
+        switch self {
+        case .session: return L10n.tagSessionFull
+        case .weekly: return L10n.tagWeeklyFull
+        case .other: return L10n.tagPaused
+        }
+    }
+}
+
+/// 복귀 대기 한 줄.
+struct OverviewWaitingAccount: Equatable {
+    let name: String
+    let cause: OverviewWaitCause
+    /// 세션 가득일 때 곁들이는 주간 사용률.
+    let weeklyPercent: Double?
+    /// 다시 라우팅되기까지 남은 초. 창이 아닌 이유(일시 제한·확인 필요)면 nil.
+    let returnSeconds: Double?
+    let returnClock: String?
+    /// 복귀 시각을 모를 때 오른쪽에 그리는 상태 라벨.
+    let note: String?
+}
+
+/// 라우팅에서 빠진 계정 한 줄.
+struct OverviewExcludedAccount: Equatable {
+    let name: String
+    let reason: String
+    let tone: PanelTone
+    /// 손볼 것에 이미 있는 계정. 제외 목록은 다시 그리지 않고 수만 센다.
+    let inTodos: Bool
+}
+
 struct OverviewModel: Equatable {
     /// TeamClaude가 없으면 큰 숫자 대신 이 안내를 그린다(Phase 1 미설치).
     var claudeNotice: ToolNotice?
@@ -62,171 +119,226 @@ struct OverviewModel: Equatable {
     var routable = 0
     var total = 0
     var headline = ""
+    /// 기다리는 계정이 없을 때 큰 숫자 옆에 그리는 다음 리셋 줄.
     var resetLine = ""
     var lanes: [OverviewLane] = []
-    var strip: [OverviewStripColumn] = []
+    /// 지금 받는 계정(세션 많이 찬 순), 복귀 대기(빨리 풀리는 순), 제외.
+    var live: [OverviewLiveAccount] = []
+    var waiting: [OverviewWaitingAccount] = []
+    var excluded: [OverviewExcludedAccount] = []
+    /// 상태별 수. 큰 숫자와 같은 라우팅 판정(routingAvailability)에서 나온다. waitCount = 세션 + 주간 + 일시 대기.
     var readyCount = 0
     var waitCount = 0
+    var sessionWaitCount = 0
+    var weeklyWaitCount = 0
+    var otherWaitCount = 0
     var excludedCount = 0
-    var elapsedCaption: String?
+    /// 복귀 시각을 아는 대기 계정 가운데 가장 먼저 돌아오는 계정.
+    var nextReturn: OverviewWaitingAccount?
     var todos: [OverviewTodo] = []
-    var waitingNames: [String] = []
-    /// 있으면 "기다리면 풀림" 줄을 그린다. 그리는 문구는 overviewWaitingCaption이 폭에 맞춰 waitingNames로 다시 만든다.
-    var waitingCaption: String?
-    /// 한도 대기를 세션 창(몇 시간)과 주간 창(며칠)으로 나눈 묶음. 막대는 주간만 그려서
-    /// 주간이 낮은데 대기인 칸(세션 창이 찬 계정)이 왜 기다리는지 여기서 말한다.
-    var waitGroups: [OverviewWaitGroup] = []
     var burnAside: String?
     var burnLines: [OverviewBurnLine] = []
+
+    var hasLedger: Bool { !live.isEmpty || !waiting.isEmpty || !excluded.isEmpty }
 }
 
-func overviewStripStateBand(_ tone: PanelTone) -> PanelTone? {
-    switch tone {
-    case .ready, .wait: return tone
-    default: return nil
+/// 속도 경고. 지금 속도(세션 사용률 ÷ 창이 지난 비율)로 리셋 전에 98%에 닿으면 값, 아니면 nil.
+/// 창이 막 시작했을 때(15% 미만)의 속도는 믿기 어려워 내다보지 않는다(시안 lib/quota.ts와 같은 문턱).
+/// 이미 문턱 이상이면 막대가 호박색으로 말하므로 경고 줄을 그리지 않는다.
+func overviewSessionProjection(percent: Double?, elapsed: Double?, remainingSeconds: Double?,
+                               thresholdPercent: Double = panelRoutingThresholdPercent) -> OverviewSessionProjection? {
+    guard let percent, percent.isFinite, percent > 0, percent < thresholdPercent,
+          let elapsed, elapsed.isFinite, elapsed >= 0.15, elapsed < 1,
+          let remainingSeconds, remainingSeconds > 0 else { return nil }
+    let spentSeconds = elapsed * teamClaudeSessionSeconds
+    let perSecond = percent / spentSeconds
+    let hitsIn = (thresholdPercent - percent) / perSecond
+    guard hitsIn < remainingSeconds else { return nil }
+    return OverviewSessionProjection(hitsLimitInSeconds: hitsIn, earlierBySeconds: remainingSeconds - hitsIn)
+}
+
+/// 세션 창 길이(5시간). 속도 경고·Claude 탭 막대 눈금이 지난 시간을 잰다.
+let teamClaudeSessionSeconds: Double = 5 * 3_600
+
+/// 원인 태그. 주간 창이 들었으면 주간(세션이 먼저 풀려도 주간이 풀릴 때까지 못 쓴다), 세션만이면 세션,
+/// 막힌 창이 없으면(throttled·exhausted·확인 필요) 일시 대기.
+func overviewWaitCause(blockedWindows: [String]) -> OverviewWaitCause {
+    if blockedWindows.contains(L10n.windowAllWeekly) { return .weekly }
+    if blockedWindows.contains(L10n.sessionShort) { return .session }
+    return .other
+}
+
+/// 세션 많이 찬 순. 값이 없으면 뒤로, 같으면 원래 순서.
+func overviewSortLive(_ accounts: [OverviewLiveAccount]) -> [OverviewLiveAccount] {
+    accounts.enumerated().sorted { lhs, rhs in
+        let l = lhs.element.sessionPercent ?? -1, r = rhs.element.sessionPercent ?? -1
+        return l != r ? l > r : lhs.offset < rhs.offset
+    }.map(\.element)
+}
+
+/// 빨리 풀리는 순. 복귀 시각을 모르면 뒤로, 같으면 원래 순서.
+func overviewSortWaiting(_ accounts: [OverviewWaitingAccount]) -> [OverviewWaitingAccount] {
+    accounts.enumerated().sorted { lhs, rhs in
+        let l = lhs.element.returnSeconds ?? .infinity, r = rhs.element.returnSeconds ?? .infinity
+        return l != r ? l < r : lhs.offset < rhs.offset
+    }.map(\.element)
+}
+
+/// 큰 숫자 옆 상태별 수(라벨, 점 색). 폭이 모자라면 0인 대기 항목부터 뺀다.
+func overviewSummaryItems(_ model: OverviewModel, maxWidth: CGFloat) -> [(String, PanelTone)] {
+    var items: [(String, PanelTone, Int, Int)] = [
+        (L10n.legendReady(model.readyCount), .ready, model.readyCount, 99),
+        (L10n.legendSessionWait(model.sessionWaitCount), .wait, model.sessionWaitCount, 1),
+        (L10n.legendWeeklyWait(model.weeklyWaitCount), .wait, model.weeklyWaitCount, 2),
+    ]
+    if model.otherWaitCount > 0 { items.append((L10n.legendOtherWait(model.otherWaitCount), .wait, model.otherWaitCount, 0)) }
+    items.append((L10n.legendExcluded(model.excludedCount), .error, model.excludedCount, 99))
+    for priority in 0...2 where overviewSummaryWidth(items.map { ($0.0, $0.1) }) > maxWidth {
+        items.removeAll { $0.3 == priority && $0.2 == 0 }
     }
+    return items.map { ($0.0, $0.1) }
 }
 
-enum OverviewWaitWindow: Equatable { case session, weekly, other }
-
-struct OverviewWaitGroup: Equatable {
-    let window: OverviewWaitWindow
-    let count: Int
-    /// 그 묶음에서 가장 먼저 돌아오는 계정까지 남은 초. 모르면 nil.
-    let soonestSeconds: Double?
+/// 요약 항목을 한 줄로 그린 폭(점 12 + 글자, 항목 사이 14).
+func overviewSummaryWidth(_ items: [(String, PanelTone)]) -> CGFloat {
+    items.reduce(0) { $0 + 12 + PanelDraw.width($1.0, TeamClaudePalette.legendFont) } + CGFloat(max(0, items.count - 1)) * 14
 }
 
-func overviewWaitGroupsCaption(_ groups: [OverviewWaitGroup]) -> String {
-    let parts = groups.map { group -> String in
-        let duration = group.soonestSeconds.map { L10n.duration(seconds: Int($0)) }
-        switch group.window {
-        case .session: return L10n.waitGroupSession(group.count, duration)
-        case .weekly: return L10n.waitGroupWeekly(group.count, duration)
-        case .other: return L10n.waitGroupOther(group.count)
-        }
-    }
-    return L10n.waitGroupsCaption(parts.joined(separator: " · "))
-}
-
-/// 띠의 칸 하나. 계정이 칸 수보다 많으면 이웃한 계정 여럿을 한 칸으로 묶는다(그리기만의 일 — 값은 고르고 평균만 낸다).
-struct OverviewStripSlot: Equatable {
-    /// 그릴 값. 한 계정이면 그 계정 그대로, 묶음이면 합친 값.
-    let column: OverviewStripColumn
-    let firstIndex: Int
-    let memberCount: Int
-    let readyCount: Int
-    let waitCount: Int
-    let excludedCount: Int
-}
-
-/// 개요 띠 칸을 눌렀을 때 갈 곳. 한 계정짜리 칸은 그 계정, 여러 계정을 묶은 칸은 구성원이 모두 보이는 Claude 탭.
-enum OverviewStripTarget: Equatable {
+/// 목록 줄·칸을 눌렀을 때 갈 곳. 계정 줄은 그 계정, 접은 줄은 모든 계정이 보이는 Claude 탭.
+enum OverviewRowTarget: Equatable {
     case account(String)
     case claudeTab
 }
 
-enum OverviewStripMetrics {
-    static let gap: CGFloat = 3
-    /// 칸이 이보다 얇아지면 묶는다. 띠 폭 안에 들어가는 칸 수가 여기서 정해진다.
-    static let minColumnWidth: CGFloat = 4
+enum OverviewLedgerSection: Equatable { case live, waiting, excluded }
 
-    static func maxColumns(chartWidth: CGFloat) -> Int {
-        max(1, Int(((chartWidth + gap) / (minColumnWidth + gap)).rounded(.down)))
-    }
-
-    /// 칸 사각형. 그리기·누르기·테스트가 같은 값을 쓴다.
-    static func columnRects(count: Int, chart: NSRect) -> [NSRect] {
-        guard count > 0 else { return [] }
-        let width = (chart.width - gap * CGFloat(count - 1)) / CGFloat(count)
-        return (0..<count).map {
-            NSRect(x: chart.minX + CGFloat($0) * (width + gap), y: chart.minY, width: width, height: chart.height)
-        }
-    }
+enum OverviewLedgerRowKind: Equatable {
+    case live(Int)
+    case waiting(Int)
+    case excluded(Int)
+    /// 접어 둔 나머지(구역, 개수).
+    case more(OverviewLedgerSection, Int)
+    /// 지금 받는 계정이 없을 때의 빈 줄.
+    case empty
 }
 
-private func overviewMean(_ values: [Double]) -> Double? {
-    values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+struct OverviewLedgerRow: Equatable {
+    let kind: OverviewLedgerRowKind
+    let rect: NSRect
+    let target: OverviewRowTarget?
 }
 
-/// 계정을 칸에 나눠 담는다. maxColumns 안이면 한 계정 한 칸, 넘으면 이웃한 계정을 같은 수씩 묶는다.
-/// 묶음 칸의 색은 뜻을 지킨다: 대기 계정이 하나라도 있으면 호박색, 전부 빠졌으면 흐리게, 오류가 있으면 빨간 띠.
-func overviewStripSlots(_ columns: [OverviewStripColumn], maxColumns: Int) -> [OverviewStripSlot] {
-    guard !columns.isEmpty else { return [] }
-    let perSlot = max(1, Int((Double(columns.count) / Double(max(1, maxColumns))).rounded(.up)))
-    return stride(from: 0, to: columns.count, by: perSlot).map { start in
-        let members = Array(columns[start..<min(columns.count, start + perSlot)])
-        let ready = members.filter { $0.tone == .ready }.count
-        let wait = members.filter { $0.tone == .wait }.count
-        let excludedCount = members.count - ready - wait
-        guard members.count > 1 else {
-            return OverviewStripSlot(column: members[0], firstIndex: start, memberCount: 1,
-                                     readyCount: ready, waitCount: wait, excludedCount: excludedCount)
+struct OverviewLedgerLayout {
+    var headers: [(OverviewLedgerSection, CGFloat)] = []
+    var cards: [NSRect] = []
+    var rows: [OverviewLedgerRow] = []
+    var height: CGFloat = 0
+}
+
+enum OverviewLedgerMetrics {
+    /// 지금 받는 계정 칸은 최대 6개, 복귀 대기·제외는 5줄. 나머지는 "외 N개" 한 줄.
+    static let maxLive = 6
+    static let maxWaiting = 5
+    static let maxExcluded = 5
+    static let headerHeight: CGFloat = 22
+    static let liveRowHeight: CGFloat = 60
+    static let warningHeight: CGFloat = 18
+    static let waitRowHeight: CGFloat = 30
+    static let excludedRowHeight: CGFloat = 26
+    static let moreRowHeight: CGFloat = 28
+    static let emptyRowHeight: CGFloat = 34
+    static let sectionGap: CGFloat = 14
+    /// 줄 안 가로 위치(줄 왼쪽 끝 기준): 점, 이름, 막대·태그 열.
+    static let dotX: CGFloat = 12
+    static let nameX: CGFloat = 24
+    static let columnX: CGFloat = 124
+
+    /// 구역 머리·카드·줄 사각형. 그리기·누르기·높이·테스트가 같은 값을 쓴다.
+    static func layout(_ model: OverviewModel, x: CGFloat, width: CGFloat, top: CGFloat) -> OverviewLedgerLayout {
+        var result = OverviewLedgerLayout()
+        guard model.hasLedger else { return result }
+        var y = top
+
+        func card(_ heights: [(OverviewLedgerRowKind, CGFloat, OverviewRowTarget?)]) {
+            let cardTop = y
+            for (kind, height, target) in heights {
+                result.rows.append(OverviewLedgerRow(kind: kind, rect: NSRect(x: x, y: y, width: width, height: height), target: target))
+                y += height
+            }
+            result.cards.append(NSRect(x: x, y: cardTop, width: width, height: y - cardTop))
         }
-        let routable = members.filter { !$0.excluded }
-        let tone: PanelTone
-        if routable.isEmpty {
-            tone = members.contains { $0.tone == .error } ? .error : members[0].tone
+
+        // 지금 받는 계정
+        result.headers.append((.live, y))
+        y += headerHeight
+        if model.live.isEmpty {
+            card([(.empty, emptyRowHeight, nil)])
         } else {
-            tone = routable.contains { $0.tone == .wait } ? .wait
-                : (routable.contains { $0.tone == .ready } ? .ready : routable[0].tone)
+            var rows = model.live.prefix(maxLive).enumerated().map { index, account in
+                (OverviewLedgerRowKind.live(index), liveRowHeight + (account.projection == nil ? 0 : warningHeight),
+                 Optional(OverviewRowTarget.account(account.name)))
+            }
+            if model.live.count > maxLive {
+                rows.append((.more(.live, model.live.count - maxLive), moreRowHeight, .claudeTab))
+            }
+            card(rows)
         }
-        // 묶인 칸의 띠는 오류 > 대기 > 사용 가능 > 꺼 둠 순으로 하나만 그린다(각 수는 툴팁이 말한다).
-        // 오류는 사람이 손봐야 하니 다른 상태에 가려지지 않게 맨 앞이다.
-        let cap: PanelTone? = members.contains { $0.cap == .error } ? .error
-            : (routable.isEmpty ? members[0].cap : nil)
-        let column = OverviewStripColumn(
-            name: members[0].name, label: L10n.stripBucketLabel(members.count), tone: tone,
-            weeklyPercent: overviewMean((routable.isEmpty ? members : routable).compactMap(\.weeklyPercent)),
-            sessionPercent: nil, fablePercent: nil,
-            weeklyElapsed: overviewMean(routable.compactMap(\.weeklyElapsed)),
-            excluded: routable.isEmpty, cap: cap)
-        return OverviewStripSlot(column: column, firstIndex: start, memberCount: members.count,
-                                 readyCount: ready, waitCount: wait, excludedCount: excludedCount)
-    }
-}
 
-/// "기다리면 풀림" 한 줄. 이름이 다 안 들어가면 앞에서부터 들어가는 만큼 + "외 N개".
-/// 이름 하나도 안 들어가면 첫 이름을 줄여서라도 남은 개수는 남긴다.
-func overviewWaitingCaption(_ names: [String], font: NSFont, maxWidth: CGFloat) -> String {
-    guard !names.isEmpty else { return "" }
-    func fits(_ value: String) -> Bool { PanelDraw.width(value, font) <= maxWidth }
-    let all = L10n.waitingCaption(names.joined(separator: " · "))
-    if fits(all) { return all }
-    func caption(_ shown: Int) -> String {
-        L10n.waitingCaption(names.prefix(shown).joined(separator: " · ") + " " + L10n.andMore(names.count - shown))
+        // 복귀 대기
+        if !model.waiting.isEmpty {
+            y += sectionGap
+            result.headers.append((.waiting, y))
+            y += headerHeight
+            var rows = model.waiting.prefix(maxWaiting).enumerated().map { index, account in
+                (OverviewLedgerRowKind.waiting(index), waitRowHeight, Optional(OverviewRowTarget.account(account.name)))
+            }
+            if model.waiting.count > maxWaiting {
+                rows.append((.more(.waiting, model.waiting.count - maxWaiting), moreRowHeight, .claudeTab))
+            }
+            card(rows)
+        }
+
+        // 제외: 손볼 것에 이미 있는 계정은 다시 그리지 않는다.
+        if !model.excluded.isEmpty {
+            y += sectionGap
+            result.headers.append((.excluded, y))
+            let listed = model.excluded.indices.filter { !model.excluded[$0].inTodos }
+            if listed.isEmpty {
+                y += 16
+            } else {
+                y += headerHeight
+                var rows = listed.prefix(maxExcluded).map { index in
+                    (OverviewLedgerRowKind.excluded(index), excludedRowHeight,
+                     Optional(OverviewRowTarget.account(model.excluded[index].name)))
+                }
+                if listed.count > maxExcluded {
+                    rows.append((.more(.excluded, listed.count - maxExcluded), moreRowHeight, .claudeTab))
+                }
+                card(rows)
+            }
+        }
+        result.height = y - top
+        return result
     }
-    var best: String?
-    for shown in 1..<names.count {
-        let candidate = caption(shown)
-        guard fits(candidate) else { break }
-        best = candidate
-    }
-    if let best { return best }
-    let suffix = names.count > 1 ? " " + L10n.andMore(names.count - 1) : ""
-    var first = names[0]
-    while !first.isEmpty {
-        first.removeLast()
-        let candidate = L10n.waitingCaption(first + "…" + suffix)
-        if fits(candidate) { return candidate }
-    }
-    return PanelDraw.clipped(all, font, maxWidth: maxWidth)
 }
 
 final class OverviewTabView: NSView {
     static let padding: CGFloat = 16
     static let heroHeight: CGFloat = 92
     static let lanesHeight: CGFloat = 76
-    static let stripHeight: CGFloat = 132
     static let todoRowHeight: CGFloat = 54
     static let sectionGap: CGFloat = 26
     static let burnLineHeight: CGFloat = 22
 
+    static func ledgerHeight(_ model: OverviewModel) -> CGFloat {
+        OverviewLedgerMetrics.layout(model, x: 0, width: 488, top: 0).height
+    }
+
     static func preferredHeight(_ model: OverviewModel) -> CGFloat {
         var height = 18 + heroHeight + lanesHeight
-        if !model.strip.isEmpty { height += sectionGap + stripHeight }
-        if !model.todos.isEmpty || !model.waitingNames.isEmpty {
+        if model.hasLedger { height += sectionGap + ledgerHeight(model) }
+        if !model.todos.isEmpty {
             height += sectionGap + 20 + CGFloat(model.todos.count) * (todoRowHeight + 6)
-            if model.waitingCaption != nil { height += 30 }
         }
         height += sectionGap + 20 + CGFloat(max(1, model.burnLines.count)) * burnLineHeight + 36
         return height + 18
@@ -245,12 +357,8 @@ final class OverviewTabView: NSView {
     var onTodo: ((OverviewTodo) -> Void)?
 
     private var laneRects: [(DashboardTab, NSRect)] = []
-    /// 마지막으로 그린 띠 칸(이름, 사각형). 누르기와 테스트가 읽는다.
-    private(set) var columnRects: [(OverviewStripTarget, NSRect)] = []
-    /// 띠 칸 툴팁 문구(툴팁 번호 → 문구). 주인은 이 뷰 자신이다.
-    /// 예전에는 `tip as NSString`을 owner로 넘겼는데 addToolTip은 owner를 붙잡지 않아,
-    /// 툴팁이 뜨는 순간 해제된 문자열에 메시지를 보내 앱이 죽었다(2026-10-26 충돌 3건, NSToolTipManager displayToolTip).
-    private(set) var stripToolTips: [NSView.ToolTipTag: String] = [:]
+    /// 마지막으로 그린 목록 줄. 누르기와 테스트가 읽는다.
+    private(set) var ledgerRows: [OverviewLedgerRow] = []
     private var todoButtons: [PanelButton] = []
     private var burnButton: PanelButton?
     private var todoRowRects: [(String, NSRect)] = []
@@ -270,21 +378,21 @@ final class OverviewTabView: NSView {
         if let notice = model.claudeNotice {
             setAccessibilityLabel("\(L10n.routableNow), \(notice.headline)")
         } else {
-            setAccessibilityLabel("\(L10n.routableNow) \(model.routable)/\(model.total), \(model.headline), \(L10n.todoBadge(model.todos.count))")
+            let counts = overviewSummaryItems(model, maxWidth: .infinity).map(\.0).joined(separator: ", ")
+            setAccessibilityLabel("\(L10n.routableNow) \(model.routable)/\(model.total), \(model.headline), \(counts), \(L10n.todoBadge(model.todos.count))")
         }
     }
 
     // MARK: 기하 — draw와 layout이 같은 값을 쓴다
 
     private var lanesTop: CGFloat { 18 + Self.heroHeight }
-    private var stripTop: CGFloat { lanesTop + Self.lanesHeight + Self.sectionGap }
+    private var ledgerTop: CGFloat { lanesTop + Self.lanesHeight + Self.sectionGap }
     private var todoTop: CGFloat {
-        model.strip.isEmpty ? lanesTop + Self.lanesHeight + Self.sectionGap : stripTop + Self.stripHeight + Self.sectionGap
+        model.hasLedger ? ledgerTop + Self.ledgerHeight(model) + Self.sectionGap : lanesTop + Self.lanesHeight + Self.sectionGap
     }
     private var burnTop: CGFloat {
-        guard !model.todos.isEmpty || !model.waitingNames.isEmpty else { return todoTop }
-        return todoTop + 20 + CGFloat(model.todos.count) * (Self.todoRowHeight + 6)
-            + (model.waitingCaption != nil ? 30 : 0) + Self.sectionGap
+        guard !model.todos.isEmpty else { return todoTop }
+        return todoTop + 20 + CGFloat(model.todos.count) * (Self.todoRowHeight + 6) + Self.sectionGap
     }
 
     private func todoRowRect(_ index: Int) -> NSRect {
@@ -328,7 +436,7 @@ final class OverviewTabView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if let lane = laneRects.first(where: { $0.1.contains(point) }) { onSelectTab?(lane.0); return }
-        if let target = stripClickTarget(at: point) {
+        if let target = rowClickTarget(at: point) {
             switch target {
             case .account(let name): onOpenAccount?(name)
             case .claudeTab: onSelectTab?(.claude)
@@ -339,9 +447,9 @@ final class OverviewTabView: NSView {
         super.mouseDown(with: event)
     }
 
-    /// 띠 칸 위의 점을 누르면 갈 곳. 칸 밖이면 nil.
-    func stripClickTarget(at point: NSPoint) -> OverviewStripTarget? {
-        columnRects.first(where: { $0.1.contains(point) })?.0
+    /// 목록 줄 위의 점을 누르면 갈 곳. 줄 밖이거나 갈 곳이 없는 줄이면 nil.
+    func rowClickTarget(at point: NSPoint) -> OverviewRowTarget? {
+        ledgerRows.first(where: { $0.rect.contains(point) })?.target
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -349,10 +457,8 @@ final class OverviewTabView: NSView {
         let x0 = Self.padding
         let width = bounds.width - Self.padding * 2
         laneRects = []
-        columnRects = []
+        ledgerRows = []
         todoRowRects = []
-        removeAllToolTips()
-        stripToolTips = [:]
 
         // 1. 지금 몇 개가 되는가
         PanelDraw.meta(L10n.routableNow, x0, 18)
@@ -363,16 +469,7 @@ final class OverviewTabView: NSView {
             // 예전 요약 띠와 같은 카드 id로 남긴다(빈 HOME 스냅샷이 소비 지점마다 같은 상태를 확인한다).
             ToolNoticeDrawLog.record("summary-\(notice.tool.rawValue)", notice)
         } else {
-            let number = "\(model.routable)"
-            let numberWidth = PanelDraw.text(number, x0 - 2, 30, TeamClaudePalette.heroFont, TeamClaudePalette.fg)
-            let unit = "/ \(model.total)"
-            let unitWidth = PanelDraw.text(unit, x0 + numberWidth + 6, 66, TeamClaudePalette.heroUnitFont, TeamClaudePalette.fg3)
-            let textX = x0 + numberWidth + unitWidth + 26
-            let textWidth = bounds.width - Self.padding - textX
-            PanelDraw.text(PanelDraw.clipped(model.headline, TeamClaudePalette.bodyFont, maxWidth: textWidth), textX, 52,
-                           TeamClaudePalette.bodyFont, TeamClaudePalette.fg2)
-            PanelDraw.text(PanelDraw.clipped(model.resetLine, TeamClaudePalette.captionFont, maxWidth: textWidth), textX, 72,
-                           TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+            drawHero(x0: x0)
         }
 
         if let notice = model.codexNotice { ToolNoticeDrawLog.record("summary-\(notice.tool.rawValue)", notice) }
@@ -406,13 +503,13 @@ final class OverviewTabView: NSView {
                            TeamClaudePalette.microFont, TeamClaudePalette.fg3)
         }
 
-        // 2. Claude 풀 주간 사용률 띠
-        if !model.strip.isEmpty {
-            drawStrip(x0: x0, width: width)
+        // 2. Claude 상태별 목록
+        if model.hasLedger {
+            drawLedger(OverviewLedgerMetrics.layout(model, x: x0, width: width, top: ledgerTop), x0: x0, width: width)
         }
 
         // 3. 손볼 것
-        if !model.todos.isEmpty || !model.waitingNames.isEmpty {
+        if !model.todos.isEmpty {
             PanelDraw.meta(L10n.todoBadge(model.todos.count), x0, todoTop)
             PanelDraw.right(L10n.todoAside, x0 + width, todoTop, TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
             for (index, todo) in model.todos.enumerated() {
@@ -432,14 +529,6 @@ final class OverviewTabView: NSView {
                 if todo.provider == "anthropic" {
                     todoRowRects.append((todo.name, NSRect(x: row.minX, y: row.minY, width: row.width - buttonWidth, height: row.height)))
                 }
-            }
-            if model.waitingCaption != nil {
-                let y = todoRowRect(model.todos.count).minY + 4
-                PanelDraw.dot(x0 + 4, centerY: y + 8, TeamClaudePalette.amber)
-                let caption = model.waitGroups.isEmpty
-                    ? overviewWaitingCaption(model.waitingNames, font: TeamClaudePalette.captionFont, maxWidth: width - 20)
-                    : PanelDraw.clipped(overviewWaitGroupsCaption(model.waitGroups), TeamClaudePalette.captionFont, maxWidth: width - 20)
-                PanelDraw.text(caption, x0 + 18, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
             }
         }
 
@@ -461,89 +550,222 @@ final class OverviewTabView: NSView {
         }
     }
 
-    private func drawStrip(x0: CGFloat, width: CGFloat) {
-        let top = stripTop
-        PanelDraw.meta(L10n.stripTitle, x0, top)
-        // 범례: 사용 가능 · 대기 · 제외
-        var legendX = x0 + width
-        for (label, tone) in [(L10n.legendExcluded(model.excludedCount), PanelTone.error),
-                              (L10n.legendWait(model.waitCount), PanelTone.wait),
-                              (L10n.legendReady(model.readyCount), PanelTone.ready)] {
-            legendX = PanelDraw.right(label, legendX, top, TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
-            PanelDraw.dot(legendX - 12, centerY: top + 7.5, tone.color)
-            legendX -= 24
-        }
+    // MARK: 큰 숫자 + 상태별 수 + 다음 복귀
 
-        let chart = NSRect(x: x0, y: top + 28, width: width, height: 56)
-        let slots = overviewStripSlots(model.strip, maxColumns: OverviewStripMetrics.maxColumns(chartWidth: chart.width))
-        let rects = OverviewStripMetrics.columnRects(count: slots.count, chart: chart)
-        let gap = OverviewStripMetrics.gap
-        let bucketed = slots.count < model.strip.count
-        for (index, (slot, rect)) in zip(slots, rects).enumerated() {
-            let column = slot.column
-            columnRects.append((slot.memberCount == 1 ? .account(column.name) : .claudeTab, rect))
-            NSGraphicsContext.saveGraphicsState()
-            NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).addClip()
-            NSColor.white.withAlphaComponent(0.06).setFill()
-            rect.fill()
-            if let weekly = column.weeklyPercent {
-                let share = CGFloat(max(0, min(100, weekly)) / 100)
-                // 채움 색은 주간 사용률만 말한다(98% 문턱부터 호박색, DESIGN.md "막대"). 상태는 위 띠가 말한다.
-                let fill = column.excluded ? TeamClaudePalette.graphite
-                    : weekly >= panelRoutingThresholdPercent ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.85)
-                fill.setFill()
-                NSRect(x: rect.minX, y: rect.maxY - rect.height * share, width: rect.width, height: rect.height * share).fill()
-            }
-            // 위 띠는 범례 점과 같은 색으로 상태를 말한다(사용 가능 민트·대기 호박·제외 빨강·꺼 둠 회색).
-            if let cap = column.cap ?? overviewStripStateBand(column.tone) {
-                cap.color.setFill()
-                NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 3).fill()
-            }
-            NSGraphicsContext.restoreGraphicsState()
-            // 창 경과 눈금 — 이 선보다 높은 칸은 리셋 전에 찰 속도로 쓰는 중이다.
-            if let elapsed = column.weeklyElapsed, !column.excluded {
-                let y = rect.maxY - rect.height * CGFloat(elapsed) - 1
-                TeamClaudePalette.sky.withAlphaComponent(0.9).setFill()
-                NSRect(x: rect.minX - (index == 0 ? 0 : gap / 2), y: y, width: rect.width + gap, height: 2).fill()
-            }
-            let tip: String
-            if slot.memberCount > 1 {
-                tip = String(format: "%02d–%02d", slot.firstIndex + 1, slot.firstIndex + slot.memberCount) + " · \(column.label)"
-                    + " · \(L10n.legendReady(slot.readyCount)) · \(L10n.legendWait(slot.waitCount)) · \(L10n.legendExcluded(slot.excludedCount))"
-                    + " · \(L10n.weeklyShort) \(panelPercentText(column.weeklyPercent))"
-            } else {
-                tip = "\(column.name) · \(column.label) · \(L10n.weeklyShort) \(panelPercentText(column.weeklyPercent))"
-                    + " · \(L10n.sessionShort) \(panelPercentText(column.sessionPercent))"
-                    + (column.fablePercent.map { " · Fable \(panelPercentText($0))" } ?? "")
-            }
-            stripToolTips[addToolTip(rect, owner: self, userData: nil)] = tip
-            guard !bucketed else { continue }
-            let label = String(format: "%02d", index + 1)
-            let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-            let showLabel = slots.count <= 20 || index == 0 || index == slots.count - 1 || (index + 1) % 5 == 0
-            if showLabel {
-                let w = PanelDraw.width(label, labelFont)
-                PanelDraw.text(label, rect.midX - w / 2, chart.maxY + 6, labelFont, TeamClaudePalette.fg3)
-            }
+    private func drawHero(x0: CGFloat) {
+        let number = "\(model.routable)"
+        let numberWidth = PanelDraw.text(number, x0 - 2, 30, TeamClaudePalette.heroFont, TeamClaudePalette.fg)
+        let unit = "/ \(model.total)"
+        let unitWidth = PanelDraw.text(unit, x0 + numberWidth + 6, 66, TeamClaudePalette.heroUnitFont, TeamClaudePalette.fg3)
+        let textX = x0 + numberWidth + unitWidth + 26
+        let textWidth = bounds.width - Self.padding - textX
+        PanelDraw.text(PanelDraw.clipped(model.headline, TeamClaudePalette.bodyFont, maxWidth: textWidth), textX, 34,
+                       TeamClaudePalette.bodyFont, TeamClaudePalette.fg2)
+        // 상태별 수: 범례 색 점(사용 가능 민트 · 대기 호박 · 제외 빨강) + 라벨.
+        var cursor = textX
+        for (label, tone) in overviewSummaryItems(model, maxWidth: textWidth) {
+            let room = textX + textWidth - cursor - 12
+            guard room > 16 else { break }
+            PanelDraw.dot(cursor, centerY: 62, tone.color)
+            let shown = PanelDraw.clipped(label, TeamClaudePalette.legendFont, maxWidth: room)
+            cursor += 12 + PanelDraw.text(shown, cursor + 12, 54, TeamClaudePalette.legendFont, TeamClaudePalette.fg2) + 14
         }
-        // 묶은 칸에는 번호 대신 묶음 안내를 그린다(칸마다 몇 개인지는 툴팁이 범위로 보여 준다).
-        if bucketed {
-            let note = L10n.stripBucketNote(total: model.strip.count, perSlot: slots.map(\.memberCount).max() ?? 1)
-            PanelDraw.text(PanelDraw.clipped(note, TeamClaudePalette.legendFont, maxWidth: width), x0, chart.maxY + 5,
-                           TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
+        let next: String
+        if let wait = model.nextReturn, let seconds = wait.returnSeconds {
+            next = L10n.nextReturn(wait.name, L10n.duration(seconds: Int(seconds)), wait.returnClock)
+        } else {
+            next = model.resetLine
         }
-        if let caption = model.elapsedCaption {
-            let y = chart.maxY + 26
-            TeamClaudePalette.sky.setFill()
-            NSBezierPath(roundedRect: NSRect(x: x0, y: y + 7, width: 16, height: 2), xRadius: 1, yRadius: 1).fill()
-            PanelDraw.text(PanelDraw.clipped(caption, TeamClaudePalette.legendFont, maxWidth: width - 24), x0 + 24, y,
-                           TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
+        PanelDraw.text(PanelDraw.clipped(next, TeamClaudePalette.captionFont, maxWidth: textWidth), textX, 74,
+                       TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+    }
+
+    // MARK: 상태별 목록
+
+    private func drawLedger(_ layout: OverviewLedgerLayout, x0: CGFloat, width: CGFloat) {
+        ledgerRows = layout.rows
+        for (section, y) in layout.headers {
+            drawSectionHeader(section, x0: x0, width: width, y: y)
+        }
+        for card in layout.cards { PanelDraw.card(card) }
+        for (index, row) in layout.rows.enumerated() {
+            if index > 0, layout.rows[index - 1].rect.maxY == row.rect.minY {
+                PanelDraw.hairline(row.rect.minX + 1, row.rect.maxX - 1, row.rect.minY)
+            }
+            switch row.kind {
+            case .live(let i): drawLiveRow(model.live[i], row.rect)
+            case .waiting(let i): drawWaitingRow(model.waiting[i], row.rect)
+            case .excluded(let i): drawExcludedRow(model.excluded[i], row.rect)
+            case .more(_, let count): drawCentered(L10n.moreInClaudeTab(count), row.rect)
+            case .empty: drawCentered(L10n.noLiveAccounts, row.rect)
+            }
         }
     }
-}
 
-extension OverviewTabView: NSViewToolTipOwner {
-    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
-        stripToolTips[tag] ?? ""
+    private func drawSectionHeader(_ section: OverviewLedgerSection, x0: CGFloat, width: CGFloat, y: CGFloat) {
+        let title: String, count: Int, hint: String?
+        switch section {
+        case .live:
+            title = L10n.liveSectionTitle; count = model.live.count; hint = L10n.liveSectionHint
+        case .waiting:
+            title = L10n.waitingSectionTitle; count = model.waiting.count
+            let soon = model.waiting.filter { ($0.returnSeconds ?? .infinity) <= teamClaudeSessionSeconds }.count
+            hint = soon > 0 ? L10n.waitingSoonHint(soon) : L10n.waitingSectionHint
+        case .excluded:
+            title = L10n.excludedSectionTitle; count = model.excluded.count
+            let inTodos = model.excluded.filter(\.inTodos).count
+            hint = inTodos > 0 ? L10n.excludedInTodosHint(inTodos) : nil
+        }
+        let titleWidth = PanelDraw.meta(title, x0, y)
+        PanelDraw.text("\(count)", x0 + titleWidth + 6, y - 0.5, TeamClaudePalette.numberFont, TeamClaudePalette.fg3)
+        if let hint {
+            PanelDraw.right(hint, x0 + width, y, TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
+        }
+    }
+
+    private func drawCentered(_ text: String, _ rect: NSRect) {
+        let font = TeamClaudePalette.legendFont
+        let shown = PanelDraw.clipped(text, font, maxWidth: rect.width - 24)
+        PanelDraw.text(shown, rect.midX - PanelDraw.width(shown, font) / 2, rect.midY - 7.5, font, TeamClaudePalette.fg3)
+    }
+
+    /// 세션·주간·Fable 라벨 열 폭(언어마다 가장 긴 라벨).
+    private var windowLabelWidth: CGFloat {
+        [L10n.sessionShort, L10n.weeklyShort, "Fable"].map { PanelDraw.width($0, TeamClaudePalette.microFont) }.max().map { ceil($0) + 6 } ?? 36
+    }
+
+    private func drawLiveRow(_ account: OverviewLiveAccount, _ rect: NSRect) {
+        let m = OverviewLedgerMetrics.self
+        let right = rect.maxX - 12
+        let top = rect.minY
+        // 이름 열
+        PanelDraw.dot(rect.minX + m.dotX, centerY: top + 19, TeamClaudePalette.mint)
+        PanelDraw.text(PanelDraw.clipped(account.name, TeamClaudePalette.nameFont, maxWidth: m.columnX - m.nameX - 8),
+                       rect.minX + m.nameX, top + 11, TeamClaudePalette.nameFont, TeamClaudePalette.fg)
+        if account.busy {
+            PanelDraw.text(PanelDraw.clipped(account.label, TeamClaudePalette.microFont, maxWidth: m.columnX - m.nameX - 8),
+                           rect.minX + m.nameX, top + 40, TeamClaudePalette.microFont, TeamClaudePalette.fg2)
+        }
+        // 오른쪽: 리셋까지 남은 시간과 리셋 시각
+        // 열 폭은 그릴 글자에 맞춘다(영어 "resets Wed 2:41 AM"이 한국어보다 길다). 막대가 너무 줄지 않게 140에서 멈춘다.
+        var timeColumn: CGFloat = 92
+        if let remaining = account.sessionRemainingSeconds, remaining > 0 {
+            let ahead = L10n.durationAhead(L10n.duration(seconds: Int(remaining)))
+            let reset = account.sessionResetClock.map(L10n.resetAtClock)
+            timeColumn = min(140, max(timeColumn, ceil(PanelDraw.width(ahead, TeamClaudePalette.captionFont)),
+                                      ceil(reset.map { PanelDraw.width($0, TeamClaudePalette.microFont) } ?? 0)))
+            PanelDraw.right(PanelDraw.clipped(ahead, TeamClaudePalette.captionFont, maxWidth: timeColumn), right, top + 9,
+                            TeamClaudePalette.captionFont, TeamClaudePalette.fg2)
+            if let reset {
+                PanelDraw.right(PanelDraw.clipped(reset, TeamClaudePalette.microFont, maxWidth: timeColumn),
+                                right, top + 24, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+            }
+        } else {
+            PanelDraw.right(StatusVocabulary.none, right, top + 9, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+        }
+        // 세션 퍼센트(큰 숫자)
+        let percentRight = right - timeColumn - 8
+        let full = (account.sessionPercent ?? 0) >= panelRoutingThresholdPercent
+        let signLeft = PanelDraw.right("%", percentRight, top + 13, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+        let value = account.sessionPercent.map { "\(panelPercentNumber($0))" } ?? StatusVocabulary.none
+        let valueLeft = PanelDraw.right(value, signLeft - 1, top + 9, TeamClaudePalette.sessionValueFont,
+                                        full ? TeamClaudePalette.amber : TeamClaudePalette.fg)
+        // 세션 막대(크게) — 안의 세로 눈금이 5시간 창이 지난 비율이다.
+        let labelX = rect.minX + m.columnX
+        let labelWidth = windowLabelWidth
+        PanelDraw.text(L10n.sessionShort, labelX, top + 12, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+        let barX = labelX + labelWidth
+        let barWidth = max(24, valueLeft - 10 - barX)
+        PanelDraw.meter(NSRect(x: barX, y: top + 15, width: barWidth, height: 8), percent: account.sessionPercent,
+                        elapsed: account.sessionElapsed)
+        // 주간·Fable 작은 막대
+        let miniWidth = (right - labelX - 12) / 2
+        drawMini(account.weekly, x: labelX, centerY: top + 47, width: miniWidth, labelWidth: labelWidth)
+        drawMini(account.fable, x: labelX + miniWidth + 12, centerY: top + 47, width: miniWidth, labelWidth: labelWidth)
+        // 속도 경고
+        if let projection = account.projection {
+            let y = top + m.liveRowHeight - 2
+            drawWarningGlyph(x: rect.minX + m.dotX - 1, centerY: y + 7.5)
+            let text = L10n.paceWarning(L10n.duration(seconds: Int(projection.hitsLimitInSeconds)),
+                                        L10n.duration(seconds: Int(projection.earlierBySeconds)))
+            PanelDraw.text(PanelDraw.clipped(text, TeamClaudePalette.captionFont, maxWidth: right - rect.minX - m.nameX),
+                           rect.minX + m.nameX, y, TeamClaudePalette.captionFont, TeamClaudePalette.fg2)
+        }
+    }
+
+    private func drawMini(_ window: OverviewMiniWindow, x: CGFloat, centerY: CGFloat, width: CGFloat, labelWidth: CGFloat) {
+        let font = TeamClaudePalette.microFont
+        PanelDraw.text(window.label, x, centerY - 7, font, TeamClaudePalette.fg3)
+        let bar = NSRect(x: x + labelWidth, y: centerY - 2, width: 36, height: 4)
+        PanelDraw.meter(bar, percent: window.percent, elapsed: nil)
+        let percentRight = bar.maxX + 36
+        PanelDraw.right(panelPercentText(window.percent), percentRight, centerY - 7.5, TeamClaudePalette.smallFont,
+                        (window.percent ?? 0) >= panelRoutingThresholdPercent ? TeamClaudePalette.amber : TeamClaudePalette.fg2)
+        if let remaining = window.remainingSeconds, remaining > 0 {
+            let room = x + width - percentRight - 6
+            PanelDraw.text(PanelDraw.clipped(L10n.duration(seconds: Int(remaining)), font, maxWidth: room), percentRight + 6,
+                           centerY - 7, font, TeamClaudePalette.fg3)
+        }
+    }
+
+    private func drawWarningGlyph(x: CGFloat, centerY: CGFloat) {
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: x + 4.5, y: centerY - 4.5))
+        path.line(to: NSPoint(x: x + 9, y: centerY + 3.5))
+        path.line(to: NSPoint(x: x, y: centerY + 3.5))
+        path.close()
+        TeamClaudePalette.amber.setFill()
+        path.fill()
+    }
+
+    private func drawWaitingRow(_ account: OverviewWaitingAccount, _ rect: NSRect) {
+        let m = OverviewLedgerMetrics.self
+        let right = rect.maxX - 12
+        PanelDraw.dot(rect.minX + m.dotX, centerY: rect.midY, TeamClaudePalette.amber)
+        PanelDraw.text(PanelDraw.clipped(account.name, TeamClaudePalette.nameFont, maxWidth: m.columnX - m.nameX - 8),
+                       rect.minX + m.nameX, rect.midY - 8, TeamClaudePalette.nameFont, TeamClaudePalette.fg2)
+        // 원인 태그(면은 무채색, 세션 가득만 글자를 밝게 — 몇 시간이면 돌아온다).
+        let tag = account.cause.tag
+        let tagWidth = ceil(PanelDraw.width(tag, TeamClaudePalette.microFont)) + 12
+        let tagRect = NSRect(x: rect.minX + m.columnX, y: rect.midY - 8.5, width: tagWidth, height: 17)
+        PanelDraw.fillRound(tagRect, NSColor.white.withAlphaComponent(0.06), 6)
+        PanelDraw.text(tag, tagRect.minX + 6, tagRect.minY + 1.5, TeamClaudePalette.microFont,
+                       account.cause == .session ? TeamClaudePalette.fg2 : TeamClaudePalette.fg3)
+        // 오른쪽: 남은 시간 · 복귀 시각
+        let clockColumn: CGFloat = 92
+        var leftLimit = right
+        if let seconds = account.returnSeconds {
+            if let clock = account.returnClock {
+                PanelDraw.right(PanelDraw.clipped(clock, TeamClaudePalette.microFont, maxWidth: clockColumn), right, rect.midY - 7,
+                                TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+            }
+            leftLimit = PanelDraw.right(L10n.durationAhead(L10n.duration(seconds: Int(seconds))), right - clockColumn - 8, rect.midY - 8,
+                                        TeamClaudePalette.captionFont,
+                                        seconds <= teamClaudeSessionSeconds ? TeamClaudePalette.fg : TeamClaudePalette.fg2)
+        } else if let note = account.note {
+            leftLimit = PanelDraw.right(PanelDraw.clipped(note, TeamClaudePalette.captionFont, maxWidth: 140), right, rect.midY - 8,
+                                        TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
+        }
+        // 세션 가득이면 주간 작은 막대와 퍼센트(주간에 여유가 있어 몇 시간이면 돌아온다는 뜻).
+        if account.cause == .session, let weekly = account.weeklyPercent {
+            let x = tagRect.maxX + 10
+            let labelWidth = ceil(PanelDraw.width(L10n.weeklyShort, TeamClaudePalette.microFont)) + 6
+            let needed = labelWidth + 36 + 6 + PanelDraw.width("100%", TeamClaudePalette.smallFont)
+            if x + needed < leftLimit - 8 {
+                PanelDraw.text(L10n.weeklyShort, x, rect.midY - 7, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+                PanelDraw.meter(NSRect(x: x + labelWidth, y: rect.midY - 2, width: 36, height: 4), percent: weekly, elapsed: nil)
+                PanelDraw.text(panelPercentText(weekly), x + labelWidth + 42, rect.midY - 7.5, TeamClaudePalette.smallFont,
+                               TeamClaudePalette.fg2)
+            }
+        }
+    }
+
+    private func drawExcludedRow(_ account: OverviewExcludedAccount, _ rect: NSRect) {
+        let m = OverviewLedgerMetrics.self
+        PanelDraw.dot(rect.minX + m.dotX, centerY: rect.midY, account.tone.color)
+        PanelDraw.text(PanelDraw.clipped(account.name, TeamClaudePalette.nameFont, maxWidth: m.columnX - m.nameX - 8),
+                       rect.minX + m.nameX, rect.midY - 8, TeamClaudePalette.nameFont, TeamClaudePalette.fg2)
+        PanelDraw.text(PanelDraw.clipped(account.reason, TeamClaudePalette.captionFont, maxWidth: rect.maxX - 12 - rect.minX - m.columnX),
+                       rect.minX + m.columnX, rect.midY - 8, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
     }
 }
