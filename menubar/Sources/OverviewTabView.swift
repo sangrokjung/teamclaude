@@ -644,16 +644,21 @@ final class OverviewTabView: NSView {
                        rect.minX + m.nameX, top + 11, TeamClaudePalette.nameFont, TeamClaudePalette.fg)
         if account.busy {
             PanelDraw.text(PanelDraw.clipped(account.label, TeamClaudePalette.microFont, maxWidth: m.columnX - m.nameX - 8),
-                           rect.minX + m.nameX, top + 35, TeamClaudePalette.microFont, TeamClaudePalette.fg2)
+                           rect.minX + m.nameX, top + 40, TeamClaudePalette.microFont, TeamClaudePalette.fg2)
         }
         // 오른쪽: 리셋까지 남은 시간과 리셋 시각
-        let timeColumn: CGFloat = 104
+        // 열 폭은 그릴 글자에 맞춘다(영어 "resets Wed 2:41 AM"이 한국어보다 길다). 막대가 너무 줄지 않게 140에서 멈춘다.
+        var timeColumn: CGFloat = 92
         if let remaining = account.sessionRemainingSeconds, remaining > 0 {
-            PanelDraw.right(PanelDraw.clipped(L10n.durationAhead(L10n.duration(seconds: Int(remaining))), TeamClaudePalette.captionFont,
-                                              maxWidth: timeColumn), right, top + 9, TeamClaudePalette.captionFont, TeamClaudePalette.fg2)
-            if let clock = account.sessionResetClock {
-                PanelDraw.right(PanelDraw.clipped(L10n.resetAtClock(clock), TeamClaudePalette.microFont, maxWidth: timeColumn),
-                                right, top + 26, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+            let ahead = L10n.durationAhead(L10n.duration(seconds: Int(remaining)))
+            let reset = account.sessionResetClock.map(L10n.resetAtClock)
+            timeColumn = min(140, max(timeColumn, ceil(PanelDraw.width(ahead, TeamClaudePalette.captionFont)),
+                                      ceil(reset.map { PanelDraw.width($0, TeamClaudePalette.microFont) } ?? 0)))
+            PanelDraw.right(PanelDraw.clipped(ahead, TeamClaudePalette.captionFont, maxWidth: timeColumn), right, top + 9,
+                            TeamClaudePalette.captionFont, TeamClaudePalette.fg2)
+            if let reset {
+                PanelDraw.right(PanelDraw.clipped(reset, TeamClaudePalette.microFont, maxWidth: timeColumn),
+                                right, top + 24, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
             }
         } else {
             PanelDraw.right(StatusVocabulary.none, right, top + 9, TeamClaudePalette.captionFont, TeamClaudePalette.fg3)
@@ -675,8 +680,8 @@ final class OverviewTabView: NSView {
                         elapsed: account.sessionElapsed)
         // 주간·Fable 작은 막대
         let miniWidth = (right - labelX - 12) / 2
-        drawMini(account.weekly, x: labelX, centerY: top + 44, width: miniWidth, labelWidth: labelWidth)
-        drawMini(account.fable, x: labelX + miniWidth + 12, centerY: top + 44, width: miniWidth, labelWidth: labelWidth)
+        drawMini(account.weekly, x: labelX, centerY: top + 47, width: miniWidth, labelWidth: labelWidth)
+        drawMini(account.fable, x: labelX + miniWidth + 12, centerY: top + 47, width: miniWidth, labelWidth: labelWidth)
         // 속도 경고
         if let projection = account.projection {
             let y = top + m.liveRowHeight - 2
