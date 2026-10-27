@@ -81,6 +81,11 @@ struct OverviewStripTests {
             let slots = overviewStripSlots(model.strip, maxColumns: maxColumns)
             precondition(slots.count == rects.count)
             precondition(slots.reduce(0) { $0 + $1.memberCount } == accounts, "\(accounts): every account lands in a column")
+            // 칸마다 툴팁이 있고, 주인은 뷰 자신이라 문구가 뷰에서 나온다(2026-10-26 충돌: 해제된 NSString owner).
+            precondition(view.stripToolTips.count == rects.count, "\(accounts): \(view.stripToolTips.count) tooltips for \(rects.count) columns")
+            for (tag, tip) in view.stripToolTips {
+                precondition(!tip.isEmpty && view.view(view, stringForToolTip: tag, point: .zero, userData: nil) == tip)
+            }
             let drawn = DrawnTextRecorder.strings
             let caption = drawn.first { $0.hasPrefix("기다리면 풀림") }
             if accounts == 17 {
