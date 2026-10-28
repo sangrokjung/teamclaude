@@ -9,7 +9,7 @@ The macOS menu-bar app and click-to-open usage panel for TeamClaude and TeamCode
 It lives in this repository next to the proxy and the TUI; no separate desktop app is needed.
 It is a native Swift/AppKit executable with no Electron, Tauri, React or npm runtime packages.
 
-**Download (beta):** [CC Menubar 0.1.0-beta.2](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.2), universal (Apple Silicon and Intel), macOS 13+. See [Install from a release](#install-from-a-release).
+**Download (beta):** [CC Menubar 0.1.0-beta.3](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.3), universal (Apple Silicon and Intel), macOS 13+. See [Install from a release](#install-from-a-release).
 
 <p align="center">
   <img src="../docs/assets/menubar-panel-en.png" alt="CC Menubar overview tab" width="49%">
