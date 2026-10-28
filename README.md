@@ -135,7 +135,7 @@ Upstream has features this fork does not, so pick whichever fits your setup.
 
 This repository also owns **CC Menubar**, a native macOS menu-bar app with a click-to-open usage dashboard ([menubar/](menubar/README.md)). It shows 5-hour and weekly usage for every Claude and Codex account in the pool, accounts that need a person, the weekly burn outlook, and Grok, Antigravity, Higgsfield and ccusage usage. Tools you don't have show as "not installed". No Electron or Tauri.
 
-**Download (beta):** [CC Menubar 0.1.0-beta.2](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.2), universal (Apple Silicon and Intel), macOS 13+. Or build it with `npm run menubar:build`.
+**Download (beta):** [CC Menubar 0.1.0-beta.3](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.3), universal (Apple Silicon and Intel), macOS 13+. Or build it with `npm run menubar:build`.
 
 <p align="center">
   <img src="docs/assets/menubar-panel-en.png" alt="CC Menubar overview tab: 12 of 17 Claude accounts routable, lanes, weekly usage strip and accounts to fix" width="49%">
