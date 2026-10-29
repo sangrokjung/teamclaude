@@ -3013,7 +3013,14 @@ final class StatusMenuDashboardView: NSView {
             return SubscriptionLatest(target: current.target, resolution: codexSubscriptionResolution(account, now: now),
                                       billingDay: current.billingDay)
         }
-        guard let claude, let index = TeamClaudeTableView.rowIndex(claude, name: target.name, accountUuid: target.accountUuid),
+        // 처리 경로와 같은 신원 해석: 상태 응답에 uuid가 없어도 이 맥 설정이 보완한 uuid(subscriptionTarget)로 맞춘다.
+        // 이름·보완된 uuid가 모두 같은 행이 정확히 하나일 때만 그 계정이다.
+        guard let claude else { return nil }
+        let matches = claude.accounts.indices.filter { index in
+            let candidate = claude.subscriptionTarget(index).target
+            return candidate.name == target.name && candidate.accountUuid == target.accountUuid
+        }
+        guard matches.count == 1, let index = matches.first,
               let resolution = claude.subscriptionResolution(index, now: now) else { return nil }
         let current = claude.subscriptionTarget(index)
         return SubscriptionLatest(target: current.target, resolution: resolution, billingDay: current.billingDay)
