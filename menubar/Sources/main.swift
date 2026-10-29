@@ -2063,13 +2063,35 @@ final class TeamClaudeTableView: NSView {
     var expandedAccount: String? {
         didSet {
             guard expandedAccount != oldValue else { return }
-            detailSignature = ""
-            needsLayout = true
-            needsDisplay = true
-            onExpansionChange?()
+            expansionChanged()
+        }
+    }
+    /// 펼친 계정 uuid. 같은 이름 계정이 둘이어도 엉뚱한 행을 펼치지 않게 이름과 함께 쓴다(없으면 이름이 하나뿐일 때만).
+    var expandedAccountUuid: String? {
+        didSet {
+            guard expandedAccountUuid != oldValue else { return }
+            expansionChanged()
         }
     }
     var onExpansionChange: (() -> Void)?
+
+    private func expansionChanged() {
+        detailSignature = ""
+        needsLayout = true
+        needsDisplay = true
+        onExpansionChange?()
+    }
+
+    /// 이름·uuid로 행 하나를 펼친다(uuid 먼저 바꿔 두 값이 한 번에 맞게).
+    func expand(_ name: String?, accountUuid: String?) {
+        expandedAccountUuid = name == nil ? nil : accountUuid
+        expandedAccount = name
+    }
+
+    static func rowIndex(_ health: TeamClaudeHealth, name: String, accountUuid: String?) -> Int? {
+        subscriptionRowIndex(names: health.accounts.map(\.name), uuids: health.accounts.map(\.accountUuid),
+                             name: name, accountUuid: accountUuid)
+    }
 
     func refreshTime(now: Date = Date()) {
         evaluatedAt = now
@@ -2083,6 +2105,7 @@ final class TeamClaudeTableView: NSView {
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
                                                            fableOver: health.fableOver, status: health.statusLabel))
         setAccessibilityHelp(health.measurementPendingCount > 0 ? L10n.measureReturnHelp : nil)
+        applyResolvedLines(now: now)
         for (button, state) in zip(subscriptionButtons, availability) {
             button.refreshTitle(now: now, appearance: state.subscriptionAppearance)
         }
@@ -2112,7 +2135,7 @@ final class TeamClaudeTableView: NSView {
     var onReauthenticate: ((String, String?) -> Void)?
     private var measureActionRect = NSRect.zero
     private var measureRowRects: [NSRect] = []
-    private var rowHitRects: [(name: String, rect: NSRect)] = []
+    private var rowHitRects: [(name: String, accountUuid: String?, rect: NSRect)] = []
     private var reauthButtons: [PanelButton] = []
     private var reauthButtonTargets: [ObjectIdentifier: (name: String, accountUuid: String?)] = [:]
     private var reauthSignature = ""
@@ -2139,22 +2162,22 @@ final class TeamClaudeTableView: NSView {
     }
 
     /// 높이 = 표 상단 + 묶음 행. 대시보드의 teamContentHeight와 이 표의 layout·draw가 같은 계산을 쓴다.
-    static func contentHeight(_ health: TeamClaudeHealth, expanded: String?, now: Date = Date()) -> CGFloat {
+    static func contentHeight(_ health: TeamClaudeHealth, expanded: String?, expandedUuid: String? = nil, now: Date = Date()) -> CGFloat {
         let availability = health.routingAvailability(now: now)
         let lines = health.rowLines(now: now, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
-                                             expanded: expanded.flatMap { name in health.accounts.firstIndex { $0.name == name } })
+                                             expanded: expanded.flatMap { rowIndex(health, name: $0, accountUuid: expandedUuid) })
         return teamClaudeCardBaseHeight(hostLine: health.hostSummaryText != nil) + layout.height
     }
 
     private var expandedIndex: Int? {
         guard let expandedAccount, let health else { return nil }
-        return health.accounts.firstIndex { $0.name == expandedAccount }
+        return Self.rowIndex(health, name: expandedAccount, accountUuid: expandedAccountUuid)
     }
 
     /// 그 계정 행의 사각형(표 좌표). 개요에서 계정을 눌러 들어올 때 스크롤 위치를 잡는다.
-    func rowRect(named name: String) -> NSRect? {
-        guard let health, let index = health.accounts.firstIndex(where: { $0.name == name }) else { return nil }
+    func rowRect(named name: String, accountUuid: String? = nil) -> NSRect? {
+        guard let health, let index = Self.rowIndex(health, name: name, accountUuid: accountUuid) else { return nil }
         let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex)
@@ -2183,20 +2206,21 @@ final class TeamClaudeTableView: NSView {
     }
 
     /// 해지 기록이 있는 인증 오류 행(상태 칸에 "종료로 확정"). 누르면 행을 펼치고 펼친 행의 확정 버튼을 무장한다.
-    private func confirmEndRows() -> [(index: Int, name: String)] {
+    private func confirmEndRows() -> [(index: Int, name: String, accountUuid: String?)] {
         guard let health else { return [] }
         let subscriptions = health.subscriptionResolutions(now: evaluatedAt)
         return health.accounts.enumerated().compactMap { index, row in
             guard subscriptions[index].isCancelled,
                   teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
                                               provider: row.provider, errorReason: row.errorReason) else { return nil }
-            return (index, row.name)
+            return (index, row.name, row.accountUuid)
         }
     }
 
     /// 손볼 것·상태 칸의 "종료로 확정"에서 들어올 때: 펼친 행의 확정 버튼을 한 번 누른 상태로 둔다.
-    func armConfirmEnd(_ name: String) {
-        guard let health, let index = health.accounts.firstIndex(where: { $0.name == name }) else { return }
+    /// 행은 이름과 uuid로 다시 고른다(같은 이름 계정이 둘이면 이름만으로는 고르지 않는다).
+    func armConfirmEnd(_ name: String, accountUuid: String?) {
+        guard let health, let index = Self.rowIndex(health, name: name, accountUuid: accountUuid) else { return }
         let subscription = health.subscriptionResolutions(now: evaluatedAt)[index]
         guard subscription.isCancelled else { return }
         SubscriptionActionButtons.arm(health.subscriptionTarget(index).target, .confirmEnd)
@@ -2212,7 +2236,7 @@ final class TeamClaudeTableView: NSView {
         let rows = reauthenticationRows()
         let confirmRows = confirmEndRows()
         let signature = rows.map { "\($0.index):\($0.name):\($0.accountUuid ?? "-")" }.joined(separator: "|")
-            + "#" + confirmRows.map { "\($0.index):\($0.name)" }.joined(separator: "|")
+            + "#" + confirmRows.map { "\($0.index):\($0.name):\($0.accountUuid ?? "-")" }.joined(separator: "|")
         guard signature != reauthSignature else { return }
         reauthSignature = signature
         reauthButtons.forEach { $0.removeFromSuperview() }
@@ -2232,14 +2256,26 @@ final class TeamClaudeTableView: NSView {
         confirmEndButtons.forEach { $0.removeFromSuperview() }
         confirmEndButtons = confirmRows.map { row in
             let button = PanelButton(title: L10n.subActionConfirmEnd, style: .primary) { [weak self] in
-                guard let self else { return }
-                self.expandedAccount = row.name
-                self.armConfirmEnd(row.name)
+                // 누른 시점의 행이 그 계정인지 uuid로 다시 확인한다(행 순서가 바뀌었을 수 있다).
+                guard let self, let health = self.health, health.accounts.indices.contains(row.index),
+                      health.accounts[row.index].name == row.name, health.accounts[row.index].accountUuid == row.accountUuid else { return }
+                self.expand(row.name, accountUuid: row.accountUuid)
+                self.armConfirmEnd(row.name, accountUuid: row.accountUuid)
             }
             button.setAccessibilityLabel("\(L10n.subActionConfirmEnd): \(row.name)")
             button.toolTip = L10n.subTodoReasonCancelled
             addSubview(button)
             return button
+        }
+    }
+
+    /// 구독 줄이 판정과 같은 말을 하게 한다. 해지 예약·종료일 지남·해지 확정이면 "해지 예약 · 11/12 종료 · 14일 남음" 형식.
+    private func applyResolvedLines(now: Date) {
+        guard let health else { return }
+        let subscriptions = health.subscriptionResolutions(now: now)
+        for (button, subscription) in zip(subscriptionButtons, subscriptions) {
+            button.resolvedLine = [.scheduled, .overdue, .ended].contains(subscription.state)
+                ? subscriptionRowLine(subscription.shown, now: now) : nil
         }
     }
 
@@ -2250,6 +2286,7 @@ final class TeamClaudeTableView: NSView {
             return "\(local.uuid ?? "-"):\(row.name):\(local.plan ?? "-"):\(row.subscriptionConfirmation?.state.rawValue ?? "-"):\(row.subscriptionConfirmation?.date ?? "-"):\(row.subscriptionConfirmation?.checkedAt.timeIntervalSince1970 ?? 0)"
         }.joined(separator: "|")
         guard signature != subscriptionSignature else {
+            applyResolvedLines(now: evaluatedAt)
             subscriptionButtons.forEach { $0.refreshTitle() }
             return
         }
@@ -2403,7 +2440,8 @@ final class TeamClaudeTableView: NSView {
             return
         }
         if let hit = rowHitRects.first(where: { $0.rect.contains(point) }) {
-            expandedAccount = expandedAccount == hit.name ? nil : hit.name
+            let isOpen = expandedAccount == hit.name && expandedAccountUuid == hit.accountUuid
+            expand(isOpen ? nil : hit.name, accountUuid: hit.accountUuid)
             return
         }
         super.mouseDown(with: event)
@@ -2469,6 +2507,7 @@ final class TeamClaudeTableView: NSView {
 
         // 측정·연동 안내
         let availability = health.routingAvailability(now: evaluatedAt)
+        applyResolvedLines(now: evaluatedAt)
         subscriptionButtons.forEach { $0.refreshTitle(now: evaluatedAt) }
         let ready = availability.filter { $0.state == .ready }.count
         let limited = availability.filter { $0.state == .limited }.count
@@ -2587,7 +2626,7 @@ final class TeamClaudeTableView: NSView {
             let presentation = teamClaudeRowPresentation(row, state)
             let subscriptionMuted = state.subscriptionAppearance.isMuted
             if isExpanded { PanelDraw.fillRound(rowRect, NSColor.white.withAlphaComponent(0.03), 8) }
-            rowHitRects.append((row.name, NSRect(x: rowRect.minX, y: rowRect.minY, width: rowRect.width, height: TeamClaudeRowMetrics.nameHeight)))
+            rowHitRects.append((row.name, row.accountUuid, NSRect(x: rowRect.minX, y: rowRect.minY, width: rowRect.width, height: TeamClaudeRowMetrics.nameHeight)))
             let dotColor = subscriptionMuted ? fg3 : presentation.tone.color
             PanelDraw.dot(left + 2, centerY: y + 15, dotColor)
             let textX = TeamClaudeColumns.nameX + 14
@@ -2775,8 +2814,10 @@ final class StatusMenuDashboardView: NSView {
     private var overviewModel = OverviewModel()
     /// 펼친 Claude 계정. 구조 재구성(configure)을 지나도 펼친 행을 유지한다.
     private var expandedClaudeAccount: String?
+    private var expandedClaudeAccountUuid: String?
     /// 펼친 Codex 계정(구독 기록). Claude와 같은 규칙.
     private var expandedCodexAccount: String?
+    private var expandedCodexAccountUuid: String?
     private var renderedCodexHeight: CGFloat = 0
     /// 직전 구독 처리의 되돌리기. 하단 막대에 6초 보인다.
     private var subscriptionUndo: SubscriptionUndo?
@@ -3176,7 +3217,7 @@ final class StatusMenuDashboardView: NSView {
                     table.onMeasure = onMeasureTeamClaude
                     table.onReauthenticate = onReauthenticateTeamClaude
                     table.onContentHeightChange = { [weak self] in self?.onTeamRowsChange?() }
-                    table.expandedAccount = expandedClaudeAccount
+                    table.expand(expandedClaudeAccount, accountUuid: expandedClaudeAccountUuid)
                     table.onExpansionChange = { [weak self] in self?.relayoutClaudeTab() }
                     teamClaudeView = table
                     view = table
@@ -3186,7 +3227,7 @@ final class StatusMenuDashboardView: NSView {
                     codexStatus.pool = teamCodex
                     codexStatus.usage = usage
                     codexStatus.onRecover = onRecoverTeamCodex
-                    codexStatus.expandedAccount = expandedCodexAccount
+                    codexStatus.expand(expandedCodexAccount, accountUuid: expandedCodexAccountUuid)
                     codexStatus.onExpansionChange = { [weak self] in self?.relayoutCodexTab() }
                     codexView = codexStatus
                     view = codexStatus
@@ -3238,7 +3279,9 @@ final class StatusMenuDashboardView: NSView {
     private func relayoutClaudeTab() {
         guard let table = teamClaudeView, let health = table.health, let document = tabDocuments[.claude] else { return }
         expandedClaudeAccount = table.expandedAccount
-        table.frame.size.height = TeamClaudeTableView.contentHeight(health, expanded: table.expandedAccount)
+        expandedClaudeAccountUuid = table.expandedAccountUuid
+        table.frame.size.height = TeamClaudeTableView.contentHeight(health, expanded: table.expandedAccount,
+                                                                    expandedUuid: table.expandedAccountUuid)
         document.frame.size.height = table.frame.maxY + dashboardSectionGap + Self.bodyInset
         table.needsLayout = true
         table.needsDisplay = true
@@ -3248,49 +3291,52 @@ final class StatusMenuDashboardView: NSView {
     private func relayoutCodexTab() {
         guard let view = codexView, let document = tabDocuments[.codex] else { return }
         expandedCodexAccount = view.expandedAccount
+        expandedCodexAccountUuid = view.expandedAccountUuid
         guard view.pool != nil else { return }
-        view.frame.size.height = CodexStatusView.preferredHeight(for: view.pool, expanded: view.expandedAccount)
+        view.frame.size.height = CodexStatusView.preferredHeight(for: view.pool, expanded: view.expandedAccount,
+                                                                 expandedUuid: view.expandedAccountUuid)
         document.frame.size.height = view.frame.maxY + dashboardSectionGap + Self.bodyInset
         view.needsLayout = true
         view.needsDisplay = true
     }
 
     /// 개요에서 계정을 누르면 Claude 탭에서 그 행을 펼친다.
-    func openAccount(_ name: String) {
+    func openAccount(_ name: String, accountUuid: String? = nil) {
         selectTab(.claude)
         guard let table = teamClaudeView, let document = tabDocuments[.claude] else { return }
-        table.expandedAccount = name
+        table.expand(name, accountUuid: accountUuid)
         relayoutClaudeTab()
         table.layoutSubtreeIfNeeded()
-        if let rowRect = table.rowRect(named: name) {
+        if let rowRect = table.rowRect(named: name, accountUuid: accountUuid) {
             let target = table.convert(rowRect, to: document)
             restoreBodyScroll(NSPoint(x: 0, y: target.minY - 40))
         }
     }
 
     /// Codex 탭에서 그 계정의 구독 기록을 펼친다(스냅샷 --expand-codex).
-    func openCodexAccount(_ name: String) {
+    func openCodexAccount(_ name: String, accountUuid: String? = nil) {
         selectTab(.codex)
-        codexView?.expandedAccount = name
+        codexView?.expand(name, accountUuid: accountUuid)
         relayoutCodexTab()
     }
 
     /// 손볼 것의 "종료로 확정": 그 계정 행을 펼치고 확정 버튼을 무장시킨다(한 번 더 누르면 확정).
-    func openSubscriptionConfirm(provider: String, name: String) {
+    /// 손볼 것은 계정 uuid를 함께 넘긴다. 같은 이름 계정이 둘이어도 그 계정 행만 펼치고 무장한다.
+    func openSubscriptionConfirm(provider: String, name: String, accountUuid: String?) {
         if provider == "codex" {
             selectTab(.codex)
             guard let view = codexView, let document = tabDocuments[.codex] else { return }
-            view.expandedAccount = name
+            view.expand(name, accountUuid: accountUuid)
             relayoutCodexTab()
-            view.armConfirmEnd(name)
+            view.armConfirmEnd(name, accountUuid: accountUuid)
             view.layoutSubtreeIfNeeded()
-            if let rowRect = view.rowRect(named: name) {
+            if let rowRect = view.rowRect(named: name, accountUuid: accountUuid) {
                 restoreBodyScroll(NSPoint(x: 0, y: view.convert(rowRect, to: document).minY - 40))
             }
             return
         }
-        openAccount(name)
-        teamClaudeView?.armConfirmEnd(name)
+        openAccount(name, accountUuid: accountUuid)
+        teamClaudeView?.armConfirmEnd(name, accountUuid: accountUuid)
     }
 
     private func runTodo(_ todo: OverviewTodo, onReauthenticate: ((String, String?) -> Void)?,
@@ -3301,7 +3347,7 @@ final class StatusMenuDashboardView: NSView {
         case .subscriptionRecord:
             AccountSubscriptionButton(provider: todo.provider, accountUuid: todo.accountUuid, accountName: todo.name).openRecordDialog()
         case .codexRecover(let kind): onRecover?(todo.name, todo.accountUuid, kind)
-        case .confirmSubscriptionEnd: openSubscriptionConfirm(provider: todo.provider, name: todo.name)
+        case .confirmSubscriptionEnd: openSubscriptionConfirm(provider: todo.provider, name: todo.name, accountUuid: todo.accountUuid)
         }
     }
 
@@ -4323,11 +4369,10 @@ func runTeamCodexSubscriptionCommand(_ arguments: [String]) -> SubscriptionCLIRe
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = [executable] + arguments
     }
-    var environment = ProcessInfo.processInfo.environment
-    environment["HOME"] = NSHomeDirectory()
-    let executableBin = URL(fileURLWithPath: executable).deletingLastPathComponent().path
-    environment["PATH"] = "\(executableBin):/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    process.environment = environment
+    // 셸에서 물려받은 TEAMCLAUDE_CONFIG·XDG_CONFIG_HOME이 다른 설정을 가리키지 않게, 화면이 읽는 기본 teamcodex.json으로 고정한다.
+    process.environment = teamCodexSubscriptionEnvironment(
+        base: ProcessInfo.processInfo.environment, home: NSHomeDirectory(),
+        executableBin: URL(fileURLWithPath: executable).deletingLastPathComponent().path)
     let errorURL = FileManager.default.temporaryDirectory.appendingPathComponent("cc-menubar-subscription-\(UUID().uuidString).log")
     guard FileManager.default.createFile(atPath: errorURL.path, contents: nil),
           let errorHandle = FileHandle(forWritingAtPath: errorURL.path) else {

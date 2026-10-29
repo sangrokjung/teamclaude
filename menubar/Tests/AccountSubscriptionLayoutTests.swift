@@ -7,7 +7,8 @@ struct AccountSubscriptionLayoutTests {
         let runId = UUID().uuidString
         let ids = (0..<16).map { "cancellation-layout-\(runId)-\($0)" }
         let states: [AccountSubscriptionState?] = [nil, .renewing, .scheduled, .ended, .renewing, .scheduled]
-        let expected = ["해지 미확인", "자동갱신 확인", "해지 예약", "구독 종료 확인", "갱신 재확인", "종료일 경과 · 확인 필요"]
+        // 해지 계열(해지 예약·해지 확정·종료일 지남)은 구독 줄도 판정과 같은 말을 쓴다(시안 B 2차본).
+        let expected = ["해지 미확인", "자동갱신 확인", "해지 예약 · 10/5 종료", "해지 확정 · 10/5 종료", "갱신 재확인", "종료일 지남 · 1/1 종료 · 확정 전"]
         func cleanUp() {
             ids.forEach { UserDefaults.standard.removeObject(forKey: "cc.account-subscription.v1.anthropic.\($0)") }
         }

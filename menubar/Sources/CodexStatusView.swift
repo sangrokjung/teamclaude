@@ -33,20 +33,25 @@ final class CodexStatusView: NSView {
     static let detailHeight: CGFloat = 100
 
     /// 행 배치. 해지 확정(프록시 확정 또는 이 맥 확정) 계정은 목록 아래 따로 묶는다(순환·재인증 제외).
-    static func rowPlan(for pool: TeamCodexPoolHealth?, expanded: String?) -> CodexPoolRowPlan {
+    static func rowIndex(_ pool: TeamCodexPoolHealth, name: String, accountUuid: String?) -> Int? {
+        subscriptionRowIndex(names: pool.accounts.map(\.name), uuids: pool.accounts.map(\.accountUuid),
+                             name: name, accountUuid: accountUuid)
+    }
+
+    static func rowPlan(for pool: TeamCodexPoolHealth?, expanded: String?, expandedUuid: String? = nil) -> CodexPoolRowPlan {
         guard let pool else { return CodexPoolRowPlan() }
         let ended = pool.accounts.map { codexSubscriptionResolution($0, now: pool.checkedAt).state == .ended }
-        let expandedIndex = expanded.flatMap { name in pool.accounts.firstIndex { $0.name == name } }
+        let expandedIndex = expanded.flatMap { rowIndex(pool, name: $0, accountUuid: expandedUuid) }
         return codexPoolRowPlan(ended: ended, expanded: expandedIndex, rowHeight: Double(poolRowHeight),
                                 endedRowHeight: Double(endedRowHeight), detailHeight: Double(detailHeight),
                                 endedHeaderHeight: Double(endedHeaderHeight))
     }
-    static func poolSectionHeight(for pool: TeamCodexPoolHealth?, expanded: String? = nil) -> CGFloat {
+    static func poolSectionHeight(for pool: TeamCodexPoolHealth?, expanded: String? = nil, expandedUuid: String? = nil) -> CGFloat {
         guard let pool = pool else { return 0 }
-        return poolHeaderHeight + CGFloat(rowPlan(for: pool, expanded: expanded).height)
+        return poolHeaderHeight + CGFloat(rowPlan(for: pool, expanded: expanded, expandedUuid: expandedUuid).height)
     }
-    static func preferredHeight(for pool: TeamCodexPoolHealth?, expanded: String? = nil) -> CGFloat {
-        baseHeight + (pool == nil ? 0 : poolSectionHeight(for: pool, expanded: expanded) + 16)
+    static func preferredHeight(for pool: TeamCodexPoolHealth?, expanded: String? = nil, expandedUuid: String? = nil) -> CGFloat {
+        baseHeight + (pool == nil ? 0 : poolSectionHeight(for: pool, expanded: expanded, expandedUuid: expandedUuid) + 16)
     }
     var health: CodexHealth? {
         didSet {
@@ -77,18 +82,40 @@ final class CodexStatusView: NSView {
     private var detailButtons: [PanelButton] = []
     private var detailSignature = ""
     /// 구독 상태(행 오른쪽)·해지 확정 행을 누르면 그 행을 펼친다.
-    private var expandHitRects: [(name: String, rect: NSRect)] = []
+    private var expandHitRects: [(name: String, accountUuid: String?, rect: NSRect)] = []
     /// 펼친 계정 이름. 바뀌면 소유자(대시보드)가 높이를 다시 잡는다.
     var expandedAccount: String? {
         didSet {
             guard expandedAccount != oldValue else { return }
-            detailSignature = ""
-            needsLayout = true
-            needsDisplay = true
-            onExpansionChange?()
+            expansionChanged()
+        }
+    }
+    /// 펼친 계정 uuid. 같은 이름 계정이 둘이어도 엉뚱한 행을 펼치지 않게 이름과 함께 쓴다.
+    var expandedAccountUuid: String? {
+        didSet {
+            guard expandedAccountUuid != oldValue else { return }
+            expansionChanged()
         }
     }
     var onExpansionChange: (() -> Void)?
+
+    private func expansionChanged() {
+        detailSignature = ""
+        needsLayout = true
+        needsDisplay = true
+        onExpansionChange?()
+    }
+
+    func expand(_ name: String?, accountUuid: String?) {
+        expandedAccountUuid = name == nil ? nil : accountUuid
+        expandedAccount = name
+    }
+
+    /// 지금 펼친 행 번호(이름 + uuid로 고른다).
+    private var expandedIndex: Int? {
+        guard let pool, let expandedAccount else { return nil }
+        return Self.rowIndex(pool, name: expandedAccount, accountUuid: expandedAccountUuid)
+    }
     var usage: UsageData? {
         didSet { needsDisplay = true }
     }
@@ -125,25 +152,29 @@ final class CodexStatusView: NSView {
     }
 
     /// 해지 기록이 있는 인증 오류 행. 상태 칸에 재인증 대신 "종료로 확정".
-    private func confirmEndRows() -> [(index: Int, name: String)] {
+    private func confirmEndRows() -> [(index: Int, name: String, accountUuid: String?)] {
         guard let pool else { return [] }
         return pool.accounts.enumerated().compactMap { index, account in
             let subscription = codexSubscriptionResolution(account, now: pool.checkedAt)
             let failed = account.status == "error" || account.errorReason != nil
-            return subscription.isCancelled && failed && account.accountUuid?.isEmpty == false ? (index, account.name) : nil
+            return subscription.isCancelled && failed && account.accountUuid?.isEmpty == false
+                ? (index, account.name, account.accountUuid) : nil
         }
     }
 
     private func ensureConfirmEndButtons() {
         let rows = confirmEndRows()
-        let signature = rows.map { "\($0.index):\($0.name)" }.joined(separator: "|")
+        let signature = rows.map { "\($0.index):\($0.name):\($0.accountUuid ?? "-")" }.joined(separator: "|")
         guard signature != confirmEndSignature else { return }
         confirmEndSignature = signature
         confirmEndButtons.forEach { $0.removeFromSuperview() }
         confirmEndButtons = rows.map { row in
             let button = PanelButton(title: L10n.subActionConfirmEnd, style: .primary) { [weak self] in
-                self?.expandedAccount = row.name
-                self?.armConfirmEnd(row.name)
+                // 누른 시점의 행이 그 계정인지 uuid로 다시 확인한다.
+                guard let self, let pool = self.pool, pool.accounts.indices.contains(row.index),
+                      pool.accounts[row.index].name == row.name, pool.accounts[row.index].accountUuid == row.accountUuid else { return }
+                self.expand(row.name, accountUuid: row.accountUuid)
+                self.armConfirmEnd(row.name, accountUuid: row.accountUuid)
             }
             button.setAccessibilityLabel("\(L10n.subActionConfirmEnd): \(row.name)")
             button.toolTip = L10n.subTodoReasonCancelled
@@ -153,9 +184,10 @@ final class CodexStatusView: NSView {
     }
 
     /// 펼친 행의 확정 버튼을 한 번 누른 상태로 둔다(손볼 것·상태 칸에서 들어올 때).
-    func armConfirmEnd(_ name: String) {
-        guard let pool, let account = pool.accounts.first(where: { $0.name == name }),
-              codexSubscriptionResolution(account, now: pool.checkedAt).isCancelled else { return }
+    func armConfirmEnd(_ name: String, accountUuid: String?) {
+        guard let pool, let index = Self.rowIndex(pool, name: name, accountUuid: accountUuid) else { return }
+        let account = pool.accounts[index]
+        guard codexSubscriptionResolution(account, now: pool.checkedAt).isCancelled else { return }
         SubscriptionActionButtons.arm(codexSubscriptionTarget(account).target, .confirmEnd)
         detailSignature = ""
         needsLayout = true
@@ -166,11 +198,12 @@ final class CodexStatusView: NSView {
     }
 
     private func ensureDetailButtons() {
-        guard let pool, let name = expandedAccount, let account = pool.accounts.first(where: { $0.name == name }) else {
+        guard let pool, let name = expandedAccount, let index = expandedIndex else {
             if !detailButtons.isEmpty { detailButtons.forEach { $0.removeFromSuperview() }; detailButtons = [] }
             detailSignature = ""
             return
         }
+        let account = pool.accounts[index]
         let subscription = codexSubscriptionResolution(account, now: pool.checkedAt)
         let target = codexSubscriptionTarget(account)
         let armed = [SubscriptionActionButtons.Kind.confirmEnd, .clear]
@@ -191,13 +224,13 @@ final class CodexStatusView: NSView {
     }
 
     /// 그 계정 행의 사각형(뷰 좌표). 손볼 것에서 들어올 때 스크롤 위치를 잡는다.
-    func rowRect(named name: String) -> NSRect? {
-        guard let pool, let poolRect = poolTableRect(), let index = pool.accounts.firstIndex(where: { $0.name == name }),
+    func rowRect(named name: String, accountUuid: String? = nil) -> NSRect? {
+        guard let pool, let poolRect = poolTableRect(), let index = Self.rowIndex(pool, name: name, accountUuid: accountUuid),
               let y = poolRowY(poolRect, index) else { return nil }
         return NSRect(x: poolRect.minX, y: y, width: poolRect.width, height: Self.poolRowHeight)
     }
 
-    private var rowPlan: CodexPoolRowPlan { Self.rowPlan(for: pool, expanded: expandedAccount) }
+    private var rowPlan: CodexPoolRowPlan { Self.rowPlan(for: pool, expanded: expandedAccount, expandedUuid: expandedAccountUuid) }
 
     /// 행 오른쪽 구독 상태 글(기호 뒤). 확인 안 됨은 "구독 확인 안 됨", 해지 계열은 한 줄 요약.
     private func subscriptionStatusText(_ subscription: SubscriptionResolution, now: Date) -> String {
@@ -261,7 +294,7 @@ final class CodexStatusView: NSView {
     /// 풀 블록의 위치. draw(_:)와 layout()이 같은 값을 쓴다. 두 곳이 어긋나면 버튼이 남의 행에 붙는다.
     private func poolTableRect() -> NSRect? {
         guard let pool else { return nil }
-        let height = Self.poolSectionHeight(for: pool, expanded: expandedAccount)
+        let height = Self.poolSectionHeight(for: pool, expanded: expandedAccount, expandedUuid: expandedAccountUuid)
         let layout = codexStatusLayout(
             topY: 4,
             poolHeight: Double(height),
@@ -315,8 +348,7 @@ final class CodexStatusView: NSView {
             button.frame = NSRect(x: poolRect.minX + 15, y: y + Self.rowSubscriptionY,
                                   width: max(40, poolRect.width - 15 - statusWidth - 12), height: Self.rowSubscriptionHeight)
         }
-        if let name = expandedAccount, let index = pool.accounts.firstIndex(where: { $0.name == name }),
-           let y = poolRowY(poolRect, index) {
+        if let index = expandedIndex, let y = poolRowY(poolRect, index) {
             let detailTop = y + (plan.ended.contains(index) ? Self.endedRowHeight : Self.poolRowHeight)
             var x = poolRect.minX + 15
             for button in detailButtons {
@@ -331,7 +363,8 @@ final class CodexStatusView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if let hit = expandHitRects.first(where: { $0.rect.contains(point) }) {
-            expandedAccount = expandedAccount == hit.name ? nil : hit.name
+            let isOpen = expandedAccount == hit.name && expandedAccountUuid == hit.accountUuid
+            expand(isOpen ? nil : hit.name, accountUuid: hit.accountUuid)
             return
         }
         super.mouseDown(with: event)
@@ -477,7 +510,7 @@ final class CodexStatusView: NSView {
                 }
                 // 플랜·결제일 줄 오른쪽: 구독 상태(기호 · 상태 · 펼침). 누르면 구독 기록이 펼쳐진다.
                 let statusY = rowY + Self.rowSubscriptionY
-                let isExpanded = expandedAccount == account.name
+                let isExpanded = expandedIndex == index
                 let statusWidth = subscriptionStatusWidth(subscription, now: pool.checkedAt)
                 let statusRect = NSRect(x: poolRect.maxX - statusWidth, y: statusY, width: statusWidth, height: Self.rowSubscriptionHeight)
                 SubscriptionGlyph.draw(subscription.state, x: statusRect.minX, y: statusY + 4.5,
@@ -485,14 +518,14 @@ final class CodexStatusView: NSView {
                 PanelDraw.text(subscriptionStatusText(subscription, now: pool.checkedAt), statusRect.minX + SubscriptionGlyph.size + 5,
                                statusY + 3, micro, SubscriptionGlyph.tone(subscription.state))
                 PanelDraw.right(isExpanded ? "⌃" : "⌄", poolRect.maxX, statusY + 3, micro, fg3)
-                expandHitRects.append((account.name, statusRect))
+                expandHitRects.append((account.name, account.accountUuid, statusRect))
                 if isExpanded {
                     drawSubscriptionDetail(subscription, top: rowY + Self.poolRowHeight, poolRect: poolRect, now: pool.checkedAt)
                 }
             }
         }
 
-        let poolHeight = Self.poolSectionHeight(for: pool, expanded: expandedAccount)
+        let poolHeight = Self.poolSectionHeight(for: pool, expanded: expandedAccount, expandedUuid: expandedAccountUuid)
         let layout = codexStatusLayout(topY: 4, poolHeight: Double(poolHeight), hasPool: pool != nil, localUsageLoaded: health != nil)
         drawTeamCodexPool(at: CGFloat(layout.poolY))
         window?.invalidateCursorRects(for: self)
@@ -625,7 +658,7 @@ final class CodexStatusView: NSView {
     private func drawEndedRow(_ account: TeamCodexPoolAccount, subscription: SubscriptionResolution, rowY: CGFloat,
                               poolRect: NSRect, now: Date) {
         let micro = TeamClaudePalette.microFont, fg2 = TeamClaudePalette.fg2, fg3 = TeamClaudePalette.fg3
-        let isExpanded = expandedAccount == account.name
+        let isExpanded = expandedIndex.map { pool?.accounts[$0].accountUuid == account.accountUuid && pool?.accounts[$0].name == account.name } ?? false
         let rowRect = NSRect(x: poolRect.minX - 6, y: rowY, width: poolRect.width + 12, height: Self.endedRowHeight)
         if isExpanded { PanelDraw.fillRound(rowRect, NSColor.white.withAlphaComponent(0.03), 8) }
         PanelDraw.dot(poolRect.minX + 2, centerY: rowY + 15, fg3)
@@ -637,7 +670,7 @@ final class CodexStatusView: NSView {
         let summary = (subscriptionRowLine(subscription.shown, now: now) ?? "")
             .replacingOccurrences(of: SubscriptionDisplayState.ended.label + " · ", with: "")
         PanelDraw.text(PanelDraw.clipped(summary, micro, maxWidth: rightX - 12 - summaryX), summaryX, rowY + 8, micro, fg3)
-        expandHitRects.append((account.name, rowRect))
+        expandHitRects.append((account.name, account.accountUuid, rowRect))
         if isExpanded {
             drawSubscriptionDetail(subscription, top: rowY + Self.endedRowHeight, poolRect: poolRect, now: now)
         }
