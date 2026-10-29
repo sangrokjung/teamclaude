@@ -26,8 +26,8 @@ the menu is open.
 | Tab | Contents |
 |---|---|
 | Overview | Accounts routable now with per-state counts and the next return, four lanes (Claude Fable, Codex, Grok, agy), the Claude ledger (session bars for accounts taking requests, accounts coming back, excluded), accounts to fix, weekly burn outlook |
-| Claude | Accounts grouped by state. Resets are stated once in the column heads. Click a row to expand plan, concurrency, request count, per-window resets and the re-auth, measure and plan-record actions |
-| Codex | The TeamCodex pool (5-hour and 7-day bars with their own resets per account), recovery buttons, and Codex usage on this Mac |
+| Claude | Accounts grouped by state. Resets are stated once in the column heads. A small symbol next to each name shows the plan state, and a recorded cancellation adds a line such as "Cancel scheduled · ends 11/12 · 14d left". Click a row to expand the plan record (state, end date, evidence, when it was recorded), concurrency, request count, per-window resets and the re-auth, measure and plan actions |
+| Codex | The TeamCodex pool (5-hour and 7-day bars with their own resets per account), the plan state at the right of each plan line (click to expand the plan record), recovery buttons, cancel-confirmed accounts grouped below the list, and Codex usage on this Mac |
 | Burn | Subscription spend and per-service verdicts, what to do first, ccusage usage (cost) |
 | CLI | Grok and agy quotas, Higgsfield credits, and the words used for missing values |
 
@@ -35,6 +35,23 @@ Bars turn amber from the 98% routing threshold. The thin sky-blue tick on a bar 
 a fill ahead of the tick means the window will fill before it resets.
 The footer has Refresh (R) and the action list (⌘K): measure accounts, import the Claude Code account, add Claude or Codex
 OAuth accounts, restart the TeamClaude server, open at login (.app builds only), and quit. Number keys 1–5 switch tabs.
+### Plan state
+
+Each account shows one of five plan states: active (confirmed), unconfirmed, cancel scheduled (with an end date, which may be
+unknown), end date passed, and cancel confirmed. You can act on them from the expanded row: record a cancellation (end date
+unknown, the billing day, or a typed date; evidence from you, the billing page or a confirmation mail), confirm it ended now,
+edit the end date, or clear the record (back to active). Confirming and clearing take a second click. After each action the
+footer shows the result with Undo for six seconds.
+
+- Claude accounts are recorded on this Mac only and merged with the record the proxy reports (the newer one wins).
+- Codex accounts are recorded in the proxy config through `teamcodex codex subscription cancel|clear … --account-uuid`,
+  only for rows whose identity is known. Confirming ended runs `cancel` without an end date (the proxy confirms it on the next
+  auth failure) and also keeps a local record so the panel shows it at once. When the running proxy cannot reload the account,
+  the result says it applies after a proxy restart; the app never restarts the proxy. If the command fails, the local record
+  is left unchanged. When the local record and the proxy disagree, the expanded row shows both.
+- In "To fix", an auth-error account with a recorded cancellation offers "Confirm ended" instead of re-auth, confirmed accounts
+  drop out, and a cancelled Codex account is never offered "Re-enable".
+
 The visual rules (colors, type, spacing) are in [DESIGN.md](DESIGN.md).
 
 ## QA hook
