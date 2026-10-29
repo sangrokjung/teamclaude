@@ -9,6 +9,10 @@ final class AccountSubscriptionButton: NSButton {
     private let fallbackConfirmation: AccountSubscriptionConfirmation?
     private let store: AccountSubscriptionStore
     private var rowAppearance: AccountSubscriptionAppearance = .standard
+    /// 표가 주는 구독 판정 한 줄(해지 예약·종료일 지남·해지 확정일 때, 아니면 nil). 있으면 수집기 문구 대신 이 줄을 쓴다.
+    /// 같은 행의 기호·펼친 기록과 다른 말("구독 미확인 · 해지 재확인 …")을 하지 않게 한다.
+    /// 제목을 만들 때마다 다시 물어 기록이 바뀐 직후에도 낡은 줄이 남지 않는다.
+    var resolvedLineProvider: ((Date) -> String?)?
 
     /// 구독 기록 대화상자를 연다. 버튼을 누른 것과 같다(개요의 "구독 확인", 펼친 행의 "구독 기록"이 쓴다).
     func openRecordDialog() {
@@ -47,6 +51,9 @@ final class AccountSubscriptionButton: NSButton {
             title = "\(details.plan ?? L10n.factSubscription) · \(L10n.reasonPlanEnded)"
         } else if rowAppearance == .endDateReached && details.appearance(now: now) != .endDateReached {
             title = "\(details.plan ?? L10n.factSubscription) · \(L10n.subEndPassed)"
+        }
+        if let resolvedLine = resolvedLineProvider?(now) {
+            title = (details.plan.map { "\($0) · " } ?? "") + resolvedLine
         }
         isEnabled = accountUuid?.isEmpty == false
             && !(provider == "codex" && appearance == .ended)

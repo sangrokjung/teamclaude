@@ -167,6 +167,74 @@ struct CodexPoolRowLayoutTests {
             view.cacheDisplay(in: view.bounds, to: bitmap)
             try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
         }
+        // 되돌리기 검사는 행 뷰가 아니라 데이터에서 계정을 찾는다. 처리 뒤 표를 새로 만들어도(옛 행 뷰 해제) 같은 계정을 찾는다.
+        let target = codexSubscriptionTarget(rows[3]).target
+        var rebuilt: CodexStatusView? = CodexStatusView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        rebuilt?.pool = pool
+        weak var released = rebuilt
+        let freshPool = rebuilt?.pool
+        rebuilt = nil
+        if released != nil { failures.append("rebuilt row view should be released in this check") }
+        let found = StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: freshPool, now: now)
+        if found?.target.accountUuid != rows[3].accountUuid { failures.append("undo lookup did not find the same account by uuid") }
+        if SubscriptionActionButtons.verifyUndo(captured: target, latest: found) != nil {
+            failures.append("undo must pass for the same unlocked account after the view is rebuilt")
+        }
+        // 같은 이름의 다른 계정(uuid 다름)이나 사라진 계정은 찾지 않는다.
+        var swapped = rows
+        swapped[3] = account(3, uuid: "row-layout-\(run)-swapped", subscriptionState: "cancellation-scheduled",
+                             subscriptionEndsAt: now.addingTimeInterval(86_400 * 5), session: 99, weekly: 99)
+        let swappedPool = TeamCodexPoolHealth(checkedAt: now, serverReachable: true, serverPort: 3457, serverPid: nil,
+                                              currentAccount: rows[0].name, currentAccountUuid: rows[0].accountUuid,
+                                              switchThresholdPercent: 98, accounts: swapped,
+                                              resetCreditsEnabled: true, resetCreditsPolicy: "account")
+        if SubscriptionActionButtons.verifyUndo(captured: target,
+                                                latest: StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: swappedPool, now: now)) == nil {
+            failures.append("undo must fail when the row now holds a different account")
+        }
+        // 프록시가 종료를 확정한 계정이면 되돌리지 않는다.
+        var locked = rows
+        locked[3] = account(3, uuid: rows[3].accountUuid, status: "error", errorReason: "subscription-ended",
+                            subscriptionState: "cancellation-scheduled", subscriptionEndsAt: now.addingTimeInterval(86_400 * 5),
+                            session: 99, weekly: 99)
+        let lockedPool = TeamCodexPoolHealth(checkedAt: now, serverReachable: true, serverPort: 3457, serverPid: nil,
+                                             currentAccount: rows[0].name, currentAccountUuid: rows[0].accountUuid,
+                                             switchThresholdPercent: 98, accounts: locked,
+                                             resetCreditsEnabled: true, resetCreditsPolicy: "account")
+        if SubscriptionActionButtons.verifyUndo(captured: target,
+                                                latest: StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: lockedPool, now: now))
+            != L10n.subFailedProxyLocked {
+            failures.append("undo must fail once the proxy confirmed the plan ended")
+        }
+
+        // Claude: 상태 응답에 uuid가 없어도 이 맥 설정이 보완한 uuid로 처리한다. 되돌리기도 같은 해석으로 그 계정을 찾는다.
+        let claudeConfig = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".config/teamclaude.json")
+        let supplied = "undo-claude-\(run)"
+        let configJSON: [String: Any] = ["accounts": [["name": "보완 계정", "accountUuid": supplied]]]
+        try JSONSerialization.data(withJSONObject: configJSON).write(to: claudeConfig)
+        let claudeRow = TeamClaudeAccountHealth(name: "보완 계정", isCurrent: false, enabled: true, isUsable: true,
+            status: "active", errorReason: nil, provider: "anthropic", accountUuid: nil,
+            source: "oauth", totalTokens: 0, totalRequests: 0, sessionPercent: 12, sessionResetSeconds: 3600,
+            weeklyPercent: 23, weeklyResetSeconds: 86400, fablePercent: 34, fableResetSeconds: 86400, probedAt: now, measurementIssue: nil)
+        let claude = TeamClaudeHealth(checkedAt: now, overallStatus: "ok", configPresent: true,
+            serverReachable: true, serverPort: 3456, serverPid: nil, accountTotal: 1, accountConfigured: 1,
+            accountActive: 1, accountUsable: 1, accountThrottled: 0, accountExhausted: 0, accountError: 0,
+            accountDisabled: 0, accountConfigDrift: 0, inflight: 0, capacity: 3, fableKnown: 0, fableOver: 0,
+            fableMaxPercent: nil, fableAvgPercent: nil, quotaThresholdPercent: 98, retryAfterSeconds: nil,
+            accounts: [claudeRow], hints: [], host: nil)
+        let claudeTarget = claude.subscriptionTarget(0).target
+        if claudeTarget.accountUuid != supplied { failures.append("fixture: Claude target must carry the config-supplied uuid") }
+        let claudeFound = StatusMenuDashboardView.subscriptionLatest(claudeTarget, claude: claude, codex: nil, now: now)
+        if SubscriptionActionButtons.verifyUndo(captured: claudeTarget, latest: claudeFound) != nil {
+            failures.append("Claude undo must find the account by the config-supplied uuid when the status row has none")
+        }
+        // 그 사이 보완 uuid가 다른 값이 된 계정(처리 때 잡은 uuid와 다름)이면 되돌리지 않는다.
+        let staleTarget = SubscriptionTarget(provider: "anthropic", name: "보완 계정", accountUuid: "undo-claude-\(run)-old")
+        if SubscriptionActionButtons.verifyUndo(captured: staleTarget,
+                                                latest: StatusMenuDashboardView.subscriptionLatest(staleTarget, claude: claude, codex: nil, now: now)) == nil {
+            failures.append("Claude undo must fail when the supplied uuid no longer matches")
+        }
+
         guard failures.isEmpty else {
             failures.forEach { print("FAIL \($0)") }
             exit(1)

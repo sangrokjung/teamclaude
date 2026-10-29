@@ -7,7 +7,8 @@ struct AccountSubscriptionLayoutTests {
         let runId = UUID().uuidString
         let ids = (0..<16).map { "cancellation-layout-\(runId)-\($0)" }
         let states: [AccountSubscriptionState?] = [nil, .renewing, .scheduled, .ended, .renewing, .scheduled]
-        let expected = ["해지 미확인", "자동갱신 확인", "해지 예약", "구독 종료 확인", "갱신 재확인", "종료일 경과 · 확인 필요"]
+        // 해지 계열(해지 예약·해지 확정·종료일 지남)은 구독 줄도 판정과 같은 말을 쓴다(시안 B 2차본).
+        let expected = ["해지 미확인", "자동갱신 확인", "해지 예약 · 10/5 종료", "해지 확정 · 10/5 종료", "갱신 재확인", "종료일 지남 · 1/1 종료 · 확정 전"]
         func cleanUp() {
             ids.forEach { UserDefaults.standard.removeObject(forKey: "cc.account-subscription.v1.anthropic.\($0)") }
         }
@@ -47,7 +48,11 @@ struct AccountSubscriptionLayoutTests {
         precondition(buttons.count == 16 && recovery.count == 11)
         for (index, row) in rows.enumerated() {
             let hasRecovery = recovery.contains { $0.accessibilityLabel() == "재인증 필요: \(row.name)" }
-            precondition(hasRecovery == (index % states.count != 3 && index % states.count != 5))
+            let hasConfirmEnd = recovery.contains { $0.accessibilityLabel() == "종료로 확정: \(row.name)" }
+            // 해지 예약 + 인증 오류는 재인증으로 풀리지 않는다. 그 자리는 "종료로 확정"이다(시안 B 2차본).
+            let kind = index % states.count
+            precondition(hasRecovery == (kind != 3 && kind != 5 && kind != 2))
+            precondition(hasConfirmEnd == (kind == 2))
         }
         func isGray(_ color: NSColor) -> Bool {
             let rgb = color.usingColorSpace(.deviceRGB)!
@@ -173,7 +178,8 @@ struct AccountSubscriptionLayoutTests {
             matrixView.health = matrix
             matrixView.layoutSubtreeIfNeeded()
             let button = matrixView.subviews.compactMap { $0 as? AccountSubscriptionButton }[0]
-            precondition(button.title.contains("종료일 경과"))
+            // 구독 줄도 판정과 같은 말("종료일 지남 · 1/1 종료 · 확정 전")을 쓴다.
+            precondition(button.title.contains("종료일 지남"))
             precondition(isGray(button.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as! NSColor))
             try capture(matrixView, "claude-due-\(enabled)-\(online).png")
         }

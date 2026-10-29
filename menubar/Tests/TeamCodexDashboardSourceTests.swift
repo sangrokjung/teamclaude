@@ -91,7 +91,8 @@ struct TeamCodexDashboardSourceTests {
             in: source
         )
         precondition(
-            recoverTeamCodex.contains("teamCodexAccountRecovery(row)")
+            // 구독 상태를 함께 본다: 해지 계정에는 다시 켜기·재인증을 실행하지 않는다(teamCodexAccountRecovery를 감싼다).
+            recoverTeamCodex.contains("teamCodexSubscriptionAwareRecovery(row, subscription: codexSubscriptionResolution(row")
                 && recoverTeamCodex.contains("recovery.kind == kind")
                 && recoverTeamCodex.contains("codexMode: true"),
             "The Codex recovery action must re-verify the live row and run through the teamcodex entrypoint"

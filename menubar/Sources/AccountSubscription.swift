@@ -119,7 +119,12 @@ private func accountSubscriptionBaseLabel(_ details: AccountSubscriptionDetails,
                 Calendar.current.startOfDay(for: $0) < Calendar.current.startOfDay(for: now)
             } ?? false
             let label = past ? L10n.subEndPassed : (stale ? L10n.subCancelRecheck : L10n.subCancelScheduled)
-            return "\(plan) · \(label) \(date)\(confirmed.date == nil ? " · \(L10n.subExpiryUnknown)" : "") · \(checked)"
+            // 해지 예약은 종료일까지 남은 날을 붙인다(시안 B "해지 예약 · 11/12 종료 · 14일 남음").
+            let remaining = past ? nil : confirmed.date.flatMap(accountSubscriptionDate).flatMap {
+                Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: now),
+                                                to: Calendar.current.startOfDay(for: $0)).day
+            }.map { $0 == 0 ? L10n.subEndsToday : L10n.subDaysLeft($0) }
+            return "\(plan) · \(label) \(date)\(remaining.map { " · \($0)" } ?? "")\(confirmed.date == nil ? " · \(L10n.subExpiryUnknown)" : "") · \(checked)"
         case .ended:
             return "\(plan) · \(stale ? L10n.subEndRecheck : L10n.subEndConfirmed) · \(L10n.subExpiry) \(date) · \(checked)"
         }
@@ -288,6 +293,40 @@ final class AccountSubscriptionStore {
         }
         defaults.set(data, forKey: key)
         return true
+    }
+
+    /// Codex 계정의 로컬 확인 기록. 정본은 프록시 설정이고, 이 기록은 메뉴바가 처리 직후 바로 보여 주려고 남긴다
+    /// (재시작 전에는 실행 중 프록시가 설정 변경을 모를 수 있다). 모양은 Claude 기록과 같다.
+    func saveCodexConfirmation(_ state: AccountSubscriptionState, date: String?, uuid: String,
+                               source: String = "user-confirmed") -> Bool {
+        guard !uuid.isEmpty, ["billing-page", "confirmation-email", "user-confirmed"].contains(source) else { return false }
+        if let date, accountSubscriptionDate(date) == nil { return false }
+        let key = key(provider: "codex", uuid: uuid)
+        var data = defaults.dictionary(forKey: key) ?? [:]
+        var record: [String: Any] = ["state": state.rawValue, "checkedAt": clock(), "source": source]
+        record["date"] = date
+        data["confirmation"] = record
+        defaults.set(data, forKey: key)
+        return true
+    }
+
+    /// 로컬에 저장된 확인 기록만(메일 수집기·프록시 기록을 섞지 않은 값).
+    func localConfirmation(provider: String, uuid: String) -> AccountSubscriptionConfirmation? {
+        accountSubscriptionConfirmation(confirmationRecord(provider: provider, uuid: uuid), now: clock())
+    }
+
+    /// 되돌리기용 원본. 처리 직전 값을 그대로 보관했다가 restoreConfirmationRecord로 돌려놓는다.
+    func confirmationRecord(provider: String, uuid: String) -> [String: Any]? {
+        guard !uuid.isEmpty else { return nil }
+        return defaults.dictionary(forKey: key(provider: provider, uuid: uuid))?["confirmation"] as? [String: Any]
+    }
+
+    func restoreConfirmationRecord(_ record: [String: Any]?, provider: String, uuid: String) {
+        guard ["anthropic", "codex"].contains(provider), !uuid.isEmpty else { return }
+        let key = key(provider: provider, uuid: uuid)
+        var data = defaults.dictionary(forKey: key) ?? [:]
+        data["confirmation"] = record
+        defaults.set(data, forKey: key)
     }
 
     func savePaymentDate(_ value: String?, provider: String, uuid: String) -> Bool {
