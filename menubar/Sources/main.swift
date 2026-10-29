@@ -2105,7 +2105,6 @@ final class TeamClaudeTableView: NSView {
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
                                                            fableOver: health.fableOver, status: health.statusLabel))
         setAccessibilityHelp(health.measurementPendingCount > 0 ? L10n.measureReturnHelp : nil)
-        applyResolvedLines(now: now)
         for (button, state) in zip(subscriptionButtons, availability) {
             button.refreshTitle(now: now, appearance: state.subscriptionAppearance)
         }
@@ -2269,16 +2268,6 @@ final class TeamClaudeTableView: NSView {
         }
     }
 
-    /// 구독 줄이 판정과 같은 말을 하게 한다. 해지 예약·종료일 지남·해지 확정이면 "해지 예약 · 11/12 종료 · 14일 남음" 형식.
-    private func applyResolvedLines(now: Date) {
-        guard let health else { return }
-        let subscriptions = health.subscriptionResolutions(now: now)
-        for (button, subscription) in zip(subscriptionButtons, subscriptions) {
-            button.resolvedLine = [.scheduled, .overdue, .ended].contains(subscription.state)
-                ? subscriptionRowLine(subscription.shown, now: now) : nil
-        }
-    }
-
     private func ensureSubscriptionButtons() {
         let rows = health?.accounts ?? []
         let signature = rows.map { row in
@@ -2286,7 +2275,6 @@ final class TeamClaudeTableView: NSView {
             return "\(local.uuid ?? "-"):\(row.name):\(local.plan ?? "-"):\(row.subscriptionConfirmation?.state.rawValue ?? "-"):\(row.subscriptionConfirmation?.date ?? "-"):\(row.subscriptionConfirmation?.checkedAt.timeIntervalSince1970 ?? 0)"
         }.joined(separator: "|")
         guard signature != subscriptionSignature else {
-            applyResolvedLines(now: evaluatedAt)
             subscriptionButtons.forEach { $0.refreshTitle() }
             return
         }
@@ -2294,6 +2282,14 @@ final class TeamClaudeTableView: NSView {
         subscriptionButtons.forEach { $0.removeFromSuperview() }
         subscriptionButtons = rows.map { row in
             let button = AccountSubscriptionButton(provider: "anthropic", accountUuid: row.accountUuid, accountName: row.name, confirmation: row.subscriptionConfirmation)
+            // 구독 줄이 판정과 같은 말을 하게 한다. 해지 예약·종료일 지남·해지 확정이면 "해지 예약 · 11/12 종료 · 14일 남음" 형식.
+            button.resolvedLineProvider = { [weak self] now in
+                guard let self, let health = self.health,
+                      let index = health.accounts.firstIndex(where: { $0.name == row.name && $0.accountUuid == row.accountUuid }),
+                      let subscription = health.subscriptionResolution(index, now: now),
+                      [.scheduled, .overdue, .ended].contains(subscription.state) else { return nil }
+                return subscriptionRowLine(subscription.shown, now: now)
+            }
             button.onChange = { [weak self] in
                 guard let self, let health = self.health else { return }
                 self.health = health
@@ -2507,7 +2503,6 @@ final class TeamClaudeTableView: NSView {
 
         // 측정·연동 안내
         let availability = health.routingAvailability(now: evaluatedAt)
-        applyResolvedLines(now: evaluatedAt)
         subscriptionButtons.forEach { $0.refreshTitle(now: evaluatedAt) }
         let ready = availability.filter { $0.state == .ready }.count
         let limited = availability.filter { $0.state == .limited }.count
@@ -3217,7 +3212,8 @@ final class StatusMenuDashboardView: NSView {
                     table.onMeasure = onMeasureTeamClaude
                     table.onReauthenticate = onReauthenticateTeamClaude
                     table.onContentHeightChange = { [weak self] in self?.onTeamRowsChange?() }
-                    table.expand(expandedClaudeAccount, accountUuid: expandedClaudeAccountUuid)
+                    table.expandedAccountUuid = expandedClaudeAccountUuid
+                    table.expandedAccount = expandedClaudeAccount
                     table.onExpansionChange = { [weak self] in self?.relayoutClaudeTab() }
                     teamClaudeView = table
                     view = table
