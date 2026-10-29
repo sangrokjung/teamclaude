@@ -112,6 +112,8 @@ final class SubscriptionActionCenter {
     private var busy: Set<String> = []
     /// 잠금·기록이 바뀌면 부른다(표가 버튼을 다시 그린다).
     var onChange: (() -> Void)?
+    /// 화면 처리 결과(하단 막대가 6초 보인다). 대시보드가 단다.
+    var onOutcome: ((SubscriptionOutcome) -> Void)?
 
     init(store: AccountSubscriptionStore, runner: @escaping SubscriptionCLIRunner) {
         self.store = store

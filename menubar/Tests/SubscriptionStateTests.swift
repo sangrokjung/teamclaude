@@ -277,6 +277,34 @@ struct SubscriptionStateTests {
         precondition(outcome?.succeeded == false && calls.count == callsBefore + 1)
     }
 
+    // 7. 기록 대화상자 값 → 명령, 두 번 눌러 확정
+    static func dialogAndArming() {
+        precondition(SubscriptionRecordDialog.command(mode: .record, endChoice: 0, typedDate: "", billingDay: nil, sourceIndex: 1,
+                                                      confirmNow: false) == .recordCancel(endDate: nil, source: "billing-page"))
+        precondition(SubscriptionRecordDialog.command(mode: .record, endChoice: 1, typedDate: "", billingDay: "2026-11-12", sourceIndex: 0,
+                                                      confirmNow: true) == .confirmEnd(endDate: "2026-11-12", source: "user-confirmed"))
+        precondition(SubscriptionRecordDialog.command(mode: .record, endChoice: 1, typedDate: "", billingDay: nil, sourceIndex: 0,
+                                                      confirmNow: false) == nil)
+        precondition(SubscriptionRecordDialog.command(mode: .record, endChoice: 2, typedDate: " 2026-12-01 ", billingDay: nil, sourceIndex: 2,
+                                                      confirmNow: false) == .recordCancel(endDate: "2026-12-01", source: "confirmation-email"))
+        precondition(SubscriptionRecordDialog.command(mode: .record, endChoice: 2, typedDate: "2026-13-01", billingDay: nil, sourceIndex: 0,
+                                                      confirmNow: false) == nil)
+        precondition(SubscriptionRecordDialog.command(mode: .edit, endChoice: 0, typedDate: "", billingDay: nil, sourceIndex: 0,
+                                                      confirmNow: false) == .editEndDate(nil))
+        let target = SubscriptionTarget(provider: "codex", name: "codex-01", accountUuid: "u")
+        let now = Date()
+        precondition(!SubscriptionActionButtons.isArmed(target, .confirmEnd, now: now))
+        SubscriptionActionButtons.arm(target, .confirmEnd, now: now)
+        precondition(SubscriptionActionButtons.isArmed(target, .confirmEnd, now: now.addingTimeInterval(1)))
+        precondition(!SubscriptionActionButtons.isArmed(target, .clear, now: now.addingTimeInterval(1)))
+        precondition(!SubscriptionActionButtons.isArmed(target, .confirmEnd, now: now.addingTimeInterval(5)))
+        precondition(SubscriptionActionButtons.title(.confirmEnd, state: .scheduled, armed: true) == "한 번 더 눌러 확정")
+        precondition(SubscriptionActionButtons.kinds(for: .unknown) == [.record])
+        precondition(SubscriptionActionButtons.kinds(for: .overdue) == [.confirmEnd, .editEnd, .clear])
+        precondition(SubscriptionActionButtons.kinds(for: .ended) == [.clear])
+        SubscriptionActionButtons.disarm(target)
+    }
+
     static func main() {
         L10n.language = .ko
         fiveStates()
@@ -285,6 +313,7 @@ struct SubscriptionStateTests {
         todoPlans()
         cliArguments()
         actionsAndUndo()
+        dialogAndArming()
         L10n.language = .en
         precondition(SubscriptionDisplayState.allCases.allSatisfy { $0.label.range(of: "[가-힣]", options: .regularExpression) == nil })
         print("SubscriptionStateTests: all assertions passed")
