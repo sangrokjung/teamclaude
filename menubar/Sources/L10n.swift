@@ -801,7 +801,7 @@ enum L10n {
     static var subEvidenceMail: String { t("확인 메일", "Confirmation mail") }
     static var subEvidenceProxy: String { t("인증 실패 뒤 자동 확정", "Auto-confirmed after auth failure") }
     static func subRecordedAt(_ stamp: String) -> String { t("\(stamp) 기록", "recorded \(stamp)") }
-    static var subTermState: String { t("구독", "Plan") }
+    static var subTermState: String { t("상태", "Status") }
     static var subTermEvidence: String { t("근거", "Evidence") }
     static var subTermLocal: String { t("이 맥 기록", "This Mac") }
     static var subTermProxy: String { t("프록시", "Proxy") }

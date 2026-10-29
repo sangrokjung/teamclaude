@@ -119,7 +119,12 @@ private func accountSubscriptionBaseLabel(_ details: AccountSubscriptionDetails,
                 Calendar.current.startOfDay(for: $0) < Calendar.current.startOfDay(for: now)
             } ?? false
             let label = past ? L10n.subEndPassed : (stale ? L10n.subCancelRecheck : L10n.subCancelScheduled)
-            return "\(plan) · \(label) \(date)\(confirmed.date == nil ? " · \(L10n.subExpiryUnknown)" : "") · \(checked)"
+            // 해지 예약은 종료일까지 남은 날을 붙인다(시안 B "해지 예약 · 11/12 종료 · 14일 남음").
+            let remaining = past ? nil : confirmed.date.flatMap(accountSubscriptionDate).flatMap {
+                Calendar.current.dateComponents([.day], from: Calendar.current.startOfDay(for: now),
+                                                to: Calendar.current.startOfDay(for: $0)).day
+            }.map { $0 == 0 ? L10n.subEndsToday : L10n.subDaysLeft($0) }
+            return "\(plan) · \(label) \(date)\(remaining.map { " · \($0)" } ?? "")\(confirmed.date == nil ? " · \(L10n.subExpiryUnknown)" : "") · \(checked)"
         case .ended:
             return "\(plan) · \(stale ? L10n.subEndRecheck : L10n.subEndConfirmed) · \(L10n.subExpiry) \(date) · \(checked)"
         }

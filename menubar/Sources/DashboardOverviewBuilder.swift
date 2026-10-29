@@ -106,7 +106,8 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             remaining.flatMap { $0 > 0 ? L10n.clockTime(now.addingTimeInterval($0), now: now) : nil }
         }
         func positive(_ value: Double?) -> Double? { value.flatMap { $0 > 0 ? $0 : nil } }
-        for (row, state) in zip(health.accounts, routing) {
+        let subscriptions = health.subscriptionResolutions(now: now)
+        for (index, (row, state)) in zip(health.accounts, routing).enumerated() {
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
                                                              checkedAt: health.checkedAt, now: now)
@@ -160,12 +161,14 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
             guard isTodo else { continue }
             let canReauth = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
                                                         provider: row.provider, errorReason: row.errorReason)
-            let orgBlocked = row.errorReason == "subscription-disabled"
-            let action: OverviewTodoAction = canReauth ? .reauthenticate : (orgBlocked ? .subscriptionRecord : .none)
-            let title: String? = canReauth ? L10n.reauthenticate : (orgBlocked ? L10n.checkSubscription : nil)
+            // 구독 기록이 동작을 바꾼다: 해지 기록 + 인증 오류 → 종료로 확정, 해지 확정 → 손볼 것에서 뺀다.
+            guard let plan = claudeSubscriptionTodoPlan(canReauth: canReauth, orgBlocked: row.errorReason == "subscription-disabled",
+                                                        subscription: subscriptions[index].state,
+                                                        baseReason: teamClaudeTodoReason(row, state)) else { continue }
+            let label = plan.action == .confirmSubscriptionEnd ? "\(presentation.label) · \(L10n.subStateCancelScheduled)" : presentation.label
             model.todos.append(OverviewTodo(provider: "anthropic", name: row.name, accountUuid: row.accountUuid,
-                                            label: presentation.label, reason: teamClaudeTodoReason(row, state),
-                                            tone: presentation.tone, actionTitle: title, primary: canReauth, action: action))
+                                            label: label, reason: plan.reason,
+                                            tone: presentation.tone, actionTitle: plan.title, primary: plan.primary, action: plan.action))
         }
         // 오류를 먼저, 꺼 둔 계정은 그다음(SubscriptionPolicy의 권고 순서).
         model.todos.sort { ($0.tone == .error ? 0 : 1) < ($1.tone == .error ? 0 : 1) }
@@ -179,19 +182,23 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         model.resetLine = resetParts.isEmpty ? "" : L10n.resetsAfter(resetParts.joined(separator: " · "))
     }
 
-    // Codex 되돌리기 제안도 손볼 것이다(재인증·다시 켜기).
+    // Codex 되돌리기 제안도 손볼 것이다(재인증·다시 켜기). 해지 기록이 있는 인증 오류는 종료로 확정,
+    // 해지 확정·해지 기록 계정에는 다시 켜기를 권하지 않는다.
     if let pool = input.teamCodex, codexNotice == nil {
         for account in pool.accounts {
-            guard let recovery = teamCodexAccountRecovery(account, now: pool.checkedAt) else { continue }
+            let subscription = codexSubscriptionResolution(account, now: pool.checkedAt)
+            guard let plan = codexSubscriptionTodoPlan(account, subscription: subscription, now: pool.checkedAt) else { continue }
             let state = teamCodexAccountState(account, switchThresholdPercent: pool.switchThresholdPercent, now: pool.checkedAt)
-            let label = state == .failed ? teamAccountErrorReasonLabel(account.errorReason)
+            var label = state == .failed ? teamAccountErrorReasonLabel(account.errorReason)
                 : teamCodexAccountStateLabel(state, status: account.status, errorReason: account.errorReason)
+            if plan.action == .confirmSubscriptionEnd { label += " · \(L10n.subStateCancelScheduled)" }
+            let reauthOrConfirm = plan.action == .confirmSubscriptionEnd || plan.action == .codexRecover(.reauth)
             model.todos.append(OverviewTodo(provider: "codex", name: account.name, accountUuid: account.accountUuid,
                                             label: "Codex · \(label)",
-                                            reason: recovery.followUpNote ?? recovery.toolTip,
-                                            tone: recovery.kind == .reauth ? .error : .off,
-                                            actionTitle: recovery.title, primary: recovery.kind == .reauth,
-                                            action: .codexRecover(recovery.kind)))
+                                            reason: plan.reason,
+                                            tone: reauthOrConfirm ? .error : .off,
+                                            actionTitle: plan.title, primary: plan.primary,
+                                            action: plan.action))
         }
     }
 

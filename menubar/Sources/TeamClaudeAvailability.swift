@@ -132,6 +132,25 @@ extension TeamClaudeHealth {
         }
     }
 
+    /// 계정별 구독 상태(로컬 기록 + 프록시 기록). 이름 옆 기호·펼친 행·손볼 것이 이 한 판정을 쓴다.
+    /// 로컬 값은 표의 구독 줄과 같은 details(메일 수집기 포함, 프록시 기록 제외)다.
+    func subscriptionResolutions(store: AccountSubscriptionStore = .shared, now: Date = Date()) -> [SubscriptionResolution] {
+        accounts.map { row in
+            let local = accountSubscriptionLocalAccount(provider: "anthropic", uuid: row.accountUuid, name: row.name)
+            let details = store.details(provider: "anthropic", uuid: local.uuid, fallbackPlan: local.plan)
+            return claudeSubscriptionResolution(local: details.confirmation, proxy: row.subscriptionConfirmation,
+                                                errorReason: row.errorReason, proxyEndReached: row.subscriptionEndReached, now: now)
+        }
+    }
+
+    /// 처리 대상(신원은 로컬 설정에서 확인한 uuid). 결제일은 해지 기록 대화상자의 "결제일" 선택지다.
+    func subscriptionTarget(_ index: Int, store: AccountSubscriptionStore = .shared) -> (target: SubscriptionTarget, billingDay: String?) {
+        let row = accounts[index]
+        let local = accountSubscriptionLocalAccount(provider: "anthropic", uuid: row.accountUuid, name: row.name)
+        let billing = store.details(provider: "anthropic", uuid: local.uuid).paymentDate
+        return (SubscriptionTarget(provider: "anthropic", name: row.name, accountUuid: local.uuid), billing)
+    }
+
     func opusAvailability(store: AccountSubscriptionStore = .shared, now: Date = Date()) -> [String] {
         zip(accounts, routingAvailability(store: store, now: now)).compactMap { row, availability in
             availability.state == .ready ? row.name : nil

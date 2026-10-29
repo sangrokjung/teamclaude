@@ -134,6 +134,19 @@ func codexSubscriptionResolution(account: TeamCodexPoolAccount, local: AccountSu
     return SubscriptionResolution(shown: shown, local: localView, proxy: proxyView)
 }
 
+/// 풀 행 하나의 구독 상태(이 맥 기록은 프록시 status가 준 계정 uuid로 찾는다. CLI도 같은 uuid로 신원을 고정한다).
+func codexSubscriptionResolution(_ account: TeamCodexPoolAccount, store: AccountSubscriptionStore = .shared,
+                                 now: Date) -> SubscriptionResolution {
+    let local = account.accountUuid.flatMap { $0.isEmpty ? nil : store.localConfirmation(provider: "codex", uuid: $0) }
+    return codexSubscriptionResolution(account: account, local: local, now: now)
+}
+
+func codexSubscriptionTarget(_ account: TeamCodexPoolAccount, store: AccountSubscriptionStore = .shared)
+    -> (target: SubscriptionTarget, billingDay: String?) {
+    let billing = account.accountUuid.flatMap { $0.isEmpty ? nil : store.details(provider: "codex", uuid: $0).paymentDate }
+    return (SubscriptionTarget(provider: "codex", name: account.name, accountUuid: account.accountUuid), billing)
+}
+
 // MARK: 문구
 
 /// "2026-11-12" → "11/12"

@@ -177,10 +177,28 @@ final class DashboardPanelHeaderView: NSView {
 }
 
 /// 하단 동작 막대: 왼쪽은 지금 탭의 한 줄 요약, 오른쪽은 "새로고침 R"과 "동작 ⌘K".
+/// 하단 막대 왼쪽에 잠깐 뜨는 처리 결과(구독 처리). 성공이면 "되돌리기"가 붙는다.
+struct DashboardFooterNotice: Equatable {
+    let text: String
+    let failed: Bool
+    let undo: Bool
+}
+
 final class DashboardPanelFooterView: NSView {
     static let preferredHeight: CGFloat = 44
 
     var context = "" { didSet { if oldValue != context { needsDisplay = true } } }
+    /// 있으면 요약 대신 이 결과를 보인다(대시보드가 6초 뒤 지운다).
+    var notice: DashboardFooterNotice? {
+        didSet {
+            guard oldValue != notice else { return }
+            undoRect = .zero
+            setAccessibilityValue(notice?.text)
+            needsDisplay = true
+        }
+    }
+    var onUndo: (() -> Void)?
+    private(set) var undoRect = NSRect.zero
     var refreshDetail = "" { didSet { if oldValue != refreshDetail { toolTip = refreshDetail } } }
     var actionsOpen = false { didSet { if oldValue != actionsOpen { needsDisplay = true } } }
     var onRefresh: (() -> Void)?
@@ -203,6 +221,7 @@ final class DashboardPanelFooterView: NSView {
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if refreshRect.contains(point) { onRefresh?(); return }
+        if notice?.undo == true, undoRect.contains(point) { onUndo?(); return }
         if actionsRect.contains(point) { onActions?(); return }
         super.mouseDown(with: event)
     }
@@ -244,6 +263,21 @@ final class DashboardPanelFooterView: NSView {
         PanelDraw.keycap("R", refreshRect.minX + 38 + refreshTextWidth, centerY: midY)
 
         let contextMax = refreshRect.minX - 16 - 12
+        if let notice {
+            // 처리 결과: 점(성공 민트·실패 빨강) · 결과 문장 · "되돌리기" 테두리 버튼.
+            let undoTitle = L10n.subActionUndo
+            let undoWidth = notice.undo ? ceil(PanelDraw.width(undoTitle, TeamClaudePalette.buttonFont)) + 20 : 0
+            let textMax = contextMax - 14 - (notice.undo ? undoWidth + 8 : 0)
+            PanelDraw.dot(16, centerY: midY, notice.failed ? TeamClaudePalette.ember : TeamClaudePalette.mint)
+            let textWidth = PanelDraw.text(PanelDraw.clipped(notice.text, TeamClaudePalette.legendFont, maxWidth: textMax), 30, midY - 7.5,
+                                           TeamClaudePalette.legendFont, notice.failed ? TeamClaudePalette.ember : TeamClaudePalette.fg)
+            if notice.undo {
+                undoRect = NSRect(x: 30 + textWidth + 8, y: midY - 12, width: undoWidth, height: 24)
+                PanelDraw.strokeRound(undoRect, TeamClaudePalette.graphite, 8)
+                PanelDraw.text(undoTitle, undoRect.minX + 10, undoRect.minY + 4, TeamClaudePalette.buttonFont, TeamClaudePalette.fg)
+            }
+            return
+        }
         PanelDraw.text(PanelDraw.clipped(context, TeamClaudePalette.legendFont, maxWidth: contextMax), 16, midY - 7.5,
                        TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
     }

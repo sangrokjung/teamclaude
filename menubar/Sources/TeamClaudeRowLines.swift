@@ -55,8 +55,11 @@ enum TeamClaudeRowMetrics {
     static let gap: CGFloat = 2
     /// 이름 줄 아래 첫 보조 줄이 시작하는 y.
     static let firstLineY: CGFloat = 26
-    /// 펼친 행의 상세(구독·동시 요청·누적 요청·리셋 + 동작 버튼).
-    static let detailHeight: CGFloat = 92
+    /// 펼친 행의 상세(구독 기록 세 줄·동시 요청·누적 요청·리셋 + 동작 버튼).
+    /// 구독 기록(상태·근거·로컬/프록시 차이 또는 규칙)이 recordHeight만큼 더해졌다(시안 B 2차본).
+    static let detailHeight: CGFloat = 92 + recordHeight + 12
+    /// 펼친 행의 구독 기록 세 줄(16pt씩) + 아래 틈.
+    static let recordHeight: CGFloat = 52
     /// 상태 묶음 머리(점·이름·개수·설명).
     static let groupHeadHeight: CGFloat = 28
 }
