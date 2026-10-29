@@ -846,6 +846,7 @@ enum L10n {
     static func subFailed(_ name: String, _ reason: String) -> String { t("\(name) 처리 실패 · \(reason)", "\(name) failed · \(reason)") }
     static var subFailedUnknown: String { t("teamcodex 명령이 실패했습니다", "the teamcodex command failed") }
     static var subFailedTimeout: String { t("teamcodex 명령이 응답하지 않았습니다", "the teamcodex command timed out") }
+    static var subFailedProxyLocked: String { t("프록시가 구독 종료로 확정해 이 맥에서 되돌릴 수 없습니다", "the proxy confirmed the plan ended; it can't be undone here") }
     static var subFailedIdentity: String { t("계정 신원을 확인할 수 없어 실행하지 않았습니다", "account identity unconfirmed, nothing was run") }
     static var subTodoReasonCancelled: String { t("해지 기록됨 · 재인증 대신 종료로 확정", "Cancellation recorded · confirm ended instead of re-auth") }
     static var subTodoReauthHint: String { t("다시 로그인해도 안 풀리면 해지 기록", "If re-login doesn't fix it, record a cancellation") }

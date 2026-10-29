@@ -90,8 +90,10 @@ enum SubscriptionActionButtons {
     static func disarm(_ target: SubscriptionTarget) { armed.removeValue(forKey: target.key) }
 
     /// 상태별 버튼 종류(시안 sub-editor 보기 모드). hideConfirm이면 행 오른쪽에 이미 "종료로 확정"이 있다.
-    static func kinds(for state: SubscriptionDisplayState) -> [Kind] {
-        switch state {
+    static func kinds(for resolution: SubscriptionResolution) -> [Kind] {
+        // 프록시가 계정 상태로 확정한 종료는 이 맥에서 되돌릴 수 없다. 누르면 성공처럼 보이고 아무것도 바뀌지 않으니 주지 않는다.
+        if resolution.proxyLocked { return [] }
+        switch resolution.state {
         case .unknown, .active: return [.record]
         case .scheduled, .overdue: return [.confirmEnd, .editEnd, .clear]
         case .ended: return [.clear]
@@ -115,7 +117,7 @@ enum SubscriptionActionButtons {
                      onChanged: @escaping () -> Void) -> [PanelButton] {
         let state = resolution.state
         let busy = center.isBusy(target)
-        return kinds(for: state).map { kind in
+        return kinds(for: resolution).map { kind in
             let isArmed = isArmed(target, kind, now: now)
             let style: PanelButton.Style = kind == .confirmEnd ? .primary : (kind == .clear ? .quiet : .ghost)
             let button = PanelButton(title: title(kind, state: state, armed: isArmed), style: style) {

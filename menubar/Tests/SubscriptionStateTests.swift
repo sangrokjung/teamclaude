@@ -299,10 +299,66 @@ struct SubscriptionStateTests {
         precondition(!SubscriptionActionButtons.isArmed(target, .clear, now: now.addingTimeInterval(1)))
         precondition(!SubscriptionActionButtons.isArmed(target, .confirmEnd, now: now.addingTimeInterval(5)))
         precondition(SubscriptionActionButtons.title(.confirmEnd, state: .scheduled, armed: true) == "한 번 더 눌러 확정")
-        precondition(SubscriptionActionButtons.kinds(for: .unknown) == [.record])
-        precondition(SubscriptionActionButtons.kinds(for: .overdue) == [.confirmEnd, .editEnd, .clear])
-        precondition(SubscriptionActionButtons.kinds(for: .ended) == [.clear])
+        precondition(SubscriptionActionButtons.kinds(for: SubscriptionResolution(shown: SubscriptionRecordView(state: .unknown))) == [.record])
+        precondition(SubscriptionActionButtons.kinds(for: SubscriptionResolution(shown: SubscriptionRecordView(state: .overdue))) == [.confirmEnd, .editEnd, .clear])
+        precondition(SubscriptionActionButtons.kinds(for: SubscriptionResolution(shown: SubscriptionRecordView(state: .ended))) == [.clear])
         SubscriptionActionButtons.disarm(target)
+    }
+
+    // 8. 프록시가 확정한 종료는 이 맥에서 되돌릴 수 없다(기록 지우기를 주지 않고, 불러도 성공으로 보이지 않는다)
+    static func proxyLockedEnd() {
+        let now = day("2026-10-29")
+        let claude = claudeSubscriptionResolution(local: nil, proxy: nil, errorReason: "subscription-ended", proxyEndReached: false, now: now)
+        precondition(claude.state == .ended && claude.proxyLocked)
+        precondition(SubscriptionActionButtons.kinds(for: claude).isEmpty)
+        let localEnded = claudeSubscriptionResolution(local: confirmation(.ended, nil, at: now), proxy: nil, errorReason: nil,
+                                                      proxyEndReached: false, now: now)
+        precondition(!localEnded.proxyLocked && SubscriptionActionButtons.kinds(for: localEnded) == [.clear])
+        let codexLocked = codexSubscriptionResolution(account: codexAccount(status: "error", errorReason: "subscription-ended"), local: nil, now: now)
+        precondition(codexLocked.proxyLocked && SubscriptionActionButtons.kinds(for: codexLocked).isEmpty)
+        // 프록시 설정의 해지 기록(ended)은 CLI clear로 지울 수 있다.
+        let codexConfig = codexSubscriptionResolution(account: codexAccount(state: "ended"), local: nil, now: now)
+        precondition(!codexConfig.proxyLocked && SubscriptionActionButtons.kinds(for: codexConfig) == [.clear])
+
+        let (store, _) = freshStore { now }
+        var ran = 0
+        let center = SubscriptionActionCenter(store: store) { _, completion in ran += 1; completion(SubscriptionCLIResult(status: 0, output: "")) }
+        var outcome: SubscriptionOutcome?
+        let target = SubscriptionTarget(provider: "anthropic", name: "acct-01", accountUuid: "uuid-locked")
+        precondition(center.perform(.clear, target: target, current: claude) { outcome = $0 })
+        precondition(outcome?.succeeded == false && outcome?.undo == nil)
+        precondition(outcome?.message == "acct-01 처리 실패 · 프록시가 구독 종료로 확정해 이 맥에서 되돌릴 수 없습니다")
+        precondition(store.localConfirmation(provider: "anthropic", uuid: "uuid-locked") == nil)
+        let codexTarget = SubscriptionTarget(provider: "codex", name: "codex-01", accountUuid: "uuid-codex-01")
+        precondition(center.perform(.clear, target: codexTarget, current: codexLocked) { outcome = $0 })
+        precondition(outcome?.succeeded == false && ran == 0)
+    }
+
+    // 9. 같은 이름 계정이 둘이어도 엉뚱한 행을 고르지 않는다
+    static func duplicateNames() {
+        let names = ["dup", "other", "dup"]
+        let uuids: [String?] = ["u-1", "u-2", "u-3"]
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "dup", accountUuid: "u-3") == 2)
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "dup", accountUuid: "u-1") == 0)
+        // uuid가 다른 행을 가리키면(이름 불일치) 고르지 않는다.
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "dup", accountUuid: "u-2") == nil)
+        // uuid 없이 이름만 오면 하나뿐일 때만.
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "dup", accountUuid: nil) == nil)
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "other", accountUuid: nil) == 1)
+        precondition(subscriptionRowIndex(names: names, uuids: [nil, nil, nil], name: "dup", accountUuid: "u-3") == nil)
+        precondition(subscriptionRowIndex(names: names, uuids: uuids, name: "missing", accountUuid: nil) == nil)
+    }
+
+    // 10. teamcodex 실행 환경: 화면이 읽는 기본 설정 파일과 같은 파일을 고친다
+    static func cliEnvironment() {
+        let base = ["TEAMCLAUDE_CONFIG": "/elsewhere/config.json", "XDG_CONFIG_HOME": "/elsewhere", "TEAMCLAUDE_PROVIDER": "anthropic",
+                    "PATH": "/usr/bin", "LANG": "en_US.UTF-8"]
+        let env = teamCodexSubscriptionEnvironment(base: base, home: "/home/test", executableBin: "/opt/tool/bin")
+        precondition(env["TEAMCLAUDE_CONFIG"] == "/home/test/.config/teamcodex.json")
+        precondition(env["XDG_CONFIG_HOME"] == nil && env["TEAMCLAUDE_PROVIDER"] == nil)
+        precondition(env["HOME"] == "/home/test" && env["LANG"] == "en_US.UTF-8")
+        precondition(env["PATH"]?.hasPrefix("/opt/tool/bin:") == true)
+        precondition(teamCodexSubscriptionConfigPath(home: "/home/test") == "/home/test/.config/teamcodex.json")
     }
 
     static func main() {
@@ -314,6 +370,9 @@ struct SubscriptionStateTests {
         cliArguments()
         actionsAndUndo()
         dialogAndArming()
+        proxyLockedEnd()
+        duplicateNames()
+        cliEnvironment()
         L10n.language = .en
         precondition(SubscriptionDisplayState.allCases.allSatisfy { $0.label.range(of: "[가-힣]", options: .regularExpression) == nil })
         print("SubscriptionStateTests: all assertions passed")

@@ -45,6 +45,9 @@ struct SubscriptionResolution: Equatable {
     var shown: SubscriptionRecordView
     var local: SubscriptionRecordView? = nil
     var proxy: SubscriptionRecordView? = nil
+    /// 프록시가 계정 상태(`errorReason == subscription-ended`)로 종료를 확정했다. 기록을 지워도 다음 판정에서 프록시 값이
+    /// 다시 이기므로 이 맥에서 되돌릴 수 없다(처리 버튼을 주지 않는다).
+    var proxyLocked = false
 
     var state: SubscriptionDisplayState { shown.state }
     /// 해지 기록이 있고 아직 확정 전(해지 예약 · 종료일 지남).
@@ -97,7 +100,8 @@ func claudeSubscriptionResolution(local: AccountSubscriptionConfirmation?, proxy
     case let (nil, proxy?): shown = proxy
     case (nil, nil): shown = SubscriptionRecordView(state: .unknown)
     }
-    return SubscriptionResolution(shown: shown, local: localView, proxy: proxyView)
+    return SubscriptionResolution(shown: shown, local: localView, proxy: proxyView,
+                                  proxyLocked: errorReason == "subscription-ended")
 }
 
 /// Codex 프록시 status가 말하는 구독 상태. 기록이 없으면 nil(프록시는 "구독 중 확인됨"을 따로 기록하지 않는다).
@@ -131,7 +135,20 @@ func codexSubscriptionResolution(account: TeamCodexPoolAccount, local: AccountSu
     let shown: SubscriptionRecordView
     if let proxyView, proxyView.state == .ended { shown = proxyView }
     else { shown = localView ?? proxyView ?? SubscriptionRecordView(state: .unknown) }
-    return SubscriptionResolution(shown: shown, local: localView, proxy: proxyView)
+    // 설정의 해지 기록(state ended)은 CLI clear로 지울 수 있지만, 인증 실패로 붙은 계정 상태는 설정을 지워도 남는다.
+    return SubscriptionResolution(shown: shown, local: localView, proxy: proxyView,
+                                  proxyLocked: account.errorReason == "subscription-ended")
+}
+
+/// 이름·uuid로 행을 고른다. uuid가 오면 그 uuid이면서 이름도 같은 행만, uuid가 없으면 그 이름이 하나뿐일 때만 고른다.
+/// 같은 이름 계정이 둘이면 이름만으로 고르지 않는다(엉뚱한 행을 펼치거나 무장하지 않게).
+func subscriptionRowIndex(names: [String], uuids: [String?], name: String, accountUuid: String?) -> Int? {
+    if let accountUuid, !accountUuid.isEmpty {
+        let matches = names.indices.filter { uuids.indices.contains($0) && uuids[$0] == accountUuid && names[$0] == name }
+        return matches.count == 1 ? matches[0] : nil
+    }
+    let matches = names.indices.filter { names[$0] == name }
+    return matches.count == 1 ? matches[0] : nil
 }
 
 /// 풀 행 하나의 구독 상태(이 맥 기록은 프록시 status가 준 계정 uuid로 찾는다. CLI도 같은 uuid로 신원을 고정한다).

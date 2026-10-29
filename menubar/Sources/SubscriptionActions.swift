@@ -101,6 +101,23 @@ func teamCodexSubscriptionFailureReason(_ result: SubscriptionCLIResult) -> Stri
     return line.count > 80 ? String(line.prefix(79)) + "…" : line
 }
 
+/// 화면이 읽는 Codex 풀 설정 파일(메뉴바는 기본 경로를 고정해 읽는다: TeamCodexPoolStatus·AccountSubscription).
+func teamCodexSubscriptionConfigPath(home: String) -> String {
+    (home as NSString).appendingPathComponent(".config/teamcodex.json")
+}
+
+/// teamcodex 실행 환경. 셸에서 물려받은 TEAMCLAUDE_CONFIG·XDG_CONFIG_HOME·TEAMCLAUDE_PROVIDER가 다른 설정 파일을 가리키면
+/// 화면은 기본 풀을 보여 주는데 클릭은 다른 파일을 고친다. 화면이 읽는 파일로 고정한다.
+func teamCodexSubscriptionEnvironment(base: [String: String], home: String, executableBin: String) -> [String: String] {
+    var environment = base
+    environment.removeValue(forKey: "XDG_CONFIG_HOME")
+    environment.removeValue(forKey: "TEAMCLAUDE_PROVIDER")
+    environment["TEAMCLAUDE_CONFIG"] = teamCodexSubscriptionConfigPath(home: home)
+    environment["HOME"] = home
+    environment["PATH"] = "\(executableBin):/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    return environment
+}
+
 final class SubscriptionActionCenter {
     static let shared = SubscriptionActionCenter(store: .shared) { _, completion in
         completion(SubscriptionCLIResult(status: -1, output: L10n.subFailedUnknown))
@@ -164,6 +181,11 @@ final class SubscriptionActionCenter {
         guard !isBusy(target) else { return false }
         guard let uuid = target.accountUuid, !uuid.isEmpty, ["anthropic", "codex"].contains(target.provider) else {
             completion(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, L10n.subFailedIdentity)))
+            return true
+        }
+        // 프록시가 확정한 종료는 이 맥 기록을 바꿔도 다음 판정에서 프록시 값이 이긴다. 성공으로 보이지 않게 거절한다.
+        if current.proxyLocked {
+            completion(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, L10n.subFailedProxyLocked)))
             return true
         }
         let local = localState(command, current: current)
