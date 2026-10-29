@@ -167,6 +167,46 @@ struct CodexPoolRowLayoutTests {
             view.cacheDisplay(in: view.bounds, to: bitmap)
             try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
         }
+        // 되돌리기 검사는 행 뷰가 아니라 데이터에서 계정을 찾는다. 처리 뒤 표를 새로 만들어도(옛 행 뷰 해제) 같은 계정을 찾는다.
+        let target = codexSubscriptionTarget(rows[3]).target
+        var rebuilt: CodexStatusView? = CodexStatusView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        rebuilt?.pool = pool
+        weak var released = rebuilt
+        let freshPool = rebuilt?.pool
+        rebuilt = nil
+        if released != nil { failures.append("rebuilt row view should be released in this check") }
+        let found = StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: freshPool, now: now)
+        if found?.target.accountUuid != rows[3].accountUuid { failures.append("undo lookup did not find the same account by uuid") }
+        if SubscriptionActionButtons.verifyUndo(captured: target, latest: found) != nil {
+            failures.append("undo must pass for the same unlocked account after the view is rebuilt")
+        }
+        // 같은 이름의 다른 계정(uuid 다름)이나 사라진 계정은 찾지 않는다.
+        var swapped = rows
+        swapped[3] = account(3, uuid: "row-layout-\(run)-swapped", subscriptionState: "cancellation-scheduled",
+                             subscriptionEndsAt: now.addingTimeInterval(86_400 * 5), session: 99, weekly: 99)
+        let swappedPool = TeamCodexPoolHealth(checkedAt: now, serverReachable: true, serverPort: 3457, serverPid: nil,
+                                              currentAccount: rows[0].name, currentAccountUuid: rows[0].accountUuid,
+                                              switchThresholdPercent: 98, accounts: swapped,
+                                              resetCreditsEnabled: true, resetCreditsPolicy: "account")
+        if SubscriptionActionButtons.verifyUndo(captured: target,
+                                                latest: StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: swappedPool, now: now)) == nil {
+            failures.append("undo must fail when the row now holds a different account")
+        }
+        // 프록시가 종료를 확정한 계정이면 되돌리지 않는다.
+        var locked = rows
+        locked[3] = account(3, uuid: rows[3].accountUuid, status: "error", errorReason: "subscription-ended",
+                            subscriptionState: "cancellation-scheduled", subscriptionEndsAt: now.addingTimeInterval(86_400 * 5),
+                            session: 99, weekly: 99)
+        let lockedPool = TeamCodexPoolHealth(checkedAt: now, serverReachable: true, serverPort: 3457, serverPid: nil,
+                                             currentAccount: rows[0].name, currentAccountUuid: rows[0].accountUuid,
+                                             switchThresholdPercent: 98, accounts: locked,
+                                             resetCreditsEnabled: true, resetCreditsPolicy: "account")
+        if SubscriptionActionButtons.verifyUndo(captured: target,
+                                                latest: StatusMenuDashboardView.subscriptionLatest(target, claude: nil, codex: lockedPool, now: now))
+            != L10n.subFailedProxyLocked {
+            failures.append("undo must fail once the proxy confirmed the plan ended")
+        }
+
         guard failures.isEmpty else {
             failures.forEach { print("FAIL \($0)") }
             exit(1)

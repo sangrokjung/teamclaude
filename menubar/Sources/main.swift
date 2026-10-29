@@ -2991,9 +2991,32 @@ final class StatusMenuDashboardView: NSView {
     }
 
     private func undoSubscriptionAction() {
-        guard let undo = subscriptionUndo else { return }
+        guard var undo = subscriptionUndo else { return }
         clearSubscriptionNotice()
+        // 누른 시점(그리고 Codex CLI 완료 뒤)에 지금 붙어 있는 표의 데이터에서 그 계정을 uuid로 다시 찾는다.
+        let captured = undo.target
+        undo.verify = { [weak self] in
+            SubscriptionActionButtons.verifyUndo(
+                captured: captured,
+                latest: Self.subscriptionLatest(captured, claude: self?.teamClaudeView?.health, codex: self?.codexView?.pool))
+        }
         SubscriptionActionCenter.shared.undo(undo) { outcome in SubscriptionActionCenter.shared.onOutcome?(outcome) }
+    }
+
+    /// 그 계정(이름 + uuid)의 최신 대상·판정. 행 뷰가 아니라 데이터에서 찾으므로 화면을 다시 만들어도 같은 답을 낸다.
+    static func subscriptionLatest(_ target: SubscriptionTarget, claude: TeamClaudeHealth?, codex: TeamCodexPoolHealth?,
+                                   now: Date = Date()) -> SubscriptionLatest? {
+        if target.provider == "codex" {
+            guard let codex, let index = CodexStatusView.rowIndex(codex, name: target.name, accountUuid: target.accountUuid) else { return nil }
+            let account = codex.accounts[index]
+            let current = codexSubscriptionTarget(account)
+            return SubscriptionLatest(target: current.target, resolution: codexSubscriptionResolution(account, now: now),
+                                      billingDay: current.billingDay)
+        }
+        guard let claude, let index = TeamClaudeTableView.rowIndex(claude, name: target.name, accountUuid: target.accountUuid),
+              let resolution = claude.subscriptionResolution(index, now: now) else { return nil }
+        let current = claude.subscriptionTarget(index)
+        return SubscriptionLatest(target: current.target, resolution: resolution, billingDay: current.billingDay)
     }
 
     // MARK: 높이

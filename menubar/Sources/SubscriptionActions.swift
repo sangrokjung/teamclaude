@@ -40,6 +40,7 @@ struct SubscriptionUndo {
     /// Codex만: 직전 설정 상태로 돌리는 CLI 인자.
     let restoreArguments: [String]?
     /// 되돌리기 직전(그리고 Codex CLI 완료 뒤) 그 계정이 아직 같은 계정인지·프록시가 잠그지 않았는지 다시 본다. nil이면 통과.
+    /// 버튼(행 뷰)이 아니라 패널이 되돌리기를 부를 때 지금 붙어 있는 데이터로 채운다. 행 뷰는 처리 뒤 다시 만들어질 수 있다.
     var verify: (() -> String?)? = nil
 }
 
@@ -179,7 +180,7 @@ final class SubscriptionActionCenter {
     /// 처리를 시작한다. 잠긴 계정이면 아무것도 하지 않고 false. completion은 메인 스레드에서 한 번 불린다.
     @discardableResult
     func perform(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
-                 now: Date = Date(), verify: (() -> String?)? = nil, undoVerify: (() -> String?)? = nil,
+                 now: Date = Date(), verify: (() -> String?)? = nil,
                  completion: @escaping (SubscriptionOutcome) -> Void) -> Bool {
         guard !isBusy(target) else { return false }
         // 화면이 주는 마지막 확인(그 계정이 아직 그 계정인지·잠기지 않았는지). 실패하면 아무것도 바꾸지 않는다.
@@ -207,7 +208,7 @@ final class SubscriptionActionCenter {
             let saved = save(local, target: target)
             completion(saved
                 ? SubscriptionOutcome(succeeded: true, message: done,
-                                      undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: nil, verify: undoVerify))
+                                      undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: nil))
                 : SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, L10n.subFormInvalidDate)))
             onChange?()
             return true
@@ -233,7 +234,7 @@ final class SubscriptionActionCenter {
             let restart = teamCodexSubscriptionNeedsRestart(result.output)
             completion(SubscriptionOutcome(succeeded: true, message: restart ? "\(done) · \(L10n.subRestartNeeded)" : done,
                                            restartNeeded: restart,
-                                           undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: restore, verify: undoVerify)))
+                                           undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: restore)))
         }
         return true
     }

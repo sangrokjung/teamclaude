@@ -431,7 +431,10 @@ struct SubscriptionStateTests {
         precondition(store.localConfirmation(provider: "codex", uuid: "uuid-u1")?.state == .ended)
 
         // (다) 처리 성공 뒤 프록시가 종료를 확정하면 하단 되돌리기도 실패하고 기록·CLI를 건드리지 않는다.
-        let undo = outcomes[4].undo!
+        var undo = outcomes[4].undo!
+        precondition(undo.verify == nil, "undo must not keep the row button's latest closure (row views are rebuilt)")
+        // 패널이 되돌리기를 부를 때 채우는 검사와 같은 모양(지금 데이터 → verifyUndo).
+        undo.verify = { SubscriptionActionButtons.verifyUndo(captured: u1, latest: latest) }
         let lockedEnd = SubscriptionResolution(shown: SubscriptionRecordView(state: .ended), proxyLocked: true)
         latest = SubscriptionLatest(target: u1, resolution: lockedEnd, billingDay: nil)
         var undone: SubscriptionOutcome?

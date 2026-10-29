@@ -173,9 +173,9 @@ enum SubscriptionActionButtons {
         // 실행 직전(대화상자를 닫은 뒤에도) 그 계정의 최신 상태를 다시 본다.
         func runChecked(_ command: SubscriptionCommand) {
             guard let current = checked() else { return }
-            center.run(command, target: current.target, current: current.resolution,
-                       verify: { verify(kind, captured: target, latest: latest()).reason },
-                       undoVerify: { verifyUndo(captured: target, latest: latest()) })
+            center.run(command, target: current.target, current: current.resolution) {
+                verify(kind, captured: target, latest: latest()).reason
+            }
         }
         switch kind {
         case .record, .editEnd:
@@ -203,8 +203,8 @@ enum SubscriptionActionButtons {
 extension SubscriptionActionCenter {
     /// 화면에서 부르는 진입점. 결과는 onOutcome(하단 막대)으로 간다. verify는 저장·실행 바로 앞에서 다시 부른다.
     func run(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
-             verify: (() -> String?)? = nil, undoVerify: (() -> String?)? = nil) {
-        perform(command, target: target, current: current, verify: verify, undoVerify: undoVerify) { [weak self] outcome in self?.onOutcome?(outcome) }
+             verify: (() -> String?)? = nil) {
+        perform(command, target: target, current: current, verify: verify) { [weak self] outcome in self?.onOutcome?(outcome) }
     }
 }
 
