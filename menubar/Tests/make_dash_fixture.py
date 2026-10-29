@@ -109,6 +109,34 @@ def build():
                 codex("codex-05", None, None, 1, 1, status="error", error="auth-rejected"),
             ],
         }
+    if "--subscriptions" in sys.argv:
+        # 구독 상태 사례(시안 B 2차본). 프록시가 기록한 값만 넣는다(이 맥 기록은 UserDefaults라 픽스처 밖).
+        now_ms = int(time.time() * 1000)
+
+        def local_midnight_after(days):
+            # 종료일 다음 날 0시(프록시 endsAt은 "그날까지 사용"의 다음 순간이다).
+            t = time.localtime(time.time() + days * 86400)
+            return int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1)) * 1000)
+
+        by_name = {a["name"]: a for a in accounts}
+        by_name["acct-09"]["subscription"] = {"state": "cancellation-scheduled", "endsAt": local_midnight_after(15),
+                                              "recordedAt": now_ms - 2 * DAY_MS}
+        # 해지 기록 + 인증 오류: 재인증 대신 종료로 확정.
+        by_name["acct-13"]["subscription"] = {"state": "cancellation-scheduled", "endsAt": None,
+                                              "recordedAt": now_ms - DAY_MS}
+        by_name["acct-11"]["subscription"] = {"state": "end-date-reached", "endsAt": local_midnight_after(-2),
+                                              "recordedAt": now_ms - 9 * DAY_MS}
+        by_name["acct-15"]["subscription"] = {"state": "ended", "endsAt": local_midnight_after(-5),
+                                              "recordedAt": now_ms - 5 * DAY_MS}
+        if "teamcodex" in fixture:
+            rows = fixture["teamcodex"]["accounts"]
+            iso = lambda ms: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ms / 1000)) + "Z"
+            rows[1]["subscription"] = {"state": "cancellation-scheduled", "endsAt": iso(local_midnight_after(14))}
+            rows[4]["subscription"] = {"state": "cancellation-scheduled"}
+            for name in ("codex-06", "codex-07"):
+                ended = dict(rows[0], name=name, accountUuid=f"{name}-uuid", status="error", errorReason="subscription-ended",
+                             usable=False, subscription={"state": "ended", "endsAt": iso(local_midnight_after(-3))})
+                rows.append(ended)
     if "--stale" in sys.argv:
         # 실패 화면은 실패했을 때만 나타나서 평소 스냅샷에 걸리지 않는다. 그래서 따로 그린다.
         fixture["staleNotes"] = {"grok": "12분째 갱신 없음", "agy": "31분째 갱신 없음",

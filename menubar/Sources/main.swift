@@ -3268,6 +3268,13 @@ final class StatusMenuDashboardView: NSView {
         }
     }
 
+    /// Codex 탭에서 그 계정의 구독 기록을 펼친다(스냅샷 --expand-codex).
+    func openCodexAccount(_ name: String) {
+        selectTab(.codex)
+        codexView?.expandedAccount = name
+        relayoutCodexTab()
+    }
+
     /// 손볼 것의 "종료로 확정": 그 계정 행을 펼치고 확정 버튼을 무장시킨다(한 번 더 누르면 확정).
     func openSubscriptionConfirm(provider: String, name: String) {
         if provider == "codex" {
@@ -7283,6 +7290,10 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     // --expand <계정>이면 개요에서 그 계정을 누른 것처럼 Claude 탭에서 행을 펼친다(펼친 상세 칸 확인용).
     if let expandIndex = CommandLine.arguments.firstIndex(of: "--expand"), CommandLine.arguments.indices.contains(expandIndex + 1) {
         view.openAccount(CommandLine.arguments[expandIndex + 1])
+    }
+    // --expand-codex <계정>이면 Codex 탭에서 그 계정의 구독 기록을 펼친다.
+    if let expandIndex = CommandLine.arguments.firstIndex(of: "--expand-codex"), CommandLine.arguments.indices.contains(expandIndex + 1) {
+        view.openCodexAccount(CommandLine.arguments[expandIndex + 1])
     }
     // --tab <id>면 그 탭 한 장, 아니면 탭 다섯 장(첫 장이 출력 경로, 나머지는 -<탭 id>).
     let tabs: [DashboardTab]
