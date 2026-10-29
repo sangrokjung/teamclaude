@@ -178,7 +178,8 @@ struct AccountSubscriptionLayoutTests {
             matrixView.health = matrix
             matrixView.layoutSubtreeIfNeeded()
             let button = matrixView.subviews.compactMap { $0 as? AccountSubscriptionButton }[0]
-            precondition(button.title.contains("종료일 경과"))
+            // 구독 줄도 판정과 같은 말("종료일 지남 · 1/1 종료 · 확정 전")을 쓴다.
+            precondition(button.title.contains("종료일 지남"))
             precondition(isGray(button.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as! NSColor))
             try capture(matrixView, "claude-due-\(enabled)-\(online).png")
         }
