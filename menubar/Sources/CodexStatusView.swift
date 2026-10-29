@@ -106,8 +106,13 @@ final class CodexStatusView: NSView {
         onExpansionChange?()
     }
 
+    /// 이름만으로 들어와도 그때 고른 행의 uuid를 고정한다(같은 이름·자리의 다른 계정으로 바뀌면 펼치지 않는다).
     func expand(_ name: String?, accountUuid: String?) {
-        expandedAccountUuid = name == nil ? nil : accountUuid
+        var pinned = accountUuid
+        if let name, pinned == nil, let pool, let index = Self.rowIndex(pool, name: name, accountUuid: nil) {
+            pinned = pool.accounts[index].accountUuid
+        }
+        expandedAccountUuid = name == nil ? nil : pinned
         expandedAccount = name
     }
 
@@ -206,19 +211,32 @@ final class CodexStatusView: NSView {
         let account = pool.accounts[index]
         let subscription = codexSubscriptionResolution(account, now: pool.checkedAt)
         let target = codexSubscriptionTarget(account)
+        // 프록시가 종료를 확정했으면 무장을 푼다.
+        if subscription.proxyLocked { SubscriptionActionButtons.disarm(target.target) }
         let armed = [SubscriptionActionButtons.Kind.confirmEnd, .clear]
             .filter { SubscriptionActionButtons.isArmed(target.target, $0) }.map(\.rawValue).joined(separator: ",")
-        let signature = "\(name):\(account.accountUuid ?? "-"):\(subscription.state.rawValue):\(subscription.shown.endDate ?? "-")"
+        // 키에 신원·잠금이 들어 있어 계정이 바뀌거나 잠기면 버튼을 새로 만든다.
+        let signature = "\(name):\(SubscriptionActionButtons.cacheKey(target: target.target, resolution: subscription))"
             + ":\(SubscriptionActionCenter.shared.isBusy(target.target)):\(armed)"
         guard signature != detailSignature else { return }
         detailSignature = signature
         detailButtons.forEach { $0.removeFromSuperview() }
         // 신원(uuid)이 확인된 행에서만 처리 버튼을 준다(CLI가 --account-uuid로 신원을 고정한다).
         detailButtons = account.accountUuid?.isEmpty == false
-            ? SubscriptionActionButtons.make(target: target.target, resolution: subscription, billingDay: target.billingDay) { [weak self] in
-                self?.detailSignature = ""
-                self?.needsLayout = true
-            }
+            ? SubscriptionActionButtons.make(
+                target: target.target, resolution: subscription, billingDay: target.billingDay,
+                // 누른 시점에 그 행(이름 + uuid)을 다시 찾아 최신 대상·판정으로 판정한다.
+                latest: { [weak self] in
+                    guard let pool = self?.pool, let index = Self.rowIndex(pool, name: name, accountUuid: account.accountUuid) else { return nil }
+                    let current = pool.accounts[index]
+                    let target = codexSubscriptionTarget(current)
+                    return SubscriptionLatest(target: target.target, resolution: codexSubscriptionResolution(current, now: Date()),
+                                              billingDay: target.billingDay)
+                },
+                onChanged: { [weak self] in
+                    self?.detailSignature = ""
+                    self?.needsLayout = true
+                })
             : []
         detailButtons.forEach { addSubview($0) }
     }

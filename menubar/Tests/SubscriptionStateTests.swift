@@ -361,6 +361,82 @@ struct SubscriptionStateTests {
         precondition(teamCodexSubscriptionConfigPath(home: "/home/test") == "/home/test/.config/teamcodex.json")
     }
 
+    // 11. 버튼은 캡처한 값이 아니라 누른 시점의 최신 상태로 판정한다
+    static func pressUsesLatestState() {
+        let now = day("2026-10-29")
+        let (store, _) = freshStore { now }
+        var ran = 0
+        let center = SubscriptionActionCenter(store: store) { _, completion in ran += 1; completion(SubscriptionCLIResult(status: 0, output: "")) }
+        var outcomes: [SubscriptionOutcome] = []
+        center.onOutcome = { outcomes.append($0) }
+        func button(_ buttons: [PanelButton], _ title: String) -> PanelButton {
+            buttons.first { $0.title.hasPrefix(title) }!
+        }
+
+        // (가) 무장한 뒤 프록시가 subscription-ended로 바뀌면 두 번째 클릭은 실패하고 기록을 바꾸지 않는다.
+        let t1 = SubscriptionTarget(provider: "anthropic", name: "acct-01", accountUuid: "uuid-lock")
+        precondition(store.saveConfirmation(.ended, date: nil, provider: "anthropic", uuid: "uuid-lock"))
+        let before = store.confirmationRecord(provider: "anthropic", uuid: "uuid-lock")?["checkedAt"] as? Date
+        let open = claudeSubscriptionResolution(local: store.localConfirmation(provider: "anthropic", uuid: "uuid-lock"), proxy: nil,
+                                                errorReason: nil, proxyEndReached: false, now: now)
+        var latest: SubscriptionLatest? = SubscriptionLatest(target: t1, resolution: open, billingDay: nil)
+        var buttons = SubscriptionActionButtons.make(target: t1, resolution: open, billingDay: nil, center: center,
+                                                     latest: { latest }, onChanged: {})
+        button(buttons, "기록 지우기").onPress?()
+        precondition(SubscriptionActionButtons.isArmed(t1, .clear) && outcomes.isEmpty)
+        let locked = claudeSubscriptionResolution(local: store.localConfirmation(provider: "anthropic", uuid: "uuid-lock"), proxy: nil,
+                                                  errorReason: "subscription-ended", proxyEndReached: false, now: now)
+        latest = SubscriptionLatest(target: t1, resolution: locked, billingDay: nil)
+        button(buttons, "기록 지우기").onPress?()
+        precondition(outcomes.count == 1 && outcomes[0].succeeded == false && outcomes[0].undo == nil, "\(outcomes)")
+        precondition(outcomes[0].message == "acct-01 처리 실패 · 프록시가 구독 종료로 확정해 이 맥에서 되돌릴 수 없습니다")
+        precondition(store.localConfirmation(provider: "anthropic", uuid: "uuid-lock")?.state == .ended)
+        precondition(store.confirmationRecord(provider: "anthropic", uuid: "uuid-lock")?["checkedAt"] as? Date == before)
+        precondition(!SubscriptionActionButtons.isArmed(t1, .clear))
+
+        // (나) 같은 이름·자리의 계정이 U1→U2로 바뀌면 U1을 잡은 버튼은 실행하지 않는다(Codex는 CLI도 부르지 않는다).
+        let u1 = SubscriptionTarget(provider: "codex", name: "codex-01", accountUuid: "uuid-u1")
+        let u2 = SubscriptionTarget(provider: "codex", name: "codex-01", accountUuid: "uuid-u2")
+        let scheduled = SubscriptionResolution(shown: SubscriptionRecordView(state: .scheduled, endDate: "2026-11-12"))
+        latest = SubscriptionLatest(target: u1, resolution: scheduled, billingDay: nil)
+        buttons = SubscriptionActionButtons.make(target: u1, resolution: scheduled, billingDay: nil, center: center,
+                                                 latest: { latest }, onChanged: {})
+        button(buttons, "종료로 확정").onPress?()
+        latest = SubscriptionLatest(target: u2, resolution: scheduled, billingDay: nil)
+        button(buttons, "종료로 확정").onPress?()
+        precondition(outcomes.count == 2 && outcomes[1].succeeded == false)
+        precondition(outcomes[1].message == "codex-01 처리 실패 · 계정이 바뀌어 실행하지 않았습니다")
+        precondition(ran == 0 && store.localConfirmation(provider: "codex", uuid: "uuid-u1") == nil
+                     && store.localConfirmation(provider: "codex", uuid: "uuid-u2") == nil)
+        // 행이 사라져도 실행하지 않는다.
+        latest = nil
+        buttons = SubscriptionActionButtons.make(target: u1, resolution: scheduled, billingDay: nil, center: center,
+                                                 latest: { latest }, onChanged: {})
+        button(buttons, "기록 지우기").onPress?()
+        button(buttons, "기록 지우기").onPress?()
+        precondition(outcomes.count == 3 && outcomes[2].succeeded == false && ran == 0)
+        // 상태가 바뀌어 그 버튼이 더는 맞지 않으면(해지 예약 → 구독 중) 실행하지 않는다.
+        latest = SubscriptionLatest(target: u1, resolution: SubscriptionResolution(shown: SubscriptionRecordView(state: .active)), billingDay: nil)
+        buttons = SubscriptionActionButtons.make(target: u1, resolution: scheduled, billingDay: nil, center: center,
+                                                 latest: { latest }, onChanged: {})
+        button(buttons, "종료로 확정").onPress?()
+        button(buttons, "종료로 확정").onPress?()
+        precondition(outcomes.count == 4 && outcomes[3].succeeded == false && ran == 0)
+        precondition(outcomes[3].message == "codex-01 처리 실패 · 상태가 바뀌어 실행하지 않았습니다")
+        // 최신 상태가 그대로면 실행한다(최신 resolution으로).
+        latest = SubscriptionLatest(target: u1, resolution: scheduled, billingDay: nil)
+        button(buttons, "종료로 확정").onPress?()
+        button(buttons, "종료로 확정").onPress?()
+        precondition(outcomes.count == 5 && outcomes[4].succeeded == true && ran == 1)
+        precondition(store.localConfirmation(provider: "codex", uuid: "uuid-u1")?.state == .ended)
+
+        // 상세 버튼 캐시 키: 잠금·신원이 바뀌면 달라진다.
+        let k1 = SubscriptionActionButtons.cacheKey(target: t1, resolution: open)
+        precondition(k1 != SubscriptionActionButtons.cacheKey(target: t1, resolution: locked))
+        precondition(SubscriptionActionButtons.cacheKey(target: u1, resolution: scheduled)
+                     != SubscriptionActionButtons.cacheKey(target: u2, resolution: scheduled))
+    }
+
     static func main() {
         L10n.language = .ko
         fiveStates()
@@ -373,6 +449,7 @@ struct SubscriptionStateTests {
         proxyLockedEnd()
         duplicateNames()
         cliEnvironment()
+        pressUsesLatestState()
         L10n.language = .en
         precondition(SubscriptionDisplayState.allCases.allSatisfy { $0.label.range(of: "[가-힣]", options: .regularExpression) == nil })
         print("SubscriptionStateTests: all assertions passed")

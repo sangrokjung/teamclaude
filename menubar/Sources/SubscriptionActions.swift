@@ -177,8 +177,14 @@ final class SubscriptionActionCenter {
     /// 처리를 시작한다. 잠긴 계정이면 아무것도 하지 않고 false. completion은 메인 스레드에서 한 번 불린다.
     @discardableResult
     func perform(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
-                 now: Date = Date(), completion: @escaping (SubscriptionOutcome) -> Void) -> Bool {
+                 now: Date = Date(), verify: (() -> String?)? = nil,
+                 completion: @escaping (SubscriptionOutcome) -> Void) -> Bool {
         guard !isBusy(target) else { return false }
+        // 화면이 주는 마지막 확인(그 계정이 아직 그 계정인지·잠기지 않았는지). 실패하면 아무것도 바꾸지 않는다.
+        if let reason = verify?() {
+            completion(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, reason)))
+            return true
+        }
         guard let uuid = target.accountUuid, !uuid.isEmpty, ["anthropic", "codex"].contains(target.provider) else {
             completion(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, L10n.subFailedIdentity)))
             return true

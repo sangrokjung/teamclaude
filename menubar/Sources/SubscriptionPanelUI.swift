@@ -70,6 +70,13 @@ enum SubscriptionGlyph {
     }
 }
 
+/// 누른 시점에 다시 조회한 그 행의 대상·판정. 버튼은 만들 때 잡은 값이 아니라 이 값으로 판정한다.
+struct SubscriptionLatest {
+    let target: SubscriptionTarget
+    let resolution: SubscriptionResolution
+    let billingDay: String?
+}
+
 /// 처리 버튼 한 줄을 만든다. 종료로 확정·기록 지우기는 한 번 더 눌러야 실행된다(시안의 확인 대화상자 대신).
 /// 무장 상태는 계정별로 4초 유지되고, 표가 버튼을 다시 만들어도 이어진다.
 enum SubscriptionActionButtons {
@@ -111,9 +118,25 @@ enum SubscriptionActionButtons {
         }
     }
 
-    /// 버튼을 만든다. onChanged는 무장 상태가 바뀌어 제목을 다시 그려야 할 때 부른다.
+    /// 상세 버튼을 다시 만들지 정하는 키. 신원(uuid)·상태·종료일·프록시 잠금 중 하나라도 바뀌면 버튼을 새로 만든다.
+    static func cacheKey(target: SubscriptionTarget, resolution: SubscriptionResolution) -> String {
+        "\(target.key)|\(resolution.state.rawValue)|\(resolution.shown.endDate ?? "-")|\(resolution.proxyLocked)"
+    }
+
+    /// 누른 시점 검사. 행이 사라졌거나 다른 계정으로 바뀌었으면, 프록시가 종료를 확정했으면, 그 버튼이 더는 맞지 않으면 실행하지 않는다.
+    static func verify(_ kind: Kind, captured: SubscriptionTarget, latest: SubscriptionLatest?) -> (latest: SubscriptionLatest?, reason: String?) {
+        guard let latest, latest.target.key == captured.key, latest.target.accountUuid == captured.accountUuid else {
+            return (nil, L10n.subFailedAccountChanged)
+        }
+        if latest.resolution.proxyLocked { return (nil, L10n.subFailedProxyLocked) }
+        guard kinds(for: latest.resolution).contains(kind) else { return (nil, L10n.subFailedStateChanged) }
+        return (latest, nil)
+    }
+
+    /// 버튼을 만든다. latest는 누른 시점에 그 행의 최신 대상·판정을 다시 조회한다. onChanged는 무장 상태가 바뀌어 제목을 다시 그려야 할 때 부른다.
     static func make(target: SubscriptionTarget, resolution: SubscriptionResolution, billingDay: String?,
                      center: SubscriptionActionCenter = .shared, now: Date = Date(),
+                     latest: @escaping () -> SubscriptionLatest?,
                      onChanged: @escaping () -> Void) -> [PanelButton] {
         let state = resolution.state
         let busy = center.isBusy(target)
@@ -121,7 +144,7 @@ enum SubscriptionActionButtons {
             let isArmed = isArmed(target, kind, now: now)
             let style: PanelButton.Style = kind == .confirmEnd ? .primary : (kind == .clear ? .quiet : .ghost)
             let button = PanelButton(title: title(kind, state: state, armed: isArmed), style: style) {
-                press(kind, target: target, resolution: resolution, billingDay: billingDay, center: center, onChanged: onChanged)
+                press(kind, target: target, center: center, latest: latest, onChanged: onChanged)
             }
             button.isEnabled = !busy
             button.setAccessibilityLabel("\(button.title): \(target.name)")
@@ -129,18 +152,29 @@ enum SubscriptionActionButtons {
         }
     }
 
-    private static func press(_ kind: Kind, target: SubscriptionTarget, resolution: SubscriptionResolution, billingDay: String?,
-                              center: SubscriptionActionCenter, onChanged: @escaping () -> Void) {
+    private static func press(_ kind: Kind, target: SubscriptionTarget, center: SubscriptionActionCenter,
+                              latest: @escaping () -> SubscriptionLatest?, onChanged: @escaping () -> Void) {
         guard !center.isBusy(target) else { return }
+        func checked() -> SubscriptionLatest? {
+            let result = verify(kind, captured: target, latest: latest())
+            if let reason = result.reason {
+                center.onOutcome?(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, reason)))
+            }
+            return result.latest
+        }
+        // 실행 직전(대화상자를 닫은 뒤에도) 그 계정의 최신 상태를 다시 본다.
+        func runChecked(_ command: SubscriptionCommand) {
+            guard let current = checked() else { return }
+            center.run(command, target: current.target, current: current.resolution) {
+                verify(kind, captured: target, latest: latest()).reason
+            }
+        }
         switch kind {
-        case .record:
-            guard let command = SubscriptionRecordDialog.run(mode: .record, name: target.name, billingDay: billingDay,
-                                                             current: resolution.shown) else { return }
-            center.run(command, target: target, current: resolution)
-        case .editEnd:
-            guard let command = SubscriptionRecordDialog.run(mode: .edit, name: target.name, billingDay: billingDay,
-                                                             current: resolution.shown) else { return }
-            center.run(command, target: target, current: resolution)
+        case .record, .editEnd:
+            guard let before = checked(),
+                  let command = SubscriptionRecordDialog.run(mode: kind == .record ? .record : .edit, name: target.name,
+                                                             billingDay: before.billingDay, current: before.resolution.shown) else { return }
+            runChecked(command)
         case .confirmEnd, .clear:
             guard isArmed(target, kind) else {
                 arm(target, kind)
@@ -149,18 +183,20 @@ enum SubscriptionActionButtons {
                 return
             }
             disarm(target)
-            let command: SubscriptionCommand = kind == .clear
-                ? .clear
-                : .confirmEnd(endDate: resolution.shown.endDate, source: "user-confirmed")
-            center.run(command, target: target, current: resolution)
+            if kind == .clear {
+                runChecked(.clear)
+            } else {
+                runChecked(.confirmEnd(endDate: latest()?.resolution.shown.endDate, source: "user-confirmed"))
+            }
         }
     }
 }
 
 extension SubscriptionActionCenter {
-    /// 화면에서 부르는 진입점. 결과는 onOutcome(하단 막대)으로 간다.
-    func run(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution) {
-        perform(command, target: target, current: current) { [weak self] outcome in self?.onOutcome?(outcome) }
+    /// 화면에서 부르는 진입점. 결과는 onOutcome(하단 막대)으로 간다. verify는 저장·실행 바로 앞에서 다시 부른다.
+    func run(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
+             verify: (() -> String?)? = nil) {
+        perform(command, target: target, current: current, verify: verify) { [weak self] outcome in self?.onOutcome?(outcome) }
     }
 }
 

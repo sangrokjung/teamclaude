@@ -2083,8 +2083,14 @@ final class TeamClaudeTableView: NSView {
     }
 
     /// 이름·uuid로 행 하나를 펼친다(uuid 먼저 바꿔 두 값이 한 번에 맞게).
+    /// 이름만으로 들어와도(개요의 계정 줄 등) 그때 고른 행의 uuid를 고정한다. 나중에 같은 이름·자리의 다른 계정으로
+    /// 바뀌면 그 행은 펼쳐지지 않는다(엉뚱한 계정의 처리 버튼을 열어 두지 않는다).
     func expand(_ name: String?, accountUuid: String?) {
-        expandedAccountUuid = name == nil ? nil : accountUuid
+        var pinned = accountUuid
+        if let name, pinned == nil, let health, let index = Self.rowIndex(health, name: name, accountUuid: nil) {
+            pinned = health.accounts[index].accountUuid
+        }
+        expandedAccountUuid = name == nil ? nil : pinned
         expandedAccount = name
     }
 
@@ -2302,15 +2308,22 @@ final class TeamClaudeTableView: NSView {
     /// 펼친 행의 동작 버튼(재인증·측정·구독 기록). 펼친 행이 바뀔 때만 다시 만든다.
     private func ensureDetailButtons(index: Int?, availability: [TeamClaudeFableAvailability]) {
         guard let health else { return }
-        let subscription = index.map { health.subscriptionResolutions(now: evaluatedAt)[$0] }
+        let subscription = index.flatMap { health.subscriptionResolution($0, now: evaluatedAt) }
         let target = index.map { health.subscriptionTarget($0) }
         let center = SubscriptionActionCenter.shared
+        // 프록시가 종료를 확정했으면 무장을 푼다(무장한 버튼이 잠긴 계정에서 실행되지 않게).
+        if let subscription, let target, subscription.proxyLocked { SubscriptionActionButtons.disarm(target.target) }
         let armedKinds = target.map { target in
             [SubscriptionActionButtons.Kind.confirmEnd, .clear].filter { SubscriptionActionButtons.isArmed(target.target, $0) }
                 .map(\.rawValue).joined(separator: ",")
         } ?? ""
-        let signature = (index.map { "\($0):\(health.accounts[$0].name):\(isMeasuring)" } ?? "")
-            + ":\(subscription?.state.rawValue ?? "-"):\(subscription?.shown.endDate ?? "-"):\(target.map { center.isBusy($0.target) } ?? false):\(armedKinds)"
+        // 키에 신원(target.key)·잠금이 들어 있어 같은 이름·자리의 계정이 바뀌거나 잠기면 버튼을 새로 만든다.
+        var subscriptionKey = "-"
+        if let subscription, let target {
+            subscriptionKey = SubscriptionActionButtons.cacheKey(target: target.target, resolution: subscription)
+        }
+        let signature = (index.map { "\($0):\(health.accounts[$0].name):\(health.accounts[$0].accountUuid ?? "-"):\(isMeasuring)" } ?? "")
+            + ":\(subscriptionKey):\(target.map { center.isBusy($0.target) } ?? false):\(armedKinds)"
         guard signature != detailSignature else { return }
         detailSignature = signature
         detailButtons.forEach { $0.removeFromSuperview() }
@@ -2322,11 +2335,21 @@ final class TeamClaudeTableView: NSView {
             detailButtons.append(PanelButton(title: L10n.measureNow, style: .ghost) { [weak self] in self?.onMeasure?() })
         }
         if let subscription, let target, target.target.accountUuid?.isEmpty == false {
-            detailButtons += SubscriptionActionButtons.make(target: target.target, resolution: subscription, billingDay: target.billingDay) {
-                [weak self] in
-                self?.detailSignature = ""
-                self?.needsLayout = true
-            }
+            // 누른 시점에 그 행(이름 + 행 uuid)을 다시 찾아 최신 대상·판정으로 판정한다.
+            let rowName = row.name, rowUuid = row.accountUuid
+            detailButtons += SubscriptionActionButtons.make(
+                target: target.target, resolution: subscription, billingDay: target.billingDay,
+                latest: { [weak self] in
+                    guard let self, let health = self.health,
+                          let index = Self.rowIndex(health, name: rowName, accountUuid: rowUuid),
+                          let resolution = health.subscriptionResolution(index, now: Date()) else { return nil }
+                    let current = health.subscriptionTarget(index)
+                    return SubscriptionLatest(target: current.target, resolution: resolution, billingDay: current.billingDay)
+                },
+                onChanged: { [weak self] in
+                    self?.detailSignature = ""
+                    self?.needsLayout = true
+                })
         }
         let subscriptionButton = subscriptionButtons.indices.contains(index) ? subscriptionButtons[index] : nil
         if subscriptionButton?.isEnabled == true {
