@@ -20,6 +20,8 @@ enum OverviewTodoAction: Equatable {
     case reauthenticate
     case subscriptionRecord
     case codexRecover(TeamCodexAccountRecoveryKind)
+    /// 해지 기록이 있는 인증 오류 계정. 그 계정 행을 펼쳐 "종료로 확정"을 한 번 더 누르게 한다.
+    case confirmSubscriptionEnd
 }
 
 struct OverviewTodo: Equatable {

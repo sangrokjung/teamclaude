@@ -776,6 +776,79 @@ enum L10n {
     static var subNextPaymentDate: String { t("다음 결제일", "Next payment date") }
     static var subInvalidDateSave: String { t("날짜를 확인하세요. 실제 존재하는 YYYY-MM-DD 날짜만 저장할 수 있습니다.", "Check the date. Only a real YYYY-MM-DD date can be saved.") }
 
+    // MARK: 구독 상태 보기·처리 (웹랩 시안 B 2차본)
+
+    static var subStateActive: String { t("구독 중", "Active") }
+    static var subStateUnknown: String { t("확인 안 됨", "Unconfirmed") }
+    static var subStateCancelScheduled: String { t("해지 예약", "Cancel scheduled") }
+    static var subStateOverdue: String { t("종료일 지남", "End date passed") }
+    static var subStateEnded: String { t("해지 확정", "Cancel confirmed") }
+    static var subRuleActive: String { t("결제·청구 화면이나 확인 메일로 확인한 기록이 있음", "Confirmed on the billing page or by mail") }
+    static var subRuleUnknown: String { t("기록 없음 · 인증 오류만으로는 해지인지 알 수 없음", "No record · an auth error alone does not mean cancelled") }
+    static var subRuleScheduled: String { t("종료일까지 사용 가능 · 다음 인증 실패 때 종료로 확정", "Usable until the end date · confirmed ended on the next auth failure") }
+    static var subRuleOverdue: String { t("종료일이 지났지만 아직 종료로 확정되지 않음", "End date passed but not confirmed ended yet") }
+    static var subRuleEnded: String { t("순환에서 빠짐 · 재인증 대상 아님", "Out of rotation · not a re-auth target") }
+    static func subEndsOn(_ date: String) -> String { t("\(date) 종료", "ends \(date)") }
+    static var subEndUnknown: String { t("종료일 모름", "end date unknown") }
+    static var subEndUnrecorded: String { t("종료일 미상", "end date not recorded") }
+    static func subDaysLeft(_ days: Int) -> String { t("\(days)일 남음", "\(days)d left") }
+    static var subEndsToday: String { t("오늘 종료", "ends today") }
+    static func subDaysAgo(_ days: Int) -> String { t("\(days)일 지남", "\(days)d ago") }
+    static var subBeforeConfirm: String { t("확정 전", "not confirmed") }
+    static var subNoRecord: String { t("기록 없음", "no record") }
+    static var subEvidenceUser: String { t("사용자 확인", "User confirmed") }
+    static var subEvidenceBilling: String { t("청구 화면", "Billing page") }
+    static var subEvidenceMail: String { t("확인 메일", "Confirmation mail") }
+    static var subEvidenceProxy: String { t("인증 실패 뒤 자동 확정", "Auto-confirmed after auth failure") }
+    static func subRecordedAt(_ stamp: String) -> String { t("\(stamp) 기록", "recorded \(stamp)") }
+    static var subTermState: String { t("구독", "Plan") }
+    static var subTermEvidence: String { t("근거", "Evidence") }
+    static var subTermLocal: String { t("이 맥 기록", "This Mac") }
+    static var subTermProxy: String { t("프록시", "Proxy") }
+    static var subCodexUnconfirmed: String { t("구독 확인 안 됨", "Plan unconfirmed") }
+    static var subCodexEndedGroup: String { t("순환·재인증 제외", "Out of rotation and re-auth") }
+    static var subActionRecordCancel: String { t("해지했다고 기록", "Record cancellation") }
+    static var subActionConfirmEnd: String { t("종료로 확정", "Confirm ended") }
+    static var subActionEditEnd: String { t("종료일 고치기", "Edit end date") }
+    static var subActionClear: String { t("기록 지우기", "Clear record") }
+    static var subActionClearToActive: String { t("기록 지우기 · 구독 중으로", "Clear · back to active") }
+    static var subActionConfirmAgain: String { t("한 번 더 눌러 확정", "Click again to confirm") }
+    static var subActionClearAgain: String { t("한 번 더 눌러 지우기", "Click again to clear") }
+    static var subActionUndo: String { t("되돌리기", "Undo") }
+    static var subFormTitleRecord: String { t("해지했다고 기록", "Record cancellation") }
+    static var subFormTitleEdit: String { t("종료일 고치기", "Edit end date") }
+    static var subFormBody: String {
+        t("종료일까지는 쓸 수 있어요. 종료일 없이 기록하면 다음 인증 실패 때 프록시가 종료로 확정해요. 실제 구독은 바꾸지 않아요.",
+          "The account stays usable until the end date. Without an end date the proxy confirms it ended on the next auth failure. The real plan is not changed.")
+    }
+    static var subFormEndLabel: String { t("종료일", "End date") }
+    static var subFormEvidenceLabel: String { t("근거", "Evidence") }
+    static var subFormEndUnknown: String { t("모름", "Unknown") }
+    static func subFormEndBilling(_ date: String) -> String { t("결제일 \(date)", "Billing day \(date)") }
+    static var subFormEndBillingMissing: String { t("결제일 미입력", "No billing day") }
+    static var subFormEndPick: String { t("날짜 입력", "Enter date") }
+    static var subFormSaveScheduled: String { t("해지 예약으로 기록", "Record as scheduled") }
+    static var subFormConfirmNow: String { t("바로 종료로 확정", "Confirm ended now") }
+    static var subFormConfirmNowAgain: String {
+        t("해지 예약을 건너뛰고 바로 순환에서 빼요. 한 번 더 누르면 확정해요.", "This skips the scheduled state and takes the account out of rotation. Click again to confirm.")
+    }
+    static var subFormPastDate: String { t("지난 날짜라 ‘종료일 지남’으로 기록돼요.", "A past date is recorded as end date passed.") }
+    static var subFormInvalidDate: String { t("날짜를 확인하세요. YYYY-MM-DD 형식의 실제 날짜만 기록할 수 있어요.", "Check the date. Only a real YYYY-MM-DD date can be recorded.") }
+    static func subDoneRecordCancel(_ name: String) -> String { t("\(name) 해지 예약으로 기록함", "\(name) recorded as cancel scheduled") }
+    static func subDoneRecordPast(_ name: String) -> String { t("\(name) 해지 기록 · 종료일 지남", "\(name) recorded · end date passed") }
+    static func subDoneConfirmEnd(_ name: String) -> String { t("\(name) 종료로 확정함", "\(name) confirmed ended") }
+    static func subDoneConfirmNow(_ name: String) -> String { t("\(name) 바로 종료로 확정함", "\(name) confirmed ended now") }
+    static func subDoneEditEnd(_ name: String) -> String { t("\(name) 종료일 바꿈", "\(name) end date changed") }
+    static func subDoneClear(_ name: String) -> String { t("\(name) 해지 기록 지움", "\(name) cancellation record cleared") }
+    static func subDoneUndo(_ name: String) -> String { t("\(name) 처리 되돌림", "\(name) change undone") }
+    static var subRestartNeeded: String { t("프록시 재시작 뒤 반영", "applies after a proxy restart") }
+    static func subFailed(_ name: String, _ reason: String) -> String { t("\(name) 처리 실패 · \(reason)", "\(name) failed · \(reason)") }
+    static var subFailedUnknown: String { t("teamcodex 명령이 실패했습니다", "the teamcodex command failed") }
+    static var subFailedTimeout: String { t("teamcodex 명령이 응답하지 않았습니다", "the teamcodex command timed out") }
+    static var subFailedIdentity: String { t("계정 신원을 확인할 수 없어 실행하지 않았습니다", "account identity unconfirmed, nothing was run") }
+    static var subTodoReasonCancelled: String { t("해지 기록됨 · 재인증 대신 종료로 확정", "Cancellation recorded · confirm ended instead of re-auth") }
+    static var subTodoReauthHint: String { t("다시 로그인해도 안 풀리면 해지 기록", "If re-login doesn't fix it, record a cancellation") }
+
     // MARK: 빈 값 어휘
 
     static var notInstalled: String { t("미설치", "Not installed") }

@@ -3115,6 +3115,24 @@ final class StatusMenuDashboardView: NSView {
         }
     }
 
+    /// 손볼 것의 "종료로 확정": 그 계정 행을 펼치고 확정 버튼을 무장시킨다(한 번 더 누르면 확정).
+    func openSubscriptionConfirm(provider: String, name: String) {
+        if provider == "codex" {
+            selectTab(.codex)
+            guard let view = codexView, let document = tabDocuments[.codex] else { return }
+            view.expandedAccount = name
+            relayoutCodexTab()
+            view.armConfirmEnd(name)
+            view.layoutSubtreeIfNeeded()
+            if let rowRect = view.rowRect(named: name) {
+                restoreBodyScroll(NSPoint(x: 0, y: view.convert(rowRect, to: document).minY - 40))
+            }
+            return
+        }
+        openAccount(name)
+        teamClaudeView?.armConfirmEnd(name)
+    }
+
     private func runTodo(_ todo: OverviewTodo, onReauthenticate: ((String, String?) -> Void)?,
                          onRecover: ((String, String?, TeamCodexAccountRecoveryKind) -> Void)?) {
         switch todo.action {
@@ -3123,6 +3141,7 @@ final class StatusMenuDashboardView: NSView {
         case .subscriptionRecord:
             AccountSubscriptionButton(provider: todo.provider, accountUuid: todo.accountUuid, accountName: todo.name).openRecordDialog()
         case .codexRecover(let kind): onRecover?(todo.name, todo.accountUuid, kind)
+        case .confirmSubscriptionEnd: openSubscriptionConfirm(provider: todo.provider, name: todo.name)
         }
     }
 
