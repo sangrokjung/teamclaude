@@ -156,12 +156,13 @@ func subscriptionShortDate(_ date: String) -> String {
     return "\(month)/\(day)"
 }
 
-func subscriptionEvidenceLabel(_ source: String?) -> String? {
+/// 근거 라벨. 프록시 기록은 해지 확정이면 "인증 실패 뒤 자동 확정"(프록시가 확정하는 유일한 길), 아니면 "프록시 기록".
+func subscriptionEvidenceLabel(_ source: String?, state: SubscriptionDisplayState? = nil) -> String? {
     switch source {
     case "user-confirmed": return L10n.subEvidenceUser
     case "billing-page": return L10n.subEvidenceBilling
     case "confirmation-email": return L10n.subEvidenceMail
-    case "proxy-record": return L10n.subEvidenceProxy
+    case "proxy-record": return state == .ended ? L10n.subEvidenceProxy : L10n.subEvidenceProxyRecord
     default: return nil
     }
 }
@@ -185,7 +186,7 @@ func subscriptionRowLine(_ view: SubscriptionRecordView, now: Date) -> String? {
         return "\(L10n.subStateOverdue) · \(L10n.subEndsOn(subscriptionShortDate(end))) · \(L10n.subBeforeConfirm)"
     case .ended:
         let end = view.endDate.map { L10n.subEndsOn(subscriptionShortDate($0)) } ?? L10n.subEndUnrecorded
-        let evidence = subscriptionEvidenceLabel(view.source).map { " · \($0)" } ?? ""
+        let evidence = subscriptionEvidenceLabel(view.source, state: view.state).map { " · \($0)" } ?? ""
         return "\(L10n.subStateEnded) · \(end)\(evidence)"
     case .active, .unknown:
         return nil
@@ -208,7 +209,7 @@ func subscriptionStateDetail(_ view: SubscriptionRecordView, now: Date) -> Strin
 
 /// 펼친 행의 "근거" 값: "사용자 확인 · 10/28 14:00 기록". 기록이 없으면 nil.
 func subscriptionEvidenceLine(_ view: SubscriptionRecordView) -> String? {
-    guard let evidence = subscriptionEvidenceLabel(view.source) else { return nil }
+    guard let evidence = subscriptionEvidenceLabel(view.source, state: view.state) else { return nil }
     guard let at = view.recordedAt else { return evidence }
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")

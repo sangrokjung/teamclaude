@@ -47,7 +47,11 @@ struct AccountSubscriptionLayoutTests {
         precondition(buttons.count == 16 && recovery.count == 11)
         for (index, row) in rows.enumerated() {
             let hasRecovery = recovery.contains { $0.accessibilityLabel() == "재인증 필요: \(row.name)" }
-            precondition(hasRecovery == (index % states.count != 3 && index % states.count != 5))
+            let hasConfirmEnd = recovery.contains { $0.accessibilityLabel() == "종료로 확정: \(row.name)" }
+            // 해지 예약 + 인증 오류는 재인증으로 풀리지 않는다. 그 자리는 "종료로 확정"이다(시안 B 2차본).
+            let kind = index % states.count
+            precondition(hasRecovery == (kind != 3 && kind != 5 && kind != 2))
+            precondition(hasConfirmEnd == (kind == 2))
         }
         func isGray(_ color: NSColor) -> Bool {
             let rgb = color.usingColorSpace(.deviceRGB)!

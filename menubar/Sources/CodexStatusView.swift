@@ -632,11 +632,11 @@ final class CodexStatusView: NSView {
         let nameWidth = PanelDraw.text(PanelDraw.clipped(account.name, TeamClaudePalette.nameFont, maxWidth: poolRect.width * 0.4),
                                        poolRect.minX + 15, rowY + 7, TeamClaudePalette.nameFont, fg2)
         let right = "\(L10n.subscriptionRecord) \(isExpanded ? "⌃" : "⌄")"
-        let rightWidth = PanelDraw.right(right, poolRect.maxX, rowY + 8, micro, fg3)
+        let rightX = PanelDraw.right(right, poolRect.maxX, rowY + 8, micro, fg3)
         let summaryX = poolRect.minX + 15 + nameWidth + 10
         let summary = (subscriptionRowLine(subscription.shown, now: now) ?? "")
             .replacingOccurrences(of: SubscriptionDisplayState.ended.label + " · ", with: "")
-        PanelDraw.text(PanelDraw.clipped(summary, micro, maxWidth: poolRect.maxX - rightWidth - 12 - summaryX), summaryX, rowY + 8, micro, fg3)
+        PanelDraw.text(PanelDraw.clipped(summary, micro, maxWidth: rightX - 12 - summaryX), summaryX, rowY + 8, micro, fg3)
         expandHitRects.append((account.name, rowRect))
         if isExpanded {
             drawSubscriptionDetail(subscription, top: rowY + Self.endedRowHeight, poolRect: poolRect, now: now)

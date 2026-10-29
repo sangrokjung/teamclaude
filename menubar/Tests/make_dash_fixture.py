@@ -119,6 +119,9 @@ def build():
             return int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1)) * 1000)
 
         by_name = {a["name"]: a for a in accounts}
+        # 처리 버튼은 신원이 확인된 행에만 붙는다. 사례 계정에 가짜 uuid를 준다.
+        for name in ("acct-09", "acct-11", "acct-13", "acct-15", "acct-01"):
+            by_name[name]["accountUuid"] = f"{name}-uuid"
         by_name["acct-09"]["subscription"] = {"state": "cancellation-scheduled", "endsAt": local_midnight_after(15),
                                               "recordedAt": now_ms - 2 * DAY_MS}
         # 해지 기록 + 인증 오류: 재인증 대신 종료로 확정.
