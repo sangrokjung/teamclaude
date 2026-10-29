@@ -133,6 +133,14 @@ enum SubscriptionActionButtons {
         return (latest, nil)
     }
 
+    /// 되돌리기 시점 검사. 같은 계정(uuid)이 아니거나 프록시가 종료를 확정했으면 되돌리지 않는다. 버튼 종류는 보지 않는다.
+    static func verifyUndo(captured: SubscriptionTarget, latest: SubscriptionLatest?) -> String? {
+        guard let latest, latest.target.key == captured.key, latest.target.accountUuid == captured.accountUuid else {
+            return L10n.subFailedAccountChanged
+        }
+        return latest.resolution.proxyLocked ? L10n.subFailedProxyLocked : nil
+    }
+
     /// 버튼을 만든다. latest는 누른 시점에 그 행의 최신 대상·판정을 다시 조회한다. onChanged는 무장 상태가 바뀌어 제목을 다시 그려야 할 때 부른다.
     static func make(target: SubscriptionTarget, resolution: SubscriptionResolution, billingDay: String?,
                      center: SubscriptionActionCenter = .shared, now: Date = Date(),
@@ -165,9 +173,9 @@ enum SubscriptionActionButtons {
         // 실행 직전(대화상자를 닫은 뒤에도) 그 계정의 최신 상태를 다시 본다.
         func runChecked(_ command: SubscriptionCommand) {
             guard let current = checked() else { return }
-            center.run(command, target: current.target, current: current.resolution) {
-                verify(kind, captured: target, latest: latest()).reason
-            }
+            center.run(command, target: current.target, current: current.resolution,
+                       verify: { verify(kind, captured: target, latest: latest()).reason },
+                       undoVerify: { verifyUndo(captured: target, latest: latest()) })
         }
         switch kind {
         case .record, .editEnd:
@@ -195,8 +203,8 @@ enum SubscriptionActionButtons {
 extension SubscriptionActionCenter {
     /// 화면에서 부르는 진입점. 결과는 onOutcome(하단 막대)으로 간다. verify는 저장·실행 바로 앞에서 다시 부른다.
     func run(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
-             verify: (() -> String?)? = nil) {
-        perform(command, target: target, current: current, verify: verify) { [weak self] outcome in self?.onOutcome?(outcome) }
+             verify: (() -> String?)? = nil, undoVerify: (() -> String?)? = nil) {
+        perform(command, target: target, current: current, verify: verify, undoVerify: undoVerify) { [weak self] outcome in self?.onOutcome?(outcome) }
     }
 }
 

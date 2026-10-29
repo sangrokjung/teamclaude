@@ -430,6 +430,36 @@ struct SubscriptionStateTests {
         precondition(outcomes.count == 5 && outcomes[4].succeeded == true && ran == 1)
         precondition(store.localConfirmation(provider: "codex", uuid: "uuid-u1")?.state == .ended)
 
+        // (다) 처리 성공 뒤 프록시가 종료를 확정하면 하단 되돌리기도 실패하고 기록·CLI를 건드리지 않는다.
+        let undo = outcomes[4].undo!
+        let lockedEnd = SubscriptionResolution(shown: SubscriptionRecordView(state: .ended), proxyLocked: true)
+        latest = SubscriptionLatest(target: u1, resolution: lockedEnd, billingDay: nil)
+        var undone: SubscriptionOutcome?
+        precondition(center.undo(undo) { undone = $0 })
+        precondition(undone?.succeeded == false && ran == 1, "\(String(describing: undone))")
+        precondition(undone?.message == "codex-01 처리 실패 · 프록시가 구독 종료로 확정해 이 맥에서 되돌릴 수 없습니다")
+        precondition(store.localConfirmation(provider: "codex", uuid: "uuid-u1")?.state == .ended)
+        // 계정이 U2로 바뀌어도 되돌리지 않는다.
+        latest = SubscriptionLatest(target: u2, resolution: scheduled, billingDay: nil)
+        precondition(center.undo(undo) { undone = $0 })
+        precondition(undone?.succeeded == false && undone?.message == "codex-01 처리 실패 · 계정이 바뀌어 실행하지 않았습니다" && ran == 1)
+        // CLI가 도는 사이 잠기면 "설정만 되돌림"으로 알리고 성공으로 보이지 않는다.
+        latest = SubscriptionLatest(target: u1, resolution: scheduled, billingDay: nil)
+        var lockDuringRun = false
+        let racing = SubscriptionActionCenter(store: store) { _, completion in
+            lockDuringRun = true
+            completion(SubscriptionCLIResult(status: 0, output: ""))
+        }
+        let raceUndo = SubscriptionUndo(target: u1, previousRecord: nil, restoreArguments: ["codex", "subscription", "clear"],
+                                        verify: { lockDuringRun ? L10n.subFailedProxyLocked : nil })
+        precondition(racing.undo(raceUndo) { undone = $0 })
+        precondition(undone?.succeeded == false && undone?.undo == nil)
+        precondition(undone?.message == "codex-01 설정만 되돌림 · 프록시가 구독 종료로 확정해 이 맥에서 되돌릴 수 없습니다")
+        // 잠기지 않았으면 그대로 되돌린다.
+        precondition(store.saveCodexConfirmation(.ended, date: nil, uuid: "uuid-u1"))
+        precondition(center.undo(undo) { undone = $0 })
+        precondition(undone?.succeeded == true && ran == 2)
+
         // 상세 버튼 캐시 키: 잠금·신원이 바뀌면 달라진다.
         let k1 = SubscriptionActionButtons.cacheKey(target: t1, resolution: open)
         precondition(k1 != SubscriptionActionButtons.cacheKey(target: t1, resolution: locked))

@@ -39,6 +39,8 @@ struct SubscriptionUndo {
     let previousRecord: [String: Any]?
     /// Codex만: 직전 설정 상태로 돌리는 CLI 인자.
     let restoreArguments: [String]?
+    /// 되돌리기 직전(그리고 Codex CLI 완료 뒤) 그 계정이 아직 같은 계정인지·프록시가 잠그지 않았는지 다시 본다. nil이면 통과.
+    var verify: (() -> String?)? = nil
 }
 
 struct SubscriptionOutcome {
@@ -177,7 +179,7 @@ final class SubscriptionActionCenter {
     /// 처리를 시작한다. 잠긴 계정이면 아무것도 하지 않고 false. completion은 메인 스레드에서 한 번 불린다.
     @discardableResult
     func perform(_ command: SubscriptionCommand, target: SubscriptionTarget, current: SubscriptionResolution,
-                 now: Date = Date(), verify: (() -> String?)? = nil,
+                 now: Date = Date(), verify: (() -> String?)? = nil, undoVerify: (() -> String?)? = nil,
                  completion: @escaping (SubscriptionOutcome) -> Void) -> Bool {
         guard !isBusy(target) else { return false }
         // 화면이 주는 마지막 확인(그 계정이 아직 그 계정인지·잠기지 않았는지). 실패하면 아무것도 바꾸지 않는다.
@@ -205,7 +207,7 @@ final class SubscriptionActionCenter {
             let saved = save(local, target: target)
             completion(saved
                 ? SubscriptionOutcome(succeeded: true, message: done,
-                                      undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: nil))
+                                      undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: nil, verify: undoVerify))
                 : SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, L10n.subFormInvalidDate)))
             onChange?()
             return true
@@ -231,7 +233,7 @@ final class SubscriptionActionCenter {
             let restart = teamCodexSubscriptionNeedsRestart(result.output)
             completion(SubscriptionOutcome(succeeded: true, message: restart ? "\(done) · \(L10n.subRestartNeeded)" : done,
                                            restartNeeded: restart,
-                                           undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: restore)))
+                                           undo: SubscriptionUndo(target: target, previousRecord: previous, restoreArguments: restore, verify: undoVerify)))
         }
         return true
     }
@@ -242,6 +244,11 @@ final class SubscriptionActionCenter {
         let target = undo.target
         guard !isBusy(target), let uuid = target.accountUuid else { return false }
         let done = L10n.subDoneUndo(target.name)
+        // 처리 뒤 프록시가 종료를 확정했거나 행이 다른 계정으로 바뀌었으면 아무것도 바꾸지 않고 실패로 알린다.
+        if let reason = undo.verify?() {
+            completion(SubscriptionOutcome(succeeded: false, message: L10n.subFailed(target.name, reason)))
+            return true
+        }
         guard let arguments = undo.restoreArguments else {
             store.restoreConfirmationRecord(undo.previousRecord, provider: target.provider, uuid: uuid)
             completion(SubscriptionOutcome(succeeded: true, message: done))
@@ -259,6 +266,11 @@ final class SubscriptionActionCenter {
                 return
             }
             self.store.restoreConfirmationRecord(undo.previousRecord, provider: target.provider, uuid: uuid)
+            // CLI가 도는 사이 프록시가 종료를 확정했으면, 설정은 되돌렸지만 화면은 여전히 해지 확정이다. 성공으로 보이지 않게 알린다.
+            if let reason = undo.verify?() {
+                completion(SubscriptionOutcome(succeeded: false, message: "\(L10n.subUndoConfigOnly(target.name)) · \(reason)"))
+                return
+            }
             let restart = teamCodexSubscriptionNeedsRestart(result.output)
             completion(SubscriptionOutcome(succeeded: true, message: restart ? "\(done) · \(L10n.subRestartNeeded)" : done,
                                            restartNeeded: restart))

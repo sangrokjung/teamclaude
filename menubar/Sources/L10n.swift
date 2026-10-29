@@ -842,6 +842,7 @@ enum L10n {
     static func subDoneEditEnd(_ name: String) -> String { t("\(name) 종료일 바꿈", "\(name) end date changed") }
     static func subDoneClear(_ name: String) -> String { t("\(name) 해지 기록 지움", "\(name) cancellation record cleared") }
     static func subDoneUndo(_ name: String) -> String { t("\(name) 처리 되돌림", "\(name) change undone") }
+    static func subUndoConfigOnly(_ name: String) -> String { t("\(name) 설정만 되돌림", "\(name) config restored only") }
     static var subRestartNeeded: String { t("프록시 재시작 뒤 반영", "applies after a proxy restart") }
     static func subFailed(_ name: String, _ reason: String) -> String { t("\(name) 처리 실패 · \(reason)", "\(name) failed · \(reason)") }
     static var subFailedUnknown: String { t("teamcodex 명령이 실패했습니다", "the teamcodex command failed") }
