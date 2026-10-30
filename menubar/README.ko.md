@@ -9,7 +9,7 @@ TeamClaude·TeamCodex의 macOS 메뉴바와 클릭 사용량 패널입니다.
 서버·TUI와 함께 이 저장소에서 관리합니다. 별도 데스크톱 앱은 필요하지 않습니다.
 Swift/AppKit 네이티브 실행 파일이며 Electron, Tauri, React, npm 런타임 패키지를 사용하지 않습니다.
 
-**다운로드(베타):** [CC Menubar 0.1.0-beta.3](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.3) · Apple Silicon·Intel 유니버설 · macOS 13 이상. 설치는 [외부 사용자 설치](#외부-사용자-설치)를 보세요.
+**다운로드(베타):** [CC Menubar 0.1.0-beta.4](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.4) · Apple Silicon·Intel 유니버설 · macOS 13 이상. 설치는 [외부 사용자 설치](#외부-사용자-설치)를 보세요.
 
 <p align="center">
   <img src="../docs/assets/menubar-panel-ko.png" alt="CC Menubar 개요 탭" width="49%">
