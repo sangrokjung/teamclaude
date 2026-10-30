@@ -128,7 +128,7 @@ BYOK 표면도, Codex 리셋 크레딧도, 계정 재인증도, 401 캐스케이
 Grok·Antigravity·Higgsfield·ccusage 사용량이 한 패널에 열립니다. 쓰지 않는 도구는 "미설치"로 보입니다.
 소스와 설치 방법은 [menubar/README.ko.md](menubar/README.ko.md)를 참고하세요.
 
-**다운로드(베타):** [CC Menubar 0.1.0-beta.3](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.3) · Apple Silicon·Intel 유니버설 · macOS 13 이상
+**다운로드(베타):** [CC Menubar 0.1.0-beta.4](https://github.com/sangrokjung/teamclaude/releases/tag/menubar-v0.1.0-beta.4) · Apple Silicon·Intel 유니버설 · macOS 13 이상
 
 <p align="center">
   <img src="docs/assets/menubar-panel-ko.png" alt="CC Menubar 개요 탭: Claude 계정 17개 중 12개 라우팅 가능, 레인, 주간 사용량 띠, 손볼 것" width="49%">
