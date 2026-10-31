@@ -32,6 +32,8 @@ struct DashboardOverviewBuilderTests {
         testMissingSources(input)
         testWaitingSortedByReturn(fixture: fixture, input: input, now: now)
         testProjectionOnlyForFastAccounts(fixture: fixture, input: input, now: now)
+        testWeeklyOnlyAccount(fixture: fixture, input: input, now: now)
+        testWeeklyOnlyRetryAfter(now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -188,5 +190,113 @@ struct DashboardOverviewBuilderTests {
         precondition(abs(projection.hitsLimitInSeconds - (0.98 / 3.4 - 0.2) * 5 * 3_600) < 120, "\(projection.hitsLimitInSeconds)")
         precondition(projection.earlierBySeconds > 3 * 3_600)
         precondition(model.live.last?.name == "acct-01", "lowest session last: \(model.live.map(\.name))")
+    }
+
+    /// 5시간 창이 없는 계정(검증된 Ultra, spec A6). 프록시가 quota.sessionWindowStated=false를 준다.
+    /// 세션 칸은 "없음", 가용·손볼 것·대기는 주간 창만으로, 세션 속도 경고는 없다.
+    static func weeklyOnlyStatus(_ fixture: [String: Any], name: String = "acct-01",
+                                 edit: (inout [String: Any]) -> Void) -> [String: Any] {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]],
+              let index = accounts.firstIndex(where: { $0["name"] as? String == name }),
+              var quota = accounts[index]["quota"] as? [String: Any] else {
+            preconditionFailure("fixture must carry \(name)")
+        }
+        quota.removeValue(forKey: "unified5h")
+        quota.removeValue(forKey: "unified5hReset")
+        quota["sessionWindowStated"] = false
+        edit(&quota)
+        accounts[index]["quota"] = quota
+        status["accounts"] = accounts
+        return status
+    }
+
+    static func testWeeklyOnlyAccount(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        // 1. 주간 34%만 있는 계정: 사용 가능, 측정 문제 없음, 세션 값 없음.
+        let status = weeklyOnlyStatus(fixture) { _ in }
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let row = health.accounts.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01") }
+        precondition(row.sessionWindowAbsent && row.sessionPercent == nil && row.sessionResetSeconds == nil && row.sessionResetAt == nil)
+        precondition(row.isUsable, "weekly-only account at 34% is usable")
+        precondition(row.measurementIssue == nil, "no 5h window is not a measurement issue: \(String(describing: row.measurementIssue))")
+        precondition(health.accounts.filter { $0.name != "acct-01" }.allSatisfy { !$0.sessionWindowAbsent }, "other rows keep the session window")
+
+        let model = rebuilt(status, input: input, now: now)
+        precondition(model.routable == 12, "weekly-only account still routes: \(model.routable)")
+        guard let live = model.live.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01 must be live: \(model.live.map(\.name))") }
+        precondition(live.sessionWindowAbsent && live.sessionPercent == nil && live.projection == nil, "no session pace warning")
+        precondition(live.sessionResetClock == nil && live.sessionRemainingSeconds == nil)
+        precondition(live.weekly.percent != nil && abs((live.weekly.percent ?? 0) - 34) < 0.01, "\(String(describing: live.weekly.percent))")
+        precondition(!model.todos.contains { $0.name == "acct-01" } && !model.waiting.contains { $0.name == "acct-01" })
+        precondition(model.live.filter { $0.name != "acct-01" }.allSatisfy { !$0.sessionWindowAbsent })
+
+        // 2. 합치기(이전 응답과 병합)를 거쳐도 라우팅 측정은 현재 것이고 플래그가 남는다.
+        let merged = teamClaudeHealthMergingQuota(candidate: health, previous: nil)
+        guard let mergedRow = merged.accounts.first(where: { $0.name == "acct-01" }) else { preconditionFailure("merged acct-01") }
+        precondition(mergedRow.sessionWindowAbsent && mergedRow.isUsable && mergedRow.measurementIssue == nil)
+        precondition(mergedRow.routingMeasurementCurrent == true, "a weekly-only row must not fall back to measurement-stale")
+        precondition(mergedRow.fableMeasurementCurrent, "Fable lane is current without a session window too")
+        let retained = teamClaudeRetainingQuota(candidate: health, previous: merged)
+        precondition(retained.accounts.first(where: { $0.name == "acct-01" })?.sessionWindowAbsent == true, "offline retention keeps the flag")
+
+        // 3. 주간 99%: 사용 가능이 아니라 주간 가득으로 기다린다.
+        let full = rebuilt(weeklyOnlyStatus(fixture) { $0["unified7d"] = 0.99 }, input: input, now: now)
+        precondition(full.routable == 11, "weekly-full weekly-only account is not routable: \(full.routable)")
+        guard let waiting = full.waiting.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01 must wait: \(full.waiting.map(\.name))") }
+        precondition(waiting.cause == .weekly && (waiting.returnSeconds ?? 0) > 5 * 86_400, "\(waiting.cause)")
+        let fullHealth = parseTeamClaudeHealth(config: nil, server: nil, status: weeklyOnlyStatus(fixture) { $0["unified7d"] = 0.99 },
+                                               port: 3456, now: now)
+        precondition(fullHealth.accounts.first(where: { $0.name == "acct-01" })?.isUsable == false)
+
+        // 4. 플래그 false인데 남은 5시간 값(99%)이 실려 와도 무시한다(세션 가득으로 막지 않는다).
+        let lingering = weeklyOnlyStatus(fixture) {
+            $0["unified5h"] = 0.99
+            $0["unified5hReset"] = Int64(now.timeIntervalSince1970 * 1000) + 3_600_000
+        }
+        let lingeringModel = rebuilt(lingering, input: input, now: now)
+        precondition(lingeringModel.live.first(where: { $0.name == "acct-01" })?.sessionWindowAbsent == true,
+                     "lingering 5h value must not block a weekly-only account: \(lingeringModel.waiting.map(\.name))")
+
+        // 5. 검증 해제·롤백: 5시간 헤더가 돌아와 플래그가 true면 세션 막대가 다시 나온다.
+        let back = weeklyOnlyStatus(fixture) {
+            $0["sessionWindowStated"] = true
+            $0["unified5h"] = 0.24
+            $0["unified5hReset"] = Int64(now.timeIntervalSince1970 * 1000) + 4 * 3_600_000
+        }
+        let backHealth = parseTeamClaudeHealth(config: nil, server: nil, status: back, port: 3456, now: now)
+        guard let backRow = backHealth.accounts.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01") }
+        precondition(!backRow.sessionWindowAbsent && abs((backRow.sessionPercent ?? 0) - 24) < 0.01)
+
+        // 6. 구버전 프록시(필드 없음)·문자열 "false": 지금 동작 그대로(세션 누락은 측정 필요).
+        for value in [nil, "false" as Any] {
+            let old = weeklyOnlyStatus(fixture) {
+                if let value { $0["sessionWindowStated"] = value } else { $0.removeValue(forKey: "sessionWindowStated") }
+            }
+            let oldHealth = parseTeamClaudeHealth(config: nil, server: nil, status: old, port: 3456, now: now)
+            guard let oldRow = oldHealth.accounts.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01") }
+            precondition(!oldRow.sessionWindowAbsent && !oldRow.isUsable && oldRow.measurementIssue == .sessionMissing,
+                         "\(String(describing: value)): \(String(describing: oldRow.measurementIssue))")
+        }
+    }
+
+    /// 재시도 시각(전원 막힘일 때 복귀까지 초)은 플래그 false 계정의 남은 5시간 값을 쓰지 않는다.
+    static func testWeeklyOnlyRetryAfter(now: Date) {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        func account(_ flag: Any?) -> [String: Any] {
+            var quota: [String: Any] = ["unified5h": 0.99, "unified5hReset": nowMs + 3_600_000,
+                                        "unified7d": 0.4, "unified7dReset": nowMs + 6 * 86_400_000]
+            if let flag { quota["sessionWindowStated"] = flag }
+            return ["name": "ultra-1", "enabled": true, "status": "active", "quota": quota]
+        }
+        let normal = computeTeamClaudeRetryAfterSeconds(accounts: [account(nil)], threshold: 0.98, nowMs: nowMs)
+        precondition(normal != nil && abs((normal ?? 0) - 3_600) <= 1, "a normal 5h-full account waits for the 5h reset: \(String(describing: normal))")
+        let absent = computeTeamClaudeRetryAfterSeconds(accounts: [account(false)], threshold: 0.98, nowMs: nowMs)
+        precondition(absent == nil, "a weekly-only account is not blocked by a lingering 5h value: \(String(describing: absent))")
+        var weeklyFull = account(false)
+        var quota = weeklyFull["quota"] as! [String: Any]
+        quota["unified7d"] = 0.99
+        weeklyFull["quota"] = quota
+        let weekly = computeTeamClaudeRetryAfterSeconds(accounts: [weeklyFull], threshold: 0.98, nowMs: nowMs)
+        precondition(weekly != nil && abs((weekly ?? 0) - 6 * 86_400) <= 1, "weekly-full waits for the weekly reset: \(String(describing: weekly))")
     }
 }

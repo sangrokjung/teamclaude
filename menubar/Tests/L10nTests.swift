@@ -40,6 +40,10 @@ struct L10nTests {
         precondition(L10n.moreInClaudeTab(3) == "외 3개 · Claude 탭에서 전부")
         precondition(L10n.durationAhead("2시간 20분") == "2시간 20분 뒤" && L10n.resetAtClock("오후 11:13") == "오후 11:13 리셋")
         precondition(L10n.notInstalled == "미설치")
+        precondition(L10n.sessionNone == "5시간 한도 없음" && L10n.sessionNoneShort == "없음")
+        L10n.language = .en
+        precondition(L10n.sessionNone == "No 5-hour limit" && L10n.sessionNoneShort == "None")
+        L10n.language = .ko
 
         // 시간 길이: 큰 단위 두 개만.
         precondition(L10n.duration(seconds: 2 * 3600 + 13 * 60) == "2시간 13분")

@@ -73,6 +73,21 @@ struct TeamClaudeRowLinesTests {
         precondition(teamClaudeCardBaseHeight(hostLine: true) == 176, "the host line adds exactly its own height")
         precondition(teamClaudeCardBaseHeight(hostLine: false) < 256, "stage 2 removed the four stat tiles, so the base must shrink")
 
+        // 6. 5시간 창이 없는 계정의 세션 칸 — 측정 문제 어휘 대신 "없음", 리셋 줄도 "세션 없음".
+        L10n.language = .ko
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: true, quotaBlocked: false, attempted: true) == "없음")
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: false, quotaBlocked: false, attempted: false) == L10n.sessionNoneShort)
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: false, stale: false, quotaBlocked: false, attempted: false) == StatusVocabulary.notMeasured)
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: false, stale: false, quotaBlocked: false, attempted: true) == StatusVocabulary.needsCheck)
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: false, stale: true, quotaBlocked: false, attempted: true) == L10n.remeasure)
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: false, stale: true, quotaBlocked: true, attempted: true) == L10n.quotaReset)
+        precondition(teamClaudeSessionResetPart(sessionWindowAbsent: true, resetLabel: "3시간 뒤") == "세션 없음")
+        precondition(teamClaudeSessionResetPart(sessionWindowAbsent: false, resetLabel: "3시간 뒤") == "세션 3시간 뒤")
+        L10n.language = .en
+        precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: false, quotaBlocked: false, attempted: true) == "None")
+        precondition(teamClaudeSessionResetPart(sessionWindowAbsent: true, resetLabel: "3h") == "Session None")
+        L10n.language = .ko
+
         print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns and card metrics passed")
     }
 }
