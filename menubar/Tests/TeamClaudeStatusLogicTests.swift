@@ -176,6 +176,38 @@ struct TeamClaudeStatusLogicTests {
         precondition(!teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 20, fablePercent: 30, thresholdPercent: 98))
         precondition(!teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: 10, weeklyPercent: 98, fablePercent: 30, thresholdPercent: 98))
 
+        // 5시간 창이 없는 계정(검증된 Ultra, 2026-10-31 spec A6): 가용은 주간만으로, 세션 누락은 측정 문제가 아니다.
+        precondition(teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 40, fablePercent: 10,
+                                               thresholdPercent: 98, sessionWindowAbsent: true), "weekly-only account routes on its weekly window")
+        precondition(!teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 99, fablePercent: 10,
+                                                thresholdPercent: 98, sessionWindowAbsent: true), "weekly-only account at 99% is full, not usable")
+        precondition(!teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: nil, fablePercent: 10,
+                                                thresholdPercent: 98, sessionWindowAbsent: true), "weekly still has to be measured")
+        precondition(!teamClaudeAccountIsUsable(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 40, fablePercent: 10,
+                                                thresholdPercent: 98, sessionWindowAbsent: false), "a missing session still blocks a normal account")
+        precondition(teamClaudeMeasurementIssue(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 40, fablePercent: 10,
+                                                lastUsed: now.addingTimeInterval(-6 * 60 * 60), now: now, sessionWindowAbsent: true) == nil,
+                     "no session window is not a missing or stale session")
+        precondition(teamClaudeMeasurementIssue(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 40, fablePercent: nil,
+                                                lastUsed: now, now: now, sessionWindowAbsent: true) == .fableMissing)
+        precondition(teamClaudeMeasurementIssue(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: nil, fablePercent: 10,
+                                                lastUsed: now, now: now, sessionWindowAbsent: true) == .weeklyMissing)
+        precondition(teamClaudeMeasurementIssue(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 99, fablePercent: 10,
+                                                lastUsed: now, now: now, sessionWindowAbsent: true) == .quotaBlocked)
+        precondition(teamClaudeMeasurementIssue(enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 40, fablePercent: 10,
+                                                lastUsed: now, now: now) == .sessionMissing, "default keeps the current behavior")
+        // 상태 응답 플래그 해석: JSON 불 false만 "5시간 창 없음"이다. 필드 없음·null·true·문자열·숫자는 지금 동작(있음).
+        func quota(_ json: String) -> [String: Any]? {
+            (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+        }
+        precondition(teamClaudeSessionWindowAbsent(quota(#"{"sessionWindowStated": false}"#)))
+        precondition(!teamClaudeSessionWindowAbsent(quota(#"{"sessionWindowStated": true}"#)))
+        precondition(!teamClaudeSessionWindowAbsent(quota(#"{"sessionWindowStated": null}"#)))
+        precondition(!teamClaudeSessionWindowAbsent(quota(#"{"unified7d": 0.4}"#)), "an older proxy without the field")
+        precondition(!teamClaudeSessionWindowAbsent(quota(#"{"sessionWindowStated": "false"}"#)), "a string is not the flag")
+        precondition(!teamClaudeSessionWindowAbsent(quota(#"{"sessionWindowStated": 0}"#)), "a number is not the flag")
+        precondition(!teamClaudeSessionWindowAbsent(nil))
+
         precondition(teamClaudeMeasurementIssue(
             enabled: true, status: "active", sessionPercent: nil, weeklyPercent: 20,
             fablePercent: 30, lastUsed: now.addingTimeInterval(-6 * 60 * 60), now: now

@@ -76,6 +76,8 @@ struct OverviewLiveAccount: Equatable {
     let weekly: OverviewMiniWindow
     let fable: OverviewMiniWindow
     let projection: OverviewSessionProjection?
+    /// 5시간 창이 없는 계정(검증된 Ultra). 세션 큰 숫자·막대 자리에 "5시간 한도 없음"을 쓴다(세션 값·전망은 비어 있다).
+    var sessionWindowAbsent = false
 }
 
 /// 기다리는 이유. 판정의 blockedWindows로 나눈다(overviewWaitCause).
@@ -667,19 +669,26 @@ final class OverviewTabView: NSView {
         }
         // 세션 퍼센트(큰 숫자)
         let percentRight = right - timeColumn - 8
-        let full = (account.sessionPercent ?? 0) >= panelRoutingThresholdPercent
-        let signLeft = PanelDraw.right("%", percentRight, top + 13, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
-        let value = account.sessionPercent.map { "\(panelPercentNumber($0))" } ?? StatusVocabulary.none
-        let valueLeft = PanelDraw.right(value, signLeft - 1, top + 9, TeamClaudePalette.sessionValueFont,
-                                        full ? TeamClaudePalette.amber : TeamClaudePalette.fg)
-        // 세션 막대(크게) — 안의 세로 눈금이 5시간 창이 지난 비율이다.
         let labelX = rect.minX + m.columnX
         let labelWidth = windowLabelWidth
         PanelDraw.text(L10n.sessionShort, labelX, top + 12, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
-        let barX = labelX + labelWidth
-        let barWidth = max(24, valueLeft - 10 - barX)
-        PanelDraw.meter(NSRect(x: barX, y: top + 15, width: barWidth, height: 8), percent: account.sessionPercent,
-                        elapsed: account.sessionElapsed)
+        if account.sessionWindowAbsent {
+            // 5시간 창이 없는 계정: 큰 숫자·막대 대신 문구 한 줄. 막대가 없으니 측정 누락처럼 보이지 않는다.
+            let barX = labelX + labelWidth
+            PanelDraw.text(PanelDraw.clipped(L10n.sessionNone, TeamClaudePalette.captionFont, maxWidth: max(24, percentRight - barX)),
+                           barX, top + 9, TeamClaudePalette.captionFont, TeamClaudePalette.fg2)
+        } else {
+            let full = (account.sessionPercent ?? 0) >= panelRoutingThresholdPercent
+            let signLeft = PanelDraw.right("%", percentRight, top + 13, TeamClaudePalette.microFont, TeamClaudePalette.fg3)
+            let value = account.sessionPercent.map { "\(panelPercentNumber($0))" } ?? StatusVocabulary.none
+            let valueLeft = PanelDraw.right(value, signLeft - 1, top + 9, TeamClaudePalette.sessionValueFont,
+                                            full ? TeamClaudePalette.amber : TeamClaudePalette.fg)
+            // 세션 막대(크게) — 안의 세로 눈금이 5시간 창이 지난 비율이다.
+            let barX = labelX + labelWidth
+            let barWidth = max(24, valueLeft - 10 - barX)
+            PanelDraw.meter(NSRect(x: barX, y: top + 15, width: barWidth, height: 8), percent: account.sessionPercent,
+                            elapsed: account.sessionElapsed)
+        }
         // 주간·Fable 작은 막대
         let miniWidth = (right - labelX - 12) / 2
         drawMini(account.weekly, x: labelX, centerY: top + 47, width: miniWidth, labelWidth: labelWidth)

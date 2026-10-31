@@ -273,6 +273,9 @@ struct TeamClaudeAccountHealth {
     var sessionResetAt: Date? = nil
     var weeklyResetAt: Date? = nil
     var fableResetAt: Date? = nil
+    /// 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false).
+    /// 참이면 세션 값은 비우고, 가용·측정 문제·재시도·소진 전망에서 세션 창을 뺀다. 필드 없음·null·true는 거짓.
+    var sessionWindowAbsent = false
 }
 
 private let _teamClaudeISOFormatter = ISO8601DateFormatter()
@@ -511,16 +514,18 @@ func stripClaudeModelSuffix(_ model: String) -> String {
 func computeTeamClaudeRetryAfterSeconds(accounts: [[String: Any]], threshold: Double, nowMs: Int64) -> Int? {
     let states = accounts.map { account -> TeamClaudeRetryAccountState in
         let quota = tcDict(account["quota"]) ?? [:]
-        var windows = [
-            TeamClaudeQuotaWindowState(
+        var windows: [TeamClaudeQuotaWindowState] = []
+        // 5시간 창이 없는 계정은 남은 5시간 값이 실려 와도 재시도 시각에 쓰지 않는다(spec A6).
+        if !teamClaudeSessionWindowAbsent(quota) {
+            windows.append(TeamClaudeQuotaWindowState(
                 utilization: tcDouble(quota["unified5h"]),
                 resetAtMs: parseTeamClaudeTimeMs(quota["unified5hReset"])
-            ),
-            TeamClaudeQuotaWindowState(
-                utilization: tcDouble(quota["unified7d"]),
-                resetAtMs: parseTeamClaudeTimeMs(quota["unified7dReset"])
-            ),
-        ]
+            ))
+        }
+        windows.append(TeamClaudeQuotaWindowState(
+            utilization: tcDouble(quota["unified7d"]),
+            resetAtMs: parseTeamClaudeTimeMs(quota["unified7dReset"])
+        ))
 
         let modelWeekly = tcDict(quota["modelWeekly"]) ?? [:]
         windows.append(contentsOf: modelWeekly.values.compactMap { value in
@@ -644,9 +649,11 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
         )
         let enabled = tcBool(account["enabled"]) ?? true
         let status = tcString(account["status"]) ?? "unknown"
-        let sessionResetMs = parseTeamClaudeTimeMs(quota?["unified5hReset"])
+        // 5시간 창이 없는 계정은 세션 값을 읽지 않는다. 그래야 막대·전망·재시도가 한 판정을 따른다.
+        let sessionWindowAbsent = teamClaudeSessionWindowAbsent(quota)
+        let sessionResetMs = sessionWindowAbsent ? nil : parseTeamClaudeTimeMs(quota?["unified5hReset"])
         let weeklyResetMs = parseTeamClaudeTimeMs(quota?["unified7dReset"])
-        let sessionPercent = teamClaudeCurrentQuotaUtilization(
+        let sessionPercent = sessionWindowAbsent ? nil : teamClaudeCurrentQuotaUtilization(
             teamClaudeQuotaNumber(quota?["unified5h"]),
             resetAtMs: sessionResetMs,
             nowMs: nowMs
@@ -664,7 +671,8 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             weeklyPercent: weeklyPercent,
             fablePercent: fablePercent,
             lastUsed: lastUsed,
-            thresholdPercent: threshold * 100
+            thresholdPercent: threshold * 100,
+            sessionWindowAbsent: sessionWindowAbsent
         )
         let isUsable = teamClaudeAccountIsUsable(
             enabled: enabled,
@@ -672,7 +680,8 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             sessionPercent: sessionPercent,
             weeklyPercent: weeklyPercent,
             fablePercent: fablePercent,
-            thresholdPercent: threshold * 100
+            thresholdPercent: threshold * 100,
+            sessionWindowAbsent: sessionWindowAbsent
         )
         if isUsable { usable += 1 }
         accountRows.append(TeamClaudeAccountHealth(
@@ -707,7 +716,8 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             subscriptionEndsAt: parseTeamClaudeTimeMs((account["subscription"] as? [String: Any])?["endsAt"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
             sessionResetAt: sessionResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             weeklyResetAt: weeklyResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
-            fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) }
+            fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
+            sessionWindowAbsent: sessionWindowAbsent
         ))
     }
 
@@ -862,7 +872,8 @@ func teamClaudeRetainingQuota(
             subscriptionConfirmation: account.subscriptionConfirmation,
             subscriptionEndReached: account.subscriptionEndReached,
             subscriptionEndsAt: account.subscriptionEndsAt,
-            sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt
+            sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt,
+            sessionWindowAbsent: account.sessionWindowAbsent
         )
     }
     let quotaPending = TeamClaudeHealth(
@@ -966,7 +977,8 @@ func teamClaudeAccountMergingQuota(
         fablePercent: fablePercent,
         lastUsed: candidate.probedAt,
         thresholdPercent: thresholdPercent,
-        now: observedAt
+        now: observedAt,
+        sessionWindowAbsent: candidate.sessionWindowAbsent
     )
     let isUsable = teamClaudeAccountIsUsable(
         enabled: candidate.enabled,
@@ -974,8 +986,12 @@ func teamClaudeAccountMergingQuota(
         sessionPercent: candidate.sessionPercent,
         weeklyPercent: weeklyPercent,
         fablePercent: fablePercent,
-        thresholdPercent: thresholdPercent
+        thresholdPercent: thresholdPercent,
+        sessionWindowAbsent: candidate.sessionWindowAbsent
     )
+    // 세션 창이 측정돼 있거나, 5시간 창이 없는 계정이라 잴 세션 창이 없다.
+    let sessionCurrent = candidate.sessionWindowAbsent
+        || (candidate.sessionPercent != nil && (candidate.sessionResetSeconds ?? 0) > 0)
 
     return TeamClaudeAccountHealth(
         name: candidate.name,
@@ -999,18 +1015,19 @@ func teamClaudeAccountMergingQuota(
         measurementIssue: measurementIssue,
         usableFromProxy: candidate.usableFromProxy,
         fableMeasurementCurrent: candidate.fableMeasurementCurrent
-            && candidate.sessionPercent != nil && candidate.weeklyPercent != nil && candidate.fablePercent != nil
-            && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0
+            && sessionCurrent && candidate.weeklyPercent != nil && candidate.fablePercent != nil
+            && (candidate.weeklyResetSeconds ?? 0) > 0
             && (candidate.fableResetSeconds ?? 0) > 0,
         routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
-            && candidate.sessionPercent != nil && candidate.weeklyPercent != nil
-            && (candidate.sessionResetSeconds ?? 0) > 0 && (candidate.weeklyResetSeconds ?? 0) > 0,
+            && sessionCurrent && candidate.weeklyPercent != nil
+            && (candidate.weeklyResetSeconds ?? 0) > 0,
         inflightCount: candidate.inflightCount,
         concurrentCapacity: candidate.concurrentCapacity,
         subscriptionConfirmation: candidate.subscriptionConfirmation,
         subscriptionEndReached: candidate.subscriptionEndReached,
         subscriptionEndsAt: candidate.subscriptionEndsAt,
-        sessionResetAt: candidate.sessionResetAt, weeklyResetAt: candidate.weeklyResetAt, fableResetAt: candidate.fableResetAt
+        sessionResetAt: candidate.sessionResetAt, weeklyResetAt: candidate.weeklyResetAt, fableResetAt: candidate.fableResetAt,
+        sessionWindowAbsent: candidate.sessionWindowAbsent
     )
 }
 
@@ -2678,9 +2695,8 @@ final class TeamClaudeTableView: NSView {
             }
             let attempted = probeAttempted(row)
             let session = teamClaudeSessionState(percent: row.sessionPercent, lastUsed: row.probedAt, now: evaluatedAt)
-            let sessionEmpty = session.isStale
-                ? (row.measurementIssue == .quotaBlocked ? L10n.quotaReset : L10n.remeasure)
-                : (attempted ? StatusVocabulary.needsCheck : StatusVocabulary.notMeasured)
+            let sessionEmpty = teamClaudeSessionEmptyLabel(sessionWindowAbsent: row.sessionWindowAbsent, stale: session.isStale,
+                                                           quotaBlocked: row.measurementIssue == .quotaBlocked, attempted: attempted)
             meterCell(TeamClaudeColumns.sessionX, percent: session.isStale ? nil : session.percent,
                       remaining: teamClaudeRemainingSeconds(row.sessionResetSeconds, resetAt: row.sessionResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
                       window: teamClaudeSessionSeconds, empty: sessionEmpty)
@@ -2745,7 +2761,8 @@ final class TeamClaudeTableView: NSView {
                     factX += termWidth + valueWidth + 20
                 }
                 let resets = [
-                    "\(L10n.sessionShort) \(teamClaudeResetLabel(row.sessionResetSeconds, checkedAt: health.checkedAt, now: evaluatedAt, resetAt: row.sessionResetAt))",
+                    teamClaudeSessionResetPart(sessionWindowAbsent: row.sessionWindowAbsent,
+                                               resetLabel: teamClaudeResetLabel(row.sessionResetSeconds, checkedAt: health.checkedAt, now: evaluatedAt, resetAt: row.sessionResetAt)),
                     "\(L10n.weeklyShort) \(teamClaudeResetLabel(row.weeklyResetSeconds, checkedAt: health.checkedAt, now: evaluatedAt, resetAt: row.weeklyResetAt))",
                     "Fable \(teamClaudeResetLabel(row.fableResetSeconds, checkedAt: health.checkedAt, now: evaluatedAt, resetAt: row.fableResetAt))",
                 ].joined(separator: " · ")

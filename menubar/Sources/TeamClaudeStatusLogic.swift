@@ -420,7 +420,8 @@ func teamClaudeMeasurementIssue(
     fablePercent: Double?,
     lastUsed: Date?,
     thresholdPercent: Double = 98,
-    now: Date = Date()
+    now: Date = Date(),
+    sessionWindowAbsent: Bool = false
 ) -> TeamClaudeMeasurementIssue? {
     guard enabled else { return .disabled }
     if status == "configured" { return .serverNotSynced }
@@ -428,9 +429,16 @@ func teamClaudeMeasurementIssue(
     if status == "throttled" { return .throttled }
     if status == "exhausted" { return .exhausted }
 
-    let knownMaximum = [sessionPercent, weeklyPercent].compactMap { $0 }.max()
+    // 5시간 창이 없는 계정은 세션 값을 보지 않는다(남은 값이 실려 와도 무시, 누락도 측정 문제가 아니다).
+    let sessionValue = sessionWindowAbsent ? nil : sessionPercent
+    let knownMaximum = [sessionValue, weeklyPercent].compactMap { $0 }.max()
     if let knownMaximum, knownMaximum >= thresholdPercent {
         return .quotaBlocked
+    }
+
+    if sessionWindowAbsent {
+        if weeklyPercent == nil { return .weeklyMissing }
+        return fablePercent == nil ? .fableMissing : nil
     }
 
     let hasMissingValue = sessionPercent == nil || weeklyPercent == nil || fablePercent == nil
@@ -449,13 +457,20 @@ func teamClaudeAccountIsUsable(
     sessionPercent: Double?,
     weeklyPercent: Double?,
     fablePercent: Double?,
-    thresholdPercent: Double
+    thresholdPercent: Double,
+    sessionWindowAbsent: Bool = false
 ) -> Bool {
-    guard enabled,
-          status == "active",
-          let sessionPercent = sessionPercent,
-          let weeklyPercent = weeklyPercent else {
-        return false
-    }
+    guard enabled, status == "active", let weeklyPercent = weeklyPercent else { return false }
+    // 5시간 창이 없는 계정(검증된 Ultra)은 주간 창만으로 판정한다.
+    if sessionWindowAbsent { return weeklyPercent < thresholdPercent }
+    guard let sessionPercent = sessionPercent else { return false }
     return max(sessionPercent, weeklyPercent) < thresholdPercent
+}
+
+/// 상태 응답 quota.sessionWindowStated가 JSON 불 false인가(5시간 창 없이 주간 창만 받는 계정, spec A6).
+/// 필드 없음(구버전 프록시)·null·true·문자열·숫자는 전부 "있음"으로 읽어 지금 동작을 유지한다.
+func teamClaudeSessionWindowAbsent(_ quota: [String: Any]?) -> Bool {
+    guard let value = quota?["sessionWindowStated"] as? NSNumber,
+          CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+    return !value.boolValue
 }
