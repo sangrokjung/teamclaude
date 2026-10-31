@@ -363,6 +363,14 @@ export class AccountManager {
   getActiveAccount(exclude = null, model = null, scope = exclude) {
     const now = Date.now();
 
+    // /byok lane: API-key credit first (it lapses at the end of the billing
+    // period). Routed through _selectBest, whose tier order puts keys ahead
+    // of subscriptions for this scope, without moving the Claude Code sticky
+    // primary. With no usable key the request takes the normal path below.
+    if (this._isByokScope(scope) && this._anyByokKeyAvailable(exclude, model, scope)) {
+      return this._selectBest(exclude && exclude.size ? exclude : null, model, scope);
+    }
+
     // Per-request failover: a prior account already returned a non-quota 429
     // for THIS request (those accounts are in `exclude`, a Set of objects). Pick another available
     // account by priority WITHOUT touching the sticky primary or warm-up state
@@ -584,7 +592,10 @@ export class AccountManager {
     // normal selection. So it never exceeds a cap, revives an exhausted account,
     // or disturbs use-or-lose for new connections. (`accounts[idx] === a` rejects
     // a stale entry left by a removeAccount that re-indexed the array.)
-    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
+    // A /byok request skips the hint: its lane prefers API-key credit over
+    // whatever subscription account the connection last used.
+    if (affOk && !this._isByokScope(creditScope)
+        && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
       const a = this._affinity.get(affinityKey);
       // Require the home to be MEASURED — not just past its warm-up tries. A
       // headerless account stays unmeasured forever; pinning a connection to it
@@ -998,6 +1009,9 @@ export class AccountManager {
     // explicit priority: credits are paid and valid for months, included
     // quota renews on a window and is lost if unused. Within the credit tier
     // the largest (bucketed) balance drains first so the pool depletes evenly.
+    // Anthropic API keys are the same kind of paid last tier (see
+    // _apiKeysUnlocked); among keys the order is soonest expiry, then least
+    // estimated credit left, then array order (_apiKeyCompare).
     const tier = new Map(eligible.map(a => [a, this._creditTier(a, model, scope)]));
     const creditRank = a => (tier.get(a) === 1 ? this._creditRank(a) : 0);
     eligible.sort((a, b) => {
@@ -1006,10 +1020,13 @@ export class AccountManager {
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
+      if (isApiKeyAccount(a) && isApiKeyAccount(b)) return this._apiKeyCompare(a, b);
       const ca = creditRank(a), cb = creditRank(b);
       if (ca !== cb) return ca < cb ? -1 : 1;                            // credit tier: larger balance first
       return this.autoCompare(a, b);                                     // then the automatic use-or-lose order
     });
+    // The key order is total (array order breaks ties), so no round-robin.
+    if (isApiKeyAccount(eligible[0])) return eligible[0];
 
     // Accounts tied for the best rank (notably all-unknown at cold start, or all
     // sharing one priority) are load-balanced round-robin instead of always
@@ -1333,6 +1350,10 @@ export class AccountManager {
       return false;
     }
 
+    // An Anthropic API key is the paid last tier for Claude Code traffic: it
+    // opens only when no subscription account can serve this model at all.
+    if (isApiKeyAccount(account) && !this._apiKeysUnlocked(model, scope, readOnly)) return false;
+
     // The reserved account stays IN rotation (unlike `enabled: false`) but stops
     // accepting new inference once it crosses its ceiling, so the credential
     // bound to it keeps usable quota. Gating here rather than in _isNearQuota
@@ -1492,9 +1513,60 @@ export class AccountManager {
     return Boolean(account) && this._isNearQuota(account, model) && this._creditRoutable(account);
   }
 
-  /** 0 = included quota (preferred), 1 = credit-backed. */
+  /**
+   * 0 = included quota (preferred), 1 = paid: a credit-backed Codex account or
+   * an Anthropic API key. The /byok lane inverts the Anthropic order (keys 0,
+   * subscriptions 1) so its credit is spent before subscription quota.
+   */
   _creditTier(account, model = null, scope = null) {
+    if (account.provider === 'anthropic' && this._isByokScope(scope)) {
+      return isApiKeyAccount(account) ? 0 : 1;
+    }
+    if (isApiKeyAccount(account)) return 1;
     return this._isCreditBacked(account, model, scope) ? 1 : 0;
+  }
+
+  // ── Anthropic API-key paid tier ──────────────────────────────────────────
+
+  /** Request scope of the /byok lane (the server sets `byok` on its CreditScope). */
+  _isByokScope(scope) {
+    return Boolean(scope && scope.byok === true);
+  }
+
+  /**
+   * Can any Anthropic subscription (OAuth) account serve this model? Capacity
+   * is ignored on purpose: an account merely at its concurrency cap still
+   * counts, so overflow queues for it instead of spilling onto paid credit.
+   * `scope` holds accounts THIS request cannot use (auth-failed): they do not
+   * hold the request off the keys.
+   */
+  _anySubscriptionServable(model = null, scope = null, readOnly = false) {
+    return this.accounts.some(a => a.provider === 'anthropic' && a.type === 'oauth'
+      && !(scope && scope.has(a))
+      && this._isAvailable(a, model, { allowCredits: false, readOnly }));
+  }
+
+  _apiKeysUnlocked(model = null, scope = null, readOnly = false) {
+    return this._isByokScope(scope) || !this._anySubscriptionServable(model, scope, readOnly);
+  }
+
+  _anyByokKeyAvailable(exclude, model, scope) {
+    return this.accounts.some(a => isApiKeyAccount(a) && !(exclude && exclude.has(a))
+      && this._isAvailable(a, model, { scope }));
+  }
+
+  _apiKeyRemaining(account) {
+    if (account.creditUsd == null) return Infinity;
+    return account.creditUsd - (Number.isFinite(account.quota.apiSpendUsd) ? account.quota.apiSpendUsd : 0);
+  }
+
+  /** Among API keys: soonest credit expiry, then least estimated credit left, then array order. */
+  _apiKeyCompare(a, b) {
+    const ea = a.creditExpiresAt ?? Infinity, eb = b.creditExpiresAt ?? Infinity;
+    if (ea !== eb) return ea < eb ? -1 : 1;
+    const ra = this._apiKeyRemaining(a), rb = this._apiKeyRemaining(b);
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    return a.index - b.index;
   }
 
   /** Larger balance ranks first within the credit tier (bucketed, see codex-credits.js). */
@@ -2734,6 +2806,7 @@ export class AccountManager {
     if (ta !== tb) return ta < tb;
     const pa = this._priority(a), pb = this._priority(b);
     if (pa !== pb) return pa < pb;
+    if (isApiKeyAccount(a) && isApiKeyAccount(b)) return this._apiKeyCompare(a, b) < 0;
     if (ta === 1) {
       const ca = this._creditRank(a), cb = this._creditRank(b);
       if (ca !== cb) return ca < cb;
