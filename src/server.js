@@ -48,7 +48,7 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
-import { classifyCreditRefusal } from './api-credit.js';
+import { classifyCreditRefusal, isMessageBasedCreditReason } from './api-credit.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -3929,7 +3929,20 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         return;
       }
       const reason = classifyCreditRefusal(upstreamRes.status, responseBody);
-      if (reason) return creditRefusal(reason, upstreamRes.status);
+      // A 400 judged only by its message text may echo request content, so one
+      // request may park at most ONE key that way (same idea as the 401
+      // cascade guard). A second identical 400 on the next key is treated as
+      // request-scoped: not persisted, and this request gets the error as is.
+      // Structured signals (402 billing_error) are not capped.
+      const messageCapped = reason && isMessageBasedCreditReason(reason)
+        && (ctx.creditMessageParks || 0) >= 1;
+      if (reason && !messageCapped) {
+        if (isMessageBasedCreditReason(reason)) ctx.creditMessageParks = (ctx.creditMessageParks || 0) + 1;
+        return creditRefusal(reason, upstreamRes.status);
+      }
+      if (messageCapped) {
+        console.log(`[TeamClaude] ${upstreamRes.status} credit message on "${account.name}" after one key was already parked by this request; not parking, relaying the error`);
+      }
 
       // Not a credit refusal: relay it byte for byte, exactly as before.
       ctx.status = upstreamRes.status;

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { classifyCreditRefusal, normalizeCreditExhausted } from '../src/api-credit.js';
+import { classifyCreditRefusal, isMessageBasedCreditReason, normalizeCreditExhausted } from '../src/api-credit.js';
 
 const HOUR = 3600_000;
 const SINCE = Date.UTC(2026, 9, 1);
@@ -216,4 +216,21 @@ test('classifyCreditRefusal: 크레딧 거절 4종만 사유를 돌려준다', (
   assert.equal(classifyCreditRefusal(500, body({ type: 'error', error: { type: 'api_error', message: 'credit balance is too low' } })), null);
   assert.equal(classifyCreditRefusal(400, Buffer.from('not json')), null);
   assert.equal(classifyCreditRefusal(402, body({ type: 'error', error: { type: 'api_error', message: 'x' } })), null);
+});
+
+test('classifyCreditRefusal: 요청 내용이 섞인 400 메시지(문장 중간의 문구)는 크레딧 거절이 아니다', () => {
+  const body = obj => Buffer.from(JSON.stringify(obj));
+  const echo = message => body({ type: 'error', error: { type: 'invalid_request_error', message } });
+  // 프롬프트에 문구를 넣어 400 메시지로 되돌아온 경우: 문장으로 시작하지 않으면 무시.
+  assert.equal(classifyCreditRefusal(400, echo("messages.0.content: 'Your credit balance is too low to access the Anthropic API' is not a valid block")), null);
+  assert.equal(classifyCreditRefusal(400, echo('Invalid value: you have reached your specified API usage limits')), null);
+  assert.equal(classifyCreditRefusal(400, echo(' Your credit balance is too low to access the Anthropic API.')), null);
+  // 대소문자는 무시한다.
+  assert.equal(classifyCreditRefusal(400, echo('YOUR CREDIT BALANCE IS TOO LOW TO ACCESS THE ANTHROPIC API.')), 'credit-exhausted');
+  // 오류 종류가 다르면 같은 문장이어도 무시한다.
+  assert.equal(classifyCreditRefusal(400, body({ type: 'error', error: { type: 'not_found_error', message: 'Your credit balance is too low to access the Anthropic API.' } })), null);
+  assert.equal(isMessageBasedCreditReason('credit-exhausted'), true);
+  assert.equal(isMessageBasedCreditReason('usage-limit'), true);
+  assert.equal(isMessageBasedCreditReason('billing'), false);
+  assert.equal(isMessageBasedCreditReason('spend-limit'), false);
 });

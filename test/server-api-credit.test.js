@@ -140,6 +140,46 @@ test('B7: 대안이 없으면 크레딧 오류 대신 기존 429 경로로 간�
   assert.equal(status.accounts[0].credit.exhausted, true);
 });
 
+test('B7: 프롬프트 문구가 섞여 돌아온 400은 키를 빼지 않고 그대로 전달한다', async t => {
+  const echoed = { type: 'error', error: { type: 'invalid_request_error',
+    message: "messages.0.content: 'Your credit balance is too low to access the Anthropic API' is not allowed here" } };
+  const { am, port, seen } = await setup(t, [apiKey('api-1'), apiKey('api-2')], (e, res) => json(res, 400, echoed));
+  const res = await post(port);
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), echoed);
+  assert.deepEqual(seen.map(e => e.who), ['api-1']);
+  assert.equal(am.accounts[0].creditExhausted, undefined);
+  assert.equal(am.accounts[0].status, 'active');
+});
+
+test('B7: 한 요청이 메시지 기반 400으로 영속 소진할 수 있는 키는 1개다(연쇄 400은 원래 오류로)', async t => {
+  const { am, port, seen } = await setup(t, [apiKey('api-1'), apiKey('api-2'), apiKey('api-3')], (e, res) => json(res, 400, CREDIT_LOW));
+  const flags = [];
+  am.onAccountCreditFlag((account, value) => flags.push([account.name, value?.reason ?? null]));
+  const res = await post(port);
+  assert.equal(res.status, 400, '두 번째 키의 같은 400은 그 요청에만 그대로 돌려준다');
+  assert.deepEqual(await res.json(), CREDIT_LOW);
+  assert.deepEqual(seen.map(e => e.who), ['api-1', 'api-2']);
+  assert.equal(am.accounts[0].creditExhausted.reason, 'credit-exhausted');
+  assert.equal(am.accounts[1].creditExhausted, undefined, '두 번째 키는 영속 처리하지 않는다');
+  assert.equal(am.accounts[1].status, 'active');
+  assert.equal(am.accounts[2].creditExhausted, undefined);
+  assert.deepEqual(flags, [['api-1', 'credit-exhausted']]);
+});
+
+test('B7: 구조화 신호(402 billing_error)는 요청당 제한 없이 영속 처리한다', async t => {
+  const billing = { type: 'error', error: { type: 'billing_error', message: 'Payment required' } };
+  const { am, port, seen } = await setup(t, [apiKey('api-1'), apiKey('api-2'), apiKey('api-3')], (e, res) => {
+    if (e.who === 'api-3') return json(res, 200, OK(e.who));
+    return json(res, 402, billing);
+  });
+  const res = await post(port);
+  assert.equal(res.status, 200);
+  assert.deepEqual(seen.map(e => e.who), ['api-1', 'api-2', 'api-3']);
+  assert.equal(am.accounts[0].creditExhausted.reason, 'billing');
+  assert.equal(am.accounts[1].creditExhausted.reason, 'billing');
+});
+
 test('B7: 크레딧과 무관한 400은 그대로 전달하고 계정을 건드리지 않는다', async t => {
   const plain = { type: 'error', error: { type: 'invalid_request_error', message: 'max_tokens: field required' } };
   const { am, port } = await setup(t, [apiKey('api-1'), apiKey('api-2')], (e, res) => json(res, 400, plain));

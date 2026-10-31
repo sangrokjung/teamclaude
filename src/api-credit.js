@@ -47,6 +47,20 @@ function parseErrorBody(body) {
   }
 }
 
+// 400 메시지 판정은 상류 문서의 문장으로 "시작하는" 경우만 인정한다. 400 오류
+// 메시지에는 클라이언트가 보낸 요청 내용이 섞여 돌아올 수 있어서, 부분 포함으로
+// 판정하면 프롬프트에 이 문구를 넣는 것만으로 멀쩡한 키를 영구로 뺄 수 있다.
+const CREDIT_LOW_MESSAGE = /^your credit balance is too low to access the anthropic api/i;
+const USAGE_LIMIT_MESSAGE = /^you have reached your specified api usage limits/i;
+
+// 메시지 문장으로만 판정한 사유. 구조화 신호(402 billing_error, 429 error_code)와
+// 달리 요청 내용의 영향을 받을 수 있어 서버가 요청당 영속 처리 수를 제한한다.
+const MESSAGE_BASED_REASONS = new Set(['credit-exhausted', 'usage-limit']);
+
+export function isMessageBasedCreditReason(reason) {
+  return MESSAGE_BASED_REASONS.has(reason);
+}
+
 /**
  * 상류 응답이 API 키의 크레딧 거절인지 판별한다. 사유 문자열 또는 null.
  * 문구가 바뀌어 놓치면 지금처럼 오류가 클라이언트에 가는 쪽으로 떨어질 뿐이다.
@@ -55,10 +69,10 @@ export function classifyCreditRefusal(status, body) {
   if (status !== 400 && status !== 402 && status !== 429) return null;
   const error = parseErrorBody(body);
   if (!error) return null;
-  const message = typeof error.message === 'string' ? error.message.toLowerCase() : '';
   if (status === 400) {
-    if (error.type === 'invalid_request_error' && message.includes('credit balance is too low')) return 'credit-exhausted';
-    if (message.includes('reached your specified api usage limits')) return 'usage-limit';
+    if (error.type !== 'invalid_request_error' || typeof error.message !== 'string') return null;
+    if (CREDIT_LOW_MESSAGE.test(error.message)) return 'credit-exhausted';
+    if (USAGE_LIMIT_MESSAGE.test(error.message)) return 'usage-limit';
     return null;
   }
   if (status === 429) {
