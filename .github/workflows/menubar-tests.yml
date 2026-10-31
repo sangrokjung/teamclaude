@@ -6,7 +6,7 @@ on:
     paths: ['menubar/**', 'scripts/subscription-monitor*', '.github/workflows/menubar-tests.yml', '.github/workflows/menubar-release.yml']
 jobs:
   build-and-test:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
