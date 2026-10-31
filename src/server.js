@@ -1501,7 +1501,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         && rl['anthropic-ratelimit-unified-status'] === 'rejected';
       if ((res.ok || accountExhausted429) && Object.keys(rl).length
           && accountManager.accounts[account.index] === account) {
-        accountManager.updateQuota(account, rl);
+        accountManager.updateQuota(account, rl, { status: res.status });
         // Convergence accounting: a probe that leaves the account fully
         // measured resets the fruitless-probe counter; one that leaves it
         // half-measured (a header family missing) counts toward the cap.
@@ -3636,7 +3636,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
-    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders);
+    accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders, { status: upstreamRes.status });
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token

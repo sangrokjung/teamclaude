@@ -3022,9 +3022,13 @@ async function statusCommand() {
       }
 
       if (q.unified5h != null || q.unified7d != null || Object.keys(q.modelWeekly ?? {}).length > 0) {
-        const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
+        // sessionWindowStated false = the account has no 5-hour window at all
+        // (verified Ultra, 2026-10-30) — distinct from "not measured yet" (-).
+        const ses = q.sessionWindowStated === false
+          ? 'no 5h limit'
+          : (q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-') + ' used';
         const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
+        let line = `    Session:  ${ses}    Weekly: ${wk} used`;
         // Model-scoped weekly windows (7d_oi = the Fable weekly limit). Guarded
         // with ?. so a status from an older running server (no modelWeekly
         // field) still prints. Unknown labels print as-is.

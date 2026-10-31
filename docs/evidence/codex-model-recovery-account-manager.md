@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `f967d52f99858feda10c3879daa0821ecd44f6015d9de4c85b5ac0f6577f6d20`
+- SHA-256: `961acbf54234fa18b95f04f03dcb33e565803040b08217ce5c269063dd257dc4`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
@@ -18,6 +18,9 @@
   유료 크레딧 라우팅 `codexUseCredits`)로 `src/account-manager.js`만 바뀌었다. `_isAvailable`의 포함 쿼터 판정이
   크레딧 경로를 갖게 되어 "Eligibility" 발췌를 바뀐 소스와 줄 단위·순서대로 맞췄다(`// ...` 생략 포함).
   모델 복구 로직(`_isModelUnsupported`·`markModelUnsupported`·`clearModelUnsupported`·`_recoverSoonest` 판정 순서)은 변경 없다.
+- 2026-10-31 갱신: 5시간 창 없는 계정 기록(`quota.sessionWindowStated`, `_noteSessionWindow`)으로 `src/account-manager.js`만 바뀌었다.
+  바뀐 곳은 `emptyQuota`·`_fullyMeasured`·`_isNearQuota`·`updateQuota`·`importQuotaState`이고 아래 발췌 구간은 건드리지 않았다.
+  모델 복구 로직은 변경 없다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을

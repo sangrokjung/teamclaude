@@ -103,6 +103,12 @@ function emptyQuota() {
     unified5hReset: null,  // ms timestamp
     unified7dReset: null,  // ms timestamp
     unifiedStatus: null,   // allowed | allowed_warning | rejected
+    // Does this Anthropic OAuth account have a 5-hour session window at all?
+    // null = unknown, true = a response carried 5h headers, false = an accepted
+    // response carried 7d headers and no 5h headers (2026-10-30: verified Ultra
+    // accounts get no session window). Display and probe-candidacy only —
+    // account selection still blocks on measured values, never on this flag.
+    sessionWindowStated: null,
     // Freshness stamp: ms timestamp of the last authoritative codex wham/usage
     // apply (updateCodexUsage). Per-response x-codex headers never set it —
     // they are a non-authoritative signal. Drives the active fast-lane refresh
@@ -1104,9 +1110,13 @@ export class AccountManager {
       // semantics the ordering helpers use. Utilization without its reset
       // timestamp gives use-or-lose nothing to sort on, so such an account
       // still needs a re-probe.
+      // An account stated to have no session window (sessionWindowStated
+      // false) is complete with the 7d window alone — re-probing it would only
+      // ever return the same weekly-only headers.
       const q = account.quota;
-      return q.unified5h != null && q.unified5hReset != null
-        && q.unified7d != null && q.unified7dReset != null;
+      const sessionComplete = (q.unified5h != null && q.unified5hReset != null)
+        || q.sessionWindowStated === false;
+      return sessionComplete && q.unified7d != null && q.unified7dReset != null;
     }
     return this._isMeasured(account);
   }
@@ -1521,6 +1531,17 @@ export class AccountManager {
       account._partialProbes = 0;
       account._warmupTries = 0;
     }
+    // No session window (sessionWindowStated false — set only by a served,
+    // non-rejected response that metered 7d but no 5h): any 5h value still
+    // present is a leftover from before the account lost its session window,
+    // not a live measurement. Clear it, future reset included, so the proxy
+    // never blocks on a limit every surface reports as absent. A fresh 5h header
+    // flips the flag back to true and repopulates the window.
+    if (q.sessionWindowStated === false
+        && (q.unified5h != null || q.unified5hReset != null)) {
+      q.unified5h = null;
+      q.unified5hReset = null;
+    }
     if (q.unified7dReset && now >= q.unified7dReset) {
       if (q.unified7d != null) console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
@@ -1643,10 +1664,14 @@ export class AccountManager {
 
   /**
    * Update an account's quota tracking from upstream response headers.
+   * `status` is the numeric HTTP status of the response the headers came from;
+   * without it the session-window flag is never set to false (only an accepted
+   * response proves the 5h window is absent).
    */
-  updateQuota(accountIndex, headers) {
+  updateQuota(accountIndex, headers, { status } = {}) {
     const account = this._resolve(accountIndex);
     if (!account) return;
+    this._noteSessionWindow(account, headers, status);
 
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
@@ -1751,6 +1776,35 @@ export class AccountManager {
             ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
             : '?';
       console.log(`[TeamClaude] Account "${account.name}" at ${pct}% usage — will switch on next request`);
+    }
+  }
+
+  /**
+   * Record whether an Anthropic OAuth account has a 5-hour session window
+   * (quota.sessionWindowStated). Any 5h header → true. An accepted (< 400),
+   * non-rejected response carrying the 7d utilization but no 5h header →
+   * false. A weekly-exhaustion 429 (or any error / header-less response) is
+   * not evidence either way and leaves the flag unchanged. API-key and Codex
+   * accounts are never touched.
+   */
+  _noteSessionWindow(account, headers, status) {
+    if (account.type !== 'oauth' || account.provider === 'codex') return;
+    const has5h = headers['anthropic-ratelimit-unified-5h-utilization'] != null
+      || headers['anthropic-ratelimit-unified-5h-reset'] != null;
+    if (has5h) {
+      account.quota.sessionWindowStated = true;
+      return;
+    }
+    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    if (Number.isFinite(u7d) && Number.isInteger(status) && status < 400
+        && headers['anthropic-ratelimit-unified-status'] !== 'rejected') {
+      account.quota.sessionWindowStated = false;
+      // A served response that meters no 5h window proves no session limit is
+      // gating this account, so a reading left over from before the switch
+      // (Max → Ultra, or a restored snapshot) must not keep it blocked while
+      // every surface says "no 5h limit".
+      account.quota.unified5h = null;
+      account.quota.unified5hReset = null;
     }
   }
 
@@ -2616,7 +2670,15 @@ export class AccountManager {
           // non-boolean flag or a string balance into routing.
           codexCredits: normalizeCodexCredits(s.quota.codexCredits),
           codexCreditsAt: Number.isFinite(s.quota.codexCreditsAt) ? s.quota.codexCreditsAt : null,
+          sessionWindowStated: typeof s.quota.sessionWindowStated === 'boolean'
+            ? s.quota.sessionWindowStated : null,
         };
+        // Same invariant as _isNearQuota: a no-session-window account carries
+        // no 5h reading, so a restored status never reports a blocking value.
+        if (a.quota.sessionWindowStated === false) {
+          a.quota.unified5h = null;
+          a.quota.unified5hReset = null;
+        }
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
       // A restored throttle must not overwrite the subscription-lapse park: a

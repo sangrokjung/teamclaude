@@ -63,10 +63,9 @@ func teamClaudeFableAvailability(
     guard elapsed >= 0, elapsed < 60, includeFable ? row.fableMeasurementCurrent : (row.routingMeasurementCurrent ?? row.fableMeasurementCurrent) else {
         return result(.unconfirmed, TeamClaudeRowReason.measurementStale)
     }
-    var windows: [(String, Double?, Int?)] = [
-        (L10n.sessionShort, row.sessionPercent, row.sessionResetSeconds),
-        (L10n.windowAllWeekly, row.weeklyPercent, row.weeklyResetSeconds)
-    ]
+    var windows: [(String, Double?, Int?)] = [(L10n.windowAllWeekly, row.weeklyPercent, row.weeklyResetSeconds)]
+    // 5시간 창이 없는 계정(검증된 Ultra)은 잴 세션 창이 없다. 넣으면 "세션 확인 필요"로 영영 미확인에 머문다.
+    if !row.sessionWindowAbsent { windows.insert((L10n.sessionShort, row.sessionPercent, row.sessionResetSeconds), at: 0) }
     let fableWindow = "Fable"
     if includeFable { windows.append((fableWindow, row.fablePercent, row.fableResetSeconds)) }
     let threshold = health.quotaThresholdPercent
