@@ -98,12 +98,12 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     if let health = input.teamClaude, claudeNotice == nil {
         // 상태별 수·목록·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
         // 서로 다른 판정을 보면 한쪽만 고쳐도 어긋난다). Fable 레인 숫자만 Fable 창까지 보는 판정이다.
-        let availability = health.fableAvailability(now: now)
+        // 큰 숫자의 분모·Fable 레인은 구독 계정만 센다. API 키는 apiCredit* 로 따로 센다.
+        let availability = zip(health.accounts, health.fableAvailability(now: now)).filter { !$0.0.isApiKey }.map(\.1)
         let opus = health.opusAvailability(now: now)
         let routing = health.routingAvailability(now: now)
-        // 큰 숫자의 분모·Fable 레인은 구독 계정만 센다. API 키는 apiCredit* 로 따로 센다.
         total = health.subscriptionAccountTotal
-        fableReady = zip(health.accounts, availability).filter { !$0.0.isApiKey && $0.1.state == .ready }.count
+        fableReady = availability.filter { $0.state == .ready }.count
         let apiCounts = health.apiCreditCounts
         model.apiCreditReady = apiCounts.ready
         model.apiCreditTotal = apiCounts.total
