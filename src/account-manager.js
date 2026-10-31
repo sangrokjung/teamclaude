@@ -1797,6 +1797,12 @@ export class AccountManager {
     if (Number.isFinite(u7d) && Number.isInteger(status) && status < 400
         && headers['anthropic-ratelimit-unified-status'] !== 'rejected') {
       account.quota.sessionWindowStated = false;
+      // A served response that meters no 5h window proves no session limit is
+      // gating this account, so a reading left over from before the switch
+      // (Max → Ultra, or a restored snapshot) must not keep it blocked while
+      // every surface says "no 5h limit".
+      account.quota.unified5h = null;
+      account.quota.unified5hReset = null;
     }
   }
 

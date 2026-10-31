@@ -155,6 +155,31 @@ test('플래그 false여도 미래 reset이 있는 5h 값은 남는다', () => {
   assert.equal(a.quota.unified5h, 0.3);
 });
 
+test('Max→Ultra 전환: 남은 미래 5h 99%는 weekly-only 성공 응답에서 지워지고 계정은 다시 쓸 수 있다', () => {
+  const am = makeManager();
+  const a = am.accounts[0];
+  am.updateQuota(a, BOTH(), { status: 200 });
+  a.quota.unified5h = 0.99;
+  a.quota.unified5hReset = Date.now() + HOUR;
+  assert.equal(am.getStatus().accounts[0].usable, false);
+  am.updateQuota(a, WEEKLY_ONLY(), { status: 200 });
+  assert.equal(a.quota.sessionWindowStated, false);
+  assert.equal(a.quota.unified5h, null);
+  assert.equal(a.quota.unified5hReset, null);
+  assert.equal(am.getStatus().accounts[0].usable, true);
+});
+
+test('weekly-only라도 거절·오류 응답은 남은 5h 값을 지우지 않는다', () => {
+  const am = makeManager();
+  const a = am.accounts[0];
+  a.quota.unified5h = 0.99;
+  a.quota.unified5hReset = Date.now() + HOUR;
+  am.updateQuota(a, { ...WEEKLY_ONLY(), 'anthropic-ratelimit-unified-status': 'rejected' }, { status: 429 });
+  assert.equal(a.quota.unified5h, 0.99);
+  am.updateQuota(a, WEEKLY_ONLY(), { status: 500 });
+  assert.equal(a.quota.unified5h, 0.99);
+});
+
 test('apikey and codex untouched', () => {
   const am = makeManager([
     { name: 'api-1', type: 'apikey', apiKey: 'k' },
