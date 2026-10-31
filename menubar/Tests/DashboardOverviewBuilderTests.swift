@@ -194,7 +194,7 @@ struct DashboardOverviewBuilderTests {
 
     /// 5시간 창이 없는 계정(검증된 Ultra, spec A6). 프록시가 quota.sessionWindowStated=false를 준다.
     /// 세션 칸은 "없음", 가용·손볼 것·대기는 주간 창만으로, 세션 속도 경고는 없다.
-    static func weeklyOnlyStatus(_ fixture: [String: Any], name: String = "acct-01",
+    static func weeklyOnlyStatus(_ fixture: [String: Any], name: String = "acct-01", usable: Bool = true,
                                  edit: (inout [String: Any]) -> Void) -> [String: Any] {
         guard var status = fixture["teamclaude"] as? [String: Any],
               var accounts = status["accounts"] as? [[String: Any]],
@@ -207,6 +207,7 @@ struct DashboardOverviewBuilderTests {
         quota["sessionWindowStated"] = false
         edit(&quota)
         accounts[index]["quota"] = quota
+        accounts[index]["usable"] = usable
         status["accounts"] = accounts
         return status
     }
@@ -239,12 +240,12 @@ struct DashboardOverviewBuilderTests {
         let retained = teamClaudeRetainingQuota(candidate: health, previous: merged)
         precondition(retained.accounts.first(where: { $0.name == "acct-01" })?.sessionWindowAbsent == true, "offline retention keeps the flag")
 
-        // 3. 주간 99%: 사용 가능이 아니라 주간 가득으로 기다린다.
-        let full = rebuilt(weeklyOnlyStatus(fixture) { $0["unified7d"] = 0.99 }, input: input, now: now)
+        // 3. 주간 99%(프록시도 usable=false로 준다): 사용 가능이 아니라 주간 가득으로 기다린다.
+        let full = rebuilt(weeklyOnlyStatus(fixture, usable: false) { $0["unified7d"] = 0.99 }, input: input, now: now)
         precondition(full.routable == 11, "weekly-full weekly-only account is not routable: \(full.routable)")
         guard let waiting = full.waiting.first(where: { $0.name == "acct-01" }) else { preconditionFailure("acct-01 must wait: \(full.waiting.map(\.name))") }
         precondition(waiting.cause == .weekly && (waiting.returnSeconds ?? 0) > 5 * 86_400, "\(waiting.cause)")
-        let fullHealth = parseTeamClaudeHealth(config: nil, server: nil, status: weeklyOnlyStatus(fixture) { $0["unified7d"] = 0.99 },
+        let fullHealth = parseTeamClaudeHealth(config: nil, server: nil, status: weeklyOnlyStatus(fixture, usable: false) { $0["unified7d"] = 0.99 },
                                                port: 3456, now: now)
         precondition(fullHealth.accounts.first(where: { $0.name == "acct-01" })?.isUsable == false)
 

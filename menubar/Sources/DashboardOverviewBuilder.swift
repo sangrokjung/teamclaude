@@ -131,7 +131,8 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
                     weekly: OverviewMiniWindow(label: L10n.weeklyShort, percent: row.weeklyPercent, remainingSeconds: positive(weeklyRemaining)),
                     fable: OverviewMiniWindow(label: "Fable", percent: row.fablePercent, remainingSeconds: positive(fableRemaining)),
                     projection: overviewSessionProjection(percent: row.sessionPercent, elapsed: elapsed,
-                                                          remainingSeconds: positive(sessionRemaining))))
+                                                          remainingSeconds: positive(sessionRemaining)),
+                    sessionWindowAbsent: row.sessionWindowAbsent))
             case .wait:
                 model.waitCount += 1
                 // 판정이 막힌 창으로 나눈다: 주간 창이 들었으면 주간(복귀 시각은 주간 리셋 — 세션이 먼저 풀려도 못 쓴다),

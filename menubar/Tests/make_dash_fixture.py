@@ -140,6 +140,16 @@ def build():
                 ended = dict(rows[0], name=name, accountUuid=f"{name}-uuid", status="error", errorReason="subscription-ended",
                              usable=False, subscription={"state": "ended", "endsAt": iso(local_midnight_after(-3))})
                 rows.append(ended)
+    if "--ultra" in sys.argv:
+        # 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, spec A6). 프록시가 sessionWindowStated=false를 싣는다.
+        # 기본 픽스처의 개수를 고정한 테스트가 많아 옵션으로만 붙인다.
+        ultra = account("ultra-1", weekly=0.4, fable=0.1)
+        for key in ("unified5h", "unified5hReset"):
+            ultra["quota"].pop(key)
+        ultra["quota"]["sessionWindowStated"] = False
+        accounts.append(ultra)
+        fixture["teamclaude"]["usableCount"] += 1
+        fixture["teamclaude"]["totalCount"] = len(accounts)
     if "--stale" in sys.argv:
         # 실패 화면은 실패했을 때만 나타나서 평소 스냅샷에 걸리지 않는다. 그래서 따로 그린다.
         fixture["staleNotes"] = {"grok": "12분째 갱신 없음", "agy": "31분째 갱신 없음",
