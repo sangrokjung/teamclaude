@@ -34,7 +34,9 @@ func teamClaudeApiCreditAvailability(_ row: TeamClaudeAccountHealth, health: Tea
         return availability
     }
     if row.apiCredit?.exhausted == true || row.errorReason == "credit-exhausted" {
-        return result(.excluded, L10n.apiCreditExhaustedReason)
+        // 소진 행도 같은 문구 함수를 거쳐야 "설정 저장 실패" 경고가 실제 행에 나온다.
+        let reason = row.apiCredit.map { teamClaudeApiCreditReason($0, now: now) } ?? L10n.apiCreditExhaustedReason
+        return result(.excluded, reason)
     }
     if row.status == "error" { return result(.excluded, teamAccountErrorReasonLabel(row.errorReason)) }
     if !row.enabled { return result(.excluded, L10n.reasonDisabled) }

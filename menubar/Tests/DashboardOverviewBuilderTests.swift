@@ -382,6 +382,16 @@ struct DashboardOverviewBuilderTests {
         let counts = health.apiCreditCounts
         precondition(counts.ready == 1 && counts.total == 2 && counts.exhausted == 0, "\(counts)")
         precondition(rebuilt(status, input: input, now: now).apiCreditReady == 1)
+
+        // 재검토 M4: 소진 차단을 설정에 못 쓴 키는 실제 행 사유 줄에도 "설정 저장 실패"가 나온다.
+        let unsaved: [String: Any] = ["usd": 50, "spentUsd": 1, "exhausted": true, "exhaustedReason": "credit-exhausted",
+                                      "unpricedTokens": 0, "persistFailed": true]
+        accounts.append(apiKeyAccount("api-unsaved", usable: false, credit: unsaved))
+        status["accounts"] = accounts
+        let health2 = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let ui = health2.accounts.firstIndex(where: { $0.name == "api-unsaved" }) else { preconditionFailure("api-unsaved") }
+        let unsavedState = health2.routingAvailability(now: now)[ui]
+        precondition(unsavedState.state == .excluded && unsavedState.reason.hasSuffix("설정 저장 실패(재시작하면 풀림)"), unsavedState.reason)
     }
 
     /// 재시도 시각(전원 막힘일 때 복귀까지 초)은 플래그 false 계정의 남은 5시간 값을 쓰지 않는다.
