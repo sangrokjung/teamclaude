@@ -303,6 +303,19 @@ test('실행 중 서버: 크레딧 거절이 설정에 영속되고 api-credit�
     assert.equal(live.accounts[0].credit.usd, 50);
     assert.equal(live.accounts[0].status, 'active');
     assert.equal(JSON.stringify(live).includes(KEY), false);
+
+    // 키 교체: 디스크에 옛 키의 소진 플래그가 남은 채 새 키로 바꾸고 재적용하면 새 키는 막히지 않는다.
+    const cfg = await fx.read();
+    cfg.accounts[0] = { ...cfg.accounts[0], apiKey: `${KEY}-new`, creditExhausted: { reason: 'billing', at: 1 } };
+    await writeFile(fx.configPath, JSON.stringify(cfg, null, 2));
+    const state = JSON.parse(await readFile(`${fx.configPath.replace(/\.json$/, '')}.server.json`, 'utf8'));
+    process.kill(state.workerPid, 'SIGHUP');
+    const replaced = await waitUntil(async () => {
+      const disk = await fx.read();
+      const body = await liveStatus(port);
+      return body && !disk.accounts[0].creditExhausted && body.accounts[0].credit.exhausted === false ? body : null;
+    }, `key replacement did not re-arm: ${output}`);
+    assert.equal(replaced.accounts[0].status, 'active');
   } finally {
     child.kill('SIGTERM');
     await new Promise(resolve => child.once('exit', resolve));

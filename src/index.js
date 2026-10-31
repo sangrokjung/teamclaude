@@ -4175,7 +4175,19 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       // refusal flag in both directions. persist=false, as above.
       // reconcileCreditFlagFromDisk keeps (and re-writes) a park whose earlier
       // config write failed instead of trusting the stale disk state.
-      const wantCreditExhausted = normalizeCreditExhausted(diskAcct.creditExhausted);
+      // A key replaced on disk is handled FIRST: its creditExhausted (if any)
+      // described the old key, so it is not re-applied to the new one.
+      const keyReplaced = isApiKeyAccount(mgr) && typeof diskAcct.apiKey === 'string' && diskAcct.apiKey
+        && mgr.credential !== diskAcct.apiKey;
+      if (keyReplaced) {
+        accountManager.setApiKey(mgr, diskAcct.apiKey);
+        if (mgr.status === 'error') {
+          mgr.status = 'active';
+          delete mgr.errorReason;
+        }
+        console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      }
+      const wantCreditExhausted = keyReplaced ? null : normalizeCreditExhausted(diskAcct.creditExhausted);
       if (isApiKeyAccount(mgr)) {
         accountManager.applyCreditConfig(mgr, diskAcct);
         accountManager.reconcileCreditFlagFromDisk(mgr, wantCreditExhausted);

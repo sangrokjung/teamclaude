@@ -55,7 +55,9 @@ test('구독 계정이 동시성 한도로만 꽉 찼으면 API 키로 넘기지
 });
 
 for (const [label, park] of [
-  ['쿼터 소진', a => measure(a, { five: 0.99 })],
+  ['주간 소진', a => measure(a, { seven: 0.99 })],
+  // 5시간만 가득이면 상류 유예(usageLimitGrace)가 먼저다. 유예가 거절된 뒤에야 API 키로 간다.
+  ['5시간 소진·유예 거절', a => { measure(a, { five: 0.99 }); a._graceSpentUntil = Date.now() + HOUR; }],
   ['스로틀', a => { a.status = 'throttled'; a.rateLimitedUntil = Date.now() + HOUR; }],
   ['비활성', a => { a.enabled = false; }],
   ['오류', a => { a.status = 'error'; a.errorReason = 'auth-revoked'; }],
@@ -83,9 +85,9 @@ test('구독 계정이 없는 풀은 지금처럼 API 키를 바로 쓴다', () 
 
 test('구독 계정이 회복하면 붙어 있던 API 키에서 구독으로 돌아온다', () => {
   const am = makeManager([oauth('sub-1'), apiKey('api-1')]);
-  measure(am.accounts[0], { five: 0.99 });
+  measure(am.accounts[0], { seven: 0.99 });
   assert.equal(am.getActiveAccount().name, 'api-1');
-  measure(am.accounts[0], { five: 0.2 });
+  measure(am.accounts[0], { seven: 0.2 });
   assert.equal(am.getActiveAccount().name, 'sub-1');
 });
 

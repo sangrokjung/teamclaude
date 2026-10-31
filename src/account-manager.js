@@ -428,8 +428,9 @@ export class AccountManager {
     // While the current account is still unmeasured, keep load-balancing via
     // _selectBest (which rotates among equal-rank accounts) instead of sticking
     // to an unknown-quota account — so a cold-start burst stays spread even
-    // after per-account warm-up attempts are exhausted.
-    if (!this._isMeasured(current)) {
+    // after per-account warm-up attempts are exhausted. An API key is ordered
+    // without measurement (_apiKeyCompare), so it stays sticky unmeasured.
+    if (!isApiKeyAccount(current) && !this._isMeasured(current)) {
       const best = this._selectBest(null, model, scope);
       if (best) {
         this.currentIndex = best.index;
@@ -604,7 +605,10 @@ export class AccountManager {
       // spreading to gather quota data / let tokens refresh on use). Once an
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
-      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model, { scope: creditScope })
+      // (An API key needs no measurement to be a valid home: it is never a
+      // warm-up target and its order does not come from quota headers.)
+      if (a && this.accounts[a.index] === a && (isApiKeyAccount(a) || this._isMeasured(a))
+          && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
         return a;
@@ -1237,6 +1241,9 @@ export class AccountManager {
    * state or marks it `error`, which makes it unavailable here.)
    */
   _isWarmupTarget(account, model = null) {
+    // An API key needs no header-based measurement to be ordered (expiry and
+    // estimated credit decide, _apiKeyCompare), and every probe on it is paid.
+    if (isApiKeyAccount(account)) return false;
     return this._isAvailable(account, model)
       && !this._isMeasured(account)
       && (account._warmupTries || 0) < this.maxWarmupTries;
@@ -1279,8 +1286,9 @@ export class AccountManager {
    * so no extra status carve-outs are needed beyond _isAvailable.)
    */
   warmupCandidates() {
+    // API keys are never probed: each probe spends paid credit (see _isWarmupTarget).
     return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
+      !isApiKeyAccount(a) && this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
       // Convergence cap: against the real upstream one probe fully measures an
       // account (responses always carry both window families), but a
       // pathological upstream — a 2xx missing a family, header-less responses,
@@ -1542,9 +1550,12 @@ export class AccountManager {
    * hold the request off the keys.
    */
   _anySubscriptionServable(model = null, scope = null, readOnly = false) {
+    // A subscription capped only by its 5-hour window still serves under the
+    // server's usage-limit grace (default on): the paid key waits until that
+    // grace is refused (noteGraceRefused), exactly as without a key.
     return this.accounts.some(a => a.provider === 'anthropic' && a.type === 'oauth'
       && !(scope && scope.has(a))
-      && this._isAvailable(a, model, { allowCredits: false, readOnly }));
+      && (this._isAvailable(a, model, { allowCredits: false, readOnly }) || this._isGraceEligible(a, model)));
   }
 
   _apiKeysUnlocked(model = null, scope = null, readOnly = false) {
@@ -2331,6 +2342,9 @@ export class AccountManager {
       // dispatched before it must not park the recharged key.
       account._creditGeneration = (account._creditGeneration || 0) + 1;
     }
+    // Expiry / amount / since order the keys (_apiKeyCompare): re-pick now so a
+    // live api-credit change moves the sticky primary without waiting for a timer.
+    this._reprioritize();
     return account;
   }
 
@@ -2409,7 +2423,10 @@ export class AccountManager {
     if (!isApiKeyAccount(account) || typeof key !== 'string' || !key || account.credential === key) return account || null;
     account.credential = key;
     account._creditGeneration = (account._creditGeneration || 0) + 1;
+    // Clear the flag in memory and on disk: a creditExhausted left in config
+    // described the old key and would park the new one after a restart.
     if (account.creditExhausted) this.clearCreditExhausted(account);
+    else this._persistCreditFlag(account, null);
     return account;
   }
 

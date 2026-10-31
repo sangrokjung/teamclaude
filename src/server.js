@@ -48,7 +48,7 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
-import { classifyCreditRefusal, isMessageBasedCreditReason } from './api-credit.js';
+import { classifyCreditRefusal, isApiKeyAccount, isMessageBasedCreditReason } from './api-credit.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -1567,8 +1567,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   async function refreshQuotaAll() {
     if (provider === 'codex') return refreshCodexQuotaAll();
     if (!activeWarmup || warmupClosed || !probeTemplate) return -1;
+    // API keys are excluded: a probe on a key spends paid credit, and their
+    // order does not depend on quota headers.
     const targets = accountManager.accounts.filter(a =>
-      (a.status !== 'error' || a.errorReason === 'subscription-disabled')
+      !isApiKeyAccount(a)
+      && (a.status !== 'error' || a.errorReason === 'subscription-disabled')
       && a.inflight === 0 && !a._warming);
     // Revive lapsed tokens FIRST. Background probes never refresh tokens (a
     // background failure could mark an account 'error' before any real request
@@ -3679,6 +3682,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the next refusal or reload; the request itself is not failed for it.
     const creditRefusal = async (reason, status) => {
       const parked = accountManager.setCreditExhausted(account, reason, { stamp: creditStamp });
+      // Only a park that actually happened uses up the per-request message cap.
+      if (parked && isMessageBasedCreditReason(reason)) ctx.creditMessageParks = (ctx.creditMessageParks || 0) + 1;
       if (parked) {
         await accountManager.waitForAccountFlag(account).catch(err => {
           console.error(`[TeamClaude] Failed to persist credit state for "${account.name}": ${err.message}`);
@@ -3948,10 +3953,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       // Structured signals (402 billing_error) are not capped.
       const messageCapped = reason && isMessageBasedCreditReason(reason)
         && (ctx.creditMessageParks || 0) >= 1;
-      if (reason && !messageCapped) {
-        if (isMessageBasedCreditReason(reason)) ctx.creditMessageParks = (ctx.creditMessageParks || 0) + 1;
-        return creditRefusal(reason, upstreamRes.status);
-      }
+      if (reason && !messageCapped) return creditRefusal(reason, upstreamRes.status);
       if (messageCapped) {
         console.log(`[TeamClaude] ${upstreamRes.status} credit message on "${account.name}" after one key was already parked by this request; not parking, relaying the error`);
       }

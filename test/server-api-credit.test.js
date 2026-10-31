@@ -21,11 +21,11 @@ const oauth = (name, extra = {}) => ({
   name, type: 'oauth', accessToken: `tok-${name}`, refreshToken: `r-${name}`, expiresAt: Date.now() + HOUR, ...extra,
 });
 
-// 구독 계정을 쿼터 소진으로 측정해 둔다(API 키 계층이 열리게).
+// 구독 계정을 주간 소진으로 측정해 둔다(API 키 계층이 열리게). 5시간만 가득이면 유예가 먼저다.
 function exhaust(a) {
-  a.quota.unified5h = 0.99;
+  a.quota.unified5h = 0.5;
   a.quota.unified5hReset = Date.now() + HOUR;
-  a.quota.unified7d = 0.5;
+  a.quota.unified7d = 0.99;
   a.quota.unified7dReset = Date.now() + 48 * HOUR;
 }
 function healthy(a) {
@@ -55,7 +55,7 @@ const CREDIT_LOW = { type: 'error', error: { type: 'invalid_request_error', mess
 const OK = (account, model = 'claude-haiku-4-5-20251001', usage = { input_tokens: 1_000_000, output_tokens: 0 }) =>
   ({ id: 'msg', type: 'message', model, account, usage, content: [] });
 
-async function setup(t, accounts, respond, overrides = {}) {
+async function setup(t, accounts, respond, overrides = {}, { measureKeys = true } = {}) {
   const seen = [];
   const upstream = http.createServer(async (req, res) => {
     const body = await readBody(req);
@@ -66,7 +66,7 @@ async function setup(t, accounts, respond, overrides = {}) {
   const upstreamPort = await listen(upstream);
   const am = new AccountManager(accounts, 0.98, 0, 3);
   for (const a of am.accounts) {
-    if (a.type === 'apikey') { a.quota.tokensLimit = 1000; a.quota.tokensRemaining = 900; }
+    if (measureKeys && a.type === 'apikey') { a.quota.tokensLimit = 1000; a.quota.tokensRemaining = 900; }
   }
   const proxy = createProxyServer(am, {
     proxy: { apiKey: 'k' },
@@ -77,7 +77,7 @@ async function setup(t, accounts, respond, overrides = {}) {
   const port = await listen(proxy);
   t.after(() => close(proxy));
   t.after(() => close(upstream));
-  return { am, port, seen };
+  return { am, port, seen, proxy };
 }
 
 function post(port, { path = '/v1/messages', headers = {}, body = { model: 'claude-haiku-4-5', messages: [] } } = {}) {
@@ -287,6 +287,46 @@ test('B7: 재충전 뒤 늦게 도착한 옛 발송의 거절은 키를 다시 �
   assert.equal(key.status, 'active');
   assert.deepEqual(flags, ['credit-exhausted', null], '영속 쓰기도 다시 일어나지 않는다');
   assert.equal(seen.filter(entry => entry.body.includes('"tag":"B"')).length, 1, 'B는 같은 키로 다시 보내지 않는다');
+});
+
+test('B7: 늦어서 무시된 거절은 요청당 메시지 기반 차단 1개 한도를 쓰지 않는다', async t => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  let firstSeen;
+  const arrived = new Promise(resolve => { firstSeen = resolve; });
+  const { am, port, seen } = await setup(t, [apiKey('api-1', { creditSince: 1000 }), apiKey('api-2')], async (e, res) => {
+    if (e.who === 'api-1') {
+      firstSeen();
+      await held;
+    }
+    json(res, 400, CREDIT_LOW);
+  });
+  const pending = post(port);
+  await arrived;
+  am.applyCreditConfig(am.accounts[0], { creditSince: 2000 }); // 발송 뒤 재충전
+  release();
+  const res = await pending;
+  await res.text();
+  assert.deepEqual(seen.map(e => e.who), ['api-1', 'api-2']);
+  assert.equal(am.accounts[0].creditExhausted, undefined, '옛 발송의 거절은 무시');
+  assert.equal(am.accounts[1].creditExhausted?.reason, 'credit-exhausted', '두 번째 키의 실제 거절은 차단된다');
+  assert.equal(res.status, 429);
+});
+
+test('active warm-up과 R(refreshQuotaAll)은 API 키에 유료 프로브를 보내지 않는다', async t => {
+  const { am, port, seen, proxy } = await setup(t, [oauth('sub-1'), apiKey('api-1'), apiKey('api-2', { creditExpiresAt: Date.now() + 24 * HOUR })],
+    (e, res) => json(res, 200, OK(e.who)),
+    { activeWarmup: true, warmupIntervalMs: 0 }, { measureKeys: false });
+  exhaust(am.accounts[0]);
+  const res = await post(port, { body: { model: 'claude-haiku-4-5', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] } });
+  assert.equal(res.status, 200);
+  await res.json();
+  await new Promise(resolve => setTimeout(resolve, 100)); // 템플릿 확정 뒤 warmupUnmeasured 팬아웃
+  assert.deepEqual(seen.filter(e => e.headers['x-api-key']).map(e => e.who), ['api-2'],
+    '만료 임박 키가 서빙하고 다른 키로 프로브가 가지 않는다(구독 프로브는 기존 동작)');
+  const refreshed = await proxy.refreshQuotaAll();
+  assert.ok(refreshed === -1 || refreshed.targets === 1, JSON.stringify(refreshed));
+  assert.equal(seen.filter(e => e.headers['x-api-key']).length, 1, 'R도 API 키를 프로브하지 않는다');
 });
 
 test('B4: 단가 없는 모델은 unpriced 토큰으로 센다, 구독 계정 응답은 원장에 넣지 않는다', async t => {
