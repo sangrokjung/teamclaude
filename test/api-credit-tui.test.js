@@ -21,6 +21,7 @@ test('formatApiCreditCompact: 남은/충전, 소진, 충전 미입력', () => {
   assert.equal(formatApiCreditCompact({ usd: 10, spentUsd: 15, exhausted: false }), '$0/10');
   assert.equal(formatApiCreditCompact({ usd: null, spentUsd: 1.5, exhausted: false }), 'sp $1.5');
   assert.equal(formatApiCreditCompact({ usd: 50, spentUsd: 0, exhausted: true }), 'out');
+  assert.equal(formatApiCreditCompact({ usd: 50, spentUsd: 0, exhausted: true, persistFailed: true }), 'out!', '설정 저장 실패');
   assert.equal(formatApiCreditCompact(null), '-');
 });
 

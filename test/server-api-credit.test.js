@@ -233,6 +233,62 @@ test('B4: 스트리밍 응답도 message_start 모델로 입력·출력 비용�
   assert.ok(Math.abs(am.accounts[0].quota.apiSpendUsd - 2.1) < 1e-9, String(am.accounts[0].quota.apiSpendUsd));
 });
 
+test('B4: message_delta의 누적 output_tokens는 증가분만 원장에 더한다(복수 delta·같은 값 반복)', async t => {
+  const { am, port } = await setup(t, [apiKey('api-1'), apiKey('api-2')], (e, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+    const model = e.who === 'api-1' ? 'claude-haiku-4-5-20251001' : 'claude-future-9';
+    res.write(ev('message_start', { message: { id: 'm', model, usage: { input_tokens: 0, output_tokens: 1 } } }));
+    res.write(ev('message_delta', { delta: {}, usage: { output_tokens: 100_000 } }));
+    res.write(ev('message_delta', { delta: {}, usage: { output_tokens: 200_000 } }));
+    res.write(ev('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 200_000 } }));
+    res.end(ev('message_stop', {}));
+  });
+  await (await post(port, { body: { model: 'claude-haiku-4-5', stream: true, messages: [] } })).text();
+  // 최종 출력 0.2M × $5 = $1 (100k + 200k + 200k = 500k로 세면 $2.5)
+  assert.ok(Math.abs(am.accounts[0].quota.apiSpendUsd - 1) < 1e-9, String(am.accounts[0].quota.apiSpendUsd));
+  // 단가 없는 모델의 토큰 수도 같은 규칙.
+  am.setCreditExhausted(am.accounts[0], 'billing', { persist: false });
+  await (await post(port, { body: { model: 'claude-future-9', stream: true, messages: [] } })).text();
+  assert.equal(am.accounts[1].quota.apiUnpricedTokens, 200_000);
+});
+
+test('B7: 재충전 뒤 늦게 도착한 옛 발송의 거절은 키를 다시 차단하지 않는다', async t => {
+  let releaseB;
+  const bHeld = new Promise(resolve => { releaseB = resolve; });
+  let bArrived;
+  const bSeen = new Promise(resolve => { bArrived = resolve; });
+  const { am, port, seen } = await setup(t, [apiKey('api-1', { creditUsd: 20, creditSince: 1000 })], async (e, res) => {
+    if (e.body.includes('"tag":"B"')) {
+      bArrived();
+      await bHeld;
+    }
+    json(res, 400, CREDIT_LOW);
+  });
+  const flags = [];
+  am.onAccountCreditFlag((account, value) => { flags.push(value?.reason ?? null); });
+  const b = post(port, { body: { model: 'claude-haiku-4-5', tag: 'B', messages: [] } });
+  await bSeen;
+  const a = await post(port, { body: { model: 'claude-haiku-4-5', tag: 'A', messages: [] } });
+  assert.equal(a.status, 429);
+  await a.text();
+  const key = am.accounts[0];
+  assert.equal(key.errorReason, 'credit-exhausted');
+
+  // 운영자가 충전 후 api-credit(재적용 경로와 같은 순서).
+  am.applyCreditConfig(key, { creditUsd: 50, creditSince: 2000 });
+  am.clearCreditExhausted(key);
+  assert.equal(key.status, 'active');
+
+  releaseB();
+  const late = await b;
+  await late.text();
+  assert.equal(key.creditExhausted, undefined, '옛 발송의 거절은 새 충전 상태를 차단하지 않는다');
+  assert.equal(key.status, 'active');
+  assert.deepEqual(flags, ['credit-exhausted', null], '영속 쓰기도 다시 일어나지 않는다');
+  assert.equal(seen.filter(entry => entry.body.includes('"tag":"B"')).length, 1, 'B는 같은 키로 다시 보내지 않는다');
+});
+
 test('B4: 단가 없는 모델은 unpriced 토큰으로 센다, 구독 계정 응답은 원장에 넣지 않는다', async t => {
   const { am, port } = await setup(t, [oauth('sub-1'), apiKey('api-1')], (e, res) =>
     json(res, 200, OK(e.who, 'claude-future-9', { input_tokens: 100, output_tokens: 20 })));

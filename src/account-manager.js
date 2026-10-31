@@ -14,6 +14,7 @@ import {
   subscriptionSnapshot,
 } from './subscription.js';
 import {
+  apiKeyFingerprint,
   creditStatus,
   isApiKeyAccount,
   normalizeCreditExhausted,
@@ -2274,8 +2275,12 @@ export class AccountManager {
     if (!isApiKeyAccount(account)) return;
     Object.assign(account, readCreditConfig(source || {}));
     account.quota.apiSpendSince = account.creditSince;
+    account._creditGeneration = 0;
     const exhausted = normalizeCreditExhausted(source?.creditExhausted);
-    if (exhausted) this._parkCreditExhausted(account, exhausted);
+    if (exhausted) {
+      this._parkCreditExhausted(account, exhausted);
+      account._creditFlagPersisted = true; // read from config
+    }
   }
 
   _parkCreditExhausted(account, exhausted) {
@@ -2322,27 +2327,114 @@ export class AccountManager {
       account.quota.apiSpendUsd = 0;
       account.quota.apiUnpricedTokens = 0;
       account.quota.apiSpendSince = next.creditSince;
+      // A re-set top-up is a new credit generation: a refusal for a request
+      // dispatched before it must not park the recharged key.
+      account._creditGeneration = (account._creditGeneration || 0) + 1;
     }
     return account;
+  }
+
+  /**
+   * Dispatch-time identity of an API key's credit state (no key material:
+   * a fingerprint only). A refusal applies only while it still matches, so a
+   * slow response cannot park a key that was recharged or replaced after the
+   * request left. Null for subscription and Codex accounts.
+   */
+  creditDispatchStamp(ref) {
+    const account = this._resolve(ref);
+    if (!isApiKeyAccount(account)) return null;
+    return {
+      generation: account._creditGeneration || 0,
+      since: account.creditSince ?? null,
+      keyFingerprint: apiKeyFingerprint(account.credential),
+    };
+  }
+
+  _creditStampCurrent(account, stamp) {
+    if (!stamp) return true;
+    const now = this.creditDispatchStamp(account);
+    return Boolean(now) && now.generation === stamp.generation && now.since === stamp.since
+      && now.keyFingerprint === stamp.keyFingerprint;
+  }
+
+  _persistCreditFlag(account, value, stamp = null) {
+    if (this.accounts[account.index] !== account) return;
+    if (value) account._creditFlagPersisted = false;
+    this._queueAccountWrite(account, () => Promise.resolve(this._onAccountCreditFlag?.(account, value, stamp)).then(
+      () => { if (value && account.creditExhausted) account._creditFlagPersisted = true; },
+      err => {
+        if (value) account._creditFlagPersisted = false;
+        throw err;
+      },
+    ));
   }
 
   /**
    * Upstream refused this API key for credit (B7): park it persistently. Only
    * an explicit re-arm (clearCreditExhausted via api-credit or a key
    * re-registration) returns it to rotation; no probe or timer revives it.
+   * `stamp` (creditDispatchStamp at dispatch) rejects a stale refusal: returns
+   * null and changes nothing. A park whose config write failed is written
+   * again by the next identical refusal instead of being deduplicated.
    */
-  setCreditExhausted(ref, reason, { persist = true, at = Date.now() } = {}) {
+  setCreditExhausted(ref, reason, { persist = true, at = Date.now(), stamp = null } = {}) {
     const account = this._resolveRef(ref);
     if (!isApiKeyAccount(account)) return null;
+    if (!this._creditStampCurrent(account, stamp)) {
+      console.log(`[TeamClaude] API key account "${account.name}" credit refusal arrived after a recharge or key change; ignored`);
+      return null;
+    }
     const next = normalizeCreditExhausted({ reason, at });
     const unchanged = account.creditExhausted?.reason === next.reason;
     this._parkCreditExhausted(account, unchanged ? account.creditExhausted : next);
-    if (unchanged) return account;
-    if (persist && this.accounts[account.index] === account) {
-      const snapshot = { ...next };
-      this._queueAccountWrite(account, () => this._onAccountCreditFlag?.(account, snapshot));
+    account._creditParkStamp = stamp || this.creditDispatchStamp(account);
+    if (!persist) {
+      account._creditFlagPersisted = true; // the flag came from disk
+      return account;
     }
-    console.log(`[TeamClaude] API key account "${account.name}" refused for credit (${next.reason}); out of rotation until re-armed`);
+    if (unchanged && account._creditFlagPersisted !== false) return account;
+    this._persistCreditFlag(account, { ...account.creditExhausted }, account._creditParkStamp);
+    if (!unchanged) {
+      console.log(`[TeamClaude] API key account "${account.name}" refused for credit (${next.reason}); out of rotation until re-armed`);
+    }
+    return account;
+  }
+
+  /**
+   * Replace an API key's credential (re-registration seen on reload). A new key
+   * is a new credit generation and re-arms a credit refusal of the old one.
+   */
+  setApiKey(ref, key) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account) || typeof key !== 'string' || !key || account.credential === key) return account || null;
+    account.credential = key;
+    account._creditGeneration = (account._creditGeneration || 0) + 1;
+    if (account.creditExhausted) this.clearCreditExhausted(account);
+    return account;
+  }
+
+  /**
+   * Apply the config's creditExhausted on reload. A park whose config write
+   * failed is not undone by the (stale) disk state; its write is retried. A
+   * saved park missing from disk was re-armed (api-credit) and is cleared.
+   */
+  reconcileCreditFlagFromDisk(ref, raw) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    const want = normalizeCreditExhausted(raw);
+    if (!want) {
+      if (!account.creditExhausted) return account;
+      // An unsaved park is kept and re-written, unless the credit state moved on
+      // since (api-credit changed creditSince, or a new key): that is a re-arm.
+      if (account._creditFlagPersisted === false && this._creditStampCurrent(account, account._creditParkStamp)) {
+        this._persistCreditFlag(account, { ...account.creditExhausted }, account._creditParkStamp);
+        return account;
+      }
+      return this.clearCreditExhausted(account, { persist: false });
+    }
+    if (account.creditExhausted?.reason !== want.reason || account._creditFlagPersisted === false) {
+      return this.setCreditExhausted(account, want.reason, { persist: false, at: want.at ?? Date.now() });
+    }
     return account;
   }
 
@@ -2351,6 +2443,9 @@ export class AccountManager {
     if (!isApiKeyAccount(account)) return null;
     if (!account.creditExhausted) return account;
     delete account.creditExhausted;
+    delete account._creditFlagPersisted;
+    delete account._creditParkStamp;
+    account._creditGeneration = (account._creditGeneration || 0) + 1;
     if (account.status === 'error' && account.errorReason === 'credit-exhausted') {
       account.status = 'active';
       delete account.errorReason;

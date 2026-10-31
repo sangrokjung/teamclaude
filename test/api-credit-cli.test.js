@@ -206,6 +206,16 @@ test('CLI status: API 키 행에 추정 남은 금액·만료일·소진 표시'
   assert.equal(r.stdout.includes('test-key'), false);
 });
 
+test('CLI status: 소진 차단을 설정에 쓰지 못했으면 그렇게 말한다', async () => {
+  const r = await statusOutput([
+    statusAccount('api-1', { status: 'error', errorReason: 'credit-exhausted', usable: false,
+      credit: { usd: 50, spentUsd: 1, remainingUsd: 49, since: 1, expiresAt: null,
+        exhausted: true, exhaustedReason: 'billing', unpricedTokens: 0, persistFailed: true } }),
+  ]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /\[credit exhausted: billing\] \(not saved to config; lost on restart, retried\)/);
+});
+
 test('CLI status: credit 블록이 없는 옛 서버 응답도 그대로 출력된다', async () => {
   const r = await statusOutput([statusAccount('api-1')]);
   assert.equal(r.status, 0, r.stderr);

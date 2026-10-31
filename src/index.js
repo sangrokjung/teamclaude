@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
-import { isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
+import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -1515,20 +1515,34 @@ async function proxyWorkerCommand() {
   }));
   // Same discipline for the API-key credit refusal flag (B7): persisted the
   // moment the request path parks a key, so a restart keeps it out.
-  accountManager.onAccountCreditFlag((account, exhausted) => atomicConfigUpdate(diskConfig => {
-    const cfgIdx = findConfigAccount(diskConfig, account);
-    if (cfgIdx < 0) return;
-    if (exhausted) diskConfig.accounts[cfgIdx].creditExhausted = exhausted;
-    else delete diskConfig.accounts[cfgIdx].creditExhausted;
-  }).then(() => {
-    const memIdx = findConfigAccount(config, account);
-    if (memIdx < 0) return;
-    if (exhausted) config.accounts[memIdx].creditExhausted = exhausted;
-    else delete config.accounts[memIdx].creditExhausted;
-  }).catch(err => {
-    console.error(`[TeamClaude] Failed to persist credit flag for "${account.name}": ${err.message}`);
-    throw err;
-  }));
+  // A park is written only while the disk entry still has the creditSince and
+  // key the refused request was sent with: a slow write must not re-block a key
+  // the operator recharged (api-credit) or replaced in the meantime.
+  accountManager.onAccountCreditFlag((account, exhausted, stamp) => {
+    let stale = false;
+    return atomicConfigUpdate(diskConfig => {
+      const cfgIdx = findConfigAccount(diskConfig, account);
+      if (cfgIdx < 0) return;
+      if (exhausted && !creditStampMatchesConfig(diskConfig.accounts[cfgIdx], stamp)) {
+        stale = true;
+        return;
+      }
+      if (exhausted) diskConfig.accounts[cfgIdx].creditExhausted = exhausted;
+      else delete diskConfig.accounts[cfgIdx].creditExhausted;
+    }).then(() => {
+      if (stale) {
+        console.log(`[TeamClaude] Credit refusal for "${account.name}" not saved: its config changed after dispatch (recharge or new key)`);
+        return;
+      }
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx < 0) return;
+      if (exhausted) config.accounts[memIdx].creditExhausted = exhausted;
+      else delete config.accounts[memIdx].creditExhausted;
+    }).catch(err => {
+      console.error(`[TeamClaude] Failed to persist credit flag for "${account.name}": ${err.message}`);
+      throw err;
+    });
+  });
   accountManager.onAccountMetadata((account, metadata) => atomicConfigUpdate(diskConfig => {
     const cfgIdx = findConfigAccount(diskConfig, account);
     if (cfgIdx < 0) return;
@@ -2339,6 +2353,7 @@ function apiCreditStatusLine(credit) {
     line += `, ${credit.unpricedTokens.toLocaleString('en-US')} unpriced tokens`;
   }
   if (credit.exhausted === true) line += ` [credit exhausted${credit.exhaustedReason ? `: ${credit.exhaustedReason}` : ''}]`;
+  if (credit.exhausted === true && credit.persistFailed === true) line += ' (not saved to config; lost on restart, retried)';
   return line;
 }
 
@@ -4158,17 +4173,12 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       // API-key credit (api-credit while the server runs): amount / since /
       // expiry, a changed creditSince restarting the spend ledger, and the
       // refusal flag in both directions. persist=false, as above.
+      // reconcileCreditFlagFromDisk keeps (and re-writes) a park whose earlier
+      // config write failed instead of trusting the stale disk state.
       const wantCreditExhausted = normalizeCreditExhausted(diskAcct.creditExhausted);
       if (isApiKeyAccount(mgr)) {
         accountManager.applyCreditConfig(mgr, diskAcct);
-        if (!wantCreditExhausted && mgr.creditExhausted) {
-          accountManager.clearCreditExhausted(mgr, { persist: false });
-        } else if (wantCreditExhausted && mgr.creditExhausted?.reason !== wantCreditExhausted.reason) {
-          accountManager.setCreditExhausted(mgr, wantCreditExhausted.reason, {
-            persist: false,
-            at: wantCreditExhausted.at ?? Date.now(),
-          });
-        }
+        accountManager.reconcileCreditFlagFromDisk(mgr, wantCreditExhausted);
       }
       const memAcct = memConfig.accounts[memIdx];
       if (memAcct && isApiKeyAccount(mgr)) {
@@ -4234,10 +4244,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
-      // A re-registered key is a fresh credential: re-arm a credit refusal
-      // recorded against the old one (persisted, so the disk flag goes too).
-      if (mgr.creditExhausted) accountManager.clearCreditExhausted(mgr);
+      // A re-registered key is a fresh credential and a new credit generation:
+      // setApiKey re-arms a credit refusal recorded against the old key
+      // (persisted, so the disk flag goes too) and voids in-flight refusals.
+      if (isApiKeyAccount(mgr)) accountManager.setApiKey(mgr, freshCred.apiKey);
+      else mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') {
         mgr.status = 'active';
         delete mgr.errorReason;

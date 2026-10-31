@@ -3600,6 +3600,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       signal: upstreamDeadline.signal,
     };
     const dispatchedAt = Date.now();
+    // API key credit state as it was when this request left (key fingerprint,
+    // creditSince, re-arm generation). A refusal that arrives after a recharge
+    // or key change must not park the key it no longer describes.
+    const creditStamp = accountManager.creditDispatchStamp?.(account) ?? null;
     const upstreamRequest = ctx.provider === 'codex'
       ? requestUpstreamRaw(upstreamUrl, requestOptions)
       : fetch(upstreamUrl, { ...requestOptions, redirect: 'manual' });
@@ -3669,13 +3673,21 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // is parked persistently and the request moves on (never back to the same
     // key). With no alternative, selection lands on the existing 429 /
     // continuity path instead of relaying the billing error.
+    // A stale refusal (dispatched before a recharge / key change) parks nothing;
+    // this request still moves on without re-sending to the same key. A failed
+    // config write is reported in status (credit.persistFailed) and retried by
+    // the next refusal or reload; the request itself is not failed for it.
     const creditRefusal = async (reason, status) => {
-      accountManager.setCreditExhausted(account, reason);
-      await accountManager.waitForAccountFlag(account).catch(err => {
-        console.error(`[TeamClaude] Failed to persist credit state for "${account.name}": ${err.message}`);
-      });
+      const parked = accountManager.setCreditExhausted(account, reason, { stamp: creditStamp });
+      if (parked) {
+        await accountManager.waitForAccountFlag(account).catch(err => {
+          console.error(`[TeamClaude] Failed to persist credit state for "${account.name}": ${err.message}`);
+        });
+      } else {
+        ctx.tried5xx.add(account);
+      }
       if (logDir) {
-        appendLogSection(`=== RESPONSE ${status} — API key credit refused (${reason}), account parked ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        appendLogSection(`=== RESPONSE ${status} — API key credit refused (${reason}), ${parked ? 'account parked' : 'stale, not parked'} ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
         flushRequestLog(logDir, reqId, logSections, hooks);
       }
       releaseHeld();
@@ -5387,10 +5399,18 @@ function parseSSEUsage(event, account, accountManager, usageState = {}) {
       // Input side now; message_delta carries the cumulative output total,
       // so message_start's provisional output count is not charged.
       usageState.model = data.message.model;
+      usageState.outputTokens = 0;
       accountManager.recordApiSpend?.(account, { ...data.message.usage, output_tokens: 0 }, usageState.model);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(account, 0, data.usage.output_tokens);
-      accountManager.recordApiSpend?.(account, { output_tokens: data.usage.output_tokens }, usageState.model);
+      // output_tokens is the cumulative total so far: charge only its increase,
+      // or several deltas for one message would be billed several times.
+      const total = data.usage.output_tokens;
+      const previous = usageState.outputTokens || 0;
+      if (Number.isFinite(total) && total > previous) {
+        usageState.outputTokens = total;
+        accountManager.recordApiSpend?.(account, { output_tokens: total - previous }, usageState.model);
+      }
     } else if (data.type === 'response.completed' && data.response?.usage) {
       accountManager.updateUsage(
         account,

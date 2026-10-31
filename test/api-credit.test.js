@@ -192,11 +192,11 @@ test('상태 응답 credit 블록: 키 값 없이 금액·만료·소진을 싣�
   const [s1, s2, s3] = status.accounts;
   assert.deepEqual(s1.credit, {
     usd: 50, spentUsd: 6, remainingUsd: 44, since: SINCE, expiresAt: EXPIRES,
-    exhausted: false, exhaustedReason: null, unpricedTokens: 3,
+    exhausted: false, exhaustedReason: null, unpricedTokens: 3, persistFailed: false,
   });
   assert.deepEqual(s2.credit, {
     usd: null, spentUsd: 0, remainingUsd: null, since: null, expiresAt: null,
-    exhausted: true, exhaustedReason: 'usage-limit', unpricedTokens: 0,
+    exhausted: true, exhaustedReason: 'usage-limit', unpricedTokens: 0, persistFailed: false,
   });
   assert.equal(s2.errorReason, 'credit-exhausted');
   assert.equal('credit' in s3, false, '구독 계정에는 credit 블록이 없다');
