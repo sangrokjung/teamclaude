@@ -442,19 +442,22 @@ test('needsPartialRemeasure caps after maxWarmupTries fruitless probes', () => {
 
 test('topUpPartialQuota caps probes on a genuinely half-reporting upstream (no infinite probing)', async () => {
   let probeCount = 0;
-  // An upstream that answers a probe with ONLY the weekly (7d) window — never
-  // the session (5h) window — so an account it "measures" stays half-measured
-  // forever (a genuinely half-reporting upstream). Its 7d is exhausted (0.99),
-  // so the account is unavailable → NOT an ordinary warm-up candidate, making
-  // topUpPartialQuota the only path that probes it (a clean probe count).
+  // An upstream that answers a probe with ONLY the session (5h) window — never
+  // the weekly (7d) window — so an account it "measures" stays half-measured
+  // forever (a genuinely half-reporting upstream). (The inverse, 7d-only on an
+  // accepted response, is the verified-Ultra "no session window" contract and
+  // converges after one probe — see claude-session-window.test.js.) Its 5h is
+  // exhausted (0.99), so the account is unavailable → NOT an ordinary warm-up
+  // candidate, making topUpPartialQuota the only path that probes it (a clean
+  // probe count).
   const upstream = http.createServer(async (req, res) => {
     let raw = '';
     for await (const c of req) raw += c;
     if (raw.includes('"max_tokens":1')) probeCount++;
     res.writeHead(200, {
       'content-type': 'application/json',
-      'anthropic-ratelimit-unified-7d-utilization': '0.99',
-      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 24 * HOUR) / 1000)),
+      'anthropic-ratelimit-unified-5h-utilization': '0.99',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
     });
     res.end('{"ok":true}');
   });
@@ -463,11 +466,11 @@ test('topUpPartialQuota caps probes on a genuinely half-reporting upstream (no i
   const proxy = createProxyServer(am, { upstream: `http://127.0.0.1:${upstreamPort}`, warmupIntervalMs: 20 });
   await listen(proxy);
   try {
-    // Put the account into the exact post-restart partial state FIRST (weekly
-    // window present + exhausted, session window absent, fresh budget) — set
-    // before the template goes live so no unmeasured-warm-up probe can race in.
+    // Put the account into a partial state FIRST (session window present +
+    // exhausted, weekly window absent, fresh budget) — set before the template
+    // goes live so no unmeasured-warm-up probe can race in.
     const a = am.accounts[0];
-    a.quota.unified7d = 0.99; a.quota.unified7dReset = Date.now() + 24 * HOUR;
+    a.quota.unified5h = 0.99; a.quota.unified5hReset = Date.now() + HOUR;
     a._partialProbes = 0;
     // Inject a known-accepted probe template (no client traffic needed) so the
     // periodic top-up can probe.
