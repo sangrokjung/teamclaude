@@ -82,6 +82,24 @@ export function classifyCreditRefusal(status, body) {
   return error.type === 'billing_error' ? 'billing' : null;
 }
 
+function compactUsd(n) {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  if (n >= 100 || Number.isInteger(n)) return String(Math.round(n));
+  return n.toFixed(1);
+}
+
+/**
+ * TUI 칸에 들어가는 짧은 표기: `$남은/충전`(추정, 0 미만은 0), 소진이면 `out`,
+ * 충전 금액이 없으면 `sp $지출`. credit 블록이 없으면 `-`.
+ */
+export function formatApiCreditCompact(credit) {
+  if (!credit || typeof credit !== 'object') return '-';
+  if (credit.exhausted === true) return 'out';
+  const spent = Number.isFinite(credit.spentUsd) ? credit.spentUsd : 0;
+  if (!Number.isFinite(credit.usd)) return `sp $${compactUsd(spent)}`;
+  return `$${compactUsd(Math.max(0, credit.usd - spent))}/${compactUsd(credit.usd)}`;
+}
+
 /** 상태 응답용 credit 블록. 키 값·키 일부는 넣지 않는다. */
 export function creditStatus(account) {
   const usd = account.creditUsd ?? null;
