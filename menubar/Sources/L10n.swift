@@ -240,6 +240,7 @@ enum L10n {
     /// 5시간 창이 없는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false). 세션 칸 자리에 쓴다.
     static var sessionNone: String { t("5시간 한도 없음", "No 5-hour limit") }
     static var sessionNoneShort: String { t("없음", "None") }
+    static var sessionResetNone: String { t("세션 없음", "No session") }
     static var weeklyShort: String { t("주간", "Weekly") }
     static var factSubscription: String { t("구독", "Plan") }
     static var factConcurrent: String { t("동시 요청", "Concurrent") }

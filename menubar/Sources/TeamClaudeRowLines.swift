@@ -87,7 +87,7 @@ func teamClaudeSessionEmptyLabel(sessionWindowAbsent: Bool, stale: Bool, quotaBl
 
 /// 펼친 상세의 리셋 줄 중 세션 부분. 5시간 창이 없으면 리셋 시각 대신 "세션 없음".
 func teamClaudeSessionResetPart(sessionWindowAbsent: Bool, resetLabel: String) -> String {
-    "\(L10n.sessionShort) \(sessionWindowAbsent ? L10n.sessionNoneShort : resetLabel)"
+    sessionWindowAbsent ? L10n.sessionResetNone : "\(L10n.sessionShort) \(resetLabel)"
 }
 
 /// 행을 묶는 상태(사용 가능 · 한도 대기 · 확인 필요 · 제외). 표는 이 순서로 묶어 그린다.

@@ -85,7 +85,7 @@ struct TeamClaudeRowLinesTests {
         precondition(teamClaudeSessionResetPart(sessionWindowAbsent: false, resetLabel: "3시간 뒤") == "세션 3시간 뒤")
         L10n.language = .en
         precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: false, quotaBlocked: false, attempted: true) == "None")
-        precondition(teamClaudeSessionResetPart(sessionWindowAbsent: true, resetLabel: "3h") == "Session None")
+        precondition(teamClaudeSessionResetPart(sessionWindowAbsent: true, resetLabel: "3h") == "No session")
         L10n.language = .ko
 
         print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns and card metrics passed")
