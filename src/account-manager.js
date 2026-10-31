@@ -1531,12 +1531,14 @@ export class AccountManager {
       account._partialProbes = 0;
       account._warmupTries = 0;
     }
-    // No session window (sessionWindowStated false): a lingering 5h value with
-    // no reset — or a past one — is a leftover from before the account lost its
-    // session window, not a live measurement. Clear it so it can't sit at 0%
-    // forever. A still-future reset is kept until it lapses.
-    if (q.sessionWindowStated === false && q.unified5h != null
-        && (q.unified5hReset == null || now >= q.unified5hReset)) {
+    // No session window (sessionWindowStated false — set only by a served,
+    // non-rejected response that metered 7d but no 5h): any 5h value still
+    // present is a leftover from before the account lost its session window,
+    // not a live measurement. Clear it, future reset included, so the proxy
+    // never blocks on a limit every surface reports as absent. A fresh 5h header
+    // flips the flag back to true and repopulates the window.
+    if (q.sessionWindowStated === false
+        && (q.unified5h != null || q.unified5hReset != null)) {
       q.unified5h = null;
       q.unified5hReset = null;
     }
@@ -2671,6 +2673,12 @@ export class AccountManager {
           sessionWindowStated: typeof s.quota.sessionWindowStated === 'boolean'
             ? s.quota.sessionWindowStated : null,
         };
+        // Same invariant as _isNearQuota: a no-session-window account carries
+        // no 5h reading, so a restored status never reports a blocking value.
+        if (a.quota.sessionWindowStated === false) {
+          a.quota.unified5h = null;
+          a.quota.unified5hReset = null;
+        }
       }
       if (s.usage && typeof s.usage === 'object') a.usage = { ...a.usage, ...s.usage };
       // A restored throttle must not overwrite the subscription-lapse park: a

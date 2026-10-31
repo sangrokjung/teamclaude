@@ -145,14 +145,32 @@ test('플래그가 null이면 reset 없는 5h 값을 지우지 않는다', () =>
   assert.equal(a.quota.unified5h, 0.3);
 });
 
-test('플래그 false여도 미래 reset이 있는 5h 값은 남는다', () => {
+test('플래그 false면 미래 reset이 있는 5h 값도 지워지고 계정이 막히지 않는다', () => {
   const am = makeManager();
   const a = am.accounts[0];
-  a.quota.unified5h = 0.3;
+  am.updateQuota(a, WEEKLY_ONLY(), { status: 200 });
+  a.quota.unified5h = 0.99;
   a.quota.unified5hReset = Date.now() + HOUR;
-  a.quota.sessionWindowStated = false;
   am._isNearQuota(a);
-  assert.equal(a.quota.unified5h, 0.3);
+  assert.equal(a.quota.unified5h, null);
+  assert.equal(a.quota.unified5hReset, null);
+  assert.equal(am.getStatus().accounts[0].usable, true);
+});
+
+test('스냅샷 복원: 플래그 false + 미래 5h 99%는 복원 시 버려지고 getStatus usable과 화면이 일치한다', () => {
+  const src = makeManager();
+  const a = src.accounts[0];
+  src.updateQuota(a, WEEKLY_ONLY(), { status: 200 });
+  const snap = src.exportQuotaState();
+  snap[0].quota.unified5h = 0.99;
+  snap[0].quota.unified5hReset = Date.now() + HOUR;
+  const am = makeManager();
+  am.importQuotaState(snap);
+  const st = am.getStatus().accounts[0];
+  assert.equal(st.quota.sessionWindowStated, false);
+  assert.equal(st.quota.unified5h, null);
+  assert.equal(st.quota.unified5hReset, null);
+  assert.equal(st.usable, true);
 });
 
 test('Max→Ultra 전환: 남은 미래 5h 99%는 weekly-only 성공 응답에서 지워지고 계정은 다시 쓸 수 있다', () => {

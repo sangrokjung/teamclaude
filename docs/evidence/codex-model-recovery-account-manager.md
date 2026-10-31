@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `b35fad2ab3152b933590e05bc0fa2e8f4dec6c5f106e8b13b3806d813f1f756c`
+- SHA-256: `961acbf54234fa18b95f04f03dcb33e565803040b08217ce5c269063dd257dc4`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
