@@ -340,6 +340,7 @@ func teamAccountErrorReasonLabel(_ reason: String?) -> String {
     case "auth-rejected": return L10n.errAuthRejected
     case "refresh-failed": return L10n.errRefreshFailed
     case "send-failed": return L10n.errSendFailed
+    case "credit-exhausted": return L10n.errCreditExhausted
     default: return L10n.errGeneric
     }
 }

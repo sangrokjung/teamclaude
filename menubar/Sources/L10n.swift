@@ -234,6 +234,26 @@ enum L10n {
     static var groupCheckNote: String { t("측정·상태를 확인하면 돌아옴", "Back after a measure or check") }
     static var groupExcluded: String { t("제외", "Excluded") }
     static var groupExcludedNote: String { t("사람이 손봐야 돌아옴", "Needs a person") }
+    // API 키 크레딧(spec B10). 구독 묶음 아래 따로 그린다. 남은 금액은 프록시의 추정이다.
+    static var groupApiCredit: String { t("API 크레딧", "API credit") }
+    static var groupApiCreditNote: String { t("구독이 모두 소진되면 사용 · 금액은 추정", "Used once every plan is out · estimated") }
+    static var stateApiStandby: String { t("대기 · 구독 소진 시", "Standby · after plans") }
+    static var stateCreditExhausted: String { t("크레딧 소진", "Credit exhausted") }
+    static var apiCreditExhaustedReason: String { t("크레딧 소진 · 충전 후 api-credit으로 다시 켜기", "Credit exhausted · top up, then re-arm with api-credit") }
+    static func apiCreditLeft(_ left: String, _ total: String) -> String { t("약 \(left) 남음 · \(total) 중 (추정)", "~\(left) left of \(total) (est.)") }
+    static func apiCreditNoTopUp(_ spent: String) -> String { t("충전 금액 미입력 · 약 \(spent) 사용 (추정)", "No top-up recorded · ~\(spent) spent (est.)") }
+    static func apiCreditExpires(_ date: String) -> String { t("만료 \(date)", "Expires \(date)") }
+    static func apiCreditExpired(_ date: String) -> String { t("만료됨 \(date)", "Expired \(date)") }
+    static func apiCreditUnpriced(_ tokens: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.groupingSeparator = ","
+        let count = formatter.string(from: NSNumber(value: tokens)) ?? "\(tokens)"
+        return t("단가 없는 토큰 \(count)", "\(count) unpriced tokens")
+    }
+    static func legendApiCredit(_ ready: Int, _ total: Int) -> String { t("API 크레딧 \(ready)/\(total)", "API credit \(ready)/\(total)") }
     static var quotaReset: String { t("리셋 대기", "Until reset") }
     static var remeasure: String { t("재측정", "Re-measure") }
     static var sessionShort: String { t("세션", "Session") }
@@ -513,6 +533,7 @@ enum L10n {
     static var errAuthRejected: String { t("인증거부", "Auth rejected") }
     static var errRefreshFailed: String { t("갱신실패", "Refresh failed") }
     static var errSendFailed: String { t("송신실패", "Send failed") }
+    static var errCreditExhausted: String { t("크레딧 소진", "Credit exhausted") }
     static var errGeneric: String { t("오류", "Error") }
     static func creditCount(_ count: Int) -> String { t("\(count)장", "\(count)") }
     static var unconfirmed: String { t("미확인", "Unknown") }
