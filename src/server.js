@@ -48,6 +48,7 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
+import { classifyCreditRefusal } from './api-credit.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -109,12 +110,15 @@ function requestUpstreamRaw(url, { method, headers, body, signal }) {
 
 // Request-scoped credit-gate scope (a Set of accounts this request may not
 // use) that also records whether the request's single reset-credit pass is
-// already charged. AccountManager only reads it through `has()`; the flag is
-// consumed by the server-installed creditDeferral.
+// already charged. AccountManager reads accounts through `has()` and the
+// `byok` flag (the /byok lane spends API-key credit before subscription
+// quota); `resetCreditsSpent` is consumed by the server-installed
+// creditDeferral.
 class CreditScope extends Set {
-  constructor(items, { resetCreditsSpent = false } = {}) {
+  constructor(items, { resetCreditsSpent = false, byok = false } = {}) {
     super(items || []);
     this.resetCreditsSpent = resetCreditsSpent;
+    this.byok = byok;
   }
 }
 
@@ -963,6 +967,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // quota left (AccountManager._creditRoutable). Default on in codex mode;
   // `codexUseCredits: false` restores "exhausted = unavailable".
   accountManager.codexUseCredits = provider === 'codex' && config.codexUseCredits !== false;
+  // Per-model price overrides for the API-key spend ledger (src/api-pricing.js).
+  accountManager.setApiPricing?.(config.apiPricing);
   const codexCreditRefusalMs = Number.isFinite(config.codexCreditRefusalMs) && config.codexCreditRefusalMs > 0
     ? config.codexCreditRefusalMs
     : DEFAULT_CODEX_CREDIT_REFUSAL_MS;
@@ -2700,6 +2706,23 @@ function isClaudeSubscriptionAccessDisabled(body) {
   }
 }
 
+// B8: Claude Code sends OAuth-only beta flags (`oauth-2025-04-20`) that mean
+// nothing on an x-api-key request. For API-key dispatches only, drop the
+// `oauth-*` tokens from anthropic-beta and keep every other token as sent; an
+// emptied header is removed. Whether upstream actually rejects the flag on a
+// key is unmeasured (needs a real key), so this removes only that one family.
+function stripOAuthBetaTokens(headers) {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== 'anthropic-beta') continue;
+    const raw = Array.isArray(headers[key]) ? headers[key].join(',') : String(headers[key]);
+    const tokens = raw.split(',').map(token => token.trim()).filter(Boolean);
+    const kept = tokens.filter(token => !token.toLowerCase().startsWith('oauth-'));
+    if (kept.length === tokens.length) continue;
+    if (kept.length === 0) delete headers[key];
+    else headers[key] = kept.join(',');
+  }
+}
+
 function logTimestamp() {
   const d = new Date();
   const pad = (n, w = 2) => String(n).padStart(w, '0');
@@ -3071,7 +3094,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // scope carries that fact to the creditDeferral check.
   const creditScope = () => {
     const scope = requestExclusions(ctx.auth401);
-    return ctx.resetCreditAttempts >= 1 ? new CreditScope(scope, { resetCreditsSpent: true }) : scope;
+    const resetCreditsSpent = ctx.resetCreditAttempts >= 1;
+    const byok = ctx.byok === true;
+    return resetCreditsSpent || byok ? new CreditScope(scope, { resetCreditsSpent, byok }) : scope;
   };
   const hasUsable = extra => accountManager.anyUsable(requestExclusions(extra), ctx.model, creditScope());
   const hasCapped = extra => accountManager.anyCapped(requestExclusions(extra), ctx.model, creditScope());
@@ -3082,8 +3107,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // (and finally a 429) instead of surfacing its 401 promptly.
   // A send-failed park is a network cooldown, not an auth verdict: counting
   // it here told operators to re-login during a pure connectivity outage.
+  // A credit-refused API key is a billing state, not an auth verdict either.
   const authFailedForRequest = a => ctx.auth401.has(a)
-    || (a.status === 'error' && a.errorReason !== 'send-failed');
+    || (a.status === 'error' && a.errorReason !== 'send-failed' && a.errorReason !== 'credit-exhausted');
   const fleetModelQuarantined = () => {
     const candidates = accountManager.accounts.filter(candidate =>
       candidate.enabled !== false
@@ -3496,6 +3522,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
     headers['x-api-key'] = account.credential;
+    stripOAuthBetaTokens(headers);
   }
 
   const hasDuplicatedCodexPrefix = ctx.provider === 'codex'
@@ -3637,6 +3664,24 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
     accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders, { status: upstreamRes.status });
+    // B7: upstream refused this API key for credit. The refusal arrived as a
+    // complete error response before any byte went to the client, so the key
+    // is parked persistently and the request moves on (never back to the same
+    // key). With no alternative, selection lands on the existing 429 /
+    // continuity path instead of relaying the billing error.
+    const creditRefusal = async (reason, status) => {
+      accountManager.setCreditExhausted(account, reason);
+      await accountManager.waitForAccountFlag(account).catch(err => {
+        console.error(`[TeamClaude] Failed to persist credit state for "${account.name}": ${err.message}`);
+      });
+      if (logDir) {
+        appendLogSection(`=== RESPONSE ${status} — API key credit refused (${reason}), account parked ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        flushRequestLog(logDir, reqId, logSections, hooks);
+      }
+      releaseHeld();
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    };
     // 401 = auth failure (stale or revoked token). For OAuth, attempt one
     // forced token refresh and retry the same account (the token may be stale
     // but still refreshable). If that doesn't fix it — refresh fails, the token
@@ -3864,6 +3909,48 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       return;
     }
 
+    if (ctx.provider === 'anthropic' && account.type === 'apikey'
+        && (upstreamRes.status === 400 || upstreamRes.status === 402)) {
+      const responseBody = await readBodyBounded(
+        upstreamRes.body,
+        ctx.maxResponseBytes,
+        ctx.reserveResponseBytes,
+        ctx.releaseReservedResponseBytes,
+      );
+      if (responseBody === null) {
+        ctx.status = 502;
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: `Upstream ${upstreamRes.status} response exceeded the proxy limit.` },
+          }));
+        }
+        return;
+      }
+      const reason = classifyCreditRefusal(upstreamRes.status, responseBody);
+      if (reason) return creditRefusal(reason, upstreamRes.status);
+
+      // Not a credit refusal: relay it byte for byte, exactly as before.
+      ctx.status = upstreamRes.status;
+      const responseHeaders = {};
+      const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
+      for (const [key, value] of upstreamRes.headers.entries()) {
+        if (HOP_BY_HOP_HEADERS.has(key) || responseConnectionHeaders.has(key)) continue;
+        if (key === CODEX_RECOVERY_SESSION_HEADER) continue;
+        if (key === 'content-encoding' || key === 'content-length') continue;
+        responseHeaders[key] = value;
+      }
+      if (logDir) {
+        appendLogSection(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers, metadataOnlyLog)}`);
+        appendLogSection(formatLogBody('=== RESPONSE BODY', responseBody));
+        flushRequestLog(logDir, reqId, logSections, hooks);
+      }
+      if (!res.headersSent) res.writeHead(upstreamRes.status, responseHeaders);
+      res.end(responseBody.length > 0 ? responseBody : undefined);
+      return;
+    }
+
     if (ctx.provider === 'codex' && upstreamRes.status === 400 && account.type === 'oauth') {
       const responseBody = await readBodyBounded(
         upstreamRes.body,
@@ -3950,6 +4037,10 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           }));
         }
         return;
+      }
+      if (ctx.provider === 'anthropic' && account.type === 'apikey') {
+        const reason = classifyCreditRefusal(429, responseBody);
+        if (reason) return creditRefusal(reason, 429);
       }
       const responseHeaders = {};
       const responseConnectionHeaders = connectionHeaderNames(upstreamRes.headers.get('connection'));
@@ -4918,6 +5009,9 @@ async function streamResponse(
   contentEncoding = null,
 ) {
   const reader = webStream.getReader();
+  // Per-stream usage state: the response model from message_start prices the
+  // output tokens reported later by message_delta (API-key spend ledger).
+  const usageState = {};
   // Usage-parsing side buffer, kept as RAW BYTES and split on the SSE event
   // boundary as bytes ("\n\n" is ASCII, so the split can never land inside a
   // multi-byte UTF-8 sequence). Reservations are in raw bytes too, so the
@@ -5013,7 +5107,7 @@ async function streamResponse(
           usageBufferDisabled = true;
         }
         for (const event of events) {
-          parseSSEUsage(event.toString('utf8'), account, accountManager);
+          parseSSEUsage(event.toString('utf8'), account, accountManager, usageState);
         }
       }
     }
@@ -5198,7 +5292,7 @@ async function streamResponse(
     // Parse any remaining (partial / never-forwarded) text for usage tracking
     if (sseBuffer.length > 0) {
       const trailing = sseBuffer.toString('utf8');
-      if (trailing.trim()) parseSSEUsage(trailing, account, accountManager);
+      if (trailing.trim()) parseSSEUsage(trailing, account, accountManager, usageState);
     }
 
     if (framer && !res.destroyed && !res.writableEnded) {
@@ -5269,7 +5363,7 @@ export function sumInputTokens(usage) {
     + (usage.cache_read_input_tokens || 0);
 }
 
-function parseSSEUsage(event, account, accountManager) {
+function parseSSEUsage(event, account, accountManager, usageState = {}) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -5277,8 +5371,13 @@ function parseSSEUsage(event, account, accountManager) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(account, sumInputTokens(data.message.usage), 0);
+      // Input side now; message_delta carries the cumulative output total,
+      // so message_start's provisional output count is not charged.
+      usageState.model = data.message.model;
+      accountManager.recordApiSpend?.(account, { ...data.message.usage, output_tokens: 0 }, usageState.model);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(account, 0, data.usage.output_tokens);
+      accountManager.recordApiSpend?.(account, { output_tokens: data.usage.output_tokens }, usageState.model);
     } else if (data.type === 'response.completed' && data.response?.usage) {
       accountManager.updateUsage(
         account,
@@ -5296,6 +5395,7 @@ function extractUsageFromBody(buffer, account, accountManager) {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(account, sumInputTokens(json.usage), json.usage.output_tokens);
+      accountManager.recordApiSpend?.(account, json.usage, json.model);
     }
   } catch {
     // not JSON or no usage
