@@ -239,6 +239,9 @@ enum L10n {
     static var groupApiCreditNote: String { t("구독이 모두 소진되면 사용 · 금액은 추정", "Used once every plan is out · estimated") }
     static var stateApiStandby: String { t("대기 · 구독 소진 시", "Standby · after plans") }
     static var stateCreditExhausted: String { t("크레딧 소진", "Credit exhausted") }
+    static var apiCreditNotSaved: String { t("설정 저장 실패(재시작하면 풀림)", "Not saved to config (lost on restart)") }
+    /// API 키가 크레딧은 남았지만 분당 토큰·요청 한도에 닿아 프록시가 잠시 쓰지 않는다(usable=false).
+    static var reasonApiRateLimited: String { t("분당 한도 대기 · 잠시 뒤 다시 사용", "Rate limit · usable again shortly") }
     static var apiCreditExhaustedReason: String { t("크레딧 소진 · 충전 후 api-credit으로 다시 켜기", "Credit exhausted · top up, then re-arm with api-credit") }
     static func apiCreditLeft(_ left: String, _ total: String) -> String { t("약 \(left) 남음 · \(total) 중 (추정)", "~\(left) left of \(total) (est.)") }
     static func apiCreditNoTopUp(_ spent: String) -> String { t("충전 금액 미입력 · 약 \(spent) 사용 (추정)", "No top-up recorded · ~\(spent) spent (est.)") }

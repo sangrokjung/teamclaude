@@ -683,8 +683,9 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             thresholdPercent: threshold * 100,
             sessionWindowAbsent: sessionWindowAbsent
         )
+        // API 키도 프록시의 usable(분당 토큰·요청 한도 포함)을 따른다. active만으로 사용 가능이라 하지 않는다.
         let isUsable = isApiKey
-            ? enabled && status == "active" && apiCredit?.exhausted != true
+            ? enabled && status == "active" && apiCredit?.exhausted != true && teamClaudeStatusBool(account["usable"]) != false
             : teamClaudeAccountIsUsable(
                 enabled: enabled,
                 status: status,

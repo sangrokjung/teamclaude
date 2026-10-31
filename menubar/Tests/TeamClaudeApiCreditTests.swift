@@ -51,6 +51,12 @@ struct TeamClaudeApiCreditTests {
         precondition(teamClaudeApiCreditReason(credit, now: beforeExpiry)
                      == "약 $12.30 남음 · $50.00 중 (추정) · 만료 \(expiryDate) · 단가 없는 토큰 1,234")
         precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기")
+        // 소진 차단을 설정에 쓰지 못했으면(재시작하면 풀림) 사유 줄이 그렇게 말한다.
+        let unsaved = teamClaudeApiCredit(["usd": 50, "spentUsd": 1, "exhausted": true, "exhaustedReason": "billing", "persistFailed": true])!
+        precondition(unsaved.persistFailed && !exhausted.persistFailed)
+        precondition(teamClaudeApiCreditReason(unsaved, now: beforeExpiry) == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기 · 설정 저장 실패(재시작하면 풀림)",
+                     teamClaudeApiCreditReason(unsaved, now: beforeExpiry))
+        precondition(L10n.reasonApiRateLimited == "분당 한도 대기 · 잠시 뒤 다시 사용")
         precondition(teamClaudeApiCreditBarValue(credit) == "$12.30")
         precondition(teamClaudeApiCreditBarValue(teamClaudeApiCredit(["spentUsd": 1])!) == "-")
         precondition(L10n.groupApiCredit == "API 크레딧")
@@ -65,6 +71,8 @@ struct TeamClaudeApiCreditTests {
         precondition(teamClaudeApiCreditExpiryText(credit, now: beforeExpiry) == "Expires \(expiryDate)")
         precondition(teamClaudeApiCreditExpiryText(credit, now: afterExpiry) == "Expired \(expiryDate)")
         precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "Credit exhausted · top up, then re-arm with api-credit")
+        precondition(teamClaudeApiCreditReason(unsaved, now: beforeExpiry).hasSuffix(" · Not saved to config (lost on restart)"))
+        precondition(L10n.reasonApiRateLimited == "Rate limit · usable again shortly")
         precondition(L10n.groupApiCredit == "API credit")
         precondition(L10n.stateCreditExhausted == "Credit exhausted")
         precondition(L10n.stateApiStandby == "Standby · after plans")

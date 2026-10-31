@@ -41,6 +41,8 @@ func teamClaudeApiCreditAvailability(_ row: TeamClaudeAccountHealth, health: Tea
     if !health.serverReachable { return result(.unconfirmed, TeamClaudeRowReason.offline) }
     let detail = row.apiCredit.map { teamClaudeApiCreditReason($0, now: now) } ?? L10n.reasonServerState
     switch row.status {
+    // 크레딧은 남았지만 프록시가 usable:false(분당 토큰·요청 한도)로 준 키는 일시 대기다(영구 소진과 구분).
+    case "active" where row.usableFromProxy == false: return result(.limited, L10n.reasonApiRateLimited)
     case "active": return result(.ready, detail)
     case "throttled", "exhausted": return result(.limited, row.status == "throttled" ? L10n.reasonThrottled : L10n.reasonQuotaReset)
     default: return result(.unconfirmed, L10n.reasonServerState)

@@ -16,6 +16,8 @@ struct TeamClaudeApiCredit: Equatable {
     var exhaustedReason: String?
     /// 단가를 모르는 모델의 토큰 수(지출 추정에 들어가지 않았다).
     var unpricedTokens: Int
+    /// 소진 차단을 프록시가 설정에 쓰지 못했다(재시작하면 풀린다, 프록시가 다시 쓴다).
+    var persistFailed = false
 
     /// 화면에 보일 남은 금액(0 미만은 0). 충전 금액이 없으면 nil.
     var remainingShownUsd: Double? { usd.map { max(0, $0 - spentUsd) } }
@@ -43,17 +45,17 @@ func teamClaudeApiCredit(_ raw: Any?) -> TeamClaudeApiCredit? {
     guard let dict = raw as? [String: Any] else { return nil }
     let usd = creditNumber(dict["usd"]).flatMap { $0 > 0 ? $0 : nil }
     let spent = creditNumber(dict["spentUsd"]).map { max(0, $0) } ?? 0
-    let exhausted: Bool
-    if let flag = dict["exhausted"] as? NSNumber, CFGetTypeID(flag) == CFBooleanGetTypeID() {
-        exhausted = flag.boolValue
-    } else {
-        exhausted = false
+    func flag(_ key: String) -> Bool {
+        guard let value = dict[key] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+        return value.boolValue
     }
+    let exhausted = flag("exhausted")
     let reason = (dict["exhaustedReason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     let unpriced = creditNumber(dict["unpricedTokens"]).map { max(0, Int($0)) } ?? 0
     return TeamClaudeApiCredit(usd: usd, spentUsd: spent, since: creditMillisDate(dict["since"]),
                                expiresAt: creditMillisDate(dict["expiresAt"]), exhausted: exhausted,
-                               exhaustedReason: reason, unpricedTokens: unpriced)
+                               exhaustedReason: reason, unpricedTokens: unpriced,
+                               persistFailed: exhausted && flag("persistFailed"))
 }
 
 private func usdText(_ value: Double) -> String { String(format: "$%.2f", value) }
@@ -82,7 +84,9 @@ func teamClaudeApiCreditExpiryText(_ credit: TeamClaudeApiCredit, now: Date = Da
 
 /// 행 2줄(사유 줄) 문구. 소진이면 다시 켜는 법, 아니면 남은 금액 · 만료 · 단가 없는 토큰.
 func teamClaudeApiCreditReason(_ credit: TeamClaudeApiCredit, now: Date = Date()) -> String {
-    if credit.exhausted { return L10n.apiCreditExhaustedReason }
+    if credit.exhausted {
+        return credit.persistFailed ? "\(L10n.apiCreditExhaustedReason) · \(L10n.apiCreditNotSaved)" : L10n.apiCreditExhaustedReason
+    }
     var parts = [teamClaudeApiCreditAmountText(credit)]
     if let expiry = teamClaudeApiCreditExpiryText(credit, now: now) { parts.append(expiry) }
     if credit.unpricedTokens > 0 { parts.append(L10n.apiCreditUnpriced(credit.unpricedTokens)) }

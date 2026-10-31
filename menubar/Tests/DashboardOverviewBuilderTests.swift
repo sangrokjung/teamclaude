@@ -35,6 +35,7 @@ struct DashboardOverviewBuilderTests {
         testWeeklyOnlyAccount(fixture: fixture, input: input, now: now)
         testWeeklyOnlyRetryAfter(now: now)
         testApiCreditAccounts(fixture: fixture, input: input, now: now)
+        testApiKeyRateLimited(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -359,6 +360,28 @@ struct DashboardOverviewBuilderTests {
         // 5. 설정에만 있는 API 키 행(서버 미동기화)도 API 키로 본다.
         let configured = teamClaudeConfiguredRows(["accounts": [["name": "api-9", "type": "apikey"]]])
         precondition(configured.first?.isApiKey == true)
+    }
+
+    /// 검토 지적 3: active이고 크레딧도 남았지만 프록시가 usable:false(분당 토큰·요청 한도)로 준 API 키는
+    /// 사용 가능이 아니라 일시 한도 대기다. 영구 크레딧 소진과 다른 문구로 보인다.
+    static func testApiKeyRateLimited(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]] else { preconditionFailure("fixture accounts") }
+        let credit: [String: Any] = ["usd": 50, "spentUsd": 1, "exhausted": false, "unpricedTokens": 0]
+        accounts.append(apiKeyAccount("api-rl", usable: false, credit: credit))
+        accounts.append(apiKeyAccount("api-ok", usable: true, credit: credit))
+        status["accounts"] = accounts
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let index = health.accounts.firstIndex(where: { $0.name == "api-rl" }) else { preconditionFailure("api-rl") }
+        let row = health.accounts[index]
+        precondition(!row.isUsable, "proxy usable:false wins over active for an API key")
+        let state = health.routingAvailability(now: now)[index]
+        precondition(state.state == .limited && state.apiCredit && teamClaudeRowGroup(state) == .apiCredit, "\(state.state)")
+        precondition(state.reason == "분당 한도 대기 · 잠시 뒤 다시 사용", state.reason)
+        precondition(teamClaudeRowPresentation(row, state).label == "한도 대기", teamClaudeRowPresentation(row, state).label)
+        let counts = health.apiCreditCounts
+        precondition(counts.ready == 1 && counts.total == 2 && counts.exhausted == 0, "\(counts)")
+        precondition(rebuilt(status, input: input, now: now).apiCreditReady == 1)
     }
 
     /// 재시도 시각(전원 막힘일 때 복귀까지 초)은 플래그 false 계정의 남은 5시간 값을 쓰지 않는다.
