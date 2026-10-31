@@ -137,6 +137,10 @@ struct OverviewModel: Equatable {
     var weeklyWaitCount = 0
     var otherWaitCount = 0
     var excludedCount = 0
+    /// API 키 계정(구독 소진 뒤의 유료 계층). 큰 숫자·상태별 수·목록에는 넣지 않고 따로 센다(spec B10).
+    var apiCreditReady = 0
+    var apiCreditTotal = 0
+    var apiCreditExhausted = 0
     /// 복귀 시각을 아는 대기 계정 가운데 가장 먼저 돌아오는 계정.
     var nextReturn: OverviewWaitingAccount?
     var todos: [OverviewTodo] = []
@@ -197,6 +201,11 @@ func overviewSummaryItems(_ model: OverviewModel, maxWidth: CGFloat) -> [(String
     ]
     if model.otherWaitCount > 0 { items.append((L10n.legendOtherWait(model.otherWaitCount), .wait, model.otherWaitCount, 0)) }
     items.append((L10n.legendExcluded(model.excludedCount), .error, model.excludedCount, 99))
+    // API 크레딧은 구독 수와 섞지 않고 따로 센다. 키가 없으면 항목도 없다.
+    if model.apiCreditTotal > 0 {
+        items.append((L10n.legendApiCredit(model.apiCreditReady, model.apiCreditTotal),
+                      model.apiCreditReady > 0 ? .info : .error, model.apiCreditTotal, 99))
+    }
     for priority in 0...2 where overviewSummaryWidth(items.map { ($0.0, $0.1) }) > maxWidth {
         items.removeAll { $0.3 == priority && $0.2 == 0 }
     }

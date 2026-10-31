@@ -32,6 +32,17 @@ struct TeamClaudeRowPresentation {
 }
 
 func teamClaudeRowPresentation(_ row: TeamClaudeAccountHealth, _ state: TeamClaudeFableAvailability) -> TeamClaudeRowPresentation {
+    // API 키는 구독이 모두 소진된 뒤의 대기다. 쓸 수 있으면 하늘색 "대기", 크레딧 거절이면 빨간 "크레딧 소진".
+    if state.apiCredit {
+        switch state.state {
+        case .ready:
+            return TeamClaudeRowPresentation(tone: .info, label: L10n.stateApiStandby, excluded: false, cap: nil)
+        case .excluded where row.apiCredit?.exhausted == true || row.errorReason == "credit-exhausted":
+            return TeamClaudeRowPresentation(tone: .error, label: L10n.stateCreditExhausted, excluded: true, cap: .error)
+        default:
+            break
+        }
+    }
     if state.subscriptionAppearance == .ended {
         return TeamClaudeRowPresentation(tone: .off, label: L10n.stateEnded, excluded: true, cap: .off)
     }
@@ -90,8 +101,13 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         let availability = health.fableAvailability(now: now)
         let opus = health.opusAvailability(now: now)
         let routing = health.routingAvailability(now: now)
-        total = max(health.accountTotal, health.accountConfigured, health.accounts.count)
-        fableReady = availability.filter { $0.state == .ready }.count
+        // 큰 숫자의 분모·Fable 레인은 구독 계정만 센다. API 키는 apiCredit* 로 따로 센다.
+        total = health.subscriptionAccountTotal
+        fableReady = zip(health.accounts, availability).filter { !$0.0.isApiKey && $0.1.state == .ready }.count
+        let apiCounts = health.apiCreditCounts
+        model.apiCreditReady = apiCounts.ready
+        model.apiCreditTotal = apiCounts.total
+        model.apiCreditExhausted = apiCounts.exhausted
         model.routable = opus.count
         model.total = total
         model.headline = health.serverReachable ? L10n.overviewHeadline(opus.count)
@@ -108,6 +124,8 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         func positive(_ value: Double?) -> Double? { value.flatMap { $0 > 0 ? $0 : nil } }
         let subscriptions = health.subscriptionResolutions(now: now)
         for (index, (row, state)) in zip(health.accounts, routing).enumerated() {
+            // API 키 행은 구독 상태별 목록·손볼 것에 넣지 않는다(위에서 따로 셌다). 보기 전용 Claude 탭 묶음에 있다.
+            if row.isApiKey { continue }
             let presentation = teamClaudeRowPresentation(row, state)
             let weeklyRemaining = teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt,
                                                              checkedAt: health.checkedAt, now: now)

@@ -1,4 +1,4 @@
-import Foundation
+import Cocoa
 
 // 프록시 상태 응답의 API 키 credit 블록(spec B9)과 Claude 탭 "API 크레딧" 묶음의 문구(B10).
 // 남은 금액은 프록시가 토큰 사용량과 단가표로 계산한 추정이다. 실제 잔액은 상류 거절(exhausted)이 진실이다.
@@ -92,4 +92,25 @@ func teamClaudeApiCreditReason(_ credit: TeamClaudeApiCredit, now: Date = Date()
 /// 막대 오른쪽 값. 남은 금액(추정) 또는 "-".
 func teamClaudeApiCreditBarValue(_ credit: TeamClaudeApiCredit) -> String {
     credit.remainingShownUsd.map(usdText) ?? "-"
+}
+
+extension PanelDraw {
+    /// API 키 행의 남은 금액 막대(추정). 채움은 남은 비율, 20% 미만이면 호박색, 빠진 키(muted)는 graphite.
+    /// 충전 금액이 없으면 트랙만 그리고 값 칸은 "-". credit 블록이 없으면(구버전 프록시) 트랙과 "-".
+    static func apiCreditMeter(_ rect: NSRect, credit: TeamClaudeApiCredit?, muted: Bool) {
+        let valueWidth: CGFloat = 64
+        let barRect = NSRect(x: rect.minX, y: rect.midY - 3, width: max(0, rect.width - valueWidth - 6), height: 6)
+        let radius = barRect.height / 2
+        fillRound(barRect, TeamClaudePalette.track, radius)
+        let fraction = credit?.exhausted == true ? 0 : credit?.remainingFraction
+        if let fraction, fraction > 0 {
+            let color = muted ? TeamClaudePalette.graphite
+                : fraction < 0.2 ? TeamClaudePalette.amber : TeamClaudePalette.mint.withAlphaComponent(0.85)
+            fillRound(NSRect(x: barRect.minX, y: barRect.minY, width: max(barRect.width * CGFloat(fraction), barRect.width * 0.03),
+                             height: barRect.height), color, radius)
+        }
+        let value = credit.map(teamClaudeApiCreditBarValue) ?? "-"
+        let color = muted || fraction == nil ? TeamClaudePalette.fg3 : (fraction ?? 1) < 0.2 ? TeamClaudePalette.amber : TeamClaudePalette.fg
+        right(value, rect.maxX, rect.midY - 7.5, TeamClaudePalette.numberFont, color)
+    }
 }

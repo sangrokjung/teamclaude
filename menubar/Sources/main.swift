@@ -207,7 +207,7 @@ struct TeamClaudeHealth {
     }
 
     var titleSlot: String {
-        let total = max(accountTotal, accountConfigured)
+        let total = max(0, max(accountTotal, accountConfigured) - accounts.filter(\.isApiKey).count)
         // 평소 경로도 개요 큰 숫자와 같은 라우팅 수(프록시 usable 포함)를 쓴다. Fable 주간 여유는 패널의 Fable 레인이 보여 준다.
         if serverReachable && accountConfigDrift == 0 {
             return L10n.titleClaudeRouting(routableCount, total)
@@ -226,7 +226,7 @@ struct TeamClaudeHealth {
             quotaLimitedCount: quotaLimitedCount,
             fableKnown: fableKnown,
             fableOver: fableOver,
-            totalAccounts: max(accountTotal, accountConfigured),
+            totalAccounts: max(0, max(accountTotal, accountConfigured) - accounts.filter(\.isApiKey).count),
             accountUsable: routableCount,
             accountActive: accountActive
         )
@@ -276,6 +276,11 @@ struct TeamClaudeAccountHealth {
     /// 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false).
     /// 참이면 세션 값은 비우고, 가용·측정 문제·재시도·소진 전망에서 세션 창을 뺀다. 필드 없음·null·true는 거짓.
     var sessionWindowAbsent = false
+    /// API 키 계정의 크레딧(상태 응답 credit 블록, spec B9). 구독 계정·구버전 프록시는 nil.
+    var apiCredit: TeamClaudeApiCredit? = nil
+    /// Anthropic API 키 계정(`teamclaude api`). 구독이 모두 소진된 뒤에 쓰는 유료 계층이라
+    /// Claude 탭에서는 구독 아래 "API 크레딧" 묶음으로, 개요에서는 따로 센다.
+    var isApiKey: Bool { source == "apikey" }
 }
 
 private let _teamClaudeISOFormatter = ISO8601DateFormatter()
@@ -664,7 +669,11 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             nowMs: nowMs
         ).map { $0 * 100 }
         let fablePercent = fableUtilization.map { $0 * 100 }
-        let measurementIssue = teamClaudeMeasurementIssue(
+        // API 키 계정은 세션·주간 창이 없다. 측정 문제로 보지 않고, 사용 가능은 켜짐·active·크레딧 미소진으로만 판정한다.
+        // 구독 사용 가능 수(usable)에는 넣지 않는다(개요가 구독과 API를 따로 센다).
+        let isApiKey = (tcString(account["source"]) ?? tcString(account["type"])) == "apikey"
+        let apiCredit = isApiKey ? teamClaudeApiCredit(account["credit"]) : nil
+        let measurementIssue = isApiKey ? nil : teamClaudeMeasurementIssue(
             enabled: enabled,
             status: status,
             sessionPercent: sessionPercent,
@@ -674,16 +683,18 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             thresholdPercent: threshold * 100,
             sessionWindowAbsent: sessionWindowAbsent
         )
-        let isUsable = teamClaudeAccountIsUsable(
-            enabled: enabled,
-            status: status,
-            sessionPercent: sessionPercent,
-            weeklyPercent: weeklyPercent,
-            fablePercent: fablePercent,
-            thresholdPercent: threshold * 100,
-            sessionWindowAbsent: sessionWindowAbsent
-        )
-        if isUsable { usable += 1 }
+        let isUsable = isApiKey
+            ? enabled && status == "active" && apiCredit?.exhausted != true
+            : teamClaudeAccountIsUsable(
+                enabled: enabled,
+                status: status,
+                sessionPercent: sessionPercent,
+                weeklyPercent: weeklyPercent,
+                fablePercent: fablePercent,
+                thresholdPercent: threshold * 100,
+                sessionWindowAbsent: sessionWindowAbsent
+            )
+        if isUsable && !isApiKey { usable += 1 }
         accountRows.append(TeamClaudeAccountHealth(
             name: name,
             isCurrent: currentAccount == name,
@@ -717,7 +728,8 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             sessionResetAt: sessionResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             weeklyResetAt: weeklyResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
-            sessionWindowAbsent: sessionWindowAbsent
+            sessionWindowAbsent: sessionWindowAbsent,
+            apiCredit: apiCredit
         ))
     }
 
@@ -873,7 +885,8 @@ func teamClaudeRetainingQuota(
             subscriptionEndReached: account.subscriptionEndReached,
             subscriptionEndsAt: account.subscriptionEndsAt,
             sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt,
-            sessionWindowAbsent: account.sessionWindowAbsent
+            sessionWindowAbsent: account.sessionWindowAbsent,
+            apiCredit: account.apiCredit
         )
     }
     let quotaPending = TeamClaudeHealth(
@@ -958,6 +971,12 @@ func teamClaudeAccountMergingQuota(
     thresholdPercent: Double,
     observedAt: Date
 ) -> TeamClaudeAccountHealth {
+    // API 키 계정은 합칠 쿼터 창이 없다. 이번 응답의 판정(크레딧·사용 가능)을 그대로 쓴다.
+    if candidate.isApiKey {
+        var current = candidate
+        current.routingMeasurementCurrent = true
+        return current
+    }
     let candidatePair = teamClaudeQuotaPair(for: candidate)
     let previousPair = teamClaudeAdjustedQuotaPair(
         previous.flatMap(teamClaudeQuotaPair(for:)),
@@ -1106,7 +1125,7 @@ func teamClaudeHealthMergingQuota(
         accountTotal: candidate.accountTotal,
         accountConfigured: candidate.accountConfigured,
         accountActive: candidate.accountActive,
-        accountUsable: accounts.filter(\.isUsable).count,
+        accountUsable: accounts.filter { $0.isUsable && !$0.isApiKey }.count,
         accountThrottled: candidate.accountThrottled,
         accountExhausted: candidate.accountExhausted,
         accountError: candidate.accountError,
@@ -2544,10 +2563,12 @@ final class TeamClaudeTableView: NSView {
         // 측정·연동 안내
         let availability = health.routingAvailability(now: evaluatedAt)
         subscriptionButtons.forEach { $0.refreshTitle(now: evaluatedAt) }
-        let ready = availability.filter { $0.state == .ready }.count
-        let limited = availability.filter { $0.state == .limited }.count
-        let excluded = availability.filter { $0.state == .excluded }.count
-        let unconfirmed = availability.filter { $0.state == .unconfirmed }.count
+        // 안내 띠는 구독 계정만 센다. API 키는 아래 "API 크레딧" 묶음이 따로 말한다.
+        let subscriptionStates = availability.filter { !$0.apiCredit }
+        let ready = subscriptionStates.filter { $0.state == .ready }.count
+        let limited = subscriptionStates.filter { $0.state == .limited }.count
+        let excluded = subscriptionStates.filter { $0.state == .excluded }.count
+        let unconfirmed = subscriptionStates.filter { $0.state == .unconfirmed }.count
         let pendingCount = health.measurementPendingCount
         let actionTone: PanelTone
         let actionTitle: String
@@ -2644,6 +2665,7 @@ final class TeamClaudeTableView: NSView {
             case .limited: tone = .wait; title = L10n.groupLimited; note = L10n.groupLimitedNote
             case .check: tone = .wait; title = L10n.groupCheck; note = L10n.groupCheckNote
             case .excluded: tone = .error; title = L10n.groupExcluded; note = L10n.groupExcludedNote
+            case .apiCredit: tone = .info; title = L10n.groupApiCredit; note = L10n.groupApiCreditNote
             }
             PanelDraw.dot(left + 2, centerY: y + 7.5, tone.color)
             let titleW = PanelDraw.text(title, left + 16, y, TeamClaudePalette.legendMediumFont, fg2)
@@ -2661,7 +2683,10 @@ final class TeamClaudeTableView: NSView {
             let presentation = teamClaudeRowPresentation(row, state)
             let subscriptionMuted = state.subscriptionAppearance.isMuted
             if isExpanded { PanelDraw.fillRound(rowRect, NSColor.white.withAlphaComponent(0.03), 8) }
-            rowHitRects.append((row.name, row.accountUuid, NSRect(x: rowRect.minX, y: rowRect.minY, width: rowRect.width, height: TeamClaudeRowMetrics.nameHeight)))
+            // API 키 행은 펼칠 상세(구독 기록·처리)가 없어 누를 자리를 만들지 않는다. 보기 전용이다.
+            if !row.isApiKey {
+                rowHitRects.append((row.name, row.accountUuid, NSRect(x: rowRect.minX, y: rowRect.minY, width: rowRect.width, height: TeamClaudeRowMetrics.nameHeight)))
+            }
             let dotColor = subscriptionMuted ? fg3 : presentation.tone.color
             PanelDraw.dot(left + 2, centerY: y + 15, dotColor)
             let textX = TeamClaudeColumns.nameX + 14
@@ -2670,8 +2695,10 @@ final class TeamClaudeTableView: NSView {
             let nameWidth = PanelDraw.text(PanelDraw.clipped(row.name, TeamClaudePalette.nameFont,
                                                              maxWidth: TeamClaudeColumns.nameWidth - 14 - SubscriptionGlyph.size - 6),
                                            textX, y + 7, TeamClaudePalette.nameFont, nameColor)
-            SubscriptionGlyph.draw(subscriptions[i].state, x: textX + nameWidth + 6, y: y + 9.5,
-                                   progress: subscriptionCancelProgress(subscriptions[i].shown, now: evaluatedAt))
+            if !row.isApiKey {
+                SubscriptionGlyph.draw(subscriptions[i].state, x: textX + nameWidth + 6, y: y + 9.5,
+                                       progress: subscriptionCancelProgress(subscriptions[i].shown, now: evaluatedAt))
+            }
             if let reasonY = teamClaudeReasonLineY(lines[i]) {
                 PanelDraw.text(PanelDraw.clipped(state.reason, micro, maxWidth: rightEdge - textX), textX, y + reasonY - 2, micro,
                                dotColor.withAlphaComponent(0.9))
@@ -2693,27 +2720,34 @@ final class TeamClaudeTableView: NSView {
                                          elapsed: panelWindowElapsed(remainingSeconds: remaining, windowSeconds: window),
                                          muted: presentation.excluded || subscriptionMuted, thresholdPercent: threshold)
             }
-            let attempted = probeAttempted(row)
-            let session = teamClaudeSessionState(percent: row.sessionPercent, lastUsed: row.probedAt, now: evaluatedAt)
-            let sessionEmpty = teamClaudeSessionEmptyLabel(sessionWindowAbsent: row.sessionWindowAbsent, stale: session.isStale,
-                                                           quotaBlocked: row.measurementIssue == .quotaBlocked, attempted: attempted)
-            meterCell(TeamClaudeColumns.sessionX, percent: session.isStale ? nil : session.percent,
-                      remaining: teamClaudeRemainingSeconds(row.sessionResetSeconds, resetAt: row.sessionResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
-                      window: teamClaudeSessionSeconds, empty: sessionEmpty)
-            // 주간·Fable 독립 표시 — 프록시는 재시작 후 Fable(7d_oi) 창을 의도적으로
-            // 스냅샷 복원하지 않고 재측정한다(self-lock 방지). 구 all-four 페어링
-            // 가드(teamClaudeQuotaPair)는 Fable 미측정 계정의 주간 표시까지 막아
-            // 두 열 모두 "동기화중"으로 떨어뜨렸다 (2026-07-22 사고).
-            meterCell(TeamClaudeColumns.weeklyX, percent: row.weeklyPercent,
-                      remaining: teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
-                      window: teamClaudeWeekSeconds, empty: StatusVocabulary.syncing)
-            meterCell(TeamClaudeColumns.fableX, percent: row.fablePercent,
-                      remaining: teamClaudeRemainingSeconds(row.fableResetSeconds, resetAt: row.fableResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
-                      window: teamClaudeWeekSeconds, empty: StatusVocabulary.notMeasured)
+            if row.isApiKey {
+                // API 키는 세션·주간·Fable 창이 없다. 세 칸 자리에 남은 금액 막대(추정) 하나를 그린다.
+                let cell = NSRect(x: TeamClaudeColumns.sessionX, y: y + 8,
+                                  width: TeamClaudeColumns.fableX + TeamClaudeColumns.meterWidth - TeamClaudeColumns.sessionX, height: 14)
+                PanelDraw.apiCreditMeter(cell, credit: row.apiCredit, muted: presentation.excluded)
+            } else {
+                let attempted = probeAttempted(row)
+                let session = teamClaudeSessionState(percent: row.sessionPercent, lastUsed: row.probedAt, now: evaluatedAt)
+                let sessionEmpty = teamClaudeSessionEmptyLabel(sessionWindowAbsent: row.sessionWindowAbsent, stale: session.isStale,
+                                                               quotaBlocked: row.measurementIssue == .quotaBlocked, attempted: attempted)
+                meterCell(TeamClaudeColumns.sessionX, percent: session.isStale ? nil : session.percent,
+                          remaining: teamClaudeRemainingSeconds(row.sessionResetSeconds, resetAt: row.sessionResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
+                          window: teamClaudeSessionSeconds, empty: sessionEmpty)
+                // 주간·Fable 독립 표시 — 프록시는 재시작 후 Fable(7d_oi) 창을 의도적으로
+                // 스냅샷 복원하지 않고 재측정한다(self-lock 방지). 구 all-four 페어링
+                // 가드(teamClaudeQuotaPair)는 Fable 미측정 계정의 주간 표시까지 막아
+                // 두 열 모두 "동기화중"으로 떨어뜨렸다 (2026-07-22 사고).
+                meterCell(TeamClaudeColumns.weeklyX, percent: row.weeklyPercent,
+                          remaining: teamClaudeRemainingSeconds(row.weeklyResetSeconds, resetAt: row.weeklyResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
+                          window: teamClaudeWeekSeconds, empty: StatusVocabulary.syncing)
+                meterCell(TeamClaudeColumns.fableX, percent: row.fablePercent,
+                          remaining: teamClaudeRemainingSeconds(row.fableResetSeconds, resetAt: row.fableResetAt, checkedAt: health.checkedAt, now: evaluatedAt),
+                          window: teamClaudeWeekSeconds, empty: StatusVocabulary.notMeasured)
+            }
 
             // 상태 칸: 재인증 버튼(layout이 배치) · 오류 사유 · 측정 · 측정 문제 · 상태 라벨. 맨 오른쪽은 펼침 표시.
             let chevron = isExpanded ? "⌃" : "⌄"
-            PanelDraw.right(chevron, rightEdge, y + 6, micro, fg3)
+            if !row.isApiKey { PanelDraw.right(chevron, rightEdge, y + 6, micro, fg3) }
             let statusRight = rightEdge - 14
             let statusWidth = statusRight - TeamClaudeColumns.statusX
             let canReauth = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
