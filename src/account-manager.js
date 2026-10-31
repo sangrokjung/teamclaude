@@ -13,6 +13,13 @@ import {
   normalizeSubscriptionCancellation,
   subscriptionSnapshot,
 } from './subscription.js';
+import {
+  creditStatus,
+  isApiKeyAccount,
+  normalizeCreditExhausted,
+  readCreditConfig,
+} from './api-credit.js';
+import { computeApiCost, normalizeApiPricing } from './api-pricing.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 export const SEND_FAILED_COOLDOWN_MS = 30 * 1000;
@@ -85,6 +92,22 @@ function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritativ
 // Live claude-fable-5 429s report the binding claim in `7d_oi`.
 // Keep the mapping in one place so selection, retry-after, and 429 handling use
 // identical semantics. Unknown/future model tiers remain on unified routing.
+// The spend ledger restores only when it was counted against the account's
+// current creditSince: a re-set top-up (api-credit) starts from zero.
+function restoredApiLedger(account, savedQuota) {
+  const fresh = { apiSpendUsd: 0, apiUnpricedTokens: 0, apiSpendSince: account.creditSince ?? null };
+  if (!isApiKeyAccount(account)) return fresh;
+  const since = Number.isFinite(savedQuota.apiSpendSince) ? savedQuota.apiSpendSince : null;
+  if (since !== fresh.apiSpendSince) return fresh;
+  const usd = savedQuota.apiSpendUsd;
+  const unpriced = savedQuota.apiUnpricedTokens;
+  return {
+    apiSpendUsd: typeof usd === 'number' && Number.isFinite(usd) && usd >= 0 ? usd : 0,
+    apiUnpricedTokens: typeof unpriced === 'number' && Number.isFinite(unpriced) && unpriced >= 0 ? unpriced : 0,
+    apiSpendSince: since,
+  };
+}
+
 export function modelQuotaLabel(model) {
   if (typeof model !== 'string') return null;
   return /(^|[-_.])(fable|mythos)($|[-_.\d])/i.test(model) ? '7d_oi' : null;
@@ -145,6 +168,13 @@ function emptyQuota() {
     // (resetsAt alone collapses them, preferring the sooner token reset).
     tokensReset: null,     // standard token-window reset (date string)
     requestsReset: null,   // standard request-window reset (date string)
+    // API-key spend ledger (Anthropic-mode `type: 'apikey'` accounts only):
+    // estimated USD charged since `apiSpendSince` (the account's creditSince
+    // when it was counted), plus tokens of models with no known price.
+    // Persisted with the snapshot; reset when creditSince changes.
+    apiSpendUsd: 0,
+    apiUnpricedTokens: 0,
+    apiSpendSince: null,
   };
 }
 
@@ -259,6 +289,10 @@ export class AccountManager {
       _accountWritePending: false,
       };
     });
+    this.accounts.forEach((account, i) => this._initCredit(account, accounts[i]));
+    // Per-model price overrides for the API-key spend ledger (config.apiPricing,
+    // installed by the server via setApiPricing). Empty = built-in table only.
+    this.apiPricing = {};
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     // Codex credit-backed routing: a codex account whose included quota is
@@ -1256,6 +1290,10 @@ export class AccountManager {
     // never chosen for a new request. _recoverSoonest iterates accounts directly
     // (not via this), so it skips disabled accounts itself.
     if (account.enabled === false) return false;
+    // A credit-refused API key stays out until an explicit re-arm (api-credit,
+    // key re-registration). Checked apart from status so no status-healing path
+    // (throttle lapse, recover, refresh) can return it to rotation.
+    if (account.creditExhausted) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -1631,6 +1669,7 @@ export class AccountManager {
       // account, re-imported credentials, or `subscription <name> ok`.
       if (account.subscriptionDisabled === true) continue;
       if (account.errorReason === 'subscription-ended') continue;
+      if (account.creditExhausted) continue;
       if (this._isModelUnsupported(account, model)) continue;
       if (this._isModelNearQuota(account, model)) continue;
       // A reserved-out account must not be revived here either. This path
@@ -2157,6 +2196,102 @@ export class AccountManager {
     account._subscriptionFlagPromise = write;
   }
 
+  // ── API-key credit (Anthropic mode) ──────────────────────────────────────
+
+  _initCredit(account, source = {}) {
+    if (!isApiKeyAccount(account)) return;
+    Object.assign(account, readCreditConfig(source || {}));
+    account.quota.apiSpendSince = account.creditSince;
+    const exhausted = normalizeCreditExhausted(source?.creditExhausted);
+    if (exhausted) this._parkCreditExhausted(account, exhausted);
+  }
+
+  _parkCreditExhausted(account, exhausted) {
+    account.creditExhausted = exhausted;
+    account.status = 'error';
+    account.errorReason = 'credit-exhausted';
+    account._errorFromRefresh = false;
+    delete account._errorFromUsagePoll;
+    delete account._errorFromSendFailure;
+  }
+
+  onAccountCreditFlag(callback) {
+    this._onAccountCreditFlag = callback;
+  }
+
+  /** Install config.apiPricing (per-model price overrides) for the spend ledger. */
+  setApiPricing(raw) {
+    this.apiPricing = normalizeApiPricing(raw);
+  }
+
+  /**
+   * Add one response's usage to an API-key account's estimated spend. No-op for
+   * subscription and Codex accounts. Unknown models count as unpriced tokens.
+   */
+  recordApiSpend(ref, usage, model) {
+    const account = this._resolve(ref);
+    if (!isApiKeyAccount(account)) return;
+    const cost = computeApiCost(usage, model, this.apiPricing);
+    if (cost.priced) account.quota.apiSpendUsd += cost.usd;
+    else account.quota.apiUnpricedTokens += cost.tokens;
+  }
+
+  /**
+   * Apply credit settings from config (api-credit / reload). A changed
+   * creditSince means the top-up was re-set: the ledger restarts from zero.
+   */
+  applyCreditConfig(ref, source = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    const next = readCreditConfig(source || {});
+    const sinceChanged = next.creditSince !== account.creditSince;
+    Object.assign(account, next);
+    if (sinceChanged) {
+      account.quota.apiSpendUsd = 0;
+      account.quota.apiUnpricedTokens = 0;
+      account.quota.apiSpendSince = next.creditSince;
+    }
+    return account;
+  }
+
+  /**
+   * Upstream refused this API key for credit (B7): park it persistently. Only
+   * an explicit re-arm (clearCreditExhausted via api-credit or a key
+   * re-registration) returns it to rotation; no probe or timer revives it.
+   */
+  setCreditExhausted(ref, reason, { persist = true, at = Date.now() } = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    const next = normalizeCreditExhausted({ reason, at });
+    const unchanged = account.creditExhausted?.reason === next.reason;
+    this._parkCreditExhausted(account, unchanged ? account.creditExhausted : next);
+    if (unchanged) return account;
+    if (persist && this.accounts[account.index] === account) {
+      const snapshot = { ...next };
+      this._queueAccountWrite(account, () => this._onAccountCreditFlag?.(account, snapshot));
+    }
+    console.log(`[TeamClaude] API key account "${account.name}" refused for credit (${next.reason}); out of rotation until re-armed`);
+    return account;
+  }
+
+  clearCreditExhausted(ref, { persist = true } = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    if (!account.creditExhausted) return account;
+    delete account.creditExhausted;
+    if (account.status === 'error' && account.errorReason === 'credit-exhausted') {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+    }
+    if (persist && this.accounts[account.index] === account) {
+      this._queueAccountWrite(account, () => this._onAccountCreditFlag?.(account, null));
+    }
+    this._drainWaiters();
+    this._reprioritize();
+    return account;
+  }
+
   setSubscriptionDisabled(ref, disabled, persist = true) {
     const account = this._resolveRef(ref);
     if (!account || account.provider !== 'anthropic') return null;
@@ -2490,6 +2625,7 @@ export class AccountManager {
       _subscriptionFlagPromise: Promise.resolve(),
       _accountWritePending: false,
     });
+    this._initCredit(this.accounts[index], acctData);
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
     // account sits idle.
@@ -2672,6 +2808,7 @@ export class AccountManager {
           codexCreditsAt: Number.isFinite(s.quota.codexCreditsAt) ? s.quota.codexCreditsAt : null,
           sessionWindowStated: typeof s.quota.sessionWindowStated === 'boolean'
             ? s.quota.sessionWindowStated : null,
+          ...restoredApiLedger(a, s.quota),
         };
         // Same invariant as _isNearQuota: a no-session-window account carries
         // no 5h reading, so a restored status never reports a blocking value.
@@ -2685,7 +2822,7 @@ export class AccountManager {
       // 'throttled' status would lazily heal to 'active' when the window
       // passes, silently returning a lapsed account to rotation.
       if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
-          && !a.subscriptionDisabled) {
+          && !a.subscriptionDisabled && !a.creditExhausted) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -2754,9 +2891,10 @@ export class AccountManager {
       status: a.status,
       // Why status is 'error' (null otherwise / when unknown): one of
       // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
-      // 'auth-rejected'. In-memory only (same as status) — except
-      // 'subscription-disabled', which mirrors the persistent config flag
-      // `subscriptionDisabled` and therefore survives restarts.
+      // 'auth-rejected' | 'credit-exhausted'. In-memory only (same as status),
+      // except 'subscription-disabled' and 'credit-exhausted', which mirror the
+      // persistent config flags `subscriptionDisabled` / `creditExhausted` and
+      // therefore survive restarts.
       errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
       planType: a.planType || null,
       subscription: subscriptionSnapshot(a),
@@ -2791,6 +2929,9 @@ export class AccountManager {
         : null,
       unsupportedModels: [...a.unsupportedModels.keys()].filter(model =>
         this._isModelUnsupported(a, model)),
+      // API-key credit (B9): estimated spend vs the recorded top-up, expiry and
+      // the persistent refusal flag. Never carries the key or any part of it.
+      ...(isApiKeyAccount(a) ? { credit: creditStatus(a) } : {}),
     }));
     return {
       ...(includeIdentity
