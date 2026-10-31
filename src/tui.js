@@ -1046,7 +1046,11 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${num} ${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    // No 5-hour window at all (verified Ultra): a same-width "none" cell instead
+    // of a bar, so it reads differently from an unmeasured "-" and stays aligned.
+    const noSession = a.type === 'oauth' && q.sessionWindowStated === false;
+    const cell1 = noSession ? textCell('none', bw) : bar(r1, bw, t1);
+    let line = ` ${sel}${cur} ${num} ${name} ${type} ${status} ${l1} ${cell1}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2)}`;
     }
