@@ -71,7 +71,7 @@ test('recordApiSpend: API 키 계정에만 쌓고, 모르는 모델은 토큰으
   am.recordApiSpend(api, { input_tokens: 1000, output_tokens: 500 }, 'claude-sonnet-4-5-20250929');
   // 1,000 × $3 + 500 × $15 = $0.0105
   assert.ok(Math.abs(api.quota.apiSpendUsd - 0.0105) < 1e-12);
-  am.recordApiSpend(api, { input_tokens: 100, output_tokens: 20 }, 'claude-fable-5');
+  am.recordApiSpend(api, { input_tokens: 100, output_tokens: 20 }, 'claude-future-9');
   assert.equal(api.quota.apiUnpricedTokens, 120);
   am.recordApiSpend(sub, { input_tokens: 1000, output_tokens: 500 }, 'claude-sonnet-4-5');
   assert.equal(sub.quota.apiSpendUsd, 0);
@@ -144,7 +144,7 @@ test('소진 키는 enable·_recoverSoonest·스냅샷 스로틀 복원으로 �
 test('원장은 스냅샷에 저장되고 creditSince가 같을 때만 복원된다', () => {
   const am = makeManager([apiKey('api-1', { creditUsd: 50, creditSince: SINCE })]);
   am.recordApiSpend(am.accounts[0], { input_tokens: 1_000_000 }, 'claude-haiku-4-5');
-  am.recordApiSpend(am.accounts[0], { input_tokens: 7 }, 'claude-fable-5');
+  am.recordApiSpend(am.accounts[0], { input_tokens: 7 }, 'claude-future-9');
   const saved = JSON.parse(JSON.stringify(am.exportQuotaState()));
   assert.equal(saved[0].quota.apiSpendUsd, 1);
 
@@ -187,7 +187,7 @@ test('상태 응답 credit 블록: 키 값 없이 금액·만료·소진을 싣�
     oauth('sub-1'),
   ]);
   am.recordApiSpend(am.accounts[0], { input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-haiku-4-5');
-  am.recordApiSpend(am.accounts[0], { input_tokens: 3 }, 'claude-fable-5');
+  am.recordApiSpend(am.accounts[0], { input_tokens: 3 }, 'claude-future-9');
   const status = am.getStatus({ includeIdentity: true });
   const [s1, s2, s3] = status.accounts;
   assert.deepEqual(s1.credit, {

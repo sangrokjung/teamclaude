@@ -3,13 +3,15 @@
 // 추정은 계정을 막지 않는다. 실제 거절(크레딧 소진 응답)만 계정을 뺀다. 그래서
 // 단가표가 틀려도 과금 위험은 없고 화면의 "남은 금액 약 $X"만 틀린다.
 //
-// 출처: Anthropic 공개 모델 가격표(1M 토큰당 USD). 값은 2026-02-03 시점 공개 단가
-// 데이터로 대조했다. 2026-11-01 구현 때 최신 가격을 다시 확인하지 못한 모델
-// (Opus 4.6 이후, Sonnet 4.6 이후, Fable 등)은 일부러 넣지 않았다. 이런 모델의
-// 토큰은 unpriced로 따로 센다. 운영자는 `config.apiPricing`으로 단가를 넣는다.
+// 출처: Anthropic 공개 모델 가격표(1M 토큰당 USD). 4.5 이하 값은 2026-02-03 시점,
+// Fable 5·5.1, Mythos 5.1, Opus 4.6~5.5, Sonnet 4.6~5.5, Haiku 5.5 값은 claude-api
+// 스킬의 현행 모델 표(2026-10-06 캐시)로 넣었다. 표에 없는 모델의 토큰은 unpriced로
+// 따로 센다. 운영자는 `config.apiPricing`으로 단가를 넣거나 고친다.
 //
 // 캐시 단가는 공개 규칙(입력 단가 기준 5분 쓰기 1.25배, 1시간 쓰기 2배, 읽기
-// 0.1배)으로 만든다. 단순화: 장문 맥락(200K 초과 입력) 할증과 배치 할인은 반영하지
+// 0.1배)으로 만든다. 가격표가 캐시 읽기를 따로 밝힌 모델(Fable 5.1·Mythos 5.1
+// $0.25, Opus 5.5 $0.20)은 그 값을 쓴다. Haiku 5.5의 100K 초과 입력 할증은
+// 반영하지 않는다. 단순화: 장문 맥락(200K 초과 입력) 할증과 배치 할인은 반영하지
 // 않는다. 할증이 붙는 요청은 실제보다 적게 추정된다. 업그레이드 경로는 응답의
 // 입력 토큰 수로 할증 구간을 판정하는 것.
 //
@@ -21,7 +23,20 @@ const CACHE_READ_MULTIPLIER = 0.1;
 const PER_TOKEN = 1 / 1_000_000;
 
 // 입력·출력 단가(1M 토큰당 USD). 키는 normalizeModelName을 거친 이름이다.
+// 세 번째 칸은 가격표가 따로 밝힌 캐시 단가(fullPrice의 extra)다.
 const BASE_PRICES = Object.freeze({
+  'claude-fable-5-1': [10, 50, { cacheRead: 0.25 }],
+  'claude-mythos-5-1': [10, 50, { cacheRead: 0.25 }],
+  'claude-fable-5': [10, 50],
+  'claude-opus-5-5': [4, 20, { cacheRead: 0.2 }],
+  'claude-opus-5': [5, 25],
+  'claude-opus-4-8': [5, 25],
+  'claude-opus-4-7': [5, 25],
+  'claude-opus-4-6': [5, 25],
+  'claude-sonnet-5-5': [2, 10],
+  'claude-sonnet-5': [2, 10],
+  'claude-sonnet-4-6': [3, 15],
+  'claude-haiku-5-5': [0.1, 0.5],
   'claude-opus-4-5': [5, 25],
   'claude-opus-4-1': [15, 75],
   'claude-opus-4': [15, 75],
@@ -50,7 +65,7 @@ function fullPrice(input, output, extra = {}) {
 }
 
 const DEFAULT_TABLE = Object.freeze(Object.fromEntries(
-  Object.entries(BASE_PRICES).map(([model, [input, output]]) => [model, Object.freeze(fullPrice(input, output))]),
+  Object.entries(BASE_PRICES).map(([model, [input, output, extra]]) => [model, Object.freeze(fullPrice(input, output, extra))]),
 ));
 
 /**

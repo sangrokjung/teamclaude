@@ -19,9 +19,11 @@ test('가장 긴 접두로 맞추되 숫자 버전 경계는 넘지 않는다', 
   assert.equal(resolveApiPrice('claude-opus-4-5-20251101').input, 5);
   assert.equal(resolveApiPrice('claude-opus-4-20250514').input, 15);
   // claude-opus-4 단가가 claude-opus-4-8 같은 새 모델을 잡으면 안 된다.
-  assert.equal(resolveApiPrice('claude-opus-4-8'), null);
-  assert.equal(resolveApiPrice('claude-fable-5'), null);
-  assert.equal(resolveApiPrice('claude-sonnet-5'), null);
+  assert.equal(resolveApiPrice('claude-opus-4-9'), null);
+  assert.equal(resolveApiPrice('claude-sonnet-4-7'), null);
+  // claude-opus-5 단가가 claude-opus-5-5를 잡으면 안 된다(각자 자기 단가).
+  assert.equal(resolveApiPrice('claude-opus-5-5').input, 4);
+  assert.equal(resolveApiPrice('claude-opus-5').input, 5);
   // 숫자가 아닌 꼬리는 같은 모델의 변형으로 본다.
   assert.equal(resolveApiPrice('claude-haiku-4-5-preview').output, 5);
 });
@@ -57,7 +59,7 @@ test('cache_creation 분리 필드가 있으면 5분·1시간 단가를 따로 �
 });
 
 test('모르는 모델은 unpriced로 토큰만 센다', () => {
-  const r = computeApiCost({ input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 10 }, 'claude-fable-5');
+  const r = computeApiCost({ input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 10 }, 'claude-future-9');
   assert.deepEqual(r, { priced: false, usd: 0, tokens: 160 });
   assert.deepEqual(computeApiCost({ input_tokens: 5 }, null), { priced: false, usd: 0, tokens: 5 });
 });
@@ -87,4 +89,29 @@ test('config.apiPricing 덮어쓰기: 새 모델 추가, 부분 입력은 배수
   assert.equal(resolveApiPrice('claude-haiku-4-5', overrides).input, 1);
   assert.deepEqual(normalizeApiPricing(null), {});
   assert.deepEqual(normalizeApiPricing([1, 2]), {});
+});
+
+test('현행 모델 단가(2026-10-06 공개 가격표): 입력·출력·캐시 읽기 예외값', () => {
+  const cases = [
+    ['claude-fable-5-1[1m]', 10, 50, 0.25],
+    ['claude-mythos-5-1', 10, 50, 0.25],
+    ['claude-fable-5', 10, 50, 1],
+    ['claude-opus-5-5', 4, 20, 0.2],
+    ['claude-opus-5', 5, 25, 0.5],
+    ['claude-opus-4-8', 5, 25, 0.5],
+    ['claude-opus-4-7', 5, 25, 0.5],
+    ['claude-opus-4-6', 5, 25, 0.5],
+    ['claude-sonnet-5-5', 2, 10, 0.2],
+    ['claude-sonnet-5', 2, 10, 0.2],
+    ['claude-sonnet-4-6', 3, 15, 0.3],
+    ['claude-haiku-5-5', 0.1, 0.5, 0.01],
+  ];
+  for (const [model, input, output, cacheRead] of cases) {
+    const p = resolveApiPrice(model);
+    assert.ok(p, model);
+    assert.equal(p.input, input, model);
+    assert.equal(p.output, output, model);
+    assert.ok(Math.abs(p.cacheRead - cacheRead) < 1e-12, `${model} cacheRead=${p.cacheRead}`);
+    assert.ok(Math.abs(p.cacheWrite5m - input * 1.25) < 1e-12, model);
+  }
 });

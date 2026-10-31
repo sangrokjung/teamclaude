@@ -235,7 +235,7 @@ test('B4: 스트리밍 응답도 message_start 모델로 입력·출력 비용�
 
 test('B4: 단가 없는 모델은 unpriced 토큰으로 센다, 구독 계정 응답은 원장에 넣지 않는다', async t => {
   const { am, port } = await setup(t, [oauth('sub-1'), apiKey('api-1')], (e, res) =>
-    json(res, 200, OK(e.who, 'claude-fable-5', { input_tokens: 100, output_tokens: 20 })));
+    json(res, 200, OK(e.who, 'claude-future-9', { input_tokens: 100, output_tokens: 20 })));
   healthy(am.accounts[0]);
   await (await post(port)).json();
   assert.equal(am.accounts[0].quota.apiSpendUsd, 0);
