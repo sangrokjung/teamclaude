@@ -668,7 +668,7 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
   const served = [];
   const reset = String(Math.floor((Date.now() + 60 * 60 * 1000) / 1000));
   const upstream = http.createServer((req, res) => {
-    served.push(req.headers['x-api-key']);
+    served.push(req.headers.authorization);
     res.writeHead(200, {
       'content-type': 'application/json',
       'anthropic-ratelimit-unified-5h-utilization': '0.1',
@@ -682,9 +682,11 @@ test('supervisor preserves worker session affinity for a public keep-alive conne
     upstream: `http://127.0.0.1:${upstreamPort}`,
     activeWarmup: false,
     reevalIntervalMs: 1,
+    // Subscription (OAuth) accounts: API keys are never warm-up targets (every
+    // probe on a key is paid), so cold-start warm-up is exercised on OAuth.
     accounts: [
-      { name: 'api-a', type: 'apikey', apiKey: 'account-a' },
-      { name: 'api-b', type: 'apikey', apiKey: 'account-b' },
+      { name: 'sub-a', type: 'oauth', accessToken: 'account-a', expiresAt: Date.now() + 24 * 60 * 60 * 1000 },
+      { name: 'sub-b', type: 'oauth', accessToken: 'account-b', expiresAt: Date.now() + 24 * 60 * 60 * 1000 },
     ],
   }));
 

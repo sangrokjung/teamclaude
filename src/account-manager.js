@@ -13,6 +13,14 @@ import {
   normalizeSubscriptionCancellation,
   subscriptionSnapshot,
 } from './subscription.js';
+import {
+  apiKeyFingerprint,
+  creditStatus,
+  isApiKeyAccount,
+  normalizeCreditExhausted,
+  readCreditConfig,
+} from './api-credit.js';
+import { computeApiCost, normalizeApiPricing } from './api-pricing.js';
 
 const REFRESH_SWEEP_RETRY_MS = 5 * 60 * 1000;
 export const SEND_FAILED_COOLDOWN_MS = 30 * 1000;
@@ -85,6 +93,22 @@ function applyCodexQuotaWindow(quota, kind, usedPercent, resetAt, { authoritativ
 // Live claude-fable-5 429s report the binding claim in `7d_oi`.
 // Keep the mapping in one place so selection, retry-after, and 429 handling use
 // identical semantics. Unknown/future model tiers remain on unified routing.
+// The spend ledger restores only when it was counted against the account's
+// current creditSince: a re-set top-up (api-credit) starts from zero.
+function restoredApiLedger(account, savedQuota) {
+  const fresh = { apiSpendUsd: 0, apiUnpricedTokens: 0, apiSpendSince: account.creditSince ?? null };
+  if (!isApiKeyAccount(account)) return fresh;
+  const since = Number.isFinite(savedQuota.apiSpendSince) ? savedQuota.apiSpendSince : null;
+  if (since !== fresh.apiSpendSince) return fresh;
+  const usd = savedQuota.apiSpendUsd;
+  const unpriced = savedQuota.apiUnpricedTokens;
+  return {
+    apiSpendUsd: typeof usd === 'number' && Number.isFinite(usd) && usd >= 0 ? usd : 0,
+    apiUnpricedTokens: typeof unpriced === 'number' && Number.isFinite(unpriced) && unpriced >= 0 ? unpriced : 0,
+    apiSpendSince: since,
+  };
+}
+
 export function modelQuotaLabel(model) {
   if (typeof model !== 'string') return null;
   return /(^|[-_.])(fable|mythos)($|[-_.\d])/i.test(model) ? '7d_oi' : null;
@@ -145,6 +169,13 @@ function emptyQuota() {
     // (resetsAt alone collapses them, preferring the sooner token reset).
     tokensReset: null,     // standard token-window reset (date string)
     requestsReset: null,   // standard request-window reset (date string)
+    // API-key spend ledger (Anthropic-mode `type: 'apikey'` accounts only):
+    // estimated USD charged since `apiSpendSince` (the account's creditSince
+    // when it was counted), plus tokens of models with no known price.
+    // Persisted with the snapshot; reset when creditSince changes.
+    apiSpendUsd: 0,
+    apiUnpricedTokens: 0,
+    apiSpendSince: null,
   };
 }
 
@@ -259,6 +290,10 @@ export class AccountManager {
       _accountWritePending: false,
       };
     });
+    this.accounts.forEach((account, i) => this._initCredit(account, accounts[i]));
+    // Per-model price overrides for the API-key spend ledger (config.apiPricing,
+    // installed by the server via setApiPricing). Empty = built-in table only.
+    this.apiPricing = {};
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
     // Codex credit-backed routing: a codex account whose included quota is
@@ -329,6 +364,14 @@ export class AccountManager {
   getActiveAccount(exclude = null, model = null, scope = exclude) {
     const now = Date.now();
 
+    // /byok lane: API-key credit first (it lapses at the end of the billing
+    // period). Routed through _selectBest, whose tier order puts keys ahead
+    // of subscriptions for this scope, without moving the Claude Code sticky
+    // primary. With no usable key the request takes the normal path below.
+    if (this._isByokScope(scope) && this._anyByokKeyAvailable(exclude, model, scope)) {
+      return this._selectBest(exclude && exclude.size ? exclude : null, model, scope);
+    }
+
     // Per-request failover: a prior account already returned a non-quota 429
     // for THIS request (those accounts are in `exclude`, a Set of objects). Pick another available
     // account by priority WITHOUT touching the sticky primary or warm-up state
@@ -385,8 +428,9 @@ export class AccountManager {
     // While the current account is still unmeasured, keep load-balancing via
     // _selectBest (which rotates among equal-rank accounts) instead of sticking
     // to an unknown-quota account — so a cold-start burst stays spread even
-    // after per-account warm-up attempts are exhausted.
-    if (!this._isMeasured(current)) {
+    // after per-account warm-up attempts are exhausted. An API key is ordered
+    // without measurement (_apiKeyCompare), so it stays sticky unmeasured.
+    if (!isApiKeyAccount(current) && !this._isMeasured(current)) {
       const best = this._selectBest(null, model, scope);
       if (best) {
         this.currentIndex = best.index;
@@ -550,7 +594,10 @@ export class AccountManager {
     // normal selection. So it never exceeds a cap, revives an exhausted account,
     // or disturbs use-or-lose for new connections. (`accounts[idx] === a` rejects
     // a stale entry left by a removeAccount that re-indexed the array.)
-    if (affOk && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
+    // A /byok request skips the hint: its lane prefers API-key credit over
+    // whatever subscription account the connection last used.
+    if (affOk && !this._isByokScope(creditScope)
+        && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
       const a = this._affinity.get(affinityKey);
       // Require the home to be MEASURED — not just past its warm-up tries. A
       // headerless account stays unmeasured forever; pinning a connection to it
@@ -558,7 +605,10 @@ export class AccountManager {
       // spreading to gather quota data / let tokens refresh on use). Once an
       // account returns rate-limit headers (every real Anthropic response does),
       // affinity engages normally.
-      if (a && this.accounts[a.index] === a && this._isMeasured(a) && this._isAvailable(a, model, { scope: creditScope })
+      // (An API key needs no measurement to be a valid home: it is never a
+      // warm-up target and its order does not come from quota headers.)
+      if (a && this.accounts[a.index] === a && (isApiKeyAccount(a) || this._isMeasured(a))
+          && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
         return a;
@@ -964,6 +1014,9 @@ export class AccountManager {
     // explicit priority: credits are paid and valid for months, included
     // quota renews on a window and is lost if unused. Within the credit tier
     // the largest (bucketed) balance drains first so the pool depletes evenly.
+    // Anthropic API keys are the same kind of paid last tier (see
+    // _apiKeysUnlocked); among keys the order is soonest expiry, then least
+    // estimated credit left, then array order (_apiKeyCompare).
     const tier = new Map(eligible.map(a => [a, this._creditTier(a, model, scope)]));
     const creditRank = a => (tier.get(a) === 1 ? this._creditRank(a) : 0);
     eligible.sort((a, b) => {
@@ -972,10 +1025,13 @@ export class AccountManager {
       const pa = this._priority(a);
       const pb = this._priority(b);
       if (pa !== pb) return pa - pb;                                     // explicit priority first (lower = preferred)
+      if (isApiKeyAccount(a) && isApiKeyAccount(b)) return this._apiKeyCompare(a, b);
       const ca = creditRank(a), cb = creditRank(b);
       if (ca !== cb) return ca < cb ? -1 : 1;                            // credit tier: larger balance first
       return this.autoCompare(a, b);                                     // then the automatic use-or-lose order
     });
+    // The key order is total (array order breaks ties), so no round-robin.
+    if (isApiKeyAccount(eligible[0])) return eligible[0];
 
     // Accounts tied for the best rank (notably all-unknown at cold start, or all
     // sharing one priority) are load-balanced round-robin instead of always
@@ -1185,6 +1241,9 @@ export class AccountManager {
    * state or marks it `error`, which makes it unavailable here.)
    */
   _isWarmupTarget(account, model = null) {
+    // An API key needs no header-based measurement to be ordered (expiry and
+    // estimated credit decide, _apiKeyCompare), and every probe on it is paid.
+    if (isApiKeyAccount(account)) return false;
     return this._isAvailable(account, model)
       && !this._isMeasured(account)
       && (account._warmupTries || 0) < this.maxWarmupTries;
@@ -1227,8 +1286,9 @@ export class AccountManager {
    * so no extra status carve-outs are needed beyond _isAvailable.)
    */
   warmupCandidates() {
+    // API keys are never probed: each probe spends paid credit (see _isWarmupTarget).
     return this.accounts.filter(a =>
-      this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
+      !isApiKeyAccount(a) && this._isAvailable(a) && !this._fullyMeasured(a) && a.inflight === 0
       // Convergence cap: against the real upstream one probe fully measures an
       // account (responses always carry both window families), but a
       // pathological upstream — a 2xx missing a family, header-less responses,
@@ -1256,6 +1316,10 @@ export class AccountManager {
     // never chosen for a new request. _recoverSoonest iterates accounts directly
     // (not via this), so it skips disabled accounts itself.
     if (account.enabled === false) return false;
+    // A credit-refused API key stays out until an explicit re-arm (api-credit,
+    // key re-registration). Checked apart from status so no status-healing path
+    // (throttle lapse, recover, refresh) can return it to rotation.
+    if (account.creditExhausted) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -1294,6 +1358,10 @@ export class AccountManager {
           && this._creditsUnlocked(model, scope, readOnly))) {
       return false;
     }
+
+    // An Anthropic API key is the paid last tier for Claude Code traffic: it
+    // opens only when no subscription account can serve this model at all.
+    if (isApiKeyAccount(account) && !this._apiKeysUnlocked(model, scope, readOnly)) return false;
 
     // The reserved account stays IN rotation (unlike `enabled: false`) but stops
     // accepting new inference once it crosses its ceiling, so the credential
@@ -1454,9 +1522,63 @@ export class AccountManager {
     return Boolean(account) && this._isNearQuota(account, model) && this._creditRoutable(account);
   }
 
-  /** 0 = included quota (preferred), 1 = credit-backed. */
+  /**
+   * 0 = included quota (preferred), 1 = paid: a credit-backed Codex account or
+   * an Anthropic API key. The /byok lane inverts the Anthropic order (keys 0,
+   * subscriptions 1) so its credit is spent before subscription quota.
+   */
   _creditTier(account, model = null, scope = null) {
+    if (account.provider === 'anthropic' && this._isByokScope(scope)) {
+      return isApiKeyAccount(account) ? 0 : 1;
+    }
+    if (isApiKeyAccount(account)) return 1;
     return this._isCreditBacked(account, model, scope) ? 1 : 0;
+  }
+
+  // ── Anthropic API-key paid tier ──────────────────────────────────────────
+
+  /** Request scope of the /byok lane (the server sets `byok` on its CreditScope). */
+  _isByokScope(scope) {
+    return Boolean(scope && scope.byok === true);
+  }
+
+  /**
+   * Can any Anthropic subscription (OAuth) account serve this model? Capacity
+   * is ignored on purpose: an account merely at its concurrency cap still
+   * counts, so overflow queues for it instead of spilling onto paid credit.
+   * `scope` holds accounts THIS request cannot use (auth-failed): they do not
+   * hold the request off the keys.
+   */
+  _anySubscriptionServable(model = null, scope = null, readOnly = false) {
+    // A subscription capped only by its 5-hour window still serves under the
+    // server's usage-limit grace (default on): the paid key waits until that
+    // grace is refused (noteGraceRefused), exactly as without a key.
+    return this.accounts.some(a => a.provider === 'anthropic' && a.type === 'oauth'
+      && !(scope && scope.has(a))
+      && (this._isAvailable(a, model, { allowCredits: false, readOnly }) || this._isGraceEligible(a, model)));
+  }
+
+  _apiKeysUnlocked(model = null, scope = null, readOnly = false) {
+    return this._isByokScope(scope) || !this._anySubscriptionServable(model, scope, readOnly);
+  }
+
+  _anyByokKeyAvailable(exclude, model, scope) {
+    return this.accounts.some(a => isApiKeyAccount(a) && !(exclude && exclude.has(a))
+      && this._isAvailable(a, model, { scope }));
+  }
+
+  _apiKeyRemaining(account) {
+    if (account.creditUsd == null) return Infinity;
+    return account.creditUsd - (Number.isFinite(account.quota.apiSpendUsd) ? account.quota.apiSpendUsd : 0);
+  }
+
+  /** Among API keys: soonest credit expiry, then least estimated credit left, then array order. */
+  _apiKeyCompare(a, b) {
+    const ea = a.creditExpiresAt ?? Infinity, eb = b.creditExpiresAt ?? Infinity;
+    if (ea !== eb) return ea < eb ? -1 : 1;
+    const ra = this._apiKeyRemaining(a), rb = this._apiKeyRemaining(b);
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    return a.index - b.index;
   }
 
   /** Larger balance ranks first within the credit tier (bucketed, see codex-credits.js). */
@@ -1631,6 +1753,7 @@ export class AccountManager {
       // account, re-imported credentials, or `subscription <name> ok`.
       if (account.subscriptionDisabled === true) continue;
       if (account.errorReason === 'subscription-ended') continue;
+      if (account.creditExhausted) continue;
       if (this._isModelUnsupported(account, model)) continue;
       if (this._isModelNearQuota(account, model)) continue;
       // A reserved-out account must not be revived here either. This path
@@ -2157,6 +2280,202 @@ export class AccountManager {
     account._subscriptionFlagPromise = write;
   }
 
+  // ── API-key credit (Anthropic mode) ──────────────────────────────────────
+
+  _initCredit(account, source = {}) {
+    if (!isApiKeyAccount(account)) return;
+    Object.assign(account, readCreditConfig(source || {}));
+    account.quota.apiSpendSince = account.creditSince;
+    account._creditGeneration = 0;
+    const exhausted = normalizeCreditExhausted(source?.creditExhausted);
+    if (exhausted) {
+      this._parkCreditExhausted(account, exhausted);
+      account._creditFlagPersisted = true; // read from config
+    }
+  }
+
+  _parkCreditExhausted(account, exhausted) {
+    account.creditExhausted = exhausted;
+    account.status = 'error';
+    account.errorReason = 'credit-exhausted';
+    account._errorFromRefresh = false;
+    delete account._errorFromUsagePoll;
+    delete account._errorFromSendFailure;
+  }
+
+  onAccountCreditFlag(callback) {
+    this._onAccountCreditFlag = callback;
+  }
+
+  /** Install config.apiPricing (per-model price overrides) for the spend ledger. */
+  setApiPricing(raw) {
+    this.apiPricing = normalizeApiPricing(raw);
+  }
+
+  /**
+   * Add one response's usage to an API-key account's estimated spend. No-op for
+   * subscription and Codex accounts. Unknown models count as unpriced tokens.
+   */
+  recordApiSpend(ref, usage, model) {
+    const account = this._resolve(ref);
+    if (!isApiKeyAccount(account)) return;
+    const cost = computeApiCost(usage, model, this.apiPricing);
+    if (cost.priced) account.quota.apiSpendUsd += cost.usd;
+    else account.quota.apiUnpricedTokens += cost.tokens;
+  }
+
+  /**
+   * Apply credit settings from config (api-credit / reload). A changed
+   * creditSince means the top-up was re-set: the ledger restarts from zero.
+   */
+  applyCreditConfig(ref, source = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    const next = readCreditConfig(source || {});
+    const sinceChanged = next.creditSince !== account.creditSince;
+    Object.assign(account, next);
+    if (sinceChanged) {
+      account.quota.apiSpendUsd = 0;
+      account.quota.apiUnpricedTokens = 0;
+      account.quota.apiSpendSince = next.creditSince;
+      // A re-set top-up is a new credit generation: a refusal for a request
+      // dispatched before it must not park the recharged key.
+      account._creditGeneration = (account._creditGeneration || 0) + 1;
+    }
+    // Expiry / amount / since order the keys (_apiKeyCompare): re-pick now so a
+    // live api-credit change moves the sticky primary without waiting for a timer.
+    this._reprioritize();
+    return account;
+  }
+
+  /**
+   * Dispatch-time identity of an API key's credit state (no key material:
+   * a fingerprint only). A refusal applies only while it still matches, so a
+   * slow response cannot park a key that was recharged or replaced after the
+   * request left. Null for subscription and Codex accounts.
+   */
+  creditDispatchStamp(ref) {
+    const account = this._resolve(ref);
+    if (!isApiKeyAccount(account)) return null;
+    return {
+      generation: account._creditGeneration || 0,
+      since: account.creditSince ?? null,
+      keyFingerprint: apiKeyFingerprint(account.credential),
+    };
+  }
+
+  _creditStampCurrent(account, stamp) {
+    if (!stamp) return true;
+    const now = this.creditDispatchStamp(account);
+    return Boolean(now) && now.generation === stamp.generation && now.since === stamp.since
+      && now.keyFingerprint === stamp.keyFingerprint;
+  }
+
+  _persistCreditFlag(account, value, stamp = null) {
+    if (this.accounts[account.index] !== account) return;
+    if (value) account._creditFlagPersisted = false;
+    this._queueAccountWrite(account, () => Promise.resolve(this._onAccountCreditFlag?.(account, value, stamp)).then(
+      () => { if (value && account.creditExhausted) account._creditFlagPersisted = true; },
+      err => {
+        if (value) account._creditFlagPersisted = false;
+        throw err;
+      },
+    ));
+  }
+
+  /**
+   * Upstream refused this API key for credit (B7): park it persistently. Only
+   * an explicit re-arm (clearCreditExhausted via api-credit or a key
+   * re-registration) returns it to rotation; no probe or timer revives it.
+   * `stamp` (creditDispatchStamp at dispatch) rejects a stale refusal: returns
+   * null and changes nothing. A park whose config write failed is written
+   * again by the next identical refusal instead of being deduplicated.
+   */
+  setCreditExhausted(ref, reason, { persist = true, at = Date.now(), stamp = null } = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    if (!this._creditStampCurrent(account, stamp)) {
+      console.log(`[TeamClaude] API key account "${account.name}" credit refusal arrived after a recharge or key change; ignored`);
+      return null;
+    }
+    const next = normalizeCreditExhausted({ reason, at });
+    const unchanged = account.creditExhausted?.reason === next.reason;
+    this._parkCreditExhausted(account, unchanged ? account.creditExhausted : next);
+    account._creditParkStamp = stamp || this.creditDispatchStamp(account);
+    if (!persist) {
+      account._creditFlagPersisted = true; // the flag came from disk
+      return account;
+    }
+    if (unchanged && account._creditFlagPersisted !== false) return account;
+    this._persistCreditFlag(account, { ...account.creditExhausted }, account._creditParkStamp);
+    if (!unchanged) {
+      console.log(`[TeamClaude] API key account "${account.name}" refused for credit (${next.reason}); out of rotation until re-armed`);
+    }
+    return account;
+  }
+
+  /**
+   * Replace an API key's credential (re-registration seen on reload). A new key
+   * is a new credit generation and re-arms a credit refusal of the old one.
+   */
+  setApiKey(ref, key) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account) || typeof key !== 'string' || !key || account.credential === key) return account || null;
+    account.credential = key;
+    account._creditGeneration = (account._creditGeneration || 0) + 1;
+    // Clear the flag in memory and on disk: a creditExhausted left in config
+    // described the old key and would park the new one after a restart.
+    if (account.creditExhausted) this.clearCreditExhausted(account);
+    else this._persistCreditFlag(account, null);
+    return account;
+  }
+
+  /**
+   * Apply the config's creditExhausted on reload. A park whose config write
+   * failed is not undone by the (stale) disk state; its write is retried. A
+   * saved park missing from disk was re-armed (api-credit) and is cleared.
+   */
+  reconcileCreditFlagFromDisk(ref, raw) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    const want = normalizeCreditExhausted(raw);
+    if (!want) {
+      if (!account.creditExhausted) return account;
+      // An unsaved park is kept and re-written, unless the credit state moved on
+      // since (api-credit changed creditSince, or a new key): that is a re-arm.
+      if (account._creditFlagPersisted === false && this._creditStampCurrent(account, account._creditParkStamp)) {
+        this._persistCreditFlag(account, { ...account.creditExhausted }, account._creditParkStamp);
+        return account;
+      }
+      return this.clearCreditExhausted(account, { persist: false });
+    }
+    if (account.creditExhausted?.reason !== want.reason || account._creditFlagPersisted === false) {
+      return this.setCreditExhausted(account, want.reason, { persist: false, at: want.at ?? Date.now() });
+    }
+    return account;
+  }
+
+  clearCreditExhausted(ref, { persist = true } = {}) {
+    const account = this._resolveRef(ref);
+    if (!isApiKeyAccount(account)) return null;
+    if (!account.creditExhausted) return account;
+    delete account.creditExhausted;
+    delete account._creditFlagPersisted;
+    delete account._creditParkStamp;
+    account._creditGeneration = (account._creditGeneration || 0) + 1;
+    if (account.status === 'error' && account.errorReason === 'credit-exhausted') {
+      account.status = 'active';
+      delete account.errorReason;
+      delete account._errorFromRefresh;
+    }
+    if (persist && this.accounts[account.index] === account) {
+      this._queueAccountWrite(account, () => this._onAccountCreditFlag?.(account, null));
+    }
+    this._drainWaiters();
+    this._reprioritize();
+    return account;
+  }
+
   setSubscriptionDisabled(ref, disabled, persist = true) {
     const account = this._resolveRef(ref);
     if (!account || account.provider !== 'anthropic') return null;
@@ -2490,6 +2809,7 @@ export class AccountManager {
       _subscriptionFlagPromise: Promise.resolve(),
       _accountWritePending: false,
     });
+    this._initCredit(this.accounts[index], acctData);
     // The new account has free capacity — hand it to any request waiting in the
     // overflow queue instead of letting it time out to a 429 while a usable
     // account sits idle.
@@ -2598,6 +2918,7 @@ export class AccountManager {
     if (ta !== tb) return ta < tb;
     const pa = this._priority(a), pb = this._priority(b);
     if (pa !== pb) return pa < pb;
+    if (isApiKeyAccount(a) && isApiKeyAccount(b)) return this._apiKeyCompare(a, b) < 0;
     if (ta === 1) {
       const ca = this._creditRank(a), cb = this._creditRank(b);
       if (ca !== cb) return ca < cb;
@@ -2672,6 +2993,7 @@ export class AccountManager {
           codexCreditsAt: Number.isFinite(s.quota.codexCreditsAt) ? s.quota.codexCreditsAt : null,
           sessionWindowStated: typeof s.quota.sessionWindowStated === 'boolean'
             ? s.quota.sessionWindowStated : null,
+          ...restoredApiLedger(a, s.quota),
         };
         // Same invariant as _isNearQuota: a no-session-window account carries
         // no 5h reading, so a restored status never reports a blocking value.
@@ -2685,7 +3007,7 @@ export class AccountManager {
       // 'throttled' status would lazily heal to 'active' when the window
       // passes, silently returning a lapsed account to rotation.
       if (Number.isFinite(s.rateLimitedUntil) && s.rateLimitedUntil > Date.now()
-          && !a.subscriptionDisabled) {
+          && !a.subscriptionDisabled && !a.creditExhausted) {
         a.rateLimitedUntil = s.rateLimitedUntil;
         a.status = 'throttled';
       }
@@ -2754,9 +3076,10 @@ export class AccountManager {
       status: a.status,
       // Why status is 'error' (null otherwise / when unknown): one of
       // 'subscription-disabled' | 'auth-revoked' | 'refresh-failed' |
-      // 'auth-rejected'. In-memory only (same as status) — except
-      // 'subscription-disabled', which mirrors the persistent config flag
-      // `subscriptionDisabled` and therefore survives restarts.
+      // 'auth-rejected' | 'credit-exhausted'. In-memory only (same as status),
+      // except 'subscription-disabled' and 'credit-exhausted', which mirror the
+      // persistent config flags `subscriptionDisabled` / `creditExhausted` and
+      // therefore survive restarts.
       errorReason: a.status === 'error' ? (a.errorReason ?? null) : null,
       planType: a.planType || null,
       subscription: subscriptionSnapshot(a),
@@ -2791,6 +3114,9 @@ export class AccountManager {
         : null,
       unsupportedModels: [...a.unsupportedModels.keys()].filter(model =>
         this._isModelUnsupported(a, model)),
+      // API-key credit (B9): estimated spend vs the recorded top-up, expiry and
+      // the persistent refusal flag. Never carries the key or any part of it.
+      ...(isApiKeyAccount(a) ? { credit: creditStatus(a) } : {}),
     }));
     return {
       ...(includeIdentity

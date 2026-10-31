@@ -54,6 +54,8 @@
   - codex 모드 설정에서는 둘 다 거부한다.
 - B3. 계층: Anthropic 모드에서 API 키 계정은 "유료 계층"이다. 요청 모델을 서빙할 수 있는 OAuth 계정(쿼터·스로틀·비활성·오류 기준, 동시성 한도로만 꽉 찬 계정은 서빙 가능으로 셈)이 하나라도 있으면 API 키 계정은 고르지 않는다. 기존 Codex 크레딧 계층(`_creditTier`·`_anyIncludedAvailable`·`_creditsUnlocked`)의 구조를 일반화해 쓴다. OAuth 계정이 하나도 없는 풀(API 키만 있는 사용자)은 지금처럼 API 키를 바로 쓴다.
   - 계층 순서: 구독 계정 → (모델별 소진이면) API 키 계정이 원래 모델로 서빙 → `modelFallbacks` 재작성 → continuity 대기.
+  - `/byok` 통로 요청은 반대로 API 키 계정을 **먼저** 쓴다(대표 2026-10-31: 크레딧은 결제 주기 끝에 사라지므로). 쓸 수 있는 API 키가 없거나 모두 소진이면 지금처럼 구독 계정으로 간다. 통로 판별은 기존 `ctx.byok`(경로 접두로만 정해지는 구조적 판별)을 쓴다.
+  - Claude Code 요청(`/v1/...`)도 마지막 계층으로 API 키를 쓴다(대표 2026-10-31 "사용해도 됩니다"). 공식 문서는 구독 동봉 크레딧의 Claude Code 사용을 막지만, 10/31 실측에서 Claude Code 표시가 있는 요청도 200이었다. 상류가 거절하면 B7로 처리한다. 요청을 다르게 꾸미지 않는다.
   - API 키끼리 순서: `creditExpiresAt`이 가까운 키 먼저(없으면 맨 뒤), 같으면 추정 잔액이 적은 키 먼저(먼저 비우기), 그다음 배열 순서.
 - B4. 지출 원장: 성공 응답(스트리밍 포함)의 `usage`에서 `input_tokens`, `cache_creation_input_tokens`(가능하면 5분·1시간 분리 필드), `cache_read_input_tokens`, `output_tokens`와 응답 모델로 비용을 계산해 계정의 `quota.apiSpendUsd`에 더한다. 단가를 모르는 모델의 토큰은 `quota.apiUnpricedTokens`에 따로 센다. 원장은 quota 스냅샷에 저장한다. `creditSince`가 바뀌면 0부터 다시 센다.
 - B5. 단가표: 새 모듈 `src/api-pricing.js`(런타임 의존성 0). 현행 Claude 모델의 공개 단가(입력·출력·캐시 쓰기 5분/1시간·캐시 읽기, 1M 토큰당 USD)를 기본값으로 넣고, `config.apiPricing`으로 모델별 덮어쓰기를 받는다. 모델 이름은 날짜·`[1m]` 접미를 떼고 가장 긴 접두로 맞춘다. 단가 출처와 확인 날짜를 모듈 주석에 적는다.
@@ -64,7 +66,7 @@
   - 429, `error.details.error_code === 'enforced_spend_limit_reached'` → `spend-limit`.
   - 402 `billing_error` → `billing`.
   - 해제: `teamclaude api-credit` 재설정, 키 재등록(`updateAccountTokens` 경로), 또는 `teamclaude enable`이 아닌 명시 명령만. 자동 프로브로 되살리지 않는다.
-- B8. OAuth 전용 요청 요소: Claude Code가 보낸 요청을 API 키로 전달할 때 상류가 거부하는 요소가 있으면(예: `anthropic-beta`의 `oauth-2025-04-20`) API 키 계정에 한해 그 요소만 뺀다. 무엇을 빼야 하는지는 구현 단계에서 실제 키로 최소 요청을 보내 확인하고, 확인 결과를 PR 증거에 남긴다. 빼지 않아도 되면 아무것도 바꾸지 않는다.
+- B8. (10/31 실측: `sk-ant-usr-` 키로 Claude Code `system` 표시가 있는 요청·없는 요청 모두 200. OAuth 전용 beta 헤더는 미실측.) OAuth 전용 요청 요소: Claude Code가 보낸 요청을 API 키로 전달할 때 상류가 거부하는 요소가 있으면(예: `anthropic-beta`의 `oauth-2025-04-20`) API 키 계정에 한해 그 요소만 뺀다. 무엇을 빼야 하는지는 구현 단계에서 실제 키로 최소 요청을 보내 확인하고, 확인 결과를 PR 증거에 남긴다. 빼지 않아도 되면 아무것도 바꾸지 않는다.
 - B9. 상태 응답: API 키 계정에 `credit: { usd, spentUsd, remainingUsd, since, expiresAt, exhausted, exhaustedReason, unpricedTokens }`를 싣는다. 키 값·키 일부는 싣지 않는다.
 - B10. 표시:
   - CLI `status`: API 키 행에 `credit ~$12.30 left of $50.00 (est.)`, 소진이면 `[credit exhausted]`, 만료일.
@@ -143,6 +145,8 @@ A는 상류 #622 원칙을 포크 구조에 맞춰 구현. B는 Codex 크레딧 
 - 실제 키 최소 요청(B8)은 대표가 키를 등록한 뒤 운영 반영 단계에서 한다. 그 전까지 PR 증거에 "B8 실측 대기"로 적는다.
 
 ## Open questions
+
+- 운영 3456 설정에서 `/byok` 통로가 꺼져 있다(상태 응답 `byok: null`). Hermes 설정 두 곳은 이 통로를 가리킨다. 통로를 켜는 것은 설정 변경이라 B 배포 때 대표에게 확인한다.
 
 - 구독 동봉 무료 크레딧의 만료 규칙(조사 중). 결과에 따라 `--expires` 기본값 안내와 순서 규칙(B3)을 확정한다. 지금은 선택 입력으로 둔다.
 - 단가표의 정확한 현행 값은 구현 시 공식 가격 페이지로 확인한다.

@@ -91,8 +91,9 @@ func teamClaudeSessionResetPart(sessionWindowAbsent: Bool, resetLabel: String) -
 }
 
 /// 행을 묶는 상태(사용 가능 · 한도 대기 · 확인 필요 · 제외). 표는 이 순서로 묶어 그린다.
+/// API 키 계정은 상태와 무관하게 구독 묶음들 아래 "API 크레딧" 묶음이다(spec B10).
 enum TeamClaudeRowGroup: Int, CaseIterable {
-    case ready, limited, check, excluded
+    case ready, limited, check, excluded, apiCredit
 }
 
 func teamClaudeRowHeight(_ lines: TeamClaudeRowLines, expanded: Bool = false) -> CGFloat {

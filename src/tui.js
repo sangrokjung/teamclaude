@@ -3,6 +3,7 @@ import { importCodexCredentials } from './codex.js';
 import { createHostTracker } from './system-metrics.js';
 import { subscriptionSnapshot } from './subscription.js';
 import { formatCodexCreditsCompact } from './codex-credits.js';
+import { creditStatus, formatApiCreditCompact, isApiKeyAccount } from './api-credit.js';
 import { canReauthenticateTuiAccount, reauthenticateTuiAccount } from './reauth.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -157,6 +158,12 @@ function textCell(text, w = 10) {
   const pad = w - t.length;
   const lp = Math.floor(pad / 2);
   return `${ESC}100;97m${' '.repeat(lp)}${t}${' '.repeat(pad - lp)}${RESET}`;
+}
+
+function localDate(ms) {
+  const d = new Date(ms);
+  const pad = v => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 function timestamp() {
@@ -987,7 +994,8 @@ export class TUI {
       } else if (a.status === 'error') {
         status = red(a.errorReason === 'subscription-disabled'
           ? 'access'
-          : this._canReauthenticate(a) ? 'reauth' : 'error');
+          : a.errorReason === 'credit-exhausted' ? 'no credit'
+            : this._canReauthenticate(a) ? 'reauth' : 'error');
       } else if (subscription.state === 'end-date-reached') {
         status = yellow('sub due');
       } else if (subscription.state === 'cancellation-scheduled') {
@@ -1056,7 +1064,12 @@ export class TUI {
     }
     // Codex accounts have no model-scoped weekly window; the third slot shows
     // the credit balance instead (narrow layouts append it after the bars).
-    const credits = a.provider === 'codex' ? formatCodexCreditsCompact(q.codexCredits) : null;
+    // Anthropic API keys use the same slot for the estimated credit left of
+    // the recorded top-up (`$12.3/50`, `out` once refused).
+    const apiCredit = isApiKeyAccount(a) ? creditStatus(a) : null;
+    const credits = a.provider === 'codex'
+      ? formatCodexCreditsCompact(q.codexCredits)
+      : apiCredit ? formatApiCreditCompact(apiCredit) : null;
     if (showThree) {
       // API-key accounts have no third metric — pad the slot so the rank
       // badges stay column-aligned across mixed account types.
@@ -1073,6 +1086,13 @@ export class TUI {
     const rank = this._rankOf(a);
     if (rank != null) line += `  ${dim('#' + rank)}`;
     else if (this.mode === 'order') line += `  ${dim('auto')}`;
+    // API-key credit is a local estimate; say so, with the expiry, after every
+    // fixed-width column so mixed-type rows stay aligned.
+    if (apiCredit && apiCredit.exhausted !== true
+        && (Number.isFinite(apiCredit.usd) || Number.isFinite(apiCredit.expiresAt))) {
+      const expiry = Number.isFinite(apiCredit.expiresAt) ? ` exp ${localDate(apiCredit.expiresAt)}` : '';
+      line += dim(` est.${expiry}`);
+    }
     return line;
   }
 

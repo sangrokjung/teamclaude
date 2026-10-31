@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
+import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
@@ -152,6 +153,7 @@ const ERROR_REASON_LABELS = {
   'refresh-failed': 'refresh 실패',
   'auth-rejected': '인증거부',
   'send-failed': '송신실패',
+  'credit-exhausted': '크레딧 소진',
 };
 
 /**
@@ -275,7 +277,14 @@ switch (command) {
     process.exit(0);
     break;
   case 'api':
-    await apiCommand();
+    // `api <path>` is the raw endpoint call. Without a path (or with only
+    // flags) it registers an API-key account: `api --name N --credit USD`.
+    if (!args[1] || args[1].startsWith('--')) await loginApiCommand();
+    else await apiCommand();
+    process.exit(0);
+    break;
+  case 'api-credit':
+    await apiCreditCommand();
     process.exit(0);
     break;
   case 'cloud-sidecar':
@@ -1504,6 +1513,36 @@ async function proxyWorkerCommand() {
     console.error(`[TeamClaude] Failed to persist subscription flag for "${account.name}": ${err.message}`);
     throw err;
   }));
+  // Same discipline for the API-key credit refusal flag (B7): persisted the
+  // moment the request path parks a key, so a restart keeps it out.
+  // A park is written only while the disk entry still has the creditSince and
+  // key the refused request was sent with: a slow write must not re-block a key
+  // the operator recharged (api-credit) or replaced in the meantime.
+  accountManager.onAccountCreditFlag((account, exhausted, stamp) => {
+    let stale = false;
+    return atomicConfigUpdate(diskConfig => {
+      const cfgIdx = findConfigAccount(diskConfig, account);
+      if (cfgIdx < 0) return;
+      if (exhausted && !creditStampMatchesConfig(diskConfig.accounts[cfgIdx], stamp)) {
+        stale = true;
+        return;
+      }
+      if (exhausted) diskConfig.accounts[cfgIdx].creditExhausted = exhausted;
+      else delete diskConfig.accounts[cfgIdx].creditExhausted;
+    }).then(() => {
+      if (stale) {
+        console.log(`[TeamClaude] Credit refusal for "${account.name}" not saved: its config changed after dispatch (recharge or new key)`);
+        return;
+      }
+      const memIdx = findConfigAccount(config, account);
+      if (memIdx < 0) return;
+      if (exhausted) config.accounts[memIdx].creditExhausted = exhausted;
+      else delete config.accounts[memIdx].creditExhausted;
+    }).catch(err => {
+      console.error(`[TeamClaude] Failed to persist credit flag for "${account.name}": ${err.message}`);
+      throw err;
+    });
+  });
   accountManager.onAccountMetadata((account, metadata) => atomicConfigUpdate(diskConfig => {
     const cfgIdx = findConfigAccount(diskConfig, account);
     if (cfgIdx < 0) return;
@@ -2249,13 +2288,89 @@ async function loginCodexCommand() {
   }
 }
 
-async function loginApiCommand() {
-  await loadOrCreateConfig();
-  let name = argValue('--name');
+// `--credit USD` (positive amount) and `--expires YYYY-MM-DD|none` for API-key
+// credit. Returns { ok, value } so callers can refuse before prompting for a key.
+function parseCreditUsdArg(raw) {
+  if (raw == null) return { ok: true, value: undefined };
+  const n = Number(raw);
+  if (!/^\d+(\.\d+)?$/.test(String(raw).trim()) || !Number.isFinite(n) || n <= 0) {
+    return { ok: false, error: `Invalid credit amount "${raw}": expected a positive USD amount such as 50 or 12.5` };
+  }
+  return { ok: true, value: n };
+}
 
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  const apiKey = await new Promise(resolve => rl.question('Anthropic API key: ', resolve));
+// A date means "usable through the end of that local day".
+function parseExpiresArg(raw) {
+  if (raw == null) return { ok: true, value: undefined };
+  if (raw === 'none' || raw === 'clear') return { ok: true, value: null };
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (m) {
+    const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const at = new Date(y, mo - 1, d, 23, 59, 59, 999);
+    if (at.getFullYear() === y && at.getMonth() === mo - 1 && at.getDate() === d) {
+      return { ok: true, value: at.getTime() };
+    }
+  }
+  return { ok: false, error: `Invalid expiry "${raw}": expected YYYY-MM-DD or "none"` };
+}
+
+function formatUsd(n) {
+  return `$${n.toFixed(2)}`;
+}
+
+function formatLocalDate(ms) {
+  const d = new Date(ms);
+  const pad = v => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Read a secret without echoing it on a terminal. Piped input (no TTY) is
+// never echoed by readline in the first place.
+async function promptSecret(question) {
+  const tty = process.stdin.isTTY === true;
+  const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: tty });
+  if (tty) {
+    process.stderr.write(question);
+    rl._writeToOutput = () => {};
+  }
+  const answer = await new Promise(resolve => rl.question(tty ? '' : question, resolve));
   rl.close();
+  if (tty) process.stderr.write('\n');
+  return answer;
+}
+
+// One status line for an API-key account's `credit` block: estimated amount
+// left of the recorded top-up (never below $0 on screen), expiry, unpriced
+// tokens and the refusal flag. Null when the server sent no credit block.
+function apiCreditStatusLine(credit) {
+  if (!credit || typeof credit !== 'object') return null;
+  const spent = Number.isFinite(credit.spentUsd) ? credit.spentUsd : 0;
+  let line = Number.isFinite(credit.usd)
+    ? `~${formatUsd(Math.max(0, credit.usd - spent))} left of ${formatUsd(credit.usd)} (est.)`
+    : `no top-up recorded (~${formatUsd(spent)} spent, est.)`;
+  if (Number.isFinite(credit.expiresAt)) line += `, expires ${formatLocalDate(credit.expiresAt)}`;
+  if (Number.isFinite(credit.unpricedTokens) && credit.unpricedTokens > 0) {
+    line += `, ${credit.unpricedTokens.toLocaleString('en-US')} unpriced tokens`;
+  }
+  if (credit.exhausted === true) line += ` [credit exhausted${credit.exhaustedReason ? `: ${credit.exhaustedReason}` : ''}]`;
+  if (credit.exhausted === true && credit.persistFailed === true) line += ' (not saved to config; lost on restart, retried)';
+  return line;
+}
+
+async function loginApiCommand() {
+  const loaded = await loadOrCreateConfig();
+  if (isCodexMode(loaded)) {
+    console.error('API-key credit accounts apply to the Claude (Anthropic) pool only, not the Codex pool.');
+    process.exit(1);
+  }
+  let name = argValue('--name');
+  const credit = parseCreditUsdArg(argValue('--credit'));
+  const expires = parseExpiresArg(argValue('--expires'));
+  for (const parsed of [credit, expires]) {
+    if (!parsed.ok) { console.error(parsed.error); process.exit(1); }
+  }
+
+  const apiKey = await promptSecret('Anthropic API key: ');
 
   if (!apiKey.trim()) {
     console.error('No API key provided');
@@ -2272,9 +2387,17 @@ async function loginApiCommand() {
     if (cfg.accounts.some(a => a.name === name)) {
       throw new Error(`Account "${name}" already exists`);
     }
-    cfg.accounts.push({ name, type: 'apikey', apiKey: apiKey.trim() });
+    const entry = { name, type: 'apikey', apiKey: apiKey.trim() };
+    if (credit.value !== undefined) {
+      entry.creditUsd = credit.value;
+      entry.creditSince = Date.now();
+    }
+    if (expires.value != null) entry.creditExpiresAt = expires.value;
+    cfg.accounts.push(entry);
   });
-  console.log(`Added API key account "${name}"`);
+  const creditNote = credit.value !== undefined ? ` (credit ${formatUsd(credit.value)}` : '';
+  const expiryNote = expires.value != null ? `${creditNote ? ', ' : ' ('}expires ${formatLocalDate(expires.value)}` : '';
+  console.log(`Added API key account "${name}"${creditNote}${expiryNote}${creditNote || expiryNote ? ')' : ''}`);
   console.log(`Saved to ${getConfigPath()}`);
   await noteRunningServerReload(savedConfig);
 }
@@ -3054,6 +3177,9 @@ async function statusCommand() {
       }
       const creditsLine = codexCreditsStatusLine(q.codexCredits, acct.creditBacked === true);
       if (creditsLine) console.log(`    Credits:  ${creditsLine}`);
+      // API-key credit (absent from older servers and from subscription rows).
+      const apiCreditLine = apiCreditStatusLine(acct.credit);
+      if (apiCreditLine) console.log(`    Credit:   ${apiCreditLine}`);
 
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
@@ -3460,6 +3586,55 @@ async function anthropicSubscriptionCommand() {
   await noteRunningServerReload(config);
 }
 
+// `api-credit <name> <USD|clear> [--expires YYYY-MM-DD|none]`: record an API
+// key's top-up. Any change restarts the spend ledger (creditSince = now) and
+// re-arms a key the proxy parked as credit-refused. A running server applies it
+// through the account-only reload (syncAccountsFromDisk).
+async function apiCreditCommand() {
+  const name = args[1];
+  const raw = args[2];
+  if (!name || raw === undefined || raw.startsWith('--')) {
+    console.error('Usage: teamcodex api-credit <account-name> <USD|clear> [--expires YYYY-MM-DD|none]');
+    console.error('  Records the credit loaded on an API-key account. Spending is estimated from');
+    console.error('  token usage from now on; the key is re-armed if it was refused for credit.');
+    process.exit(1);
+  }
+  if (isCodexMode(await loadConfig())) {
+    console.error('api-credit applies to Claude (Anthropic) API-key accounts only, not the Codex pool.');
+    process.exit(1);
+  }
+  const clearing = raw === 'clear' || raw === 'none';
+  const credit = clearing ? { ok: true, value: null } : parseCreditUsdArg(raw);
+  const expires = parseExpiresArg(argValue('--expires'));
+  for (const parsed of [credit, expires]) {
+    if (!parsed.ok) { console.error(parsed.error); process.exit(1); }
+  }
+  let outcome = 'missing';
+  const config = await atomicConfigUpdate(cfg => {
+    const acct = cfg.accounts.find(a => a.name === name);
+    if (!acct) return;
+    if (acct.type !== 'apikey') { outcome = 'not-apikey'; return; }
+    outcome = 'ok';
+    if (credit.value == null) delete acct.creditUsd;
+    else acct.creditUsd = credit.value;
+    acct.creditSince = Date.now();
+    if (expires.value === null || clearing) delete acct.creditExpiresAt;
+    else if (expires.value !== undefined) acct.creditExpiresAt = expires.value;
+    delete acct.creditExhausted;
+  });
+  if (outcome === 'missing') { console.error(`Account "${name}" not found`); process.exit(1); }
+  if (outcome === 'not-apikey') {
+    console.error(`Account "${name}" is not an API-key account (api-credit applies to "teamcodex api" accounts)`);
+    process.exit(1);
+  }
+  const acct = config.accounts.find(a => a.name === name);
+  const expiry = acct?.creditExpiresAt ? `, expires ${formatLocalDate(acct.creditExpiresAt)}` : '';
+  console.log(clearing
+    ? `Cleared the credit amount for "${name}" (spend ledger restarted; key back in rotation)`
+    : `Set credit of "${name}" to ${formatUsd(credit.value)}${expiry} (spend ledger restarted; key back in rotation)`);
+  await noteRunningServerReload(config);
+}
+
 async function subscriptionCommand() {
   return cliProvider === 'codex'
     ? codexSubscriptionCommand()
@@ -3777,6 +3952,12 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
+  api [--name N] [--credit USD] [--expires YYYY-MM-DD]
+                      Add an API key account (key prompted, not echoed) with its
+                      loaded credit; used only after every subscription is out
+  api-credit <name> <USD|clear> [--expires YYYY-MM-DD|none]
+                      Record a key's top-up: restarts the spend estimate and
+                      re-arms a key refused for credit
   env                 Print env vars to use with Claude
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
@@ -3989,7 +4170,37 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
       if (mgr.provider === 'anthropic' && (mgr.subscriptionDisabled === true) !== wantLapsed) {
         accountManager.setSubscriptionDisabled(mgr, wantLapsed, false);
       }
+      // API-key credit (api-credit while the server runs): amount / since /
+      // expiry, a changed creditSince restarting the spend ledger, and the
+      // refusal flag in both directions. persist=false, as above.
+      // reconcileCreditFlagFromDisk keeps (and re-writes) a park whose earlier
+      // config write failed instead of trusting the stale disk state.
+      // A key replaced on disk is handled FIRST: its creditExhausted (if any)
+      // described the old key, so it is not re-applied to the new one.
+      const keyReplaced = isApiKeyAccount(mgr) && typeof diskAcct.apiKey === 'string' && diskAcct.apiKey
+        && mgr.credential !== diskAcct.apiKey;
+      if (keyReplaced) {
+        accountManager.setApiKey(mgr, diskAcct.apiKey);
+        if (mgr.status === 'error') {
+          mgr.status = 'active';
+          delete mgr.errorReason;
+        }
+        console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+      }
+      const wantCreditExhausted = keyReplaced ? null : normalizeCreditExhausted(diskAcct.creditExhausted);
+      if (isApiKeyAccount(mgr)) {
+        accountManager.applyCreditConfig(mgr, diskAcct);
+        accountManager.reconcileCreditFlagFromDisk(mgr, wantCreditExhausted);
+      }
       const memAcct = memConfig.accounts[memIdx];
+      if (memAcct && isApiKeyAccount(mgr)) {
+        for (const field of ['creditUsd', 'creditSince', 'creditExpiresAt']) {
+          if (diskAcct[field] === undefined) delete memAcct[field];
+          else memAcct[field] = diskAcct[field];
+        }
+        if (wantCreditExhausted) memAcct.creditExhausted = wantCreditExhausted;
+        else delete memAcct.creditExhausted;
+      }
       if (memAcct) {
         if (wantEnabled) delete memAcct.enabled; else memAcct.enabled = false;
         if (diskPriority === null) delete memAcct.priority; else memAcct.priority = diskPriority;
@@ -4045,7 +4256,11 @@ async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
         console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
-      mgr.credential = freshCred.apiKey;
+      // A re-registered key is a fresh credential and a new credit generation:
+      // setApiKey re-arms a credit refusal recorded against the old key
+      // (persisted, so the disk flag goes too) and voids in-flight refusals.
+      if (isApiKeyAccount(mgr)) accountManager.setApiKey(mgr, freshCred.apiKey);
+      else mgr.credential = freshCred.apiKey;
       if (mgr.status === 'error') {
         mgr.status = 'active';
         delete mgr.errorReason;

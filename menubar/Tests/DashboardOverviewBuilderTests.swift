@@ -34,6 +34,8 @@ struct DashboardOverviewBuilderTests {
         testProjectionOnlyForFastAccounts(fixture: fixture, input: input, now: now)
         testWeeklyOnlyAccount(fixture: fixture, input: input, now: now)
         testWeeklyOnlyRetryAfter(now: now)
+        testApiCreditAccounts(fixture: fixture, input: input, now: now)
+        testApiKeyRateLimited(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -278,6 +280,118 @@ struct DashboardOverviewBuilderTests {
             precondition(!oldRow.sessionWindowAbsent && !oldRow.isUsable && oldRow.measurementIssue == .sessionMissing,
                          "\(String(describing: value)): \(String(describing: oldRow.measurementIssue))")
         }
+    }
+
+    /// API 키 계정(spec B10): 상태 응답 credit 블록을 행에 싣고, Claude 탭에서는 구독 아래 "API 크레딧" 묶음,
+    /// 개요의 라우팅 가능 수·상태별 목록은 구독만 세고 API 크레딧은 따로 센다.
+    static func apiKeyAccount(_ name: String, status: String = "active", usable: Bool = true,
+                              errorReason: Any = NSNull(), credit: [String: Any]) -> [String: Any] {
+        ["name": name, "type": "apikey", "provider": "anthropic", "status": status, "errorReason": errorReason,
+         "usable": usable, "enabled": true, "priority": NSNull(), "inflight": 0, "maxConcurrent": 3,
+         "quota": ["tokensLimit": 1000, "tokensRemaining": 900, "apiSpendUsd": credit["spentUsd"] ?? 0],
+         "usage": ["totalInputTokens": 10, "totalOutputTokens": 5, "totalRequests": 2, "lastUsed": NSNull()],
+         "credit": credit]
+    }
+
+    static func testApiCreditAccounts(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]] else { preconditionFailure("fixture accounts") }
+        let base = rebuilt(status, input: input, now: now)
+        let baseHealth = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        let nowMs = now.timeIntervalSince1970 * 1000
+        accounts.append(apiKeyAccount("api-1", credit: [
+            "usd": 50, "spentUsd": 37.7, "remainingUsd": 12.3, "since": nowMs - 86_400_000,
+            "expiresAt": nowMs + 30 * 86_400_000, "exhausted": false, "exhaustedReason": NSNull(), "unpricedTokens": 0,
+        ]))
+        accounts.append(apiKeyAccount("api-2", status: "error", usable: false, errorReason: "credit-exhausted", credit: [
+            "usd": NSNull(), "spentUsd": 3, "remainingUsd": NSNull(), "since": NSNull(), "expiresAt": NSNull(),
+            "exhausted": true, "exhaustedReason": "spend-limit", "unpricedTokens": 0,
+        ]))
+        status["accounts"] = accounts
+        status["totalCount"] = accounts.count
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let api1 = health.accounts.first(where: { $0.name == "api-1" }),
+              let api2 = health.accounts.first(where: { $0.name == "api-2" }) else { preconditionFailure("api rows") }
+
+        // 1. 행이 credit 블록을 싣고, 주간·세션 창이 없어도 측정 문제로 보지 않는다.
+        precondition(api1.isApiKey && api2.isApiKey && !health.accounts.contains { !$0.isApiKey && $0.apiCredit != nil })
+        precondition(api1.apiCredit?.usd == 50 && abs((api1.apiCredit?.spentUsd ?? 0) - 37.7) < 1e-9)
+        precondition(api2.apiCredit?.exhausted == true && api2.apiCredit?.exhaustedReason == "spend-limit")
+        precondition(api1.measurementIssue == nil && api2.measurementIssue == nil,
+                     "\(String(describing: api1.measurementIssue)) \(String(describing: api2.measurementIssue))")
+        precondition(api1.isUsable && !api2.isUsable)
+        precondition(health.accountUsable == baseHealth.accountUsable, "구독 사용 가능 수에 API 키를 섞지 않는다")
+        precondition(health.measurementPendingCount == baseHealth.measurementPendingCount)
+
+        // 2. Claude 탭: 대기(사용 가능)·소진 모두 API 크레딧 묶음이고, 묶음은 구독 묶음들 아래다.
+        let routing = health.routingAvailability(now: now)
+        guard let i1 = health.accounts.firstIndex(where: { $0.name == "api-1" }),
+              let i2 = health.accounts.firstIndex(where: { $0.name == "api-2" }) else { preconditionFailure("indices") }
+        precondition(routing[i1].state == .ready && routing[i1].apiCredit && teamClaudeRowGroup(routing[i1]) == .apiCredit)
+        precondition(routing[i2].state == .excluded && teamClaudeRowGroup(routing[i2]) == .apiCredit)
+        precondition(routing[i1].reason.hasPrefix("약 $12.30 남음 · $50.00 중 (추정) · 만료 "), routing[i1].reason)
+        precondition(routing[i2].reason == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기", routing[i2].reason)
+        precondition(teamClaudeRowPresentation(api1, routing[i1]).label == "대기 · 구독 소진 시")
+        precondition(teamClaudeRowPresentation(api2, routing[i2]).label == "크레딧 소진")
+        let lines = health.rowLines(now: now, availability: routing)
+        precondition(lines[i1].reason && !lines[i1].subscription, "API 행은 사유 줄(금액·만료)을 그리고 구독 줄은 없다")
+        let layout = teamClaudeGroupedLayout(groups: routing.map(teamClaudeRowGroup), lines: lines, expanded: nil)
+        precondition(layout.headings.last?.group == .apiCredit && layout.headings.last?.count == 2)
+        precondition(Array(layout.order.suffix(2)) == [i1, i2], "API 행은 구독 행 뒤에 그린다: \(layout.order)")
+
+        // 3. 개요: 라우팅 가능 수·전체·목록은 구독만, API 크레딧은 따로.
+        let model = rebuilt(status, input: input, now: now)
+        precondition(model.routable == base.routable && model.total == base.total, "\(model.routable)/\(model.total) vs \(base.routable)/\(base.total)")
+        precondition(model.readyCount == base.readyCount && model.excludedCount == base.excludedCount)
+        precondition(model.apiCreditReady == 1 && model.apiCreditTotal == 2 && model.apiCreditExhausted == 1)
+        let shown = Set(model.live.map(\.name) + model.waiting.map(\.name) + model.excluded.map(\.name) + model.todos.map(\.name))
+        precondition(!shown.contains("api-1") && !shown.contains("api-2"), "\(shown)")
+        precondition(overviewSummaryItems(model, maxWidth: 10_000).contains { $0.0 == "API 크레딧 1/2" })
+        precondition(!overviewSummaryItems(base, maxWidth: 10_000).contains { $0.0.hasPrefix("API") }, "API 키가 없으면 항목도 없다")
+        precondition(health.routableCount == baseHealth.routableCount)
+
+        // 4. 병합·오프라인 보존을 거쳐도 credit 블록과 판정이 남는다(소비 지점 전달).
+        let merged = teamClaudeHealthMergingQuota(candidate: health, previous: nil)
+        guard let mergedApi = merged.accounts.first(where: { $0.name == "api-1" }) else { preconditionFailure("merged api-1") }
+        precondition(mergedApi.apiCredit == api1.apiCredit && mergedApi.isUsable && mergedApi.measurementIssue == nil)
+        let retained = teamClaudeRetainingQuota(candidate: health, previous: merged)
+        precondition(retained.accounts.first(where: { $0.name == "api-1" })?.apiCredit == api1.apiCredit, "offline retention keeps credit")
+
+        // 5. 설정에만 있는 API 키 행(서버 미동기화)도 API 키로 본다.
+        let configured = teamClaudeConfiguredRows(["accounts": [["name": "api-9", "type": "apikey"]]])
+        precondition(configured.first?.isApiKey == true)
+    }
+
+    /// 검토 지적 3: active이고 크레딧도 남았지만 프록시가 usable:false(분당 토큰·요청 한도)로 준 API 키는
+    /// 사용 가능이 아니라 일시 한도 대기다. 영구 크레딧 소진과 다른 문구로 보인다.
+    static func testApiKeyRateLimited(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]] else { preconditionFailure("fixture accounts") }
+        let credit: [String: Any] = ["usd": 50, "spentUsd": 1, "exhausted": false, "unpricedTokens": 0]
+        accounts.append(apiKeyAccount("api-rl", usable: false, credit: credit))
+        accounts.append(apiKeyAccount("api-ok", usable: true, credit: credit))
+        status["accounts"] = accounts
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let index = health.accounts.firstIndex(where: { $0.name == "api-rl" }) else { preconditionFailure("api-rl") }
+        let row = health.accounts[index]
+        precondition(!row.isUsable, "proxy usable:false wins over active for an API key")
+        let state = health.routingAvailability(now: now)[index]
+        precondition(state.state == .limited && state.apiCredit && teamClaudeRowGroup(state) == .apiCredit, "\(state.state)")
+        precondition(state.reason == "분당 한도 대기 · 잠시 뒤 다시 사용", state.reason)
+        precondition(teamClaudeRowPresentation(row, state).label == "한도 대기", teamClaudeRowPresentation(row, state).label)
+        let counts = health.apiCreditCounts
+        precondition(counts.ready == 1 && counts.total == 2 && counts.exhausted == 0, "\(counts)")
+        precondition(rebuilt(status, input: input, now: now).apiCreditReady == 1)
+
+        // 재검토 M4: 소진 차단을 설정에 못 쓴 키는 실제 행 사유 줄에도 "설정 저장 실패"가 나온다.
+        let unsaved: [String: Any] = ["usd": 50, "spentUsd": 1, "exhausted": true, "exhaustedReason": "credit-exhausted",
+                                      "unpricedTokens": 0, "persistFailed": true]
+        accounts.append(apiKeyAccount("api-unsaved", usable: false, credit: unsaved))
+        status["accounts"] = accounts
+        let health2 = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let ui = health2.accounts.firstIndex(where: { $0.name == "api-unsaved" }) else { preconditionFailure("api-unsaved") }
+        let unsavedState = health2.routingAvailability(now: now)[ui]
+        precondition(unsavedState.state == .excluded && unsavedState.reason.hasSuffix("설정 저장 실패(재시작하면 풀림)"), unsavedState.reason)
     }
 
     /// 재시도 시각(전원 막힘일 때 복귀까지 초)은 플래그 false 계정의 남은 5시간 값을 쓰지 않는다.

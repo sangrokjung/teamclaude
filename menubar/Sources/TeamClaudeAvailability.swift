@@ -20,12 +20,42 @@ struct TeamClaudeFableAvailability {
     var graceWindows: [String] = []
     /// .limited인데 문턱 이상이라 막힌 창 이름들. 비어 있으면 창이 아닌 이유(throttled·exhausted)로 기다린다.
     var blockedWindows: [String] = []
+    /// API 키 계정의 판정이다. 표에서는 상태와 무관하게 "API 크레딧" 묶음으로 간다.
+    var apiCredit = false
+}
+
+/// API 키 계정(spec B3·B10). 세션·주간 창이 없고 구독이 모두 소진된 뒤에야 프록시가 쓰는 유료 계층이다.
+/// .ready는 "지금 받는 중"이 아니라 "쓸 수 있는 대기"다. 사유 줄에는 남은 금액(추정)·만료를 쓴다.
+func teamClaudeApiCreditAvailability(_ row: TeamClaudeAccountHealth, health: TeamClaudeHealth,
+                                     now: Date) -> TeamClaudeFableAvailability {
+    func result(_ state: TeamClaudeFableState, _ reason: String) -> TeamClaudeFableAvailability {
+        var availability = TeamClaudeFableAvailability(state: state, reason: reason)
+        availability.apiCredit = true
+        return availability
+    }
+    if row.apiCredit?.exhausted == true || row.errorReason == "credit-exhausted" {
+        // 소진 행도 같은 문구 함수를 거쳐야 "설정 저장 실패" 경고가 실제 행에 나온다.
+        let reason = row.apiCredit.map { teamClaudeApiCreditReason($0, now: now) } ?? L10n.apiCreditExhaustedReason
+        return result(.excluded, reason)
+    }
+    if row.status == "error" { return result(.excluded, teamAccountErrorReasonLabel(row.errorReason)) }
+    if !row.enabled { return result(.excluded, L10n.reasonDisabled) }
+    if !health.serverReachable { return result(.unconfirmed, TeamClaudeRowReason.offline) }
+    let detail = row.apiCredit.map { teamClaudeApiCreditReason($0, now: now) } ?? L10n.reasonServerState
+    switch row.status {
+    // 크레딧은 남았지만 프록시가 usable:false(분당 토큰·요청 한도)로 준 키는 일시 대기다(영구 소진과 구분).
+    case "active" where row.usableFromProxy == false: return result(.limited, L10n.reasonApiRateLimited)
+    case "active": return result(.ready, detail)
+    case "throttled", "exhausted": return result(.limited, row.status == "throttled" ? L10n.reasonThrottled : L10n.reasonQuotaReset)
+    default: return result(.unconfirmed, L10n.reasonServerState)
+    }
 }
 
 func teamClaudeFableAvailability(
     _ row: TeamClaudeAccountHealth, health: TeamClaudeHealth,
     subscription: AccountSubscriptionDetails, now: Date = Date(), includeFable: Bool = true
 ) -> TeamClaudeFableAvailability {
+    if row.isApiKey { return teamClaudeApiCreditAvailability(row, health: health, now: now) }
     let subscriptionAppearance: AccountSubscriptionAppearance =
         subscription.appearance(now: now) == .endDateReached || row.subscriptionEndReached
         || row.subscriptionEndsAt.map({ end in
@@ -155,10 +185,23 @@ extension TeamClaudeHealth {
         return (SubscriptionTarget(provider: "anthropic", name: row.name, accountUuid: local.uuid), billing)
     }
 
+    /// 지금 라우팅 가능한 구독 계정. API 키 계정은 구독이 모두 소진된 뒤의 대기라 세지 않는다(apiCreditReadyCount).
     func opusAvailability(store: AccountSubscriptionStore = .shared, now: Date = Date()) -> [String] {
         zip(accounts, routingAvailability(store: store, now: now)).compactMap { row, availability in
-            availability.state == .ready ? row.name : nil
+            availability.state == .ready && !row.isApiKey ? row.name : nil
         }
+    }
+
+    /// API 키 계정 수와 그중 쓸 수 있는(크레딧 미소진·켜짐) 수, 크레딧 소진 수.
+    var apiCreditCounts: (ready: Int, total: Int, exhausted: Int) {
+        let keys = accounts.filter(\.isApiKey)
+        return (keys.filter(\.isUsable).count, keys.count,
+                keys.filter { $0.apiCredit?.exhausted == true || $0.errorReason == "credit-exhausted" }.count)
+    }
+
+    /// 구독 계정 수(제목·개요의 "N/M"의 M). API 키 계정은 따로 센다.
+    var subscriptionAccountTotal: Int {
+        max(0, max(accountTotal, accountConfigured, accounts.count) - accounts.filter(\.isApiKey).count)
     }
 
     /// 지금 라우팅 가능한 계정 수(동시 요청이 가득 찬 계정·유예 차선 포함). 개요 큰 숫자와 같은 값이다.
@@ -186,15 +229,17 @@ extension TeamClaudeHealth {
                                         fallbackConfirmation: row.subscriptionConfirmation)
             let appearance = state.subscriptionAppearance == .standard ? details.appearance(now: now) : state.subscriptionAppearance
             // 구독 줄은 기록이 있을 때만 그린다. 기록이 없는 행의 입력 진입점은 펼친 행의 상세 칸에 있다.
+            // API 키 행은 구독 기록이 없다. 사유 줄(남은 금액·만료·소진)만 그린다.
             return TeamClaudeRowLines(
                 reason: teamClaudeReasonLineIsInformative(state.reason),
-                subscription: accountSubscriptionLineIsInformative(details, appearance: appearance))
+                subscription: !row.isApiKey && accountSubscriptionLineIsInformative(details, appearance: appearance))
         }
     }
 }
 
 /// 표의 상태 묶음. 구독이 끝난 계정은 판정과 무관하게 제외 묶음이다.
 func teamClaudeRowGroup(_ state: TeamClaudeFableAvailability) -> TeamClaudeRowGroup {
+    if state.apiCredit { return .apiCredit }
     if state.subscriptionAppearance == .ended { return .excluded }
     switch state.state {
     case .ready: return .ready
