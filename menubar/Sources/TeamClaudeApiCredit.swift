@@ -51,7 +51,8 @@ func teamClaudeApiCredit(_ raw: Any?) -> TeamClaudeApiCredit? {
     }
     let exhausted = flag("exhausted")
     let reason = (dict["exhaustedReason"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-    let unpriced = creditNumber(dict["unpricedTokens"]).map { max(0, Int($0)) } ?? 0
+    // 범위를 먼저 자른 뒤 정수로 바꾼다. 유한하지만 Int 범위 밖인 값(손상된 응답)에서 앱이 멈추지 않게.
+    let unpriced = creditNumber(dict["unpricedTokens"]).map { Int(min(max(0, $0), 1_000_000_000_000_000)) } ?? 0
     return TeamClaudeApiCredit(usd: usd, spentUsd: spent, since: creditMillisDate(dict["since"]),
                                expiresAt: creditMillisDate(dict["expiresAt"]), exhausted: exhausted,
                                exhaustedReason: reason, unpricedTokens: unpriced,

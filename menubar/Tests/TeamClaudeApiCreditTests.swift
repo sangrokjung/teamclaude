@@ -27,6 +27,9 @@ struct TeamClaudeApiCreditTests {
         // 숫자 아닌 값·불은 무시한다. 지출이 충전을 넘으면 남은 비율은 0.
         let odd = teamClaudeApiCredit(["usd": true, "spentUsd": "3", "exhausted": 1, "unpricedTokens": -5])!
         precondition(odd.usd == nil && odd.spentUsd == 0 && odd.exhausted == false && odd.unpricedTokens == 0)
+        // Int 범위를 벗어난 유한값도 앱을 멈추지 않는다(검토 지적 M2): 위로는 상한, 음수는 0.
+        precondition(teamClaudeApiCredit(["unpricedTokens": 1e20])!.unpricedTokens == 1_000_000_000_000_000)
+        precondition(teamClaudeApiCredit(["unpricedTokens": -1e20])!.unpricedTokens == 0)
         let over = teamClaudeApiCredit(["usd": 10, "spentUsd": 15])!
         precondition(over.remainingFraction == 0)
         precondition(over.remainingShownUsd == 0)
