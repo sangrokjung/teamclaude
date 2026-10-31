@@ -73,7 +73,7 @@ struct TeamClaudeRowLinesTests {
         precondition(teamClaudeCardBaseHeight(hostLine: true) == 176, "the host line adds exactly its own height")
         precondition(teamClaudeCardBaseHeight(hostLine: false) < 256, "stage 2 removed the four stat tiles, so the base must shrink")
 
-        // 6. 5시간 창이 없는 계정의 세션 칸 — 측정 문제 어휘 대신 "없음", 리셋 줄도 "세션 없음".
+        // 6. 5시간 창이 없는 계정의 세션 칸: 측정 문제 어휘 대신 "없음", 리셋 줄도 "세션 없음".
         L10n.language = .ko
         precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: true, quotaBlocked: false, attempted: true) == "없음")
         precondition(teamClaudeSessionEmptyLabel(sessionWindowAbsent: true, stale: false, quotaBlocked: false, attempted: false) == L10n.sessionNoneShort)
