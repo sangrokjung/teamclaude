@@ -5,7 +5,7 @@
 고정하고, 검토에 필요한 구간만 원문 그대로 옮겼습니다.
 
 - Source: `src/account-manager.js`
-- SHA-256: `dbe0abf724603717a805b15aa5804c836b4f8d347dd4dfd553f8982f2ee1b3fc`
+- SHA-256: `02db40a4a20927a175a1e5d150bbd483b728b8be6674e0e93cbbf70bea472f08`
 - Source: `src/config.js`
 - SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
@@ -25,6 +25,8 @@
   `src/account-manager.js`만 바뀌었다. `_isAvailable`에는 발췌 시작 전에 `creditExhausted` 판정이, 근접 쿼터 판정 뒤
   `// ...` 자리에 API 키 계층 잠금이 들어갔고, `_recoverSoonest`에는 `_isModelUnsupported` 앞 `// ...` 자리에
   `creditExhausted` 건너뛰기가 들어갔다. 아래 발췌 줄은 바뀐 소스와 줄 단위·순서대로 일치하고 모델 복구 로직은 변경 없다.
+  같은 날 검토 수정(발송 도장 `creditDispatchStamp`·`setApiKey`·`reconcileCreditFlagFromDisk`, 영속 실패 재시도)도
+  크레딧 메서드 안에서만 바뀌었고 발췌 구간은 그대로다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을
