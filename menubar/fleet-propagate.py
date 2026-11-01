@@ -88,10 +88,20 @@ def verify():
         return "not-stable-or-unexpected-process " + comm
     return selftest(target)
 
+def prune_backups(keep=5):
+    """install.py는 설치마다 backup-*를 남긴다. 자동 재시도가 쌓지 않도록 최근 것만 둔다."""
+    import shutil
+    backups = sorted((p for p in directory.glob("backup-*") if p.is_dir()), key=lambda p: p.stat().st_mtime)
+    for old in backups[:-keep]:
+        shutil.rmtree(old, ignore_errors=True)
+
 installed_backup = None
 installed = False
 if not (target.exists() and digest(target) == want):
     installed = True
+    # 로그아웃 상태면 LaunchAgent를 올릴 GUI 도메인이 없다. 설치 시도(=백업 생성) 전에 거른다.
+    if subprocess.run(["launchctl", "print", "gui/%d" % os.getuid()], capture_output=True).returncode != 0:
+        fail("no-gui-session")
     archs = subprocess.run(["lipo", "-archs", str(candidate)], capture_output=True, text=True)
     runnable = {platform.machine()} | ({"arm64e"} if platform.machine() == "arm64" else set())
     if archs.returncode != 0 or not runnable & set(archs.stdout.split()):
@@ -112,8 +122,11 @@ if problem:
     if previous and previous.exists():
         restored = subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(previous),
                                    "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
+        prune_backups()
         fail("%s (rolled-back rc=%d)" % (problem, restored.returncode))
     fail(problem)
+if installed:
+    prune_backups()
 print("OK", "installed" if installed else "verified", want[:16])
 '''
 
@@ -213,7 +226,12 @@ def targets(manifest):
         if node["id"] in seen:
             raise ValueError("duplicate node id %r" % node["id"])
         seen.add(node["id"])
-        if node.get("menubarAutoUpdate", True) and (not isinstance(node.get("host"), str) or not node["host"]):
+        if not isinstance(node.get("menubarAutoUpdate", True), bool):
+            raise ValueError("node %r: menubarAutoUpdate must be true or false" % node["id"])
+        for key in ("python", "menubar", "host"):
+            if key in node and not isinstance(node[key], str):
+                raise ValueError("node %r: %s must be a string" % (node["id"], key))
+        if node.get("menubarAutoUpdate", True) and not node.get("host"):
             raise ValueError("node %r needs a 'host' (or menubarAutoUpdate: false)" % node["id"])
     return [n for n in manifest["nodes"] if n.get("menubarAutoUpdate", True)]
 
@@ -308,9 +326,17 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
 
 
 def run_command(args):
-    manifest_path = Path(args.manifest).expanduser()
-    manifest = json.loads(manifest_path.read_text())
-    state_dir = Path(args.state_dir).expanduser() if args.state_dir else Path(manifest["menubar"]).resolve().parent / "fleet"
+    try:
+        manifest = json.loads(Path(args.manifest).expanduser().read_text())
+        default_state = Path(manifest["menubar"]).resolve().parent / "fleet"
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        # 매니페스트를 못 읽어도 표식은 남긴다. 설치된 키트에서는 이 스크립트 폴더가 곧 상태 폴더다.
+        state_dir = Path(args.state_dir).expanduser() if args.state_dir else Path(__file__).resolve().parent
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "FAILED").write_text(json.dumps({"at": now(), "manifest": repr(error)}, ensure_ascii=False))
+        log(state_dir, "매니페스트 오류: %r" % (error,))
+        return 1
+    state_dir = Path(args.state_dir).expanduser() if args.state_dir else default_state
     state_dir.mkdir(parents=True, exist_ok=True)
     with open(state_dir / ".lock", "a") as lock:
         try:
@@ -328,6 +354,7 @@ def run_command(args):
 def install_command(args):
     manifest_path = Path(args.manifest).expanduser().resolve(strict=True)
     manifest = json.loads(manifest_path.read_text())
+    targets(manifest)  # 등록 전에 run과 같은 검증을 통과해야 한다
     binary = Path(manifest["menubar"]).resolve()
     kit = binary.parent / "fleet"
     kit.mkdir(parents=True, exist_ok=True)

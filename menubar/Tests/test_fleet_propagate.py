@@ -189,18 +189,31 @@ class FleetPropagateTest(unittest.TestCase):
         self.assertFalse((self.state / "last-ok").exists())
 
     def test_malformed_manifest_stops_instead_of_skipping_nodes(self):
-        for nodes in ([{"id": "a", "host": "h1"}, {"id": "a", "host": "h2"}], [{"id": "a"}], [{"host": "h"}]):
+        for nodes in ([{"id": "a", "host": "h1"}, {"id": "a", "host": "h2"}], [{"id": "a"}], [{"host": "h"}],
+                      [{"id": "a", "host": "h", "menubarAutoUpdate": None}],
+                      [{"id": "a", "host": "h", "menubarAutoUpdate": "false"}],
+                      [{"id": "a", "host": "h", "python": 42}]):
             self.manifest["nodes"] = nodes
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError, msg=nodes):
                 self.propagate(FakeRunner(self.binary))
+
+    def test_unreadable_manifest_leaves_failure_marker(self):
+        import argparse
+        bad = self.base / "bad.json"
+        bad.write_text("{not json")
+        self.assertEqual(fp.run_command(argparse.Namespace(manifest=str(bad), state_dir=str(self.state))), 1)
+        self.assertIn("manifest", (self.state / "FAILED").read_text())
 
     # --- 워커 쪽 스크립트(REMOTE)를 임시 HOME에서 실제로 실행 ---
 
-    def run_remote(self, candidate, install_py="raise SystemExit('install.py must not run')"):
+    def run_remote(self, candidate, install_py="raise SystemExit('install.py must not run')", old_backups=0,
+                   path="/usr/bin:/bin"):
         home = self.base / "home"
-        app = home / "Applications/cc-menubar"
-        app.mkdir(parents=True)
-        (app / "cc-menubar").write_text("old")
+        self.app = home / "Applications/cc-menubar"
+        self.app.mkdir(parents=True)
+        (self.app / "cc-menubar").write_text("old")
+        for i in range(old_backups):
+            (self.app / ("backup-old-%d" % i)).mkdir()
         stage = home / "stage"
         stage.mkdir()
         (stage / "cc-menubar").write_bytes(candidate)
@@ -208,8 +221,19 @@ class FleetPropagateTest(unittest.TestCase):
         (stage / "install.py").write_text(install_py)
         want = hashlib.sha256(candidate).hexdigest()
         result = subprocess.run(["/usr/bin/python3", "-", str(stage), want, ""], input=fp.REMOTE, text=True,
-                                capture_output=True, timeout=120, env={"HOME": str(home), "PATH": "/usr/bin:/bin"})
-        return result, (app / "cc-menubar").read_bytes()
+                                capture_output=True, timeout=120, env={"HOME": str(home), "PATH": path})
+        return result, (self.app / "cc-menubar").read_bytes()
+
+    def test_remote_does_nothing_when_user_is_logged_out(self):
+        fake = self.base / "fakebin"
+        fake.mkdir()
+        (fake / "launchctl").write_text("#!/bin/sh\nexit 113\n")  # GUI 도메인 없음
+        (fake / "launchctl").chmod(0o755)
+        result, installed = self.run_remote(b"anything", path="%s:/usr/bin:/bin" % fake)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("FAIL no-gui-session", result.stdout)
+        self.assertEqual(installed, b"old")
+        self.assertEqual(list(self.app.glob("backup-*")), [])
 
     def selftest_binary(self):
         """--selftest에 SELFTEST를 찍는 이 맥용 실행 파일."""
@@ -241,10 +265,11 @@ class FleetPropagateTest(unittest.TestCase):
             "bk = d / ('backup-%d' % time.time_ns()); bk.mkdir()\n"
             "shutil.copy2(d / 'cc-menubar', bk / 'cc-menubar'); shutil.copy2(b, d / 'cc-menubar')\n")
         # 이 임시 설치본은 실제 LaunchAgent가 실행하는 파일이 아니므로 확인 단계가 실패해야 하고, 백업으로 되돌아가야 한다.
-        result, installed = self.run_remote(self.selftest_binary(), install_py=fake_install)
+        result, installed = self.run_remote(self.selftest_binary(), install_py=fake_install, old_backups=7)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("rolled-back rc=0", result.stdout)
         self.assertEqual(installed, b"old")
+        self.assertEqual(len(list(self.app.glob("backup-*"))), 5)  # 재시도가 백업을 쌓지 않는다
 
     def test_elapsed_seconds_parses_ps_formats(self):
         self.assertEqual(fp.elapsed_seconds("00:21"), 21)
