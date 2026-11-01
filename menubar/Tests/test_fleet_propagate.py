@@ -46,7 +46,13 @@ class FakeRunner:
         if host in self.hanging_hosts and "input" in kwargs:
             raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 1))
         if host in self.failing_hosts:
-            return Result(255, "", "ssh: connect timed out")
+            if "input" in kwargs:
+                return Result(1, "FAIL no-gui-session\n")
+            if command[-1].startswith("rm -rf "):
+                return Result()
+            if command[0].endswith("scp"):
+                return Result()
+            return Result(0) if command[-1].startswith("mkdir") else Result(255, "", "ssh: connect timed out")
         if "input" in kwargs:
             return Result(0, "OK installed abc\n")
         return Result()
@@ -131,6 +137,12 @@ class FleetPropagateTest(unittest.TestCase):
         self.assertEqual(self.propagate(retry), 0)
         self.assertEqual(retry.installs(), ["host-b"])
         self.assertFalse((self.state / "FAILED").exists())
+
+    def test_staging_is_removed_even_when_remote_install_fails(self):
+        runner = FakeRunner(self.binary, failing_hosts={"host-b"})
+        self.assertEqual(self.propagate(runner), 1)
+        cleanups = [c[-2] for c, k in runner.calls if c[0].endswith("ssh") and c[-1].startswith("rm -rf .cache/")]
+        self.assertEqual(cleanups, ["host-a", "host-b"])
 
     def test_new_hub_binary_goes_to_every_node_again(self):
         self.propagate(FakeRunner(self.binary))
@@ -270,6 +282,28 @@ class FleetPropagateTest(unittest.TestCase):
         self.assertIn("rolled-back rc=0", result.stdout)
         self.assertEqual(installed, b"old")
         self.assertEqual(len(list(self.app.glob("backup-*"))), 5)  # 재시도가 백업을 쌓지 않는다
+
+    def test_remote_does_not_roll_back_over_an_install_that_took_over(self):
+        # 가짜 install.py: 후보를 설치하고, 2초 뒤 다른 설치(v3)가 끼어드는 상황을 만든다.
+        takeover = (
+            "import sys, shutil, pathlib, time, subprocess\n"
+            "a = sys.argv; b = pathlib.Path(a[a.index('--binary') + 1]); d = pathlib.Path(a[a.index('--install-dir') + 1])\n"
+            "bk = d / ('backup-%d' % time.time_ns()); bk.mkdir()\n"
+            "shutil.copy2(d / 'cc-menubar', bk / 'cc-menubar'); shutil.copy2(b, d / 'cc-menubar')\n"
+            "subprocess.Popen(['/bin/sh', '-c', 'sleep 2; printf v3 > \"$0\"', str(d / 'cc-menubar')])\n")
+        result, installed = self.run_remote(self.selftest_binary(), install_py=takeover)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("another install took over", result.stdout)
+        self.assertEqual(installed, b"v3")
+
+    def test_remote_prunes_backups_when_install_py_fails(self):
+        failing = (
+            "import sys, pathlib, time\n"
+            "d = pathlib.Path(sys.argv[sys.argv.index('--install-dir') + 1])\n"
+            "(d / ('backup-%d' % time.time_ns())).mkdir(); raise SystemExit(5)\n")
+        result, installed = self.run_remote(self.selftest_binary(), install_py=failing, old_backups=7)
+        self.assertIn("FAIL install-py rc=5", result.stdout)
+        self.assertEqual(len(list(self.app.glob("backup-*"))), 5)
 
     def test_elapsed_seconds_parses_ps_formats(self):
         self.assertEqual(fp.elapsed_seconds("00:21"), 21)

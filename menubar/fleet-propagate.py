@@ -113,12 +113,16 @@ if not (target.exists() and digest(target) == want):
     result = subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(candidate),
                              "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
+        prune_backups()  # install.py는 실패해도 백업을 남긴다. 재시도가 쌓지 않게 한다.
         fail("install-py rc=%d %s" % (result.returncode, result.stderr.strip()[-200:]))
     created = sorted(set(directory.glob("backup-*")) - before)
     installed_backup = created[-1] if created else None
 problem = verify()
 if problem:
     previous = installed_backup / "cc-menubar" if installed_backup else None
+    if previous and previous.exists() and target.exists() and digest(target) != want:
+        # 검증하는 사이 다른 설치가 끼어들었다. 그 설치를 옛 백업으로 덮지 않는다.
+        fail("%s (another install took over; not rolled back)" % problem)
     if previous and previous.exists():
         restored = subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(previous),
                                    "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
@@ -255,6 +259,16 @@ def push(node, kit, binary_hash, runner=run):
 def _push(node, kit, binary_hash, runner):
     host = node["host"]
     stage = ".cache/cc-menubar-fleet/" + binary_hash[:16]
+    try:
+        return _push_staged(node, kit, binary_hash, runner, host, stage)
+    finally:  # 성공이든 실패든 워커에 복사한 키트를 남기지 않는다. 정리 실패는 결과를 바꾸지 않는다.
+        try:
+            runner([*SSH, host, "rm -rf " + shlex.quote(stage)], timeout=60)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
+def _push_staged(node, kit, binary_hash, runner, host, stage):
     steps = [
         [*SSH, host, "mkdir -p " + shlex.quote(stage)],
         [*SCP, *[str(kit / name) for name in ("cc-menubar", "install.py", "com.qjc.cc-menubar.plist.template")],
@@ -270,10 +284,6 @@ def _push(node, kit, binary_hash, runner):
     result = runner([*SSH, host, remote], input=REMOTE, timeout=REMOTE_TIMEOUT)
     if result.returncode != 0 or not result.stdout.startswith("OK "):
         return "install-failed rc=%d %s" % (result.returncode, ((result.stderr or "") + (result.stdout or "")).strip()[-300:]), None
-    try:  # 설치는 끝났다. 정리 실패는 결과를 바꾸지 않는다.
-        runner([*SSH, host, "rm -rf " + shlex.quote(stage)], timeout=60)
-    except (subprocess.TimeoutExpired, OSError):
-        pass
     return None, result.stdout.split()[1]
 
 
