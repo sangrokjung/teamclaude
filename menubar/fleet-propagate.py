@@ -33,6 +33,7 @@ SSH = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 SCP = ["/usr/bin/scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 STABLE_SECONDS = 20
 STABLE_WAIT_LIMIT = 120
+REVERIFY_SECONDS = 6 * 3600  # 같은 판이어도 이 주기로 워커를 다시 확인한다(워커를 손으로 되돌린 경우 등)
 REMOTE_TIMEOUT = 240
 
 # 노드에서 실행하는 설치 스크립트. 기존 LaunchAgent가 가리키는 폴더 그대로 교체한다.
@@ -88,7 +89,9 @@ def verify():
     return selftest(target)
 
 installed_backup = None
+installed = False
 if not (target.exists() and digest(target) == want):
+    installed = True
     archs = subprocess.run(["lipo", "-archs", str(candidate)], capture_output=True, text=True)
     runnable = {platform.machine()} | ({"arm64e"} if platform.machine() == "arm64" else set())
     if archs.returncode != 0 or not runnable & set(archs.stdout.split()):
@@ -111,7 +114,7 @@ if problem:
                                    "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
         fail("%s (rolled-back rc=%d)" % (problem, restored.returncode))
     fail(problem)
-print("OK", want[:16])
+print("OK", "installed" if installed else "verified", want[:16])
 '''
 
 
@@ -158,6 +161,9 @@ def hub_ready(binary, runner=run, clock=time.time, sleep=time.sleep):
         if reason is None or not reason.startswith("settling") or clock() >= deadline:
             break
         sleep(5)
+    if reason and reason.startswith("settling:"):
+        # 유예를 다 썼는데도 안정되지 않았다(기동 실패·재시작 반복). 실패로 드러낸다.
+        return "hub-not-stable-after-%ds (%s)" % (STABLE_WAIT_LIMIT, reason.split(": ", 1)[1])
     if reason:
         return reason
     result = runner([str(binary), "--selftest"], timeout=60)
@@ -197,17 +203,35 @@ def save_state(state_dir, state):
 
 
 def targets(manifest):
-    return [n for n in manifest.get("nodes", []) if n.get("menubarAutoUpdate", True) and n.get("host")]
+    """전파 대상 노드. 형식이 틀린 매니페스트는 노드를 조용히 빼지 않고 오류로 멈춘다."""
+    if not isinstance(manifest.get("menubar"), str) or not isinstance(manifest.get("nodes"), list):
+        raise ValueError("manifest needs 'menubar' (string) and 'nodes' (list)")
+    seen = set()
+    for node in manifest["nodes"]:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+            raise ValueError("every node needs a non-empty string 'id'")
+        if node["id"] in seen:
+            raise ValueError("duplicate node id %r" % node["id"])
+        seen.add(node["id"])
+        if node.get("menubarAutoUpdate", True) and (not isinstance(node.get("host"), str) or not node["host"]):
+            raise ValueError("node %r needs a 'host' (or menubarAutoUpdate: false)" % node["id"])
+    return [n for n in manifest["nodes"] if n.get("menubarAutoUpdate", True)]
+
+
+def is_current(record, node, binary_hash, clock):
+    """같은 판이 같은 주소에 REVERIFY_SECONDS 안에 확인됐으면 이번 회차는 건너뛴다."""
+    return (record.get("hash") == binary_hash and record.get("host") == node["host"]
+            and clock() - record.get("verifiedAt", 0) < REVERIFY_SECONDS)
 
 
 def push(node, kit, binary_hash, runner=run):
-    """노드 하나에 설치. 성공이면 None, 실패면 이유. 시간 초과도 이 노드의 실패로만 끝난다."""
+    """노드 하나에 설치·확인. (None, "installed"|"verified") 또는 (이유, None). 시간 초과도 이 노드의 실패로만 끝난다."""
     try:
         return _push(node, kit, binary_hash, runner)
     except subprocess.TimeoutExpired as error:
-        return "timeout %ss %s" % (int(error.timeout), error.cmd[0] if error.cmd else "")
+        return "timeout %ss %s" % (int(error.timeout), error.cmd[0] if error.cmd else ""), None
     except OSError as error:
-        return "os-error %s" % error
+        return "os-error %s" % error, None
 
 
 def _push(node, kit, binary_hash, runner):
@@ -221,29 +245,29 @@ def _push(node, kit, binary_hash, runner):
     for command in steps:
         result = runner(command, timeout=REMOTE_TIMEOUT)
         if result.returncode != 0:
-            return "copy-failed rc=%d %s" % (result.returncode, (result.stderr or "").strip()[-200:])
+            return "copy-failed rc=%d %s" % (result.returncode, (result.stderr or "").strip()[-200:]), None
     python = node.get("python") or "python3"
     remote = " ".join([shlex.quote(python), "-", '"$HOME"/' + shlex.quote(stage), shlex.quote(binary_hash),
                        shlex.quote(node.get("menubar", ""))])
     result = runner([*SSH, host, remote], input=REMOTE, timeout=REMOTE_TIMEOUT)
-    if result.returncode != 0 or not result.stdout.startswith("OK"):
-        return "install-failed rc=%d %s" % (result.returncode, ((result.stderr or "") + (result.stdout or "")).strip()[-300:])
+    if result.returncode != 0 or not result.stdout.startswith("OK "):
+        return "install-failed rc=%d %s" % (result.returncode, ((result.stderr or "") + (result.stdout or "")).strip()[-300:]), None
     try:  # 설치는 끝났다. 정리 실패는 결과를 바꾸지 않는다.
         runner([*SSH, host, "rm -rf " + shlex.quote(stage)], timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         pass
-    return None
+    return None, result.stdout.split()[1]
 
 
 def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, sleep=time.sleep):
     """한 회차. 종료 코드: 0 = 전 노드 최신이거나 대기, 1 = 실패 노드 있음."""
+    nodes = targets(manifest)
     binary = Path(manifest["menubar"]).resolve()
     marker = state_dir / "FAILED"
+    checked_hash = sha256(binary)  # 허브 점검을 받는 판
     reason = hub_ready(binary, runner, clock, sleep)
     if reason:
-        log(state_dir, "대기: " + reason)
-        if reason.startswith("settling"):
-            return 0  # 허브가 막 바뀌는 중. 다음 회차가 다시 본다.
+        log(state_dir, "허브 확인 실패: " + reason)
         marker.write_text(json.dumps({"at": now(), "hub": reason}, ensure_ascii=False, indent=1))
         return 1
     state = load_state(state_dir)
@@ -253,20 +277,24 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
         for name in ("install.py", "com.qjc.cc-menubar.plist.template"):
             shutil.copy2(kit_source / name, kit / name)
         binary_hash = sha256(kit / "cc-menubar")
+        if binary_hash != checked_hash:
+            # 점검하는 사이 허브가 또 바뀌었다. 점검 안 받은 판은 보내지 않는다(파일 교체가 다음 회차를 깨운다).
+            log(state_dir, "대기: 허브 판이 점검 중에 바뀜")
+            return 0
         failures = {}
-        for node in targets(manifest):
+        for node in nodes:
             record = state["nodes"].get(node["id"], {})
-            if record.get("hash") == binary_hash:
+            if is_current(record, node, binary_hash, clock):
                 continue
-            error = push(node, kit, binary_hash, runner)
+            error, outcome = push(node, kit, binary_hash, runner)
             if error:
                 # 실패한 시도 뒤에는 노드에 무엇이 남았는지 모른다. 옛 성공 해시를 지워 다음 회차가 반드시 다시 확인하게 한다.
                 failures[node["id"]] = error
                 state["nodes"][node["id"]] = {"lastError": error, "lastErrorAt": now()}
                 log(state_dir, "실패 %s: %s" % (node["id"], error))
             else:
-                state["nodes"][node["id"]] = {"hash": binary_hash, "at": now()}
-                log(state_dir, "설치 %s: %s" % (node["id"], binary_hash[:16]))
+                state["nodes"][node["id"]] = {"hash": binary_hash, "host": node["host"], "at": now(), "verifiedAt": clock()}
+                log(state_dir, "%s %s: %s" % ("설치" if outcome == "installed" else "확인", node["id"], binary_hash[:16]))
             save_state(state_dir, state)  # 노드마다 바로 기록한다
         state["hub"] = {"hash": binary_hash, "checkedAt": now()}
         save_state(state_dir, state)
