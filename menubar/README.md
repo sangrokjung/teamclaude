@@ -109,6 +109,30 @@ menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png 
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
+## Keeping several Macs on the same build
+
+If you run one hub Mac and several worker Macs (each with the menu bar installed), the hub can push its build to the
+others automatically. List the workers in a JSON manifest:
+
+```json
+{"menubar": "/Users/me/Applications/cc-menubar/cc-menubar",
+ "nodes": [{"id": "worker1", "host": "worker1", "python": "/opt/homebrew/bin/python3"}]}
+```
+
+`host` is an ssh destination that works non-interactively (`ssh -o BatchMode=yes <host>`). Then, on the hub:
+
+```sh
+python3 menubar/fleet-propagate.py install --manifest ~/path/to/manifest.json
+```
+
+This copies the propagation kit next to the installed app (`~/Applications/cc-menubar/fleet/`) and registers the
+`com.qjc.cc-menubar-fleet` LaunchAgent. It wakes when the hub binary is replaced, and every 10 minutes as a fallback.
+A build is pushed only after the hub's own menu bar has been running it for 20 seconds and `--selftest` passes, so a
+build that breaks on the hub never reaches the workers. Each worker is updated in place (the folder its LaunchAgent
+already points at) through `install.py`, then checked by hash, running process and `--selftest`. Workers that are
+offline are retried on the next round; failures are listed in `fleet/FAILED` and `fleet/last-ok` records the last clean
+round. Set `"menubarAutoUpdate": false` on a node to leave it alone. One manual round: `fleet-propagate.py run --manifest ...`.
+
 ## Install from a release
 
 Download from GitHub Releases. macOS 13 or later, universal (Apple Silicon and Intel).
