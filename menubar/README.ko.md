@@ -104,6 +104,29 @@ menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png 
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
+## 여러 맥을 같은 판으로 유지
+
+허브 맥 한 대와 워커 맥 여러 대에 메뉴바가 깔려 있다면, 허브 판을 워커에 자동으로 퍼뜨릴 수 있습니다.
+워커 목록을 JSON 매니페스트로 적습니다.
+
+```json
+{"menubar": "/Users/me/Applications/cc-menubar/cc-menubar",
+ "nodes": [{"id": "worker1", "host": "worker1", "python": "/opt/homebrew/bin/python3"}]}
+```
+
+`host`는 비대화형으로 접속되는 ssh 대상이어야 합니다(`ssh -o BatchMode=yes <host>`). 허브에서 다음을 실행합니다.
+
+```sh
+python3 menubar/fleet-propagate.py install --manifest ~/path/to/manifest.json
+```
+
+설치된 앱 옆(`~/Applications/cc-menubar/fleet/`)에 전파 키트를 복사하고 `com.qjc.cc-menubar-fleet` LaunchAgent를 등록합니다.
+허브 바이너리가 바뀌면 바로, 그 밖에는 10분마다 확인합니다. 허브 메뉴바가 새 판으로 20초 이상 실행되고 `--selftest`가 통과한 뒤에만
+보내므로 허브에서 깨지는 판은 워커로 가지 않습니다. 워커는 LaunchAgent가 가리키던 폴더 그대로 `install.py`로 교체한 뒤
+해시·실행 프로세스·`--selftest`로 확인합니다. 꺼져 있던 워커는 다음 회차에 다시 시도하고, 실패는 `fleet/FAILED`에,
+마지막으로 깨끗이 끝난 회차는 `fleet/last-ok`에 남습니다. 건드리지 않을 노드는 `"menubarAutoUpdate": false`.
+한 회차만 손으로 돌릴 때는 `fleet-propagate.py run --manifest ...`.
+
 ## 외부 사용자 설치
 
 GitHub Releases에서 받는 배포본입니다. macOS 13 이상, Apple Silicon·Intel 공용(유니버설)입니다.
