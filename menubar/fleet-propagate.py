@@ -35,41 +35,83 @@ STABLE_SECONDS = 20
 STABLE_WAIT_LIMIT = 120
 REMOTE_TIMEOUT = 240
 
-# 노드에서 실행하는 설치 스크립트. 기존 LaunchAgent가 가리키는 폴더 그대로 교체하고 해시·실행·자체 점검을 확인한다.
+# 노드에서 실행하는 설치 스크립트. 기존 LaunchAgent가 가리키는 폴더 그대로 교체한다.
+# 교체 전: 후보가 이 맥의 아키텍처를 담고 있고 --selftest가 통과해야 한다(실패하면 기존 설치를 건드리지 않는다).
+# 교체 후: 해시·실행 프로세스·--selftest를 확인하고, 실패하면 install.py가 남긴 백업으로 되돌린다.
 REMOTE = r'''
-import os, plistlib, subprocess, sys, time, hashlib
+import os, platform, plistlib, subprocess, sys, time, hashlib
 from pathlib import Path
 stage, want, fallback = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+def fail(message):
+    print("FAIL", message)
+    sys.exit(1)
+
+def selftest(binary):
+    try:
+        result = subprocess.run([str(binary), "--selftest"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return "selftest-error %s" % type(error).__name__
+    if result.returncode != 0 or not result.stdout.startswith("SELFTEST"):
+        return "selftest-failed rc=%d" % result.returncode
+    return None
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
 plist = Path.home() / "Library/LaunchAgents/com.qjc.cc-menubar.plist"
 try:
     current = plistlib.loads(plist.read_bytes())["ProgramArguments"][0]
 except Exception:
     current = fallback or str(Path.home() / "Applications/cc-menubar/cc-menubar")
 directory = Path(current).parent
-digest = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
 target = directory / "cc-menubar"
+candidate = stage / "cc-menubar"
+
+def verify():
+    if not target.exists() or digest(target) != want:
+        return "hash-mismatch"
+    service = "gui/%d/com.qjc.cc-menubar" % os.getuid()
+    pid = None
+    for _ in range(30):
+        out = subprocess.run(["launchctl", "print", service], capture_output=True, text=True).stdout
+        pid = next((l.split("=")[1].strip() for l in out.splitlines() if l.startswith("\tpid = ")), None)
+        if pid:
+            break
+        time.sleep(1)
+    if not pid:
+        return "not-running"
+    time.sleep(5)  # 바로 죽고 재시작을 반복하는 판을 거른다
+    comm = subprocess.run(["ps", "-p", pid, "-o", "comm="], capture_output=True, text=True).stdout.strip()
+    if comm != str(target):
+        return "not-stable-or-unexpected-process " + comm
+    return selftest(target)
+
+installed_backup = None
 if not (target.exists() and digest(target) == want):
-    subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(stage / "cc-menubar"),
-                    "--install-dir", str(directory)], check=True, timeout=120)
-if digest(target) != want:
-    sys.exit("hash-mismatch")
-service = "gui/%d/com.qjc.cc-menubar" % os.getuid()
-pid = None
-for _ in range(30):
-    out = subprocess.run(["launchctl", "print", service], capture_output=True, text=True).stdout
-    pid = next((l.split("=")[1].strip() for l in out.splitlines() if l.startswith("\tpid = ")), None)
-    if pid:
-        break
-    time.sleep(1)
-if not pid:
-    sys.exit("not-running")
-comm = subprocess.run(["ps", "-p", pid, "-o", "comm="], capture_output=True, text=True).stdout.strip()
-if comm != str(target):
-    sys.exit("unexpected-process " + comm)
-result = subprocess.run([str(target), "--selftest"], capture_output=True, text=True, timeout=60)
-if result.returncode != 0 or not result.stdout.startswith("SELFTEST"):
-    sys.exit("selftest-failed rc=%d" % result.returncode)
-print("OK", want[:16], pid)
+    archs = subprocess.run(["lipo", "-archs", str(candidate)], capture_output=True, text=True)
+    runnable = {platform.machine()} | ({"arm64e"} if platform.machine() == "arm64" else set())
+    if archs.returncode != 0 or not runnable & set(archs.stdout.split()):
+        fail("arch-mismatch machine=%s candidate=%s" % (platform.machine(), archs.stdout.strip() or "unknown"))
+    problem = selftest(candidate)
+    if problem:
+        fail("candidate-" + problem)
+    before = set(directory.glob("backup-*")) if directory.exists() else set()
+    result = subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(candidate),
+                             "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        fail("install-py rc=%d %s" % (result.returncode, result.stderr.strip()[-200:]))
+    created = sorted(set(directory.glob("backup-*")) - before)
+    installed_backup = created[-1] if created else None
+problem = verify()
+if problem:
+    previous = installed_backup / "cc-menubar" if installed_backup else None
+    if previous and previous.exists():
+        restored = subprocess.run([sys.executable, str(stage / "install.py"), "--binary", str(previous),
+                                   "--install-dir", str(directory)], capture_output=True, text=True, timeout=120)
+        fail("%s (rolled-back rc=%d)" % (problem, restored.returncode))
+    fail(problem)
+print("OK", want[:16])
 '''
 
 
@@ -159,7 +201,16 @@ def targets(manifest):
 
 
 def push(node, kit, binary_hash, runner=run):
-    """노드 하나에 설치. 성공이면 None, 실패면 이유."""
+    """노드 하나에 설치. 성공이면 None, 실패면 이유. 시간 초과도 이 노드의 실패로만 끝난다."""
+    try:
+        return _push(node, kit, binary_hash, runner)
+    except subprocess.TimeoutExpired as error:
+        return "timeout %ss %s" % (int(error.timeout), error.cmd[0] if error.cmd else "")
+    except OSError as error:
+        return "os-error %s" % error
+
+
+def _push(node, kit, binary_hash, runner):
     host = node["host"]
     stage = ".cache/cc-menubar-fleet/" + binary_hash[:16]
     steps = [
@@ -177,17 +228,24 @@ def push(node, kit, binary_hash, runner=run):
     result = runner([*SSH, host, remote], input=REMOTE, timeout=REMOTE_TIMEOUT)
     if result.returncode != 0 or not result.stdout.startswith("OK"):
         return "install-failed rc=%d %s" % (result.returncode, ((result.stderr or "") + (result.stdout or "")).strip()[-300:])
-    runner([*SSH, host, "rm -rf " + shlex.quote(stage)], timeout=60)
+    try:  # 설치는 끝났다. 정리 실패는 결과를 바꾸지 않는다.
+        runner([*SSH, host, "rm -rf " + shlex.quote(stage)], timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     return None
 
 
 def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, sleep=time.sleep):
     """한 회차. 종료 코드: 0 = 전 노드 최신이거나 대기, 1 = 실패 노드 있음."""
     binary = Path(manifest["menubar"]).resolve()
+    marker = state_dir / "FAILED"
     reason = hub_ready(binary, runner, clock, sleep)
     if reason:
         log(state_dir, "대기: " + reason)
-        return 1 if not reason.startswith("settling") else 0
+        if reason.startswith("settling"):
+            return 0  # 허브가 막 바뀌는 중. 다음 회차가 다시 본다.
+        marker.write_text(json.dumps({"at": now(), "hub": reason}, ensure_ascii=False, indent=1))
+        return 1
     state = load_state(state_dir)
     with tempfile.TemporaryDirectory(prefix="cc-menubar-fleet-") as directory:
         kit = Path(directory)
@@ -202,15 +260,16 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
                 continue
             error = push(node, kit, binary_hash, runner)
             if error:
+                # 실패한 시도 뒤에는 노드에 무엇이 남았는지 모른다. 옛 성공 해시를 지워 다음 회차가 반드시 다시 확인하게 한다.
                 failures[node["id"]] = error
-                state["nodes"][node["id"]] = dict(record, lastError=error, lastErrorAt=now())
+                state["nodes"][node["id"]] = {"lastError": error, "lastErrorAt": now()}
                 log(state_dir, "실패 %s: %s" % (node["id"], error))
             else:
                 state["nodes"][node["id"]] = {"hash": binary_hash, "at": now()}
                 log(state_dir, "설치 %s: %s" % (node["id"], binary_hash[:16]))
+            save_state(state_dir, state)  # 노드마다 바로 기록한다
         state["hub"] = {"hash": binary_hash, "checkedAt": now()}
         save_state(state_dir, state)
-    marker = state_dir / "FAILED"
     if failures:
         marker.write_text(json.dumps({"at": now(), "hash": binary_hash, "nodes": failures}, ensure_ascii=False, indent=1))
         return 1
