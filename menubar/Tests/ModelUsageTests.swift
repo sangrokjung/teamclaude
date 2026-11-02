@@ -40,7 +40,7 @@ struct ModelUsageTests {
          "receipts":{"audit":{"jsonFiles":9,"uniqueRuns":4,"dupRunId":5},"daily":[
            {"date":"2026-10-29","runs":1,"tokens":1000000,"reviewSec":3600},{"date":"2026-11-01","runs":3,"tokens":3000000,"reviewSec":7200}]},
          "implLoop":{"daily":[{"date":"2026-10-31","runs":2,"rounds":5},{"date":"2026-11-02","runs":1,"rounds":1}]},
-         "pro200":{"mid":10000000,"lo":5000000,"hi":20000000,"weeks":3},
+         "pro200":{"mid":10000000,"lo":5000000,"hi":20000000,"weeks":3,"samples":7,"excluded":2},
          "undated":[{"lane":"codex","model":"gpt-6.1-sol","source":"hermes","input":700,"output":70,"cacheRead":0,"cacheWrite":0,"calls":7}],
          "quotaCycles":{"since":"2026-10-30","completeFrom":"2026-10-31","daily":[{"date":"2026-11-01","window":"5h","cycles":4,"exhausted":3},
            {"date":"2026-11-01","window":"7d","cycles":2,"exhausted":2}]},
@@ -62,7 +62,7 @@ struct ModelUsageTests {
         let r = report
         precondition(r.today == "2026-11-02" && r.daily.count == 7 && r.receipts.count == 2 && r.impl.count == 2)
         precondition(r.coverage.claudeCompleteFrom == "2026-10-21" && r.coverage.codexCliLastDay == "2026-10-30")
-        precondition(r.pro200?.mid == 10_000_000 && r.claudePool.accounts.count == 3 && !r.codexPool.available)
+        precondition(r.pro200?.mid == 10_000_000 && r.pro200?.samples == 7 && r.claudePool.accounts.count == 3 && !r.codexPool.available)
         precondition(r.generatedAt != nil)
         precondition(r.undated.count == 1 && r.undated[0].calls == 7 && r.cyclesSince == "2026-10-30" && r.cyclesCompleteFrom == "2026-10-31")
         precondition(ModelUsageReport.parse(Data("{}".utf8)) == nil, "schema missing")

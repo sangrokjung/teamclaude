@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import plistlib
@@ -42,11 +43,15 @@ OUTPUT_DAYS = 70          # JSON에 싣는 날짜 범위(10주)
 SEEN_KEEP_DAYS = 120      # 중복 제거 키를 기억하는 기간
 DEFAULT_RETENTION = 30    # Claude Code cleanupPeriodDays 기본값
 TOKENS_RE = re.compile(r'tokens used\s*\n\s*([\d,]+)')
-STATE_VERSION = '2'
+STATE_VERSION = '3'
 # 메뉴바(main.swift recordQuotaObservation)는 주기 이력을 레인·창마다 최근 256개만 남긴다. 그만큼 찬 파일은 앞이 잘렸을 수 있다.
 HISTORY_KEEP_PER_WINDOW = 256
-STATE_TABLES = ('meta', 'files', 'seen', 'daily', 'windows', 'receipt_files', 'receipt_logs', 'receipts',
-                'hermes_seen', 'undated', 'cycles')
+# windows는 2형식의 표다(재구성 때 지운다).
+STATE_TABLES = ('meta', 'files', 'seen', 'daily', 'windows', 'codex_obs', 'receipt_files', 'receipt_logs', 'receipts',
+                'hermes_seen', 'undated', 'cycles', 'impl_runs')
+FINGERPRINT_BYTES = 4096  # 오프셋 바로 앞 몇 바이트로 같은 inode 재작성을 알아챈다
+PRO_MIN_PCT_DELTA = 5.0   # 표본 창의 최소 사용률 변화(%p). 사용률이 정수 단위라 작은 변화는 잡음이다
+PRO_MIN_SAMPLES = 3       # 이보다 적으면 기준값을 내지 않는다(산출 불가)
 
 
 # ---------- 상태 DB ----------
@@ -65,21 +70,22 @@ def open_state(path: Path) -> sqlite3.Connection:
     meta_set(db, 'stateVersion', STATE_VERSION)
     db.executescript("""
     create table if not exists meta (key text primary key, value text);
-    create table if not exists files (path text primary key, ino integer, size integer, mtime real, offset integer, ctx text);
+    create table if not exists files (path text primary key, ino integer, size integer, mtime real, offset integer, ctx text, fp text);
     create table if not exists seen (key text primary key, day text);
     create table if not exists daily (date text, lane text, model text, source text,
         input integer, output integer, cache_read integer, cache_write integer, calls integer,
         primary key (date, lane, model, source));
-    create table if not exists windows (path text, reset integer, first_pct real, max_pct real, tokens integer, last_ts integer,
-        primary key (path, reset));
+    create table if not exists codex_obs (reset integer, ts integer, pct real, noncache integer);
+    create index if not exists codex_obs_reset on codex_obs (reset, ts);
     create table if not exists receipt_files (path text primary key, mtime real);
     create table if not exists receipt_logs (path text primary key, mtime real);
     create table if not exists receipts (run_id text primary key, canonical integer, base text, date text, tokens integer, review_sec real);
     create table if not exists hermes_seen (key text primary key, calls integer, input integer, output integer,
-        cache_read integer, cache_write integer);
+        cache_read integer, cache_write integer, last_seen real);
     create table if not exists undated (lane text, model text, source text, input integer, output integer,
         cache_read integer, cache_write integer, calls integer, primary key (lane, model, source));
     create table if not exists cycles (key text primary key, window text, date text, exhausted integer);
+    create table if not exists impl_runs (run text primary key, date text, rounds integer);
     """)
     return db
 
@@ -142,37 +148,49 @@ def jsonl_files(root: Path):
     return sorted(p for p in root.rglob('*.jsonl') if p.is_file())
 
 
+def prefix_fingerprint(path: Path, offset: int):
+    """오프셋 바로 앞 FINGERPRINT_BYTES의 지문. 같은 inode에서 다른 내용으로 다시 써졌는지 본다."""
+    if offset <= 0:
+        return ''
+    try:
+        with path.open('rb') as f:
+            f.seek(max(0, offset - FINGERPRINT_BYTES))
+            return hashlib.sha256(f.read(min(offset, FINGERPRINT_BYTES))).hexdigest()
+    except OSError:
+        return None
+
+
 def read_new_lines(db, path: Path, scan: Scan, handle_line, ctx_default):
-    """붙은 줄만 handle_line(line, ctx)로 넘긴다. 파일이 줄었거나 바뀌었으면 처음부터(중복 키가 막는다)."""
+    """붙은 줄만 handle_line(line, ctx)로 넘긴다. 파일이 줄었거나, inode가 바뀌었거나, 이미 읽은 끝부분이 달라졌으면
+    (같은 inode 재작성) 처음부터 다시 읽는다. 다시 읽어도 중복 키가 같은 응답을 두 번 세지 않게 막는다."""
     try:
         st = path.stat()
     except OSError:
         return
     scan.files += 1
-    row = db.execute('select ino, size, mtime, offset, ctx from files where path = ?', (str(path),)).fetchone()
+    row = db.execute('select ino, size, mtime, offset, ctx, fp from files where path = ?', (str(path),)).fetchone()
     offset, ctx = 0, dict(ctx_default)
     if row:
-        ino, size, mtime, prev_offset, prev_ctx = row
+        ino, size, mtime, prev_offset, prev_ctx, fp = row
         if ino == st.st_ino and st.st_size >= prev_offset:
             if st.st_size == size and st.st_mtime == mtime:
                 return
-            offset, ctx = prev_offset, json.loads(prev_ctx or '{}')
-    if st.st_size <= offset:
-        db.execute('insert or replace into files values (?,?,?,?,?,?)', (str(path), st.st_ino, st.st_size, st.st_mtime, offset, json.dumps(ctx)))
-        return
-    try:
-        with path.open('rb') as f:
-            f.seek(offset)
-            for raw in f:
-                if not raw.endswith(b'\n'):
-                    break  # 아직 쓰는 중인 줄은 다음 회차에
-                offset += len(raw)
-                scan.bytes_read += len(raw)
-                handle_line(raw.decode('utf-8', 'replace'), ctx)
-    except OSError:
-        return
-    db.execute('insert or replace into files values (?,?,?,?,?,?)', (str(path), st.st_ino, st.st_size, st.st_mtime, offset, json.dumps(ctx)))
-
+            if prefix_fingerprint(path, prev_offset) == fp:
+                offset, ctx = prev_offset, json.loads(prev_ctx or '{}')
+    if st.st_size > offset:
+        try:
+            with path.open('rb') as f:
+                f.seek(offset)
+                for raw in f:
+                    if not raw.endswith(b'\n'):
+                        break  # 아직 쓰는 중인 줄은 다음 회차에
+                    offset += len(raw)
+                    scan.bytes_read += len(raw)
+                    handle_line(raw.decode('utf-8', 'replace'), ctx)
+        except OSError:
+            return
+    db.execute('insert or replace into files values (?,?,?,?,?,?,?)',
+               (str(path), st.st_ino, st.st_size, st.st_mtime, offset, json.dumps(ctx), prefix_fingerprint(path, offset)))
 
 # ---------- Claude Code ----------
 
@@ -224,25 +242,18 @@ def collect_claude(db, home, tz, scan):
 
 # ---------- Codex CLI ----------
 
+def weekly_window(rate_limits):
+    """7일 창(resets_at 초, 사용률). 없거나 모양이 다르면 None."""
+    if not isinstance(rate_limits, dict):
+        return None
+    weekly = next((w for w in (rate_limits.get('primary'), rate_limits.get('secondary'))
+                   if isinstance(w, dict) and w.get('window_minutes') == 10080), None)
+    if not weekly or not weekly.get('resets_at') or not isinstance(weekly.get('used_percent'), (int, float)):
+        return None
+    return int(weekly['resets_at']), float(weekly['used_percent'])
+
+
 def codex_handle(db, tz, path):
-    windows = {}
-
-    def window_for(ctx, rl, ts):
-        weekly = next((w for w in (rl.get('primary'), rl.get('secondary'))
-                       if isinstance(w, dict) and w.get('window_minutes') == 10080), None) if isinstance(rl, dict) else None
-        if not weekly or not weekly.get('resets_at') or not isinstance(weekly.get('used_percent'), (int, float)):
-            return None
-        reset = int(weekly['resets_at'])
-        win = windows.get(reset)
-        if win is None:
-            row = db.execute('select first_pct, max_pct, tokens, last_ts from windows where path = ? and reset = ?', (str(path), reset)).fetchone()
-            win = {'first': row[0], 'max': row[1], 'tokens': row[2], 'last': row[3]} if row else \
-                {'first': weekly['used_percent'], 'max': weekly['used_percent'], 'tokens': 0, 'last': 0}
-            windows[reset] = win
-        win['max'] = max(win['max'], weekly['used_percent'])
-        win['last'] = int(ts.timestamp() * 1000)
-        return win
-
     def handle(line, ctx):
         if '"turn_context"' not in line and '"token_count"' not in line and '"session_meta"' not in line:
             return
@@ -264,7 +275,6 @@ def codex_handle(db, tz, path):
         ts = parse_ts(o.get('timestamp'))
         if ts is None:
             return
-        win = window_for(ctx, p.get('rate_limits'), ts)
         info = p.get('info') or {}
         total = info.get('total_token_usage')
         if not isinstance(total, dict):
@@ -286,22 +296,19 @@ def codex_handle(db, tz, path):
         cached = max(0, delta.get('cached_input_tokens') or 0)
         inp = max(0, (delta.get('input_tokens') or 0) - cached)
         out = max(0, delta.get('output_tokens') or 0)
-        if win is not None:
-            win['tokens'] += max(0, delta.get('input_tokens') or 0) + out
         add_daily(db, day, 'codex', ctx.get('model', 'unknown'), 'codex-cli', inp, out, cached, 0)
+        # 같은 응답의 사용률(응답 뒤 상태)과 그 응답의 비캐시 토큰을 한 관측으로 남긴다. 계정 구분은 정확한 resets_at 초다.
+        window = weekly_window(p.get('rate_limits'))
+        if window is not None:
+            db.execute('insert into codex_obs values (?,?,?,?)', (window[0], int(ts.timestamp() * 1000), window[1], inp + out))
 
-    def flush():
-        for reset, w in windows.items():
-            db.execute('insert or replace into windows values (?,?,?,?,?,?)', (str(path), reset, w['first'], w['max'], w['tokens'], w['last']))
-    return handle, flush
+    return handle
 
 
 def collect_codex(db, home, tz, scan):
     for root in (home / '.codex' / 'sessions', home / '.codex' / 'archived_sessions'):
         for path in jsonl_files(root):
-            handle, flush = codex_handle(db, tz, path)
-            read_new_lines(db, path, scan, handle, {'model': 'unknown'})
-            flush()
+            read_new_lines(db, path, scan, codex_handle(db, tz, path), {'model': 'unknown'})
 
 
 # ---------- 적대 검증 영수증 ----------
@@ -389,28 +396,29 @@ def receipts_report(db, since):
 
 # ---------- 구현 루프·Hermes·주기 이력 ----------
 
-def collect_impl(home, since, today):
+def collect_impl(db, home):
+    """구현 루프 실행(폴더)마다 날짜와 라운드 수를 상태 DB에 남긴다. 원장이 지워져도 남긴 집계는 그대로다.
+    같은 실행의 라운드가 늘면 그 값으로 바꾼다(실행 수는 폴더 하나)."""
     folder = home / '.claude' / 'cache' / 'codex-impl-loop'
-    by_day = {}
     if not folder.is_dir():
-        return []
+        return
     for entry in sorted(folder.iterdir()):
         m = re.match(r'^(\d{4})(\d{2})(\d{2})-\d{6}', entry.name)
         if not m:
-            continue
-        day = f'{m[1]}-{m[2]}-{m[3]}'  # 폴더 이름은 로컬 시각
-        if day < since or day > today:
             continue
         try:
             ledger = json.loads((entry / 'ledger.json').read_text())
         except (OSError, ValueError):
             continue
         rounds = ledger.get('rounds') if isinstance(ledger, dict) else None
-        row = by_day.setdefault(day, {'date': day, 'runs': 0, 'rounds': 0})
-        row['runs'] += 1
-        row['rounds'] += len(rounds) if isinstance(rounds, list) else 0
-    return [by_day[k] for k in sorted(by_day)]
+        count = len(rounds) if isinstance(rounds, list) else 0
+        db.execute("""insert into impl_runs values (?,?,?) on conflict(run) do update set
+            rounds = max(rounds, excluded.rounds)""", (entry.name, f'{m[1]}-{m[2]}-{m[3]}', count))  # 폴더 이름은 로컬 시각
 
+
+def impl_report(db, since, today):
+    return [{'date': d, 'runs': r, 'rounds': n} for d, r, n in db.execute(
+        'select date, count(*), sum(rounds) from impl_runs where date >= ? and date <= ? group by date order by date', (since, today))]
 
 def hermes_lane(url: str) -> str:
     if ':3457' in url or 'chatgpt.com' in url:
@@ -437,8 +445,9 @@ def add_undated(db, lane, model, values):
 
 
 def collect_hermes(db, home, tz):
-    """Hermes state.db는 세션·모델별 누적값만 준다. 직전 누적값을 기억해 늘어난 몫만 그것을 본 날(last_seen)에 쌓는다.
-    처음 보는 세션이 이미 여러 날에 걸쳐 있으면 날짜별 몫을 알 수 없어 '날짜 불명'으로 따로 둔다."""
+    """Hermes state.db는 세션·모델별 누적값만 준다. 직전 누적값과 관측 시각을 기억해 늘어난 몫만 쌓는다.
+    늘어난 구간(직전 관측 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로,
+    자정을 넘으면 날마다 나눌 수 없어 '날짜 불명'으로 따로 둔다."""
     try:
         names = sorted(n for n in os.listdir(home) if re.fullmatch(r'\.hermes(-[a-z0-9]+)?', n))
     except OSError:
@@ -457,8 +466,9 @@ def collect_hermes(db, home, tz):
                 continue
             key = f'{name}|{sid}|{model}|{url}'
             now_vals = [calls or 0, inp or 0, out or 0, cr or 0, cw or 0]
-            prev = db.execute('select calls, input, output, cache_read, cache_write from hermes_seen where key = ?', (key,)).fetchone()
-            db.execute('insert or replace into hermes_seen values (?,?,?,?,?,?)', (key, *now_vals))
+            row = db.execute('select calls, input, output, cache_read, cache_write, last_seen from hermes_seen where key = ?', (key,)).fetchone()
+            prev, prev_seen = (row[:5], row[5]) if row else (None, None)
+            db.execute('insert or replace into hermes_seen values (?,?,?,?,?,?,?)', (key, *now_vals, float(seen_at)))
             delta = [a - b for a, b in zip(now_vals, prev)] if prev else now_vals
             if any(v < 0 for v in delta):
                 delta = now_vals  # 세션이 다시 시작됐다(누적이 줄었다): 지금 값이 새 몫
@@ -466,8 +476,11 @@ def collect_hermes(db, home, tz):
                 continue
             day = local_day(dt.datetime.fromtimestamp(float(seen_at), dt.timezone.utc), tz)
             lane, model = hermes_lane(url or ''), model or 'unknown'
-            first_day = local_day(dt.datetime.fromtimestamp(float(started), dt.timezone.utc), tz) if started is not None else None
-            if prev is None and first_day != day:
+            # 이 증분이 생긴 구간의 시작: 처음 보는 세션이면 세션 시작, 아니면 직전 관측 시각. 그 구간에 자정이 끼면
+            # 호출별 시각이 없어 날마다 나눌 수 없으므로 날짜 불명으로 둔다.
+            span_start = started if prev is None else prev_seen
+            first_day = local_day(dt.datetime.fromtimestamp(float(span_start), dt.timezone.utc), tz) if span_start is not None else None
+            if first_day != day:
                 add_undated(db, lane, model, [delta[1], delta[2], delta[3], delta[4], delta[0]])
                 continue
             add_daily(db, day, lane, model, 'hermes', delta[1], delta[2], delta[3], delta[4], delta[0])
@@ -545,43 +558,37 @@ def pool_report(status, prefix):
 
 # ---------- Pro 200 환산 기준값 ----------
 
-def pro200_estimate(daily, windows, tz):
-    """Pro 200 1주 ≈ 비캐시 토큰 N(추정). 7일 창을 시 단위로 묶어 계정-주로 보고, 창 소진 %p와 그 주 세션 토큰으로 나눈다.
-    비캐시 5천만 토큰이 넘는 주의 값으로 중앙(mid)·최소(lo)·최대(hi)를 낸다. 관측이 없으면 None."""
-    clusters = {}
-    for w in windows:
-        c = clusters.setdefault(int(w['reset']) // 3600, {'tokens': 0, 'min': float('inf'), 'max': float('-inf'), 'ts': []})
-        c['tokens'] += w['tokens']
-        c['min'] = min(c['min'], w['firstPct'])
-        c['max'] = max(c['max'], w['maxPct'])
-        c['ts'].append(w['lastTs'])
-    by_week = {}
-    for c in clusters.values():
-        consumed = c['max'] - c['min']
-        if consumed <= 0:
-            continue
-        ts = sorted(c['ts'])[len(c['ts']) // 2]
-        week = iso_week(local_day(dt.datetime.fromtimestamp(ts / 1000, dt.timezone.utc), tz))
-        b = by_week.setdefault(week, {'pro': 0.0, 'tokens': 0})
-        b['pro'] += consumed / 100
-        b['tokens'] += c['tokens']
-    sessions = {}
-    for r in daily:
-        if r.get('source') != 'codex-cli':
-            continue
-        s = sessions.setdefault(iso_week(r['date']), {'total': 0, 'noncache': 0})
-        s['total'] += r['input'] + r['cacheRead'] + r['output']
-        s['noncache'] += r['input'] + r['output']
-    per_week = []
-    for week, b in by_week.items():
-        s = sessions.get(week)
-        if not s or s['noncache'] <= 50_000_000 or b['pro'] <= 0:
-            continue
-        per_week.append(round(s['noncache'] * (b['tokens'] / max(s['total'], 1)) / b['pro']))
-    if not per_week:
-        return None
-    return {'mid': round(statistics.median(per_week)), 'lo': min(per_week), 'hi': max(per_week), 'weeks': len(per_week)}
+def pro200_estimate(observations, tz):
+    """Pro 200 1주(사용률 100%) ≈ 비캐시 토큰 N(추정).
 
+    observations: (resets_at, 시각 ms, 사용률 %, 그 응답의 비캐시 토큰). 같은 resets_at 초를 한 계정의 한 창으로 본다.
+    창마다 첫 관측 뒤에 쓴 토큰 ÷ (마지막 − 첫 사용률)만 표본으로 쓴다(첫 관측 이전 몫은 그 사용률에 이미 들었다).
+    사용률이 되돌아가는 창은 같은 리셋 초를 가진 다른 계정이 섞였거나 창이 바뀐 것이라 계정을 가릴 수 없어 뺀다.
+    변화가 PRO_MIN_PCT_DELTA보다 작은 창도 뺀다. 표본은 마지막 관측의 ISO 주로 묶어 주마다 합친 토큰 ÷ 합친 사용률을 내고,
+    주 값들의 중앙(mid)·최소(lo)·최대(hi)를 낸다. 표본 창이 PRO_MIN_SAMPLES보다 적으면 None(산출 불가).
+    한계: 같은 계정을 이 맥 밖(다른 기기·임시 CODEX_HOME)에서 쓴 몫은 사용률에만 들어가 기준값을 낮게 만든다."""
+    by_reset = {}
+    for reset, ts, pct, noncache in observations:
+        by_reset.setdefault(reset, []).append((ts, pct, noncache))
+    weeks, samples, excluded = {}, 0, 0
+    for obs in by_reset.values():
+        obs.sort()
+        pcts = [o[1] for o in obs]
+        consumed = pcts[-1] - pcts[0]
+        mixed = any(b < a - 0.5 for a, b in zip(pcts, pcts[1:]))
+        if len(obs) < 2 or mixed or consumed < PRO_MIN_PCT_DELTA:
+            excluded += 1
+            continue
+        samples += 1
+        week = iso_week(local_day(dt.datetime.fromtimestamp(obs[-1][0] / 1000, dt.timezone.utc), tz))
+        b = weeks.setdefault(week, [0, 0.0])
+        b[0] += sum(o[2] for o in obs[1:])
+        b[1] += consumed / 100
+    if samples < PRO_MIN_SAMPLES:
+        return None
+    values = [round(tokens / pro) for tokens, pro in weeks.values()]
+    return {'mid': round(statistics.median(values)), 'lo': min(values), 'hi': max(values),
+            'weeks': len(values), 'samples': samples, 'excluded': excluded}
 
 # ---------- 조립 ----------
 
@@ -620,17 +627,20 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         collect_receipts(db, home, tz, scan)
         collect_hermes(db, home, tz)
         collect_cycles(db, home, tz)
-        db.execute('delete from seen where day < ?', ((dt.date.fromisoformat(today) - dt.timedelta(days=SEEN_KEEP_DAYS)).isoformat(),))
+        collect_impl(db, home)
+        keep_from = dt.date.fromisoformat(today) - dt.timedelta(days=SEEN_KEEP_DAYS)
+        db.execute('delete from seen where day < ?', (keep_from.isoformat(),))
+        keep_ms = int(dt.datetime.combine(keep_from, dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
+        db.execute('delete from codex_obs where ts < ?', (keep_ms,))  # 기준값 표본도 같은 기간만 둔다
         db.commit()
         stored = daily_rows(db, since)
-        windows = [{'reset': r, 'firstPct': f, 'maxPct': m, 'tokens': t, 'lastTs': ts}
-                   for r, f, m, t, ts in db.execute('select reset, first_pct, max_pct, tokens, last_ts from windows')]
-        all_cli = [r for r in daily_rows(db, '0000') if r['source'] == 'codex-cli']
+        pro200 = pro200_estimate(db.execute('select reset, ts, pct, noncache from codex_obs').fetchall(), tz)
         receipts = receipts_report(db, since)
         receipt_first = db.execute('select min(date) from receipts').fetchone()[0]
         cli_last = db.execute("select max(date) from daily where source = 'codex-cli' and calls > 0").fetchone()[0]
         undated = undated_rows(db)
         cycles = cycles_report(db, since)
+        impl = impl_report(db, since, today)
     finally:
         db.close()
     complete_from = (dt.date.fromisoformat(first_run) - dt.timedelta(days=retention - 1)).isoformat()
@@ -645,8 +655,8 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         # 날짜를 알 수 없는 Hermes 몫(처음 볼 때 이미 여러 날에 걸친 세션). 일별 막대에 넣지 않는다.
         'undated': undated,
         'receipts': receipts,
-        'implLoop': {'daily': collect_impl(home, since, today)},
-        'pro200': pro200_estimate(all_cli, windows, tz),
+        'implLoop': {'daily': impl},
+        'pro200': pro200,
         'quotaCycles': cycles,
         'pools': {'claude': pool_report(fetch_status(3456), 'C'), 'codex': pool_report(fetch_status(3457), 'X')},
         'scan': {'bytesRead': scan.bytes_read, 'files': scan.files},

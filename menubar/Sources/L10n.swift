@@ -904,7 +904,8 @@ enum L10n {
     static func modelCodexRange(_ lo: String, _ hi: String, _ tokens: String) -> String {
         t("범위 \(lo)~\(hi) · 비캐시 \(tokens) 토큰", "range \(lo)–\(hi) · \(tokens) non-cached tokens")
     }
-    static var modelCodexNoBaseline: String { t("환산 기준값 없음(7일 창 관측 부족)", "No conversion baseline (too few 7-day windows)") }
+    static var modelCodexNoBaseline: String { t("산출 불가(계정별 7일 창 표본 부족)", "Not computable (too few per-account 7-day windows)") }
+    static func modelBaselineSamples(_ count: Int) -> String { t("기준 표본 \(count)창", "\(count) baseline windows") }
     static var modelLaneNote: String {
         t("두 레인은 세는 단위가 달라 한 비율로 견주지 않습니다. Codex 값은 구현 루프(토큰 기록 없음)를 뺀 비캐시 토큰을 Pro 200 1주 기준값으로 나눈 것입니다.",
           "The two lanes count different units, so they are not compared as one ratio. The Codex value divides non-cached tokens (without the impl loop, which has no token records) by a Pro 200 one-week baseline.")

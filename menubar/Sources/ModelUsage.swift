@@ -38,7 +38,8 @@ struct ModelUsageImplDay { let date: String; let runs: Double; let rounds: Doubl
 struct ModelUsageCycleDay { let date: String; let window: String; let cycles: Double; let exhausted: Double }
 struct ModelUsagePoolAccount { let label: String; let util7d: Double?; let reset7d: Date?; let usable: Bool; let enabled: Bool }
 struct ModelUsagePool { var available = false; var accounts: [ModelUsagePoolAccount] = [] }
-struct ModelUsagePro200 { let mid: Double; let lo: Double; let hi: Double }
+/// samples: 기준값을 낸 표본 창 수(수집기 값). 기간 환산 값에는 없다(nil).
+struct ModelUsagePro200 { let mid: Double; let lo: Double; let hi: Double; var samples: Int? = nil }
 struct ModelUsageCoverage { var claudeCompleteFrom: String?; var claudeRetentionDays: Int?; var codexCliLastDay: String?; var receiptFirstDay: String? }
 
 struct ModelUsageReport {
@@ -88,7 +89,7 @@ struct ModelUsageReport {
             (o["date"] as? String).map { ModelUsageImplDay(date: $0, runs: num(o["runs"]), rounds: num(o["rounds"])) }
         }
         if let p = root["pro200"] as? [String: Any], num(p["mid"]) > 0, num(p["lo"]) > 0, num(p["hi"]) > 0 {
-            r.pro200 = ModelUsagePro200(mid: num(p["mid"]), lo: num(p["lo"]), hi: num(p["hi"]))
+            r.pro200 = ModelUsagePro200(mid: num(p["mid"]), lo: num(p["lo"]), hi: num(p["hi"]), samples: (p["samples"] as? NSNumber)?.intValue)
         }
         let quotaCycles = root["quotaCycles"] as? [String: Any] ?? [:]
         r.cyclesSince = quotaCycles["since"] as? String

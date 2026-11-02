@@ -570,7 +570,10 @@ final class ModelUsageTabView: NSView {
         PanelDraw.meta(L10n.modelFactsTitle(p.facts.weekLabel), rect.minX + 26, rect.minY + 10)
         let f = p.facts
         let demand = f.pro.map { L10n.modelFactDemandValue(Self.proText($0.mid)) } ?? StatusVocabulary.none
-        let demandSub = f.pro.map { "\(Self.proText($0.lo))~\(Self.proText($0.hi))" + (f.lowerBound ? " · \(L10n.modelBadgeLowerBound)" : "") } ?? ""
+        var demandSub = f.pro.map { "\(Self.proText($0.lo))~\(Self.proText($0.hi))" + (f.lowerBound ? " · \(L10n.modelBadgeLowerBound)" : "") } ?? ""
+        if let samples = report?.pro200?.samples {
+            demandSub += (demandSub.isEmpty ? "" : " · ") + L10n.modelBaselineSamples(samples)
+        }
         let facts: [(String, String, String)] = [
             (L10n.modelFactDemand, demand, demandSub),
             (L10n.modelFactRuns, "\(modelUsageCount(f.reviewRuns)) · \(modelUsageCount(f.implRuns))", ""),

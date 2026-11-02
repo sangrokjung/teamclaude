@@ -234,7 +234,8 @@ class CollectorTests(unittest.TestCase):
         self.fx.run()
         utc = dt.timezone.utc
         db = self.hermes_db()
-        # 같은 세션이 다음 날(11/2 KST) 다섯 번 더 호출
+        # 같은 세션이 다음 날(11/2 KST) 다섯 번 더 호출. 직전 관측(11/1)과 이번 관측 사이에 자정이 껴서
+        # 다섯 번이 어느 날 몫인지 알 수 없다 → 날짜 불명
         db.execute("update session_model_usage set api_call_count = 9, input_tokens = 1500, output_tokens = 300, last_seen = ? where session_id = 'h1'",
                    (dt.datetime(2026, 11, 2, 1, tzinfo=utc).timestamp(),))
         # 처음 보는데 이미 여러 날에 걸친 세션 → 날짜 불명
@@ -249,10 +250,38 @@ class CollectorTests(unittest.TestCase):
         db.close()
         report = self.fx.run()
         got = sorted((r["date"], r["lane"], r["calls"], r["input"], r["output"]) for r in rows(report, "hermes"))
-        self.assertEqual([("2026-11-01", "codex", 4, 1000, 200), ("2026-11-02", "claude", 2, 20, 2), ("2026-11-02", "codex", 5, 500, 100)], got)
-        self.assertEqual([("codex", "gpt-6.1-sol", "hermes", 7, 700, 70)],
-                         [(r["lane"], r["model"], r["source"], r["calls"], r["input"], r["output"]) for r in report["undated"]])
+        self.assertEqual([("2026-11-01", "codex", 4, 1000, 200), ("2026-11-02", "claude", 2, 20, 2)], got)
+        self.assertEqual([("codex", "gpt-6.1-sol", "hermes", 12, 1200, 170)],
+                         [(r["lane"], r["model"], r["source"], r["calls"], r["input"], r["output"]) for r in report["undated"]],
+                         "h2 first seen spanning days (7) + h1 increment across midnight (5)")
         self.assertEqual(report["daily"], self.fx.run()["daily"], "a rerun without changes adds nothing")
+        # 같은 날 안의 다음 증분은 그날로 확정한다
+        db = self.hermes_db()
+        db.execute("update session_model_usage set api_call_count = 10, input_tokens = 1600, output_tokens = 310, last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 2, 2, tzinfo=utc).timestamp(),))
+        db.commit()
+        db.close()
+        same_day = {(r["date"], r["lane"]): r for r in rows(self.fx.run(), "hermes")}
+        self.assertEqual((1, 100, 10), (same_day[("2026-11-02", "codex")]["calls"], same_day[("2026-11-02", "codex")]["input"],
+                                        same_day[("2026-11-02", "codex")]["output"]))
+
+    def test_hermes_increment_across_midnight_is_undated(self):
+        """23:30 수집 → 23:45·00:15 호출 → 00:30 재수집. 차분 2를 다음 날에 몰아 넣지 않는다."""
+        utc = dt.timezone.utc
+        db = self.hermes_db()
+        db.execute("update session_model_usage set last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 1, 14, 20, tzinfo=utc).timestamp(),))  # 11/1 23:20 KST
+        db.commit()
+        db.close()
+        self.fx.run(now=dt.datetime(2026, 11, 1, 23, 30, tzinfo=TZ))
+        db = self.hermes_db()
+        db.execute("update session_model_usage set api_call_count = 6, input_tokens = 1200, output_tokens = 240, last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 1, 15, 15, tzinfo=utc).timestamp(),))  # 11/2 00:15 KST
+        db.commit()
+        db.close()
+        report = self.fx.run(now=dt.datetime(2026, 11, 2, 0, 30, tzinfo=TZ))
+        self.assertEqual([("2026-11-01", 4)], [(r["date"], r["calls"]) for r in rows(report, "hermes")])
+        self.assertEqual([("codex", 2, 200, 40)], [(r["lane"], r["calls"], r["input"], r["output"]) for r in report["undated"]])
 
     def write_cycles(self, start, count):
         cycles = [{"lane": "claude", "window": "5h", "endedAt": (start + dt.timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -324,14 +353,71 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(1, json.loads(text)["schema"])
         self.assertEqual("2026-11-02T03:00:00Z", json.loads(text)["generatedAt"])
 
-    def test_pro200_estimate_uses_window_consumption(self):
-        daily = [{"date": "2026-10-20", "source": "codex-cli", "input": 60_000_000, "cacheRead": 40_000_000, "output": 10_000_000}]
-        ms = int(dt.datetime(2026, 10, 21, tzinfo=TZ).timestamp() * 1000)
-        windows = [{"reset": 1793000000, "firstPct": 0.0, "maxPct": 50.0, "tokens": 110_000_000, "lastTs": ms}]
-        est = collector.pro200_estimate(daily, windows, TZ)
-        # 비캐시 7천만 × (창 1.1억 / 세션 1.1억) ÷ 0.5 Pro-주 = 1.4억
-        self.assertEqual((140_000_000, 140_000_000, 140_000_000), (est["mid"], est["lo"], est["hi"]))
-        self.assertIsNone(collector.pro200_estimate([], [], TZ))
+    def write_codex_session(self, name, events):
+        """events: (시각, 누적 비캐시 입력, 누적 출력, resets_at, 주간 사용률). 캐시 입력은 0."""
+        path = self.fx.home / ".codex" / "sessions" / "2026" / "10" / "20" / f"rollout-{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = json.dumps({"timestamp": events[0][0], "type": "session_meta", "payload": {"id": name}}) + "\n"
+        lines += json.dumps({"timestamp": events[0][0], "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}) + "\n"
+        for ts, inp, out, reset, pct in events:
+            lines += codex_token(ts, inp, 0, out, resets_at=reset, pct=pct)
+        path.write_text(lines)
+
+    def test_pro200_samples_only_token_and_usage_deltas_of_one_account_window(self):
+        m = 1_000_000
+        # 리뷰 지적 예: 6천만씩 두 응답, 사용률 10% → 20%. 첫 응답 토큰은 첫 관측 전 몫이라 뺀다 → 6천만 ÷ 0.10 = 6억.
+        self.write_codex_session("a", [("2026-10-20T01:00:00Z", 50 * m, 10 * m, 1793100000, 10.0),
+                                       ("2026-10-20T02:00:00Z", 100 * m, 20 * m, 1793100000, 20.0)])
+        # 같은 주 다른 계정(다른 리셋 시각) 하나 더: 3천만 ÷ 0.05 = 6억 → 그 주(W43) 합산 9천만 ÷ 0.15 = 6억
+        self.write_codex_session("b", [("2026-10-20T03:00:00Z", 10 * m, 0, 1793100500, 30.0),
+                                       ("2026-10-20T04:00:00Z", 40 * m, 0, 1793100500, 35.0)])
+        # 다음 주 계정: 3천만 ÷ 0.10 = 3억
+        self.write_codex_session("c", [("2026-10-27T01:00:00Z", 10 * m, 0, 1793700000, 40.0),
+                                       ("2026-10-27T02:00:00Z", 40 * m, 0, 1793700000, 50.0)])
+        # 같은 리셋 초를 가진 두 계정이 섞인 창(사용률이 왔다 갔다) → 어느 계정 몫인지 알 수 없어 뺀다
+        self.write_codex_session("d", [("2026-10-28T01:00:00Z", 10 * m, 0, 1793800000, 10.0),
+                                       ("2026-10-28T02:00:00Z", 900 * m, 0, 1793800000, 60.0),
+                                       ("2026-10-28T03:00:00Z", 901 * m, 0, 1793800000, 11.0),
+                                       ("2026-10-28T04:00:00Z", 902 * m, 0, 1793800000, 61.0)])
+        # 표본이 되기엔 사용률 변화가 작은 창(1%p) → 뺀다
+        self.write_codex_session("e", [("2026-10-28T05:00:00Z", 10 * m, 0, 1793900000, 5.0),
+                                       ("2026-10-28T06:00:00Z", 900 * m, 0, 1793900000, 6.0)])
+        pro = self.fx.run()["pro200"]
+        self.assertEqual((450 * m, 300 * m, 600 * m), (pro["mid"], pro["lo"], pro["hi"]), pro)
+        self.assertEqual((3, 3, 2), (pro["samples"], pro["excluded"], pro["weeks"]), pro)  # 제외: d(섞임)·e(1%p)·기본 픽스처(2%p)
+
+    def test_pro200_is_unavailable_without_enough_samples(self):
+        m = 1_000_000
+        self.write_codex_session("a", [("2026-10-20T01:00:00Z", 50 * m, 10 * m, 1793100000, 10.0),
+                                       ("2026-10-20T02:00:00Z", 100 * m, 20 * m, 1793100000, 20.0)])
+        self.assertIsNone(self.fx.run()["pro200"], "one window is not a baseline")
+
+    # ---- 3라운드 ----
+
+    def test_impl_loop_days_survive_ledger_cleanup(self):
+        impl = self.fx.home / ".claude" / "cache" / "codex-impl-loop"
+        late = impl / "20261102-090000-y"
+        late.mkdir()
+        (late / "ledger.json").write_text(json.dumps({"rounds": [{"engine": "codex"}]}))
+        self.assertEqual(2, len(self.fx.run()["implLoop"]["daily"]))
+        (late / "ledger.json").write_text(json.dumps({"rounds": [{"engine": "codex"}, {"engine": "codex"}, {"engine": "codex"}]}))
+        grown = {r["date"]: r for r in self.fx.run()["implLoop"]["daily"]}
+        self.assertEqual((1, 3), (grown["2026-11-02"]["runs"], grown["2026-11-02"]["rounds"]), "the same run grows, not doubles")
+        for folder in impl.iterdir():
+            (folder / "ledger.json").unlink()
+            folder.rmdir()
+        kept = self.fx.run()["implLoop"]["daily"]
+        self.assertEqual([{"date": "2026-11-01", "runs": 1, "rounds": 2}, {"date": "2026-11-02", "runs": 1, "rounds": 3}], kept)
+
+    def test_same_inode_rewrite_with_different_content_is_reread(self):
+        self.fx.run()
+        with self.fx.claude_b.open("r+") as f:  # 같은 inode에서 내용을 바꿔 다시 쓴다
+            f.seek(0)
+            f.truncate()
+            f.write(claude_line("msg_9", "req_9", "2026-11-02T01:00:00Z", model="claude-sonnet-5")
+                    + claude_line("msg_1", "req_1", "2026-11-01T01:00:00Z"))
+        report = self.fx.run()
+        self.assertEqual(3, sum(r["calls"] for r in rows(report, "claude-code")), "msg_9 counted once, msg_1 not twice")
 
 
 if __name__ == "__main__":
