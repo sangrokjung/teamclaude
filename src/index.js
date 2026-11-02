@@ -675,7 +675,8 @@ async function superviseServerCommand() {
   }
 
   // Log a stop signal the moment it lands: who we are, who our parent is, how
-  // long we have been up and how much traffic the stop will cut.
+  // long we have been up and how much traffic the stop will cut. A deployment
+  // drain in progress points at a rollout rather than an outside kill.
   function traceStopSignal(signal) {
     if (!traceEnabled) return;
     console.error(formatSignalTrace({
@@ -686,7 +687,7 @@ async function superviseServerCommand() {
       uptimeSec: process.uptime(),
       inflight: activePublicRequests,
       workerPid: worker?.pid,
-    }));
+    }) + (deploymentDraining ? ' deploymentDraining=1' : ''));
   }
 
   function onStopSignal(signal) {

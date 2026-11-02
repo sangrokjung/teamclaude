@@ -76,7 +76,7 @@ async function startServer(t) {
   ]);
   const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   await waitUntilListening(port, child);
-  return { child, out, drained, exited };
+  return { child, out, drained, exited, port };
 }
 
 function withTimeout(promise, ms, what) {
@@ -123,4 +123,26 @@ test('SIGHUP is traced but keeps its default (terminating) disposition', async t
   // The orphaned worker notices the dead IPC channel and says so.
   assert.match(out.stderr, new RegExp(
     `^${STAMP} \\[TeamClaude\\] Worker shutting down on SIGTERM source=ipc-disconnect pid=\\d+`, 'm'), all);
+});
+
+test('SIGTERM during a deployment drain is traced with deploymentDraining=1', async t => {
+  const { child, out, drained, exited, port } = await startServer(t);
+  const statusResponse = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+    headers: { 'x-api-key': 'tc-test', 'x-teamcodex-status-identity': '1' },
+  });
+  const { lifecycleId } = await statusResponse.json();
+  const drain = await fetch(`http://127.0.0.1:${port}/teamclaude/deployment/drain`, {
+    method: 'POST',
+    headers: { 'x-api-key': 'tc-test', 'x-teamcodex-lifecycle-id': lifecycleId },
+  });
+  assert.equal(drain.status, 200);
+  child.kill('SIGTERM');
+  await withTimeout(exited, 10_000, 'supervisor exit');
+  await withTimeout(drained, 10_000, 'output drain');
+  const all = `${out.stdout}\n${out.stderr}`;
+
+  // A drain in progress points at a rollout rather than an outside kill.
+  assert.match(out.stderr, new RegExp(
+    `^${STAMP} \\[TeamClaude\\] Supervisor received SIGTERM pid=${child.pid} ppid=${process.pid}`
+    + ' uptime=\\d+\\.\\ds inflight=0 workerPid=\\d+ deploymentDraining=1$', 'm'), all);
 });
