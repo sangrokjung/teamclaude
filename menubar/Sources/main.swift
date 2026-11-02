@@ -2878,6 +2878,20 @@ final class StatusMenuDashboardView: NSView {
     private var cliLanesView: CliQuotaLanesView?
     private var burnView: SubscriptionBurnView?
     private var usageView: UsageDashboardView?
+    private var modelView: ModelUsageTabView?
+    /// 모델 탭 데이터(scripts/model-usage-collector.py 결과). 호스트가 configure·updateContent 전에 넣는다.
+    /// 값이 바뀌면 열린 탭만 다시 잡는다(다른 탭·메뉴 기하는 그대로).
+    var modelUsage: ModelUsageReport? {
+        didSet {
+            let before = oldValue.map { ($0.generatedAt, $0.today, $0.daily.count) }
+            let after = modelUsage.map { ($0.generatedAt, $0.today, $0.daily.count) }
+            guard before?.0 != after?.0 || before?.1 != after?.1 || before?.2 != after?.2 || (before == nil) != (after == nil) else { return }
+            modelView?.report = modelUsage
+            relayoutModelTab()
+        }
+    }
+    /// 모델 탭에서 고른 기간·지표. 구조 재구성(configure)을 지나도 유지한다.
+    private(set) var modelSelection = ModelUsageSelection()
     /// 모든 섹션(탭 구분 없이). 헤더 요약과 스냅샷 출력이 읽는다.
     private(set) var sections: [DashboardSection] = []
     private var headerViews: [DashboardSectionHeaderView] = []
@@ -3020,6 +3034,7 @@ final class StatusMenuDashboardView: NSView {
         case .codex: return sections.first { $0.id == "codex" }?.summary ?? ""
         case .burn: return L10n.footerBurn
         case .cli: return L10n.footerCli
+        case .model: return sections.first { $0.id == "model" }?.summary ?? ""
         }
     }
 
@@ -3101,7 +3116,8 @@ final class StatusMenuDashboardView: NSView {
     /// 탭별 섹션 본문. 순서는 탭 안의 위→아래 순서다. preferredHeight와 configure가 이 한 목록을 쓴다.
     static func sectionBodies(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?,
                               higgsfield: HiggsfieldCreditsData?, burnModel: SubscriptionBurnModel, notices: DashboardToolNotices,
-                              summaries: [String: String]) -> [DashboardTab: [(id: String, title: String, summary: String, height: CGFloat)]] {
+                              summaries: [String: String], modelUsage: ModelUsageReport? = nil,
+                              modelSelection: ModelUsageSelection = ModelUsageSelection()) -> [DashboardTab: [(id: String, title: String, summary: String, height: CGFloat)]] {
         [
             .claude: [(id: "claude", title: L10n.sectionClaude, summary: summaries["claude"] ?? "", height: bodyHeight("claude", teamContentHeight(teamClaude), notices))],
             .codex: [(id: "codex", title: L10n.sectionCodex, summary: summaries["codex"] ?? "", height: bodyHeight("codex", codexHeight(codex, teamCodex: teamCodex), notices))],
@@ -3110,6 +3126,9 @@ final class StatusMenuDashboardView: NSView {
             .cli: [(id: "cli", title: L10n.sectionCli, summary: summaries["cli"] ?? "", height: cliHeight),
                    (id: "higgsfield", title: "Higgsfield", summary: summaries["higgsfield"] ?? "", height: bodyHeight("higgsfield", HiggsfieldCreditsView.preferredHeight(for: higgsfield), notices)),
                    (id: "vocabulary", title: L10n.sectionVocabulary, summary: "", height: EmptyValueVocabularyView.preferredHeight)],
+            // 모델 탭은 수집 결과가 없어도 "수집 전" 안내를 그린다(빈 탭 없음).
+            .model: [(id: "model", title: L10n.sectionModel, summary: summaries["model"] ?? "",
+                      height: ModelUsageTabView.preferredHeight(modelUsage, selection: modelSelection))],
         ]
     }
 
@@ -3237,6 +3256,7 @@ final class StatusMenuDashboardView: NSView {
         cliLanesView = nil
         burnView = nil
         usageView = nil
+        modelView = nil
         renderedNotices = notices
         renderedAccountCount = teamClaude?.accounts.count ?? 0
         renderedTeamClaudePresent = teamClaude != nil
@@ -3268,9 +3288,10 @@ final class StatusMenuDashboardView: NSView {
         self.overviewView = overviewView
 
         // 나머지 탭. preferredHeight와 같은 목록·같은 높이. 섹션을 더하면 sectionBodies와 sectionSummaries를 같이 고친다.
-        let summaries = Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes)
+        let summaries = withModelSummary(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes))
         let bodies = Self.sectionBodies(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
-                                        burnModel: burnModel, notices: notices, summaries: summaries)
+                                        burnModel: burnModel, notices: notices, summaries: summaries,
+                                        modelUsage: modelUsage, modelSelection: modelSelection)
         var allSections: [DashboardSection] = []
         for tab in DashboardTab.allCases where tab != .overview {
             let layout = dashboardSectionLayout(startY: Self.bodyInset, bodies: bodies[tab] ?? [])
@@ -3361,6 +3382,16 @@ final class StatusMenuDashboardView: NSView {
                     view = usageDashboard
                 case "vocabulary":
                     view = EmptyValueVocabularyView(frame: frame)
+                case "model":
+                    let model = ModelUsageTabView(frame: frame)
+                    model.report = modelUsage
+                    model.selection = modelSelection
+                    model.onSelectionChange = { [weak self] selection in
+                        self?.modelSelection = selection
+                        self?.relayoutModelTab()
+                    }
+                    modelView = model
+                    view = model
                 default:
                     continue
                 }
@@ -3386,6 +3417,27 @@ final class StatusMenuDashboardView: NSView {
         document.frame.size.height = table.frame.maxY + dashboardSectionGap + Self.bodyInset
         table.needsLayout = true
         table.needsDisplay = true
+    }
+
+    /// 모델 탭의 기간·지표나 데이터가 바뀌면 그 뷰와 탭 문서의 높이, 머리 요약만 다시 잡는다.
+    private func relayoutModelTab() {
+        guard let view = modelView, let document = tabDocuments[.model] else { return }
+        view.frame.size.height = ModelUsageTabView.preferredHeight(modelUsage, selection: modelSelection, width: view.frame.width)
+        document.frame.size.height = view.frame.maxY + dashboardSectionGap + Self.bodyInset
+        view.needsDisplay = true
+        refreshSectionSummaries(withModelSummary(Dictionary(uniqueKeysWithValues: sections.map { ($0.id, $0.summary) })))
+    }
+
+    /// 섹션 요약에 모델 탭 요약을 더한다. 모델 데이터는 이 뷰가 들고 있어 정적 sectionSummaries 밖에서 붙인다.
+    private func withModelSummary(_ summaries: [String: String]) -> [String: String] {
+        var out = summaries
+        out["model"] = ModelUsageTabView.summary(modelUsage, selection: modelSelection)
+        return out
+    }
+
+    /// 스냅샷: 모델 탭의 기간·지표를 고른다(클릭과 같은 경로).
+    func selectModel(_ selection: ModelUsageSelection) {
+        modelView?.select(selection)
     }
 
     /// Codex 행을 펼치거나 접으면 Codex 뷰와 탭 문서의 높이만 다시 잡는다.
@@ -3548,7 +3600,7 @@ final class StatusMenuDashboardView: NSView {
         usageView?.active = active
         usageView?.needsDisplay = true
         phases.mark("cards")
-        refreshSectionSummaries(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes))
+        refreshSectionSummaries(withModelSummary(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes)))
         phases.mark("sections")
     }
 
@@ -4691,6 +4743,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentCodex: CodexHealth?
     var currentTeamCodex: TeamCodexPoolHealth?
     var currentHiggsfield: HiggsfieldCreditsData?
+    /// 모델 탭 데이터(수집기 JSON). 파일 mtime이 바뀔 때만 다시 읽는다.
+    var currentModelUsage: ModelUsageReport?
+    private var modelUsageFileStamp: Date?
+    private var isLoadingModelUsage = false
     /// 도구 설치 여부(R1). 탐색은 백그라운드 로더가 하고 결과만 여기 둔다(로그인 셸 조회가 메인 스레드를 막지 않게).
     /// nil은 아직 모름 — 안내를 띄우지 않고 기존 "확인 중" 화면을 둔다.
     var higgsfieldInstalled: Bool?
@@ -5037,6 +5093,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 60초마다 Codex 세션 코퍼스 스캔 (10초 틱에서 분리 — 최근 8일 수백 파일·수 GB를 stat/tail 하는 디스크 작업)
         codexScanTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.loadCodexStatusInBackground()
+            self?.loadModelUsageInBackground()
         }
         if let t = codexScanTimer { RunLoop.main.add(t, forMode: .common) }
 
@@ -5390,6 +5447,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadHiggsfieldInBackground()
         loadGrokUsageInBackground(force: true)
         loadAgyUsageInBackground(force: true)
+        loadModelUsageInBackground()
+    }
+
+    /// 모델 탭 JSON을 읽는다. 로그 스캔은 수집기(scripts/model-usage-collector.py) 몫이고 여기서는 작은 결과 파일만 본다.
+    /// 파일이 그대로면(mtime 같음) 읽지 않는다. 파일이 없거나 깨졌으면 nil(탭이 "수집 전" 안내를 그린다).
+    func loadModelUsageInBackground() {
+        guard !isLoadingModelUsage else { return }
+        isLoadingModelUsage = true
+        let previousStamp = modelUsageFileStamp
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let path = ModelUsageReport.defaultPath
+            let stamp = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+            let changed = stamp != previousStamp
+            let report = changed ? ModelUsageReport.load(path: path) : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoadingModelUsage = false
+                guard changed else { return }
+                self.modelUsageFileStamp = stamp
+                self.currentModelUsage = report
+                print("MODEL-USAGE: \(report == nil ? "없음" : "읽음 \(report?.daily.count ?? 0)행")")
+                fflush(stdout)
+                self.scheduleDashboardRefresh(reason: "loadModelUsageInBackground")
+            }
+        }
     }
 
     /// 힉스필드 크레딧 조회. CLI 왕복이라 느릴 수 있어 단일 실행만 허용하고 10분 간격으로 제한한다.
@@ -5516,6 +5598,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             updateCachedMenuPresentation()
             return
         }
+        dashboard.modelUsage = currentModelUsage
         dashboard.updateContent(
             teamClaude: currentTeamClaude,
             codex: currentCodex,
@@ -6043,6 +6126,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let previousScrollOrigin = dashboard.bodyScrollOrigin
         dashboard.maxBodyHeight = dashboardMaxBodyHeight()
+        dashboard.modelUsage = currentModelUsage
 
         dashboard.updateContent(
             teamClaude: currentTeamClaude,
@@ -6186,6 +6270,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu?.cancelTracking()
         }
         dashboard.actions = dashboardActions(menu: menu)
+        dashboard.modelUsage = currentModelUsage
         dashboard.configure(
             teamClaude: currentTeamClaude,
             codex: currentCodex,
@@ -7342,6 +7427,8 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
     if let notice = grokPresenceNotice() { delegate.currentGrokCard = grokCardModel(for: notice) }
     if agyExecutableURL() == nil { delegate.currentAgyCard = agyCardModel(for: agyToolNotice()) }
     delegate.refreshBurnModel()
+    // 모델 탭: 실제 로더와 같은 경로(빈 HOME이면 수집 결과가 없어 "수집 전" 안내).
+    delegate.currentModelUsage = ModelUsageReport.load()
     let notices = delegate.currentToolNotices
     let view = StatusMenuDashboardView(frame: NSRect(
         x: 0, y: 0, width: StatusMenuDashboardView.preferredWidth,
@@ -7350,6 +7437,7 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
             usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
             burnModel: delegate.currentBurnModel, notices: notices, maxBodyHeight: .greatestFiniteMagnitude)
     ))
+    view.modelUsage = delegate.currentModelUsage
     view.configure(
         teamClaude: delegate.currentTeamClaude, codex: delegate.currentCodex, teamCodex: delegate.currentTeamCodex,
         usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
@@ -7419,6 +7507,10 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
             maxBodyHeight: .greatestFiniteMagnitude
         )
     ))
+    // 모델 탭: 픽스처의 "modelUsage"(수집기 JSON 모양)를 실제 파서로 읽는다. 없으면 "수집 전" 안내.
+    view.modelUsage = (fixture["modelUsage"] as? [String: Any]).flatMap { raw in
+        (try? JSONSerialization.data(withJSONObject: raw)).flatMap(ModelUsageReport.parse)
+    }
     view.configure(
         teamClaude: health, codex: nil, teamCodex: teamCodex, usage: nil,
         higgsfield: higgsfield,
@@ -7441,7 +7533,15 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     if let expandIndex = CommandLine.arguments.firstIndex(of: "--expand-codex"), CommandLine.arguments.indices.contains(expandIndex + 1) {
         view.openCodexAccount(CommandLine.arguments[expandIndex + 1])
     }
-    // --tab <id>면 그 탭 한 장, 아니면 탭 다섯 장(첫 장이 출력 경로, 나머지는 -<탭 id>).
+    // --model-range week|fortnight|all, --model-metric calls|output|total이면 모델 탭에서 그 값을 고른 것처럼 그린다.
+    func modelArgument(_ flag: String) -> String? {
+        CommandLine.arguments.firstIndex(of: flag).flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
+    }
+    let modelRanges: [String: ModelUsageRange] = ["week": .week, "fortnight": .fortnight, "all": .all]
+    let modelMetrics: [String: ModelUsageMetric] = ["calls": .calls, "output": .output, "total": .total]
+    view.selectModel(ModelUsageSelection(range: modelArgument("--model-range").flatMap { modelRanges[$0] } ?? .week,
+                                         metric: modelArgument("--model-metric").flatMap { modelMetrics[$0] } ?? .calls))
+    // --tab <id>면 그 탭 한 장, 아니면 탭 여섯 장(첫 장이 출력 경로, 나머지는 -<탭 id>).
     let tabs: [DashboardTab]
     if let tabIndex = CommandLine.arguments.firstIndex(of: "--tab"), CommandLine.arguments.indices.contains(tabIndex + 1) {
         guard let tab = DashboardTab.allCases.first(where: { $0.id == CommandLine.arguments[tabIndex + 1] }) else {

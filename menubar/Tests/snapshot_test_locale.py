@@ -21,7 +21,7 @@ TESTS = ROOT / "menubar" / "Tests"
 DEFAULT_BINARY = ROOT / "menubar" / ".build" / "cc-menubar"
 BINARY = pathlib.Path(os.environ.get("CC_MENUBAR_BINARY", str(DEFAULT_BINARY)))
 HANGUL = re.compile(r"[가-힣ㄱ-ㆎ]")
-TABS = ["overview", "claude", "codex", "burn", "cli"]
+TABS = ["overview", "claude", "codex", "burn", "cli", "model"]
 
 # A안(261024-menubar-a)에서 가져온 한국어 문구. 탭마다 하나 이상.
 A_COPY = {
@@ -33,6 +33,9 @@ A_COPY = {
     "codex": ["계정마다 창이 따로 돕니다", "5시간", "7일"],
     "burn": ["월 합계", "기여 없는 계정", "서비스별 판정", "먼저 할 일", "고칠 수 있는 것부터", "목표 사용률 100%"],
     "cli": ["CLI 쿼터", "값이 없을 때 쓰는 말", "확인 중", "확인 필요", "동기화 중", "측정 전"],
+    # 모델 탭(2026-11-02 웹랩 시안 b안 2차본).
+    "model": ["모델", "모델 사용량", "출처별", "날짜별", "계정 풀 주간 사용률", "Claude 5시간 주기 소진 이력", "추정", "하한",
+              "Codex 적대 검증", "Codex 구현 루프", "Hermes 에이전트", "Codex CLI 세션 로그가", "날짜 불명 12호출"],
 }
 
 
@@ -61,7 +64,7 @@ class LocaleSnapshotTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="cc-menubar-locale-")
         work = pathlib.Path(cls.tmp.name)
         fixture = work / "fixture.json"
-        subprocess.run([sys.executable, str(TESTS / "make_dash_fixture.py"), str(fixture), "--codex"],
+        subprocess.run([sys.executable, str(TESTS / "make_dash_fixture.py"), str(fixture), "--codex", "--model"],
                        check=True, capture_output=True, timeout=60)
         cls.runs = {}
         for lang in ("en", "ko"):

@@ -86,7 +86,7 @@ class DashboardWiringTests(unittest.TestCase):
         bodies = body[body.index("    static func sectionBodies("):]
         bodies = bodies[:bodies.index("\n    }\n")]
         ids = re.findall(r'\(id: "([a-z]+)", title: ', bodies)
-        self.assertEqual(ids, ["claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary"],
+        self.assertEqual(ids, ["claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary", "model"],
                          "every former dashboard section keeps a place in one tab")
         self.assertIn("sectionBodies(", body[body.index("    static func tabContentHeights("):])
         configure = body[body.index("    func configure("):]
@@ -94,7 +94,7 @@ class DashboardWiringTests(unittest.TestCase):
         self.assertIn("Self.sectionBodies(", configure)
         self.assertIn("Self.overviewModel(", configure)
         tabs = (SOURCES / "DashboardPanel.swift").read_text()
-        for section in ("overview", "claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary"):
+        for section in ("overview", "claude", "codex", "burn", "usage", "cli", "higgsfield", "vocabulary", "model"):
             self.assertIn(f'"{section}"', tabs[tabs.index("var sectionIDs"):tabs.index("static func containing")])
 
 

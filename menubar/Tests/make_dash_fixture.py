@@ -154,7 +154,45 @@ def build():
         # 실패 화면은 실패했을 때만 나타나서 평소 스냅샷에 걸리지 않는다. 그래서 따로 그린다.
         fixture["staleNotes"] = {"grok": "12분째 갱신 없음", "agy": "31분째 갱신 없음",
                                  "higgsfield": "48분째 갱신 없음"}
+    if "--model" in sys.argv:
+        fixture["modelUsage"] = model_usage()
     return fixture
+
+
+def model_usage():
+    """모델 탭 픽스처(수집기 schema 1 모양, 지어낸 작은 수). 오늘 기준 21일, 기록 공백·CLI 로그 끝·풀·주기 이력을 모두 담는다."""
+    import datetime as dt
+    today = dt.date.today()
+    day = lambda back: (today - dt.timedelta(days=back)).isoformat()
+    daily, receipts, impl, cycles = [], [], [], []
+    for back in range(20, -1, -1):
+        base = 21 - back
+        daily.append({"date": day(back), "lane": "claude", "model": "claude-opus-5", "source": "claude-code",
+                      "input": 50 * base, "output": 900 * base, "cacheRead": 40000 * base, "cacheWrite": 2000 * base, "calls": 120 + 9 * base})
+        daily.append({"date": day(back), "lane": "claude", "model": "claude-sonnet-5", "source": "claude-code",
+                      "input": 20 * base, "output": 300 * base, "cacheRead": 9000 * base, "cacheWrite": 500 * base, "calls": 30 + base})
+        daily.append({"date": day(back), "lane": "codex", "model": "gpt-6.1-sol", "source": "hermes",
+                      "input": 400000, "output": 90000, "cacheRead": 0, "cacheWrite": 0, "calls": 40})
+        if back >= 4:
+            daily.append({"date": day(back), "lane": "codex", "model": "gpt-6.1-sol", "source": "codex-cli",
+                          "input": 3000000, "output": 600000, "cacheRead": 9000000, "cacheWrite": 0, "calls": 300})
+        if back <= 10:
+            receipts.append({"date": day(back), "runs": 60 + back, "tokens": 5000000, "reviewSec": 9000})
+            cycles.append({"date": day(back), "window": "5h", "cycles": 5, "exhausted": back % 3})
+        if back <= 7 and back % 2 == 0:
+            impl.append({"date": day(back), "runs": 3, "rounds": 5})
+    now_ms = int(time.time() * 1000)
+    pool = lambda prefix, utils: [{"label": f"{prefix}{i + 1:02d}", "util7d": u, "reset7d": now_ms + 3 * DAY_MS,
+                                   "usable": u is not None and u < 0.98, "enabled": u is not None} for i, u in enumerate(utils)]
+    return {"schema": 1, "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "today": day(0), "since": day(20),
+            "coverage": {"claudeCompleteFrom": day(13), "claudeRetentionDays": 14, "codexCliLastDay": day(4), "receiptFirstDay": day(10)},
+            "daily": daily, "receipts": {"audit": {"jsonFiles": 30, "uniqueRuns": 11, "dupRunId": 19}, "daily": receipts},
+            "implLoop": {"daily": impl}, "pro200": {"mid": 90000000, "lo": 60000000, "hi": 130000000, "weeks": 4, "samples": 9, "excluded": 3},
+            "undated": [{"lane": "codex", "model": "gpt-6.1-sol", "source": "hermes", "input": 900000, "output": 80000,
+                         "cacheRead": 0, "cacheWrite": 0, "calls": 12}],
+            "quotaCycles": {"since": day(10), "completeFrom": day(8), "daily": cycles},
+            "pools": {"claude": {"available": True, "threshold": 0.98, "accounts": pool("C", [1.0, 0.99, 0.42, 0.75, None, 0.2])},
+                      "codex": {"available": True, "threshold": 0.98, "accounts": pool("X", [1.0, 0.31, None])}}}
 
 
 if __name__ == "__main__":

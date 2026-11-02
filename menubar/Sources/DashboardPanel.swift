@@ -1,10 +1,10 @@
 import Cocoa
 
-// 패널 셸(menubar/DESIGN.md "패널 구성"): 머리(제목·기준 시각·손볼 것 배지) + 탭 5개 + 본문 + 하단 동작 막대.
+// 패널 셸(menubar/DESIGN.md "패널 구성"): 머리(제목·기준 시각·손볼 것 배지) + 탭 6개 + 본문 + 하단 동작 막대.
 // 본문을 그리는 카드들은 각 파일에 있고, 여기는 셸과 탭·단축키 판정만 둔다(main.swift 없이 컴파일된다).
 
 enum DashboardTab: Int, CaseIterable {
-    case overview, claude, codex, burn, cli
+    case overview, claude, codex, burn, cli, model
 
     var title: String {
         switch self {
@@ -13,10 +13,11 @@ enum DashboardTab: Int, CaseIterable {
         case .codex: return L10n.tabCodex
         case .burn: return L10n.tabBurn
         case .cli: return L10n.tabCli
+        case .model: return L10n.tabModel
         }
     }
 
-    /// 숫자 키 1–5.
+    /// 숫자 키 1–6.
     var shortcutKey: String { "\(rawValue + 1)" }
 
     /// 스냅샷 파일 이름·출력에 쓰는 고정 id(언어와 무관).
@@ -27,6 +28,7 @@ enum DashboardTab: Int, CaseIterable {
         case .codex: return "codex"
         case .burn: return "burn"
         case .cli: return "cli"
+        case .model: return "model"
         }
     }
 
@@ -38,6 +40,7 @@ enum DashboardTab: Int, CaseIterable {
         case .codex: return ["codex"]
         case .burn: return ["burn", "usage"]
         case .cli: return ["cli", "higgsfield", "vocabulary"]
+        case .model: return ["model"]
         }
     }
 
@@ -46,7 +49,7 @@ enum DashboardTab: Int, CaseIterable {
     }
 }
 
-/// 패널 단축키(⌘K 동작 목록, R·⌘R 새로고침, 1–5 탭). 판정은 순수 함수이고, 키를 받는 쪽은 AppDelegate다.
+/// 패널 단축키(⌘K 동작 목록, R·⌘R 새로고침, 1–6 탭). 판정은 순수 함수이고, 키를 받는 쪽은 AppDelegate다.
 /// esc는 메뉴가 스스로 닫히며 처리한다(닫힐 때 동작 목록도 닫는다).
 enum DashboardShortcut: Equatable {
     case tab(DashboardTab)

@@ -14,20 +14,21 @@ struct DashboardPanelTests {
     }
 
     static func testTabsCoverEverySectionOnce() {
-        precondition(DashboardTab.allCases.count == 5)
-        precondition(DashboardTab.allCases.map(\.id) == ["overview", "claude", "codex", "burn", "cli"])
+        precondition(DashboardTab.allCases.count == 6)
+        precondition(DashboardTab.allCases.map(\.id) == ["overview", "claude", "codex", "burn", "cli", "model"])
         let all = DashboardTab.allCases.flatMap(\.sectionIDs)
         precondition(Set(all).count == all.count, "a section must live in exactly one tab: \(all)")
         // 예전 대시보드 섹션 전부 + 새 개요·빈 값 어휘. 하나라도 빠지면 기능이 사라진다.
-        for id in ["overview", "burn", "claude", "codex", "higgsfield", "cli", "usage", "vocabulary"] {
+        for id in ["overview", "burn", "claude", "codex", "higgsfield", "cli", "usage", "vocabulary", "model"] {
             precondition(DashboardTab.containing(section: id) != nil, "section \(id) has no tab")
         }
         precondition(DashboardTab.containing(section: "usage") == .burn, "ccusage cost lives in the burn tab")
         precondition(DashboardTab.containing(section: "higgsfield") == .cli)
+        precondition(DashboardTab.containing(section: "model") == .model)
         L10n.language = .ko
-        precondition(DashboardTab.allCases.map(\.title) == ["개요", "Claude", "Codex", "소진", "CLI"])
+        precondition(DashboardTab.allCases.map(\.title) == ["개요", "Claude", "Codex", "소진", "CLI", "모델"])
         L10n.language = .en
-        precondition(DashboardTab.allCases.map(\.title) == ["Overview", "Claude", "Codex", "Burn", "CLI"])
+        precondition(DashboardTab.allCases.map(\.title) == ["Overview", "Claude", "Codex", "Burn", "CLI", "Models"])
         L10n.language = .ko
     }
 
@@ -47,7 +48,8 @@ struct DashboardPanelTests {
         for tab in DashboardTab.allCases {
             precondition(DashboardShortcut.resolve(characters: tab.shortcutKey, command: false, otherModifiers: false) == .tab(tab))
         }
-        precondition(DashboardShortcut.resolve(characters: "6", command: false, otherModifiers: false) == nil)
+        precondition(DashboardShortcut.resolve(characters: "6", command: false, otherModifiers: false) == .tab(.model))
+        precondition(DashboardShortcut.resolve(characters: "7", command: false, otherModifiers: false) == nil)
         precondition(DashboardShortcut.resolve(characters: "0", command: false, otherModifiers: false) == nil)
     }
 
@@ -104,7 +106,7 @@ struct DashboardPanelTests {
         }
         // 탭 세그먼트는 겹치지 않고 패널 안에 든다.
         let rects = DashboardPanelHeaderView.tabSegmentRects(width: 520).map(\.1)
-        precondition(rects.count == 5)
+        precondition(rects.count == 6)
         for (a, b) in zip(rects, rects.dropFirst()) { precondition(!a.intersects(b) && a.maxX <= b.minX + 0.001) }
         precondition(rects.first!.minX >= 16 && rects.last!.maxX <= 504)
         // 동작 목록 높이: 묶음 머리 + 행.

@@ -112,7 +112,7 @@ enum QAValidationError: Error, Equatable, CustomStringConvertible {
 struct QARequestValidator {
     static let maxRequestBytes = 64 * 1024
     static let maxSteps = 50
-    static let supportedKeys = Set(["1", "2", "3", "4", "5", "r", "cmd+k", "escape"])
+    static let supportedKeys = Set(["1", "2", "3", "4", "5", "6", "r", "cmd+k", "escape"])
     static let nameCharacterSet = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
     static func decode(_ data: Data) throws -> QARequest {

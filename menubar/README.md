@@ -19,7 +19,7 @@ It is a native Swift/AppKit executable with no Electron, Tauri, React or npm run
 ## The panel
 
 Clicking the menu-bar item opens a 520pt panel. The header shows the title, the time of the data, and how many accounts
-need a person ("To fix N"). Below it are five tabs. The panel is as tall as the overview tab (at least 400pt of body, at most
+need a person ("To fix N"). Below it are six tabs. The panel is as tall as the overview tab (at least 400pt of body, at most
 the screen); a longer tab, such as the Claude tab with many accounts, scrolls inside the body. The height does not change while
 the menu is open.
 
@@ -30,11 +30,12 @@ the menu is open.
 | Codex | The TeamCodex pool (5-hour and 7-day bars with their own resets per account), the plan state at the right of each plan line (click to expand the plan record), recovery buttons, cancel-confirmed accounts grouped below the list, and Codex usage on this Mac |
 | Burn | Subscription spend and per-service verdicts, what to do first, ccusage usage (cost) |
 | CLI | Grok and agy quotas, Higgsfield credits, and the words used for missing values |
+| Models | Which models the agent system uses and how much (7d · 14d · all × calls · output tokens · all tokens): Claude calls, Codex demand as Pro 200 accounts per week (estimate, with range and lower-bound marks), five sources each in its own unit (Claude Code, Codex CLI, Codex adversarial review, Codex impl loop, Hermes), stacked daily bars, models compared with the previous period, pool weekly usage, Claude 5-hour cycles that ended exhausted, and Codex capacity facts. Days whose records were deleted are hatched |
 
 Bars turn amber from the 98% routing threshold. The thin sky-blue tick on a bar is how much of that window has elapsed;
 a fill ahead of the tick means the window will fill before it resets.
 The footer has Refresh (R) and the action list (⌘K): measure accounts, import the Claude Code account, add Claude or Codex
-OAuth accounts, restart the TeamClaude server, open at login (.app builds only), and quit. Number keys 1–5 switch tabs.
+OAuth accounts, restart the TeamClaude server, open at login (.app builds only), and quit. Number keys 1–6 switch tabs.
 ### Plan state
 
 Each account shows one of five plan states: active (confirmed), unconfirmed, cancel scheduled (with an end date, which may be
@@ -105,7 +106,7 @@ To look at the panel, use the offscreen snapshot. It renders one image per tab a
 
 ```sh
 python3 menubar/Tests/make_dash_fixture.py /tmp/fixture.json --codex
-menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png            # five tabs
+menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png            # six tabs
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
@@ -203,12 +204,19 @@ Running the workflow by hand (workflow_dispatch) without a tag only uploads the 
 - `DESIGN.md`: the panel's visual rules
 - `Tests/`, `run-tests.sh`: Swift/Python regression checks and snapshots
 - `../scripts/subscription-monitor.py`, `subscription-monitor-browser.js`: the optional plan collector
+- `../scripts/model-usage-collector.py`: the optional model usage collector for the Models tab
 - `build.sh`, `install.sh`: standalone build and install
 - `package-app.sh`: universal `CC Menubar.app` (zip and sha256) for public releases
 
 Account data comes from `~/.config/teamclaude.json`, `~/.config/teamcodex.json` and the local server state.
 External CLIs (Grok, Agy, Higgsfield, ccusage) are only used for their own cards.
 The plan collector is optional, needs the existing browser tool and qgate, and is not started by the menu-bar install.
+The Models tab reads only `~/.local/state/cc-menubar/model-usage.json`. `python3 scripts/model-usage-collector.py` writes it from
+local logs (Claude Code and Codex session logs, review receipts, impl loop ledgers, Hermes `state.db`, the proxy status) using only
+the Python standard library. It reads only lines added since the last run (offsets kept in `model-usage.sqlite` next to the JSON),
+keeps daily totals after the source logs are deleted, and writes accounts as sequence labels (C01, X01) without e-mail, names,
+tokens or conversation text. `--install` registers an hourly `com.qjc.cc-model-usage` LaunchAgent through qgate; nothing installs it
+automatically. Without the JSON the tab shows "Model usage not collected yet".
 If an existing collector LaunchAgent points at an old repository, move both the script path in its `ProgramArguments`
 and its `WorkingDirectory` to this repository. Live mailbox checks are opt-in.
 
@@ -222,5 +230,5 @@ shipped by this project.
 The runner reports two availability methods (a second-vs-day boundary check and an old local QA hash check) as
 known-red. Mailbox checks are opt-in. The migration did not widen the exception list or loosen assertions.
 
-The panel shortcuts (R, 1–5, ⌘K) are received by 1pt-tall menu items that carry key equivalents, because custom views
+The panel shortcuts (R, 1–6, ⌘K) are received by 1pt-tall menu items that carry key equivalents, because custom views
 do not receive key events while a menu is tracking. Offscreen snapshots cannot exercise that path; check it in the real menu.
