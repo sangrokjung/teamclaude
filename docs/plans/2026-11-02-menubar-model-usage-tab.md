@@ -1,6 +1,6 @@
 # Plan: 메뉴바 "모델" 탭
 - Spec: docs/specs/2026-11-02-menubar-model-usage-tab.md
-- STATUS: APPROVED (대표 2026-11-02 b안 확정, 등급 M 위임 범위)
+- STATUS: APPROVED (대표 2026-11-03 승인, 변경 규모 L등급. 적대 검증 6라운드 REQUEST_CHANGES 잔여 지적은 대표 결정으로 후속 이슈 처리)
 
 ## Task 1: 수집기 (TDD)
 - `menubar/Tests/test_model_usage_collector.py`: 증분(두 번째 실행 읽은 바이트 0, 줄 덧붙임만 읽음, 끝나지 않은 줄 보류), Claude 중복 제거, 영수증 run_id 중복 제거, Codex 누적 토큰 증분, 기록 공백(coverage), 개인정보 미포함.
