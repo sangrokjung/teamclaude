@@ -1,6 +1,6 @@
 """scripts/model-usage-collector.py 회귀 테스트(표준 라이브러리 unittest).
 
-실행: python3 -m unittest test/test_model_usage_collector.py
+실행: python3 menubar/Tests/test_model_usage_collector.py (menubar/run-tests.sh가 함께 돌린다)
 가짜 HOME에 Claude·Codex·영수증·구현 루프·Hermes·주기 이력 기록을 만들어 수집기를 두 번 이상 돌린다.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/model-usage-collector.py"
+MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts/model-usage-collector.py"
 SPEC = importlib.util.spec_from_file_location("model_usage_collector", MODULE_PATH)
 assert SPEC and SPEC.loader
 collector = importlib.util.module_from_spec(SPEC)
@@ -27,7 +27,7 @@ TZ = ZoneInfo("Asia/Seoul")
 NOW = dt.datetime(2026, 11, 2, 12, 0, tzinfo=TZ)
 EMAIL = "someone@example.test"
 UUID = "0f0f0f0f-1111-2222-3333-444444444444"
-SECRET = "sk-ant-oat01-SECRETVALUE"
+SECRET = "USER-PROMPT-TEXT-MARKER"  # 사용자 메시지 내용이 결과에 새지 않는지 보는 표지
 
 
 def claude_line(msg_id, req, ts, model="claude-opus-5", out=10, inp=5, cr=100, cw=7, prompt="hello"):

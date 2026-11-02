@@ -41,6 +41,8 @@ EXPECTED_TAB_DRAWN = {
     "codex": {"codex"},
     "burn": {"subscription", "usage"},
     "cli": {"grok", "agy", "higgsfield"},
+    # 모델 탭은 도구 안내 카드가 아니라 본문 안 "수집 전" 안내를 그린다(아래 섹션 요약에서 확인).
+    "model": set(),
 }
 
 EXPECTED_SECTIONS = {
@@ -49,6 +51,7 @@ EXPECTED_SECTIONS = {
     "codex": "Codex·TeamCodex 미설치",
     "higgsfield": "Higgsfield 미설치",
     "usage": "사용량 미설치",
+    "model": "모델 사용량 수집 전",
 }
 
 

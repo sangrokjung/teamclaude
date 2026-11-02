@@ -52,5 +52,5 @@
 - A6 기존 menubar 테스트 신규 실패 0.
 
 ## 검증 방법
-- `python3 -m unittest test/test_model_usage_collector.py`
+- `python3 menubar/Tests/test_model_usage_collector.py`
 - `bash menubar/run-tests.sh`(qgate default 슬롯), 스냅샷 `menubar/.build/cc-menubar --dashboard-snapshot <fixture> out.png --tab model`

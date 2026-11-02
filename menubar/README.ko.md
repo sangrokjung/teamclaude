@@ -19,7 +19,7 @@ Swift/AppKit 네이티브 실행 파일이며 Electron, Tauri, React, npm 런타
 ## 패널
 
 메뉴바 아이콘을 누르면 폭 520pt 패널이 열립니다. 맨 위에 제목과 기준 시각, 사람이 손봐야 하는 계정 수("손볼 것 N")가 있고,
-그 아래 탭 다섯 개가 있습니다. 패널 높이는 개요 탭에 맞춥니다(본문 최소 400pt, 화면 높이 이하). 계정이 많은 Claude 탭처럼 더 긴 탭은
+그 아래 탭 여섯 개가 있습니다. 패널 높이는 개요 탭에 맞춥니다(본문 최소 400pt, 화면 높이 이하). 계정이 많은 Claude 탭처럼 더 긴 탭은
 본문 안에서 스크롤합니다. 메뉴가 열려 있는 동안에는 높이가 바뀌지 않습니다.
 
 | 탭 | 내용 |
@@ -29,10 +29,11 @@ Swift/AppKit 네이티브 실행 파일이며 Electron, Tauri, React, npm 런타
 | Codex | TeamCodex 계정 풀(계정마다 5시간·7일 막대와 리셋), 플랜·결제일 줄 오른쪽의 구독 상태(누르면 구독 기록이 펼쳐짐), 되돌리기 버튼, 목록 아래 따로 묶은 해지 확정 계정, 이 맥의 Codex 사용량 |
 | 소진 | 구독 지출과 서비스별 판정, 먼저 할 일, ccusage 사용량(비용) |
 | CLI | Grok·agy 쿼터, Higgsfield 크레딧, 값이 없을 때 쓰는 말 |
+| 모델 | 에이전트 시스템이 어떤 모델을 얼마나 쓰는지(7일·14일·전체 × 호출·출력 토큰·전체 토큰): Claude 호출, Codex 수요의 주당 Pro 200 환산(추정·범위·하한 표기), 출처 5개(Claude Code·Codex CLI·Codex 적대 검증·Codex 구현 루프·Hermes, 각자 단위), 날짜별 쌓은 막대, 앞 기간 대비 모델별 목록, 계정 풀 주간 사용률, Claude 5시간 주기 소진 이력, Codex 용량 현황. 기록이 지워진 구간은 빗금 |
 
 막대는 98% 라우팅 문턱부터 호박색이고, 하늘색 세로 눈금은 창이 지난 비율입니다. 채움이 눈금보다 앞서면 그 창은 리셋 전에 찹니다.
 하단 막대에는 새로고침(R)과 동작 목록(⌘K)이 있습니다. 동작 목록에서 계정 측정, Claude Code 계정 가져오기, Claude·Codex OAuth 계정 추가,
-TeamClaude 서버 재시작, 로그인 시 열기(.app 배포본만), 종료를 실행합니다. 숫자 키 1–5는 탭을 옮깁니다.
+TeamClaude 서버 재시작, 로그인 시 열기(.app 배포본만), 종료를 실행합니다. 숫자 키 1–6은 탭을 옮깁니다.
 ### 구독 상태
 
 계정마다 구독 상태가 다섯 가지 중 하나로 보입니다: 구독 중(확인됨) · 확인 안 됨 · 해지 예약(종료일, 비어 있을 수 있음) · 종료일 지남 ·
@@ -100,7 +101,7 @@ npm run menubar:install -- --binary "$PWD/menubar/.build/cc-menubar"
 
 ```sh
 python3 menubar/Tests/make_dash_fixture.py /tmp/fixture.json --codex
-menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png            # 탭 다섯 장
+menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png            # 탭 여섯 장
 menubar/.build/cc-menubar --dashboard-snapshot /tmp/fixture.json /tmp/panel.png --tab claude --expand acct-13
 ```
 
@@ -193,12 +194,18 @@ ad-hoc 서명(`codesign -s -`)만 합니다. `menubar-v<버전>` 태그를 올�
 - `DESIGN.md`: 패널 화면 규칙(시각 기준)
 - `Tests/`, `run-tests.sh`: Swift/Python 회귀 검사와 스냅샷
 - `../scripts/subscription-monitor.py`, `subscription-monitor-browser.js`: 선택적인 구독 확인 수집기
+- `../scripts/model-usage-collector.py`: 모델 탭용 선택적 모델 사용량 수집기
 - `build.sh`, `install.sh`: 독립 빌드와 설치
 - `package-app.sh`: 외부 배포용 유니버설 `CC Menubar.app`(zip·sha256)
 
 계정 데이터는 기존 `~/.config/teamclaude.json`, `~/.config/teamcodex.json`과 로컬 서버 상태를 읽습니다.
 외부 CLI(Grok, Agy, Higgsfield, ccusage)는 해당 기능에만 사용되며 데스크톱 앱과 무관합니다.
 구독 수집기는 기존 브라우저 도구와 qgate를 필요로 하는 선택 기능이며 메뉴바 설치가 자동 실행하지 않습니다.
+모델 탭은 `~/.local/state/cc-menubar/model-usage.json` 하나만 읽습니다. 이 파일은 `python3 scripts/model-usage-collector.py`가
+로컬 기록(Claude Code·Codex 세션 로그, 적대 검증 영수증, 구현 루프 원장, Hermes `state.db`, 프록시 status)에서 Python 표준 라이브러리만으로 만듭니다.
+지난 실행 뒤 붙은 줄만 읽고(오프셋은 같은 폴더의 `model-usage.sqlite`), 원본 로그가 지워져도 모은 날짜별 합계는 남깁니다.
+계정은 순번(C01·X01)으로만 쓰고 이메일·이름·토큰·대화 내용은 넣지 않습니다. `--install`은 qgate를 거치는 1시간 주기
+`com.qjc.cc-model-usage` LaunchAgent를 등록하며, 자동으로 설치되지 않습니다. 파일이 없으면 탭은 "모델 사용량 수집 전"을 보입니다.
 기존 수집기 LaunchAgent가 옛 저장소를 가리킨다면 그 `ProgramArguments`의 스크립트 경로와
 `WorkingDirectory`를 이 저장소로 함께 옮겨야 합니다. 사용자 메일함 라이브 검사는 기본 실행하지 않습니다.
 
@@ -211,5 +218,5 @@ ad-hoc 서명(`codesign -s -`)만 합니다. `menubar-v<버전>` 태그를 올�
 기존 러너는 availability의 초/일 경계 검사와 과거 로컬 QA 해시 검사 두 메서드를
 known-red로 별도 집계합니다. 외부 메일함 검사는 opt-in입니다. 이관하면서 예외 목록이나 assertion을 넓히지 않습니다.
 
-패널 단축키(R·1–5·⌘K)는 메뉴가 열린 동안 키 등가를 가진 높이 1pt 메뉴 항목으로 받습니다. 메뉴 추적 중에는 커스텀 뷰가
+패널 단축키(R·1–6·⌘K)는 메뉴가 열린 동안 키 등가를 가진 높이 1pt 메뉴 항목으로 받습니다. 메뉴 추적 중에는 커스텀 뷰가
 키 이벤트를 받지 못하기 때문입니다. 오프스크린 스냅샷으로는 이 경로를 검증할 수 없으니 실제 메뉴에서 확인하세요.

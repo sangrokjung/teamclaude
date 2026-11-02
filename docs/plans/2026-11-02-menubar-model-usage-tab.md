@@ -3,7 +3,7 @@
 - STATUS: APPROVED (대표 2026-11-02 b안 확정, 등급 M 위임 범위)
 
 ## Task 1: 수집기 (TDD)
-- `test/test_model_usage_collector.py`: 증분(두 번째 실행 읽은 바이트 0, 줄 덧붙임만 읽음, 끝나지 않은 줄 보류), Claude 중복 제거, 영수증 run_id 중복 제거, Codex 누적 토큰 증분, 기록 공백(coverage), 개인정보 미포함.
+- `menubar/Tests/test_model_usage_collector.py`: 증분(두 번째 실행 읽은 바이트 0, 줄 덧붙임만 읽음, 끝나지 않은 줄 보류), Claude 중복 제거, 영수증 run_id 중복 제거, Codex 누적 토큰 증분, 기록 공백(coverage), 개인정보 미포함.
 - `scripts/model-usage-collector.py`: sqlite 상태, jsonl 증분 리더, 출처별 집계, Pro 200 추정, 풀 status 읽기, 원자적 쓰기, `--install`.
 
 ## Task 2: 표시 로직 (Swift, main.swift 없이 컴파일)
