@@ -915,6 +915,10 @@ enum L10n {
         t("\(day) 이전 Claude Code 기록은 보존 설정(\(days)일)으로 지워져 실제보다 적습니다.",
           "Claude Code records before \(day) were deleted by the \(days)-day retention setting, so they read low.")
     }
+    static func modelGapPause(_ span: String) -> String {
+        t("\(span) 사이 수집이 오래 멈춰 Claude Code 기록이 빠졌을 수 있습니다.",
+          "Collection paused too long around \(span), so Claude Code records may be missing.")
+    }
     static func modelGapCli(_ day: String) -> String {
         t("Codex CLI 세션 로그가 \(day)까지만 있어 그 뒤 Codex 값은 하한입니다.", "Codex CLI session logs end on \(day), so later Codex values are a lower bound.")
     }

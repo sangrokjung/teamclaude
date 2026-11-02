@@ -15,6 +15,7 @@ struct ModelUsageTests {
         testCountFormat()
         testAllRangeCoversEveryKeptDay()
         testAllRangeIncludesCycleOnlyDays()
+        testCollectorPauseGapIsHatchedAndNotCompared()
         print("ModelUsageTests: parse, periods, pro, sources, gaps, models, pools, format passed")
     }
 
@@ -208,6 +209,21 @@ struct ModelUsageTests {
         older.since = "2026-10-10"
         let all = makeModelUsagePresentation(older, ModelUsageSelection(range: .all, metric: .calls))
         precondition(all.period.from == "2026-10-10" && all.cycleSummary.fiveCycles == 6, "\(all.period.from) \(all.cycleSummary.fiveCycles)")
+    }
+
+    /// 수집이 오래 멈춘 구간(claudeGaps)은 온전하지 않다: 빗금·경고, 앞 기간 비교 안 함.
+    static func testCollectorPauseGapIsHatchedAndNotCompared() {
+        var r = report
+        r.coverage.claudeCompleteFrom = "2026-10-01"
+        r.coverage.claudeGaps = [("2026-10-22", "2026-10-24")]
+        let week = makeModelUsagePresentation(r, ModelUsageSelection(range: .week, metric: .calls))
+        precondition(week.claudeDelta == nil && week.claudePrevIncomplete, "previous week 10/20~10/26 overlaps the gap")
+        let fortnight = makeModelUsagePresentation(r, ModelUsageSelection(range: .fortnight, metric: .calls))
+        precondition(fortnight.claudeDays.filter(\.hatched).map(\.date) == ["2026-10-22", "2026-10-23", "2026-10-24"])
+        precondition(fortnight.gapNote?.contains("10/22–10/24") == true, fortnight.gapNote ?? "")
+        let parsed = ModelUsageReport.parse(Data(json.replacingOccurrences(of: #""receiptFirstDay":"2026-10-23"}"#,
+            with: #""receiptFirstDay":"2026-10-23","claudeGaps":[{"from":"2026-10-22","to":"2026-10-24"}]}"#).utf8))
+        precondition(parsed?.coverage.claudeGaps.count == 1 && parsed?.coverage.claudeGaps.first?.to == "2026-10-24")
     }
 
     static func testCountFormat() {

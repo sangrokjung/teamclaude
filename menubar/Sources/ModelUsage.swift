@@ -40,7 +40,11 @@ struct ModelUsagePoolAccount { let label: String; let util7d: Double?; let reset
 struct ModelUsagePool { var available = false; var accounts: [ModelUsagePoolAccount] = [] }
 /// samples: 기준값을 낸 표본 창 수(수집기 값). 기간 환산 값에는 없다(nil).
 struct ModelUsagePro200 { let mid: Double; let lo: Double; let hi: Double; var samples: Int? = nil }
-struct ModelUsageCoverage { var claudeCompleteFrom: String?; var claudeRetentionDays: Int?; var codexCliLastDay: String?; var receiptFirstDay: String? }
+struct ModelUsageCoverage {
+    var claudeCompleteFrom: String?; var claudeRetentionDays: Int?; var codexCliLastDay: String?; var receiptFirstDay: String?
+    /// 수집이 Claude 보존 기간보다 오래 멈췄던 구간(그 사이 생겼다 지워진 기록이 있을 수 있다).
+    var claudeGaps: [(from: String, to: String)] = []
+}
 
 struct ModelUsageReport {
     var generatedAt: Date?
@@ -76,7 +80,11 @@ struct ModelUsageReport {
         let cov = root["coverage"] as? [String: Any] ?? [:]
         r.coverage = ModelUsageCoverage(claudeCompleteFrom: cov["claudeCompleteFrom"] as? String,
                                         claudeRetentionDays: (cov["claudeRetentionDays"] as? NSNumber)?.intValue,
-                                        codexCliLastDay: cov["codexCliLastDay"] as? String, receiptFirstDay: cov["receiptFirstDay"] as? String)
+                                        codexCliLastDay: cov["codexCliLastDay"] as? String, receiptFirstDay: cov["receiptFirstDay"] as? String,
+                                        claudeGaps: objects(cov["claudeGaps"]).compactMap { g in
+                                            guard let from = g["from"] as? String, let to = g["to"] as? String else { return nil }
+                                            return (from, to)
+                                        })
         r.daily = objects(root["daily"]).compactMap { o in
             guard let date = o["date"] as? String else { return nil }
             return row(o, date: date)
@@ -229,20 +237,21 @@ private func modelUsageFirstDay(_ r: ModelUsageReport) -> String {
     return min(max(dates.min() ?? r.since, r.since), r.today)
 }
 
-private func claudeComplete(_ r: ModelUsageReport, from: String) -> Bool {
-    r.coverage.claudeCompleteFrom.map { from >= $0 } ?? true
+/// Claude 기록이 [from, to] 동안 온전한가: 첫 수집 전 보존 경계 뒤이고, 수집이 오래 멈춘 구간과 겹치지 않는다.
+private func claudeComplete(_ r: ModelUsageReport, from: String, to: String) -> Bool {
+    (r.coverage.claudeCompleteFrom.map { from >= $0 } ?? true) && !r.coverage.claudeGaps.contains { $0.from <= to && $0.to >= from }
 }
 
 func modelUsagePeriod(_ r: ModelUsageReport, _ range: ModelUsageRange) -> ModelUsagePeriod {
     let first = modelUsageFirstDay(r)
     guard let days = range.days else {
         return ModelUsagePeriod(from: first, to: r.today, days: modelUsageDays(first, r.today).count,
-                                complete: claudeComplete(r, from: first), prev: nil)
+                                complete: claudeComplete(r, from: first, to: r.today), prev: nil)
     }
     let from = modelUsageAddDays(r.today, -(days - 1))
     let prevFrom = modelUsageAddDays(from, -days)
-    let prevOK = prevFrom >= r.since && claudeComplete(r, from: prevFrom)
-    return ModelUsagePeriod(from: from, to: r.today, days: days, complete: claudeComplete(r, from: from),
+    let prevOK = prevFrom >= r.since && claudeComplete(r, from: prevFrom, to: modelUsageAddDays(from, -1))
+    return ModelUsagePeriod(from: from, to: r.today, days: days, complete: claudeComplete(r, from: from, to: r.today),
                             prev: (prevFrom, modelUsageAddDays(from, -1), prevOK))
 }
 
@@ -400,6 +409,7 @@ private func sourceLines(_ r: ModelUsageReport, _ period: ModelUsagePeriod, week
         var prevState = ModelUsagePrevState.none
         if let prev = period.prev {
             let recorded = prev.from >= r.since && (sourceFirstDay(r, key).map { prev.from >= $0 } ?? true)
+                && (key != .claudeCode || claudeComplete(r, from: prev.from, to: prev.to))
             prevState = recorded ? .compared(modelUsageDelta(now.count, sourceTotal(r, key, prev.from, prev.to).count)) : .notRecorded
         }
         return ModelUsageSourceLine(key: key, count: now.count, tokens: now.tokens, extra: now.extra, prevState: prevState,
@@ -416,7 +426,7 @@ private func dayBars(_ r: ModelUsageReport, _ period: ModelUsagePeriod, metric: 
         var parts = [Double](repeating: 0, count: 5)
         for row in r.daily where row.lane == "claude" && row.date == day { parts[named[row.model] ?? 4] += row.value(metric) }
         return ModelUsageDayBar(date: day, parts: parts.enumerated().map { ModelUsageBarPart(key: $0.offset, value: $0.element) },
-                                hatched: !claudeComplete(r, from: day))
+                                hatched: !claudeComplete(r, from: day, to: day))
     }
     let codex = days.map { day -> ModelUsageDayBar in
         let d = modelUsageCodexNoncache(r, day, day)
@@ -461,8 +471,11 @@ private func panelWeekElapsed(_ reset: Date?, now: Date) -> Double? {
 
 private func gapNote(_ r: ModelUsageReport, _ period: ModelUsagePeriod) -> String? {
     var parts: [String] = []
-    if !period.complete, let from = r.coverage.claudeCompleteFrom {
+    if let from = r.coverage.claudeCompleteFrom, period.from < from {
         parts.append(L10n.modelGapClaude(modelUsageMonthDay(from), days: r.coverage.claudeRetentionDays ?? 30))
+    }
+    for gap in r.coverage.claudeGaps where gap.from <= period.to && gap.to >= period.from {
+        parts.append(L10n.modelGapPause(modelUsageSpan(gap.from, gap.to)))
     }
     if lowerBound(r, to: period.to), let last = r.coverage.codexCliLastDay {
         parts.append(L10n.modelGapCli(modelUsageMonthDay(last)))

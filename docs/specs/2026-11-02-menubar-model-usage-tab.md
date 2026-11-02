@@ -22,10 +22,10 @@
 - Hermes: state.db는 세션·모델별 누적값만 준다. 직전 누적값과 그것을 본 수집 시각(수집 시작 시각, 누적값이 그대로여도 매번 갱신)을 상태 DB에 두고 늘어난 몫만 쌓는다. 늘어난 구간(직전 수집 시각 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로, 자정을 넘으면 호출별 시각이 없어 날마다 나눌 수 없으므로 `undated`로 따로 낸다(일별·기간 합계에 넣지 않는다).
 - 구현 루프: 실행(폴더)마다 날짜·라운드 수를 상태 DB에 남긴다. 원장이 지워져도 남긴 집계는 그대로고, 같은 실행의 라운드가 늘면 그 값으로 바꾼다.
 - 주기 이력: 메뉴바는 창마다 최근 256개만 남긴다. 수집기는 주기마다 안정 식별자로 상태 DB에 쌓고, 파일이 상한까지 찼는데 가장 오래된 주기를 처음 보면 그 다음 날을 `completeFrom`으로 올린다. 화면은 그 앞 날을 0이 아니라 빗금(모름)으로 그리고 합계 문장에 경계 날짜를 붙인다.
-- 보존: 한번 모은 날짜별 합계는 원본 로그가 지워져도 남는다. 기록이 빈 구간은 `coverage`에 밝힌다. Claude는 "수집기 첫 실행일 − cleanupPeriodDays(없으면 30)"의 다음 날부터 온전하다고 본다.
+- 보존: 한번 모은 날짜별 합계는 원본 로그가 지워져도 남는다. 기록이 빈 구간은 `coverage`에 밝힌다. Claude는 "수집기 첫 실행일 − cleanupPeriodDays(없으면 30)"의 다음 날부터 온전하다고 본다. 직전 수집일과 이번 수집일 사이가 보존 기간보다 길면 "직전 수집일 ~ 오늘 − 보존 기간"을 `coverage.claudeGaps`(공백 가능)로 남기고, 화면은 그 날을 빗금·경고로 그리며 그 구간이 걸린 기간은 앞 기간과 비교하지 않는다.
 - 출력: `~/.local/state/cc-menubar/model-usage.json`(원자적 쓰기, 0600). 스키마 `schema: 1`:
   - `generatedAt`(ISO), `today`(로컬 날짜), `since`(실은 첫 날짜. 기본은 상태 DB에 보존한 가장 이른 날이라 '전체'가 보존 범위 전체다. `--since`를 주면 그날부터)
-  - `scan`: `bytesRead`, `files`, `malformed{claude, codex, status}`(모양이 다른 외부 기록을 건너뛴 수. 한 줄·한 계정이 이상해도 수집 전체는 계속한다)
+  - `scan`: `bytesRead`, `files`, `malformed{claude, codex, status}`(JSON 문법이 깨졌거나 모양이 다른 외부 기록을 건너뛴 수. 한 줄·한 계정이 이상해도 수집 전체는 계속한다)
   - `coverage`: `claudeCompleteFrom`, `claudeRetentionDays`, `codexCliLastDay`, `receiptFirstDay`
   - `daily[]`: `date, lane(claude|codex|other), model, source(claude-code|codex-cli|hermes), input, output, cacheRead, cacheWrite, calls`
   - `undated[]`: `lane, model, source, input, output, cacheRead, cacheWrite, calls`(날짜 불명 몫)
@@ -35,7 +35,7 @@
   - `quotaCycles`: `since`(처음 남은 날), `completeFrom`(온전한 첫날, 잘림이 없었으면 null), `daily[]{date, window(5h|7d), cycles, exhausted}`(Claude 레인)
   - `pools.claude|codex`: `available, threshold, accounts[]{label(C01·X01 순번), util7d, reset7d(ms), usable, enabled}`
 - 결과에 넣지 않는 것: 이메일, 계정 이름·UUID, 토큰, 프롬프트·응답 내용, 작업 경로.
-- 실행: `python3 scripts/model-usage-collector.py [--out PATH] [--state PATH] [--home PATH] [--since YYYY-MM-DD]`, `--install`은 구독 수집기와 같은 qgate 경유 LaunchAgent(`com.qjc.cc-model-usage`, 1시간)를 만든다.
+- 실행: `python3 scripts/model-usage-collector.py [--out PATH] [--state PATH] [--home PATH] [--since YYYY-MM-DD]`, `--install`은 구독 수집기와 같은 qgate 경유 LaunchAgent(`com.qjc.cc-model-usage`, 1시간)를 만든다(`~/Library/LaunchAgents`가 없으면 만든다).
 
 ## 화면 계약 (탭 "모델")
 - 조작: 기간 7일·14일·전체, 지표 호출·출력 토큰·전체 토큰. 고른 값은 갱신·재구성 뒤에도 유지한다. '전체'는 보존 시작일을 요약에 함께 적고("전체(8/25부터)"), 날짜가 막대 폭보다 많으면 이어진 날을 묶어 그린다(합은 그대로).

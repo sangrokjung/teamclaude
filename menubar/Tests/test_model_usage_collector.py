@@ -9,6 +9,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import plistlib
 import sqlite3
 import sys
 import tempfile
@@ -335,6 +336,51 @@ class CollectorTests(unittest.TestCase):
         report = self.fx.run()
         self.assertEqual(([], "2026-11-01"), (report["daily"], report["since"]), "only cycle history is kept")
         self.assertEqual([{"date": "2026-11-01", "window": "5h", "cycles": 2, "exhausted": 1}], report["quotaCycles"]["daily"])
+
+    def test_long_pause_between_runs_is_reported_as_a_possible_gap(self):
+        """9/1 수집 → 11/3까지 멈춤. 보존 14일보다 긴 공백이라 9/1~10/20에 생겼다 지워진 기록이 있을 수 있다."""
+        self.fx.run(now=dt.datetime(2026, 9, 1, 12, 0, tzinfo=TZ))
+        report = self.fx.run(now=dt.datetime(2026, 11, 3, 12, 0, tzinfo=TZ))
+        self.assertEqual([{"from": "2026-09-01", "to": "2026-10-20"}], report["coverage"]["claudeGaps"])
+        self.assertEqual("2026-08-19", report["coverage"]["claudeCompleteFrom"], "the first-run boundary stays")
+        again = self.fx.run(now=dt.datetime(2026, 11, 3, 18, 0, tzinfo=TZ))
+        self.assertEqual(report["coverage"]["claudeGaps"], again["coverage"]["claudeGaps"], "a short pause adds nothing")
+        self.fx.run(now=dt.datetime(2026, 11, 10, 12, 0, tzinfo=TZ))  # 7일 쉼 < 보존 14일 → 공백 아님
+        self.assertEqual(1, len(self.fx.run(now=dt.datetime(2026, 11, 10, 13, 0, tzinfo=TZ))["coverage"]["claudeGaps"]))
+
+    def test_json_syntax_errors_are_counted_as_malformed(self):
+        with self.fx.claude_a.open("a") as f:
+            f.write('{"type": "assistant", "usage": {broken\n')
+        with self.fx.codex.open("a") as f:
+            f.write('{"type": "event_msg", "payload": {"type": "token_count", oops}\n')
+        report = self.fx.run()
+        self.assertEqual({"claude": 1, "codex": 1, "status": 0}, report["scan"]["malformed"])
+
+    def test_install_creates_launch_agents_folder_and_registers_once(self):
+        home = Path(self.fx.tmp.name) / "fresh-home"
+        (home / ".claude" / "scripts").mkdir(parents=True)
+        (home / ".claude" / "scripts" / "qgate.py").write_text("# stub\n")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd[:2])
+            class Done:  # print는 '등록 안 됨'(1), bootstrap은 성공(0)
+                returncode = 1 if cmd[1] == "print" else 0
+            return Done()
+
+        result = collector.install(home=home, python="/usr/bin/python3", runner=fake_run)
+        plist = home / "Library" / "LaunchAgents" / "com.qjc.cc-model-usage.plist"
+        self.assertTrue(plist.is_file(), "the LaunchAgents folder is created on a fresh account")
+        data = plistlib.loads(plist.read_bytes())
+        self.assertEqual(3600, data["StartInterval"])
+        self.assertIn(str(home / ".claude" / "scripts" / "qgate.py"), data["ProgramArguments"])
+        self.assertEqual(str(home / ".local" / "state" / "cc-menubar" / "model-usage.log"), data["StandardOutPath"])
+        self.assertEqual([["launchctl", "print"], ["launchctl", "bootstrap"]], calls)
+        self.assertEqual(0o600, plist.stat().st_mode & 0o777)
+        self.assertTrue(result["installed"])
+        calls.clear()
+        collector.install(home=home, python="/usr/bin/python3", runner=lambda cmd, **kw: (calls.append(cmd[:2]), type("D", (), {"returncode": 0})())[1])
+        self.assertEqual([["launchctl", "print"]], calls, "an already registered agent is not bootstrapped again")
 
     def test_malformed_records_are_skipped_and_counted(self):
         with self.fx.claude_a.open("a") as f:

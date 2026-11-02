@@ -96,6 +96,7 @@ def open_state(path: Path) -> sqlite3.Connection:
         cache_read integer, cache_write integer, calls integer, primary key (lane, model, source));
     create table if not exists cycles (key text primary key, window text, date text, exhausted integer);
     create table if not exists impl_runs (run text primary key, date text, rounds integer);
+    create table if not exists claude_gaps (from_day text primary key, to_day text);
     """)
     return db
 
@@ -229,6 +230,7 @@ def collect_claude(db, home, tz, scan, counted_from):
         try:
             o = json.loads(line)
         except ValueError:
+            scan.malformed['claude'] += 1  # 걸러진 줄(assistant·usage 글자가 든 줄)인데 JSON이 깨졌다
             return
         if not isinstance(o, dict):
             scan.malformed['claude'] += 1
@@ -278,6 +280,7 @@ def codex_handle(db, tz, path, scan, counted_from):
         try:
             o = json.loads(line)
         except ValueError:
+            scan.malformed['codex'] += 1
             return
         p = o.get('payload') if isinstance(o, dict) else None
         if not isinstance(p, dict):
@@ -633,6 +636,16 @@ def pro200_estimate(observations, tz):
 
 # ---------- 조립 ----------
 
+def record_claude_gap(db, last_run_day, today, retention):
+    """직전 수집일과 오늘 사이가 Claude 보존 기간(retention일)보다 길면, 그 사이에 생겼다 지워진 기록이 있을 수 있다.
+    오늘 남아 있는 로그는 today − (retention − 1)부터라, 공백 가능 구간은 직전 수집일 ~ today − retention이다."""
+    if not last_run_day:
+        return
+    gap_to = (dt.date.fromisoformat(today) - dt.timedelta(days=retention)).isoformat()
+    if last_run_day <= gap_to:
+        db.execute('insert or replace into claude_gaps values (?, ?)', (last_run_day, gap_to))
+
+
 def first_kept_day(db):
     """상태 DB에 남은 가장 이른 날짜(일별·영수증·구현 루프·주기 이력 중)."""
     days = [db.execute(sql).fetchone()[0] for sql in ('select min(date) from daily', 'select min(date) from receipts',
@@ -677,6 +690,8 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         collect_hermes(db, home, tz, now.timestamp())
         collect_cycles(db, home, tz)
         collect_impl(db, home)
+        record_claude_gap(db, meta_get(db, 'lastRunDay'), today, retention)
+        meta_set(db, 'lastRunDay', today)
         db.execute('delete from seen where day < ?', (counted_from,))  # 이 날짜보다 앞 기록은 위에서 세지 않는다
         keep_ms = int(dt.datetime.combine(dt.date.fromisoformat(counted_from), dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
         db.execute('delete from codex_obs where ts < ?', (keep_ms,))  # 기준값 표본도 같은 기간만 둔다
@@ -689,6 +704,7 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         receipt_first = db.execute('select min(date) from receipts').fetchone()[0]
         cli_last = db.execute("select max(date) from daily where source = 'codex-cli' and calls > 0").fetchone()[0]
         undated = undated_rows(db)
+        gaps = [{'from': f, 'to': t} for f, t in db.execute('select from_day, to_day from claude_gaps order by from_day')]
         cycles = cycles_report(db, since)
         impl = impl_report(db, since, today)
     finally:
@@ -702,7 +718,9 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         'coverage': {'claudeCompleteFrom': complete_from, 'claudeRetentionDays': retention,
                      'codexCliLastDay': cli_last, 'receiptFirstDay': receipt_first,
                      # Claude·Codex 세션 로그는 이 날짜부터의 기록만 새로 센다(그 앞은 이미 센 합계만 남는다).
-                     'countedFrom': counted_from},
+                     'countedFrom': counted_from,
+                     # 수집이 Claude 보존 기간보다 오래 멈췄던 구간. 그 사이 생겼다 지워진 기록이 있을 수 있다.
+                     'claudeGaps': gaps},
         'daily': stored,
         # 날짜를 알 수 없는 Hermes 몫(처음 볼 때 이미 여러 날에 걸친 세션). 일별 막대에 넣지 않는다.
         'undated': undated,
@@ -717,33 +735,38 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
     return report
 
 
-def install():
-    """구독 수집기와 같은 방식: qgate 경유 LaunchAgent(1시간). 사람이 실행할 때만 만든다."""
-    plist = Path.home() / 'Library/LaunchAgents' / (LABEL + '.plist')
-    qgate = Path.home() / '.claude/scripts/qgate.py'
-    python = shutil.which('python3')
+def install(home: Path = None, python: str = None, runner=subprocess.run):
+    """구독 수집기와 같은 방식: qgate 경유 LaunchAgent(1시간). 사람이 실행할 때만 만든다.
+    home·python·runner는 테스트가 바꾼다(실제 launchctl을 부르지 않게)."""
+    home = home or Path.home()
+    plist = home / 'Library/LaunchAgents' / (LABEL + '.plist')
+    qgate = home / '.claude/scripts/qgate.py'
+    python = python or shutil.which('python3')
     if not python or not qgate.is_file():
         raise RuntimeError('scheduler-unavailable')
-    log = DEFAULT_OUT.with_suffix('.log')
+    state_dir = home / '.local/state/cc-menubar'
+    log, error_log = state_dir / 'model-usage.log', state_dir / 'model-usage.error.log'
     data = {'Label': LABEL, 'ProgramArguments': [python, str(qgate), 'run', '--detach', '--follow', '--slot', 'default',
                                                  '--label', 'model-usage', '--', python, str(Path(__file__).resolve())],
             'RunAtLoad': True, 'StartInterval': 3600, 'ProcessType': 'Background', 'LowPriorityIO': True, 'Nice': 10,
             'WorkingDirectory': str(Path(__file__).resolve().parents[1]), 'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')},
-            'StandardOutPath': str(log), 'StandardErrorPath': str(DEFAULT_OUT.with_suffix('.error.log'))}
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for path in (log, DEFAULT_OUT.with_suffix('.error.log')):
+            'StandardOutPath': str(log), 'StandardErrorPath': str(error_log)}
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for path in (log, error_log):
         path.touch(mode=0o600, exist_ok=True)
         path.chmod(0o600)
     if plist.exists():
         if plistlib.loads(plist.read_bytes()) != data:
             raise RuntimeError('existing-agent-differs')
     else:
+        plist.parent.mkdir(parents=True, exist_ok=True)  # 새 계정에는 ~/Library/LaunchAgents가 아직 없다
         plist.write_bytes(plistlib.dumps(data))
         plist.chmod(0o600)
-    if subprocess.run(['launchctl', 'print', f'gui/{os.getuid()}/{LABEL}'], capture_output=True).returncode:
-        subprocess.run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(plist)], check=True, capture_output=True)
-    print(json.dumps({'installed': True, 'intervalHours': 1, 'plist': str(plist)}))
-
+    if runner(['launchctl', 'print', f'gui/{os.getuid()}/{LABEL}'], capture_output=True).returncode:
+        runner(['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(plist)], check=True, capture_output=True)
+    result = {'installed': True, 'intervalHours': 1, 'plist': str(plist)}
+    print(json.dumps(result))
+    return result
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='모델 사용량 증분 수집기(메뉴바 모델 탭)')
