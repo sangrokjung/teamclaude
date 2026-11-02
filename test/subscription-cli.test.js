@@ -168,6 +168,15 @@ test('Codex re-import preserves subscription cancellation metadata', async () =>
   const dir = await mkdtemp(join(tmpdir(), 'teamcodex-subscription-import-'));
   const authPath = join(dir, 'auth.json');
   const configPath = join(dir, 'teamcodex.json');
+  // Pin the proxy to an unused port: a fresh config would take the default
+  // Codex port, and a TeamCodex server already listening there (a developer
+  // machine) could not confirm a reload for this temporary config, so the
+  // import would end with a non-zero exit.
+  await writeFile(configPath, JSON.stringify({
+    provider: 'codex',
+    proxy: { port: 1, apiKey: 'fixture-key' },
+    accounts: [],
+  }));
   await writeFile(authPath, JSON.stringify({
     auth_mode: 'chatgpt',
     tokens: {
