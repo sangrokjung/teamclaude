@@ -126,11 +126,12 @@ export function maskSecrets(text) {
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
     .replace(/\bsk-(?!ant-\*)[A-Za-z0-9_-]{16,}/g, 'sk-***')
     .replace(/\btc-[A-Za-z0-9_-]{16,}/g, 'tc-***')
-    // From the first auth header or secret option on, the rest of the command
-    // line is dropped. Quoting, spaces and scheme syntax make the end of such a
-    // value ambiguous, and a trace only needs the program and the args before
-    // it; over-masking is the safe side.
-    .replace(/(\b(?:x-api-key|authorization)\s*:|--(?:api-key|key|token|secret|password)\b)[\s\S]*$/i, '$1 ***')
+    // From the first credential-ish word on (an auth header name, quoted or
+    // not, inline code, a secret option), the rest of the command line is
+    // dropped. Quoting, spaces and scheme syntax make the end of such a value
+    // ambiguous, and a trace only needs the program and the args before it;
+    // over-masking is the safe side.
+    .replace(/(authorization|x-api-key|api[-_]?key|--key\b|passw(?:or)?d|secret|token)[\s\S]*$/i, '$1 ***')
     .replace(/[A-Za-z0-9_+/=-]{32,}/g, maskRun);
 }
 

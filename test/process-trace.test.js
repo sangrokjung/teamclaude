@@ -376,7 +376,7 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   assert.equal(maskSecrets(key), 'tc-***');
   // 인증 방식 뒤의 값, 따옴표로 감싼 옵션 값도 가린다.
   const basic = maskSecrets('curl -H "Authorization: Basic dXNlcjpwYXNz" https://ops.example/teamclaude/status');
-  assert.ok(!basic.includes('dXNlcjpwYXNz') && basic.includes('Authorization: ***'), basic);
+  assert.ok(!basic.includes('dXNlcjpwYXNz') && basic.includes('Authorization ***'), basic);
   const quoted = maskSecrets(`sh -c 'teamclaude --password "hunterhunter" status'`);
   assert.ok(!quoted.includes('hunterhunter'), quoted);
   const quoted2 = maskSecrets('teamclaude --token=\'plainvalue\' status');
@@ -394,4 +394,18 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   const spaced = maskSecrets(`sh -c 'curl --password="correct horse battery staple" https://ops.example/teamclaude/status'`);
   assert.ok(!/horse|battery|staple/.test(spaced), spaced);
   assert.ok(spaced.startsWith("sh -c 'curl --password"), spaced);
+  // 따옴표 안의 헤더 이름(인라인 코드)도 잡는다.
+  const py = 'python3 -c \'import requests; requests.get("https://teamclaude.example/status", headers={"Authorization": "Basic dXNlcjpwYXNz"})\'';
+  const js = 'node -e \'fetch("http://localhost:3456/teamclaude/status",{headers:{"x-api-key":"shortsecretvalue"}})\'';
+  for (const cmd of [py, js]) {
+    const m = maskSecrets(cmd);
+    assert.ok(!/dXNlcjpwYXNz|shortsecretvalue/.test(m), m);
+  }
+  const ps = [
+    '  PID  PPID STARTED                       COMMAND',
+    '  700     1 Sat Oct 10 21:40:01 2026     ' + py,
+    '  701     1 Sat Oct 10 21:40:01 2026     ' + js,
+  ].join('\n');
+  const rows = filterPsSnapshot(ps, { selfPid: 1 });
+  assert.ok(!/dXNlcjpwYXNz|shortsecretvalue/.test(JSON.stringify(rows)), JSON.stringify(rows));
 });
