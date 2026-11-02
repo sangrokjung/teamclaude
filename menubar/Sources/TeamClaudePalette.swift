@@ -27,6 +27,10 @@ enum TeamClaudePalette {
     static let sky = hex(0x56C2FF)
     /// 막대 트랙.
     static let track = NSColor(white: 1, alpha: 0.08)
+    /// 모델 탭 데이터 계열색(차트 면에만). 첫째는 Claude 레인, 둘째는 Codex 레인 색이고, 모델은 전체 기간 호출 상위 4개에 이 순서로 준다.
+    /// #0F1012 바탕에서 인접 계열 색각 이상 ΔE ≥ 15.9로 검증한 시안 b안 팔레트다.
+    static let series: [NSColor] = [hex(0xD95926), hex(0x3987E5), hex(0xD55181), hex(0x9085E9)]
+    static let seriesOther = hex(0x5B5C60)
 
     // MARK: 예전 이름(카드들이 쓰는 별칭). 값은 위 토큰에서 온다.
     /// 카드 면. 패널 바탕(sheet) 위에 흰색 2.5%를 얹은 층.
@@ -76,7 +80,7 @@ enum TeamClaudePalette {
 
     /// 정적 멤버 전부를 한 번 건드려 첫 draw 안이 아니라 기동 시점에 팔레트를 만든다.
     static func prewarm() {
-        _ = (void, sheet, raised, overlay, graphite, lineStrong, fg, fg2, fg3, ash, ashInk, mint, amber, ember, sky, track)
+        _ = (void, sheet, raised, overlay, graphite, lineStrong, fg, fg2, fg3, ash, ashInk, mint, amber, ember, sky, track, series, seriesOther)
         _ = (bg, panel, panel2, line, text, muted, green, yellow, red, blue, inactive)
         _ = (panelTitleFont, heroFont, heroUnitFont, laneValueFont, sessionValueFont, bodyFont, bodyMediumFont, captionFont, microFont,
              metaFont, legendFont, legendMediumFont, buttonFont, keycapFont, nameFont, numberFont, titleFont, subFont, headFont, rowFont, smallFont)
