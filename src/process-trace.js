@@ -128,8 +128,11 @@ export function maskSecrets(text) {
     .replace(/\btc-[A-Za-z0-9_-]{16,}/g, 'tc-***')
     // Values not already masked above (a value still holding *** keeps its
     // readable prefix, e.g. `sk-ant-***`).
-    // An auth scheme word (Basic, Token, …) is kept; the credential after it is not.
-    .replace(/\b(x-api-key|authorization)(\s*:\s*)(?!Bearer\b)([A-Za-z]+\s+)?(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2$3***')
+    // x-api-key: the first token is the credential, whatever its alphabet.
+    .replace(/\b(x-api-key)(\s*:\s*)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
+    // authorization: a known scheme word is kept and the credential after it
+    // masked; anything else is treated as the credential itself.
+    .replace(/\b(authorization)(\s*:\s*)(?!Bearer\b)((?:Basic|Token|Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+)?(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2$3***')
     // Option values may be quoted (`--password "x"`, `--token='x'`).
     .replace(/(--(?:api-key|key|token|secret|password)(?:\s+|=))(['"]?)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
     .replace(/[A-Za-z0-9_+/=-]{32,}/g, maskRun);

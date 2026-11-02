@@ -378,4 +378,9 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   assert.ok(!quoted.includes('hunterhunter'), quoted);
   const quoted2 = maskSecrets('teamclaude --token=\'plainvalue\' status');
   assert.ok(!quoted2.includes('plainvalue'), quoted2);
+  // x-api-key 값은 인증 방식 단어로 오인하지 않는다(글자만 있는 키 뒤에 다른 인자가 와도).
+  const letters = maskSecrets('curl -H x-api-key: ABCDEFGHIJKLMNOPQRST https://x');
+  assert.ok(!letters.includes('ABCDEFGHIJKLMNOPQRST'), letters);
+  const unknownScheme = maskSecrets('curl -H "Authorization: QWERTYUIOPASDFGH next" x');
+  assert.ok(!unknownScheme.includes('QWERTYUIOPASDFGH'), unknownScheme);
 });
