@@ -929,8 +929,9 @@ enum L10n {
     static var modelUnitRun: String { t("실행", "runs") }
     static var modelUnitCall: String { t("호출", "calls") }
     static var modelUnitNoTokens: String { t("실행 · 토큰 없음", "runs · no tokens") }
-    static var modelCountSuffixEvents: String { t("건", "") }
-    static var modelCountSuffixRuns: String { t("회", "") }
+    /// 수 뒤에 붙는 단위 글자. 영어 화면은 단위 배지가 이미 말하므로 붙이지 않는다(영어 쪽이 빈 문자열인 한·영 쌍은 표가 받지 않는다).
+    static var modelCountSuffixEvents: String { language == .ko ? "건" : "" }
+    static var modelCountSuffixRuns: String { language == .ko ? "회" : "" }
     static func modelSourceNoteClaude(_ tokens: String) -> String { t("토큰 \(tokens)(입력·캐시·출력)", "\(tokens) tokens (input · cache · output)") }
     static func modelSourceNoteCli(_ tokens: String, afterDay: String?) -> String {
         afterDay.map { t("비캐시 토큰 \(tokens) · \($0) 뒤 로그 없음", "\(tokens) non-cached tokens · no logs after \($0)") }

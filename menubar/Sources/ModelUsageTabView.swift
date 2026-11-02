@@ -182,7 +182,7 @@ final class ModelUsageTabView: NSView {
         drawHeader(L10n.modelSourcesTitle, L10n.modelSourcesHint(weeks.first?.label ?? "", weeks.last?.label ?? ""), l.sourcesHeader)
         drawSources(p, l.sources)
         drawHeader(L10n.modelDailyTitle, "\(modelUsageMonthDay(p.period.from))–\(modelUsageMonthDay(p.period.to))", l.dailyHeader)
-        drawClaudeChart(p, report, l.claudeChart)
+        drawClaudeChart(p, l.claudeChart)
         drawCodexChart(p, l.codexChart)
         drawHatchLegend(l.hatchLegend)
         let compareDays = p.period.prev?.complete == true ? p.period.days : nil
@@ -399,7 +399,7 @@ final class ModelUsageTabView: NSView {
         if peak > 0 { PanelDraw.right(modelUsageCount(peak), rect.maxX, rect.minY + 1, TeamClaudePalette.smallFont, TeamClaudePalette.fg3) }
     }
 
-    private func drawClaudeChart(_ p: ModelUsagePresentation, _ report: ModelUsageReport, _ rect: NSRect) {
+    private func drawClaudeChart(_ p: ModelUsagePresentation, _ rect: NSRect) {
         let peak = p.claudeDays.map(\.total).max() ?? 0
         let legend = NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: ModelUsageLayout.chartLegendHeight)
         drawLegend(L10n.modelClaudeChart(Self.metricLabel(p.selection.metric)), color: TeamClaudePalette.series[0], peak: peak, rect: legend)
