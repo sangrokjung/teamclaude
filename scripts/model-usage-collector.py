@@ -48,6 +48,7 @@ TOKENS_RE = re.compile(r'tokens used\s*\n\s*([\d,]+)')
 
 def open_state(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)  # 로그 파일 경로가 들어 있어 본인만 읽게 둔다
     db = sqlite3.connect(path)
     db.executescript("""
     create table if not exists meta (key text primary key, value text);

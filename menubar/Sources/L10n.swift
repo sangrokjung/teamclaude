@@ -882,6 +882,112 @@ enum L10n {
     static var subTodoReasonCancelled: String { t("해지 기록됨 · 재인증 대신 종료로 확정", "Cancellation recorded · confirm ended instead of re-auth") }
     static var subTodoReauthHint: String { t("다시 로그인해도 안 풀리면 해지 기록", "If re-login doesn't fix it, record a cancellation") }
 
+    // MARK: 모델 탭(2026-11-02 웹랩 시안 b안 2차본)
+
+    static var tabModel: String { t("모델", "Models") }
+    static var sectionModel: String { t("모델 사용량", "Model usage") }
+    static var modelRangeWeek: String { t("7일", "7d") }
+    static var modelRangeFortnight: String { t("14일", "14d") }
+    static var modelRangeAll: String { t("전체", "All") }
+    static var modelMetricCalls: String { t("호출", "Calls") }
+    static var modelMetricOutput: String { t("출력 토큰", "Output tokens") }
+    static var modelMetricTotal: String { t("전체 토큰", "All tokens") }
+    static var modelUnitCalls: String { t("호출", "calls") }
+    static var modelUnitTokens: String { t("토큰", "tokens") }
+    static var modelCodexMeta: String { t("Codex · 주당 Pro 200 환산", "Codex · Pro 200 per week") }
+    static var modelBadgeEstimate: String { t("추정", "Est.") }
+    static var modelBadgeLowerBound: String { t("하한", "Lower bound") }
+    static var modelCodexUnit: String { t("계정분", "accounts") }
+    static func modelVsPrevious(_ days: Int, _ delta: String) -> String { t("앞선 \(days)일보다 \(delta)", "\(delta) vs previous \(days)d") }
+    static var modelPrevIncomplete: String { t("앞 기간은 Claude 기록이 일부만 남아 비교 안 함", "Previous period is partly missing, not compared") }
+    static var modelPrevZero: String { t("앞 기간 기록 없음", "No record in the previous period") }
+    static func modelCodexRange(_ lo: String, _ hi: String, _ tokens: String) -> String {
+        t("범위 \(lo)~\(hi) · 비캐시 \(tokens) 토큰", "range \(lo)–\(hi) · \(tokens) non-cached tokens")
+    }
+    static var modelCodexNoBaseline: String { t("환산 기준값 없음(7일 창 관측 부족)", "No conversion baseline (too few 7-day windows)") }
+    static var modelLaneNote: String {
+        t("두 레인은 세는 단위가 달라 한 비율로 견주지 않습니다. Codex 값은 구현 루프(토큰 기록 없음)를 뺀 비캐시 토큰을 Pro 200 1주 기준값으로 나눈 것입니다.",
+          "The two lanes count different units, so they are not compared as one ratio. The Codex value divides non-cached tokens (without the impl loop, which has no token records) by a Pro 200 one-week baseline.")
+    }
+    static func modelGapClaude(_ day: String, days: Int) -> String {
+        t("\(day) 이전 Claude Code 기록은 보존 설정(\(days)일)으로 지워져 실제보다 적습니다.",
+          "Claude Code records before \(day) were deleted by the \(days)-day retention setting, so they read low.")
+    }
+    static func modelGapCli(_ day: String) -> String {
+        t("Codex CLI 세션 로그가 \(day)까지만 있어 그 뒤 Codex 값은 하한입니다.", "Codex CLI session logs end on \(day), so later Codex values are a lower bound.")
+    }
+    static var modelSourcesTitle: String { t("출처별", "By source") }
+    static func modelSourcesHint(_ first: String, _ last: String) -> String {
+        t("출처마다 자기 단위 · 막대는 주별(\(first)~\(last))", "Each in its own unit · weekly bars (\(first)–\(last))")
+    }
+    static var modelSourceClaudeCode: String { "Claude Code" }
+    static var modelSourceCodexCli: String { "Codex CLI" }
+    static var modelSourceReview: String { t("Codex 적대 검증", "Codex adversarial review") }
+    static var modelSourceImpl: String { t("Codex 구현 루프", "Codex impl loop") }
+    static var modelSourceHermes: String { t("Hermes 에이전트", "Hermes agent") }
+    static var modelUnitResponse: String { t("응답", "responses") }
+    static var modelUnitRun: String { t("실행", "runs") }
+    static var modelUnitCall: String { t("호출", "calls") }
+    static var modelUnitNoTokens: String { t("실행 · 토큰 없음", "runs · no tokens") }
+    static var modelCountSuffixEvents: String { t("건", "") }
+    static var modelCountSuffixRuns: String { t("회", "") }
+    static func modelSourceNoteClaude(_ tokens: String) -> String { t("토큰 \(tokens)(입력·캐시·출력)", "\(tokens) tokens (input · cache · output)") }
+    static func modelSourceNoteCli(_ tokens: String, afterDay: String?) -> String {
+        afterDay.map { t("비캐시 토큰 \(tokens) · \($0) 뒤 로그 없음", "\(tokens) non-cached tokens · no logs after \($0)") }
+            ?? t("비캐시 토큰 \(tokens)", "\(tokens) non-cached tokens")
+    }
+    static func modelSourceNoteReview(_ tokens: String, hours: Int) -> String {
+        t("Codex 레인 토큰 \(tokens)(비캐시로 해석) · 검토 \(hours)시간", "\(tokens) Codex-lane tokens (read as non-cached) · \(hours)h of review")
+    }
+    static func modelSourceNoteImpl(_ rounds: String) -> String {
+        t("라운드 \(rounds) · 토큰 기록 없음(횟수로만 셈)", "\(rounds) rounds · no token records (counted by runs)")
+    }
+    static func modelSourceNoteHermes(_ codexCalls: String, _ tokens: String) -> String {
+        t("Codex 쪽 \(codexCalls)호출 · 토큰 \(tokens)", "\(codexCalls) calls on Codex · \(tokens) tokens")
+    }
+    static var modelNotRecorded: String { t("기록 전", "no record") }
+    static var modelDailyTitle: String { t("날짜별", "By day") }
+    static func modelClaudeChart(_ metric: String) -> String { t("Claude · \(metric) (Claude Code·Hermes)", "Claude · \(metric) (Claude Code · Hermes)") }
+    static var modelCodexChart: String { t("Codex · 비캐시 토큰 (CLI·적대 검증·Hermes)", "Codex · non-cached tokens (CLI · review · Hermes)") }
+    static var modelHatchClaude: String { t("빗금 = Claude 기록 일부", "Hatched = Claude records partial") }
+    static var modelHatchCli: String { t("빗금 = CLI 로그 없음(하한)", "Hatched = no CLI logs (lower bound)") }
+    static var modelModelsTitle: String { t("모델별", "By model") }
+    static func modelModelsHint(compareDays: Int?) -> String {
+        compareDays.map { t("앞선 \($0)일 대비", "vs previous \($0)d") } ?? t("많은 순", "Largest first")
+    }
+    static func modelMoreModels(_ count: Int) -> String { t("외 \(count)개 모델", "+\(count) more models") }
+    static var modelNew: String { t("새로", "new") }
+    static var modelOther: String { t("기타", "Other") }
+    static var modelNoRecords: String { t("이 기간에 응답 기록이 없습니다.", "No response records in this period.") }
+    static var modelPoolsTitle: String { t("계정 풀 주간 사용률", "Pool weekly usage") }
+    static var modelPoolsHint: String { t("98%부터 호박색 · 눈금은 7일 창 경과", "Amber from 98% · tick = 7-day window elapsed") }
+    static func modelPoolSummary(_ name: String, full: Int, total: Int) -> String {
+        t("\(name) · 98% 이상 \(full)/\(total)", "\(name) · \(full)/\(total) at 98%+")
+    }
+    static var modelPoolUnavailable: String { t("프록시 응답 없음(수집 시점)", "Proxy did not answer (at collection)") }
+    static var modelCyclesTitle: String { t("Claude 5시간 주기 소진 이력", "Claude 5-hour cycles") }
+    static func modelCyclesSummary(_ five: String, _ fiveExhausted: String, _ week: String, _ weekExhausted: String) -> String {
+        t("5시간 주기 \(five)개 중 \(fiveExhausted)개, 주간 주기 \(week)개 중 \(weekExhausted)개가 소진으로 끝남",
+          "\(fiveExhausted) of \(five) 5-hour cycles and \(weekExhausted) of \(week) weekly cycles ended exhausted")
+    }
+    static var modelCyclesExhausted: String { t("소진으로 끝난 주기", "Ended exhausted") }
+    static var modelCyclesHeadroom: String { t("여유를 남긴 주기", "Ended with headroom") }
+    static var modelCyclesEmpty: String { t("이 기간 주기 기록 없음(메뉴바 주기 이력)", "No cycle records in this period (menu bar history)") }
+    static func modelFactsTitle(_ week: String) -> String { t("Codex 용량 현황 · \(week) 기준", "Codex capacity · \(week)") }
+    static var modelFactDemand: String { t("수요(Pro 200 환산)", "Demand (Pro 200)") }
+    static func modelFactDemandValue(_ value: String) -> String { t("\(value)개분", "\(value) accounts") }
+    static var modelFactRuns: String { t("적대 검증 · 구현 루프", "Review · impl loop") }
+    static var modelFactAccounts: String { t("켜진 Codex 계정", "Codex accounts on") }
+    static func modelCollectedAt(_ stamp: String) -> String { t("수집 \(stamp) · 이 맥의 로컬 기록 기준", "Collected \(stamp) · local records on this Mac") }
+    static var modelEmptyTitle: String { t("모델 사용량 수집 전", "Model usage not collected yet") }
+    static var modelEmptyDetail: String {
+        t("python3 scripts/model-usage-collector.py를 실행하면 채워집니다(선택).", "Run python3 scripts/model-usage-collector.py to fill this tab (optional).")
+    }
+    static func modelSectionSummary(_ range: String, _ claude: String, _ codex: String?) -> String {
+        codex.map { t("\(range) · Claude \(claude) · Codex \($0)개분(추정)", "\(range) · Claude \(claude) · Codex \($0) accts (est.)") }
+            ?? t("\(range) · Claude \(claude)", "\(range) · Claude \(claude)")
+    }
+
     // MARK: 빈 값 어휘
 
     static var notInstalled: String { t("미설치", "Not installed") }
