@@ -188,7 +188,9 @@ def model_usage():
             "coverage": {"claudeCompleteFrom": day(13), "claudeRetentionDays": 14, "codexCliLastDay": day(4), "receiptFirstDay": day(10)},
             "daily": daily, "receipts": {"audit": {"jsonFiles": 30, "uniqueRuns": 11, "dupRunId": 19}, "daily": receipts},
             "implLoop": {"daily": impl}, "pro200": {"mid": 90000000, "lo": 60000000, "hi": 130000000, "weeks": 4},
-            "quotaCycles": {"since": day(10), "daily": cycles},
+            "undated": [{"lane": "codex", "model": "gpt-6.1-sol", "source": "hermes", "input": 900000, "output": 80000,
+                         "cacheRead": 0, "cacheWrite": 0, "calls": 12}],
+            "quotaCycles": {"since": day(10), "completeFrom": day(8), "daily": cycles},
             "pools": {"claude": {"available": True, "threshold": 0.98, "accounts": pool("C", [1.0, 0.99, 0.42, 0.75, None, 0.2])},
                       "codex": {"available": True, "threshold": 0.98, "accounts": pool("X", [1.0, 0.31, None])}}}
 

@@ -947,6 +947,13 @@ enum L10n {
         t("Codex 쪽 \(codexCalls)호출 · 토큰 \(tokens)", "\(codexCalls) calls on Codex · \(tokens) tokens")
     }
     static var modelNotRecorded: String { t("기록 전", "no record") }
+    static func modelUndated(_ calls: String) -> String {
+        t("날짜 불명 \(calls)호출(처음 볼 때 이미 여러 날에 걸친 Hermes 세션)은 날짜별·기간 합계에서 뺐습니다.",
+          "\(calls) undated calls (Hermes sessions already spanning several days when first seen) are left out of daily and period totals.")
+    }
+    static func modelCyclesPartial(_ day: String) -> String {
+        t("\(day) 이전은 주기 기록이 일부만 남음(빗금)", "records before \(day) are partial (hatched)")
+    }
     static var modelDailyTitle: String { t("날짜별", "By day") }
     static func modelClaudeChart(_ metric: String) -> String { t("Claude · \(metric) (Claude Code·Hermes)", "Claude · \(metric) (Claude Code · Hermes)") }
     static var modelCodexChart: String { t("Codex · 비캐시 토큰 (CLI·적대 검증·Hermes)", "Codex · non-cached tokens (CLI · review · Hermes)") }

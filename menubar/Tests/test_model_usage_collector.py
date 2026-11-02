@@ -202,6 +202,102 @@ class CollectorTests(unittest.TestCase):
         hermes = rows(report, "hermes")
         self.assertEqual([("codex", "gpt-6.1-sol", 4, 1000, 200)], [(r["lane"], r["model"], r["calls"], r["input"], r["output"]) for r in hermes])
         self.assertEqual([{"date": "2026-11-01", "window": "5h", "cycles": 2, "exhausted": 1}], report["quotaCycles"]["daily"])
+        self.assertEqual(("2026-11-01", None), (report["quotaCycles"]["since"], report["quotaCycles"]["completeFrom"]),
+                         "a history below the 256 cap is complete from its first cycle")
+        self.assertEqual([], report["undated"])
+
+    # ---- 2라운드(적대 검증 지적) 회귀 ----
+
+    def test_lines_written_after_the_run_started_are_not_lost(self):
+        """수집 시작 시각보다 늦은 줄(동시 append)을 버리면서 오프셋·prev만 앞으로 옮기면 영구 누락된다."""
+        self.fx.run()
+        late = "2026-11-02T03:00:05Z"  # NOW(03:00Z) 5초 뒤에 쓰인 응답
+        with self.fx.claude_a.open("a") as f:
+            f.write(claude_line("msg_late", "req_late", late))
+        with self.fx.codex.open("a") as f:
+            f.write(codex_token(late, 400, 100, 80))
+        report = self.fx.run()
+        self.assertEqual(3, sum(r["calls"] for r in rows(report, "claude-code")))
+        codex = {r["date"]: r for r in rows(report, "codex-cli")}
+        self.assertEqual((1, 140, 10, 30), (codex["2026-11-02"]["calls"], codex["2026-11-02"]["input"],
+                                             codex["2026-11-02"]["cacheRead"], codex["2026-11-02"]["output"]))
+        with self.fx.codex.open("a") as f:
+            f.write(codex_token("2026-11-02T03:00:06Z", 500, 100, 100))
+        again = {r["date"]: r for r in rows(self.fx.run(), "codex-cli")}
+        self.assertEqual((2, 240, 50), (again["2026-11-02"]["calls"], again["2026-11-02"]["input"], again["2026-11-02"]["output"]),
+                         "prev must match what was counted, so the next delta is exact")
+
+    def hermes_db(self):
+        return sqlite3.connect(self.fx.home / ".hermes" / "state.db")
+
+    def test_hermes_counts_increments_on_the_day_they_were_seen(self):
+        self.fx.run()
+        utc = dt.timezone.utc
+        db = self.hermes_db()
+        # 같은 세션이 다음 날(11/2 KST) 다섯 번 더 호출
+        db.execute("update session_model_usage set api_call_count = 9, input_tokens = 1500, output_tokens = 300, last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 2, 1, tzinfo=utc).timestamp(),))
+        # 처음 보는데 이미 여러 날에 걸친 세션 → 날짜 불명
+        db.execute("insert into sessions values ('h2', ?)", (dt.datetime(2026, 10, 29, 3, tzinfo=utc).timestamp(),))
+        db.execute("insert into session_model_usage values ('h2','gpt-6.1-sol','http://127.0.0.1:3457/v1',7,700,70,0,0,0,?)",
+                   (dt.datetime(2026, 11, 1, 3, tzinfo=utc).timestamp(),))
+        # 처음 보지만 하루 안에 끝난 세션 → 그날로
+        db.execute("insert into sessions values ('h3', ?)", (dt.datetime(2026, 11, 2, 0, tzinfo=utc).timestamp(),))
+        db.execute("insert into session_model_usage values ('h3','claude-opus-5','http://127.0.0.1:3456/v1',2,20,2,0,0,0,?)",
+                   (dt.datetime(2026, 11, 2, 1, tzinfo=utc).timestamp(),))
+        db.commit()
+        db.close()
+        report = self.fx.run()
+        got = sorted((r["date"], r["lane"], r["calls"], r["input"], r["output"]) for r in rows(report, "hermes"))
+        self.assertEqual([("2026-11-01", "codex", 4, 1000, 200), ("2026-11-02", "claude", 2, 20, 2), ("2026-11-02", "codex", 5, 500, 100)], got)
+        self.assertEqual([("codex", "gpt-6.1-sol", "hermes", 7, 700, 70)],
+                         [(r["lane"], r["model"], r["source"], r["calls"], r["input"], r["output"]) for r in report["undated"]])
+        self.assertEqual(report["daily"], self.fx.run()["daily"], "a rerun without changes adds nothing")
+
+    def write_cycles(self, start, count):
+        cycles = [{"lane": "claude", "window": "5h", "endedAt": (start + dt.timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "exhaustedAccounts": i % 2, "meanUtilization": 0.5, "maxUtilization": 0.5} for i in range(count)]
+        path = self.fx.home / ".codex" / "cache" / "cc-menubar-quota-history-v1.json"
+        path.write_text(json.dumps({"version": 1, "cycles": cycles}))
+
+    def test_cycle_history_trimmed_at_256_is_kept_and_marked_partial(self):
+        start = dt.datetime(2026, 10, 22, 0, tzinfo=dt.timezone.utc)
+        self.write_cycles(start, 256)  # 생산자 상한(레인·창마다 256)까지 찬 파일 → 첫날 앞은 이미 잘렸을 수 있다
+        first = self.fx.run()["quotaCycles"]
+        self.assertEqual(256, sum(r["cycles"] for r in first["daily"]))
+        self.assertEqual(("2026-10-22", "2026-10-23"), (first["since"], first["completeFrom"]))
+        self.write_cycles(start + dt.timedelta(hours=20), 256)  # 생산자가 오래된 20개를 잘라내고 새 20개를 붙였다
+        second = self.fx.run()["quotaCycles"]
+        self.assertEqual(276, sum(r["cycles"] for r in second["daily"]), "earlier cycles survive the producer trim")
+        self.assertEqual("2026-10-23", second["completeFrom"], "no gap: the file still overlaps what was kept")
+        self.write_cycles(start + dt.timedelta(days=30), 256)  # 수집이 멈춘 사이 통째로 밀렸다 → 그 사이는 공백
+        third = self.fx.run()["quotaCycles"]
+        self.assertEqual("2026-11-22", third["completeFrom"])
+
+    def test_old_state_format_is_rebuilt_from_the_remaining_logs(self):
+        self.fx.state.parent.mkdir(parents=True, exist_ok=True)
+        old = sqlite3.connect(self.fx.state)  # 1라운드 형식: stateVersion 없음, receipts에 base 열 없음
+        old.executescript("""create table meta (key text primary key, value text);
+            insert into meta values ('firstRun', '2026-10-01');
+            create table receipts (run_id text primary key, canonical integer, date text, tokens integer, review_sec real);""")
+        old.commit()
+        old.close()
+        report = self.fx.run()
+        self.assertEqual(2, report["receipts"]["audit"]["uniqueRuns"])
+        self.assertEqual("2026-10-20", report["coverage"]["claudeCompleteFrom"], "first run restarts with the rebuild")
+
+    def test_receipt_tokens_update_when_the_log_completes_later(self):
+        review = self.fx.home / ".claude" / "cache" / "codex-review"
+        (review / "20261101T050000Z-bbbb2222.json").write_text(json.dumps({
+            "run_id": "20261101T050000Z-bbbb2222", "started_at": "2026-11-01T05:00:00Z", "lane": "codex-sol", "verdict": "APPROVE"}))
+        log = review / "20261101T050000Z-bbbb2222.codex-sol.log"
+        log.write_text("running\n")
+        first = {r["date"]: r for r in self.fx.run()["receipts"]["daily"]}
+        self.assertEqual((2, 1234), (first["2026-11-01"]["runs"], first["2026-11-01"]["tokens"]))
+        log.write_text("running\ntokens used\n500\n")
+        os.utime(log, (log.stat().st_atime, log.stat().st_mtime + 5))
+        later = {r["date"]: r for r in self.fx.run()["receipts"]["daily"]}
+        self.assertEqual((2, 1734), (later["2026-11-01"]["runs"], later["2026-11-01"]["tokens"]), "tokens refresh, runs do not double")
 
     def test_coverage_marks_claude_gap_before_first_run(self):
         report = self.fx.run()

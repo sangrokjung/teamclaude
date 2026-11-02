@@ -543,13 +543,16 @@ final class ModelUsageTabView: NSView {
 
     private func drawCycles(_ p: ModelUsagePresentation, _ rect: NSRect) {
         let s = p.cycleSummary
-        let summary = s.fiveCycles + s.weekCycles > 0
+        var summary = s.fiveCycles + s.weekCycles > 0
             ? L10n.modelCyclesSummary(modelUsageCount(s.fiveCycles), modelUsageCount(s.fiveExhausted), modelUsageCount(s.weekCycles), modelUsageCount(s.weekExhausted))
             : L10n.modelCyclesEmpty
+        if let partial = s.partialBefore, s.fiveCycles + s.weekCycles > 0 {
+            summary += " · " + L10n.modelCyclesPartial(modelUsageMonthDay(partial))
+        }
         PanelDraw.text(PanelDraw.clipped(summary, TeamClaudePalette.legendFont, maxWidth: rect.width), rect.minX, rect.minY,
                        TeamClaudePalette.legendFont, TeamClaudePalette.fg2)
         let bars = p.cycles5h.map { ModelUsageDayBar(date: $0.date, parts: [ModelUsageBarPart(key: 0, value: $0.exhausted),
-                                                                             ModelUsageBarPart(key: 1, value: max(0, $0.cycles - $0.exhausted))], hatched: false) }
+                                                                             ModelUsageBarPart(key: 1, value: max(0, $0.cycles - $0.exhausted))], hatched: $0.hatched) }
         let peak = bars.map(\.total).max() ?? 0
         drawStacked(bars, peak: peak, color: { $0 == 0 ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.35) },
                     rect: NSRect(x: rect.minX, y: rect.minY + 20, width: rect.width, height: ModelUsageLayout.chartHeight))

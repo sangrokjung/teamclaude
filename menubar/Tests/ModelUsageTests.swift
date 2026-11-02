@@ -41,7 +41,8 @@ struct ModelUsageTests {
            {"date":"2026-10-29","runs":1,"tokens":1000000,"reviewSec":3600},{"date":"2026-11-01","runs":3,"tokens":3000000,"reviewSec":7200}]},
          "implLoop":{"daily":[{"date":"2026-10-31","runs":2,"rounds":5},{"date":"2026-11-02","runs":1,"rounds":1}]},
          "pro200":{"mid":10000000,"lo":5000000,"hi":20000000,"weeks":3},
-         "quotaCycles":{"since":"2026-10-30","daily":[{"date":"2026-11-01","window":"5h","cycles":4,"exhausted":3},
+         "undated":[{"lane":"codex","model":"gpt-6.1-sol","source":"hermes","input":700,"output":70,"cacheRead":0,"cacheWrite":0,"calls":7}],
+         "quotaCycles":{"since":"2026-10-30","completeFrom":"2026-10-31","daily":[{"date":"2026-11-01","window":"5h","cycles":4,"exhausted":3},
            {"date":"2026-11-01","window":"7d","cycles":2,"exhausted":2}]},
          "pools":{"claude":{"available":true,"threshold":0.995,"accounts":[
            {"label":"C01","util7d":0.99,"reset7d":1794078000000,"usable":false,"enabled":true},
@@ -63,6 +64,7 @@ struct ModelUsageTests {
         precondition(r.coverage.claudeCompleteFrom == "2026-10-21" && r.coverage.codexCliLastDay == "2026-10-30")
         precondition(r.pro200?.mid == 10_000_000 && r.claudePool.accounts.count == 3 && !r.codexPool.available)
         precondition(r.generatedAt != nil)
+        precondition(r.undated.count == 1 && r.undated[0].calls == 7 && r.cyclesSince == "2026-10-30" && r.cyclesCompleteFrom == "2026-10-31")
         precondition(ModelUsageReport.parse(Data("{}".utf8)) == nil, "schema missing")
         precondition(ModelUsageReport.parse(Data(#"{"schema":2,"today":"2026-11-02","daily":[]}"#.utf8)) == nil, "future schema")
         precondition(ModelUsageReport.parse(Data("nope".utf8)) == nil)
@@ -109,7 +111,8 @@ struct ModelUsageTests {
         precondition(byKey[.claudeCode]?.count == 550, "sources count events, not the chosen metric")
         precondition(byKey[.codexReview]?.count == 4 && byKey[.codexReview]?.tokens == 4_000_000)
         precondition(byKey[.codexImpl]?.count == 3 && byKey[.codexImpl]?.tokens == nil && byKey[.codexImpl]?.extra == 6)
-        precondition(byKey[.hermes]?.count == 15 && byKey[.hermes]?.extra == 10, "Hermes codex-side calls")
+        precondition(byKey[.hermes]?.count == 15 && byKey[.hermes]?.extra == 10, "Hermes codex-side calls, undated calls excluded")
+        precondition(p.gapNote?.contains("날짜 불명 7호출") == true, p.gapNote ?? "")
         precondition(byKey[.codexCli]?.note.contains("10/30 뒤 로그 없음") == true, byKey[.codexCli]?.note ?? "")
         precondition(byKey[.codexImpl]?.note.contains("토큰 기록 없음") == true)
         precondition(byKey[.codexReview]?.prevState == .notRecorded, "receipts start 10/23, previous week starts 10/20")
@@ -150,6 +153,19 @@ struct ModelUsageTests {
         precondition(p.claudePool.accounts[0].full && !p.claudePool.accounts[1].full)
         precondition(p.claudePool.accounts[2].muted, "disabled accounts are drawn muted")
         precondition(p.cycles5h.count == 7 && p.cycles5h.first { $0.date == "2026-11-01" }?.exhausted == 3)
+        // 10/31부터 온전: 그 앞(10/27~10/30)은 0이 아니라 모름(빗금), 합계에는 경계 날짜를 밝힌다.
+        precondition(p.cycles5h.filter(\.hatched).map(\.date) == ["2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"])
+        precondition(p.cycleSummary.partialBefore == "2026-10-31")
+        var noHistory = report
+        noHistory.cycles = []
+        noHistory.cyclesSince = nil
+        noHistory.cyclesCompleteFrom = nil
+        precondition(makeModelUsagePresentation(noHistory, ModelUsageSelection()).cycles5h.allSatisfy(\.hatched), "no history → unknown, not zero")
+        var complete = report
+        complete.cyclesCompleteFrom = nil
+        complete.cyclesSince = "2026-10-01"
+        let full = makeModelUsagePresentation(complete, ModelUsageSelection())
+        precondition(full.cycleSummary.partialBefore == nil && !full.cycles5h.contains(where: \.hatched))
         precondition(p.cycleSummary.fiveCycles == 4 && p.cycleSummary.fiveExhausted == 3 && p.cycleSummary.weekCycles == 2)
         precondition(p.facts.weekLabel == "W44" && p.facts.reviewRuns == 4 && p.facts.implRuns == 2)
         precondition(p.facts.lowerBound, "W44 ends after the last CLI day")

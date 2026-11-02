@@ -51,6 +51,11 @@ struct ModelUsageReport {
     var impl: [ModelUsageImplDay] = []
     var pro200: ModelUsagePro200?
     var cycles: [ModelUsageCycleDay] = []
+    /// 주기 이력이 처음 남은 날과 온전한 첫날. 메뉴바는 주기를 창마다 256개만 남겨서 수집기가 보기 전에 잘린 몫이 있을 수 있다.
+    var cyclesSince: String?
+    var cyclesCompleteFrom: String?
+    /// 날짜를 알 수 없는 사용량(처음 볼 때 이미 여러 날에 걸친 Hermes 세션). 일별·기간 합계에 넣지 않고 따로 밝힌다.
+    var undated: [ModelUsageRow] = []
     var claudePool = ModelUsagePool()
     var codexPool = ModelUsagePool()
 
@@ -72,11 +77,10 @@ struct ModelUsageReport {
                                         claudeRetentionDays: (cov["claudeRetentionDays"] as? NSNumber)?.intValue,
                                         codexCliLastDay: cov["codexCliLastDay"] as? String, receiptFirstDay: cov["receiptFirstDay"] as? String)
         r.daily = objects(root["daily"]).compactMap { o in
-            guard let date = o["date"] as? String, let lane = o["lane"] as? String, let model = o["model"] as? String,
-                  let source = o["source"] as? String else { return nil }
-            return ModelUsageRow(date: date, lane: lane, model: model, source: source, input: num(o["input"]), output: num(o["output"]),
-                                 cacheRead: num(o["cacheRead"]), cacheWrite: num(o["cacheWrite"]), calls: num(o["calls"]))
+            guard let date = o["date"] as? String else { return nil }
+            return row(o, date: date)
         }
+        r.undated = objects(root["undated"]).compactMap { row($0, date: "") }
         r.receipts = objects((root["receipts"] as? [String: Any])?["daily"]).compactMap { o in
             (o["date"] as? String).map { ModelUsageReceiptDay(date: $0, runs: num(o["runs"]), tokens: num(o["tokens"]), reviewSec: num(o["reviewSec"])) }
         }
@@ -86,7 +90,10 @@ struct ModelUsageReport {
         if let p = root["pro200"] as? [String: Any], num(p["mid"]) > 0, num(p["lo"]) > 0, num(p["hi"]) > 0 {
             r.pro200 = ModelUsagePro200(mid: num(p["mid"]), lo: num(p["lo"]), hi: num(p["hi"]))
         }
-        r.cycles = objects((root["quotaCycles"] as? [String: Any])?["daily"]).compactMap { o in
+        let quotaCycles = root["quotaCycles"] as? [String: Any] ?? [:]
+        r.cyclesSince = quotaCycles["since"] as? String
+        r.cyclesCompleteFrom = quotaCycles["completeFrom"] as? String
+        r.cycles = objects(quotaCycles["daily"]).compactMap { o in
             guard let date = o["date"] as? String, let window = o["window"] as? String else { return nil }
             return ModelUsageCycleDay(date: date, window: window, cycles: num(o["cycles"]), exhausted: num(o["exhausted"]))
         }
@@ -97,6 +104,12 @@ struct ModelUsageReport {
     }
 
     private static func objects(_ value: Any?) -> [[String: Any]] { value as? [[String: Any]] ?? [] }
+
+    private static func row(_ o: [String: Any], date: String) -> ModelUsageRow? {
+        guard let lane = o["lane"] as? String, let model = o["model"] as? String, let source = o["source"] as? String else { return nil }
+        return ModelUsageRow(date: date, lane: lane, model: model, source: source, input: num(o["input"]), output: num(o["output"]),
+                             cacheRead: num(o["cacheRead"]), cacheWrite: num(o["cacheWrite"]), calls: num(o["calls"]))
+    }
     private static func num(_ value: Any?) -> Double { (value as? NSNumber)?.doubleValue ?? 0 }
 
     private static func pool(_ value: Any?) -> ModelUsagePool {
@@ -228,8 +241,13 @@ struct ModelUsageDayBar { let date: String; let parts: [ModelUsageBarPart]; let 
 struct ModelUsageModelLine { let model: String; let lane: String; let value: Double; let share: Double; let delta: String?; let isNew: Bool }
 struct ModelUsagePoolLine { let label: String; let percent: Double?; let elapsed: Double?; let muted: Bool; var full: Bool { (percent ?? 0) >= panelRoutingThresholdPercent } }
 struct ModelUsagePoolPresentation { let available: Bool; let accounts: [ModelUsagePoolLine]; var fullCount: Int { accounts.filter(\.full).count } }
-struct ModelUsageCycleBar { let date: String; let cycles: Double; let exhausted: Double }
-struct ModelUsageCycleSummary { var fiveCycles: Double = 0; var fiveExhausted: Double = 0; var weekCycles: Double = 0; var weekExhausted: Double = 0 }
+/// hatched: 그날 주기 기록이 잘렸거나 아직 없다(0이 아니라 모름).
+struct ModelUsageCycleBar { let date: String; let cycles: Double; let exhausted: Double; let hatched: Bool }
+struct ModelUsageCycleSummary {
+    var fiveCycles: Double = 0; var fiveExhausted: Double = 0; var weekCycles: Double = 0; var weekExhausted: Double = 0
+    /// 기간 앞쪽이 기록 공백에 걸리면 그 경계 날짜(이 날부터 온전). 합계는 그 뒤만 온전하다.
+    var partialBefore: String?
+}
 struct ModelUsageFacts { let weekLabel: String; let pro: ModelUsagePro200?; let lowerBound: Bool; let reviewRuns: Double; let implRuns: Double; let codexOn: Int; let codexTotal: Int }
 
 struct ModelUsagePresentation {
@@ -419,6 +437,9 @@ private func gapNote(_ r: ModelUsageReport, _ period: ModelUsagePeriod) -> Strin
     if lowerBound(r, to: period.to), let last = r.coverage.codexCliLastDay {
         parts.append(L10n.modelGapCli(modelUsageMonthDay(last)))
     }
+    // 날짜를 모르는 몫은 어느 기간에도 넣지 않았다는 사실을 기간과 무관하게 밝힌다.
+    let undated = r.undated.reduce(0) { $0 + $1.calls }
+    if undated > 0 { parts.append(L10n.modelUndated(modelUsageCount(undated))) }
     return parts.isEmpty ? nil : parts.joined(separator: " ")
 }
 
@@ -444,11 +465,15 @@ func makeModelUsagePresentation(_ r: ModelUsageReport, _ selection: ModelUsageSe
     let bars = dayBars(r, period, metric: selection.metric)
     let cycleDays = modelUsageDays(period.from, period.to)
     let five = r.cycles.filter { $0.window == "5h" }
+    // 기록이 온전한 첫날: 잘린 경계(completeFrom)가 있으면 그날, 없으면 이력이 처음 남은 날. 이력이 없으면 전부 모름.
+    let cyclesComplete = r.cyclesCompleteFrom ?? r.cyclesSince
     let cycles5h = cycleDays.map { day in
         ModelUsageCycleBar(date: day, cycles: five.filter { $0.date == day }.reduce(0) { $0 + $1.cycles },
-                           exhausted: five.filter { $0.date == day }.reduce(0) { $0 + $1.exhausted })
+                           exhausted: five.filter { $0.date == day }.reduce(0) { $0 + $1.exhausted },
+                           hatched: cyclesComplete.map { day < $0 } ?? true)
     }
     var summary = ModelUsageCycleSummary()
+    if let complete = cyclesComplete, period.from < complete { summary.partialBefore = complete }
     for c in r.cycles where inRange(c.date, period.from, period.to) {
         if c.window == "5h" { summary.fiveCycles += c.cycles; summary.fiveExhausted += c.exhausted }
         if c.window == "7d" { summary.weekCycles += c.cycles; summary.weekExhausted += c.exhausted }
