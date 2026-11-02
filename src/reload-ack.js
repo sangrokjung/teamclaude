@@ -129,8 +129,8 @@ async function listRequestNonces(dir, limit, exclude = new Set()) {
  * its CLI withdrew (or one that cannot be removed) is skipped. `attempted`
  * lists every nonce tried, claimed or not.
  */
-async function claimReloadRequests(dir, limit) {
-  const attempted = await listRequestNonces(dir, limit);
+async function claimReloadRequests(dir, limit, skip = new Set()) {
+  const attempted = await listRequestNonces(dir, limit, skip);
   const claimed = [];
   for (const nonce of attempted) {
     try {
@@ -174,6 +174,7 @@ export async function runConfirmedReload({
   staleResultMs = STALE_RESULT_MS,
   sweepMaxEntries = SWEEP_MAX_ENTRIES,
   sweepBudgetMs = SWEEP_BUDGET_MS,
+  skip = new Set(),
 }) {
   let ackError = null;
   const noteAckError = err => {
@@ -192,7 +193,7 @@ export async function runConfirmedReload({
   let claimed = [];
   let attempted = [];
   try {
-    ({ claimed, attempted } = await claimReloadRequests(dir, maxClaims));
+    ({ claimed, attempted } = await claimReloadRequests(dir, maxClaims, skip));
   } catch (err) {
     noteAckError(err);
   }
@@ -209,11 +210,13 @@ export async function runConfirmedReload({
   }
   let pending = false;
   try {
-    pending = (await listRequestNonces(dir, 1, new Set(attempted))).length > 0;
+    pending = (await listRequestNonces(dir, 1, new Set([...skip, ...attempted]))).length > 0;
   } catch (err) {
     noteAckError(err);
   }
-  return { ...outcome, claimed, ackError, pending, swept };
+  const claimedSet = new Set(claimed);
+  const unclaimable = attempted.filter(nonce => !claimedSet.has(nonce));
+  return { ...outcome, claimed, unclaimable, ackError, pending, swept };
 }
 
 /**
@@ -225,12 +228,20 @@ export async function runConfirmedReload({
  */
 export function createReloadQueue({ dir, reload, onResult = () => {}, ...stepOptions }) {
   let chain = Promise.resolve();
+  // Requests a step tried but could not claim are skipped by the follow-up
+  // steps of the same burst, so every follow-up either claims something or
+  // grows this set: a pile of unremovable entries larger than one step's limit
+  // cannot keep the queue stepping. Cleared once nothing is pending, so a later
+  // SIGHUP tries them again.
+  const unclaimable = new Set();
   const trigger = () => {
     chain = chain
-      .then(() => runConfirmedReload({ dir, reload, ...stepOptions }))
+      .then(() => runConfirmedReload({ dir, reload, ...stepOptions, skip: unclaimable }))
       .then(result => {
         onResult(result);
+        for (const nonce of result.unclaimable || []) unclaimable.add(nonce);
         if (result.pending) trigger();
+        else unclaimable.clear();
       })
       .catch(err => onResult({ ok: false, error: err?.message || String(err), claimed: [], pending: false }));
     return chain;

@@ -393,6 +393,26 @@ test('no spin: a request file that cannot be claimed does not keep the queue ste
   }
 });
 
+test('no spin: unclaimable requests beyond one step limit do not loop, and a fresh request is still answered', async () => {
+  const dir = join(await tempDir(), 'config.reload');
+  let reloads = 0;
+  try {
+    for (let i = 0; i < 3; i++) {
+      await mkdir(join(reqFile(dir, newReloadNonce()), 'x'), { recursive: true });
+    }
+    const fresh = newReloadNonce();
+    await postRequest(dir, fresh);
+    const queue = createReloadQueue({ dir, reload: async () => { reloads += 1; }, maxClaims: 2 });
+    queue.trigger();
+    const done = await Promise.race([queue.whenIdle().then(() => true), new Promise(r => setTimeout(() => r(false), 2000))]);
+    assert.ok(done, `queue kept stepping (reloads=${reloads})`);
+    assert.ok(reloads <= 3, `bounded steps, got ${reloads}`);
+    await assert.doesNotReject(readFile(resFile(dir, fresh), 'utf8'), 'fresh request answered');
+  } finally {
+    await rm(join(dir, '..'), { recursive: true, force: true });
+  }
+});
+
 test('ack failure: a reload that succeeded but could not record a result reports the ack error', async () => {
   const dir = join(await tempDir(), 'config.reload');
   const nonce = newReloadNonce();

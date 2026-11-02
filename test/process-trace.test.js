@@ -371,4 +371,11 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
     assert.ok(!/QQQQQQQQQQ|ZZZZZZZZZZ/.test(masked), masked);
   }
   assert.equal(maskSecrets(key), 'tc-***');
+  // 인증 방식 뒤의 값, 따옴표로 감싼 옵션 값도 가린다.
+  const basic = maskSecrets('curl -H "Authorization: Basic dXNlcjpwYXNz" https://ops.example/teamclaude/status');
+  assert.ok(!basic.includes('dXNlcjpwYXNz') && basic.includes('Authorization: Basic ***'), basic);
+  const quoted = maskSecrets(`sh -c 'teamclaude --password "hunterhunter" status'`);
+  assert.ok(!quoted.includes('hunterhunter'), quoted);
+  const quoted2 = maskSecrets('teamclaude --token=\'plainvalue\' status');
+  assert.ok(!quoted2.includes('plainvalue'), quoted2);
 });
