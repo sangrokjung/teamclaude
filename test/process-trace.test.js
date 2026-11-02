@@ -383,4 +383,6 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   assert.ok(!letters.includes('ABCDEFGHIJKLMNOPQRST'), letters);
   const unknownScheme = maskSecrets('curl -H "Authorization: QWERTYUIOPASDFGH next" x');
   assert.ok(!unknownScheme.includes('QWERTYUIOPASDFGH'), unknownScheme);
+  const custom = maskSecrets('curl -H "Authorization: CustomScheme secretvaluexyz" x');
+  assert.ok(!custom.includes('secretvaluexyz'), custom);
 });

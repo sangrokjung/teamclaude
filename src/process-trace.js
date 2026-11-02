@@ -130,9 +130,10 @@ export function maskSecrets(text) {
     // readable prefix, e.g. `sk-ant-***`).
     // x-api-key: the first token is the credential, whatever its alphabet.
     .replace(/\b(x-api-key)(\s*:\s*)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
-    // authorization: a known scheme word is kept and the credential after it
-    // masked; anything else is treated as the credential itself.
-    .replace(/\b(authorization)(\s*:\s*)(?!Bearer\b)((?:Basic|Token|Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+)?(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2$3***')
+    // authorization: everything up to the closing quote or line end is masked
+    // (a scheme may be followed by several credential parts). A known scheme
+    // word stays readable; Bearer was already handled above.
+    .replace(/\b(authorization)(\s*:)(?!\s*Bearer\b)(\s*)((?:Basic|Token|Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+)?[^'"\n]+/gi, '$1$2$3$4***')
     // Option values may be quoted (`--password "x"`, `--token='x'`).
     .replace(/(--(?:api-key|key|token|secret|password)(?:\s+|=))(['"]?)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
     .replace(/[A-Za-z0-9_+/=-]{32,}/g, maskRun);
