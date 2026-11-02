@@ -223,9 +223,10 @@ struct ModelUsagePeriod {
     let prev: (from: String, to: String, complete: Bool)?
 }
 
+/// '전체'의 첫날: 보존된 모든 기록(일별·영수증·구현 루프·주기 이력) 중 가장 이른 날. 기록이 하나도 없으면 수집기의 since.
 private func modelUsageFirstDay(_ r: ModelUsageReport) -> String {
-    let dates = r.daily.map(\.date) + r.receipts.map(\.date) + r.impl.map(\.date)
-    return max(dates.min() ?? r.today, r.since)
+    let dates = r.daily.map(\.date) + r.receipts.map(\.date) + r.impl.map(\.date) + r.cycles.map(\.date)
+    return min(max(dates.min() ?? r.since, r.since), r.today)
 }
 
 private func claudeComplete(_ r: ModelUsageReport, from: String) -> Bool {

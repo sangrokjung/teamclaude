@@ -14,6 +14,7 @@ struct ModelUsageTests {
         testPoolsCyclesAndFacts()
         testCountFormat()
         testAllRangeCoversEveryKeptDay()
+        testAllRangeIncludesCycleOnlyDays()
         print("ModelUsageTests: parse, periods, pro, sources, gaps, models, pools, format passed")
     }
 
@@ -192,6 +193,21 @@ struct ModelUsageTests {
         precondition(modelUsageBucketed(all.claudeDays.suffix(7).map { $0 }, maxBars: 244).count == 7, "short ranges are untouched")
         precondition(modelUsageSpan("2025-01-01", "2026-11-02") == "25/1/1–11/2" && modelUsageSpan("2026-10-27", "2026-11-02") == "10/27–11/2")
         precondition(L10n.modelRangeAllSince(modelUsageDayLabel(all.period.from, yearOf: all.period.to)) == "전체(25/1/1부터)")
+    }
+
+    /// 주기 이력만 남은 날(로컬 세션 로그 없음)도 '전체'의 시작에 든다.
+    static func testAllRangeIncludesCycleOnlyDays() {
+        let only = #"{"schema":1,"today":"2026-11-03","since":"2026-11-02","daily":[],"receipts":{"daily":[]},"implLoop":{"daily":[]},"quotaCycles":{"since":"2026-11-02","completeFrom":null,"daily":[{"date":"2026-11-02","window":"5h","cycles":4,"exhausted":3}]}}"#
+        let r = ModelUsageReport.parse(Data(only.utf8))!
+        let p = makeModelUsagePresentation(r, ModelUsageSelection(range: .all, metric: .calls))
+        precondition(p.period.from == "2026-11-02", p.period.from)
+        precondition(p.cycleSummary.fiveCycles == 4 && p.cycles5h.first?.exhausted == 3)
+        var older = report
+        older.cycles.append(ModelUsageCycleDay(date: "2026-10-10", window: "5h", cycles: 2, exhausted: 1))
+        older.cyclesSince = "2026-10-10"
+        older.since = "2026-10-10"
+        let all = makeModelUsagePresentation(older, ModelUsageSelection(range: .all, metric: .calls))
+        precondition(all.period.from == "2026-10-10" && all.cycleSummary.fiveCycles == 6, "\(all.period.from) \(all.cycleSummary.fiveCycles)")
     }
 
     static func testCountFormat() {

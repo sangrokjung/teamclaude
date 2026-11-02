@@ -39,7 +39,9 @@ DEFAULT_OUT = STATE_DIR / 'model-usage.json'
 DEFAULT_STATE = STATE_DIR / 'model-usage.sqlite'
 LABEL = 'com.qjc.cc-model-usage'
 SCHEMA = 1
-SEEN_KEEP_DAYS = 120      # 중복 제거 키를 기억하는 기간
+# 새로 세는 범위(일). 이 범위 안 기록만 세고 그 중복 키만 기억한다. 범위 밖으로 밀려난 키는 지우되, 범위 밖 기록은
+# 다시 만나도(폴더 이동·재작성) 세지 않으므로 이미 센 날짜를 두 번 더하지 않는다. 한번 센 날짜별 합계는 범위 밖이 돼도 남는다.
+SEEN_KEEP_DAYS = 120
 DEFAULT_RETENTION = 30    # Claude Code cleanupPeriodDays 기본값
 TOKENS_RE = re.compile(r'tokens used\s*\n\s*([\d,]+)')
 STATE_VERSION = '4'
@@ -220,7 +222,7 @@ def retention_days(root: Path) -> int:
     return int(value) if isinstance(value, (int, float)) and value > 0 else DEFAULT_RETENTION
 
 
-def collect_claude(db, home, tz, scan):
+def collect_claude(db, home, tz, scan, counted_from):
     def handle(line, _ctx):
         if '"assistant"' not in line or '"usage"' not in line:
             return
@@ -243,7 +245,7 @@ def collect_claude(db, home, tz, scan):
         if not model or model == '<synthetic>' or ts is None:
             return
         day = local_day(ts, tz)
-        if not first_seen(db, f"c:{msg.get('id')}:{o.get('requestId') or ''}", day):
+        if day < counted_from or not first_seen(db, f"c:{msg.get('id')}:{o.get('requestId') or ''}", day):
             return
         u = msg['usage']
         add_daily(db, day, 'claude', model, 'claude-code', u.get('input_tokens') or 0, u.get('output_tokens') or 0,
@@ -269,7 +271,7 @@ def weekly_window(rate_limits):
     return int(weekly['resets_at']), float(weekly['used_percent'])
 
 
-def codex_handle(db, tz, path, scan):
+def codex_handle(db, tz, path, scan, counted_from):
     def handle(line, ctx):
         if '"turn_context"' not in line and '"token_count"' not in line and '"session_meta"' not in line:
             return
@@ -313,7 +315,7 @@ def codex_handle(db, tz, path, scan):
             return
         key = f"x:{ctx.get('session', path.name)}:{o.get('timestamp')}:{total.get('input_tokens')}:{total.get('output_tokens')}"
         day = local_day(ts, tz)
-        if not first_seen(db, key, day):
+        if day < counted_from or not first_seen(db, key, day):
             return
         cached = max(0, delta.get('cached_input_tokens') or 0)
         inp = max(0, (delta.get('input_tokens') or 0) - cached)
@@ -327,10 +329,10 @@ def codex_handle(db, tz, path, scan):
     return handle
 
 
-def collect_codex(db, home, tz, scan):
+def collect_codex(db, home, tz, scan, counted_from):
     for root in (home / '.codex' / 'sessions', home / '.codex' / 'archived_sessions'):
         for path in jsonl_files(root):
-            read_new_lines(db, path, scan, codex_handle(db, tz, path, scan), {'model': 'unknown'})
+            read_new_lines(db, path, scan, codex_handle(db, tz, path, scan, counted_from), {'model': 'unknown'})
 
 
 # ---------- 적대 검증 영수증 ----------
@@ -668,15 +670,15 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
     try:
         first_run = meta_get(db, 'firstRun') or today
         meta_set(db, 'firstRun', first_run)
-        retention = collect_claude(db, home, tz, scan)
-        collect_codex(db, home, tz, scan)
+        counted_from = (dt.date.fromisoformat(today) - dt.timedelta(days=SEEN_KEEP_DAYS)).isoformat()
+        retention = collect_claude(db, home, tz, scan, counted_from)
+        collect_codex(db, home, tz, scan, counted_from)
         collect_receipts(db, home, tz, scan)
         collect_hermes(db, home, tz, now.timestamp())
         collect_cycles(db, home, tz)
         collect_impl(db, home)
-        keep_from = dt.date.fromisoformat(today) - dt.timedelta(days=SEEN_KEEP_DAYS)
-        db.execute('delete from seen where day < ?', (keep_from.isoformat(),))
-        keep_ms = int(dt.datetime.combine(keep_from, dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
+        db.execute('delete from seen where day < ?', (counted_from,))  # 이 날짜보다 앞 기록은 위에서 세지 않는다
+        keep_ms = int(dt.datetime.combine(dt.date.fromisoformat(counted_from), dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
         db.execute('delete from codex_obs where ts < ?', (keep_ms,))  # 기준값 표본도 같은 기간만 둔다
         db.commit()
         # 기본은 보존한 범위 전체를 싣는다(화면의 '전체'가 실제 보존 시작일부터). --since를 주면 그날부터만.
@@ -698,7 +700,9 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         'today': today,
         'since': since,
         'coverage': {'claudeCompleteFrom': complete_from, 'claudeRetentionDays': retention,
-                     'codexCliLastDay': cli_last, 'receiptFirstDay': receipt_first},
+                     'codexCliLastDay': cli_last, 'receiptFirstDay': receipt_first,
+                     # Claude·Codex 세션 로그는 이 날짜부터의 기록만 새로 센다(그 앞은 이미 센 합계만 남는다).
+                     'countedFrom': counted_from},
         'daily': stored,
         # 날짜를 알 수 없는 Hermes 몫(처음 볼 때 이미 여러 날에 걸친 세션). 일별 막대에 넣지 않는다.
         'undated': undated,

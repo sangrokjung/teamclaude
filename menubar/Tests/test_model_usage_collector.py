@@ -298,6 +298,44 @@ class CollectorTests(unittest.TestCase):
                                      now=dt.datetime(2027, 1, 11, 12, 0, tzinfo=TZ), since="2026-12-01", fetch_status=self.fx.status)
         self.assertEqual(("2026-12-01", []), (explicit["since"], rows(explicit, "claude-code")), "--since still narrows on request")
 
+    def test_expired_dedupe_keys_never_recount_moved_or_rewritten_logs(self):
+        """중복 키는 120일 보존 범위 밖에서 지운다. 그 뒤 같은 로그가 다른 폴더로 옮겨지거나 다시 써져도 다시 세지 않는다
+        (보존 범위 밖 기록은 새로 세지 않는다는 불변식)."""
+        first = self.fx.run()
+        kept = sorted((r["date"], r["source"], r["model"], r["calls"], r["input"], r["output"]) for r in first["daily"])
+        later = dt.datetime(2027, 3, 15, 12, 0, tzinfo=TZ)  # 11/1 기록이 보존 범위(120일) 밖이 된 날
+        self.fx.run(now=later)
+        archived = self.fx.home / ".codex" / "archived_sessions" / "2026" / "11" / "01"
+        archived.mkdir(parents=True)
+        self.fx.codex.rename(archived / self.fx.codex.name)  # sessions → archived_sessions 이동(새 경로라 처음부터 읽는다)
+        with self.fx.claude_b.open("r+") as f:  # 같은 inode 재작성(지문이 달라져 처음부터 읽는다)
+            f.seek(0)
+            f.truncate()
+            f.write(claude_line("msg_2", "req_2", "2026-11-01T02:00:00Z", model="claude-sonnet-5")
+                    + claude_line("msg_1", "req_1", "2026-11-01T01:00:00Z"))
+        moved = self.fx.run(now=later)
+        self.assertGreater(moved["scan"]["bytesRead"], 0, "the moved and rewritten files were really read again")
+        self.assertEqual(kept, sorted((r["date"], r["source"], r["model"], r["calls"], r["input"], r["output"]) for r in moved["daily"]))
+
+    def test_records_older_than_the_window_are_not_newly_counted(self):
+        """첫 실행에서 보존 범위(120일)보다 오래된 기록은 세지 않는다(그 키를 기억하지 않으므로 세면 나중에 두 번 센다)."""
+        with self.fx.claude_a.open("a") as f:
+            f.write(claude_line("msg_old", "req_old", "2026-06-01T01:00:00Z"))
+        report = self.fx.run()
+        self.assertNotIn("2026-06-01", [r["date"] for r in report["daily"]])
+        self.assertEqual("2026-07-05", report["coverage"]["countedFrom"], "the window start (11/2 − 120 days) is reported")
+
+    def test_all_range_starts_at_kept_cycles_without_session_logs(self):
+        for path in (self.fx.claude_a, self.fx.claude_b, self.fx.codex):
+            path.unlink()
+        (self.fx.home / ".hermes" / "state.db").unlink()
+        for folder in (self.fx.home / ".claude" / "cache" / "codex-review", self.fx.home / ".claude" / "cache" / "codex-impl-loop"):
+            for item in sorted(folder.rglob("*"), reverse=True):
+                item.rmdir() if item.is_dir() else item.unlink()
+        report = self.fx.run()
+        self.assertEqual(([], "2026-11-01"), (report["daily"], report["since"]), "only cycle history is kept")
+        self.assertEqual([{"date": "2026-11-01", "window": "5h", "cycles": 2, "exhausted": 1}], report["quotaCycles"]["daily"])
+
     def test_malformed_records_are_skipped_and_counted(self):
         with self.fx.claude_a.open("a") as f:
             f.write(json.dumps(["assistant", "usage"]) + "\n")
