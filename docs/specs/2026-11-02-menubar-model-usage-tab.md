@@ -30,7 +30,7 @@
   - `undated[]`: `lane, model, source, input, output, cacheRead, cacheWrite, calls`(날짜 불명 몫)
   - `receipts`: `audit{jsonFiles, dupRunId, uniqueRuns}`, `daily[]{date, runs, tokens, reviewSec}`
   - `implLoop.daily[]{date, runs, rounds}`
-  - `pro200`: `{mid, lo, hi, weeks, samples, excluded}` 또는 null(산출 불가). "Pro 1주(사용률 100%) ≈ 비캐시 토큰" 추정. Codex CLI 응답마다 (resets_at 초, 사용률, 그 응답의 비캐시 토큰)을 남기고, 같은 resets_at 초를 한 계정의 한 창으로 본다. 창마다 첫 관측 뒤 토큰 ÷ (마지막 − 첫 사용률)만 표본이다. 사용률이 되돌아가는 창(계정이 섞임)과 변화가 5%p 미만인 창은 뺀다. 표본을 ISO 주로 묶어 주마다 합친 값을 내고 그 중앙·최소·최대를 쓴다. 표본 창이 3개 미만이면 null. 한계: 같은 계정을 이 맥 밖에서 쓴 몫은 사용률에만 들어가 기준값을 낮춘다.
+  - `pro200`: `{mid, lo, hi, weeks, samples, excluded}` 또는 null(산출 불가). "Pro 1주(사용률 100%) ≈ 비캐시 토큰" 추정. Codex CLI 응답마다 (resets_at 초, 사용률, 그 응답의 비캐시 토큰)을 남긴다. 같은 계정의 resets_at은 응답마다 몇 초씩 흔들려(실측) 5초 안으로 이어지는 값들을 한 계정의 한 창으로 본다. 창마다 첫 관측 뒤 토큰 ÷ (최고 − 첫 사용률)만 표본이다. 사용률이 5%p 넘게 되돌아가는 창(리셋 시각이 가까운 다른 계정이 섞임)과 변화가 5%p 미만인 창은 뺀다(동시 요청 순서로 생기는 1~3%p 되돌림은 허용). 표본을 ISO 주로 묶어 주마다 합친 값을 내되 표본 토큰이 5천만 미만인 주는 뺀다(이 맥 CLI가 거의 안 쓴 주의 사용률은 다른 소비자 몫). 남은 주 값의 중앙·최소·최대를 쓴다. 표본 창이 3개 미만이면 null. 한계: 같은 계정을 이 맥 밖에서 쓴 몫은 사용률에만 들어가 기준값을 낮춘다.
   - `quotaCycles`: `since`(처음 남은 날), `completeFrom`(온전한 첫날, 잘림이 없었으면 null), `daily[]{date, window(5h|7d), cycles, exhausted}`(Claude 레인)
   - `pools.claude|codex`: `available, threshold, accounts[]{label(C01·X01 순번), util7d, reset7d(ms), usable, enabled}`
 - 결과에 넣지 않는 것: 이메일, 계정 이름·UUID, 토큰, 프롬프트·응답 내용, 작업 경로.

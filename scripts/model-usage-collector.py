@@ -52,6 +52,15 @@ STATE_TABLES = ('meta', 'files', 'seen', 'daily', 'windows', 'codex_obs', 'recei
 FINGERPRINT_BYTES = 4096  # 오프셋 바로 앞 몇 바이트로 같은 inode 재작성을 알아챈다
 PRO_MIN_PCT_DELTA = 5.0   # 표본 창의 최소 사용률 변화(%p). 사용률이 정수 단위라 작은 변화는 잡음이다
 PRO_MIN_SAMPLES = 3       # 이보다 적으면 기준값을 내지 않는다(산출 불가)
+# 같은 계정의 resets_at은 응답마다 몇 초씩 흔들린다(실측: 한 계정이 …794~…800, 다른 계정이 …813~…823).
+# 이 간격 안의 이웃 값은 한 창으로 잇는다. 더 가까운 두 계정은 섞이지만 아래 되돌림 검사가 그 창을 뺀다.
+PRO_RESET_JITTER_SEC = 5
+# 동시 요청은 응답 순서와 기록 순서가 어긋나 사용률이 1~3%p 되돌아 보일 수 있다(실측 최대 3). 그보다 크게 되돌아가면
+# 다른 계정이 섞인 것으로 본다.
+PRO_MIX_DROP_PCT = 5.0
+# 한 주의 표본 토큰이 이보다 적으면 그 주는 뺀다. 이 맥 CLI가 거의 안 쓴 주의 사용률은 다른 소비자(Hermes·임시 CODEX_HOME
+# 검토 등)가 같은 계정을 쓴 몫이라, 로컬 토큰으로 나누면 기준값이 한두 자리 작게 나온다(실측 W38·W44 약 100만).
+PRO_MIN_WEEK_TOKENS = 50_000_000
 
 
 # ---------- 상태 DB ----------
@@ -561,34 +570,46 @@ def pool_report(status, prefix):
 def pro200_estimate(observations, tz):
     """Pro 200 1주(사용률 100%) ≈ 비캐시 토큰 N(추정).
 
-    observations: (resets_at, 시각 ms, 사용률 %, 그 응답의 비캐시 토큰). 같은 resets_at 초를 한 계정의 한 창으로 본다.
-    창마다 첫 관측 뒤에 쓴 토큰 ÷ (마지막 − 첫 사용률)만 표본으로 쓴다(첫 관측 이전 몫은 그 사용률에 이미 들었다).
-    사용률이 되돌아가는 창은 같은 리셋 초를 가진 다른 계정이 섞였거나 창이 바뀐 것이라 계정을 가릴 수 없어 뺀다.
-    변화가 PRO_MIN_PCT_DELTA보다 작은 창도 뺀다. 표본은 마지막 관측의 ISO 주로 묶어 주마다 합친 토큰 ÷ 합친 사용률을 내고,
+    observations: (resets_at, 시각 ms, 사용률 %, 그 응답의 비캐시 토큰). resets_at이 PRO_RESET_JITTER_SEC 안으로 이어지는
+    값들을 한 계정의 한 창으로 본다. 창마다 첫 관측 뒤에 쓴 토큰 ÷ (최고 − 첫 사용률)만 표본으로 쓴다(첫 관측 이전 몫은
+    그 사용률에 이미 들었다). 사용률이 PRO_MIX_DROP_PCT보다 크게 되돌아가는 창은 리셋 시각이 가까운 다른 계정이 섞인
+    것이라 계정을 가릴 수 없어 뺀다.
+    변화가 PRO_MIN_PCT_DELTA보다 작은 창도 뺀다. 표본은 마지막 관측의 ISO 주로 묶어 주마다 합친 토큰 ÷ 합친 사용률을 내고
+    (표본 토큰이 PRO_MIN_WEEK_TOKENS보다 적은 주는 뺀다),
     주 값들의 중앙(mid)·최소(lo)·최대(hi)를 낸다. 표본 창이 PRO_MIN_SAMPLES보다 적으면 None(산출 불가).
     한계: 같은 계정을 이 맥 밖(다른 기기·임시 CODEX_HOME)에서 쓴 몫은 사용률에만 들어가 기준값을 낮게 만든다."""
-    by_reset = {}
-    for reset, ts, pct, noncache in observations:
-        by_reset.setdefault(reset, []).append((ts, pct, noncache))
-    weeks, samples, excluded = {}, 0, 0
-    for obs in by_reset.values():
+    windows, last_reset = [], None
+    for reset, ts, pct, noncache in sorted(observations):
+        if last_reset is None or reset - last_reset > PRO_RESET_JITTER_SEC:
+            windows.append([])
+        windows[-1].append((ts, pct, noncache))
+        last_reset = reset
+    weeks, excluded, singles = {}, 0, 0
+    for obs in windows:
         obs.sort()
         pcts = [o[1] for o in obs]
-        consumed = pcts[-1] - pcts[0]
-        mixed = any(b < a - 0.5 for a, b in zip(pcts, pcts[1:]))
-        if len(obs) < 2 or mixed or consumed < PRO_MIN_PCT_DELTA:
+        consumed = max(pcts) - pcts[0]
+        mixed = any(b < a - PRO_MIX_DROP_PCT for a, b in zip(pcts, pcts[1:]))
+        if len(obs) < 2:
+            singles += 1
+            continue
+        if mixed or consumed < PRO_MIN_PCT_DELTA:
             excluded += 1
             continue
-        samples += 1
         week = iso_week(local_day(dt.datetime.fromtimestamp(obs[-1][0] / 1000, dt.timezone.utc), tz))
-        b = weeks.setdefault(week, [0, 0.0])
+        b = weeks.setdefault(week, [0, 0.0, 0])
         b[0] += sum(o[2] for o in obs[1:])
         b[1] += consumed / 100
+        b[2] += 1
+    kept = {week: b for week, b in weeks.items() if b[0] >= PRO_MIN_WEEK_TOKENS}
+    excluded += sum(b[2] for week, b in weeks.items() if week not in kept)
+    samples = sum(b[2] for b in kept.values())
     if samples < PRO_MIN_SAMPLES:
         return None
-    values = [round(tokens / pro) for tokens, pro in weeks.values()]
+    values = [round(tokens / pro) for tokens, pro, _ in kept.values()]
     return {'mid': round(statistics.median(values)), 'lo': min(values), 'hi': max(values),
-            'weeks': len(values), 'samples': samples, 'excluded': excluded}
+            'weeks': len(values), 'samples': samples, 'excluded': excluded, 'singleObservation': singles}
+
 
 # ---------- 조립 ----------
 
