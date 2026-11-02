@@ -13,6 +13,31 @@ function jwt(payload) {
   return `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`;
 }
 
+// The import/login tests below create a fresh config on the default Codex port.
+// When a TeamCodex server already listens there (a developer machine), the CLI
+// finds that server, has no state file for this temporary config (so it never
+// signals it), and must report the reload as unconfirmed with a non-zero exit.
+// Without such a server the command simply succeeds.
+async function teamServerOnPort(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { signal: AbortSignal.timeout(1500) });
+    const body = res.ok ? await res.json() : null;
+    return Array.isArray(body?.accounts) && typeof body?.switchThreshold === 'number';
+  } catch {
+    return false;
+  }
+}
+
+function assertAccountCommandExit(result, foreignServer) {
+  if (!foreignServer) {
+    assert.equal(result.status, 0, result.stderr);
+    return;
+  }
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr,
+    /NOT confirmed as applied to the running server: it does not support account-only live reload/);
+}
+
 async function readInvocations(logPath) {
   return (await readFile(logPath, 'utf8'))
     .trim()
@@ -202,6 +227,7 @@ test('teamclaude codex import creates a separate Codex account pool', async () =
 
   try {
     // When
+    const foreignServer = await teamServerOnPort(3457);
     const result = spawnSync(
       process.execPath,
       [entry, 'codex', 'import', '--from', authPath, '--name', 'pooled-pro'],
@@ -216,7 +242,7 @@ test('teamclaude codex import creates a separate Codex account pool', async () =
     );
 
     // Then
-    assert.equal(result.status, 0, result.stderr);
+    assertAccountCommandExit(result, foreignServer);
     const config = JSON.parse(await readFile(join(dir, 'teamcodex.json'), 'utf8'));
     assert.equal(config.provider, 'codex');
     assert.equal(config.proxy.port, 3457);
@@ -268,6 +294,7 @@ writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), ${JSON.stringify(JSON.s
 
   try {
     // When
+    const foreignServer = await teamServerOnPort(3457);
     const result = spawnSync(
       process.execPath,
       [entry, 'codex', 'login', '--name', 'isolated-plus'],
@@ -284,7 +311,7 @@ writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), ${JSON.stringify(JSON.s
     );
 
     // Then
-    assert.equal(result.status, 0, result.stderr);
+    assertAccountCommandExit(result, foreignServer);
     const config = JSON.parse(await readFile(join(dir, 'teamcodex.json'), 'utf8'));
     assert.equal(config.accounts.length, 1);
     assert.equal(config.accounts[0].name, 'isolated-plus');

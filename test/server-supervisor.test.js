@@ -925,20 +925,17 @@ setTimeout(() => {
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Applied to the running server without restarting/);
 
-    const reloaded = await waitUntil(async () => {
-      const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
-        headers: {
-          'x-api-key': 'tc-test',
-          'x-teamcodex-status-identity': '1',
-        },
-      });
-      if (!response) return null;
-      const body = await response.json();
-      const state = await readState(statePath);
-      return body.accounts.length === 1
-        ? { body, state }
-        : null;
-    }, 'live worker did not apply the removed account', 8000);
+    // The CLI only reports success after the worker confirmed the reload, so
+    // the change must already be live the moment the command returns.
+    const response = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: {
+        'x-api-key': 'tc-test',
+        'x-teamcodex-status-identity': '1',
+      },
+    });
+    assert.ok(response.ok, 'proxy must still answer after the reload');
+    const reloaded = { body: await response.json(), state: await readState(statePath) };
+    assert.equal(reloaded.body.accounts.length, 1, 'removal must be live when the CLI returns');
 
     assert.equal(reloaded.state.pid, initial.pid, 'public supervisor PID must stay stable');
     assert.equal(reloaded.state.pid, child.pid);
@@ -967,6 +964,174 @@ setTimeout(() => {
     assert.equal((await readState(statePath)).workerPid, initial.workerPid);
   } finally {
     await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+function runCli(argv, env, input) {
+  return new Promise(resolve => {
+    const cli = spawn(process.execPath, [entry, ...argv], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    cli.stdout.on('data', chunk => { stdout += chunk; });
+    cli.stderr.on('data', chunk => { stderr += chunk; });
+    cli.stdin.end(input ?? '');
+    cli.once('exit', code => resolve({ code, stdout, stderr }));
+  });
+}
+
+test('every account CLI command confirms its live reload, and concurrent conflicting changes end live as on disk', { timeout: 30000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-commands-'));
+  const configPath = join(dir, 'config.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'keep', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  // Account names are only visible on the authenticated identity view.
+  const live = async () => (await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+    headers: { 'x-api-key': 'tc-test', 'x-teamcodex-status-identity': '1' },
+  })).json()).accounts;
+  const confirmed = (result, label) => {
+    assert.equal(result.code, 0, `${label}: ${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Applied to the running server/, label);
+  };
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+
+    confirmed(await runCli(['login', '--api', '--name', 'added'], env, 'key-b\n'), 'login --api');
+    assert.deepEqual((await live()).map(a => a.name).sort(), ['added', 'keep'], 'login is live on return');
+
+    confirmed(await runCli(['priority', 'added', '1'], env), 'priority');
+    assert.equal((await live()).find(a => a.name === 'added').priority, 1, 'priority is live on return');
+
+    confirmed(await runCli(['disable', 'added'], env), 'disable');
+    assert.equal((await live()).find(a => a.name === 'added').enabled, false, 'disable is live on return');
+
+    confirmed(await runCli(['enable', 'added'], env), 'enable');
+    assert.equal((await live()).find(a => a.name === 'added').enabled, true, 'enable is live on return');
+
+    // Two CLIs flip the same account at once. Config writes are serialized, so
+    // the later save wins on disk; each confirmation means the server re-read
+    // the config at or after that CLI's save, so the live state must equal disk.
+    const [off, on] = await Promise.all([
+      runCli(['disable', 'keep'], env),
+      runCli(['enable', 'keep'], env),
+    ]);
+    confirmed(off, 'concurrent disable');
+    confirmed(on, 'concurrent enable');
+    const disk = JSON.parse(await readFile(configPath, 'utf8')).accounts.find(a => a.name === 'keep');
+    assert.equal((await live()).find(a => a.name === 'keep').enabled, disk.enabled !== false,
+      'live state matches the last saved config after concurrent confirmed reloads');
+  } finally {
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('CLI account change against a worker that never confirms exits non-zero and says it is not applied', { timeout: 20000, skip: process.platform === 'win32' }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-unconfirmed-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const port = await unusedPort();
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'acct', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  const serverEnv = { ...process.env, TEAMCLAUDE_CONFIG: configPath };
+  const child = spawn(process.execPath, [entry, 'server'], { env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  let workerPid = null;
+
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    ({ workerPid } = await waitUntil(() => readState(statePath), 'server state was not written'));
+    // The CLI reads the worker's process identity with ps right before it
+    // sends the reload signal. This ps shim stops the verified worker at that
+    // moment, so the signal lands on a live worker that never answers: the
+    // CLI must time out instead of reporting success.
+    const bin = join(dir, 'bin');
+    await mkdir(bin);
+    const realPs = spawnSync('which', ['ps'], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(realPs, 'ps is required to verify the worker identity');
+    await writeFile(join(bin, 'ps'), `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args.includes(${JSON.stringify(String(workerPid))})) process.kill(${workerPid}, 'SIGSTOP');
+const result = spawnSync(${JSON.stringify(realPs)}, args, { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+    const cliEnv = { ...serverEnv, PATH: `${bin}:${process.env.PATH}`, TEAMCLAUDE_RELOAD_TIMEOUT_MS: '400' };
+
+    const { code, stdout, stderr } = await runCli(['disable', 'acct'], cliEnv);
+
+    assert.notEqual(code, 0, `CLI must fail when the reload is unconfirmed\n${stdout}\n${stderr}`);
+    assert.doesNotMatch(stdout, /Applied to the running server/);
+    assert.match(stderr, /saved/i);
+    assert.match(stderr, /NOT confirmed as applied to the running server/);
+    // A timeout cannot tell "still reloading" from "never will": point at the
+    // log instead of recommending a restart that would cut in-flight requests.
+    assert.match(stderr, /may still be in progress/);
+    assert.doesNotMatch(stderr, /schedule a restart|teamcodex restart/i);
+    const persisted = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(persisted.accounts[0].enabled, false, 'the change is still saved to disk');
+    assert.ok(isPidAlive(workerPid), 'an unconfirmed reload must not stop the worker');
+  } finally {
+    if (workerPid) {
+      try { process.kill(workerPid, 'SIGCONT'); } catch { /* already gone */ }
+    }
+    await stopChild(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('api, api-credit and subscription exit non-zero when the live reload is unconfirmed', { timeout: 20000 }, async () => {
+  // These commands end with an explicit process exit in the CLI dispatcher.
+  // A hard-coded exit(0) there would swallow the exitCode 1 that an
+  // unconfirmed reload sets, so the caller would read failure as success.
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-live-unconfirmed-exit-'));
+  const configPath = join(dir, 'config.json');
+  const statePath = join(dir, 'config.server.json');
+  const fakeSupervisor = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ accounts: [], switchThreshold: 0.98 }));
+  });
+  const port = await listen(fakeSupervisor);
+  const oldWorker = spawn(process.execPath, ['-e',
+    "process.on('SIGHUP', () => {}); setInterval(() => {}, 1000);"], { stdio: 'ignore' });
+  await delay(200);
+  await writeFile(configPath, JSON.stringify({
+    proxy: { port },
+    accounts: [{ name: 'acct', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  await writeFile(statePath, JSON.stringify({ pid: process.pid, workerPid: oldWorker.pid, port }));
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_RELOAD_TIMEOUT_MS: '400' };
+
+  try {
+    const cases = [
+      { label: 'api --name', argv: ['api', '--name', 'added'], input: 'key-b\n' },
+      { label: 'api-credit', argv: ['api-credit', 'acct', '80'] },
+      { label: 'subscription', argv: ['subscription', 'acct', 'disabled'] },
+    ];
+    for (const { label, argv, input } of cases) {
+      const result = await runCli(argv, env, input);
+      assert.equal(result.code, 1, `${label} must fail when the reload is unconfirmed\n${result.stdout}\n${result.stderr}`);
+      assert.doesNotMatch(result.stdout, /Applied to the running server/, label);
+      assert.match(result.stderr, /NOT confirmed as applied to the running server/, label);
+    }
+    const persisted = JSON.parse(await readFile(configPath, 'utf8')).accounts;
+    assert.deepEqual(persisted.map(a => a.name), ['acct', 'added'], 'api still saved the new account');
+    assert.equal(persisted[0].creditUsd, 80, 'api-credit still saved the credit');
+    assert.equal(persisted[0].subscriptionDisabled, true, 'subscription still saved the flag');
+  } finally {
+    oldWorker.kill('SIGKILL');
+    await close(fakeSupervisor);
     await rm(dir, { recursive: true, force: true });
   }
 });

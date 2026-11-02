@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
+import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getReloadAckDir, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
@@ -79,6 +79,14 @@ import {
   normalizeSubscriptionCancellation,
   subscriptionSnapshot,
 } from './subscription.js';
+import { requestConfirmedReload, createReloadQueue, normalizeReloadTimeoutMs } from './reload-ack.js';
+import {
+  installTimestampedConsole,
+  formatSignalTrace,
+  formatSupervisorExitTrace,
+  formatWorkerShutdownTrace,
+  logProcessSnapshot,
+} from './process-trace.js';
 import {
   buildClaudeRecoveryEnv,
   hasClaudeRecoveryMarker,
@@ -234,15 +242,15 @@ switch (command) {
     break;
   case 'import':
     await importCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'login':
     await loginCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'reauth':
     await reauthenticateCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'env':
     await envCommand();
@@ -254,38 +262,38 @@ switch (command) {
     break;
   case 'accounts':
     await accountsCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'remove':
     await removeCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'disable':
     await setEnabledCommand(false);
-    process.exit(0);
+    process.exit();
     break;
   case 'enable':
     await setEnabledCommand(true);
-    process.exit(0);
+    process.exit();
     break;
   case 'priority':
     await setPriorityCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'subscription':
     await subscriptionCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'api':
     // `api <path>` is the raw endpoint call. Without a path (or with only
     // flags) it registers an API-key account: `api --name N --credit USD`.
     if (!args[1] || args[1].startsWith('--')) await loginApiCommand();
     else await apiCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'api-credit':
     await apiCreditCommand();
-    process.exit(0);
+    process.exit();
     break;
   case 'cloud-sidecar':
     await cloudSidecarCommand();
@@ -325,7 +333,16 @@ switch (command) {
 
 // ── server ──────────────────────────────────────────────────
 
+// Daemon (non-TUI) output: the worker picks its TUI with exactly this
+// predicate, and the supervisor shares the worker's stdio. In daemon mode every
+// log line gets a local timestamp and stop signals are traced; TUI output is
+// left untouched.
+function isDaemonOutput() {
+  return !(process.stdout.isTTY && process.stdin.isTTY);
+}
+
 async function serverCommand() {
+  if (isDaemonOutput()) installTimestampedConsole();
   if (process.env[SUPERVISED_WORKER_ENV] === '1') {
     await proxyWorkerCommand();
     return;
@@ -429,6 +446,8 @@ async function superviseServerCommand() {
   let sessionRescuer = null;
   const codexRecoveryReceipts = new Map();
   let finish;
+  const traceEnabled = isDaemonOutput();
+  let exitReason = null;
 
   function storeCodexRecoveryReceipt(identity) {
     if (!identity) return;
@@ -644,6 +663,40 @@ async function superviseServerCommand() {
       try { worker.kill('SIGKILL'); } catch {}
     }
   });
+  if (traceEnabled) {
+    process.once('exit', code => {
+      console.error(formatSupervisorExitTrace({
+        reason: exitReason,
+        code,
+        pid: process.pid,
+        uptimeSec: process.uptime(),
+      }));
+    });
+  }
+
+  // Log a stop signal the moment it lands: who we are, who our parent is, how
+  // long we have been up and how much traffic the stop will cut. A deployment
+  // drain in progress points at a rollout rather than an outside kill.
+  function traceStopSignal(signal) {
+    if (!traceEnabled) return;
+    console.error(formatSignalTrace({
+      role: 'Supervisor',
+      signal,
+      pid: process.pid,
+      ppid: process.ppid,
+      uptimeSec: process.uptime(),
+      inflight: activePublicRequests,
+      workerPid: worker?.pid,
+    }) + (deploymentDraining ? ' deploymentDraining=1' : ''));
+  }
+
+  function onStopSignal(signal) {
+    traceStopSignal(signal);
+    requestShutdown({ reason: `signal:${signal}` });
+    // Fire-and-forget, bounded to 1s and unref'd: it is recorded only if it
+    // finishes before the process exits, and never delays the shutdown above.
+    if (traceEnabled) logProcessSnapshot({ label: signal });
+  }
 
   function bufferRequest(req, reserveRequestBytes) {
     return new Promise((resolve, reject) => {
@@ -1088,7 +1141,7 @@ async function superviseServerCommand() {
       }
       if (child !== worker) return;
       if (message?.type === 'teamcodex:shutdown') {
-        requestShutdown({ workerWillExit: true });
+        requestShutdown({ workerWillExit: true, reason: 'worker-requested-shutdown' });
         return;
       }
       if (message?.type === 'teamcodex:capacity'
@@ -1161,6 +1214,7 @@ async function superviseServerCommand() {
         return;
       }
       if (!hasBeenReady && !becameReady) {
+        exitReason = `worker-exited-before-ready:${signal || `exit ${code}`}`;
         closePublicListener(true);
         finish(code ?? 1);
         return;
@@ -1310,9 +1364,10 @@ async function superviseServerCommand() {
     healthReq.once('error', err => finishCheck(false, probeFailureKind(err)));
   }
 
-  function requestShutdown({ workerWillExit = false } = {}) {
+  function requestShutdown({ workerWillExit = false, reason = 'shutdown-requested' } = {}) {
     if (stopping) return;
     stopping = true;
+    exitReason = reason;
     workerReady = false;
     workerPort = null;
     clearTimeout(restartTimer);
@@ -1347,6 +1402,7 @@ async function superviseServerCommand() {
     // later server error (EMFILE, ENOBUFS under load) would be reported as
     // "port already in use" and exit the supervisor mid-stream.
     const onListenError = err => {
+      exitReason = `listen-error:${err?.code || 'unknown'}`;
       handleServerListenError(err, port);
     };
     listener.once('error', onListenError);
@@ -1361,8 +1417,19 @@ async function superviseServerCommand() {
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
     });
-    process.once('SIGINT', () => requestShutdown());
-    process.once('SIGTERM', () => requestShutdown());
+    // `once` on purpose (unchanged): a second SIGINT/SIGTERM falls through to
+    // the default disposition and kills a stuck shutdown.
+    process.once('SIGINT', () => onStopSignal('SIGINT'));
+    process.once('SIGTERM', () => onStopSignal('SIGTERM'));
+    if (traceEnabled) {
+      process.once('SIGHUP', () => {
+        traceStopSignal('SIGHUP');
+        // Keep SIGHUP's default (terminating) disposition: this once-listener
+        // is already detached, so re-raising behaves exactly like an untraced
+        // SIGHUP. Only re-raise when nothing else claimed the signal since.
+        if (process.listenerCount('SIGHUP') === 0) process.kill(process.pid, 'SIGHUP');
+      });
+    }
   });
 
   await clearServerState();
@@ -1629,14 +1696,18 @@ async function proxyWorkerCommand() {
     }
   };
   const server = createProxyServer(accountManager, config, hooks);
-  let liveSyncChain = Promise.resolve();
-  process.on('SIGHUP', () => {
-    // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
-    // and every in-flight response alive. Serializing signals avoids overlapping
-    // remove/add passes when several CLI changes land together.
-    liveSyncChain = liveSyncChain.then(async () => {
+  // Account-only reload: keep the worker, sockets, affinity map, prompt caches,
+  // and every in-flight response alive. The queue serializes steps (one per
+  // SIGHUP) so overlapping remove/add passes cannot interleave, answers the CLI
+  // requests each step claimed (reload-ack.js) only after the reload finished,
+  // and keeps stepping while a request whose SIGHUP was coalesced is waiting.
+  // A failure is reported to the waiting CLIs and logged, never thrown, so it
+  // cannot take the worker or the supervisor down.
+  const accountReloads = createReloadQueue({
+    dir: getReloadAckDir(),
+    reload: async () => {
       const diskConfig = await accountManager.readAfterAccountFlagWrites(() => loadConfig());
-      if (!diskConfig) return;
+      if (!diskConfig) throw new Error(`config file not found: ${getConfigPath()}`);
       await syncAccountsFromDisk(diskConfig, config, accountManager);
       if (codexMode) await server.refreshQuotaAll();
       if (process.connected) {
@@ -1645,11 +1716,18 @@ async function proxyWorkerCommand() {
           maxPublicRequests: publicRequestCapacity(config, accountManager.accounts),
         });
       }
-      console.log('[TeamClaude] Applied account config without restarting the worker');
-    }).catch(err => {
-      console.error(`[TeamClaude] Account config reload failed: ${err.message}`);
-    });
+    },
+    onResultError: err => console.error(`[TeamClaude] Could not record account reload result: ${err.message}`),
+    onResult: result => {
+      if (result.ok) console.log('[TeamClaude] Applied account config without restarting the worker');
+      else console.error(`[TeamClaude] Account config reload failed: ${result.error}`);
+      if (result.ackError) {
+        console.error('[TeamClaude] A waiting account CLI was not sent its reload confirmation '
+          + `and will report the change as unconfirmed: ${result.ackError}`);
+      }
+    },
   });
+  process.on('SIGHUP', () => { accountReloads.trigger(); });
   // Restore the last run's committed probe template alongside the quota
   // snapshot, so forced re-measure (TUI R) and warm-up probes work on a
   // freshly restarted idle proxy — without this the template is memory-only
@@ -1717,9 +1795,22 @@ async function proxyWorkerCommand() {
     }
   });
 
+  // 'signal' = a SIGINT/SIGTERM was delivered to the worker (normally the
+  // supervisor's own SIGTERM while the IPC channel is still up);
+  // 'ipc-disconnect' = the supervisor channel closed and the worker raised
+  // SIGTERM on itself (see the 'disconnect' handler below).
+  let stopSource = 'signal';
   if (!tui) {
     let shuttingDown = false;
-    const shutdown = () => {
+    const shutdown = signal => {
+      console.error(formatWorkerShutdownTrace({
+        signal,
+        source: stopSource,
+        pid: process.pid,
+        ppid: process.ppid,
+        supervisorPid: process.env[SUPERVISOR_PID_ENV],
+        ipcConnected: process.connected,
+      }));
       if (shuttingDown) return;
       shuttingDown = true;
       console.log('\n[TeamClaude] Shutting down...');
@@ -1734,8 +1825,8 @@ async function proxyWorkerCommand() {
       });
       server.closeIdleConnections?.();
     };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   }
   // Liveness corroboration for the supervisor. Answering proves this worker's
   // event loop is running, which its HTTP probe cannot tell apart from a
@@ -1746,7 +1837,10 @@ async function proxyWorkerCommand() {
       process.send({ type: 'teamcodex:pong', id: message.id });
     } catch { /* the channel closed mid-answer; the supervisor times out */ }
   });
-  process.once('disconnect', () => process.kill(process.pid, 'SIGTERM'));
+  process.once('disconnect', () => {
+    stopSource = 'ipc-disconnect';
+    process.kill(process.pid, 'SIGTERM');
+  });
 }
 
 // ── server lifecycle: discover / stop / restart ─────────────
@@ -3481,8 +3575,27 @@ async function removeCommand() {
 
 // ── enable / disable / priority ─────────────────────────────
 
-/** Ask the supervised worker to live-sync account changes without a restart. */
+/**
+ * Ask the supervised worker to live-sync account changes without a restart, and
+ * wait for it to confirm. Anything short of a confirmed reload is reported as
+ * "saved but not applied" with a non-zero exit code; the server is never
+ * restarted from here.
+ */
 async function noteRunningServerReload(config) {
+  const notApplied = (reason, { maybeInProgress = false } = {}) => {
+    console.error(`Saved to ${getConfigPath()}, but NOT confirmed as applied to the running server: ${reason}.`);
+    if (maybeInProgress) {
+      // The worker may have claimed the request and still be reloading; do not
+      // recommend a restart that would cut in-flight requests for nothing.
+      console.error('The reload may still be in progress. Check the server log for');
+      console.error('"Applied account config without restarting the worker" before retrying the command.');
+    } else {
+      console.error('The running server keeps its previous accounts until a reload succeeds or it restarts.');
+      console.error('Retry the command, or schedule a restart for an idle moment (a restart ends in-flight requests).');
+    }
+    process.exitCode = 1;
+    return false;
+  };
   try {
     const running = await findRunningServer(config, configuredStatusProbeTimeoutMs(30_000));
     if (!running) return false;
@@ -3491,18 +3604,27 @@ async function noteRunningServerReload(config) {
       && verifyWorkerIdentity(state, running.identity)
       ? state.workerPid
       : null;
-    if (!workerPid) {
-      console.error('The running server does not support account-only live reload.');
-      console.error('Apply the change with: teamcodex restart');
-      return false;
+    if (!workerPid) return notApplied('it does not support account-only live reload');
+    const timeoutMs = normalizeReloadTimeoutMs(process.env.TEAMCLAUDE_RELOAD_TIMEOUT_MS);
+    const outcome = await requestConfirmedReload({
+      dir: getReloadAckDir(),
+      signal: () => process.kill(workerPid, 'SIGHUP'),
+      isWorkerAlive: () => isPidAlive(workerPid),
+      timeoutMs,
+    });
+    if (outcome.status === 'applied') {
+      console.log('Applied to the running server without restarting active connections.');
+      return true;
     }
-    process.kill(workerPid, 'SIGHUP');
-    console.log('Applied to the running server without restarting active connections.');
-    return true;
+    if (outcome.status === 'failed') return notApplied(`the reload failed (${outcome.error})`);
+    if (outcome.reason === 'timeout') {
+      return notApplied(`no confirmation within ${timeoutMs / 1000}s (an older server never confirms)`,
+        { maybeInProgress: true });
+    }
+    if (outcome.reason === 'worker-exited') return notApplied('the worker exited before confirming');
+    return notApplied(outcome.reason);
   } catch (err) {
-    console.error(`Could not reload the running server automatically: ${err.message}`);
-    console.error('Apply the change with: teamcodex restart');
-    return false;
+    return notApplied(`could not reload it automatically (${err.message})`);
   }
 }
 
