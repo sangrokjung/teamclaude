@@ -7,7 +7,7 @@
 - Source: `src/account-manager.js`
 - SHA-256: `c3c1cb560ddb1f1e6121fa4e8703b6e162a14d5a077f3f095d2fcff73ae6ac66`
 - Source: `src/config.js`
-- SHA-256: `dd982f9cdc909071ae37785d67862b753a99fbbee26da5c373998b2f3e703959`
+- SHA-256: `7e7b69c0694357055a3cf515969a050936b9fb07d5de346295d86bce7456b45f`
 - 2026-09-08 갱신: 기본 브랜치 `09de69e`의 두 파일과 아래 발췌 구간을 대조했다.
   이후 두 소스가 바뀌면 이 문서와 `test/test_model_recovery_gate.py`의 핀을 함께 검토·갱신한다.
 - 2026-10-07 갱신: 사용량 유예 차선(`usageLimitGrace`) 추가로 `src/account-manager.js`만 바뀌었다.
@@ -28,6 +28,8 @@
   같은 날 검토 수정(발송 도장 `creditDispatchStamp`·`setApiKey`·`reconcileCreditFlagFromDisk`, 영속 실패 재시도)도
   크레딧 메서드 안에서만 바뀌었고 발췌 구간은 그대로다. 2차 검토 수정(유예 우선 `_anySubscriptionServable`, API 키의
   warm-up 후보 제외 `_isWarmupTarget`·`warmupCandidates`, 미측정 재균형·연결 친화의 API 키 예외)도 발췌 밖이다.
+- 2026-11-02 갱신: 계정 CLI 재로딩 확인(#62) 이식으로 `src/config.js`만 바뀌었다(`getReloadAckDir` 추가).
+  "Codex fallback default" 발췌는 그대로이고 `src/account-manager.js`는 변경 없다. 모델 복구 로직은 변경 없다.
 - 검증 명령: `shasum -a 256 src/account-manager.js src/config.js`
 - 전체 파일을 gate bundle에 직접 넣지 않은 이유: 모델 복구와 무관한 credential property
   identifiers가 value-shape secret scanner의 보수적 규칙에 걸립니다. 이 evidence는 값을
