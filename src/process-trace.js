@@ -126,16 +126,11 @@ export function maskSecrets(text) {
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
     .replace(/\bsk-(?!ant-\*)[A-Za-z0-9_-]{16,}/g, 'sk-***')
     .replace(/\btc-[A-Za-z0-9_-]{16,}/g, 'tc-***')
-    // Values not already masked above (a value still holding *** keeps its
-    // readable prefix, e.g. `sk-ant-***`).
-    // x-api-key: the first token is the credential, whatever its alphabet.
-    .replace(/\b(x-api-key)(\s*:\s*)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
-    // authorization: everything up to the closing quote or line end is masked
-    // (a scheme may be followed by several credential parts). A known scheme
-    // word stays readable; Bearer was already handled above.
-    .replace(/\b(authorization)(\s*:)(?!\s*Bearer\b)(\s*)((?:Basic|Token|Digest|Negotiate|NTLM|AWS4-HMAC-SHA256)\s+)?[^'"\n]+/gi, '$1$2$3$4***')
-    // Option values may be quoted (`--password "x"`, `--token='x'`).
-    .replace(/(--(?:api-key|key|token|secret|password)(?:\s+|=))(['"]?)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
+    // From the first auth header or secret option on, the rest of the command
+    // line is dropped. Quoting, spaces and scheme syntax make the end of such a
+    // value ambiguous, and a trace only needs the program and the args before
+    // it; over-masking is the safe side.
+    .replace(/(\b(?:x-api-key|authorization)\s*:|--(?:api-key|key|token|secret|password)\b)[\s\S]*$/i, '$1 ***')
     .replace(/[A-Za-z0-9_+/=-]{32,}/g, maskRun);
 }
 

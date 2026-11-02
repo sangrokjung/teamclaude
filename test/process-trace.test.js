@@ -149,9 +149,12 @@ test('maskSecrets hides Anthropic keys, bearer tokens and long base64-like runs'
     + 'ab12CD34ef56/GH78ij90KL12mn34OP56qr78ST90uv+w== '
     + '0123456789abcdef0123456789abcdef01234567',
   );
-  assert.ok(masked.includes('sk-ant-***'), masked);
   assert.ok(!masked.includes('AbCdEf123'), masked);
-  assert.ok(masked.includes('Bearer ***'), masked);
+  assert.ok(masked.startsWith('claude --key ***'), masked);
+  assert.equal(maskSecrets('x sk-ant-abc123DEFghi'), 'x sk-ant-***');
+  assert.equal(maskSecrets('run Bearer eyJabc.def'), 'run Bearer ***');
+  const runs = maskSecrets('tool QWxhZGRpbjpvcGVuIHNlc2FtZQ0K1234567890abcdEF ab12CD34ef56/GH78ij90KL12mn34OP56qr78ST90uv+w== 0123456789abcdef0123456789abcdef01234567');
+  assert.ok(runs.startsWith('tool ') && !/QWxhZGRp|GH78ij90|0123456789abcdef0123/.test(runs), runs);
   assert.ok(!masked.includes('eyJhbGciOi'), masked);
   assert.ok(!masked.includes('QWxhZGRpbjpvcGVu'), masked);
   assert.ok(!masked.includes('GH78ij90'), masked);
@@ -230,7 +233,7 @@ test('filterPsSnapshot masks before matching output and truncates the command to
   const cmd0 = byPid(42).split(' cmd=')[1];
   assert.equal(cmd0.length, 160);
   assert.ok(longCmd.startsWith(cmd0));
-  assert.ok(byPid(43).endsWith('cmd=teamcodex --token sk-ant-***'), byPid(43));
+  assert.ok(byPid(43).endsWith('cmd=teamcodex --token ***'), byPid(43));
 });
 
 test('filterPsSnapshot caps the number of rows', () => {
@@ -373,7 +376,7 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   assert.equal(maskSecrets(key), 'tc-***');
   // 인증 방식 뒤의 값, 따옴표로 감싼 옵션 값도 가린다.
   const basic = maskSecrets('curl -H "Authorization: Basic dXNlcjpwYXNz" https://ops.example/teamclaude/status');
-  assert.ok(!basic.includes('dXNlcjpwYXNz') && basic.includes('Authorization: Basic ***'), basic);
+  assert.ok(!basic.includes('dXNlcjpwYXNz') && basic.includes('Authorization: ***'), basic);
   const quoted = maskSecrets(`sh -c 'teamclaude --password "hunterhunter" status'`);
   assert.ok(!quoted.includes('hunterhunter'), quoted);
   const quoted2 = maskSecrets('teamclaude --token=\'plainvalue\' status');
@@ -385,4 +388,10 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   assert.ok(!unknownScheme.includes('QWERTYUIOPASDFGH'), unknownScheme);
   const custom = maskSecrets('curl -H "Authorization: CustomScheme secretvaluexyz" x');
   assert.ok(!custom.includes('secretvaluexyz'), custom);
+  // 헤더 안 인용값, 공백이 든 인용 옵션값도 남지 않는다(지점부터 줄 끝까지 버림).
+  const inner = maskSecrets(`curl -H 'Authorization: Token token="shortsecretvalue"' https://ops.example/teamclaude/status`);
+  assert.ok(!inner.includes('shortsecretvalue'), inner);
+  const spaced = maskSecrets(`sh -c 'curl --password="correct horse battery staple" https://ops.example/teamclaude/status'`);
+  assert.ok(!/horse|battery|staple/.test(spaced), spaced);
+  assert.ok(spaced.startsWith("sh -c 'curl --password"), spaced);
 });
