@@ -67,7 +67,7 @@ class ModelUsageWiringTests(unittest.TestCase):
     def test_collector_has_no_runtime_dependencies(self):
         source = (ROOT / "scripts" / "model-usage-collector.py").read_text()
         imports = set(re.findall(r"^(?:import|from) ([a-z0-9_.]+)", source, re.M))
-        allowed = {"__future__", "argparse", "datetime", "json", "os", "plistlib", "re", "shutil", "sqlite3", "statistics",
+        allowed = {"__future__", "argparse", "datetime", "hashlib", "json", "os", "plistlib", "re", "shutil", "sqlite3", "statistics",
                    "subprocess", "sys", "tempfile", "urllib.request", "pathlib"}
         self.assertLessEqual(imports, allowed)
 
