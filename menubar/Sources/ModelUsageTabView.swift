@@ -119,7 +119,10 @@ final class ModelUsageTabView: NSView {
         guard let report else { return L10n.modelEmptyTitle }
         let p = makeModelUsagePresentation(report, selection)
         let claude = "\(modelUsageCount(p.claudeValue)) \(metricUnit(selection.metric))"
-        return L10n.modelSectionSummary(rangeLabel(selection.range), claude, p.codexPro.map { proText($0.mid) })
+        // '전체'는 보존 시작일을 함께 밝힌다(보존한 범위가 곧 전체다).
+        let range = selection.range == .all
+            ? L10n.modelRangeAllSince(modelUsageDayLabel(p.period.from, yearOf: p.period.to)) : rangeLabel(selection.range)
+        return L10n.modelSectionSummary(range, claude, p.codexPro.map { proText($0.mid) })
     }
 
     static func rangeLabel(_ range: ModelUsageRange) -> String {
@@ -181,7 +184,7 @@ final class ModelUsageTabView: NSView {
         let weeks = p.weeks
         drawHeader(L10n.modelSourcesTitle, L10n.modelSourcesHint(weeks.first?.label ?? "", weeks.last?.label ?? ""), l.sourcesHeader)
         drawSources(p, l.sources)
-        drawHeader(L10n.modelDailyTitle, "\(modelUsageMonthDay(p.period.from))–\(modelUsageMonthDay(p.period.to))", l.dailyHeader)
+        drawHeader(L10n.modelDailyTitle, modelUsageSpan(p.period.from, p.period.to), l.dailyHeader)
         drawClaudeChart(p, l.claudeChart)
         drawCodexChart(p, l.codexChart)
         drawHatchLegend(l.hatchLegend)
@@ -191,7 +194,7 @@ final class ModelUsageTabView: NSView {
         drawHeader(L10n.modelPoolsTitle, L10n.modelPoolsHint, l.poolsHeader)
         drawPool("TeamClaude", p.claudePool, l.claudePool)
         drawPool("TeamCodex", p.codexPool, l.codexPool)
-        drawHeader(L10n.modelCyclesTitle, "\(modelUsageMonthDay(p.period.from))–\(modelUsageMonthDay(p.period.to))", l.cyclesHeader)
+        drawHeader(L10n.modelCyclesTitle, modelUsageSpan(p.period.from, p.period.to), l.cyclesHeader)
         drawCycles(p, l.cycles)
         drawFacts(p, l.facts)
         let stamp = report.generatedAt.map { modelUsageStampFormatter.string(from: $0) } ?? report.today
@@ -283,7 +286,7 @@ final class ModelUsageTabView: NSView {
         } else if p.period.prev != nil {
             claudeLine = L10n.modelPrevZero
         } else {
-            claudeLine = "\(modelUsageMonthDay(p.period.from))–\(modelUsageMonthDay(p.period.to))"
+            claudeLine = modelUsageSpan(p.period.from, p.period.to)
         }
         PanelDraw.text(PanelDraw.clipped(claudeLine, TeamClaudePalette.microFont, maxWidth: half - 28), x, rect.minY + 64,
                        TeamClaudePalette.microFont, TeamClaudePalette.fg3)
@@ -399,18 +402,25 @@ final class ModelUsageTabView: NSView {
         if peak > 0 { PanelDraw.right(modelUsageCount(peak), rect.maxX, rect.minY + 1, TeamClaudePalette.smallFont, TeamClaudePalette.fg3) }
     }
 
+    /// 한 막대에 최소 2pt(막대 1 + 간격 1). 그보다 날이 많으면 이어진 날을 묶는다.
+    private func chartBars(_ bars: [ModelUsageDayBar], _ rect: NSRect) -> [ModelUsageDayBar] {
+        modelUsageBucketed(bars, maxBars: Int(rect.width / 2))
+    }
+
     private func drawClaudeChart(_ p: ModelUsagePresentation, _ rect: NSRect) {
-        let peak = p.claudeDays.map(\.total).max() ?? 0
+        let days = chartBars(p.claudeDays, rect)
+        let peak = days.map(\.total).max() ?? 0
         let legend = NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: ModelUsageLayout.chartLegendHeight)
         drawLegend(L10n.modelClaudeChart(Self.metricLabel(p.selection.metric)), color: TeamClaudePalette.series[0], peak: peak, rect: legend)
-        drawStacked(p.claudeDays, peak: peak, color: modelColor, rect: NSRect(x: rect.minX, y: legend.maxY, width: rect.width, height: ModelUsageLayout.chartHeight))
+        drawStacked(days, peak: peak, color: modelColor, rect: NSRect(x: rect.minX, y: legend.maxY, width: rect.width, height: ModelUsageLayout.chartHeight))
     }
 
     private func drawCodexChart(_ p: ModelUsagePresentation, _ rect: NSRect) {
-        let peak = p.codexDays.map(\.total).max() ?? 0
+        let days = chartBars(p.codexDays, rect)
+        let peak = days.map(\.total).max() ?? 0
         let legend = NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: ModelUsageLayout.chartLegendHeight)
         drawLegend(L10n.modelCodexChart, color: TeamClaudePalette.series[1], peak: peak, rect: legend)
-        drawStacked(p.codexDays, peak: peak, color: codexPartColor, rect: NSRect(x: rect.minX, y: legend.maxY, width: rect.width, height: ModelUsageLayout.chartHeight))
+        drawStacked(days, peak: peak, color: codexPartColor, rect: NSRect(x: rect.minX, y: legend.maxY, width: rect.width, height: ModelUsageLayout.chartHeight))
     }
 
     private func barSlots(_ count: Int, _ rect: NSRect) -> (width: CGFloat, step: CGFloat) {
@@ -553,8 +563,9 @@ final class ModelUsageTabView: NSView {
                        TeamClaudePalette.legendFont, TeamClaudePalette.fg2)
         let bars = p.cycles5h.map { ModelUsageDayBar(date: $0.date, parts: [ModelUsageBarPart(key: 0, value: $0.exhausted),
                                                                              ModelUsageBarPart(key: 1, value: max(0, $0.cycles - $0.exhausted))], hatched: $0.hatched) }
-        let peak = bars.map(\.total).max() ?? 0
-        drawStacked(bars, peak: peak, color: { $0 == 0 ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.35) },
+        let grouped = chartBars(bars, rect)
+        let peak = grouped.map(\.total).max() ?? 0
+        drawStacked(grouped, peak: peak, color: { $0 == 0 ? TeamClaudePalette.amber : TeamClaudePalette.ash.withAlphaComponent(0.35) },
                     rect: NSRect(x: rect.minX, y: rect.minY + 20, width: rect.width, height: ModelUsageLayout.chartHeight))
         var x = rect.minX
         let y = rect.minY + 20 + ModelUsageLayout.chartHeight + 2

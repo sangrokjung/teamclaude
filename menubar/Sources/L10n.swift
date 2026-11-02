@@ -889,6 +889,7 @@ enum L10n {
     static var modelRangeWeek: String { t("7일", "7d") }
     static var modelRangeFortnight: String { t("14일", "14d") }
     static var modelRangeAll: String { t("전체", "All") }
+    static func modelRangeAllSince(_ day: String) -> String { t("전체(\(day)부터)", "All (since \(day))") }
     static var modelMetricCalls: String { t("호출", "Calls") }
     static var modelMetricOutput: String { t("출력 토큰", "Output tokens") }
     static var modelMetricTotal: String { t("전체 토큰", "All tokens") }

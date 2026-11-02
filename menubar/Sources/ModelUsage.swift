@@ -161,8 +161,36 @@ func modelUsageAddDays(_ day: String, _ n: Int) -> String {
 func modelUsageDays(_ from: String, _ to: String) -> [String] {
     var out: [String] = []
     var day = from
-    while day <= to, out.count < 400 { out.append(day); day = modelUsageAddDays(day, 1) }
+    // '전체'는 수집기가 보존한 범위 전체다. 상한은 깨진 입력에서 끝없이 돌지 않게 하는 안전판(10년)일 뿐이다.
+    while day <= to, out.count < 3_660 { out.append(day); day = modelUsageAddDays(day, 1) }
     return out
+}
+
+/// 기간 표시 "10/27–11/2". 해가 다르면 앞쪽에 연도를 붙인다("25/1/1–11/2").
+func modelUsageSpan(_ from: String, _ to: String) -> String {
+    "\(modelUsageDayLabel(from, yearOf: to))–\(modelUsageMonthDay(to))"
+}
+
+/// 기준 날짜와 해가 다르면 "25/1/1", 같으면 "1/1".
+func modelUsageDayLabel(_ day: String, yearOf reference: String) -> String {
+    day.prefix(4) == reference.prefix(4) ? modelUsageMonthDay(day) : "\(day.dropFirst(2).prefix(2))/\(modelUsageMonthDay(day))"
+}
+
+/// 막대가 그릴 폭보다 많으면 이어진 날을 묶어 한 막대로 합친다(값은 더하고, 하나라도 빗금이면 빗금). 날짜는 묶음의 첫날.
+func modelUsageBucketed(_ bars: [ModelUsageDayBar], maxBars: Int) -> [ModelUsageDayBar] {
+    guard maxBars > 0, bars.count > maxBars else { return bars }
+    let size = (bars.count + maxBars - 1) / maxBars
+    return stride(from: 0, to: bars.count, by: size).map { start in
+        let group = bars[start..<min(start + size, bars.count)]
+        var sums: [Int: Double] = [:]
+        var order: [Int] = []
+        for part in group.flatMap(\.parts) {
+            if sums[part.key] == nil { order.append(part.key) }
+            sums[part.key, default: 0] += part.value
+        }
+        return ModelUsageDayBar(date: group.first!.date, parts: order.map { ModelUsageBarPart(key: $0, value: sums[$0]!) },
+                                hatched: group.contains(where: \.hatched))
+    }
 }
 
 /// "11/2"

@@ -19,12 +19,13 @@
 - 입력(읽기 전용): Claude Code `~/.claude/projects/**/*.jsonl`·`~/.claude-pure/projects/**/*.jsonl`, Codex `~/.codex/sessions/**/*.jsonl`·`~/.codex/archived_sessions`, 적대 검증 영수증 `~/.claude/cache/codex-review/*.json`(+같은 이름 `*.codex-{astra,sol}.log`의 "tokens used"), 구현 루프 `~/.claude/cache/codex-impl-loop/*/ledger.json`, Hermes `~/.hermes*/state.db`(sqlite 읽기 전용), 메뉴바 주기 이력 `~/.codex/cache/cc-menubar-quota-history-v1.json`, 프록시 status `http://127.0.0.1:3456|3457/teamclaude/status`.
 - 증분: 상태는 `~/.local/state/cc-menubar/model-usage.sqlite`. jsonl은 파일별 (inode, size, mtime, 오프셋)을 기억해 붙은 줄만 읽고, 줄이 끝나지 않은 꼬리는 다음 회차로 미룬다. 파일이 줄었거나 inode가 바뀌었거나, 오프셋 바로 앞 4KB 지문이 달라졌으면(같은 inode 재작성) 처음부터 다시 읽는다(중복 키가 막는다). 영수증은 파일 mtime이 바뀐 것만 다시 읽고, `*.codex-{astra,sol}.log` mtime이 바뀌면 같은 run_id의 tokens만 다시 읽는다(실행 수는 그대로). 수집 시작 시각보다 늦게 붙은 줄도 그 회차에 센다(시각으로 거르지 않는다 → 오프셋만 넘어가 누락되는 일이 없다). 상태 형식이 바뀌면(stateVersion) 남은 로그로 다시 모은다.
 - 중복 제거: Claude는 `message.id:requestId`, Codex는 `세션 id:시각:누적 토큰`을 키로 한 번만 센다. 영수증은 `run_id`로 한 번만 센다(같은 run_id 사본 여럿 → 1회).
-- Hermes: state.db는 세션·모델별 누적값만 준다. 직전 누적값과 관측 시각을 상태 DB에 두고 늘어난 몫만 쌓는다. 늘어난 구간(직전 관측 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로, 자정을 넘으면 호출별 시각이 없어 날마다 나눌 수 없으므로 `undated`로 따로 낸다(일별·기간 합계에 넣지 않는다).
+- Hermes: state.db는 세션·모델별 누적값만 준다. 직전 누적값과 그것을 본 수집 시각(수집 시작 시각, 누적값이 그대로여도 매번 갱신)을 상태 DB에 두고 늘어난 몫만 쌓는다. 늘어난 구간(직전 수집 시각 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로, 자정을 넘으면 호출별 시각이 없어 날마다 나눌 수 없으므로 `undated`로 따로 낸다(일별·기간 합계에 넣지 않는다).
 - 구현 루프: 실행(폴더)마다 날짜·라운드 수를 상태 DB에 남긴다. 원장이 지워져도 남긴 집계는 그대로고, 같은 실행의 라운드가 늘면 그 값으로 바꾼다.
 - 주기 이력: 메뉴바는 창마다 최근 256개만 남긴다. 수집기는 주기마다 안정 식별자로 상태 DB에 쌓고, 파일이 상한까지 찼는데 가장 오래된 주기를 처음 보면 그 다음 날을 `completeFrom`으로 올린다. 화면은 그 앞 날을 0이 아니라 빗금(모름)으로 그리고 합계 문장에 경계 날짜를 붙인다.
 - 보존: 한번 모은 날짜별 합계는 원본 로그가 지워져도 남는다. 기록이 빈 구간은 `coverage`에 밝힌다. Claude는 "수집기 첫 실행일 − cleanupPeriodDays(없으면 30)"의 다음 날부터 온전하다고 본다.
 - 출력: `~/.local/state/cc-menubar/model-usage.json`(원자적 쓰기, 0600). 스키마 `schema: 1`:
-  - `generatedAt`(ISO), `today`(로컬 날짜), `since`(첫 날짜)
+  - `generatedAt`(ISO), `today`(로컬 날짜), `since`(실은 첫 날짜. 기본은 상태 DB에 보존한 가장 이른 날이라 '전체'가 보존 범위 전체다. `--since`를 주면 그날부터)
+  - `scan`: `bytesRead`, `files`, `malformed{claude, codex, status}`(모양이 다른 외부 기록을 건너뛴 수. 한 줄·한 계정이 이상해도 수집 전체는 계속한다)
   - `coverage`: `claudeCompleteFrom`, `claudeRetentionDays`, `codexCliLastDay`, `receiptFirstDay`
   - `daily[]`: `date, lane(claude|codex|other), model, source(claude-code|codex-cli|hermes), input, output, cacheRead, cacheWrite, calls`
   - `undated[]`: `lane, model, source, input, output, cacheRead, cacheWrite, calls`(날짜 불명 몫)
@@ -37,7 +38,7 @@
 - 실행: `python3 scripts/model-usage-collector.py [--out PATH] [--state PATH] [--home PATH] [--since YYYY-MM-DD]`, `--install`은 구독 수집기와 같은 qgate 경유 LaunchAgent(`com.qjc.cc-model-usage`, 1시간)를 만든다.
 
 ## 화면 계약 (탭 "모델")
-- 조작: 기간 7일·14일·전체, 지표 호출·출력 토큰·전체 토큰. 고른 값은 갱신·재구성 뒤에도 유지한다.
+- 조작: 기간 7일·14일·전체, 지표 호출·출력 토큰·전체 토큰. 고른 값은 갱신·재구성 뒤에도 유지한다. '전체'는 보존 시작일을 요약에 함께 적고("전체(8/25부터)"), 날짜가 막대 폭보다 많으면 이어진 날을 묶어 그린다(합은 그대로).
 - 큰 숫자 두 칸: Claude(고른 지표, 앞 기간 대비. 앞 기간 기록이 온전하지 않으면 비교하지 않는다고 밝힘), Codex 주당 Pro 200 환산(추정 배지, 범위, CLI 로그가 끊긴 뒤 기간이면 하한 배지).
 - 출처별 5줄: Claude Code·Codex CLI(응답), Codex 적대 검증·구현 루프(실행), Hermes(호출). 토큰 없는 구현 루프는 "토큰 없음 · 횟수로만". 줄마다 주별 막대(자기 눈금).
 - 날짜별: Claude 지표 막대(모델별 쌓기), Codex 비캐시 토큰 막대(출처별 쌓기). Claude 기록이 빈 날은 빗금, CLI 로그가 끊긴 뒤 날은 빗금(하한).

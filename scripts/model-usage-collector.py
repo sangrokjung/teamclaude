@@ -39,11 +39,10 @@ DEFAULT_OUT = STATE_DIR / 'model-usage.json'
 DEFAULT_STATE = STATE_DIR / 'model-usage.sqlite'
 LABEL = 'com.qjc.cc-model-usage'
 SCHEMA = 1
-OUTPUT_DAYS = 70          # JSON에 싣는 날짜 범위(10주)
 SEEN_KEEP_DAYS = 120      # 중복 제거 키를 기억하는 기간
 DEFAULT_RETENTION = 30    # Claude Code cleanupPeriodDays 기본값
 TOKENS_RE = re.compile(r'tokens used\s*\n\s*([\d,]+)')
-STATE_VERSION = '3'
+STATE_VERSION = '4'
 # 메뉴바(main.swift recordQuotaObservation)는 주기 이력을 레인·창마다 최근 256개만 남긴다. 그만큼 찬 파일은 앞이 잘렸을 수 있다.
 HISTORY_KEEP_PER_WINDOW = 256
 # windows는 2형식의 표다(재구성 때 지운다).
@@ -90,7 +89,7 @@ def open_state(path: Path) -> sqlite3.Connection:
     create table if not exists receipt_logs (path text primary key, mtime real);
     create table if not exists receipts (run_id text primary key, canonical integer, base text, date text, tokens integer, review_sec real);
     create table if not exists hermes_seen (key text primary key, calls integer, input integer, output integer,
-        cache_read integer, cache_write integer, last_seen real);
+        cache_read integer, cache_write integer, observed_at real);
     create table if not exists undated (lane text, model text, source text, input integer, output integer,
         cache_read integer, cache_write integer, calls integer, primary key (lane, model, source));
     create table if not exists cycles (key text primary key, window text, date text, exhausted integer);
@@ -149,6 +148,8 @@ class Scan:
     def __init__(self):
         self.bytes_read = 0
         self.files = 0
+        # 모양이 예상과 다른 외부 기록(건너뛴 수). 출처별로 결과 JSON에 싣는다.
+        self.malformed = {'claude': 0, 'codex': 0, 'status': 0}
 
 
 def jsonl_files(root: Path):
@@ -227,8 +228,14 @@ def collect_claude(db, home, tz, scan):
             o = json.loads(line)
         except ValueError:
             return
-        msg = o.get('message') if isinstance(o, dict) else None
-        if o.get('type') != 'assistant' or not isinstance(msg, dict) or not isinstance(msg.get('usage'), dict):
+        if not isinstance(o, dict):
+            scan.malformed['claude'] += 1
+            return
+        if o.get('type') != 'assistant':
+            return
+        msg = o.get('message')
+        if not isinstance(msg, dict) or not isinstance(msg.get('usage'), dict):
+            scan.malformed['claude'] += 1
             return
         model = msg.get('model')
         ts = parse_ts(o.get('timestamp'))
@@ -262,7 +269,7 @@ def weekly_window(rate_limits):
     return int(weekly['resets_at']), float(weekly['used_percent'])
 
 
-def codex_handle(db, tz, path):
+def codex_handle(db, tz, path, scan):
     def handle(line, ctx):
         if '"turn_context"' not in line and '"token_count"' not in line and '"session_meta"' not in line:
             return
@@ -270,7 +277,10 @@ def codex_handle(db, tz, path):
             o = json.loads(line)
         except ValueError:
             return
-        p = o.get('payload') or {}
+        p = o.get('payload') if isinstance(o, dict) else None
+        if not isinstance(p, dict):
+            scan.malformed['codex'] += 1
+            return
         if o.get('type') == 'session_meta':
             if p.get('id'):
                 ctx['session'] = p['id']
@@ -284,16 +294,19 @@ def codex_handle(db, tz, path):
         ts = parse_ts(o.get('timestamp'))
         if ts is None:
             return
-        info = p.get('info') or {}
-        total = info.get('total_token_usage')
+        info = p.get('info')
+        total = info.get('total_token_usage') if isinstance(info, dict) else None
         if not isinstance(total, dict):
+            if info is not None:
+                scan.malformed['codex'] += 1
             return
         prev = ctx.get('prev')
         delta = total
         if prev:
             delta = {k: (total.get(k) or 0) - (prev.get(k) or 0) for k in ('input_tokens', 'cached_input_tokens', 'output_tokens')}
             if delta['input_tokens'] < 0 or delta['output_tokens'] < 0:  # 압축·새 스레드: 마지막 호출 값
-                delta = info.get('last_token_usage') or total
+                last = info.get('last_token_usage')
+                delta = last if isinstance(last, dict) else total
         ctx['prev'] = {k: total.get(k) or 0 for k in ('input_tokens', 'cached_input_tokens', 'output_tokens')}
         # prev와 센 값이 늘 함께 움직인다(늦은 줄을 버리면서 prev만 옮기면 다음 차분도 틀린다).
         if (delta.get('input_tokens') or 0) == 0 and (delta.get('output_tokens') or 0) == 0:
@@ -317,7 +330,7 @@ def codex_handle(db, tz, path):
 def collect_codex(db, home, tz, scan):
     for root in (home / '.codex' / 'sessions', home / '.codex' / 'archived_sessions'):
         for path in jsonl_files(root):
-            read_new_lines(db, path, scan, codex_handle(db, tz, path), {'model': 'unknown'})
+            read_new_lines(db, path, scan, codex_handle(db, tz, path, scan), {'model': 'unknown'})
 
 
 # ---------- 적대 검증 영수증 ----------
@@ -453,10 +466,12 @@ def add_undated(db, lane, model, values):
         cache_write = cache_write + excluded.cache_write, calls = calls + excluded.calls""", (lane, model, *values))
 
 
-def collect_hermes(db, home, tz):
-    """Hermes state.db는 세션·모델별 누적값만 준다. 직전 누적값과 관측 시각을 기억해 늘어난 몫만 쌓는다.
-    늘어난 구간(직전 관측 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로,
-    자정을 넘으면 날마다 나눌 수 없어 '날짜 불명'으로 따로 둔다."""
+def collect_hermes(db, home, tz, observed_at: float):
+    """Hermes state.db는 세션·모델별 누적값만 준다. 직전 누적값과 그것을 본 수집 시각을 기억해 늘어난 몫만 쌓는다.
+    늘어난 구간(직전 수집 시각 → 이번 last_seen, 처음 보면 세션 시작 → last_seen)이 하루 안이면 그날로,
+    자정을 넘으면 날마다 나눌 수 없어 '날짜 불명'으로 따로 둔다.
+    observed_at은 이번 수집의 시작 시각이다. state.db를 읽기 전 시각이라 그 스냅샷보다 늦지 않고, 누적값이 그대로여도
+    매번 갱신한다(자정 뒤 무변화 수집이 있었다면 다음 증분은 그날 몫으로 확정된다)."""
     try:
         names = sorted(n for n in os.listdir(home) if re.fullmatch(r'\.hermes(-[a-z0-9]+)?', n))
     except OSError:
@@ -475,9 +490,9 @@ def collect_hermes(db, home, tz):
                 continue
             key = f'{name}|{sid}|{model}|{url}'
             now_vals = [calls or 0, inp or 0, out or 0, cr or 0, cw or 0]
-            row = db.execute('select calls, input, output, cache_read, cache_write, last_seen from hermes_seen where key = ?', (key,)).fetchone()
-            prev, prev_seen = (row[:5], row[5]) if row else (None, None)
-            db.execute('insert or replace into hermes_seen values (?,?,?,?,?,?,?)', (key, *now_vals, float(seen_at)))
+            row = db.execute('select calls, input, output, cache_read, cache_write, observed_at from hermes_seen where key = ?', (key,)).fetchone()
+            prev, prev_observed = (row[:5], row[5]) if row else (None, None)
+            db.execute('insert or replace into hermes_seen values (?,?,?,?,?,?,?)', (key, *now_vals, observed_at))
             delta = [a - b for a, b in zip(now_vals, prev)] if prev else now_vals
             if any(v < 0 for v in delta):
                 delta = now_vals  # 세션이 다시 시작됐다(누적이 줄었다): 지금 값이 새 몫
@@ -485,9 +500,9 @@ def collect_hermes(db, home, tz):
                 continue
             day = local_day(dt.datetime.fromtimestamp(float(seen_at), dt.timezone.utc), tz)
             lane, model = hermes_lane(url or ''), model or 'unknown'
-            # 이 증분이 생긴 구간의 시작: 처음 보는 세션이면 세션 시작, 아니면 직전 관측 시각. 그 구간에 자정이 끼면
+            # 이 증분이 생긴 구간의 시작: 처음 보는 세션이면 세션 시작, 아니면 직전 수집 시각. 그 구간에 자정이 끼면
             # 호출별 시각이 없어 날마다 나눌 수 없으므로 날짜 불명으로 둔다.
-            span_start = started if prev is None else prev_seen
+            span_start = started if prev is None else prev_observed
             first_day = local_day(dt.datetime.fromtimestamp(float(span_start), dt.timezone.utc), tz) if span_start is not None else None
             if first_day != day:
                 add_undated(db, lane, model, [delta[1], delta[2], delta[3], delta[4], delta[0]])
@@ -554,13 +569,16 @@ def fetch_proxy_status(port):
         return None
 
 
-def pool_report(status, prefix):
+def pool_report(status, prefix, scan):
     if not isinstance(status, dict) or not isinstance(status.get('accounts'), list):
         return {'available': False, 'threshold': None, 'accounts': []}
     accounts = []
-    for i, a in enumerate(status['accounts'], 1):
-        q = a.get('quota') if isinstance(a, dict) and isinstance(a.get('quota'), dict) else {}
-        accounts.append({'label': f'{prefix}{i:02d}', 'util7d': q.get('unified7d'), 'reset7d': q.get('unified7dReset'),
+    for a in status['accounts']:
+        if not isinstance(a, dict):
+            scan.malformed['status'] += 1
+            continue
+        q = a.get('quota') if isinstance(a.get('quota'), dict) else {}
+        accounts.append({'label': f'{prefix}{len(accounts) + 1:02d}', 'util7d': q.get('unified7d'), 'reset7d': q.get('unified7dReset'),
                          'usable': bool(a.get('usable')), 'enabled': a.get('enabled') is not False})
     return {'available': True, 'threshold': status.get('switchThreshold'), 'accounts': accounts}
 
@@ -613,6 +631,14 @@ def pro200_estimate(observations, tz):
 
 # ---------- 조립 ----------
 
+def first_kept_day(db):
+    """상태 DB에 남은 가장 이른 날짜(일별·영수증·구현 루프·주기 이력 중)."""
+    days = [db.execute(sql).fetchone()[0] for sql in ('select min(date) from daily', 'select min(date) from receipts',
+                                                      'select min(date) from impl_runs', 'select min(date) from cycles')]
+    days = [d for d in days if d]
+    return min(days) if days else None
+
+
 def daily_rows(db, since):
     return [{'date': d, 'lane': lane, 'model': m, 'source': s, 'input': i, 'output': o, 'cacheRead': cr, 'cacheWrite': cw, 'calls': c}
             for d, lane, m, s, i, o, cr, cw, c in db.execute(
@@ -637,7 +663,6 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
     tz = tz or dt.datetime.now().astimezone().tzinfo
     now = now or dt.datetime.now(dt.timezone.utc)
     today = local_day(now, tz)
-    since = since or (dt.date.fromisoformat(today) - dt.timedelta(days=OUTPUT_DAYS - 1)).isoformat()
     scan = Scan()
     db = open_state(state_path)
     try:
@@ -646,7 +671,7 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         retention = collect_claude(db, home, tz, scan)
         collect_codex(db, home, tz, scan)
         collect_receipts(db, home, tz, scan)
-        collect_hermes(db, home, tz)
+        collect_hermes(db, home, tz, now.timestamp())
         collect_cycles(db, home, tz)
         collect_impl(db, home)
         keep_from = dt.date.fromisoformat(today) - dt.timedelta(days=SEEN_KEEP_DAYS)
@@ -654,6 +679,8 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         keep_ms = int(dt.datetime.combine(keep_from, dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
         db.execute('delete from codex_obs where ts < ?', (keep_ms,))  # 기준값 표본도 같은 기간만 둔다
         db.commit()
+        # 기본은 보존한 범위 전체를 싣는다(화면의 '전체'가 실제 보존 시작일부터). --since를 주면 그날부터만.
+        since = since or first_kept_day(db) or today
         stored = daily_rows(db, since)
         pro200 = pro200_estimate(db.execute('select reset, ts, pct, noncache from codex_obs').fetchall(), tz)
         receipts = receipts_report(db, since)
@@ -679,8 +706,8 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
         'implLoop': {'daily': impl},
         'pro200': pro200,
         'quotaCycles': cycles,
-        'pools': {'claude': pool_report(fetch_status(3456), 'C'), 'codex': pool_report(fetch_status(3457), 'X')},
-        'scan': {'bytesRead': scan.bytes_read, 'files': scan.files},
+        'pools': {'claude': pool_report(fetch_status(3456), 'C', scan), 'codex': pool_report(fetch_status(3457), 'X', scan)},
+        'scan': {'bytesRead': scan.bytes_read, 'files': scan.files, 'malformed': scan.malformed},
     }
     atomic_write(out_path, report)
     return report

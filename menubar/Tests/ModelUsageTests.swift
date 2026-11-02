@@ -13,6 +13,7 @@ struct ModelUsageTests {
         testModelRowsAndWeeks()
         testPoolsCyclesAndFacts()
         testCountFormat()
+        testAllRangeCoversEveryKeptDay()
         print("ModelUsageTests: parse, periods, pro, sources, gaps, models, pools, format passed")
     }
 
@@ -172,6 +173,25 @@ struct ModelUsageTests {
         precondition(p.facts.codexOn == 0 && p.facts.codexTotal == 0, "codex pool unavailable in the fixture")
         let fractional = ModelUsageReport.parse(Data(json.replacingOccurrences(of: "03:00:00Z", with: "03:00:00.123456Z").utf8))
         precondition(fractional?.generatedAt != nil, "fractional seconds still parse")
+    }
+
+    /// '전체'는 보존한 범위 전체다(1년이 넘어도). 그릴 때는 막대를 묶되 합은 그대로다.
+    static func testAllRangeCoversEveryKeptDay() {
+        var old = report
+        old.since = "2025-01-01"
+        old.daily.append(ModelUsageRow(date: "2025-01-01", lane: "claude", model: "claude-opus-5", source: "claude-code",
+                                       input: 0, output: 0, cacheRead: 0, cacheWrite: 0, calls: 1000))
+        let all = makeModelUsagePresentation(old, ModelUsageSelection(range: .all, metric: .calls))
+        precondition(all.period.from == "2025-01-01" && all.period.days == 671, "\(all.period.from) \(all.period.days)")
+        precondition(all.claudeValue == 1000 + 100 + 300 + 200 + 50 + 5, "\(all.claudeValue)")
+        precondition(all.claudeDays.count == 671)
+        let grouped = modelUsageBucketed(all.claudeDays, maxBars: 244)
+        precondition(grouped.count <= 244 && grouped.first?.date == "2025-01-01")
+        precondition(grouped.reduce(0) { $0 + $1.total } == all.claudeDays.reduce(0) { $0 + $1.total }, "bucketing keeps the sum")
+        precondition(grouped.first?.hatched == true, "a bucket with a gap day stays hatched")
+        precondition(modelUsageBucketed(all.claudeDays.suffix(7).map { $0 }, maxBars: 244).count == 7, "short ranges are untouched")
+        precondition(modelUsageSpan("2025-01-01", "2026-11-02") == "25/1/1–11/2" && modelUsageSpan("2026-10-27", "2026-11-02") == "10/27–11/2")
+        precondition(L10n.modelRangeAllSince(modelUsageDayLabel(all.period.from, yearOf: all.period.to)) == "전체(25/1/1부터)")
     }
 
     static func testCountFormat() {

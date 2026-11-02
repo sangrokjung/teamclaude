@@ -52,6 +52,8 @@ struct ModelUsageTabLayoutTests {
         precondition(view.presentation?.selection.metric == .output)
         precondition(ModelUsageTabView.summary(report, selection: ModelUsageSelection()).hasPrefix("7일 · Claude 30 호출"),
                      ModelUsageTabView.summary(report, selection: ModelUsageSelection()))
+        let allSummary = ModelUsageTabView.summary(report, selection: ModelUsageSelection(range: .all, metric: .calls))
+        precondition(allSummary.hasPrefix("전체(10/20부터) · Claude 40 호출"), allSummary)
     }
 
     static func render(_ view: NSView) {

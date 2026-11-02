@@ -231,10 +231,10 @@ class CollectorTests(unittest.TestCase):
         return sqlite3.connect(self.fx.home / ".hermes" / "state.db")
 
     def test_hermes_counts_increments_on_the_day_they_were_seen(self):
-        self.fx.run()
+        self.fx.run(now=dt.datetime(2026, 11, 1, 23, 0, tzinfo=TZ))
         utc = dt.timezone.utc
         db = self.hermes_db()
-        # 같은 세션이 다음 날(11/2 KST) 다섯 번 더 호출. 직전 관측(11/1)과 이번 관측 사이에 자정이 껴서
+        # 같은 세션이 다음 날(11/2 KST) 다섯 번 더 호출. 직전 수집(11/1 23:00)과 이번 last_seen 사이에 자정이 껴서
         # 다섯 번이 어느 날 몫인지 알 수 없다 → 날짜 불명
         db.execute("update session_model_usage set api_call_count = 9, input_tokens = 1500, output_tokens = 300, last_seen = ? where session_id = 'h1'",
                    (dt.datetime(2026, 11, 2, 1, tzinfo=utc).timestamp(),))
@@ -264,6 +264,57 @@ class CollectorTests(unittest.TestCase):
         same_day = {(r["date"], r["lane"]): r for r in rows(self.fx.run(), "hermes")}
         self.assertEqual((1, 100, 10), (same_day[("2026-11-02", "codex")]["calls"], same_day[("2026-11-02", "codex")]["input"],
                                         same_day[("2026-11-02", "codex")]["output"]))
+
+    def test_hermes_increment_after_an_unchanged_midnight_observation_is_dated(self):
+        """23:20 호출 → 23:30 수집 → 00:30 무변화 수집 → 01:20 호출 → 01:30 수집. 새 호출은 11/2 몫이다."""
+        utc = dt.timezone.utc
+        db = self.hermes_db()
+        db.execute("update session_model_usage set last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 1, 14, 20, tzinfo=utc).timestamp(),))  # 11/1 23:20 KST
+        db.commit()
+        db.close()
+        self.fx.run(now=dt.datetime(2026, 11, 1, 23, 30, tzinfo=TZ))
+        self.fx.run(now=dt.datetime(2026, 11, 2, 0, 30, tzinfo=TZ))  # 누적값 그대로
+        db = self.hermes_db()
+        db.execute("update session_model_usage set api_call_count = 5, input_tokens = 1100, output_tokens = 220, last_seen = ? where session_id = 'h1'",
+                   (dt.datetime(2026, 11, 1, 16, 20, tzinfo=utc).timestamp(),))  # 11/2 01:20 KST
+        db.commit()
+        db.close()
+        report = self.fx.run(now=dt.datetime(2026, 11, 2, 1, 30, tzinfo=TZ))
+        self.assertEqual([("2026-11-01", 4), ("2026-11-02", 1)], sorted((r["date"], r["calls"]) for r in rows(report, "hermes")))
+        self.assertEqual([], report["undated"])
+
+    def test_all_range_exports_every_kept_day_past_seventy_days(self):
+        self.fx.run()  # 11/1 사용량을 모아 둔다
+        for path in (self.fx.claude_a, self.fx.claude_b, self.fx.codex):
+            path.unlink()  # 원본 로그는 정리됐다
+        later = self.fx.run(now=dt.datetime(2027, 1, 11, 12, 0, tzinfo=TZ))  # 71일 뒤 기본 인자로 다시 수집
+        self.assertLessEqual(later["since"], "2026-11-01")
+        self.assertEqual(2, sum(r["calls"] for r in rows(later, "claude-code")), "kept days stay in the export")
+        self.assertIn("2026-11-01", [r["date"] for r in later["receipts"]["daily"]])
+        self.assertIn("2026-11-01", [r["date"] for r in later["implLoop"]["daily"]])
+        self.assertIn("2026-11-01", [r["date"] for r in later["quotaCycles"]["daily"]])
+        explicit = collector.collect(home=self.fx.home, state_path=self.fx.state, out_path=self.fx.out, tz=TZ,
+                                     now=dt.datetime(2027, 1, 11, 12, 0, tzinfo=TZ), since="2026-12-01", fetch_status=self.fx.status)
+        self.assertEqual(("2026-12-01", []), (explicit["since"], rows(explicit, "claude-code")), "--since still narrows on request")
+
+    def test_malformed_records_are_skipped_and_counted(self):
+        with self.fx.claude_a.open("a") as f:
+            f.write(json.dumps(["assistant", "usage"]) + "\n")
+            f.write(json.dumps({"type": "assistant", "usage": 1, "message": "assistant usage"}) + "\n")
+        with self.fx.codex.open("a") as f:
+            f.write(json.dumps({"timestamp": "2026-11-01T02:00:00Z", "type": "event_msg", "payload": "token_count"}) + "\n")
+            f.write(json.dumps({"timestamp": "2026-11-01T02:00:01Z", "type": "event_msg",
+                                "payload": {"type": "token_count", "info": "x", "rate_limits": []}}) + "\n")
+            f.write(json.dumps(["turn_context"]) + "\n")
+        def status(port):
+            base = self.fx.status(port)
+            return None if base is None else {**base, "accounts": [None, "x", *base["accounts"]]}
+        report = collector.collect(home=self.fx.home, state_path=self.fx.state, out_path=self.fx.out, now=NOW, tz=TZ, fetch_status=status)
+        self.assertEqual(2, sum(r["calls"] for r in rows(report, "claude-code")))
+        self.assertEqual(2, sum(r["calls"] for r in rows(report, "codex-cli")))
+        self.assertEqual(["C01", "C02"], [a["label"] for a in report["pools"]["claude"]["accounts"]])
+        self.assertEqual({"claude": 2, "codex": 3, "status": 2}, report["scan"]["malformed"])
 
     def test_hermes_increment_across_midnight_is_undated(self):
         """23:30 수집 → 23:45·00:15 호출 → 00:30 재수집. 차분 2를 다음 날에 몰아 넣지 않는다."""
