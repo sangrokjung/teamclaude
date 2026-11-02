@@ -10,6 +10,7 @@ import {
   formatSupervisorExitTrace,
   formatWorkerShutdownTrace,
   maskSecrets,
+  summarizeCommand,
   filterPsSnapshot,
   clampSnapshotTimeout,
   captureProcessSnapshot,
@@ -225,7 +226,7 @@ test('filterPsSnapshot keeps signal senders when the row cap bites', () => {
 });
 
 test('filterPsSnapshot masks before matching output and truncates the command to 160 chars', () => {
-  const longCmd = `/usr/local/bin/teamclaude ${'a'.repeat(300)}`;
+  const longCmd = `/usr/local/bin/teamclaude ${'abcd '.repeat(60).trim()}`;
   const raw = `  42     1 Sat Oct 10 21:40:01 2026     ${longCmd}\n`
     + '  43     1 Sat Oct 10 21:40:01 2026     teamcodex --token sk-ant-oat01-SECRETSECRET123\n';
   const { lines } = filterPsSnapshot(raw);
@@ -408,4 +409,23 @@ test('maskSecrets hides digit-free proxy keys and values of auth headers or secr
   ].join('\n');
   const rows = filterPsSnapshot(ps, { selfPid: 1 });
   assert.ok(!/dXNlcjpwYXNz|shortsecretvalue/.test(JSON.stringify(rows)), JSON.stringify(rows));
+});
+
+test('filterPsSnapshot logs only allowlisted arguments: inline code, curl -u and earlier variables never reach the log', () => {
+  const cmds = [
+    'node -e \'const b="dXNlcjpwYXNz";fetch("https://teamclaude.example/status",{headers:{"Authorization":"Basic "+b}})\'',
+    'curl -u alice:violet-meadow https://ops.example/teamclaude/status',
+    'python3 -c \'k="shortkeyvalue"; import urllib.request as u; u.urlopen(u.Request("http://localhost:3456/teamclaude/status", headers={"x-api-key": k}))\'',
+  ];
+  const raw = cmds.map((c, i) => `  ${800 + i}     1 Sat Oct 10 21:40:01 2026     ${c}`).join('\n');
+  const { lines } = filterPsSnapshot(raw);
+  const text = lines.join('\n');
+  assert.equal(lines.length, 3, text);
+  assert.ok(!/dXNlcjpwYXNz|violet-meadow|shortkeyvalue|alice/.test(text), text);
+  assert.ok(lines.some(l => l.endsWith('cmd=node …')), text);
+  assert.ok(lines.some(l => l.endsWith('cmd=curl …')), text);
+  // Signal senders and the proxy CLI keep their plain arguments.
+  assert.equal(summarizeCommand('launchctl kickstart -k gui/501/com.example.teamclaude'), 'launchctl kickstart -k gui/501/com.example.teamclaude');
+  assert.equal(summarizeCommand('/usr/bin/kill -TERM 1234'), '/usr/bin/kill -TERM 1234');
+  assert.equal(summarizeCommand('teamclaude status --name x=y'), 'teamclaude status --name …');
 });

@@ -142,6 +142,39 @@ const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{1,2}:\d{2}:\d{
 // else so the row cap can never hide the likely sender.
 const SIGNAL_SENDER = /(?:^|[\s/])(?:launchctl|kill|pkill|killall)(?:\s|$)|kickstart/i;
 
+// Programs whose plain arguments say who is stopping what (signal senders and
+// the proxy's own CLIs). Any other program is logged by name only: a trace
+// never needs its arguments, and arbitrary argv (inline scripts, curl -u, a
+// credential in a variable declared earlier) cannot be masked reliably.
+const ARG_PROGRAMS = new Set(['launchctl', 'kill', 'pkill', 'killall', 'teamclaude', 'teamcodex', 'cc-menubar']);
+const SCRIPT_RUNNERS = new Set(['node', 'python', 'python3', 'bash', 'sh', 'zsh']);
+const PLAIN_ARG = /^[A-Za-z0-9_./,+%-]{1,80}$/;
+const SCRIPT_PATH = /^[A-Za-z0-9_./-]{1,200}\.(?:m?js|cjs|py|sh)$/;
+
+/**
+ * Allowlist view of a command line: the program name, plus plain arguments
+ * only for ARG_PROGRAMS (stopping at the first argument that is not plain) or
+ * the script path for a script runner. Everything else is replaced by `…`.
+ */
+export function summarizeCommand(command) {
+  const tokens = String(command).trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return '';
+  const name = tokens[0].split('/').pop();
+  const kept = [PLAIN_ARG.test(tokens[0]) ? tokens[0] : name];
+  let rest = tokens.slice(1);
+  if (ARG_PROGRAMS.has(name)) {
+    while (rest.length && PLAIN_ARG.test(rest[0])) kept.push(rest.shift());
+  } else if (SCRIPT_RUNNERS.has(name) && rest.length && SCRIPT_PATH.test(rest[0])) {
+    kept.push(rest.shift());
+    const script = kept[1];
+    if (/(?:^|\/)(?:teamclaude|teamcodex)(?:\/|$)/.test(script)
+        || ARG_PROGRAMS.has(script.split('/').pop().replace(/\.(?:m?js|cjs|py|sh)$/, ''))) {
+      while (rest.length && PLAIN_ARG.test(rest[0])) kept.push(rest.shift());
+    }
+  }
+  return rest.length ? `${kept.join(' ')} …` : kept.join(' ');
+}
+
 /**
  * Parse `ps -axo pid=,ppid=,lstart=,command=` output, keep PS_MATCH rows and
  * render them as `pid= ppid= start="…" cmd=…` with the command masked and cut
@@ -169,7 +202,7 @@ export function filterPsSnapshot(output, { maxLines = DEFAULT_MAX_ROWS } = {}) {
     || (b.startMs - a.startMs || 0)
     || (b.pid - a.pid));
   const lines = ranked.slice(0, Math.max(0, maxLines)).map(row => {
-    const cmd = maskSecrets(row.command.trim()).slice(0, MAX_COMMAND_CHARS);
+    const cmd = maskSecrets(summarizeCommand(row.command)).slice(0, MAX_COMMAND_CHARS);
     return `pid=${row.pid} ppid=${row.ppid} start="${row.start}" cmd=${cmd}`;
   });
   return { lines, total: rows.length };
