@@ -142,35 +142,64 @@ const PS_ROW = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{1,2}:\d{2}:\d{
 // else so the row cap can never hide the likely sender.
 const SIGNAL_SENDER = /(?:^|[\s/])(?:launchctl|kill|pkill|killall)(?:\s|$)|kickstart/i;
 
-// Programs whose plain arguments say who is stopping what (signal senders and
-// the proxy's own CLIs). Any other program is logged by name only: a trace
-// never needs its arguments, and arbitrary argv (inline scripts, curl -u, a
-// credential in a variable declared earlier) cannot be masked reliably.
-const ARG_PROGRAMS = new Set(['launchctl', 'kill', 'pkill', 'killall', 'teamclaude', 'teamcodex', 'cc-menubar']);
-const SCRIPT_RUNNERS = new Set(['node', 'python', 'python3', 'bash', 'sh', 'zsh']);
-const PLAIN_ARG = /^[A-Za-z0-9_./,+%-]{1,80}$/;
+// A trace only needs to say who is stopping what, so arguments are kept by
+// meaning, never by program alone: values a program merely carries (launchctl
+// setenv, an inline script, curl -u, a credential declared earlier) are not
+// maskable reliably and are dropped. Anything not listed is name + `…`.
+const PATH_ARG = /^[A-Za-z0-9_./-]{1,200}$/;
+const FLAG = /^-{1,2}[A-Za-z0-9]{1,12}$/;
+const PID = /^\d{1,9}$/;
+const SERVICE = /^(?:(?:gui|user|system|pid)\/[0-9]+(?:\/[A-Za-z0-9_.-]{1,120})?|[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,})$/;
 const SCRIPT_PATH = /^[A-Za-z0-9_./-]{1,200}\.(?:m?js|cjs|py|sh)$/;
+const LAUNCHCTL_SUBCOMMANDS = new Set([
+  'kickstart', 'stop', 'start', 'kill', 'bootout', 'bootstrap', 'load', 'unload',
+  'enable', 'disable', 'remove', 'restart', 'print', 'list',
+]);
+const PROXY_SUBCOMMANDS = new Set([
+  'server', 'status', 'stop', 'restart', 'run', 'resume', 'codex', 'accounts', 'enable',
+  'disable', 'priority', 'remove', 'import', 'login', 'reauth', 'subscription', 'api',
+  'api-credit', 'env', 'cloud-dispatch',
+]);
+const PROXY_CLIS = new Set(['teamclaude', 'teamcodex']);
+const SCRIPT_RUNNERS = new Set(['node', 'python', 'python3', 'bash', 'sh', 'zsh']);
+
+function takeWhile(rest, test, max = 8) {
+  const kept = [];
+  while (rest.length && kept.length < max && test(rest[0])) kept.push(rest.shift());
+  return kept;
+}
+
+function proxySubcommands(rest) {
+  return takeWhile(rest, token => PROXY_SUBCOMMANDS.has(token), 2);
+}
 
 /**
- * Allowlist view of a command line: the program name, plus plain arguments
- * only for ARG_PROGRAMS (stopping at the first argument that is not plain) or
- * the script path for a script runner. Everything else is replaced by `…`.
+ * Allowlist view of a command line for the stop-signal trace: the program,
+ * plus only arguments whose meaning is known to be safe. `launchctl` keeps a
+ * control subcommand with its flags and service targets; `kill`/`pkill`/
+ * `killall` keep signal flags and PIDs; the proxy CLI (direct or as the
+ * package's `src/index.js`) keeps known subcommand words. Everything else is
+ * replaced by `…`.
  */
 export function summarizeCommand(command) {
   const tokens = String(command).trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return '';
   const name = tokens[0].split('/').pop();
-  const kept = [PLAIN_ARG.test(tokens[0]) ? tokens[0] : name];
-  let rest = tokens.slice(1);
-  if (ARG_PROGRAMS.has(name)) {
-    while (rest.length && PLAIN_ARG.test(rest[0])) kept.push(rest.shift());
-  } else if (SCRIPT_RUNNERS.has(name) && rest.length && SCRIPT_PATH.test(rest[0])) {
-    kept.push(rest.shift());
-    const script = kept[1];
-    if (/(?:^|\/)(?:teamclaude|teamcodex)(?:\/|$)/.test(script)
-        || ARG_PROGRAMS.has(script.split('/').pop().replace(/\.(?:m?js|cjs|py|sh)$/, ''))) {
-      while (rest.length && PLAIN_ARG.test(rest[0])) kept.push(rest.shift());
+  const kept = [PATH_ARG.test(tokens[0]) ? tokens[0] : name];
+  const rest = tokens.slice(1);
+  if (name === 'launchctl') {
+    if (rest.length && LAUNCHCTL_SUBCOMMANDS.has(rest[0])) {
+      kept.push(rest.shift());
+      kept.push(...takeWhile(rest, t => FLAG.test(t) || SERVICE.test(t)));
     }
+  } else if (name === 'kill' || name === 'pkill' || name === 'killall') {
+    kept.push(...takeWhile(rest, t => FLAG.test(t) || PID.test(t), 16));
+  } else if (PROXY_CLIS.has(name)) {
+    kept.push(...proxySubcommands(rest));
+  } else if (SCRIPT_RUNNERS.has(name) && rest.length && SCRIPT_PATH.test(rest[0])) {
+    const script = rest.shift();
+    kept.push(script);
+    if (/(?:^|\/)(?:teamclaude|teamcodex)\/src\/index\.js$/.test(script)) kept.push(...proxySubcommands(rest));
   }
   return rest.length ? `${kept.join(' ')} …` : kept.join(' ');
 }

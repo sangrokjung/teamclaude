@@ -202,7 +202,7 @@ test('filterPsSnapshot keeps matching rows as pid/ppid/start/cmd and masks secre
   assert.equal(total, 3);
   // Signal senders (launchctl/kickstart/kill family) first, then newest first.
   assert.deepEqual(lines, [
-    'pid=779 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=/usr/bin/pkill -f something',
+    'pid=779 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=/usr/bin/pkill -f …',
     'pid=777 ppid=650 start="Sat Oct 10 21:40:01 2026" cmd=launchctl kickstart -k gui/501/com.example.teamclaude',
     'pid=500 ppid=1 start="Sat Oct 10 21:39:58 2026" cmd=/usr/local/bin/node /usr/local/lib/node_modules/teamcodex/src/index.js server',
   ]);
@@ -226,7 +226,7 @@ test('filterPsSnapshot keeps signal senders when the row cap bites', () => {
 });
 
 test('filterPsSnapshot masks before matching output and truncates the command to 160 chars', () => {
-  const longCmd = `/usr/local/bin/teamclaude ${'abcd '.repeat(60).trim()}`;
+  const longCmd = `launchctl bootout gui/501/com.example.${'a'.repeat(100)} gui/501/com.example.${'b'.repeat(100)}`;
   const raw = `  42     1 Sat Oct 10 21:40:01 2026     ${longCmd}\n`
     + '  43     1 Sat Oct 10 21:40:01 2026     teamcodex --token sk-ant-oat01-SECRETSECRET123\n';
   const { lines } = filterPsSnapshot(raw);
@@ -234,7 +234,7 @@ test('filterPsSnapshot masks before matching output and truncates the command to
   const cmd0 = byPid(42).split(' cmd=')[1];
   assert.equal(cmd0.length, 160);
   assert.ok(longCmd.startsWith(cmd0));
-  assert.ok(byPid(43).endsWith('cmd=teamcodex --token ***'), byPid(43));
+  assert.ok(byPid(43).endsWith('cmd=teamcodex …'), byPid(43));
 });
 
 test('filterPsSnapshot caps the number of rows', () => {
@@ -427,5 +427,24 @@ test('filterPsSnapshot logs only allowlisted arguments: inline code, curl -u and
   // Signal senders and the proxy CLI keep their plain arguments.
   assert.equal(summarizeCommand('launchctl kickstart -k gui/501/com.example.teamclaude'), 'launchctl kickstart -k gui/501/com.example.teamclaude');
   assert.equal(summarizeCommand('/usr/bin/kill -TERM 1234'), '/usr/bin/kill -TERM 1234');
-  assert.equal(summarizeCommand('teamclaude status --name x=y'), 'teamclaude status --name …');
+  assert.equal(summarizeCommand('teamclaude status --name x=y'), 'teamclaude status …');
+});
+
+test('summarizeCommand keeps arguments by meaning: launchctl setenv values, credential options and arbitrary scripts are dropped', () => {
+  const raw = [
+    'launchctl setenv SMTP_PASS violet-meadow',
+    'launchctl setenv BASIC_AUTH dXNlcjpwYXNz',
+    'node /opt/teamclaude/diagnose.js --credential violet-meadow',
+    'teamclaude violet-meadow status',
+  ].map((c, i) => `  ${900 + i}     1 Sat Oct 10 21:40:01 2026     ${c}`).join('\n');
+  const { lines } = filterPsSnapshot(raw);
+  const text = lines.join('\n');
+  assert.equal(lines.length, 4, text);
+  assert.ok(!/violet-meadow|dXNlcjpwYXNz|SMTP_PASS|BASIC_AUTH|credential/.test(text), text);
+  assert.equal(summarizeCommand('launchctl setenv SMTP_PASS violet-meadow'), 'launchctl …');
+  assert.equal(summarizeCommand('node /opt/teamclaude/diagnose.js --credential x'), 'node /opt/teamclaude/diagnose.js …');
+  assert.equal(summarizeCommand('/usr/local/bin/node /usr/local/lib/node_modules/teamcodex/src/index.js codex server'),
+    '/usr/local/bin/node /usr/local/lib/node_modules/teamcodex/src/index.js codex server');
+  assert.equal(summarizeCommand('launchctl bootout gui/501/com.example.teamclaude'), 'launchctl bootout gui/501/com.example.teamclaude');
+  assert.equal(summarizeCommand('kill -9 4321'), 'kill -9 4321');
 });
