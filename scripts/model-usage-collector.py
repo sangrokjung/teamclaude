@@ -537,7 +537,7 @@ def collect(home: Path, state_path: Path, out_path: Path, now=None, tz=None, sin
     hermes = sorted(collect_hermes(home, tz, now), key=lambda r: (r['date'], r['lane'], r['model']))
     report = {
         'schema': SCHEMA,
-        'generatedAt': now.astimezone(dt.timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'generatedAt': now.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z'),
         'today': today,
         'since': since,
         'coverage': {'claudeCompleteFrom': complete_from, 'claudeRetentionDays': retention,

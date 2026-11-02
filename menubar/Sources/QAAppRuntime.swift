@@ -48,6 +48,7 @@ final class QAAppRuntime: QAExecutionRuntime {
         case "3": keyCode = 20
         case "4": keyCode = 21
         case "5": keyCode = 23
+        case "6": keyCode = 22
         case "r": keyCode = 15
         case "cmd+k": keyCode = 40
         case "escape": keyCode = 53

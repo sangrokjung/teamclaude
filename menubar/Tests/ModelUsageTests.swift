@@ -153,6 +153,9 @@ struct ModelUsageTests {
         precondition(p.cycleSummary.fiveCycles == 4 && p.cycleSummary.fiveExhausted == 3 && p.cycleSummary.weekCycles == 2)
         precondition(p.facts.weekLabel == "W44" && p.facts.reviewRuns == 4 && p.facts.implRuns == 2)
         precondition(p.facts.lowerBound, "W44 ends after the last CLI day")
+        precondition(p.facts.codexOn == 0 && p.facts.codexTotal == 0, "codex pool unavailable in the fixture")
+        let fractional = ModelUsageReport.parse(Data(json.replacingOccurrences(of: "03:00:00Z", with: "03:00:00.123456Z").utf8))
+        precondition(fractional?.generatedAt != nil, "fractional seconds still parse")
     }
 
     static func testCountFormat() {

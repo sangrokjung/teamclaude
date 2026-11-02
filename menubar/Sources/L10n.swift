@@ -899,7 +899,7 @@ enum L10n {
     static var modelBadgeLowerBound: String { t("하한", "Lower bound") }
     static var modelCodexUnit: String { t("계정분", "accounts") }
     static func modelVsPrevious(_ days: Int, _ delta: String) -> String { t("앞선 \(days)일보다 \(delta)", "\(delta) vs previous \(days)d") }
-    static var modelPrevIncomplete: String { t("앞 기간은 Claude 기록이 일부만 남아 비교 안 함", "Previous period is partly missing, not compared") }
+    static var modelPrevIncomplete: String { t("앞 기간은 Claude 기록이 일부만 남아 비교 안 함", "Previous period partial, not compared") }
     static var modelPrevZero: String { t("앞 기간 기록 없음", "No record in the previous period") }
     static func modelCodexRange(_ lo: String, _ hi: String, _ tokens: String) -> String {
         t("범위 \(lo)~\(hi) · 비캐시 \(tokens) 토큰", "range \(lo)–\(hi) · \(tokens) non-cached tokens")

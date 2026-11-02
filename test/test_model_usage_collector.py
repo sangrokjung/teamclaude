@@ -226,6 +226,7 @@ class CollectorTests(unittest.TestCase):
             self.assertNotIn(needle, text)
         self.assertEqual(0o600, os.stat(self.fx.out).st_mode & 0o777)
         self.assertEqual(1, json.loads(text)["schema"])
+        self.assertEqual("2026-11-02T03:00:00Z", json.loads(text)["generatedAt"])
 
     def test_pro200_estimate_uses_window_consumption(self):
         daily = [{"date": "2026-10-20", "source": "codex-cli", "input": 60_000_000, "cacheRead": 40_000_000, "output": 10_000_000}]

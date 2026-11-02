@@ -66,7 +66,7 @@ struct ModelUsageReport {
               (root["schema"] as? NSNumber)?.intValue == modelUsageSchema,
               let today = root["today"] as? String, modelUsageDate(today) != nil else { return nil }
         var r = ModelUsageReport(today: today, since: (root["since"] as? String) ?? today)
-        r.generatedAt = (root["generatedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        r.generatedAt = (root["generatedAt"] as? String).flatMap(modelUsageParseInstant)
         let cov = root["coverage"] as? [String: Any] ?? [:]
         r.coverage = ModelUsageCoverage(claudeCompleteFrom: cov["claudeCompleteFrom"] as? String,
                                         claudeRetentionDays: (cov["claudeRetentionDays"] as? NSNumber)?.intValue,
@@ -109,6 +109,15 @@ struct ModelUsageReport {
         }
         return ModelUsagePool(available: true, accounts: accounts)
     }
+}
+
+/// ISO 8601 시각(소수 초가 있어도 읽는다).
+func modelUsageParseInstant(_ value: String) -> Date? {
+    let plain = ISO8601DateFormatter()
+    if let date = plain.date(from: value) { return date }
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return fractional.date(from: value)
 }
 
 // MARK: 날짜(문자열 YYYY-MM-DD, 시간대 없는 날짜 산술)
@@ -417,7 +426,7 @@ private func facts(_ r: ModelUsageReport) -> ModelUsageFacts {
     let weeks = modelUsageWeeks(today: r.today, count: 2)
     let last = weeks.first ?? ModelUsageWeek(from: r.today, to: r.today, label: "", partial: true)
     let d = modelUsageCodexNoncache(r, last.from, last.to)
-    let on = r.codexPool.accounts.filter { $0.enabled && $0.usable }.count
+    let on = r.codexPool.accounts.filter(\.enabled).count  // 켜진(설정상 사용) 계정. 지금 한도에 막혔는지는 풀 막대가 말한다
     return ModelUsageFacts(weekLabel: last.label, pro: toPro(r, d.cli + d.review + d.hermes, days: 7), lowerBound: lowerBound(r, to: last.to),
                            reviewRuns: sourceTotal(r, .codexReview, last.from, last.to).count,
                            implRuns: sourceTotal(r, .codexImpl, last.from, last.to).count,
