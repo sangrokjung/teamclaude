@@ -355,3 +355,20 @@ test('logProcessSnapshot reports an unavailable snapshot and swallows capture er
     '[TeamClaude] ps snapshot after SIGINT unavailable: boom',
   ]);
 });
+
+test('maskSecrets hides digit-free proxy keys and values of auth headers or secret options', () => {
+  const key = 'tc-' + 'AbCdEfGhIjKlMnOpQrStUvWxYzab';
+  const cases = [
+    `curl -H 'x-api-key: ${key}' http://127.0.0.1:3456/teamclaude/status`,
+    `curl -H "X-Api-Key:${key}" http://localhost:3456/v1/messages`,
+    `teamclaude --api-key ${key} status`,
+    `teamclaude --token=${'Q'.repeat(20)} status`,
+    `curl -H 'authorization: ${'Z'.repeat(24)}' x`,
+  ];
+  for (const cmd of cases) {
+    const masked = maskSecrets(cmd);
+    assert.ok(!masked.includes(key), masked);
+    assert.ok(!/QQQQQQQQQQ|ZZZZZZZZZZ/.test(masked), masked);
+  }
+  assert.equal(maskSecrets(key), 'tc-***');
+});

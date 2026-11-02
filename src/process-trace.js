@@ -114,12 +114,22 @@ function maskRun(run) {
   return tokenLike ? '***' : run.split('/').map(maskSegment).join('/');
 }
 
-/** Mask credential-looking substrings (sk-ant- keys, Bearer values, long base64-ish runs). */
+/**
+ * Mask credential-looking substrings (sk-ant- keys, Bearer values, the
+ * proxy's own `tc-` keys, values of auth headers and secret CLI options, long
+ * base64-ish runs). The header/option and `tc-` rules match by position, not
+ * by alphabet, so a generated key with no digit is still hidden.
+ */
 export function maskSecrets(text) {
   return String(text)
     .replace(/\bBearer\s+[^\s'"]+/gi, 'Bearer ***')
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
     .replace(/\bsk-(?!ant-\*)[A-Za-z0-9_-]{16,}/g, 'sk-***')
+    .replace(/\btc-[A-Za-z0-9_-]{16,}/g, 'tc-***')
+    // Values not already masked above (a value still holding *** keeps its
+    // readable prefix, e.g. `sk-ant-***`).
+    .replace(/\b(x-api-key|authorization)(\s*:\s*)(?!Bearer\b)(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1$2***')
+    .replace(/(--(?:api-key|key|token|secret|password)(?:\s+|=))(?![^\s'"]*\*\*\*)[^\s'"]+/gi, '$1***')
     .replace(/[A-Za-z0-9_+/=-]{32,}/g, maskRun);
 }
 
