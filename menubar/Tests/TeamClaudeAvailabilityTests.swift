@@ -9,12 +9,12 @@ struct TeamClaudeAvailabilityTests {
         func row(_ name: String = "검증 계정", session: Double? = 12, weekly: Double? = 23,
                  fable: Double? = 34, reset: Int? = 3600, status: String = "active",
                  enabled: Bool = true, proxy: Bool? = true, current: Bool = true,
-                 inflight: Int = 0, capacity: Int = 3, reason: String? = nil) -> TeamClaudeAccountHealth {
+                 inflight: Int = 0, capacity: Int = 3, reason: String? = nil, fableReset: Int?? = .none) -> TeamClaudeAccountHealth {
             TeamClaudeAccountHealth(name: name, isCurrent: false, enabled: enabled, isUsable: true,
                 status: status, errorReason: reason, provider: "anthropic", accountUuid: "ui-fixture-\(name)",
                 source: "oauth", totalTokens: 0, totalRequests: 1, sessionPercent: session,
                 sessionResetSeconds: reset, weeklyPercent: weekly, weeklyResetSeconds: reset,
-                fablePercent: fable, fableResetSeconds: reset, probedAt: now, measurementIssue: nil,
+                fablePercent: fable, fableResetSeconds: fableReset ?? reset, probedAt: now, measurementIssue: nil,
                 usableFromProxy: proxy, fableMeasurementCurrent: current, inflightCount: inflight,
                 concurrentCapacity: capacity)
         }
@@ -52,6 +52,22 @@ struct TeamClaudeAvailabilityTests {
                      row(reset: -1), row(reset: nil), row(fable: .nan), row(fable: -.infinity), row(fable: -1)] {
             expect(item, .unconfirmed)
         }
+        // Fable 주간 수치가 없는 계정(값·리셋 모두 없음: 창 초기화 뒤 미사용·프록시 재시작)은 Fable 레인에서 쓸 수 있다고 센다(2026-11-03 실측: 0/21).
+        var fableUnused = row(fable: nil, fableReset: .some(nil))
+        fableUnused.fableWindowAbsent = true
+        // 창은 있는데 값·리셋이 빠진 부분 측정은 확인 필요로 남는다.
+        expect(row(fable: nil, fableReset: .some(nil)), .unconfirmed)
+        expect(fableUnused, .ready)
+        let unusedResult = teamClaudeFableAvailability(fableUnused, health: health([fableUnused]), subscription: subscription(nil), now: now)
+        precondition(unusedResult.fableUnmeasured && unusedResult.reason == L10n.reasonFableUnmeasured)
+        precondition(!teamClaudeFableAvailability(row(), health: health([row()]), subscription: subscription(nil), now: now).fableUnmeasured)
+        // 라우팅 판정(표 묶음)은 Fable 창을 보지 않으니 표시가 바뀌지 않는다.
+        precondition(!teamClaudeFableAvailability(fableUnused, health: health([fableUnused]), subscription: subscription(nil), now: now, includeFable: false).fableUnmeasured)
+        // 프록시가 뺀 계정·주간이 막힌 계정은 Fable이 비어도 그대로다.
+        var unusedExcluded = row(fable: nil, proxy: false, fableReset: .some(nil)); unusedExcluded.fableWindowAbsent = true
+        expect(unusedExcluded, .excluded)
+        var unusedWeeklyFull = row(weekly: 100, fable: nil, proxy: false, fableReset: .some(nil)); unusedWeeklyFull.fableWindowAbsent = true
+        expect(unusedWeeklyFull, .limited)
         expect(row(), .unconfirmed, online: false)
         expect(row(current: false), .unconfirmed)
         expect(row(weekly: 100, current: false), .unconfirmed)

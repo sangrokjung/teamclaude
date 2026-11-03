@@ -276,6 +276,9 @@ struct TeamClaudeAccountHealth {
     /// 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false).
     /// 참이면 세션 값은 비우고, 가용·측정 문제·재시도·소진 전망에서 세션 창을 뺀다. 필드 없음·null·true는 거짓.
     var sessionWindowAbsent = false
+    /// 상태 응답에 Fable 주간 창(modelWeekly["7d_oi"])이 아예 없다(창 초기화 뒤 Fable 미사용·프록시 재시작).
+    /// 창은 있는데 값·리셋 중 하나가 빠진 부분 측정은 거짓이다. 이 경우만 Fable 레인이 "측정 전"으로 센다.
+    var fableWindowAbsent = false
     /// API 키 계정의 크레딧(상태 응답 credit 블록, spec B9). 구독 계정·구버전 프록시는 nil.
     var apiCredit: TeamClaudeApiCredit? = nil
     /// Anthropic API 키 계정(`teamclaude api`). 구독이 모두 소진된 뒤에 쓰는 유료 계층이라
@@ -730,6 +733,7 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             weeklyResetAt: weeklyResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
             sessionWindowAbsent: sessionWindowAbsent,
+            fableWindowAbsent: modelWeekly?["7d_oi"] == nil,
             apiCredit: apiCredit
         ))
     }
@@ -887,6 +891,7 @@ func teamClaudeRetainingQuota(
             subscriptionEndsAt: account.subscriptionEndsAt,
             sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt,
             sessionWindowAbsent: account.sessionWindowAbsent,
+            fableWindowAbsent: account.fableWindowAbsent,
             apiCredit: account.apiCredit
         )
     }
@@ -1034,10 +1039,19 @@ func teamClaudeAccountMergingQuota(
         probedAt: candidate.probedAt,
         measurementIssue: measurementIssue,
         usableFromProxy: candidate.usableFromProxy,
+        // Fable 창은 이번 응답에 값·리셋이 있거나, 응답에 창 자체가 없고 병합 뒤에도 값·리셋이 없을 때(창 초기화 뒤 Fable 미사용·프록시 재시작) 현재로 본다.
+        // 창은 있는데 값·리셋 중 하나만 온 부분 측정은 현재가 아니다(확인 필요로 남는다).
+        // 프록시 재시작으로 창이 비었는데 메뉴바가 아직 리셋 전인 이전 Fable 측정을 들고 있으면 그 값으로 판정한다
+        // (30%면 사용 가능, 문턱 이상이면 대기). 측정 전으로 세면 가득 찬 계정을 부풀리고, 미확인으로 두면 빠뜨린다.
+        // 뒤의 경우 Fable 레인은 "측정 전"으로 세어 0으로 떨어뜨리지 않는다(2026-11-03 실측 0/21).
         fableMeasurementCurrent: candidate.fableMeasurementCurrent
-            && sessionCurrent && candidate.weeklyPercent != nil && candidate.fablePercent != nil
+            && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0
-            && (candidate.fableResetSeconds ?? 0) > 0,
+            && ((candidate.fablePercent != nil && (candidate.fableResetSeconds ?? 0) > 0)
+                || (candidate.fableWindowAbsent
+                    && (fablePercent == nil
+                        ? (mergedPair?.fableResetSeconds ?? candidate.fableResetSeconds) == nil
+                        : (mergedPair?.fableResetSeconds ?? 0) > 0))),
         routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
             && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0,
@@ -1047,7 +1061,8 @@ func teamClaudeAccountMergingQuota(
         subscriptionEndReached: candidate.subscriptionEndReached,
         subscriptionEndsAt: candidate.subscriptionEndsAt,
         sessionResetAt: candidate.sessionResetAt, weeklyResetAt: candidate.weeklyResetAt, fableResetAt: candidate.fableResetAt,
-        sessionWindowAbsent: candidate.sessionWindowAbsent
+        sessionWindowAbsent: candidate.sessionWindowAbsent,
+        fableWindowAbsent: candidate.fableWindowAbsent
     )
 }
 
