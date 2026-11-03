@@ -22,6 +22,8 @@ struct TeamClaudeFableAvailability {
     var blockedWindows: [String] = []
     /// API 키 계정의 판정이다. 표에서는 상태와 무관하게 "API 크레딧" 묶음으로 간다.
     var apiCredit = false
+    /// .ready인데 Fable 주간 수치가 아직 없다(창 초기화 뒤 Fable 미사용). 개요 Fable 레인은 세되 "측정 전"으로 밝힌다.
+    var fableUnmeasured = false
 }
 
 /// API 키 계정(spec B3·B10). 세션·주간 창이 없고 구독이 모두 소진된 뒤에야 프록시가 쓰는 유료 계층이다.
@@ -130,15 +132,22 @@ func teamClaudeFableAvailability(
           let capacity = row.concurrentCapacity, capacity > 0 else {
         return result(.unconfirmed, L10n.reasonConcurrencyUnknown)
     }
+    // Fable 주간 창은 Fable 요청의 응답에만 실린다. 창이 초기화된 뒤 Fable을 아직 안 쓴 계정은 수치가 비어 있고,
+    // 프록시는 이 창으로 미리 막지 않으니(첫 429에서 판정) 비어 있는 Fable 창은 "아직 안 씀"으로 보고 쓸 수 있다고 센다.
+    // 값이나 리셋 중 하나만 있는 창은 여전히 확인 필요다.
+    let fableUnmeasured = includeFable && row.fablePercent == nil && row.fableResetSeconds == nil
     for (name, percent, reset) in windows {
+        if name == fableWindow && fableUnmeasured { continue }
         guard let percent, percent.isFinite, percent >= 0,
               let reset, reset > 0 else { return result(.unconfirmed, L10n.reasonWindowCheck(name)) }
     }
     // 동시 요청이 가득 찬 것은 대기가 아니다. 프록시는 이 계정으로 계속 보내고 새 요청은 줄을 선다.
     var ready = result(.ready, grace.isEmpty
-        ? (includeFable ? TeamClaudeRowReason.fableReady : TeamClaudeRowReason.opusReady)
+        ? (fableUnmeasured ? L10n.reasonFableUnmeasured
+            : (includeFable ? TeamClaudeRowReason.fableReady : TeamClaudeRowReason.opusReady))
         : L10n.reasonProxyGrace(grace.joined(separator: "·")))
     ready.graceWindows = grace
+    ready.fableUnmeasured = fableUnmeasured
     if inflight >= capacity { ready.busy = TeamClaudeConcurrencyLoad(inflight: inflight, capacity: capacity) }
     return ready
 }

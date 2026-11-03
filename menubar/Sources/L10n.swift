@@ -106,6 +106,7 @@ enum L10n {
     static func weeklyWindowIn(_ duration: String) -> String { t("주간 창 \(duration) 뒤", "weekly window in \(duration)") }
     static func resetsAfter(_ parts: String) -> String { t("\(parts) 리셋", "Resets: \(parts)") }
     static var fableLaneNote: String { t("Fable 주간까지 여유", "Fable weekly headroom") }
+    static func fableLaneNoteUnmeasured(_ n: Int) -> String { t("측정 전 \(n)개 포함 · 첫 Fable 요청에 잼", "incl. \(n) not yet measured") }
     static var codexLaneNote: String { t("지금 배정 가능", "Assignable now") }
     static var usageRate: String { t("사용률", "Used") }
     static func agyLaneNote(_ name: String) -> String { t("\(name) 주간", "\(name) weekly") }
@@ -500,6 +501,7 @@ enum L10n {
     static func reasonErrorCheck(_ label: String) -> String { t("\(label) · 상태 확인 필요", "\(label) · check state") }
     static var windowAllWeekly: String { t("전체 주간", "weekly") }
     static func reasonWindowsBlocked(_ windows: String) -> String { t("\(windows) 한도 대기", "\(windows) at limit") }
+    static var reasonFableUnmeasured: String { t("Fable 아직 안 씀 · 첫 요청에 측정", "Fable unused yet · measured on first request") }
     static func reasonWindowCheck(_ window: String) -> String { t("\(window) 한도 확인 필요", "\(window) limit needs check") }
     static var issueDisabledLong: String { t("비활성 계정", "Disabled account") }
     static var issueNotSyncedLong: String { t("서버 동기화 필요", "Needs server sync") }

@@ -94,6 +94,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     model.codexNotice = codexNotice
 
     var fableReady = 0
+    var fableUnmeasured = 0
     var total = 0
     if let health = input.teamClaude, claudeNotice == nil {
         // 상태별 수·목록·손볼 것은 큰 숫자와 같은 라우팅 판정을 쓴다(실사용 QA 2026-10-25: 큰 숫자와 범례가
@@ -104,6 +105,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
         let routing = health.routingAvailability(now: now)
         total = health.subscriptionAccountTotal
         fableReady = availability.filter { $0.state == .ready }.count
+        fableUnmeasured = availability.filter { $0.state == .ready && $0.fableUnmeasured }.count
         let apiCounts = health.apiCreditCounts
         model.apiCreditReady = apiCounts.ready
         model.apiCreditTotal = apiCounts.total
@@ -228,7 +230,7 @@ func makeOverviewModel(_ input: DashboardOverviewInput) -> OverviewModel {
     } else if input.teamClaude == nil {
         claudeLane = OverviewLane(name: "Claude Fable", value: StatusVocabulary.checking, unit: "", note: L10n.waitingForValue, tab: .claude, quiet: true)
     } else {
-        claudeLane = OverviewLane(name: "Claude Fable", value: "\(fableReady)", unit: "/ \(total)", note: L10n.fableLaneNote, tab: .claude, quiet: false)
+        claudeLane = OverviewLane(name: "Claude Fable", value: "\(fableReady)", unit: "/ \(total)", note: fableUnmeasured > 0 ? L10n.fableLaneNoteUnmeasured(fableUnmeasured) : L10n.fableLaneNote, tab: .claude, quiet: false)
     }
     let codexLane: OverviewLane
     if let notice = codexNotice {
