@@ -431,6 +431,12 @@ struct DashboardOverviewBuilderTests {
         precondition(baseline.note == L10n.fableLaneNote, baseline.note)
         precondition(unused.value == baseline.value, "Fable 미사용 계정도 센다: \(unused.value) vs \(baseline.value)")
         precondition(unused.note == L10n.fableLaneNoteUnmeasured(1), unused.note)
+        // 창은 있는데 값·리셋 중 하나만 온 부분 측정은 측정 전으로 세지 않는다(확인 필요).
+        for partial in [["utilization": 1, "reset": NSNull()] as [String: Any],
+                        ["utilization": NSNull(), "reset": now.timeIntervalSince1970 * 1000 + 86_400_000] as [String: Any]] {
+            let got = lane(weeklyOnlyStatus(fixture) { $0["modelWeekly"] = ["7d_oi": partial] })
+            precondition(Int(got.value)! == Int(baseline.value)! - 1 && got.note == L10n.fableLaneNote, "partial \(partial): \(got.value) \(got.note)")
+        }
         // 프록시가 뺀 계정은 Fable이 비어도 세지 않는다.
         let excluded = lane(weeklyOnlyStatus(fixture, usable: false) { $0["modelWeekly"] = [String: Any]() })
         precondition(Int(excluded.value)! == Int(baseline.value)! - 1 && excluded.note == L10n.fableLaneNote, "\(excluded.value) \(excluded.note)")

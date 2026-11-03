@@ -135,8 +135,8 @@ func teamClaudeFableAvailability(
     // Fable 주간 창은 Fable 요청의 응답에만 실린다. 창 초기화 뒤 Fable을 안 썼거나 프록시가 재시작되면 수치가 비고,
     // 프록시는 이 창으로 미리 막지 않으니(첫 429에서 판정) 비어 있는 Fable 창은 "측정 전"으로 보고 쓸 수 있다고 센다.
     // 실제로 가득 찬 계정이면 첫 Fable 요청에서 프록시가 다른 계정으로 넘기고, 그 응답으로 수치가 채워진다.
-    // 값이나 리셋 중 하나만 있는 창은 여전히 확인 필요다.
-    let fableUnmeasured = includeFable && row.fablePercent == nil && row.fableResetSeconds == nil
+    // 창은 있는데 값이나 리셋 중 하나만 온 부분 측정(fableWindowAbsent=false)은 여전히 확인 필요다.
+    let fableUnmeasured = includeFable && row.fableWindowAbsent && row.fablePercent == nil && row.fableResetSeconds == nil
     for (name, percent, reset) in windows {
         if name == fableWindow && fableUnmeasured { continue }
         guard let percent, percent.isFinite, percent >= 0,

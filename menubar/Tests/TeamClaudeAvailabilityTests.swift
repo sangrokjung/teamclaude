@@ -53,7 +53,10 @@ struct TeamClaudeAvailabilityTests {
             expect(item, .unconfirmed)
         }
         // Fable 주간 수치가 없는 계정(값·리셋 모두 없음: 창 초기화 뒤 미사용·프록시 재시작)은 Fable 레인에서 쓸 수 있다고 센다(2026-11-03 실측: 0/21).
-        let fableUnused = row(fable: nil, fableReset: .some(nil))
+        var fableUnused = row(fable: nil, fableReset: .some(nil))
+        fableUnused.fableWindowAbsent = true
+        // 창은 있는데 값·리셋이 빠진 부분 측정은 확인 필요로 남는다.
+        expect(row(fable: nil, fableReset: .some(nil)), .unconfirmed)
         expect(fableUnused, .ready)
         let unusedResult = teamClaudeFableAvailability(fableUnused, health: health([fableUnused]), subscription: subscription(nil), now: now)
         precondition(unusedResult.fableUnmeasured && unusedResult.reason == L10n.reasonFableUnmeasured)
@@ -61,9 +64,9 @@ struct TeamClaudeAvailabilityTests {
         // 라우팅 판정(표 묶음)은 Fable 창을 보지 않으니 표시가 바뀌지 않는다.
         precondition(!teamClaudeFableAvailability(fableUnused, health: health([fableUnused]), subscription: subscription(nil), now: now, includeFable: false).fableUnmeasured)
         // 프록시가 뺀 계정·주간이 막힌 계정은 Fable이 비어도 그대로다.
-        let unusedExcluded = row(fable: nil, proxy: false, fableReset: .some(nil))
+        var unusedExcluded = row(fable: nil, proxy: false, fableReset: .some(nil)); unusedExcluded.fableWindowAbsent = true
         expect(unusedExcluded, .excluded)
-        let unusedWeeklyFull = row(weekly: 100, fable: nil, proxy: false, fableReset: .some(nil))
+        var unusedWeeklyFull = row(weekly: 100, fable: nil, proxy: false, fableReset: .some(nil)); unusedWeeklyFull.fableWindowAbsent = true
         expect(unusedWeeklyFull, .limited)
         expect(row(), .unconfirmed, online: false)
         expect(row(current: false), .unconfirmed)
