@@ -1034,10 +1034,13 @@ func teamClaudeAccountMergingQuota(
         probedAt: candidate.probedAt,
         measurementIssue: measurementIssue,
         usableFromProxy: candidate.usableFromProxy,
+        // Fable 창은 이번 응답에 값·리셋이 있거나, 병합 뒤에도 둘 다 없을 때(창 초기화 뒤 Fable 미사용·프록시 재시작) 현재로 본다.
+        // 뒤의 경우 Fable 레인은 "측정 전"으로 세어 0으로 떨어뜨리지 않는다(2026-11-03 실측 0/21).
         fableMeasurementCurrent: candidate.fableMeasurementCurrent
-            && sessionCurrent && candidate.weeklyPercent != nil && candidate.fablePercent != nil
+            && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0
-            && (candidate.fableResetSeconds ?? 0) > 0,
+            && ((candidate.fablePercent != nil && (candidate.fableResetSeconds ?? 0) > 0)
+                || (fablePercent == nil && (mergedPair?.fableResetSeconds ?? candidate.fableResetSeconds) == nil)),
         routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
             && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0,

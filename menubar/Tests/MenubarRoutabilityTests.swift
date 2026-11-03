@@ -179,8 +179,9 @@ struct MenubarRoutabilityTests {
         precondition(routing[0].state == .ready && routing[0].busy == TeamClaudeConcurrencyLoad(inflight: 3, capacity: 3),
                      "\(routing[0].state) \(routing[0].reason)")
         precondition(routing[1].state == .limited, "\(routing[1].state) \(routing[1].reason)")
-        // Fable 레인은 Fable이 비어 있으니 확인 필요다(그 의미는 지킨다).
-        precondition(committed.fableAvailability(now: now)[0].state == .unconfirmed)
+        // Fable 레인: Fable이 비어 있으면 "측정 전"으로 센다(프록시는 Fable 창으로 미리 막지 않는다, 2026-11-03 대표 지시: 0/21 표시 문제).
+        let unmeasured = committed.fableAvailability(now: now)[0]
+        precondition(unmeasured.state == .ready && unmeasured.fableUnmeasured, unmeasured.reason)
         let model = makeOverviewModel(DashboardOverviewInput(
             teamClaude: committed, teamCodex: nil, grok: GrokCardModel(headline: "Grok 21%", detail: nil),
             agy: AgyCardModel(message: nil, groups: []),

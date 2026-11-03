@@ -52,7 +52,7 @@ struct TeamClaudeAvailabilityTests {
                      row(reset: -1), row(reset: nil), row(fable: .nan), row(fable: -.infinity), row(fable: -1)] {
             expect(item, .unconfirmed)
         }
-        // Fable 주간 창이 초기화된 뒤 Fable을 아직 안 쓴 계정(값·리셋 모두 없음)은 Fable 레인에서 쓸 수 있다고 센다(2026-11-03 실측: 0/21).
+        // Fable 주간 수치가 없는 계정(값·리셋 모두 없음: 창 초기화 뒤 미사용·프록시 재시작)은 Fable 레인에서 쓸 수 있다고 센다(2026-11-03 실측: 0/21).
         let fableUnused = row(fable: nil, fableReset: .some(nil))
         expect(fableUnused, .ready)
         let unusedResult = teamClaudeFableAvailability(fableUnused, health: health([fableUnused]), subscription: subscription(nil), now: now)

@@ -22,7 +22,7 @@ struct TeamClaudeFableAvailability {
     var blockedWindows: [String] = []
     /// API 키 계정의 판정이다. 표에서는 상태와 무관하게 "API 크레딧" 묶음으로 간다.
     var apiCredit = false
-    /// .ready인데 Fable 주간 수치가 아직 없다(창 초기화 뒤 Fable 미사용). 개요 Fable 레인은 세되 "측정 전"으로 밝힌다.
+    /// .ready인데 Fable 주간 수치가 아직 없다(창 초기화 뒤 Fable 미사용·프록시 재시작). 개요 Fable 레인은 세되 "측정 전"으로 밝힌다.
     var fableUnmeasured = false
 }
 
@@ -132,8 +132,9 @@ func teamClaudeFableAvailability(
           let capacity = row.concurrentCapacity, capacity > 0 else {
         return result(.unconfirmed, L10n.reasonConcurrencyUnknown)
     }
-    // Fable 주간 창은 Fable 요청의 응답에만 실린다. 창이 초기화된 뒤 Fable을 아직 안 쓴 계정은 수치가 비어 있고,
-    // 프록시는 이 창으로 미리 막지 않으니(첫 429에서 판정) 비어 있는 Fable 창은 "아직 안 씀"으로 보고 쓸 수 있다고 센다.
+    // Fable 주간 창은 Fable 요청의 응답에만 실린다. 창 초기화 뒤 Fable을 안 썼거나 프록시가 재시작되면 수치가 비고,
+    // 프록시는 이 창으로 미리 막지 않으니(첫 429에서 판정) 비어 있는 Fable 창은 "측정 전"으로 보고 쓸 수 있다고 센다.
+    // 실제로 가득 찬 계정이면 첫 Fable 요청에서 프록시가 다른 계정으로 넘기고, 그 응답으로 수치가 채워진다.
     // 값이나 리셋 중 하나만 있는 창은 여전히 확인 필요다.
     let fableUnmeasured = includeFable && row.fablePercent == nil && row.fableResetSeconds == nil
     for (name, percent, reset) in windows {

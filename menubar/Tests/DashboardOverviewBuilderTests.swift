@@ -36,6 +36,7 @@ struct DashboardOverviewBuilderTests {
         testWeeklyOnlyRetryAfter(now: now)
         testApiCreditAccounts(fixture: fixture, input: input, now: now)
         testApiKeyRateLimited(fixture: fixture, input: input, now: now)
+        testFableUnmeasuredCounts(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -414,4 +415,25 @@ struct DashboardOverviewBuilderTests {
         let weekly = computeTeamClaudeRetryAfterSeconds(accounts: [weeklyFull], threshold: 0.98, nowMs: nowMs)
         precondition(weekly != nil && abs((weekly ?? 0) - 6 * 86_400) <= 1, "weekly-full waits for the weekly reset: \(String(describing: weekly))")
     }
+
+    /// Fable 주간 창이 초기화된 뒤 Fable을 아직 안 쓴 계정(modelWeekly 비어 있음)은 실제 갱신 경로
+    /// (파싱 → 병합 → 개요)를 거쳐도 Fable 레인에서 "측정 전"으로 센다(2026-11-03 실측: 라우팅 7개인데 0/21).
+    static func testFableUnmeasuredCounts(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        func lane(_ status: [String: Any]) -> OverviewLane {
+            let parsed = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+            let merged = teamClaudeHealthMergingQuota(candidate: parsed, previous: nil)
+            let model = makeOverviewModel(DashboardOverviewInput(teamClaude: merged, teamCodex: input.teamCodex,
+                grok: input.grok, agy: input.agy, burn: input.burn, notices: input.notices, now: now))
+            return model.lanes[0]
+        }
+        let baseline = lane(weeklyOnlyStatus(fixture) { _ in })
+        let unused = lane(weeklyOnlyStatus(fixture) { $0["modelWeekly"] = [String: Any]() })
+        precondition(baseline.note == L10n.fableLaneNote, baseline.note)
+        precondition(unused.value == baseline.value, "Fable 미사용 계정도 센다: \(unused.value) vs \(baseline.value)")
+        precondition(unused.note == L10n.fableLaneNoteUnmeasured(1), unused.note)
+        // 프록시가 뺀 계정은 Fable이 비어도 세지 않는다.
+        let excluded = lane(weeklyOnlyStatus(fixture, usable: false) { $0["modelWeekly"] = [String: Any]() })
+        precondition(Int(excluded.value)! == Int(baseline.value)! - 1 && excluded.note == L10n.fableLaneNote, "\(excluded.value) \(excluded.note)")
+    }
+
 }
