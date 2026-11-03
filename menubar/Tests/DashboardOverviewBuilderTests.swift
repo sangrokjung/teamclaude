@@ -437,6 +437,22 @@ struct DashboardOverviewBuilderTests {
             let got = lane(weeklyOnlyStatus(fixture) { $0["modelWeekly"] = ["7d_oi": partial] })
             precondition(Int(got.value)! == Int(baseline.value)! - 1 && got.note == L10n.fableLaneNote, "partial \(partial): \(got.value) \(got.note)")
         }
+        // 프록시 재시작: 이전 갱신에 Fable 측정이 있고 새 응답의 창이 비면, 리셋 전인 이전 값으로 판정한다.
+        func restartedLane(previousFable: Double) -> OverviewLane {
+            let before = parseTeamClaudeHealth(config: nil, server: nil,
+                status: weeklyOnlyStatus(fixture) { $0["modelWeekly"] = ["7d_oi": ["utilization": previousFable, "reset": now.timeIntervalSince1970 * 1000 + 3 * 86_400_000]] },
+                port: 3456, now: now)
+            let previous = teamClaudeHealthMergingQuota(candidate: before, previous: nil)
+            let after = parseTeamClaudeHealth(config: nil, server: nil,
+                status: weeklyOnlyStatus(fixture) { $0["modelWeekly"] = [String: Any]() }, port: 3456, now: now)
+            let merged = teamClaudeHealthMergingQuota(candidate: after, previous: previous)
+            return makeOverviewModel(DashboardOverviewInput(teamClaude: merged, teamCodex: input.teamCodex,
+                grok: input.grok, agy: input.agy, burn: input.burn, notices: input.notices, now: now)).lanes[0]
+        }
+        let restartedLow = restartedLane(previousFable: 0.3)
+        precondition(restartedLow.value == baseline.value && restartedLow.note == L10n.fableLaneNote, "restart 30%: \(restartedLow.value) \(restartedLow.note)")
+        let restartedFull = restartedLane(previousFable: 0.99)
+        precondition(Int(restartedFull.value)! == Int(baseline.value)! - 1 && restartedFull.note == L10n.fableLaneNote, "restart 99%: \(restartedFull.value) \(restartedFull.note)")
         // 프록시가 뺀 계정은 Fable이 비어도 세지 않는다.
         let excluded = lane(weeklyOnlyStatus(fixture, usable: false) { $0["modelWeekly"] = [String: Any]() })
         precondition(Int(excluded.value)! == Int(baseline.value)! - 1 && excluded.note == L10n.fableLaneNote, "\(excluded.value) \(excluded.note)")

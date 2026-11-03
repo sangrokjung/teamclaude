@@ -1041,13 +1041,17 @@ func teamClaudeAccountMergingQuota(
         usableFromProxy: candidate.usableFromProxy,
         // Fable 창은 이번 응답에 값·리셋이 있거나, 응답에 창 자체가 없고 병합 뒤에도 값·리셋이 없을 때(창 초기화 뒤 Fable 미사용·프록시 재시작) 현재로 본다.
         // 창은 있는데 값·리셋 중 하나만 온 부분 측정은 현재가 아니다(확인 필요로 남는다).
+        // 프록시 재시작으로 창이 비었는데 메뉴바가 아직 리셋 전인 이전 Fable 측정을 들고 있으면 그 값으로 판정한다
+        // (30%면 사용 가능, 문턱 이상이면 대기). 측정 전으로 세면 가득 찬 계정을 부풀리고, 미확인으로 두면 빠뜨린다.
         // 뒤의 경우 Fable 레인은 "측정 전"으로 세어 0으로 떨어뜨리지 않는다(2026-11-03 실측 0/21).
         fableMeasurementCurrent: candidate.fableMeasurementCurrent
             && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0
             && ((candidate.fablePercent != nil && (candidate.fableResetSeconds ?? 0) > 0)
-                || (candidate.fableWindowAbsent && fablePercent == nil
-                    && (mergedPair?.fableResetSeconds ?? candidate.fableResetSeconds) == nil)),
+                || (candidate.fableWindowAbsent
+                    && (fablePercent == nil
+                        ? (mergedPair?.fableResetSeconds ?? candidate.fableResetSeconds) == nil
+                        : (mergedPair?.fableResetSeconds ?? 0) > 0))),
         routingMeasurementCurrent: (candidate.routingMeasurementCurrent ?? candidate.fableMeasurementCurrent)
             && sessionCurrent && candidate.weeklyPercent != nil
             && (candidate.weeklyResetSeconds ?? 0) > 0,
