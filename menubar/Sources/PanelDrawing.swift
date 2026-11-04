@@ -136,7 +136,8 @@ enum PanelDraw {
         meter(barRect, percent: percent, elapsed: elapsed, muted: muted, thresholdPercent: thresholdPercent)
         let full = (percent ?? 0) >= thresholdPercent
         let color = percent == nil || muted ? TeamClaudePalette.fg3 : full ? TeamClaudePalette.amber : TeamClaudePalette.fg
-        right(meterValueText(percent, emptyText: emptyText), rect.maxX, rect.midY - 7.5, TeamClaudePalette.numberFont, color)
+        let value = meterValueText(percent, emptyText: emptyText)
+        right(value, rect.maxX, rect.midY - 7.5, TeamClaudePalette.numberFont, color)
     }
 
     /// 막대 오른쪽 값 글자("42%", 값이 없으면 emptyText). 그리기와 테스트가 같은 문구를 쓴다.

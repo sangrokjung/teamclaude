@@ -21,7 +21,8 @@ class RuntimeWiringTests(unittest.TestCase):
 
     def test_codex_card_decodes_and_draws_runtime(self):
         pool = (SOURCES / "TeamCodexPoolStatus.swift").read_text()
-        view = (SOURCES / "CodexStatusView.swift").read_text()
+        # 카드 문구(서버 줄 포함)는 뷰가 부르는 공유 순수 함수 TeamCodexPoolRowText.swift가 정한다.
+        view = (SOURCES / "CodexStatusView.swift").read_text() + (SOURCES / "TeamCodexPoolRowText.swift").read_text()
         self.assertIn("var runtimeSummary: String? = nil", pool)
         self.assertIn('teamRuntimeSummary(', pool)
         self.assertIn("pool.runtimeSummary", view)
