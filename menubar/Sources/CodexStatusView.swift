@@ -252,8 +252,7 @@ final class CodexStatusView: NSView {
 
     /// 행 오른쪽 구독 상태 글(기호 뒤). 확인 안 됨은 "구독 확인 안 됨", 해지 계열은 한 줄 요약.
     private func subscriptionStatusText(_ subscription: SubscriptionResolution, now: Date) -> String {
-        subscription.state == .unknown ? L10n.subCodexUnconfirmed
-            : (subscriptionRowLine(subscription.shown, now: now) ?? subscription.state.label)
+        codexSubscriptionStatusText(subscription, now: now)
     }
 
     private func subscriptionStatusWidth(_ subscription: SubscriptionResolution, now: Date) -> CGFloat {
@@ -411,28 +410,24 @@ final class CodexStatusView: NSView {
         func drawTeamCodexPool(at poolY: CGFloat) {
             guard let pool = pool else { return }
             let poolRect = NSRect(x: x0, y: poolY, width: width, height: Self.poolSectionHeight(for: pool))
-            let poolTone: PanelTone = !pool.serverReachable ? .error : (pool.usableCount == 0 ? .wait : .ready)
+            // 무엇을 쓸지는 teamCodexPoolHeaderText(TeamCodexPoolRowText.swift)가 정하고, 여기는 배치·색만 입힌다.
+            let header = teamCodexPoolHeaderText(pool)
+            let poolTone = header.tone
             let titleWidth = PanelDraw.text(L10n.teamCodexPool, poolRect.minX, poolRect.minY + 2, TeamClaudePalette.panelTitleFont, fg)
             PanelDraw.dot(poolRect.minX + titleWidth + 10, centerY: poolRect.minY + 11, poolTone.color)
-            let labelWidth = PanelDraw.text(pool.statusLabel, poolRect.minX + titleWidth + 22, poolRect.minY + 3.5, caption, poolTone.color)
-            var headerRight = "port \(pool.serverPort)"
-            if let runtime = pool.runtimeSummary { headerRight += " · \(runtime)" }
+            let labelWidth = PanelDraw.text(header.statusLabel, poolRect.minX + titleWidth + 22, poolRect.minY + 3.5, caption, poolTone.color)
             let rightMax = poolRect.maxX - (poolRect.minX + titleWidth + 22 + labelWidth + 16)
-            PanelDraw.right(PanelDraw.clipped(headerRight, micro, maxWidth: rightMax), poolRect.maxX, poolRect.minY + 5, micro, fg3)
+            PanelDraw.right(PanelDraw.clipped(header.serverLine, micro, maxWidth: rightMax), poolRect.maxX, poolRect.minY + 5, micro, fg3)
 
             // 큰 숫자: 지금 배정 가능 / 풀
             let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 32, weight: .semibold)
-            let numberWidth = PanelDraw.text("\(pool.usableCount)", poolRect.minX - 1, poolRect.minY + 26, numberFont, fg)
-            PanelDraw.text(L10n.codexPoolUsable(pool: pool.poolCount, excluded: pool.excludedCount), poolRect.minX + numberWidth + 8,
+            let numberWidth = PanelDraw.text(header.usableNumber, poolRect.minX - 1, poolRect.minY + 26, numberFont, fg)
+            PanelDraw.text(header.usableDetail, poolRect.minX + numberWidth + 8,
                            poolRect.minY + 42, NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .regular), fg3)
-            PanelDraw.right(PanelDraw.clipped(pool.resetCreditSummary, caption, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 34, caption, fg2)
-            PanelDraw.right(PanelDraw.clipped(pool.resetCreditPolicyLabel, micro, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 52, micro, fg3)
-            // 지금 배정 가능한 계정 이름(Claude 표의 "사용 가능" 묶음과 같은 정보).
-            let readyNames = pool.accounts
-                .filter { $0.isUsable(switchThresholdPercent: pool.switchThresholdPercent, now: pool.checkedAt) }
-                .map(\.name)
-            PanelDraw.text(PanelDraw.clipped(L10n.codexUsableNames(readyNames), micro, maxWidth: width / 2 - 8), poolRect.minX, poolRect.minY + 66,
-                           micro, readyNames.isEmpty ? TeamClaudePalette.amber : fg3)
+            PanelDraw.right(PanelDraw.clipped(header.resetCreditSummary, caption, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 34, caption, fg2)
+            PanelDraw.right(PanelDraw.clipped(header.resetCreditPolicy, micro, maxWidth: width / 2), poolRect.maxX, poolRect.minY + 52, micro, fg3)
+            PanelDraw.text(PanelDraw.clipped(header.readyNames, micro, maxWidth: width / 2 - 8), poolRect.minX, poolRect.minY + 66,
+                           micro, header.readyNamesEmpty ? TeamClaudePalette.amber : fg3)
 
             let headY = poolRect.minY + 84
             PanelDraw.meta(L10n.codexAccountsHead, poolRect.minX, headY)
@@ -459,71 +454,34 @@ final class CodexStatusView: NSView {
                     continue
                 }
                 if index != plan.order.first { PanelDraw.hairline(poolRect.minX, poolRect.maxX, rowY - 1) }
-                let accountState = teamCodexAccountState(account, switchThresholdPercent: pool.switchThresholdPercent, now: pool.checkedAt)
-                let quotaBlocked = accountState == .limited
-                // 영구 제외(구독 종료·수동 제외)는 가장 조용하게, 일시 한도는 호박, 진짜 오류는 빨강.
-                let tone: PanelTone
-                switch accountState {
-                case .retired, .excluded, .other: tone = .off
-                case .failed: tone = .error
-                case .endDateReached, .limited, .paused: tone = .wait
-                case .serving: tone = .ready
-                }
-                let retired = accountState == .retired
-                let muted = retired || accountState == .excluded
-                // 오류 사유는 두 렌더러(Claude 표·Codex 풀)가 같은 canonical 라벨을 쓴다는 회귀 가드.
-                let statusText = accountState == .failed
-                    ? teamAccountErrorReasonLabel(account.errorReason)
-                    : teamCodexAccountStateLabel(accountState, status: account.status, errorReason: account.errorReason)
+                // 무엇을 쓸지는 teamCodexPoolRowText(TeamCodexPoolRowText.swift)가 정하고, 여기는 배치·색만 입힌다.
+                let rowText = teamCodexPoolRowText(account, pool: pool)
+                let tone = rowText.tone
+                let muted = rowText.muted
                 PanelDraw.dot(poolRect.minX + 2, centerY: rowY + 14, tone.color)
-                let nameWidth = PanelDraw.text(PanelDraw.clipped(account.name, TeamClaudePalette.nameFont, maxWidth: width * 0.55),
+                let nameWidth = PanelDraw.text(PanelDraw.clipped(rowText.name, TeamClaudePalette.nameFont, maxWidth: width * 0.55),
                                                poolRect.minX + 15, rowY + 6, TeamClaudePalette.nameFont, muted ? fg2 : fg)
-                if account.isCurrent && !retired {
-                    PanelDraw.text(L10n.codexCurrent, poolRect.minX + 15 + nameWidth + 8, rowY + 7, micro, TeamClaudePalette.sky)
+                if let currentLabel = rowText.currentLabel {
+                    PanelDraw.text(currentLabel, poolRect.minX + 15 + nameWidth + 8, rowY + 7, micro, TeamClaudePalette.sky)
                 }
                 if !recoveryIndices.contains(index) {
-                    PanelDraw.right(statusText, poolRect.maxX, rowY + 6, caption, tone == .off ? fg2 : tone.color)
+                    PanelDraw.right(rowText.statusText, poolRect.maxX, rowY + 6, caption, tone == .off ? fg2 : tone.color)
                 }
 
                 // 5시간 · 7일 막대(리셋은 계정마다 따로).
-                // 돌아오지 않는 계정에 초기화 카운트다운을 그리면 "곧 복귀"로 오해된다.
-                let drawsResetCountdown = !account.isPermanentlyOut(now: pool.checkedAt)
-                let sessionPercent = account.sessionUsagePercent(at: pool.checkedAt)
-                let weeklyPercent = account.weeklyUsagePercent(at: pool.checkedAt)
                 let half = (width - 15 - 16) / 2
-                let windows: [(String, Double?, Date?, Double)] = [
-                    (L10n.codexFiveHours, sessionPercent, account.sessionResetAt, 5 * 3_600),
-                    (L10n.codexSevenDays, weeklyPercent, account.weeklyResetAt, 7 * 86_400),
-                ]
-                for (column, window) in windows.enumerated() {
+                for (column, window) in rowText.windows.enumerated() {
                     let x = poolRect.minX + 15 + CGFloat(column) * (half + 16)
-                    PanelDraw.text(window.0, x, rowY + 28, micro, fg3)
-                    let reset = muted || !drawsResetCountdown ? StatusVocabulary.none
-                        : formatTeamCodexResetRemaining(window.2, now: pool.checkedAt)
-                    PanelDraw.right(PanelDraw.clipped(reset, micro, maxWidth: half - 50), x + half, rowY + 28, micro,
-                                    quotaBlocked && column == 0 ? amber : fg3)
-                    let elapsed = drawsResetCountdown
-                        ? panelWindowElapsed(remainingSeconds: window.2?.timeIntervalSince(pool.checkedAt), windowSeconds: window.3) : nil
-                    PanelDraw.meterWithValue(NSRect(x: x, y: rowY + 42, width: half, height: 14), percent: retired ? nil : window.1,
-                                             elapsed: elapsed, muted: muted, thresholdPercent: pool.switchThresholdPercent)
+                    PanelDraw.text(window.label, x, rowY + 28, micro, fg3)
+                    PanelDraw.right(PanelDraw.clipped(window.reset, micro, maxWidth: half - 50), x + half, rowY + 28, micro,
+                                    rowText.quotaBlocked && column == 0 ? amber : fg3)
+                    PanelDraw.meterWithValue(NSRect(x: x, y: rowY + 42, width: half, height: 14), percent: window.percent,
+                                             elapsed: window.elapsed, muted: muted, thresholdPercent: pool.switchThresholdPercent)
                 }
-                // 보조 줄: 돌아오는지·안 돌아오는지(노트) · 되돌리기 안내, 오른쪽에 동시 · 요청 · 리셋권 · 토큰.
-                var notes: [String] = []
-                if let note = teamCodexAccountNote(account, switchThresholdPercent: pool.switchThresholdPercent, now: pool.checkedAt) {
-                    notes.append(note)
-                }
-                // 다시 켜도 실행 중 서버에 바로 반영된다는 보장이 없다. 그 사실을 행에서 말한다.
-                if let followUp = teamCodexAccountRecovery(account, now: pool.checkedAt)?.followUpNote, !drawsResetCountdown {
-                    notes.append(followUp)
-                }
-                let credits = account.resetCreditCount(at: pool.checkedAt, online: pool.serverReachable)
-                let facts = L10n.codexFacts(inflight: account.inflight, maxConcurrent: account.maxConcurrent,
-                                            requests: account.totalRequests,
-                                            credits: account.resetCreditLabel(at: pool.checkedAt, online: pool.serverReachable),
-                                            tokens: formatCodexTokens(account.totalTokens))
-                let factsWidth = PanelDraw.right(facts, poolRect.maxX, rowY + Self.rowFactsY, micro, credits == nil && !muted ? amber : fg3)
-                if !notes.isEmpty {
-                    PanelDraw.text(PanelDraw.clipped(notes.joined(separator: " · "), micro, maxWidth: factsWidth - poolRect.minX - 15 - 12),
+                // 보조 줄(노트 · 되돌리기 안내), 오른쪽에 동시 · 요청 · 리셋권 · 토큰.
+                let factsWidth = PanelDraw.right(rowText.facts, poolRect.maxX, rowY + Self.rowFactsY, micro, rowText.factsWarn ? amber : fg3)
+                if !rowText.notes.isEmpty {
+                    PanelDraw.text(PanelDraw.clipped(rowText.notes.joined(separator: " · "), micro, maxWidth: factsWidth - poolRect.minX - 15 - 12),
                                    poolRect.minX + 15, rowY + Self.rowFactsY, micro, tone == .error ? ember : fg3)
                 }
                 // 플랜·결제일 줄 오른쪽: 구독 상태(기호 · 상태 · 펼침). 누르면 구독 기록이 펼쳐진다.

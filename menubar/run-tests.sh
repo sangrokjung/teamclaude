@@ -39,6 +39,8 @@ SKIP_TESTS+=(UsageLoadOutcomeTests.swift)
 SKIP_TESTS+=(CodexPoolRowLayoutTests.swift)
 # MenubarRoutabilityTests는 main.swift의 TeamClaudeHealth·StatusMenuDashboardView를 쓴다. test_menubar_routability.py가 선언부와 함께 컴파일해 돌린다.
 SKIP_TESTS+=(MenubarRoutabilityTests.swift)
+# StatusConsumerMapTests는 실제 CodexStatusView를 그려 그린 글자를 본다. test_status_consumer_map.py가 선언부와 함께 컴파일해 돌린다.
+SKIP_TESTS+=(StatusConsumerMapTests.swift)
 # 실제 외부 표면(브라우저 탭·브라우저 도구 바이너리·메일함 dry-run)을 건드리는 테스트.
 # 게이트는 트리만의 함수여야 하므로 CC_MENUBAR_LIVE_SURFACES=1일 때만 돌리고, 아니면 env-skip으로 표시한다.
 LIVE_SURFACE_TESTS=(test_live_subscription_surface.py)

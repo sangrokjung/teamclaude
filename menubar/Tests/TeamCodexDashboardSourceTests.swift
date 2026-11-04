@@ -10,7 +10,9 @@ struct TeamCodexDashboardSourceTests {
         let sourcePath = "\(CommandLine.arguments[1])/menubar/Sources/main.swift"
         let source = try String(contentsOfFile: sourcePath, encoding: .utf8)
         let codexStatusViewPath = "\(CommandLine.arguments[1])/menubar/Sources/CodexStatusView.swift"
+        // Codex 풀 카드의 문구·값은 TeamCodexPoolRowText.swift(뷰가 부르는 공유 순수 함수)가 정하므로 함께 본다.
         let codexStatusView = try String(contentsOfFile: codexStatusViewPath, encoding: .utf8)
+            + String(contentsOfFile: "\(CommandLine.arguments[1])/menubar/Sources/TeamCodexPoolRowText.swift", encoding: .utf8)
         // 화면 문구는 L10n.swift 한 표에 있다(R5). 문구 단언은 표에서, 배선 단언은 소스에서 본다.
         let table = try String(contentsOfFile: "\(CommandLine.arguments[1])/menubar/Sources/L10n.swift", encoding: .utf8)
 
