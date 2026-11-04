@@ -15,6 +15,28 @@ test('모델 이름 정규화: 날짜·[1m]·-v1:0·-latest 접미를 뗀다', (
   assert.equal(normalizeModelName(null), null);
 });
 
+test('Bedrock 접두와 Vertex 날짜 접미를 정규화한다', () => {
+  const cases = [
+    ['us.anthropic.claude-sonnet-4-5-20250929-v1:0', 'claude-sonnet-4-5'],
+    ['anthropic.claude-3-5-sonnet-20240620-v1:0', 'claude-3-5-sonnet'],
+    ['eu.anthropic.claude-opus-4-1-20250805-v1:0', 'claude-opus-4-1'],
+    ['apac.anthropic.claude-sonnet-4-5', 'claude-sonnet-4-5'],
+    ['global.anthropic.claude-sonnet-4-5', 'claude-sonnet-4-5'],
+    ['claude-sonnet-4-5@20250929', 'claude-sonnet-4-5'],
+    ['usa.other.claude-sonnet-4-5', 'usa.other.claude-sonnet-4-5'],
+    ['abcde.anthropic.claude-sonnet-4-5', 'abcde.anthropic.claude-sonnet-4-5'],
+    ['anthropic.anthropic.claude-sonnet-4-5', 'anthropic.claude-sonnet-4-5'],
+    ['claude-sonnet-4-5@2025092', 'claude-sonnet-4-5@2025092'],
+    ['claude-sonnet-4-5@202509290', 'claude-sonnet-4-5@202509290'],
+    ['claude-sonnet-4-5@20250929-preview', 'claude-sonnet-4-5@20250929-preview'],
+  ];
+  for (const [model, expected] of cases) {
+    assert.equal(normalizeModelName(model), expected, model);
+  }
+  assert.deepEqual(resolveApiPrice(cases[0][0]), resolveApiPrice('claude-sonnet-4-5'));
+  assert.equal(computeApiCost({ input_tokens: 1000 }, cases[5][0]).priced, true);
+});
+
 test('가장 긴 접두로 맞추되 숫자 버전 경계는 넘지 않는다', () => {
   assert.equal(resolveApiPrice('claude-opus-4-5-20251101').input, 5);
   assert.equal(resolveApiPrice('claude-opus-4-20250514').input, 15);

@@ -70,11 +70,14 @@ const DEFAULT_TABLE = Object.freeze(Object.fromEntries(
 
 /**
  * 모델 이름을 단가표 키 모양으로 바꾼다: 소문자, `[1m]` 같은 대괄호 접미,
- * `-v1:0` 배포 접미, `-YYYYMMDD` 날짜, `-latest`를 뗀다.
+ * Bedrock 지역·공급자 접두, Vertex `@YYYYMMDD`, `-v1:0` 배포 접미,
+ * `-YYYYMMDD` 날짜, `-latest`를 뗀다.
  */
 export function normalizeModelName(model) {
   if (typeof model !== 'string') return null;
   let name = model.trim().toLowerCase();
+  name = name.replace(/^(?:(?:[a-z]{2,4}|global)\.)?anthropic\./, '');
+  name = name.replace(/@\d{8}$/, '');
   name = name.replace(/\[[^\]]*\]$/, '');
   name = name.replace(/-v\d+(?::\d+)?$/, '');
   name = name.replace(/-\d{8}$/, '');
