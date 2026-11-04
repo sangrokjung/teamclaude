@@ -49,6 +49,7 @@ import {
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
 import { classifyCreditRefusal, isApiKeyAccount, isMessageBasedCreditReason } from './api-credit.js';
+import { isRemoteAuthorized } from './proxy-auth.js';
 
 
 const HOP_BY_HOP_HEADERS = new Set([
@@ -1929,7 +1930,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         });
         return;
       }
-      if (proxyApiKey && clientKey !== proxyApiKey && bearerKey !== proxyApiKey && !isLocal) {
+      if (!isRemoteAuthorized({ isLocal, proxyApiKey, clientKey, bearerKey })) {
         rejectEarlyRequest(req, res, 401, { 'Content-Type': 'application/json' }, {
           type: 'error',
           error: { type: 'authentication_error', message: 'Invalid proxy API key' },

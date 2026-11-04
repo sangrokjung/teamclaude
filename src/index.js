@@ -12,6 +12,7 @@ import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpda
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
+import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -545,9 +546,7 @@ async function superviseServerCommand() {
       ? authorization.slice('Bearer '.length)
       : null;
     const remoteAddr = req.socket.remoteAddress;
-    const isLocal = remoteAddr === '127.0.0.1'
-      || remoteAddr === '::1'
-      || remoteAddr === '::ffff:127.0.0.1';
+    const isLocal = isLoopbackAddress(remoteAddr);
     if (!isLocal) delete req.headers['x-teamcodex-status-identity'];
     if (consumeDeploymentDrain(req, res, isLocal)) return;
     if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
@@ -581,8 +580,9 @@ async function superviseServerCommand() {
       });
       return;
     }
-    if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
-      && bearerKey !== config.proxy.apiKey && !isLocal) {
+    if (!isRemoteAuthorized({
+      isLocal, proxyApiKey: config.proxy?.apiKey, clientKey, bearerKey,
+    })) {
       rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
         type: 'error',
         error: { type: 'authentication_error', message: 'Invalid proxy API key' },
