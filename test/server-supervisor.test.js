@@ -415,7 +415,7 @@ test('supervisor preserves proxy API-key authentication for remote clients', { t
   const configPath = join(dir, 'config.json');
   const port = await unusedPort();
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: 'tc-remote-auth' },
+    proxy: { port, apiKey: 'tc-remote-auth', bindHosts: ['127.0.0.1', host], allowLanBind: true },
     upstream: 'http://127.0.0.1:9',
     activeWarmup: false,
     accounts: [{ name: 'operator@example.test', type: 'apikey', apiKey: 'test-api-key' }],
@@ -532,7 +532,7 @@ test('supervisor rejects remote account rotation even with a valid proxy API key
   const configPath = join(dir, 'config.json');
   const port = await unusedPort();
   await writeFile(configPath, JSON.stringify({
-    proxy: { port, apiKey: 'tc-remote-rotate' },
+    proxy: { port, apiKey: 'tc-remote-rotate', bindHosts: ['127.0.0.1', host], allowLanBind: true },
     upstream: 'http://127.0.0.1:9',
     activeWarmup: false,
     accounts: [
@@ -1820,7 +1820,7 @@ test('supervisor fences the operator reset-credit route to loopback (codex mode)
   const port = await unusedPort();
   await writeFile(configPath, JSON.stringify({
     provider: 'codex',
-    proxy: { port, apiKey: 'tc-remote-reset' },
+    proxy: { port, apiKey: 'tc-remote-reset', bindHosts: ['127.0.0.1', host], allowLanBind: true },
     upstream: 'http://127.0.0.1:9',
     activeWarmup: false,
     codexUsageRefresh: false,

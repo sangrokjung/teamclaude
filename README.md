@@ -855,6 +855,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 |-------|-------------|
 | `proxy.port` | Local port the proxy listens on |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
+| `proxy.bindHosts` | IP addresses the proxy listens on (optional, default `["127.0.0.1", "::1"]`, loopback only). The first entry must be loopback. Loopback and Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) are allowed; any other address, including LAN addresses and `0.0.0.0`/`::`, also needs `proxy.allowLanBind: true`. An invalid list refuses startup, and an extra address that is absent or taken is skipped with a warning. Remote (non-loopback) clients must always send `proxy.apiKey` |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which an account is considered full and skipped |
 | `reevalIntervalMs` | How often (ms) to re-rank accounts by priority while the active one is healthy (optional, default `300000` = 5 min). Set to `0` to disable the timer entirely — the active account then only changes when it becomes unavailable or via per-request 429 failover |

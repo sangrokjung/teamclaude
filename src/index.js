@@ -4,6 +4,7 @@ import { fork, spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, realpathSync, unlinkSync } from 'node:fs';
 import http from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,8 @@ import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpda
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
+import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
+import { isLoopbackBindHost, resolveBindHosts } from './bind-hosts.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -353,6 +356,7 @@ async function serverCommand() {
 async function superviseServerCommand() {
   const config = await loadOrCreateConfig();
   assertSafeProxyConfig(config);
+  const bindHosts = resolveBindHosts(config);
   const port = config?.proxy?.port;
   const proxyApiKey = config?.proxy?.apiKey;
   const existing = await findRunningServer(config);
@@ -536,7 +540,10 @@ async function superviseServerCommand() {
     return true;
   }
 
-  const listener = http.createServer((req, res) => {
+  // One request handler shared by every public listener (one http.Server per
+  // bind host, all on the same port).
+  const publicListeners = [];
+  const handlePublicListenerRequest = (req, res) => {
     const clientKey = req.headers['x-api-key'];
     const authorization = req.headers.authorization;
     const hasRecoveryMarker = hasClaudeRecoveryMarker(authorization);
@@ -545,9 +552,7 @@ async function superviseServerCommand() {
       ? authorization.slice('Bearer '.length)
       : null;
     const remoteAddr = req.socket.remoteAddress;
-    const isLocal = remoteAddr === '127.0.0.1'
-      || remoteAddr === '::1'
-      || remoteAddr === '::ffff:127.0.0.1';
+    const isLocal = isLoopbackAddress(remoteAddr);
     if (!isLocal) delete req.headers['x-teamcodex-status-identity'];
     if (consumeDeploymentDrain(req, res, isLocal)) return;
     if (consumeCodexRecoveryReceipt(req, res, isLocal)) return;
@@ -581,8 +586,9 @@ async function superviseServerCommand() {
       });
       return;
     }
-    if (config.proxy?.apiKey && clientKey !== config.proxy.apiKey
-      && bearerKey !== config.proxy.apiKey && !isLocal) {
+    if (!isRemoteAuthorized({
+      isLocal, proxyApiKey: config.proxy?.apiKey, clientKey, bearerKey,
+    })) {
       rejectPublicRequest(req, res, 401, { 'content-type': 'application/json' }, {
         type: 'error',
         error: { type: 'authentication_error', message: 'Invalid proxy API key' },
@@ -646,7 +652,7 @@ async function superviseServerCommand() {
         res.destroy(err);
       }
     });
-  });
+  };
   // Only the process that actually claimed the state file may remove it. A start
   // that loses the port race (EADDRINUSE against an already-running server) exits
   // through this handler too, and deleting the LIVE server's state file there
@@ -806,11 +812,94 @@ async function superviseServerCommand() {
   }
 
   function closePublicListener(force = false) {
-    try { listener.close(); } catch {}
+    for (const listener of publicListeners) {
+      try { listener.close(); } catch {}
+    }
     workerReady = false;
     workerPort = null;
     wakeWorkerWaiters();
-    if (force) listener.closeAllConnections?.();
+    if (force) {
+      for (const listener of publicListeners) listener.closeAllConnections?.();
+    }
+  }
+
+  // Bind one public listener. Resolves with the bind error instead of
+  // rejecting so the caller decides between failing startup and skipping.
+  function listenPublicHost(host) {
+    return new Promise(resolve => {
+      const listener = http.createServer(handlePublicListenerRequest);
+      // Drop the bind-time handler once we own the address. Left attached,
+      // any later server error (EMFILE, ENOBUFS under load) would be reported
+      // as a bind failure and exit the supervisor mid-stream.
+      const onBindError = err => resolve({ listener: null, err });
+      listener.once('error', onBindError);
+      listener.listen(port, host, () => {
+        listener.removeListener('error', onBindError);
+        listener.on('error', err => {
+          console.error(
+            `[TeamClaude] Public listener runtime error${err.code ? ` (${err.code})` : ''}: ${err.message}`,
+          );
+        });
+        publicListeners.push(listener);
+        resolve({ listener, err: null });
+      });
+    });
+  }
+
+  // A process already listening on the wildcard address does not always block
+  // a loopback-specific bind (BSD lets a more specific bind coexist with it
+  // under SO_REUSEADDR), so check for a live listener first and report it as
+  // the port being in use, like the old wildcard bind did.
+  function loopbackPortInUse(host) {
+    return new Promise(resolve => {
+      const socket = netConnect({ host, port });
+      const done = inUse => {
+        socket.destroy();
+        resolve(inUse);
+      };
+      socket.setTimeout(1000, () => done(false));
+      socket.once('connect', () => done(true));
+      socket.once('error', () => done(false));
+    });
+  }
+
+  // Bind every configured host. A required host (the first host, or any
+  // loopback host) that fails takes the existing startup-failure exit; the
+  // one exception is ::1 on a host without IPv6. Extra non-loopback hosts that
+  // are absent or taken are skipped with a warning.
+  async function listenPublicHosts() {
+    for (const [index, host] of bindHosts.entries()) {
+      let err = null;
+      if (isLoopbackBindHost(host) && await loopbackPortInUse(host)) {
+        err = Object.assign(new Error(`listen EADDRINUSE: address already in use ${host}:${port}`), {
+          code: 'EADDRINUSE',
+        });
+      } else {
+        ({ err } = await listenPublicHost(host));
+      }
+      if (!err) continue;
+      const required = index === 0 || isLoopbackBindHost(host);
+      // ::1 is skipped only when the host has no usable IPv6 loopback at all;
+      // a busy ::1 (EADDRINUSE) still fails startup like 127.0.0.1 does.
+      const ipv6Unavailable = err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT';
+      if (required && !(host === '::1' && ipv6Unavailable)) {
+        exitReason = `listen-error:${err?.code || 'unknown'}`;
+        handleServerListenError(err, port);
+        return false;
+      }
+      if (!required && err.code !== 'EADDRNOTAVAIL' && err.code !== 'EADDRINUSE') {
+        exitReason = `listen-error:${err?.code || 'unknown'}`;
+        handleServerListenError(err, port);
+        return false;
+      }
+      console.error(`[TeamClaude] Skipping bind ${host}: ${err.code}`);
+    }
+    if (publicListeners.length === 0) {
+      exitReason = 'listen-error:no-listener';
+      handleServerListenError(new Error('no bind host could be bound'), port);
+      return false;
+    }
+    return true;
   }
 
   async function handlePublicRequest(req, res, reserveRequestBytes) {
@@ -1398,21 +1487,14 @@ async function superviseServerCommand() {
       sessionRescuer?.stop();
       resolve(code);
     };
-    // Drop the bind-time diagnosis once we own the port. Left attached, any
-    // later server error (EMFILE, ENOBUFS under load) would be reported as
-    // "port already in use" and exit the supervisor mid-stream.
-    const onListenError = err => {
-      exitReason = `listen-error:${err?.code || 'unknown'}`;
-      handleServerListenError(err, port);
-    };
-    listener.once('error', onListenError);
-    listener.listen(port, () => {
-      listener.removeListener('error', onListenError);
-      listener.on('error', err => {
-        console.error(
-          `[TeamClaude] Public listener runtime error${err.code ? ` (${err.code})` : ''}: ${err.message}`,
-        );
-      });
+    // The worker launches once, after every required public listener is up.
+    listenPublicHosts().then(ready => {
+      if (!ready) return;
+      if (stopping) {
+        // A stop signal arrived while binding: release what was bound late.
+        closePublicListener(true);
+        return;
+      }
       launchWorker();
       healthTimer = setInterval(checkWorkerHealth, workerHealthIntervalMs);
       healthTimer.unref?.();
