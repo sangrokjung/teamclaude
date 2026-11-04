@@ -38,14 +38,8 @@ test('memoryUsage reports a coherent total/used/percent', () => {
 
 test('formatBytes renders units and tolerates junk', () => {
   assert.strictEqual(formatBytes(2 * 1024 ** 4), '2.0TB');
-  assert.strictEqual(formatBytes(1024 ** 4), '1.0TB');
-  assert.strictEqual(formatBytes(1024 ** 4 - 1), '1024.0GB');
   assert.strictEqual(formatBytes(64 * 1024 ** 3), '64.0GB');
-  assert.strictEqual(formatBytes(1024 ** 3), '1.0GB');
-  assert.strictEqual(formatBytes(1024 ** 3 - 1), '1024MB');
   assert.strictEqual(formatBytes(512 * 1024 ** 2), '512MB');
-  assert.strictEqual(formatBytes(1024 ** 2), '1MB');
-  assert.strictEqual(formatBytes(1024 ** 2 - 1), '1024KB');
   assert.strictEqual(formatBytes(2048), '2KB');
   assert.strictEqual(formatBytes(1536), '2KB');
   assert.strictEqual(formatBytes(0), '0KB');
@@ -53,6 +47,15 @@ test('formatBytes renders units and tolerates junk', () => {
   assert.strictEqual(formatBytes(NaN), '?');
   assert.strictEqual(formatBytes(Infinity), '?');
   assert.strictEqual(formatBytes('2048'), '?');
+});
+
+test('formatBytes preserves units at boundaries before rounding', () => {
+  assert.strictEqual(formatBytes(1024 ** 2 - 1), '1024KB');
+  assert.strictEqual(formatBytes(1024 ** 2), '1MB');
+  assert.strictEqual(formatBytes(1024 ** 3 - 1), '1024MB');
+  assert.strictEqual(formatBytes(1024 ** 3), '1.0GB');
+  assert.strictEqual(formatBytes(1024 ** 4 - 1), '1024.0GB');
+  assert.strictEqual(formatBytes(1024 ** 4), '1.0TB');
 });
 
 test('createHostTracker: first sample has shape, cpu warms up between calls', async () => {
