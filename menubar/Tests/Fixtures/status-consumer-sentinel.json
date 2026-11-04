@@ -310,7 +310,7 @@
       "patch": [
         {
           "field": "switchThreshold",
-          "value": 0.5479
+          "value": 0.3
         }
       ]
     },

@@ -227,6 +227,8 @@ const exhaustCredit = am => { const k = apikeyOf(am); k.creditExhausted = { reas
 const SCENARIOS = {
   currentAccount: { mutate: am => { am.currentIndex = 1; } },
   currentAccountUuid: { mutate: am => { am.currentIndex = 1; } },
+  // 문턱이 일부 계정 사용률(Claude 25%/35%) 아래로 내려와야 문턱을 쓰는 표시(한도 판정·호박색)가 바뀐다.
+  switchThreshold: { mutate: am => { am.switchThreshold = 0.3; } },
   usableCount: { payloadOnly: v => v + 37 },
   creditBackedCount: { payloadOnly: v => v + 37 },
   totalCount: { payloadOnly: v => v + 37 },
