@@ -1923,12 +1923,21 @@ function isExpectedServerIdentity(identity, { worker = false, supervisorPid = nu
   return identity.ppid > 0;
 }
 
+// The server records the config path it resolved; a CLI may name the same
+// file through another path (the daemon's HOME is a symlink to the real home),
+// so compare resolved files, falling back to the literal path when one is gone.
+function sameConfigFile(recorded, current) {
+  if (typeof recorded !== 'string') return false;
+  if (recorded === current) return true;
+  try { return realpathSync(recorded) === realpathSync(current); } catch { return false; }
+}
+
 function verifyLifecycleState(state, ownerPid, port) {
   if (!state?.lifecycle || state.lifecycle.version !== 1
       || typeof state.lifecycle.id !== 'string' || state.lifecycle.id.length < 16) {
     return { ok: false, reason: 'unverified-lifecycle' };
   }
-  if (state.pid !== ownerPid || state.port !== port || state.config !== getConfigPath()) {
+  if (state.pid !== ownerPid || state.port !== port || !sameConfigFile(state.config, getConfigPath())) {
     return { ok: false, reason: 'unverified-lifecycle' };
   }
   const supervisor = readProcessIdentity(state.pid);

@@ -196,6 +196,15 @@ func teamClaudeIsServerCommand(_ command: String) -> Bool {
     return entryIndex + 1 == serverIndex
 }
 
+/// 상태 파일의 설정 경로와 이 앱이 보는 경로가 같은 파일인가. 데몬 HOME이 실제 홈의 심볼릭 링크라
+/// 같은 파일이 다른 글자로 기록될 수 있어, 글자가 다르면 링크를 풀어 비교한다(프록시 CLI의 sameConfigFile과 같은 기준).
+func teamClaudeSameConfigFile(_ recorded: String?, _ expected: String) -> Bool {
+    guard let recorded else { return false }
+    if recorded == expected { return true }
+    let resolve = { (path: String) in URL(fileURLWithPath: path).resolvingSymlinksInPath().path }
+    return resolve(recorded) == resolve(expected)
+}
+
 /// worker에 SIGHUP을 보내도 되는가. 프록시 CLI의 verifyWorkerIdentity와 같은 기준으로,
 /// 상태 파일 기록과 현재 프로세스(부모·시작 시각·명령)가 모두 일치할 때만 허용한다.
 func teamClaudeWorkerSignalDecision(
@@ -205,7 +214,7 @@ func teamClaudeWorkerSignalDecision(
     observedWorker: TeamClaudeProcessIdentity?
 ) -> TeamClaudeWorkerSignalDecision {
     guard let state else { return .refuse(L10n.refuseNoState) }
-    guard state.configPath == expectedConfigPath else { return .refuse(L10n.refuseOtherConfig) }
+    guard teamClaudeSameConfigFile(state.configPath, expectedConfigPath) else { return .refuse(L10n.refuseOtherConfig) }
     guard let supervisorPid = state.supervisorPid, supervisorPid > 1,
           let workerPid = state.workerPid, workerPid > 1, workerPid != supervisorPid else {
         return .refuse(L10n.refuseBadPid)
