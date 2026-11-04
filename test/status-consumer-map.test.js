@@ -9,7 +9,7 @@
 //  - CLI: `teamcodex status`를 자식 프로세스로 띄우고, 가짜 프록시가 표식 status를 응답한다(서버 응답 대체).
 //  - TUI: 실제 AccountManager 상태에 표식을 넣고 TUI.render()가 stdout에 쓰는 프레임을 캡처한다.
 //  - 메뉴바: 같은 표식을 menubar/Tests/Fixtures/status-consumer-sentinel.json으로 내보내고
-//    menubar/Tests/StatusConsumerMapTests.swift가 메뉴바 디코딩·표시 로직에 넣어 판정한다.
+//    menubar/Tests/StatusConsumerMapTests.swift가 메뉴바 디코딩에 넣고 실제 CodexStatusView가 그린 글자로 판정한다.
 //
 // 필드 목록은 손으로 적지 않는다. 실제 getStatus 결과에서 모은다(최상위 키 + 계정 키, 중첩 객체는 1단계).
 // 보이지 않는 게 맞는 필드는 test/status-consumer-exemptions.json에 사유·만료·승인과 함께 등록한다.
@@ -36,7 +36,7 @@ const EXEMPTIONS_PATH = fileURLToPath(new URL('./status-consumer-exemptions.json
 const CONSUMER_FILES = {
   cli: 'src/index.js',
   tui: 'src/tui.js',
-  menubar: 'menubar/Sources/TeamCodexPoolStatus.swift',
+  menubar: 'menubar/Sources/CodexStatusView.swift',
 };
 
 // 고정 시계 기준. fixture가 실행 시각과 무관하게 같은 내용이 되도록 먼 미래의 고정 시각을 쓴다.

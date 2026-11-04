@@ -1,4 +1,4 @@
-import Foundation
+import Cocoa
 
 // status 필드 × 메뉴바 소비자 지도(test/status-consumer-map.test.js의 메뉴바 쪽).
 //
@@ -6,13 +6,14 @@ import Foundation
 // 실제 키와 달라지면 JS 테스트가 실패한다(갱신: TC_UPDATE_STATUS_SENTINEL=1 node --test test/status-consumer-map.test.js).
 //
 // 필드마다 "바탕 응답"과 "그 필드 칸만 표식으로 바꾼 응답"을 메뉴바 디코딩(teamCodexPoolHealth)에 넣고,
-// 실제 뷰가 그리는 문구·값을 비교한다. 문구·값은 뷰가 직접 부르는 공유 함수에서 받는다:
-//  - teamCodexPoolHeaderText · teamCodexPoolRowText(TeamCodexPoolRowText.swift) → CodexStatusView.drawTeamCodexPool
-//  - PanelDraw.meterValueText → PanelDraw.meterWithValue, codexSubscriptionStatusText → CodexStatusView 구독 상태 글
-//  - teamCodexAccountRecovery(되돌리기 버튼), titleSlot·accessibilitySummary(메뉴바 제목), TeamClaudeApiCredit 행 문구
-// 그래서 뷰에서 표시를 빼려면 이 공유 함수를 바꿔야 하고, 그러면 여기서 실패한다.
+// 실제 CodexStatusView를 화면 밖 비트맵에 그려 DrawnTextRecorder가 가로챈 "실제로 그려진 글자"를 비교한다
+// (자식 컨트롤 제목은 collectControlTitles). 뷰가 값을 계산만 하고 그리기 호출을 빼면 글자가 같아져 실패한다.
 // 같으면 그 필드는 메뉴바에 보이지 않는 것이다. 보이지 않는 게 맞는 필드는
 // test/status-consumer-exemptions.json(consumer "menubar")에 사유·만료·승인과 함께 등록한다.
+//
+// CodexStatusView는 main.swift 타입에 의존해 러너가 직접 못 돌린다(run-tests.sh SKIP_TESTS).
+// test_status_consumer_map.py가 main.swift 진입점 앞부분을 잘라 붙여 컴파일하고, 구독 버튼이 ~/.config 설정을
+// 읽으므로 격리 HOME에서 실행한다. Claude 풀 표(main.swift 본체)는 여기서 그리지 않는다.
 
 @main
 struct StatusConsumerMapTests {
@@ -30,7 +31,7 @@ struct StatusConsumerMapTests {
         let approvedBy: String
     }
 
-    static let missingHint = "대신 menubar/Sources/TeamCodexPoolRowText.swift에 표시 지점을 추가하거나 exemptions에 사유·만료·승인 등록"
+    static let missingHint = "대신 menubar/Sources/CodexStatusView.swift에 표시 지점을 추가하거나 exemptions에 사유·만료·승인 등록"
 
     // ── 응답 패치 ────────────────────────────────────────────
 
@@ -61,43 +62,31 @@ struct StatusConsumerMapTests {
         return out
     }
 
-    // ── 메뉴바 표시(뷰와 공유하는 함수만 부른다) ────────────────────────
+    // ── 메뉴바 표시: 실제 CodexStatusView가 그린 글자 ──────────────────────
 
     static func render(_ payload: [String: Any], now: Date) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let pool = try? teamCodexPoolHealth(from: data, port: 3457, serverPid: 1, checkedAt: now) else {
             fatalError("메뉴바 status 디코딩 실패")
         }
-        var lines = [
-            pool.titleSlot(timeZone: TimeZone(identifier: "UTC")!),
-            pool.accessibilitySummary,
-            String(describing: teamCodexPoolHeaderText(pool)),
-        ]
-        for account in pool.accounts { lines += rowLines(account, pool: pool) }
-        lines += apiCreditLines(payload, now: now)
-        return lines.joined(separator: "\n")
+        return drawnStrings(pool).joined(separator: "\n")
     }
 
-    static func rowLines(_ account: TeamCodexPoolAccount, pool: TeamCodexPoolHealth) -> [String] {
-        let row = teamCodexPoolRowText(account, pool: pool)
-        var lines = [String(describing: row)]
-        lines += row.windows.map { PanelDraw.meterValueText($0.percent) }
-        if let recovery = teamCodexAccountRecovery(account, now: pool.checkedAt) { lines.append(recovery.title) }
-        let subscription = codexSubscriptionResolution(account: account, local: nil, now: pool.checkedAt)
-        lines.append(codexSubscriptionStatusText(subscription, now: pool.checkedAt))
-        return lines
-    }
-
-    /// Claude 탭 "API 크레딧" 묶음의 행 문구(TeamClaudeApiCredit.swift). 같은 응답의 계정별 credit 블록을 읽는다.
-    static func apiCreditLines(_ payload: [String: Any], now: Date) -> [String] {
-        var lines: [String] = []
-        for row in payload["accounts"] as? [[String: Any]] ?? [] {
-            guard let credit = teamClaudeApiCredit(row["credit"]) else { continue }
-            lines += [teamClaudeApiCreditReason(credit, now: now), teamClaudeApiCreditBarValue(credit),
-                      teamClaudeApiCreditAmountText(credit)]
-            if let expiry = teamClaudeApiCreditExpiryText(credit, now: now) { lines.append(expiry) }
-        }
-        return lines
+    /// 화면 밖 비트맵에 실제 draw()를 돌리고, 그 사이 NSString·NSAttributedString 그리기로 나간 글자와
+    /// 보이는 컨트롤 제목(구독 버튼 등)을 그린 순서대로 모은다.
+    static func drawnStrings(_ pool: TeamCodexPoolHealth) -> [String] {
+        let width = StatusMenuDashboardView.preferredWidth
+        let view = CodexStatusView(frame: NSRect(x: 0, y: 0, width: width, height: CodexStatusView.preferredHeight(for: pool)))
+        view.appearance = NSAppearance(named: .darkAqua)
+        view.pool = pool
+        view.layoutSubtreeIfNeeded()
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { fatalError("비트맵 생성 실패") }
+        DrawnTextRecorder.reset()
+        view.cacheDisplay(in: view.bounds, to: rep)
+        DrawnTextRecorder.collectControlTitles(in: view)
+        let drawn = DrawnTextRecorder.strings
+        DrawnTextRecorder.reset()
+        return drawn
     }
 
     // ── 입력 ─────────────────────────────────────────────────
@@ -162,6 +151,14 @@ struct StatusConsumerMapTests {
     }
 
     static func main() {
+        _ = NSApplication.shared
+        L10n.language = .ko
+        // 구독 버튼은 ~/.config 아래 설정을 읽는다. 실제 계정 설정을 건드리지 않도록 격리 HOME에서만 돈다.
+        guard NSHomeDirectory().contains("cc-status-consumer-map-") else {
+            FileHandle.standardError.write("Refusing to run outside the isolated HOME (cc-status-consumer-map-*)\n".data(using: .utf8)!)
+            exit(2)
+        }
+        DrawnTextRecorder.install()
         let testsDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         let fixture = loadFixture(testsDir)
         let exemptions = loadExemptions(testsDir.deletingLastPathComponent().deletingLastPathComponent())
