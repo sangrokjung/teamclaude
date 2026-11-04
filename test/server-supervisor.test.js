@@ -968,6 +968,41 @@ setTimeout(() => {
   }
 });
 
+test('CLI confirms its live reload when the server named the same config through a symlinked path', { timeout: 15000 }, async () => {
+  // Production: the daemon's HOME is a symlink to the real home, so the server
+  // records the config as <link>/.config/teamclaude.json while a CLI launched
+  // from the real home resolves <real>/.config/teamclaude.json. Same file —
+  // the CLI must still find and reload the running worker.
+  const real = await mkdtemp(join(tmpdir(), 'teamclaude-live-symlink-'));
+  const link = `${real}-link`;
+  await symlink(real, link, 'dir');
+  const port = await unusedPort();
+  await writeFile(join(real, 'config.json'), JSON.stringify({
+    proxy: { port, apiKey: 'tc-test' },
+    upstream: 'http://127.0.0.1:9',
+    activeWarmup: false,
+    accounts: [{ name: 'keep', type: 'apikey', apiKey: 'key-a' }],
+  }));
+  const serverEnv = { ...process.env, TEAMCLAUDE_CONFIG: join(link, 'config.json') };
+  const cliEnv = { ...process.env, TEAMCLAUDE_CONFIG: join(real, 'config.json') };
+  const child = spawn(process.execPath, [entry, 'server'], { env: serverEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await waitUntil(() => status(port), 'proxy did not start');
+    await waitUntil(() => readState(join(real, 'config.server.json')), 'server state was not written');
+    const result = await runCli(['priority', 'keep', '1'], cliEnv);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /Applied to the running server/);
+    const accounts = (await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`, {
+      headers: { 'x-api-key': 'tc-test', 'x-teamcodex-status-identity': '1' },
+    })).json()).accounts;
+    assert.equal(accounts[0].priority, 1, 'the change must be live when the CLI returns');
+  } finally {
+    await stopChild(child);
+    await rm(link, { force: true });
+    await rm(real, { recursive: true, force: true });
+  }
+});
+
 function runCli(argv, env, input) {
   return new Promise(resolve => {
     const cli = spawn(process.execPath, [entry, ...argv], { env, stdio: ['pipe', 'pipe', 'pipe'] });

@@ -141,6 +141,23 @@ struct TeamClaudeServerControlTests {
             state: state, expectedConfigPath: "/home/u/.config/teamcodex.json",
             launchd: .running(pid: 30821), observedWorker: liveWorker
         ) { preconditionFailure("config mismatch must refuse") }
+        // 같은 파일을 심볼릭 링크 경로로 기록한 서버(데몬 HOME이 실제 홈의 링크)에는 보낸다
+        do {
+            let fm = FileManager.default
+            let real = fm.temporaryDirectory.appendingPathComponent("tc-symlink-\(UUID().uuidString)")
+            let link = URL(fileURLWithPath: real.path + "-link")
+            try? fm.createDirectory(at: real, withIntermediateDirectories: true)
+            fm.createFile(atPath: real.appendingPathComponent("teamclaude.json").path, contents: Data("{}".utf8))
+            try? fm.createSymbolicLink(at: link, withDestinationURL: real)
+            defer { try? fm.removeItem(at: link); try? fm.removeItem(at: real) }
+            var linkedJSON = stateJSON
+            linkedJSON["config"] = link.appendingPathComponent("teamclaude.json").path
+            guard let linkedState = parseTeamClaudeServerState(linkedJSON) else { preconditionFailure("linked state parse") }
+            precondition(teamClaudeWorkerSignalDecision(
+                state: linkedState, expectedConfigPath: real.appendingPathComponent("teamclaude.json").path,
+                launchd: .running(pid: 30821), observedWorker: liveWorker
+            ) == .signal(pid: 30823), "symlinked config path of the same file must signal")
+        }
         // launchd 서비스 pid와 상태 파일 supervisor가 다르면 거부
         if case .signal = teamClaudeWorkerSignalDecision(
             state: state, expectedConfigPath: expectedConfig,
