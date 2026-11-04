@@ -879,7 +879,10 @@ async function superviseServerCommand() {
       }
       if (!err) continue;
       const required = index === 0 || isLoopbackBindHost(host);
-      if (required && !(host === '::1' && err.code === 'EADDRNOTAVAIL')) {
+      // ::1 is skipped only when the host has no usable IPv6 loopback at all;
+      // a busy ::1 (EADDRINUSE) still fails startup like 127.0.0.1 does.
+      const ipv6Unavailable = err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT';
+      if (required && !(host === '::1' && ipv6Unavailable)) {
         exitReason = `listen-error:${err?.code || 'unknown'}`;
         handleServerListenError(err, port);
         return false;

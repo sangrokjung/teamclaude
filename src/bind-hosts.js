@@ -76,5 +76,10 @@ export function resolveBindHosts(config) {
       );
     }
   });
+  // Discovery and management clients probe 127.0.0.1, so an IPv4 loopback
+  // (or a wildcard that covers it) must always be bound.
+  if (!hosts.some(host => host === '127.0.0.1' || isWildcardBindHost(host))) {
+    throw new Error('proxy.bindHosts must include 127.0.0.1 (local clients probe the IPv4 loopback).');
+  }
   return [...hosts];
 }

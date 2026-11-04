@@ -43,10 +43,15 @@ test('accepts a Tailscale-range host', () => {
 
 test('accepts a Tailscale-range IPv6 host and rejects a lookalike', () => {
   assert.deepEqual(
-    resolveBindHosts({ proxy: { bindHosts: ['::1', 'fd7a:115c:a1e0::1'] } }),
-    ['::1', 'fd7a:115c:a1e0::1'],
+    resolveBindHosts({ proxy: { bindHosts: ['::1', '127.0.0.1', 'fd7a:115c:a1e0::1'] } }),
+    ['::1', '127.0.0.1', 'fd7a:115c:a1e0::1'],
   );
-  assert.throws(() => resolveBindHosts({ proxy: { bindHosts: ['::1', 'fd7a:115c:a1e1::1'] } }), Error);
+  assert.throws(() => resolveBindHosts({ proxy: { bindHosts: ['::1', '127.0.0.1', 'fd7a:115c:a1e1::1'] } }), Error);
+});
+
+test('rejects bindHosts without the IPv4 loopback that local probes use', () => {
+  assert.throws(() => resolveBindHosts({ proxy: { bindHosts: ['::1'] } }), /127\.0\.0\.1/);
+  assert.throws(() => resolveBindHosts({ proxy: { bindHosts: ['::1', 'fd7a:115c:a1e0::1'] } }), /127\.0\.0\.1/);
 });
 
 test('rejects non-array and empty bindHosts', () => {
