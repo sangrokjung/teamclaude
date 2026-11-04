@@ -191,6 +191,13 @@ private func subscriptionRemaining(_ date: String, now: Date) -> String? {
     return L10n.subDaysAgo(-days)
 }
 
+/// Codex 풀 행 오른쪽 구독 상태 글(기호 뒤). 확인 안 됨은 "구독 확인 안 됨", 해지 계열은 한 줄 요약.
+/// CodexStatusView가 그리고 StatusConsumerMapTests가 같은 함수로 확인한다.
+func codexSubscriptionStatusText(_ subscription: SubscriptionResolution, now: Date) -> String {
+    subscription.state == .unknown ? L10n.subCodexUnconfirmed
+        : (subscriptionRowLine(subscription.shown, now: now) ?? subscription.state.label)
+}
+
 /// 행 아래 한 줄. 해지 계열만 쓴다(구독 중·확인 안 됨은 이름 옆 기호로 충분하다).
 func subscriptionRowLine(_ view: SubscriptionRecordView, now: Date) -> String? {
     switch view.state {

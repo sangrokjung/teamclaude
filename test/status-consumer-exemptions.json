@@ -56,6 +56,20 @@
     "approved_by": "pending"
   },
   {
+    "field": "accounts.planType",
+    "consumer": "menubar",
+    "reason": "플랜 줄은 AccountSubscriptionButton(NSButton)이 사용자 설정 파일과 저장소를 읽어 그린다 — 공유 표시 모델(teamCodexPoolRowText) 밖이라 이 테스트가 실행 검증하지 못한다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.accountUuid",
+    "consumer": "menubar",
+    "reason": "내부 식별자 — 계정 대조·현재 계정 판정용이고 화면에는 이름을 쓴다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
     "field": "currentAccountUuid",
     "consumer": "cli",
     "reason": "내부 식별자 — 계정 대조·현재 계정 판정용이고 화면에는 이름을 쓴다",

@@ -357,17 +357,25 @@ function statusMap() {
   return cachedMap;
 }
 
+/**
+ * 메뉴바 표식 fixture(생성물). 이 함수만 만들고 손으로 고치지 않는다 — 갱신은
+ * `TC_UPDATE_STATUS_SENTINEL=1 node --test test/status-consumer-map.test.js`. 리뷰할 때 줄 단위로 읽히도록
+ * 최상위 키와 필드별 표식(variants)을 한 줄에 하나씩 쓴다.
+ */
 function fixtureContent() {
   const { defaultBase, paths, cases } = statusMap();
-  const fixture = {
-    _comment: 'test/status-consumer-map.test.js가 실제 AccountManager.getStatus로 생성한다. 손으로 고치지 말고 '
-      + 'TC_UPDATE_STATUS_SENTINEL=1 node --test test/status-consumer-map.test.js 로 갱신한다.',
-    now: iso(T0),
-    fields: paths,
-    baseline: defaultBase,
-    variants: cases.map(c => ({ field: c.field, basePatch: c.basePatch, patch: c.patch })),
-  };
-  return `${JSON.stringify(fixture, null, 2)}\n`;
+  const variants = cases.map(c => `    ${JSON.stringify({ field: c.field, basePatch: c.basePatch, patch: c.patch })}`);
+  return [
+    '{',
+    `  "now": ${JSON.stringify(iso(T0))},`,
+    `  "fields": ${JSON.stringify(paths)},`,
+    `  "baseline": ${JSON.stringify(defaultBase)},`,
+    '  "variants": [',
+    variants.join(',\n'),
+    '  ]',
+    '}',
+    '',
+  ].join('\n');
 }
 
 // ── 예외 원장 ──────────────────────────────────────────────
