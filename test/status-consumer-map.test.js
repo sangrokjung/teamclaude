@@ -225,8 +225,19 @@ const exhaustCredit = am => { const k = apikeyOf(am); k.creditExhausted = { reas
 // mutate는 표식 쪽 상태만 바꾼다. payloadOnly는 상태 하나로 따로 움직일 수 없는 집계값이라
 // 응답(JSON)에서만 바꾼다 — 계정 상태를 직접 그리는 TUI에는 주입 경로가 없다.
 const SCENARIOS = {
+  // 현재 계정의 이름·UUID는 currentIndex 하나에서 함께 나온다(독립 주입 불가 — TUI 판정은 연동으로 남는다).
   currentAccount: { mutate: am => { am.currentIndex = 1; } },
   currentAccountUuid: { mutate: am => { am.currentIndex = 1; } },
+  // 현재 계정(0번)은 건드리지 않는다. 바꾸면 currentAccount·currentAccountUuid가 함께 바뀐다.
+  'accounts.name': { mutate: am => am.accounts.forEach((a, i) => { if (i !== am.currentIndex) a.name = `__TC_accounts.name_${i}__`; }) },
+  'accounts.accountUuid': {
+    mutate: am => am.accounts.forEach((a, i) => { if (i !== am.currentIndex) a.accountUuid = `__TC_accounts.accountUuid_${i}__`; }),
+  },
+  // false가 되면 getStatus가 5시간 값(unified5h·리셋)을 비운다. 양쪽 모두 미측정에서 시작해 이 필드만 바뀌게 한다.
+  'accounts.quota.sessionWindowStated': {
+    setup: am => { Object.assign(byName(am, 'acct-claude').quota, { unified5h: null, unified5hReset: null }); },
+    mutate: am => { byName(am, 'acct-claude').quota.sessionWindowStated = false; },
+  },
   // 문턱이 일부 계정 사용률(Claude 25%/35%) 아래로 내려와야 문턱을 쓰는 표시(한도 판정·호박색)가 바뀐다.
   switchThreshold: { mutate: am => { am.switchThreshold = 0.3; } },
   usableCount: { payloadOnly: v => v + 37 },
@@ -291,6 +302,13 @@ function genericScenario(path, base) {
   };
 }
 
+// 다른 필드에서 계산되는 파생값. 바꾼 필드의 함수라 따라 바뀌는 게 정상이고, 그 표시 변화는 바꾼 필드의
+// 표시 효과다. 그래서 "연동"으로 세지 않는다. 반대로 이 필드 자체를 바꾸는 시나리오는 메서드 stub이라 입력이 따로 안 바뀐다.
+const DERIVED_FIELDS = new Set([
+  'usableCount', 'creditBackedCount', 'totalCount',
+  'accounts.usable', 'accounts.creditBacked', 'accounts.creditRecoverable', 'accounts.credit.remainingUsd',
+]);
+
 /**
  * 필드 하나의 바탕/표식 쌍. 응답 소비자(CLI·메뉴바)에는 바탕 응답에서 그 필드 칸만 바꾼 응답을,
  * TUI에는 바탕·표식 AccountManager 쌍을 준다.
@@ -303,17 +321,23 @@ function buildCase(path, defaultBase, paths) {
   const base = statusOf(baseAm);
   let patch;
   let variantAm = null;
+  let coupled = [];
   if (scenario.payloadOnly) {
     patch = [{ field: path, value: scenario.payloadOnly(readField(base, path)) }];
   } else {
     variantAm = buildManager();
     scenario.setup?.(variantAm);
     scenario.mutate(variantAm, base);
-    patch = diffPatch(base, statusOf(variantAm), [path]);
+    const variantStatus = statusOf(variantAm);
+    patch = diffPatch(base, variantStatus, [path]);
     if (patch.length === 0) throw new Error(`${path}: 표식 주입이 getStatus 값을 바꾸지 못함 — SCENARIOS 확인`);
+    // 같은 주입으로 함께 바뀐 다른(파생 아닌) 필드. 있으면 TUI 화면 차이가 이 필드 때문인지 가릴 수 없다.
+    coupled = [...new Set(diffPatch(base, variantStatus, paths).map(e => e.field))]
+      .filter(f => f !== path && !DERIVED_FIELDS.has(f));
   }
   return {
     field: path,
+    coupled,
     basePatch: diffPatch(defaultBase, base, paths),
     patch,
     base,
@@ -363,10 +387,21 @@ function missingMessage(field, consumer) {
   return `${field} 누락: ${consumer} — 대신 ${CONSUMER_FILES[consumer]}에 표시 지점을 추가하거나 exemptions에 사유·만료·승인 등록`;
 }
 
+/**
+ * shownByField 값: true(표시) · false(표시 안 함) · { coupled: [...] }(화면은 바뀌었지만 다른 필드가 함께 바뀌어
+ * 이 필드 때문인지 가릴 수 없음). 연동은 표시로 세지 않는다 — 단독 시나리오를 만들거나 예외 원장에 연동 사유를 단다.
+ */
 function judge(consumer, shownByField, exemptions) {
   const failures = [];
   for (const [field, shown] of shownByField) {
     const exempt = isExempt(exemptions, field, consumer);
+    if (shown?.coupled) {
+      if (!exempt) {
+        failures.push(`${field} 독립 주입 불가: ${consumer} — ${shown.coupled.join(', ')}와 함께 바뀜. `
+          + 'SCENARIOS에 그 필드만 바꾸는 시나리오를 만들거나 exemptions에 연동 사유 등록');
+      }
+      continue;
+    }
     if (!shown && !exempt) failures.push(missingMessage(field, consumer));
     if (shown && exempt) failures.push(`${field} 불필요한 예외: ${consumer}가 이미 표시함 — exemptions에서 제거`);
   }
@@ -537,7 +572,9 @@ test('TUI 화면이 getStatus 필드를 표시한다', async () => {
     // 상태 하나로 따로 움직일 수 없는 집계값(payloadOnly)은 TUI에 주입 경로가 없다 = 표시하지 않음.
     if (!c.variantAm) return [c.field, false];
     // 바탕을 매번 다시 그려 시각에 따른 리셋 카운트다운 차이를 없앤다.
-    return [c.field, renderTui(c.baseAm) !== renderTui(c.variantAm)];
+    const changed = renderTui(c.baseAm) !== renderTui(c.variantAm);
+    // TUI는 응답이 아니라 계정 상태를 그린다. 같은 주입으로 다른 필드도 바뀌었으면 차이의 원인을 가릴 수 없다.
+    return [c.field, changed && c.coupled.length > 0 ? { coupled: c.coupled } : changed];
   });
   assert.deepEqual(judge('tui', shown, exemptions), []);
 });

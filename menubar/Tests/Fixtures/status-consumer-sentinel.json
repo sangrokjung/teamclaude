@@ -360,11 +360,6 @@
       "patch": [
         {
           "field": "accounts.name",
-          "index": 0,
-          "value": "__TC_accounts.name_0__"
-        },
-        {
-          "field": "accounts.name",
           "index": 1,
           "value": "__TC_accounts.name_1__"
         },
@@ -379,11 +374,6 @@
       "field": "accounts.accountUuid",
       "basePatch": [],
       "patch": [
-        {
-          "field": "accounts.accountUuid",
-          "index": 0,
-          "value": "__TC_accounts.accountUuid_0__"
-        },
         {
           "field": "accounts.accountUuid",
           "index": 1,
@@ -859,7 +849,18 @@
     },
     {
       "field": "accounts.quota.sessionWindowStated",
-      "basePatch": [],
+      "basePatch": [
+        {
+          "field": "accounts.quota.unified5h",
+          "index": 0,
+          "value": null
+        },
+        {
+          "field": "accounts.quota.unified5hReset",
+          "index": 0,
+          "value": null
+        }
+      ],
       "patch": [
         {
           "field": "accounts.quota.sessionWindowStated",

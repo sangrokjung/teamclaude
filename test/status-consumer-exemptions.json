@@ -1,5 +1,61 @@
 [
   {
+    "field": "currentAccount",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — TUI는 현재 계정을 currentIndex(► 표시)로 그리고 응답의 이름·UUID를 읽지 않는다. 이름·UUID는 같은 인덱스에서 함께 바뀐다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "currentAccountUuid",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — TUI는 현재 계정을 currentIndex(► 표시)로 그리고 응답의 이름·UUID를 읽지 않는다. 이름·UUID는 같은 인덱스에서 함께 바뀐다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.subscription.state",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — 해지 기록 하나에서 state·endedAt·evidence가 함께 바뀐다. TUI는 이 기록을 상태 칸(canceling·sub ended)으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.subscription.evidence",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — 해지 기록 하나에서 state·endedAt·evidence가 함께 바뀐다. TUI는 이 기록을 상태 칸(canceling·sub ended)으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.quota.apiSpendUsd",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — quota.apiSpendUsd와 credit.spentUsd는 같은 지출 원장 값의 두 노출이다. TUI는 그 값을 Cr 칸 남은 금액으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.credit.spentUsd",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — quota.apiSpendUsd와 credit.spentUsd는 같은 지출 원장 값의 두 노출이다. TUI는 그 값을 Cr 칸 남은 금액으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.credit.remainingUsd",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — usd − spentUsd 파생값이라 입력 없이 따로 바꿀 수 없다. TUI는 Cr 칸 남은 금액으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
+    "field": "accounts.credit.exhausted",
+    "consumer": "tui",
+    "reason": "연동(독립 주입 불가) — 소진 플래그와 사유는 같은 소진 기록에서 함께 생긴다. TUI는 Cr 칸 out으로 그린다",
+    "expires": "2027-02-04",
+    "approved_by": "pending"
+  },
+  {
     "field": "currentAccountUuid",
     "consumer": "cli",
     "reason": "내부 식별자 — 계정 대조·현재 계정 판정용이고 화면에는 이름을 쓴다",
