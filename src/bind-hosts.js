@@ -1,0 +1,80 @@
+import { isIP } from 'node:net';
+
+// Which local addresses the supervisor's public listener binds.
+//
+// Default: loopback only (127.0.0.1 and ::1), never the wildcard address.
+// proxy.bindHosts may add hosts. Loopback and Tailscale-range addresses
+// (IPv4 100.64.0.0/10, IPv6 fd7a:115c:a1e0::/48) are allowed as-is; any other
+// address, including private LAN ranges and the wildcard 0.0.0.0 / ::, needs
+// proxy.allowLanBind === true. A violation throws so startup is refused.
+
+export const DEFAULT_BIND_HOSTS = Object.freeze(['127.0.0.1', '::1']);
+
+const LOOPBACK_BIND_HOSTS = new Set(['127.0.0.1', '::1']);
+const WILDCARD_BIND_HOSTS = new Set(['0.0.0.0', '::']);
+
+export function isLoopbackBindHost(host) {
+  return LOOPBACK_BIND_HOSTS.has(host);
+}
+
+export function isWildcardBindHost(host) {
+  return WILDCARD_BIND_HOSTS.has(host);
+}
+
+function expandIPv6(host) {
+  const [head, tail] = host.includes('::') ? host.split('::') : [host, null];
+  const headParts = head ? head.split(':') : [];
+  const tailParts = tail ? tail.split(':') : [];
+  const missing = tail == null ? 0 : 8 - headParts.length - tailParts.length;
+  return [...headParts, ...Array(missing).fill('0'), ...tailParts]
+    .map(part => Number.parseInt(part || '0', 16));
+}
+
+export function isTailscaleAddress(host) {
+  const family = isIP(host);
+  if (family === 4) {
+    const [first, second] = host.split('.').map(Number);
+    return first === 100 && second >= 64 && second <= 127;
+  }
+  if (family === 6) {
+    // IPv4-embedded forms (a dotted tail) are not part of the Tailscale range.
+    if (host.includes('.')) return false;
+    const groups = expandIPv6(host);
+    return groups[0] === 0xfd7a && groups[1] === 0x115c && groups[2] === 0xa1e0;
+  }
+  return false;
+}
+
+export function resolveBindHosts(config) {
+  const proxy = config?.proxy || {};
+  if (proxy.bindHosts === undefined) return [...DEFAULT_BIND_HOSTS];
+  const hosts = proxy.bindHosts;
+  if (!Array.isArray(hosts) || hosts.length === 0) {
+    throw new Error('proxy.bindHosts must be a non-empty array of IP addresses.');
+  }
+  const allowLan = proxy.allowLanBind === true;
+  const seen = new Set();
+  hosts.forEach((host, index) => {
+    if (typeof host !== 'string' || isIP(host) === 0) {
+      throw new Error(`proxy.bindHosts[${index}] must be an IP address literal, got ${JSON.stringify(host)}.`);
+    }
+    if (seen.has(host)) {
+      throw new Error(`proxy.bindHosts lists ${host} more than once.`);
+    }
+    seen.add(host);
+    if (isLoopbackBindHost(host)) return;
+    if (index === 0 && !(allowLan && isWildcardBindHost(host))) {
+      // A wildcard first host already covers loopback, so it is accepted with
+      // the LAN opt-in; any other first host must be loopback.
+      throw new Error('proxy.bindHosts must start with a loopback address (127.0.0.1 or ::1).');
+    }
+    if (isTailscaleAddress(host)) return;
+    if (!allowLan) {
+      throw new Error(
+        `proxy.bindHosts entry ${host} is outside loopback and the Tailscale range; `
+        + 'set proxy.allowLanBind to true to bind it.',
+      );
+    }
+  });
+  return [...hosts];
+}
