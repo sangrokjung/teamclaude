@@ -37,6 +37,7 @@ struct DashboardOverviewBuilderTests {
         testApiCreditAccounts(fixture: fixture, input: input, now: now)
         testApiKeyRateLimited(fixture: fixture, input: input, now: now)
         testFableUnmeasuredCounts(fixture: fixture, input: input, now: now)
+        testWeeklyExhaustedAccounts(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
     }
 
@@ -456,6 +457,122 @@ struct DashboardOverviewBuilderTests {
         // 프록시가 뺀 계정은 Fable이 비어도 세지 않는다.
         let excluded = lane(weeklyOnlyStatus(fixture, usable: false) { $0["modelWeekly"] = [String: Any]() })
         precondition(Int(excluded.value)! == Int(baseline.value)! - 1 && excluded.note == L10n.fableLaneNote, "\(excluded.value) \(excluded.note)")
+    }
+
+    /// 주간 한도를 다 쓴 계정의 실제 상태 응답 모양(2026-11-05 실측). 프록시는 active·errorReason null·usable=false,
+    /// quota는 unified7d=1(정수 JSON)·unifiedStatus "rejected". 5시간 창 없는 계정은 unified5h/5hReset null + sessionWindowStated=false.
+    /// modelWeekly는 Fable 요청 응답에만 실리고 프록시가 재시작 사이에 보존하지 않아 빈 객체로 올 수 있다.
+    static func quotaStatus(_ fixture: [String: Any], now: Date, names: [String], weekly: Double, usable: Bool,
+                            sessionWindow: Bool, fable: Double?) -> [String: Any] {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]] else { preconditionFailure("fixture accounts") }
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        for name in names {
+            guard let index = accounts.firstIndex(where: { $0["name"] as? String == name }) else { preconditionFailure(name) }
+            accounts[index]["status"] = "active"
+            accounts[index]["errorReason"] = NSNull()
+            accounts[index]["enabled"] = true
+            accounts[index]["usable"] = usable
+            accounts[index]["inflight"] = 0
+            accounts[index]["maxConcurrent"] = 3
+            var quota: [String: Any] = [
+                "unified7d": weekly, "unified7dReset": nowMs + 3 * 86_400_000,
+                "unifiedStatus": usable ? "allowed" : "rejected",
+                "modelWeekly": fable.map { ["7d_oi": ["utilization": $0, "reset": nowMs + 3 * 86_400_000]] } ?? [String: Any](),
+            ]
+            if sessionWindow {
+                quota["unified5h"] = 0.3
+                quota["unified5hReset"] = nowMs + 4 * 3_600_000
+                quota["sessionWindowStated"] = true
+            } else {
+                quota["unified5h"] = NSNull()
+                quota["unified5hReset"] = NSNull()
+                quota["sessionWindowStated"] = false
+            }
+            accounts[index]["quota"] = quota
+        }
+        status["accounts"] = accounts
+        // 실제 경로는 HTTP 바이트를 JSONSerialization으로 읽는다. 사전 리터럴이 아니라 같은 디코더를 거친다(1 → 정수 NSNumber).
+        guard let data = try? JSONSerialization.data(withJSONObject: status),
+              let decoded = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            preconditionFailure("status round-trip")
+        }
+        return decoded
+    }
+
+    /// 주간 한도를 다 쓴 계정은 손볼 것·제외가 아니라 복귀 대기(주간 가득, 주간 리셋 시각)에 있다.
+    static func expectWeeklyWait(_ label: String, _ health: TeamClaudeHealth, names: [String], input: DashboardOverviewInput, at: Date) {
+        let routing = health.routingAvailability(now: at)
+        for name in names {
+            guard let index = health.accounts.firstIndex(where: { $0.name == name }) else { preconditionFailure(name) }
+            let row = health.accounts[index], state = routing[index]
+            precondition(state.state == .limited && state.blockedWindows == [L10n.windowAllWeekly],
+                         "\(label) \(name): \(state.state) · \(state.reason) · weekly \(String(describing: row.weeklyPercent))")
+            precondition(abs((row.weeklyPercent ?? 0) - 100) < 0.01, "\(label) \(name): weekly \(String(describing: row.weeklyPercent))")
+            precondition(teamClaudeRowPresentation(row, state).tone == .wait, "\(label) \(name) presentation")
+        }
+        let model = makeOverviewModel(DashboardOverviewInput(teamClaude: health, teamCodex: input.teamCodex,
+            grok: input.grok, agy: input.agy, burn: input.burn, notices: input.notices, now: at))
+        let todoNames = model.todos.map(\.name)
+        precondition(!todoNames.contains { names.contains($0) }, "\(label): weekly-full accounts are not todos: \(todoNames)")
+        precondition(!model.excluded.contains { names.contains($0.name) }, "\(label): not excluded: \(model.excluded.map(\.name))")
+        for name in names {
+            guard let waiting = model.waiting.first(where: { $0.name == name }) else {
+                preconditionFailure("\(label) \(name) must wait: \(model.waiting.map(\.name))")
+            }
+            precondition(waiting.cause == .weekly && (waiting.returnSeconds ?? 0) > 2 * 86_400 && waiting.returnClock != nil,
+                         "\(label) \(name): \(waiting.cause) \(String(describing: waiting.returnSeconds))")
+        }
+        // 기존 분류는 그대로: 인증 오류(재인증)·조직 차단·꺼 둔 계정은 손볼 것에 남는다.
+        precondition(todoNames.filter { $0.hasPrefix("acct-") } == ["acct-13", "acct-14", "acct-15"], "\(label) todos: \(todoNames)")
+        precondition(model.todos.first { $0.name == "acct-13" }?.action == .reauthenticate, "\(label) error account keeps reauth")
+        precondition(model.todos.first { $0.name == "acct-15" }?.reason == L10n.todoReasonDisabled, "\(label) disabled account keeps its reason")
+    }
+
+    static func testWeeklyExhaustedAccounts(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        let weeklyOnly = ["acct-01", "acct-02", "acct-03", "acct-04"]
+        func parse(_ status: [String: Any], _ at: Date) -> TeamClaudeHealth {
+            parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: at)
+        }
+
+        // 1. 신고된 모양 그대로(Fable 2% 실림): 파싱 → 첫 병합 → 다음 병합 모두 주간 대기.
+        let reported = quotaStatus(fixture, now: now, names: weeklyOnly, weekly: 1, usable: false, sessionWindow: false, fable: 0.02)
+        let first = teamClaudeHealthMergingQuota(candidate: parse(reported, now), previous: nil)
+        expectWeeklyWait("reported/parsed", parse(reported, now), names: weeklyOnly, input: input, at: now)
+        expectWeeklyWait("reported/first", first, names: weeklyOnly, input: input, at: now)
+        expectWeeklyWait("reported/second", teamClaudeHealthMergingQuota(candidate: parse(reported, now.addingTimeInterval(5)), previous: first),
+                         names: weeklyOnly, input: input, at: now.addingTimeInterval(5))
+
+        // 2. 실제 갱신 경로의 결함: 앞선 갱신에서 주간 90%·Fable 10%로 쟀던 계정이 한도를 다 쓰고, 프록시 재시작으로
+        //    Fable 창이 빈 응답(modelWeekly {})이 온다. 이번 응답의 주간 100%가 정본이고, 이전 갱신은 빈 Fable만 메운다.
+        //    예전에는 주간·Fable을 한 짝으로만 골라 이전 짝의 낡은 주간 90%가 새 100%를 덮었고,
+        //    문턱 아래인데 프록시가 usable=false라 "제외 · 프록시 라우팅 제외"로 손볼 것에 올랐다.
+        let before = quotaStatus(fixture, now: now, names: weeklyOnly, weekly: 0.9, usable: true, sessionWindow: false, fable: 0.1)
+        let previous = teamClaudeHealthMergingQuota(candidate: parse(before, now.addingTimeInterval(-30)), previous: nil)
+        let exhausted = quotaStatus(fixture, now: now, names: weeklyOnly, weekly: 1, usable: false, sessionWindow: false, fable: nil)
+        let afterRestart = teamClaudeHealthMergingQuota(candidate: parse(exhausted, now), previous: previous)
+        expectWeeklyWait("restart/first", afterRestart, names: weeklyOnly, input: input, at: now)
+        let later = teamClaudeHealthMergingQuota(candidate: parse(exhausted, now.addingTimeInterval(5)), previous: afterRestart)
+        expectWeeklyWait("restart/second", later, names: weeklyOnly, input: input, at: now.addingTimeInterval(5))
+        // Fable 재시작 대체(이전 측정으로 빈 Fable 창 메우기)는 그대로다.
+        precondition(afterRestart.accounts.filter { weeklyOnly.contains($0.name) }.allSatisfy { abs(($0.fablePercent ?? -1) - 10) < 0.01 },
+                     "previous Fable still fills an empty Fable window")
+
+        // 3. 5시간 창이 있는 계정도 같은 병합을 지난다. 재시작 뒤 주간 100%는 주간 대기, 이전 Fable 대체는 그대로.
+        let sessionNames = ["acct-05", "acct-06"]
+        let sessionBefore = quotaStatus(fixture, now: now, names: sessionNames, weekly: 0.9, usable: true, sessionWindow: true, fable: 0.1)
+        let sessionPrevious = teamClaudeHealthMergingQuota(candidate: parse(sessionBefore, now.addingTimeInterval(-30)), previous: nil)
+        let sessionExhausted = quotaStatus(fixture, now: now, names: sessionNames, weekly: 1, usable: false, sessionWindow: true, fable: nil)
+        let sessionAfter = teamClaudeHealthMergingQuota(candidate: parse(sessionExhausted, now), previous: sessionPrevious)
+        expectWeeklyWait("session/restart", sessionAfter, names: sessionNames, input: input, at: now)
+        precondition(sessionAfter.accounts.filter { sessionNames.contains($0.name) }.allSatisfy {
+            !$0.sessionWindowAbsent && abs(($0.sessionPercent ?? -1) - 30) < 0.01 && abs(($0.fablePercent ?? -1) - 10) < 0.01
+        }, "5h-window rows keep their session value and the Fable fallback")
+        // 5시간 창 계정이 주간 여유(90%)로 라우팅 중이면 이전과 같이 지금 받는 계정이다.
+        let sessionReady = teamClaudeHealthMergingQuota(candidate: parse(sessionBefore, now), previous: sessionPrevious)
+        let readyModel = makeOverviewModel(DashboardOverviewInput(teamClaude: sessionReady, teamCodex: input.teamCodex,
+            grok: input.grok, agy: input.agy, burn: input.burn, notices: input.notices, now: now))
+        precondition(sessionNames.allSatisfy { name in readyModel.live.contains { $0.name == name } }, "\(readyModel.live.map(\.name))")
     }
 
 }
