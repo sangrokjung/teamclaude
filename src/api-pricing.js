@@ -77,8 +77,8 @@ export function normalizeModelName(model) {
   if (typeof model !== 'string') return null;
   let name = model.trim().toLowerCase();
   name = name.replace(/^(?:(?:[a-z]{2,4}|global)\.)?anthropic\./, '');
-  name = name.replace(/@\d{8}$/, '');
   name = name.replace(/\[[^\]]*\]$/, '');
+  name = name.replace(/@\d{8}$/, '');
   name = name.replace(/-v\d+(?::\d+)?$/, '');
   name = name.replace(/-\d{8}$/, '');
   name = name.replace(/-latest$/, '');
