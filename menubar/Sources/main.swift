@@ -992,7 +992,14 @@ func teamClaudeAccountMergingQuota(
         candidate: candidatePair,
         previous: previousPair
     )
-    let weeklyPercent = mergedPair?.weeklyPercent ?? candidate.weeklyPercent
+    // 이번 응답에 주간 창(값·남은 리셋)이 있으면 그것이 정본이다. 이전 짝은 이번 응답에 빠진 창만 메운다.
+    // 주간·Fable을 한 짝으로만 고르면 Fable 창이 빈 응답(프록시 재시작 뒤 Fable 미사용)에서 이전 짝의 낡은 주간 값이
+    // 새 주간 값을 덮는다. 주간 100%인 계정이 90%로 남아 문턱 아래로 보이고, 프록시는 usable=false라
+    // "제외 · 프록시 라우팅 제외"로 손볼 것에 올랐다(2026-11-05 실측).
+    let candidateWeeklyCurrent = candidate.weeklyPercent != nil && (candidate.weeklyResetSeconds ?? 0) > 0
+    let weeklyPercent = candidateWeeklyCurrent ? candidate.weeklyPercent : (mergedPair?.weeklyPercent ?? candidate.weeklyPercent)
+    let weeklyResetSeconds = candidateWeeklyCurrent
+        ? candidate.weeklyResetSeconds : (mergedPair?.weeklyResetSeconds ?? candidate.weeklyResetSeconds)
     let fablePercent = mergedPair?.fablePercent ?? candidate.fablePercent
     let measurementIssue = teamClaudeMeasurementIssue(
         enabled: candidate.enabled,
@@ -1033,7 +1040,7 @@ func teamClaudeAccountMergingQuota(
         sessionPercent: candidate.sessionPercent,
         sessionResetSeconds: candidate.sessionResetSeconds,
         weeklyPercent: weeklyPercent,
-        weeklyResetSeconds: mergedPair?.weeklyResetSeconds ?? candidate.weeklyResetSeconds,
+        weeklyResetSeconds: weeklyResetSeconds,
         fablePercent: fablePercent,
         fableResetSeconds: mergedPair?.fableResetSeconds ?? candidate.fableResetSeconds,
         probedAt: candidate.probedAt,
