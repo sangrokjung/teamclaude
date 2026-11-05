@@ -243,7 +243,20 @@ enum L10n {
     static var apiCreditNotSaved: String { t("설정 저장 실패(재시작하면 풀림)", "Not saved to config (lost on restart)") }
     /// API 키가 크레딧은 남았지만 분당 토큰·요청 한도에 닿아 프록시가 잠시 쓰지 않는다(usable=false).
     static var reasonApiRateLimited: String { t("분당 한도 대기 · 잠시 뒤 다시 사용", "Rate limit · usable again shortly") }
-    static var apiCreditExhaustedReason: String { t("크레딧 소진 · 충전 후 api-credit으로 다시 켜기", "Credit exhausted · top up, then re-arm with api-credit") }
+    /// Anthropic이 거절한 API 키의 사유 줄. 사유는 프록시 credit.exhaustedReason(없으면 잔액 부족).
+    static func apiCreditRefusedReason(_ reason: String?) -> String {
+        switch reason {
+        case "usage-limit", "spend-limit":
+            return t("Anthropic이 사용 한도 도달로 거절 · 한도 조정 후 api-credit으로 다시 켜기",
+                     "Refused by Anthropic: usage limit reached · raise the limit, then re-arm with api-credit")
+        case "billing":
+            return t("Anthropic이 결제 문제로 거절 · 결제 확인 후 api-credit으로 다시 켜기",
+                     "Refused by Anthropic: billing issue · fix billing, then re-arm with api-credit")
+        default:
+            return t("Anthropic이 잔액 부족으로 거절 · 충전 후 api-credit으로 다시 켜기",
+                     "Refused by Anthropic: credit balance too low · top up, then re-arm with api-credit")
+        }
+    }
     static func apiCreditLeft(_ left: String, _ total: String) -> String { t("약 \(left) 남음 · \(total) 중 (추정)", "~\(left) left of \(total) (est.)") }
     static func apiCreditNoTopUp(_ spent: String) -> String { t("충전 금액 미입력 · 약 \(spent) 사용 (추정)", "No top-up recorded · ~\(spent) spent (est.)") }
     static func apiCreditExpires(_ date: String) -> String { t("만료 \(date)", "Expires \(date)") }

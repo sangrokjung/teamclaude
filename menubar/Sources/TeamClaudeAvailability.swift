@@ -35,10 +35,9 @@ func teamClaudeApiCreditAvailability(_ row: TeamClaudeAccountHealth, health: Tea
         availability.apiCredit = true
         return availability
     }
-    if row.apiCredit?.exhausted == true || row.errorReason == "credit-exhausted" {
-        // 소진 행도 같은 문구 함수를 거쳐야 "설정 저장 실패" 경고가 실제 행에 나온다.
-        let reason = row.apiCredit.map { teamClaudeApiCreditReason($0, now: now) } ?? L10n.apiCreditExhaustedReason
-        return result(.excluded, reason)
+    if teamClaudeApiCreditRefused(row.apiCredit, errorReason: row.errorReason) {
+        // 소진 행도 같은 문구 함수를 거쳐야 "설정 저장 실패" 경고가 실제 행에 나온다. 추정 잔액은 넣지 않는다.
+        return result(.excluded, teamClaudeApiCreditRefusedReason(row.apiCredit))
     }
     if row.status == "error" { return result(.excluded, teamAccountErrorReasonLabel(row.errorReason)) }
     if !row.enabled { return result(.excluded, L10n.reasonDisabled) }
@@ -206,7 +205,7 @@ extension TeamClaudeHealth {
     var apiCreditCounts: (ready: Int, total: Int, exhausted: Int) {
         let keys = accounts.filter(\.isApiKey)
         return (keys.filter(\.isUsable).count, keys.count,
-                keys.filter { $0.apiCredit?.exhausted == true || $0.errorReason == "credit-exhausted" }.count)
+                keys.filter { teamClaudeApiCreditRefused($0.apiCredit, errorReason: $0.errorReason) }.count)
     }
 
     /// 구독 계정 수(제목·개요의 "N/M"의 M). API 키 계정은 따로 센다.

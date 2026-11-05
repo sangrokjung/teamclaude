@@ -37,7 +37,7 @@ func teamClaudeRowPresentation(_ row: TeamClaudeAccountHealth, _ state: TeamClau
         switch state.state {
         case .ready:
             return TeamClaudeRowPresentation(tone: .info, label: L10n.stateApiStandby, excluded: false, cap: nil)
-        case .excluded where row.apiCredit?.exhausted == true || row.errorReason == "credit-exhausted":
+        case .excluded where teamClaudeApiCreditRefused(row.apiCredit, errorReason: row.errorReason):
             return TeamClaudeRowPresentation(tone: .error, label: L10n.stateCreditExhausted, excluded: true, cap: .error)
         default:
             break

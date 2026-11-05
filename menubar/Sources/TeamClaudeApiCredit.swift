@@ -83,38 +83,55 @@ func teamClaudeApiCreditExpiryText(_ credit: TeamClaudeApiCredit, now: Date = Da
     return expiresAt <= now ? L10n.apiCreditExpired(date) : L10n.apiCreditExpires(date)
 }
 
-/// 행 2줄(사유 줄) 문구. 소진이면 다시 켜는 법, 아니면 남은 금액 · 만료 · 단가 없는 토큰.
-func teamClaudeApiCreditReason(_ credit: TeamClaudeApiCredit, now: Date = Date()) -> String {
-    if credit.exhausted {
-        return credit.persistFailed ? "\(L10n.apiCreditExhaustedReason) · \(L10n.apiCreditNotSaved)" : L10n.apiCreditExhaustedReason
-    }
+/// Anthropic이 크레딧 문제로 거절한 키인가. credit 블록의 소진 표시 또는 행의 errorReason "credit-exhausted".
+/// 잔액 조회 API가 없어 확정적으로 아는 사실은 "거절 = 쓸 수 있는 잔액 0"뿐이다. 모든 소비 지점이 이 판정을 쓴다.
+func teamClaudeApiCreditRefused(_ credit: TeamClaudeApiCredit?, errorReason: String?) -> Bool {
+    credit?.exhausted == true || errorReason == "credit-exhausted"
+}
+
+/// 거절 키의 사유 줄. 추정 잔액은 넣지 않는다.
+func teamClaudeApiCreditRefusedReason(_ credit: TeamClaudeApiCredit?) -> String {
+    let reason = L10n.apiCreditRefusedReason(credit?.exhaustedReason)
+    return credit?.persistFailed == true ? "\(reason) · \(L10n.apiCreditNotSaved)" : reason
+}
+
+/// 행 2줄(사유 줄) 문구. 거절이면 거절 사유와 다시 켜는 법, 아니면 남은 금액(추정) · 만료 · 단가 없는 토큰.
+func teamClaudeApiCreditReason(_ credit: TeamClaudeApiCredit, refused: Bool = false, now: Date = Date()) -> String {
+    if refused || credit.exhausted { return teamClaudeApiCreditRefusedReason(credit) }
     var parts = [teamClaudeApiCreditAmountText(credit)]
     if let expiry = teamClaudeApiCreditExpiryText(credit, now: now) { parts.append(expiry) }
     if credit.unpricedTokens > 0 { parts.append(L10n.apiCreditUnpriced(credit.unpricedTokens)) }
     return parts.joined(separator: " · ")
 }
 
-/// 막대 오른쪽 값. 남은 금액(추정) 또는 "-".
-func teamClaudeApiCreditBarValue(_ credit: TeamClaudeApiCredit) -> String {
-    credit.remainingShownUsd.map(usdText) ?? "-"
+/// 막대 오른쪽 값. 거절이면 "$0.00", 아니면 남은 금액(추정) 또는 "-".
+func teamClaudeApiCreditBarValue(_ credit: TeamClaudeApiCredit?, refused: Bool = false) -> String {
+    if refused || credit?.exhausted == true { return usdText(0) }
+    return credit?.remainingShownUsd.map(usdText) ?? "-"
+}
+
+/// 막대 채움 비율(0~1). 거절이면 0, 충전 금액을 모르면 nil.
+func teamClaudeApiCreditMeterFraction(_ credit: TeamClaudeApiCredit?, refused: Bool = false) -> Double? {
+    refused || credit?.exhausted == true ? 0 : credit?.remainingFraction
 }
 
 extension PanelDraw {
     /// API 키 행의 남은 금액 막대(추정). 채움은 남은 비율, 20% 미만이면 호박색, 빠진 키(muted)는 graphite.
     /// 충전 금액이 없으면 트랙만 그리고 값 칸은 "-". credit 블록이 없으면(구버전 프록시) 트랙과 "-".
-    static func apiCreditMeter(_ rect: NSRect, credit: TeamClaudeApiCredit?, muted: Bool) {
+    /// 거절된 키(refused)는 추정치 대신 빈 막대와 "$0.00".
+    static func apiCreditMeter(_ rect: NSRect, credit: TeamClaudeApiCredit?, refused: Bool, muted: Bool) {
         let valueWidth: CGFloat = 64
         let barRect = NSRect(x: rect.minX, y: rect.midY - 3, width: max(0, rect.width - valueWidth - 6), height: 6)
         let radius = barRect.height / 2
         fillRound(barRect, TeamClaudePalette.track, radius)
-        let fraction = credit?.exhausted == true ? 0 : credit?.remainingFraction
+        let fraction = teamClaudeApiCreditMeterFraction(credit, refused: refused)
         if let fraction, fraction > 0 {
             let color = muted ? TeamClaudePalette.graphite
                 : fraction < 0.2 ? TeamClaudePalette.amber : TeamClaudePalette.mint.withAlphaComponent(0.85)
             fillRound(NSRect(x: barRect.minX, y: barRect.minY, width: max(barRect.width * CGFloat(fraction), barRect.width * 0.03),
                              height: barRect.height), color, radius)
         }
-        let value = credit.map(teamClaudeApiCreditBarValue) ?? "-"
+        let value = teamClaudeApiCreditBarValue(credit, refused: refused)
         let color = muted || fraction == nil ? TeamClaudePalette.fg3 : (fraction ?? 1) < 0.2 ? TeamClaudePalette.amber : TeamClaudePalette.fg
         right(value, rect.maxX, rect.midY - 7.5, TeamClaudePalette.numberFont, color)
     }
