@@ -53,15 +53,17 @@ struct TeamClaudeApiCreditTests {
         precondition(teamClaudeApiCreditExpiryText(over, now: beforeExpiry) == nil)
         precondition(teamClaudeApiCreditReason(credit, now: beforeExpiry)
                      == "약 $12.30 남음 · $50.00 중 (추정) · 만료 \(expiryDate) · 단가 없는 토큰 1,234")
-        precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기")
+        precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "Anthropic이 사용 한도 도달로 거절 · 한도 조정 후 api-credit으로 다시 켜기",
+                     teamClaudeApiCreditReason(exhausted, now: beforeExpiry))
         // 소진 차단을 설정에 쓰지 못했으면(재시작하면 풀림) 사유 줄이 그렇게 말한다.
         let unsaved = teamClaudeApiCredit(["usd": 50, "spentUsd": 1, "exhausted": true, "exhaustedReason": "billing", "persistFailed": true])!
         precondition(unsaved.persistFailed && !exhausted.persistFailed)
-        precondition(teamClaudeApiCreditReason(unsaved, now: beforeExpiry) == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기 · 설정 저장 실패(재시작하면 풀림)",
+        precondition(teamClaudeApiCreditReason(unsaved, now: beforeExpiry) == "Anthropic이 결제 문제로 거절 · 결제 확인 후 api-credit으로 다시 켜기 · 설정 저장 실패(재시작하면 풀림)",
                      teamClaudeApiCreditReason(unsaved, now: beforeExpiry))
         precondition(L10n.reasonApiRateLimited == "분당 한도 대기 · 잠시 뒤 다시 사용")
         precondition(teamClaudeApiCreditBarValue(credit) == "$12.30")
         precondition(teamClaudeApiCreditBarValue(teamClaudeApiCredit(["spentUsd": 1])!) == "-")
+        testRefusedIsZero(credit: credit, now: beforeExpiry)
         precondition(L10n.groupApiCredit == "API 크레딧")
         precondition(L10n.stateCreditExhausted == "크레딧 소진")
         precondition(L10n.stateApiStandby == "대기 · 구독 소진 시")
@@ -73,7 +75,12 @@ struct TeamClaudeApiCreditTests {
         precondition(teamClaudeApiCreditAmountText(teamClaudeApiCredit(["spentUsd": 1.5])!) == "No top-up recorded · ~$1.50 spent (est.)")
         precondition(teamClaudeApiCreditExpiryText(credit, now: beforeExpiry) == "Expires \(expiryDate)")
         precondition(teamClaudeApiCreditExpiryText(credit, now: afterExpiry) == "Expired \(expiryDate)")
-        precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "Credit exhausted · top up, then re-arm with api-credit")
+        precondition(teamClaudeApiCreditReason(exhausted, now: beforeExpiry) == "Refused by Anthropic: usage limit reached · raise the limit, then re-arm with api-credit",
+                     teamClaudeApiCreditReason(exhausted, now: beforeExpiry))
+        precondition(teamClaudeApiCreditRefusedReason(nil) == "Refused by Anthropic: credit balance too low · top up, then re-arm with api-credit",
+                     teamClaudeApiCreditRefusedReason(nil))
+        precondition(teamClaudeApiCreditRefusedReason(unsaved) == "Refused by Anthropic: billing issue · fix billing, then re-arm with api-credit · Not saved to config (lost on restart)",
+                     teamClaudeApiCreditRefusedReason(unsaved))
         precondition(teamClaudeApiCreditReason(unsaved, now: beforeExpiry).hasSuffix(" · Not saved to config (lost on restart)"))
         precondition(L10n.reasonApiRateLimited == "Rate limit · usable again shortly")
         precondition(L10n.groupApiCredit == "API credit")
@@ -84,5 +91,45 @@ struct TeamClaudeApiCreditTests {
         L10n.language = .ko
 
         print("TeamClaudeApiCreditTests passed")
+    }
+
+    /// Anthropic이 잔액 부족으로 거절한 키는 금액 칸이 $0.00이고 막대도 비운다. 잔액 조회 API가 없어
+    /// 확정적으로 아는 사실은 "거절 = 쓸 수 있는 잔액 0"뿐이라, 등록값에서 지출을 뺀 추정치는 남기지 않는다.
+    /// 거절되지 않은 키의 추정치는 그대로다(회귀). 한국어 기준(호출 전 L10n.language = .ko).
+    static func testRefusedIsZero(credit: TeamClaudeApiCredit, now: Date) {
+        // 보고된 증상: 충전 $200, 추정 지출 $31.87, 상류 거절로 프록시가 뺀 키가 "$168.13"으로 보였다.
+        let refusedFlag = teamClaudeApiCredit(["usd": 200, "spentUsd": 31.87, "exhausted": true, "exhaustedReason": "credit-exhausted"])!
+        precondition(teamClaudeApiCreditRefused(refusedFlag, errorReason: "credit-exhausted"))
+        precondition(teamClaudeApiCreditBarValue(refusedFlag) == "$0.00", teamClaudeApiCreditBarValue(refusedFlag))
+        precondition(teamClaudeApiCreditMeterFraction(refusedFlag) == 0)
+        precondition(teamClaudeApiCreditReason(refusedFlag, now: now) == "Anthropic이 잔액 부족으로 거절 · 충전 후 api-credit으로 다시 켜기",
+                     teamClaudeApiCreditReason(refusedFlag, now: now))
+
+        // credit 블록에 소진 표시가 없어도 행의 errorReason이 credit-exhausted면 거절로 본다(같은 판정을 모든 소비 지점이 쓴다).
+        let blockOnly = teamClaudeApiCredit(["usd": 200, "spentUsd": 0, "exhausted": false])!
+        precondition(teamClaudeApiCreditRefused(blockOnly, errorReason: "credit-exhausted"))
+        precondition(teamClaudeApiCreditBarValue(blockOnly, refused: true) == "$0.00")
+        precondition(teamClaudeApiCreditMeterFraction(blockOnly, refused: true) == 0)
+        let blockOnlyReason = teamClaudeApiCreditReason(blockOnly, refused: true, now: now)
+        precondition(blockOnlyReason == "Anthropic이 잔액 부족으로 거절 · 충전 후 api-credit으로 다시 켜기", blockOnlyReason)
+        precondition(!blockOnlyReason.contains("$200.00") && !blockOnlyReason.contains("추정"), "거절 행에 추정치를 남기지 않는다")
+        // credit 블록이 없는 구버전 프록시라도 거절이면 $0.00.
+        precondition(teamClaudeApiCreditRefused(nil, errorReason: "credit-exhausted"))
+        precondition(teamClaudeApiCreditBarValue(nil, refused: true) == "$0.00")
+        precondition(teamClaudeApiCreditMeterFraction(nil, refused: true) == 0)
+        precondition(teamClaudeApiCreditRefusedReason(nil) == "Anthropic이 잔액 부족으로 거절 · 충전 후 api-credit으로 다시 켜기")
+
+        // 회귀: 거절되지 않은 키는 추정치·비율·사유가 바뀌지 않는다.
+        precondition(!teamClaudeApiCreditRefused(credit, errorReason: nil))
+        precondition(!teamClaudeApiCreditRefused(credit, errorReason: "auth-rejected"))
+        precondition(!teamClaudeApiCreditRefused(nil, errorReason: nil))
+        precondition(teamClaudeApiCreditBarValue(credit, refused: false) == "$12.30")
+        precondition(teamClaudeApiCreditBarValue(blockOnly) == "$200.00")
+        precondition(teamClaudeApiCreditBarValue(nil) == "-")
+        precondition(abs((teamClaudeApiCreditMeterFraction(credit) ?? -1) - 0.246) < 1e-9)
+        precondition(teamClaudeApiCreditMeterFraction(blockOnly) == 1)
+        precondition(teamClaudeApiCreditMeterFraction(nil) == nil)
+        precondition(teamClaudeApiCreditReason(blockOnly, now: now) == "약 $200.00 남음 · $200.00 중 (추정)",
+                     teamClaudeApiCreditReason(blockOnly, now: now))
     }
 }
