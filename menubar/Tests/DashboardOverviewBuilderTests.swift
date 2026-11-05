@@ -36,6 +36,7 @@ struct DashboardOverviewBuilderTests {
         testWeeklyOnlyRetryAfter(now: now)
         testApiCreditAccounts(fixture: fixture, input: input, now: now)
         testApiKeyRateLimited(fixture: fixture, input: input, now: now)
+        testApiKeyRefusedByErrorReason(fixture: fixture, input: input, now: now)
         testFableUnmeasuredCounts(fixture: fixture, input: input, now: now)
         testWeeklyExhaustedAccounts(fixture: fixture, input: input, now: now)
         print("DashboardOverviewBuilderTests: counts, lanes, todos, waiting, notices passed")
@@ -332,7 +333,7 @@ struct DashboardOverviewBuilderTests {
         precondition(routing[i1].state == .ready && routing[i1].apiCredit && teamClaudeRowGroup(routing[i1]) == .apiCredit)
         precondition(routing[i2].state == .excluded && teamClaudeRowGroup(routing[i2]) == .apiCredit)
         precondition(routing[i1].reason.hasPrefix("약 $12.30 남음 · $50.00 중 (추정) · 만료 "), routing[i1].reason)
-        precondition(routing[i2].reason == "크레딧 소진 · 충전 후 api-credit으로 다시 켜기", routing[i2].reason)
+        precondition(routing[i2].reason == "Anthropic이 사용 한도 도달로 거절 · 한도 조정 후 api-credit으로 다시 켜기", routing[i2].reason)
         precondition(teamClaudeRowPresentation(api1, routing[i1]).label == "대기 · 구독 소진 시")
         precondition(teamClaudeRowPresentation(api2, routing[i2]).label == "크레딧 소진")
         let lines = health.rowLines(now: now, availability: routing)
@@ -394,6 +395,38 @@ struct DashboardOverviewBuilderTests {
         guard let ui = health2.accounts.firstIndex(where: { $0.name == "api-unsaved" }) else { preconditionFailure("api-unsaved") }
         let unsavedState = health2.routingAvailability(now: now)[ui]
         precondition(unsavedState.state == .excluded && unsavedState.reason.hasSuffix("설정 저장 실패(재시작하면 풀림)"), unsavedState.reason)
+    }
+
+    /// Anthropic이 잔액 부족으로 거절한 키(status error, errorReason credit-exhausted)는 credit 블록에 소진 표시가
+    /// 없어도 모든 소비 지점(행 사유·상태 라벨·개요 집계)에서 거절로 보인다. 사유 줄에 추정 잔액을 남기지 않는다.
+    static func testApiKeyRefusedByErrorReason(fixture: [String: Any], input: DashboardOverviewInput, now: Date) {
+        guard var status = fixture["teamclaude"] as? [String: Any],
+              var accounts = status["accounts"] as? [[String: Any]] else { preconditionFailure("fixture accounts") }
+        accounts.append(apiKeyAccount("api-refused", status: "error", usable: false, errorReason: "credit-exhausted", credit: [
+            "usd": 200, "spentUsd": 31.87, "remainingUsd": 168.13, "exhausted": false, "unpricedTokens": 0,
+        ]))
+        accounts.append(apiKeyAccount("api-live", credit: ["usd": 200, "spentUsd": 31.87, "exhausted": false, "unpricedTokens": 0]))
+        status["accounts"] = accounts
+        let health = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456, now: now)
+        guard let ri = health.accounts.firstIndex(where: { $0.name == "api-refused" }),
+              let li = health.accounts.firstIndex(where: { $0.name == "api-live" }) else { preconditionFailure("api rows") }
+        let refusedRow = health.accounts[ri]
+        precondition(teamClaudeApiCreditRefused(refusedRow.apiCredit, errorReason: refusedRow.errorReason))
+        precondition(teamClaudeApiCreditBarValue(refusedRow.apiCredit, refused: true) == "$0.00")
+        let routing = health.routingAvailability(now: now)
+        precondition(routing[ri].state == .excluded && teamClaudeRowGroup(routing[ri]) == .apiCredit)
+        precondition(routing[ri].reason == "Anthropic이 잔액 부족으로 거절 · 충전 후 api-credit으로 다시 켜기", routing[ri].reason)
+        precondition(!routing[ri].reason.contains("$168.13"), "거절 행 사유에 추정 잔액을 남기지 않는다")
+        precondition(teamClaudeRowPresentation(refusedRow, routing[ri]).label == "크레딧 소진")
+        // 회귀: 같은 금액의 거절되지 않은 키는 추정치를 그대로 보인다.
+        let liveRow = health.accounts[li]
+        precondition(!teamClaudeApiCreditRefused(liveRow.apiCredit, errorReason: liveRow.errorReason))
+        precondition(teamClaudeApiCreditBarValue(liveRow.apiCredit) == "$168.13")
+        precondition(routing[li].reason == "약 $168.13 남음 · $200.00 중 (추정)", routing[li].reason)
+        let counts = health.apiCreditCounts
+        precondition(counts.ready == 1 && counts.total == 2 && counts.exhausted == 1, "\(counts)")
+        let model = rebuilt(status, input: input, now: now)
+        precondition(model.apiCreditReady == 1 && model.apiCreditTotal == 2 && model.apiCreditExhausted == 1)
     }
 
     /// 재시도 시각(전원 막힘일 때 복귀까지 초)은 플래그 false 계정의 남은 5시간 값을 쓰지 않는다.

@@ -2747,7 +2747,9 @@ final class TeamClaudeTableView: NSView {
                 // API 키는 세션·주간·Fable 창이 없다. 세 칸 자리에 남은 금액 막대(추정) 하나를 그린다.
                 let cell = NSRect(x: TeamClaudeColumns.sessionX, y: y + 8,
                                   width: TeamClaudeColumns.fableX + TeamClaudeColumns.meterWidth - TeamClaudeColumns.sessionX, height: 14)
-                PanelDraw.apiCreditMeter(cell, credit: row.apiCredit, muted: presentation.excluded)
+                PanelDraw.apiCreditMeter(cell, credit: row.apiCredit,
+                                         refused: teamClaudeApiCreditRefused(row.apiCredit, errorReason: row.errorReason),
+                                         muted: presentation.excluded)
             } else {
                 let attempted = probeAttempted(row)
                 let session = teamClaudeSessionState(percent: row.sessionPercent, lastUsed: row.probedAt, now: evaluatedAt)
