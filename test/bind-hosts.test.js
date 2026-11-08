@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bindPublicHosts, listenBindTargets, resolveBindHosts } from '../src/bind-hosts.js';
+import { bindPublicHosts, isOwnIpv4LoopbackProbe, listenBindTargets, resolveBindHosts } from '../src/bind-hosts.js';
 
 const listenBindHosts = hosts => listenBindTargets(hosts).map(target => target.host);
 
@@ -206,4 +206,29 @@ test('optional hosts are skipped and an empty bind set fails', async () => {
   assert.equal(hard.err.code, 'EACCES');
   const none = await simulateBind(['::1', '0.0.0.0'], { fail: { '::1': 'EAFNOSUPPORT', '0.0.0.0': 'EACCES' } });
   assert.equal(none.ok, false);
+});
+
+const ownProbe = {
+  port: 3456,
+  probe: { localPort: 50123, remoteAddress: '127.0.0.1' },
+  incoming: { remoteAddress: '::ffff:127.0.0.1', remotePort: 50123, localPort: 3456 },
+};
+const withIncoming = extra => ({ ...ownProbe, incoming: { ...ownProbe.incoming, ...extra } });
+const withProbe = extra => ({ ...ownProbe, probe: { ...ownProbe.probe, ...extra } });
+
+test('IPv4 loopback probe is ours only when the full tuple matches', () => {
+  assert.equal(isOwnIpv4LoopbackProbe(ownProbe), true);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remoteAddress: '127.0.0.1' })), true);
+});
+
+test('IPv4 loopback probe mismatches are not ours', () => {
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remoteAddress: '192.0.2.10' })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remoteAddress: '::1' })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remoteAddress: undefined })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remotePort: 50124 })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ localPort: 3457 })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withProbe({ remoteAddress: '::1' })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withProbe({ remoteAddress: undefined })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withProbe({ localPort: undefined })), false);
+  assert.equal(isOwnIpv4LoopbackProbe(withIncoming({ remotePort: undefined })), false);
 });

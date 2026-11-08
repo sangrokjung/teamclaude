@@ -14,7 +14,7 @@ import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
-import { bindPublicHosts, resolveBindHosts } from './bind-hosts.js';
+import { bindPublicHosts, isOwnIpv4LoopbackProbe, resolveBindHosts } from './bind-hosts.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -864,16 +864,18 @@ async function superviseServerCommand() {
   }
 
   // Whether 127.0.0.1:port reaches one of our own public listeners (a
-  // dual-stack :: accepts IPv4). The probe is ours when a listener sees a
-  // connection from the probe socket's local port; anything else (no answer,
-  // or another process answering) counts as not served.
+  // dual-stack :: accepts IPv4). The probe is ours only when a listener
+  // accepts a connection whose full tuple matches the probe socket (see
+  // isOwnIpv4LoopbackProbe); anything else (no answer, a timeout, or another
+  // process answering) counts as not served, so a required bind still fails.
   function servesIpv4Loopback() {
     return new Promise(resolve => {
-      const seenPorts = new Set();
-      let probePort = null;
+      const accepted = [];
+      let probe = null;
       let settled = false;
       let timer = null;
       let socket = null;
+      const matches = incoming => probe != null && isOwnIpv4LoopbackProbe({ incoming, probe, port });
       function done(served) {
         if (settled) return;
         settled = true;
@@ -882,16 +884,21 @@ async function superviseServerCommand() {
         socket.destroy();
         resolve(served);
       }
-      function onConnection(incoming) {
-        seenPorts.add(incoming.remotePort);
-        if (probePort != null && seenPorts.has(probePort)) done(true);
+      function onConnection(conn) {
+        const incoming = {
+          remoteAddress: conn.remoteAddress,
+          remotePort: conn.remotePort,
+          localPort: conn.localPort,
+        };
+        accepted.push(incoming);
+        if (matches(incoming)) done(true);
       }
       for (const listener of publicListeners) listener.on('connection', onConnection);
       socket = netConnect({ host: '127.0.0.1', port });
       timer = setTimeout(() => done(false), 1000);
       socket.once('connect', () => {
-        probePort = socket.localPort;
-        if (seenPorts.has(probePort)) done(true);
+        probe = { localPort: socket.localPort, remoteAddress: socket.remoteAddress };
+        if (accepted.some(matches)) done(true);
       });
       socket.once('error', () => done(false));
     });

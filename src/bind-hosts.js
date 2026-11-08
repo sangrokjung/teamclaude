@@ -122,6 +122,21 @@ export function foldedLoopbackHosts(hosts) {
 }
 
 const IPV4_LOOPBACK_COVERING_HOSTS = new Set(['127.0.0.1', '0.0.0.0']);
+const IPV4_LOOPBACK_PEER_ADDRESSES = new Set(['127.0.0.1', '::ffff:127.0.0.1']);
+
+// Whether a connection one of our listeners accepted is our own IPv4 loopback
+// probe. Every part of the tuple must match: the accepted socket comes from
+// the IPv4 loopback (plain or IPv4-mapped) at the probe's local port and
+// arrived on our port, and the probe itself is connected to 127.0.0.1.
+// Anything missing or different is not ours, so the caller fails closed.
+export function isOwnIpv4LoopbackProbe({ incoming, probe, port }) {
+  return Number.isInteger(probe?.localPort)
+    && Number.isInteger(port)
+    && probe.remoteAddress === '127.0.0.1'
+    && IPV4_LOOPBACK_PEER_ADDRESSES.has(incoming?.remoteAddress)
+    && incoming.remotePort === probe.localPort
+    && incoming.localPort === port;
+}
 
 // Whether a failed bind must fail startup ('fail') or is skipped with a
 // warning ('skip'). ipv4LoopbackServed says a listener we already opened
