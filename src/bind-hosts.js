@@ -83,3 +83,15 @@ export function resolveBindHosts(config) {
   }
   return [...hosts];
 }
+
+// Addresses to actually listen on. A wildcard already accepts connections to
+// the loopback of its own address family, so that loopback is dropped instead
+// of being bound (and pre-checked) separately: the pre-check would otherwise
+// connect to our own wildcard listener and report the port as in use. Only
+// same-family pairs are merged (0.0.0.0 covers 127.0.0.1, :: covers ::1).
+export function listenBindHosts(hosts) {
+  const coveredLoopback = new Set();
+  if (hosts.includes('0.0.0.0')) coveredLoopback.add('127.0.0.1');
+  if (hosts.includes('::')) coveredLoopback.add('::1');
+  return hosts.filter(host => !coveredLoopback.has(host));
+}

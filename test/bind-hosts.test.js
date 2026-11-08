@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveBindHosts } from '../src/bind-hosts.js';
+import { listenBindHosts, resolveBindHosts } from '../src/bind-hosts.js';
 
 test('default is loopback only', () => {
   assert.deepEqual(resolveBindHosts({}), ['127.0.0.1', '::1']);
@@ -58,4 +58,21 @@ test('rejects non-array and empty bindHosts', () => {
   assert.throws(() => resolveBindHosts({ proxy: { bindHosts: '127.0.0.1' } }), Error);
   assert.throws(() => resolveBindHosts({ proxy: { bindHosts: [] } }), Error);
   assert.throws(() => resolveBindHosts({ proxy: { bindHosts: ['127.0.0.1', 42] } }), Error);
+});
+
+test('a same-family wildcard covers the loopback bind', () => {
+  const hosts = resolveBindHosts({ proxy: { bindHosts: ['0.0.0.0', '127.0.0.1'], allowLanBind: true } });
+  assert.deepEqual(listenBindHosts(hosts), ['0.0.0.0']);
+  assert.deepEqual(listenBindHosts(['127.0.0.1', '0.0.0.0']), ['0.0.0.0']);
+  assert.deepEqual(listenBindHosts(['0.0.0.0', '::', '127.0.0.1', '::1']), ['0.0.0.0', '::']);
+});
+
+test('loopback of another family is kept beside a wildcard', () => {
+  assert.deepEqual(listenBindHosts(['0.0.0.0', '::1']), ['0.0.0.0', '::1']);
+  assert.deepEqual(listenBindHosts(['::', '127.0.0.1']), ['::', '127.0.0.1']);
+});
+
+test('bind targets without a wildcard are unchanged', () => {
+  assert.deepEqual(listenBindHosts(['127.0.0.1', '::1']), ['127.0.0.1', '::1']);
+  assert.deepEqual(listenBindHosts(['127.0.0.1', '100.100.100.100']), ['127.0.0.1', '100.100.100.100']);
 });

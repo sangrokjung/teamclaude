@@ -14,7 +14,7 @@ import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
-import { isLoopbackBindHost, resolveBindHosts } from './bind-hosts.js';
+import { isLoopbackBindHost, listenBindHosts, resolveBindHosts } from './bind-hosts.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -868,7 +868,7 @@ async function superviseServerCommand() {
   // one exception is ::1 on a host without IPv6. Extra non-loopback hosts that
   // are absent or taken are skipped with a warning.
   async function listenPublicHosts() {
-    for (const [index, host] of bindHosts.entries()) {
+    for (const [index, host] of listenBindHosts(bindHosts).entries()) {
       let err = null;
       if (isLoopbackBindHost(host) && await loopbackPortInUse(host)) {
         err = Object.assign(new Error(`listen EADDRINUSE: address already in use ${host}:${port}`), {
