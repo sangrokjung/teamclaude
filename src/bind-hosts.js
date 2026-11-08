@@ -84,14 +84,32 @@ export function resolveBindHosts(config) {
   return [...hosts];
 }
 
-// Addresses to actually listen on. A wildcard already accepts connections to
-// the loopback of its own address family, so that loopback is dropped instead
-// of being bound (and pre-checked) separately: the pre-check would otherwise
-// connect to our own wildcard listener and report the port as in use. Only
-// same-family pairs are merged (0.0.0.0 covers 127.0.0.1, :: covers ::1).
-export function listenBindHosts(hosts) {
-  const coveredLoopback = new Set();
-  if (hosts.includes('0.0.0.0')) coveredLoopback.add('127.0.0.1');
-  if (hosts.includes('::')) coveredLoopback.add('::1');
-  return hosts.filter(host => !coveredLoopback.has(host));
+// Addresses to actually listen on, each with whether its bind failure must
+// fail startup. A wildcard already accepts connections to the loopback of its
+// own address family, so that loopback is dropped instead of being bound (and
+// pre-checked) separately: the pre-check would otherwise connect to our own
+// wildcard listener and report the port as in use. Only same-family pairs are
+// merged (0.0.0.0 covers 127.0.0.1, :: covers ::1).
+//
+// Requirements come from the original list, not from the filtered order:
+// loopback hosts and the first host are required, a wildcard that replaces a
+// loopback inherits that loopback's requirement, and the host that provides
+// the IPv4 loopback local clients probe is always required. Other hosts stay
+// optional. skipWithoutIpv6 marks a requirement that only comes from ::1,
+// which is skipped on a host without IPv6.
+export function listenBindTargets(hosts) {
+  const hasIpv4Wildcard = hosts.includes('0.0.0.0');
+  const hasIpv6Wildcard = hosts.includes('::');
+  const ipv4ProvidedByIpv6Wildcard = !hasIpv4Wildcard && !hosts.includes('127.0.0.1');
+  const target = (host, required, skipWithoutIpv6 = false) => ({ host, required, skipWithoutIpv6 });
+  return hosts.flatMap((host, index) => {
+    if (host === '127.0.0.1') return hasIpv4Wildcard ? [] : [target(host, true)];
+    if (host === '::1') return hasIpv6Wildcard ? [] : [target(host, true, true)];
+    if (host === '0.0.0.0') return [target(host, true)];
+    if (host === '::') {
+      if (index === 0 || ipv4ProvidedByIpv6Wildcard) return [target(host, true)];
+      return [target(host, hosts.includes('::1'), hosts.includes('::1'))];
+    }
+    return [target(host, index === 0)];
+  });
 }

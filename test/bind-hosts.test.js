@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { listenBindHosts, resolveBindHosts } from '../src/bind-hosts.js';
+import { listenBindTargets, resolveBindHosts } from '../src/bind-hosts.js';
+
+const listenBindHosts = hosts => listenBindTargets(hosts).map(target => target.host);
 
 test('default is loopback only', () => {
   assert.deepEqual(resolveBindHosts({}), ['127.0.0.1', '::1']);
@@ -75,4 +77,49 @@ test('loopback of another family is kept beside a wildcard', () => {
 test('bind targets without a wildcard are unchanged', () => {
   assert.deepEqual(listenBindHosts(['127.0.0.1', '::1']), ['127.0.0.1', '::1']);
   assert.deepEqual(listenBindHosts(['127.0.0.1', '100.100.100.100']), ['127.0.0.1', '100.100.100.100']);
+});
+
+test('an extra host stays optional when an earlier loopback is covered', () => {
+  assert.deepEqual(listenBindTargets(['127.0.0.1', '100.100.100.100', '0.0.0.0']), [
+    { host: '100.100.100.100', required: false, skipWithoutIpv6: false },
+    { host: '0.0.0.0', required: true, skipWithoutIpv6: false },
+  ]);
+});
+
+test('a wildcard that replaces a loopback inherits its requirement', () => {
+  assert.deepEqual(listenBindTargets(['127.0.0.1', '::1', '0.0.0.0']), [
+    { host: '::1', required: true, skipWithoutIpv6: true },
+    { host: '0.0.0.0', required: true, skipWithoutIpv6: false },
+  ]);
+  assert.deepEqual(listenBindTargets(['127.0.0.1', '::1', '::']), [
+    { host: '127.0.0.1', required: true, skipWithoutIpv6: false },
+    { host: '::', required: true, skipWithoutIpv6: true },
+  ]);
+});
+
+test('default and plain extra hosts keep their requirements', () => {
+  assert.deepEqual(listenBindTargets(['127.0.0.1', '::1']), [
+    { host: '127.0.0.1', required: true, skipWithoutIpv6: false },
+    { host: '::1', required: true, skipWithoutIpv6: true },
+  ]);
+  assert.deepEqual(listenBindTargets(['127.0.0.1', '192.0.2.10', '::']), [
+    { host: '127.0.0.1', required: true, skipWithoutIpv6: false },
+    { host: '192.0.2.10', required: false, skipWithoutIpv6: false },
+    { host: '::', required: false, skipWithoutIpv6: false },
+  ]);
+});
+
+test('the host that covers the IPv4 loopback is always required', () => {
+  assert.deepEqual(listenBindTargets(['::1', '0.0.0.0']), [
+    { host: '::1', required: true, skipWithoutIpv6: true },
+    { host: '0.0.0.0', required: true, skipWithoutIpv6: false },
+  ]);
+  assert.deepEqual(listenBindTargets(['::1', '192.0.2.10', '::']), [
+    { host: '192.0.2.10', required: false, skipWithoutIpv6: false },
+    { host: '::', required: true, skipWithoutIpv6: false },
+  ]);
+  assert.deepEqual(listenBindTargets(['::', '192.0.2.10']), [
+    { host: '::', required: true, skipWithoutIpv6: false },
+    { host: '192.0.2.10', required: false, skipWithoutIpv6: false },
+  ]);
 });
