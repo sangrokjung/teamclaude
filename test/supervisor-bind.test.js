@@ -216,3 +216,23 @@ test('unavailable extra host before a covering wildcard is still skipped', { tim
   assert.equal(child.exitCode, null);
   assert.ok(await status(port));
 });
+
+test('loopback folded into a wildcard is pre-checked for another listener', { timeout: 30000 }, async t => {
+  // Where the OS refuses a wildcard bind beside a loopback holder the bind
+  // itself fails with EADDRINUSE; where it allows both (BSD), only the
+  // pre-check catches the holder. Either way the diagnostic must be the same.
+  const holder = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
+  const port = await listenOn(holder, 0, '127.0.0.1');
+  t.after(() => close(holder));
+  const { output, exited } = await startSupervisor(t, {
+    port,
+    bindHosts: ['127.0.0.1', '0.0.0.0'],
+    allowLanBind: true,
+  });
+  const [code] = await Promise.race([
+    exited,
+    delay(15000).then(() => { throw new Error(`supervisor did not exit:\n${output.text}`); }),
+  ]);
+  assert.equal(code, 1);
+  assert.match(output.text, new RegExp(`Port ${port} is already in use`));
+});
