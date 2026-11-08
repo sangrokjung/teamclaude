@@ -191,3 +191,28 @@ test('ipv6 loopback EADDRINUSE fails startup', { timeout: 30000 }, async t => {
   assert.notEqual(code, 0);
   assert.match(output.text, new RegExp(`Port ${port} is already in use`));
 });
+
+test('wildcard plus same-family loopback starts with LAN bind', { timeout: 30000 }, async t => {
+  const { child, port, output } = await startSupervisor(t, {
+    bindHosts: ['0.0.0.0', '127.0.0.1'],
+    allowLanBind: true,
+  });
+  await waitUntil(() => status(port), `proxy did not start:\n${output.text}`);
+  assert.equal(child.exitCode, null);
+  assert.doesNotMatch(output.text, /already in use/);
+  assert.ok(await status(port));
+});
+
+test('unavailable extra host before a covering wildcard is still skipped', { timeout: 30000 }, async t => {
+  if (await canBind('100.100.100.100')) {
+    t.skip('100.100.100.100 is a local address on this host');
+    return;
+  }
+  const { child, port, output } = await startSupervisor(t, {
+    bindHosts: ['127.0.0.1', '100.100.100.100', '0.0.0.0'],
+    allowLanBind: true,
+  });
+  await waitUntil(() => status(port), `proxy did not start:\n${output.text}`);
+  assert.equal(child.exitCode, null);
+  assert.ok(await status(port));
+});

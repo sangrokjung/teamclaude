@@ -14,7 +14,7 @@ import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
-import { isLoopbackBindHost, resolveBindHosts } from './bind-hosts.js';
+import { isLoopbackBindHost, listenBindTargets, resolveBindHosts } from './bind-hosts.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -863,12 +863,12 @@ async function superviseServerCommand() {
     });
   }
 
-  // Bind every configured host. A required host (the first host, or any
-  // loopback host) that fails takes the existing startup-failure exit; the
-  // one exception is ::1 on a host without IPv6. Extra non-loopback hosts that
-  // are absent or taken are skipped with a warning.
+  // Bind every configured host. A required host (see listenBindTargets) that
+  // fails takes the existing startup-failure exit; the one exception is a
+  // requirement that only comes from ::1 on a host without IPv6. Optional
+  // hosts that are absent or taken are skipped with a warning.
   async function listenPublicHosts() {
-    for (const [index, host] of bindHosts.entries()) {
+    for (const { host, required, skipWithoutIpv6 } of listenBindTargets(bindHosts)) {
       let err = null;
       if (isLoopbackBindHost(host) && await loopbackPortInUse(host)) {
         err = Object.assign(new Error(`listen EADDRINUSE: address already in use ${host}:${port}`), {
@@ -878,11 +878,10 @@ async function superviseServerCommand() {
         ({ err } = await listenPublicHost(host));
       }
       if (!err) continue;
-      const required = index === 0 || isLoopbackBindHost(host);
       // ::1 is skipped only when the host has no usable IPv6 loopback at all;
       // a busy ::1 (EADDRINUSE) still fails startup like 127.0.0.1 does.
       const ipv6Unavailable = err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT';
-      if (required && !(host === '::1' && ipv6Unavailable)) {
+      if (required && !(skipWithoutIpv6 && ipv6Unavailable)) {
         exitReason = `listen-error:${err?.code || 'unknown'}`;
         handleServerListenError(err, port);
         return false;
