@@ -14,7 +14,7 @@ import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
 import { createProxyServer } from './server.js';
 import { isLoopbackAddress, isRemoteAuthorized } from './proxy-auth.js';
-import { isLoopbackBindHost, listenBindTargets, resolveBindHosts } from './bind-hosts.js';
+import { bindPublicHosts, isOwnIpv4LoopbackProbe, resolveBindHosts } from './bind-hosts.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   assertSafeCodexArgs,
@@ -863,42 +863,61 @@ async function superviseServerCommand() {
     });
   }
 
-  // Bind every configured host. A required host (see listenBindTargets) that
-  // fails takes the existing startup-failure exit; the one exception is a
-  // requirement that only comes from ::1 on a host without IPv6. Optional
-  // hosts that are absent or taken are skipped with a warning.
+  // Whether 127.0.0.1:port reaches one of our own public listeners (a
+  // dual-stack :: accepts IPv4). The probe is ours only when a listener
+  // accepts a connection whose full tuple matches the probe socket (see
+  // isOwnIpv4LoopbackProbe); anything else (no answer, a timeout, or another
+  // process answering) counts as not served, so a required bind still fails.
+  function servesIpv4Loopback() {
+    return new Promise(resolve => {
+      const accepted = [];
+      let probe = null;
+      let settled = false;
+      let timer = null;
+      let socket = null;
+      const matches = incoming => probe != null && isOwnIpv4LoopbackProbe({ incoming, probe, port });
+      function done(served) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        for (const listener of publicListeners) listener.removeListener('connection', onConnection);
+        socket.destroy();
+        resolve(served);
+      }
+      function onConnection(conn) {
+        const incoming = {
+          remoteAddress: conn.remoteAddress,
+          remotePort: conn.remotePort,
+          localPort: conn.localPort,
+        };
+        accepted.push(incoming);
+        if (matches(incoming)) done(true);
+      }
+      for (const listener of publicListeners) listener.on('connection', onConnection);
+      socket = netConnect({ host: '127.0.0.1', port });
+      timer = setTimeout(() => done(false), 1000);
+      socket.once('connect', () => {
+        probe = { localPort: socket.localPort, remoteAddress: socket.remoteAddress };
+        if (accepted.some(matches)) done(true);
+      });
+      socket.once('error', () => done(false));
+    });
+  }
+
+  // Bind every configured host (see bindPublicHosts for the order and the
+  // fail-or-skip rules). A failure takes the existing startup-failure exit.
   async function listenPublicHosts() {
-    for (const { host, required, skipWithoutIpv6 } of listenBindTargets(bindHosts)) {
-      let err = null;
-      if (isLoopbackBindHost(host) && await loopbackPortInUse(host)) {
-        err = Object.assign(new Error(`listen EADDRINUSE: address already in use ${host}:${port}`), {
-          code: 'EADDRINUSE',
-        });
-      } else {
-        ({ err } = await listenPublicHost(host));
-      }
-      if (!err) continue;
-      // ::1 is skipped only when the host has no usable IPv6 loopback at all;
-      // a busy ::1 (EADDRINUSE) still fails startup like 127.0.0.1 does.
-      const ipv6Unavailable = err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT';
-      if (required && !(skipWithoutIpv6 && ipv6Unavailable)) {
-        exitReason = `listen-error:${err?.code || 'unknown'}`;
-        handleServerListenError(err, port);
-        return false;
-      }
-      if (!required && err.code !== 'EADDRNOTAVAIL' && err.code !== 'EADDRINUSE') {
-        exitReason = `listen-error:${err?.code || 'unknown'}`;
-        handleServerListenError(err, port);
-        return false;
-      }
-      console.error(`[TeamClaude] Skipping bind ${host}: ${err.code}`);
-    }
-    if (publicListeners.length === 0) {
-      exitReason = 'listen-error:no-listener';
-      handleServerListenError(new Error('no bind host could be bound'), port);
-      return false;
-    }
-    return true;
+    const result = await bindPublicHosts(bindHosts, {
+      port,
+      portInUse: loopbackPortInUse,
+      listen: async host => (await listenPublicHost(host)).err,
+      servesIpv4Loopback,
+      warn: message => console.error(message),
+    });
+    if (result.ok) return true;
+    exitReason = result.noListener ? 'listen-error:no-listener' : `listen-error:${result.err?.code || 'unknown'}`;
+    handleServerListenError(result.err, port);
+    return false;
   }
 
   async function handlePublicRequest(req, res, reserveRequestBytes) {

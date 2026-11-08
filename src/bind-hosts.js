@@ -113,3 +113,82 @@ export function listenBindTargets(hosts) {
     return [target(host, index === 0)];
   });
 }
+
+// Loopback hosts that listenBindTargets folds into a same-family wildcard.
+// They are not bound on their own, but another process may still hold them.
+export function foldedLoopbackHosts(hosts) {
+  return hosts.filter(host => (host === '127.0.0.1' && hosts.includes('0.0.0.0'))
+    || (host === '::1' && hosts.includes('::')));
+}
+
+const IPV4_LOOPBACK_COVERING_HOSTS = new Set(['127.0.0.1', '0.0.0.0']);
+const IPV4_LOOPBACK_PEER_ADDRESSES = new Set(['127.0.0.1', '::ffff:127.0.0.1']);
+
+// Whether a connection one of our listeners accepted is our own IPv4 loopback
+// probe. Every part of the tuple must match: the accepted socket comes from
+// the IPv4 loopback (plain or IPv4-mapped) at the probe's local port and
+// arrived on our port, and the probe itself is connected to 127.0.0.1.
+// Anything missing or different is not ours, so the caller fails closed.
+export function isOwnIpv4LoopbackProbe({ incoming, probe, port }) {
+  return Number.isInteger(probe?.localPort)
+    && Number.isInteger(port)
+    && probe.remoteAddress === '127.0.0.1'
+    && IPV4_LOOPBACK_PEER_ADDRESSES.has(incoming?.remoteAddress)
+    && incoming.remotePort === probe.localPort
+    && incoming.localPort === port;
+}
+
+// Whether a failed bind must fail startup ('fail') or is skipped with a
+// warning ('skip'). ipv4LoopbackServed says a listener we already opened
+// answers on 127.0.0.1 (a dual-stack :: does): an EADDRINUSE on the IPv4
+// loopback or IPv4 wildcard then only overlaps our own listener.
+export function bindFailureAction({ target, code, ipv4LoopbackServed = false }) {
+  if (code === 'EADDRINUSE' && ipv4LoopbackServed && IPV4_LOOPBACK_COVERING_HOSTS.has(target.host)) {
+    return 'skip';
+  }
+  // ::1 is skipped only when the host has no usable IPv6 loopback at all;
+  // a busy ::1 (EADDRINUSE) still fails startup like 127.0.0.1 does.
+  const ipv6Unavailable = code === 'EADDRNOTAVAIL' || code === 'EAFNOSUPPORT';
+  if (target.required) return target.skipWithoutIpv6 && ipv6Unavailable ? 'skip' : 'fail';
+  return code === 'EADDRNOTAVAIL' || code === 'EADDRINUSE' ? 'skip' : 'fail';
+}
+
+function addressInUseError(host, port) {
+  return Object.assign(new Error(`listen EADDRINUSE: address already in use ${host}:${port}`), {
+    code: 'EADDRINUSE',
+  });
+}
+
+// Bind every configured host with injected I/O:
+//   portInUse(host)       -> whether something already answers on host:port
+//   listen(host)          -> null on success, or the bind error
+//   servesIpv4Loopback()  -> whether 127.0.0.1:port reaches a listener we opened
+//   warn(message)         -> skip warning sink
+// Folded loopback hosts are pre-checked before any listener opens, so the
+// check cannot mistake our own wildcard for another process. A loopback
+// target is pre-checked right before its bind, as before. Resolves to
+// { ok: true } or { ok: false, err, noListener }.
+export async function bindPublicHosts(hosts, { port, portInUse, listen, servesIpv4Loopback, warn }) {
+  for (const host of foldedLoopbackHosts(hosts)) {
+    if (await portInUse(host)) return { ok: false, err: addressInUseError(host, port), noListener: false };
+  }
+  let bound = 0;
+  for (const target of listenBindTargets(hosts)) {
+    const { host } = target;
+    const err = isLoopbackBindHost(host) && await portInUse(host)
+      ? addressInUseError(host, port)
+      : await listen(host);
+    if (!err) {
+      bound += 1;
+      continue;
+    }
+    const ipv4LoopbackServed = err.code === 'EADDRINUSE' && bound > 0
+      && IPV4_LOOPBACK_COVERING_HOSTS.has(host) && await servesIpv4Loopback();
+    if (bindFailureAction({ target, code: err.code, ipv4LoopbackServed }) === 'fail') {
+      return { ok: false, err, noListener: false };
+    }
+    warn(`[TeamClaude] Skipping bind ${host}: ${err.code}`);
+  }
+  if (bound === 0) return { ok: false, err: new Error('no bind host could be bound'), noListener: true };
+  return { ok: true };
+}
