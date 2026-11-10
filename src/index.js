@@ -96,6 +96,7 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
+import { refreshClaudeModelOptions } from './claude-model-options.js';
 import {
   createCmuxSessionRescuer,
   defaultCmuxRescuePaths,
@@ -2855,6 +2856,34 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+// A session holding only the local recovery marker cannot refresh Claude
+// Code's /model list itself (see claude-model-options.js), so the launcher
+// refreshes it once with a pool token. A real inherited OAuth token is left to
+// Claude Code. Accounts are re-read from disk because a proxy started by this
+// launch persists freshly refreshed tokens after our first config read.
+// Every other outcome (no account, fetch failure, lock busy, raced, …) leaves
+// the cache stale and is reported. 'missing' is a first run: Claude Code has
+// not created its config yet and will fetch with nothing cached to go stale.
+// The set lives inside the function: this module runs its command via a
+// top-level await ABOVE this point, so a module-level const would still be in
+// its temporal dead zone when `run` reaches here.
+async function refreshLaunchModelOptions(childEnv) {
+  const okOutcomes = new Set(['updated', 'refreshed', 'unchanged', 'fresh', 'missing']);
+  const token = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
+  if (typeof token !== 'string') return;
+  const preferredUuid = parseClaudeRecoveryAccount(`Bearer ${token}`);
+  if (!preferredUuid) return;
+  const outcome = await refreshClaudeModelOptions({
+    loadAccounts: async () => (await loadConfig())?.accounts,
+    preferredUuid,
+    env: childEnv,
+    home: typeof childEnv.HOME === 'string' && childEnv.HOME.length > 0 ? childEnv.HOME : homedir(),
+  });
+  if (!okOutcomes.has(outcome)) {
+    console.error(`[TeamClaude] Could not refresh Claude Code's /model list (${outcome}); it may show an older model until the next launch.`);
+  }
+}
+
 async function seedClaudeRecoveryAccount(config, childEnv) {
   // Preserve any inherited credential; it may be a real external OAuth token.
   if (Object.hasOwn(childEnv, 'CLAUDE_CODE_OAUTH_TOKEN')) return;
@@ -3158,6 +3187,7 @@ async function runCommand(clientArgsOverride = null) {
   delete childEnv.DISABLE_GROWTHBOOK;
   await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
   await seedClaudeRecoveryAccount(runtimeConfig, childEnv);
+  await refreshLaunchModelOptions(childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
