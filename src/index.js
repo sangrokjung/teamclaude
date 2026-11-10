@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { recheckAnthropicAccount, applyRecheckToAccount, describeRecheck, RECHECK_EXIT, BILLING_URL } from './subscription-recheck.js';
+import { recheckAnthropicAccount, recheckedAccount, isConclusiveRecheck, describeRecheck, RECHECK_EXIT, BILLING_URL } from './subscription-recheck.js';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getReloadAckDir, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
@@ -3821,23 +3821,39 @@ async function recheckCommand() {
     process.exit(1);
   }
   const quotaCache = await readQuotaCache().catch(() => null);
-  const outcome = await recheckAnthropicAccount({ account: target, template: quotaCache?.probeTemplate ?? null });
+  const probe = await recheckAnthropicAccount({ account: target, template: quotaCache?.probeTemplate ?? null });
   let changed = false;
-  let config = initial;
-  if (['ok', 'payment-past-due', 'org-blocked'].includes(outcome.outcome)) {
-    config = await atomicConfigUpdate(cfg => {
-      const acct = (cfg.accounts || []).find(a => a.name === name
+  let applied = null;
+  if (isConclusiveRecheck(probe)) {
+    const config = await atomicConfigUpdate(cfg => {
+      const idx = (cfg.accounts || []).findIndex(a => a.name === name
         && (!target.accountUuid || a.accountUuid === target.accountUuid));
-      if (acct) changed = applyRecheckToAccount(acct, outcome);
+      if (idx < 0) return;
+      const result = recheckedAccount(cfg.accounts[idx], probe);
+      changed = result.changed;
+      cfg.accounts[idx] = result.account;
     });
+    // Always ask the running server to converge, even when disk already
+    // matched: an earlier recheck may have saved without the reload landing.
+    // noteRunningServerReload sets exitCode 1 when a live server did not
+    // confirm; no running server is fine (disk is the next start's truth).
+    const previousExitCode = process.exitCode;
+    process.exitCode = 0;
+    await noteRunningServerReload(config);
+    applied = process.exitCode !== 1;
+    process.exitCode = previousExitCode;
   }
+  const outcome = applied === false ? { ...probe, outcome: 'not-applied', verdict: probe.outcome } : probe;
   const message = describeRecheck(name, outcome);
   if (asJson) {
-    console.log(JSON.stringify({ name, ...outcome, changed, billingUrl: outcome.outcome === 'payment-past-due' ? BILLING_URL : null, message }));
+    console.log(JSON.stringify({
+      name, ...outcome, changed, applied,
+      billingUrl: probe.outcome === 'payment-past-due' ? BILLING_URL : null,
+      message,
+    }));
   } else {
     console.log(message);
   }
-  if (changed) await noteRunningServerReload(config);
   process.exitCode = RECHECK_EXIT[outcome.outcome] ?? RECHECK_EXIT.unknown;
 }
 

@@ -179,6 +179,7 @@ enum L10n {
     static func recheckOrgBlocked(_ name: String) -> String { t("\(name) 조직이 Claude Code를 막아 둠 · 재인증으로 풀리지 않음", "\(name) org blocks Claude Code · re-auth won't fix it") }
     static func recheckAuthInvalid(_ name: String) -> String { t("\(name) 토큰 거부 · 재인증 창을 열었습니다", "\(name) token rejected · opened re-auth") }
     static func recheckTokenExpiring(_ name: String) -> String { t("\(name) 토큰 갱신 대기 · 몇 분 뒤 다시 확인", "\(name) token refreshing · recheck in a few minutes") }
+    static func recheckNotApplied(_ name: String) -> String { t("\(name) 저장했지만 실행 중 서버 반영 미확인 · 다시 확인", "\(name) saved but the running server didn't confirm · recheck") }
     static func recheckInconclusive(_ name: String) -> String { t("\(name) 확인 실패 · 잠시 뒤 다시 시도", "\(name) recheck failed · try again shortly") }
     static var serverOffline: String { t("서버 오프라인", "Server offline") }
     static var serverDelayed: String { t("서버 응답 지연", "Server slow to respond") }

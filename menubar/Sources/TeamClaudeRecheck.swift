@@ -26,6 +26,10 @@ let teamClaudeDefaultBillingURL = URL(string: "https://claude.ai/settings/billin
 
 /// CLI 결과를 화면 동작으로 바꾼다. 출력의 마지막 JSON 줄을 읽고, 없으면 종료 코드로 판단한다.
 func teamClaudeRecheckResult(_ cli: SubscriptionCLIResult, name: String) -> TeamClaudeRecheckResult {
+    // 시간 초과로 끊긴 실행은 출력에 무엇이 있든 결과를 믿지 않는다.
+    if cli.timedOut {
+        return TeamClaudeRecheckResult(outcome: "unknown", succeeded: false, message: L10n.recheckInconclusive(name), followUp: .none)
+    }
     var outcome: String?
     var billing: URL?
     for line in cli.output.split(separator: "\n").reversed() {
@@ -40,11 +44,15 @@ func teamClaudeRecheckResult(_ cli: SubscriptionCLIResult, name: String) -> Team
         }
         break
     }
-    if outcome == nil, !cli.timedOut {
-        let byExit: [Int32: String] = [0: "ok", 2: "payment-past-due", 3: "org-blocked", 4: "auth-invalid", 5: "token-expired"]
+    if outcome == nil {
+        let byExit: [Int32: String] = [0: "ok", 2: "payment-past-due", 3: "org-blocked", 4: "auth-invalid", 5: "token-expired", 7: "not-applied"]
         outcome = byExit[cli.status]
     }
+    // JSON과 종료 코드가 어긋나면(예: ok인데 비정상 종료) 성공으로 보지 않는다.
+    if outcome == "ok" && cli.status != 0 { outcome = "unknown" }
     switch outcome {
+    case "not-applied":
+        return TeamClaudeRecheckResult(outcome: "not-applied", succeeded: false, message: L10n.recheckNotApplied(name), followUp: .refresh)
     case "ok":
         return TeamClaudeRecheckResult(outcome: "ok", succeeded: true, message: L10n.recheckOk(name), followUp: .refresh)
     case "payment-past-due":

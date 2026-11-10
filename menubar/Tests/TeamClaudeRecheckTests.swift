@@ -27,6 +27,14 @@ struct TeamClaudeRecheckTests {
         r = teamClaudeRecheckResult(cli(5, "{\"outcome\":\"token-expired\"}"), name: "a")
         precondition(r.followUp == .none)
 
+        // 서버 반영 미확인은 성공이 아니다(JSON이든 종료 코드든).
+        r = teamClaudeRecheckResult(cli(7, "{\"outcome\":\"not-applied\",\"verdict\":\"ok\"}"), name: "a")
+        precondition(r.outcome == "not-applied" && !r.succeeded, "\(r)")
+        precondition(teamClaudeRecheckResult(cli(7, ""), name: "a").outcome == "not-applied")
+        // ok JSON이라도 시간 초과·비정상 종료면 성공으로 보지 않는다.
+        precondition(teamClaudeRecheckResult(cli(0, "{\"outcome\":\"ok\"}", timedOut: true), name: "a").outcome == "unknown")
+        precondition(teamClaudeRecheckResult(cli(1, "{\"outcome\":\"ok\"}"), name: "a").outcome == "unknown")
+
         // JSON이 없으면 종료 코드로, 시간 초과면 판단하지 않는다.
         precondition(teamClaudeRecheckResult(cli(2, "plain text"), name: "a").outcome == "payment-past-due")
         precondition(teamClaudeRecheckResult(cli(0, "", timedOut: true), name: "a").outcome == "unknown")
