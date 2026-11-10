@@ -168,10 +168,20 @@ enum L10n {
     static var burnDetailsLink: String { t("구독·소진에서 자세히 ↗", "Details in Burn ↗") }
     static var lowConfidence: String { t("신뢰 낮음", "Low confidence") }
     static var todoReasonReauth: String { t("재인증하면 돌아옴", "Back after re-authentication") }
-    static var todoReasonOrgBlocked: String { t("조직이 구독을 막아 둠 · 재인증으로 풀리지 않음", "Blocked by the org · re-auth won't fix it") }
+    static var todoReasonOrgBlocked: String { t("결제 연체나 조직 차단으로 막힘 · 다시 확인하면 원인을 봄", "Blocked by billing or the org · recheck to find out") }
     static var todoReasonDisabled: String { t("직접 꺼 둔 계정 · 라우팅 제외", "Turned off by you · not routed") }
     static var reauthenticate: String { t("재인증", "Re-auth") }
     static var checkSubscription: String { t("구독 확인", "Check plan") }
+    static var recheckAccess: String { t("다시 확인", "Recheck") }
+    static func recheckRunning(_ name: String) -> String { t("\(name) 다시 확인 중…", "Rechecking \(name)…") }
+    static func recheckOk(_ name: String) -> String { t("\(name) 다시 사용 가능 · 라우팅에 복귀", "\(name) works again · back in rotation") }
+    static func recheckPastDue(_ name: String) -> String { t("\(name) 결제 연체 · 결제 화면을 열었습니다. 결제 후 다시 확인", "\(name) payment past due · opened billing. Recheck after paying") }
+    static func recheckOrgBlocked(_ name: String) -> String { t("\(name) 조직이 Claude Code를 막아 둠 · 재인증으로 풀리지 않음", "\(name) org blocks Claude Code · re-auth won't fix it") }
+    static func recheckAuthInvalid(_ name: String) -> String { t("\(name) 토큰 거부 · 재인증 창을 열었습니다", "\(name) token rejected · opened re-auth") }
+    static func recheckTokenExpiring(_ name: String) -> String { t("\(name) 토큰 갱신 대기 · 몇 분 뒤 다시 확인", "\(name) token refreshing · recheck in a few minutes") }
+    static func recheckAccessDenied(_ name: String) -> String { t("\(name) 접근 거부 · 결제 상태를 못 읽음 · 잠시 뒤 다시 확인", "\(name) access denied · couldn't read billing · recheck shortly") }
+    static func recheckNotApplied(_ name: String) -> String { t("\(name) 저장했지만 실행 중 서버 반영 미확인 · 다시 확인", "\(name) saved but the running server didn't confirm · recheck") }
+    static func recheckInconclusive(_ name: String) -> String { t("\(name) 확인 실패 · 잠시 뒤 다시 시도", "\(name) recheck failed · try again shortly") }
     static var serverOffline: String { t("서버 오프라인", "Server offline") }
     static var serverDelayed: String { t("서버 응답 지연", "Server slow to respond") }
 
@@ -545,7 +555,7 @@ enum L10n {
     static func durationMinutes(_ minutes: Int) -> String { t("\(minutes)분", "\(minutes)m") }
     static func durationDaysHours(_ days: Int, _ hours: Int) -> String { t("\(days)일 \(hours)시간", "\(days)d \(hours)h") }
     static func durationHoursMinutes(_ hours: Int, _ minutes: Int) -> String { t("\(hours)시간 \(minutes)분", "\(hours)h \(minutes)m") }
-    static var errOrgBlocked: String { t("조직차단", "Org blocked") }
+    static var errOrgBlocked: String { t("접근차단", "Access blocked") }
     static var errPlanEnded: String { t("구독종료", "Plan ended") }
     static var errAuthExpired: String { t("인증만료", "Auth expired") }
     static var errAuthRejected: String { t("인증거부", "Auth rejected") }

@@ -120,9 +120,9 @@ struct SubscriptionStateTests {
         // 기록 없는 인증 오류는 재인증 유지 + 안내.
         plan = claudeSubscriptionTodoPlan(canReauth: true, orgBlocked: false, subscription: .unknown, baseReason: "재인증하면 돌아옴")
         precondition(plan?.action == .reauthenticate && plan?.reason == "재인증하면 돌아옴 · 다시 로그인해도 안 풀리면 해지 기록")
-        // 조직 차단은 지금처럼 구독 확인.
+        // 접근 차단(결제 연체·조직 차단)은 다시 확인이 주 동작이다.
         plan = claudeSubscriptionTodoPlan(canReauth: false, orgBlocked: true, subscription: .unknown, baseReason: "조직 차단")
-        precondition(plan?.action == .subscriptionRecord && plan?.title == "구독 확인")
+        precondition(plan?.action == .recheckAccess && plan?.title == "다시 확인" && plan?.primary == true)
 
         // Codex: 해지 계정에 다시 켜기를 권하지 않는다.
         let now = day("2026-10-29")

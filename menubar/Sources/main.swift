@@ -3523,6 +3523,8 @@ final class StatusMenuDashboardView: NSView {
         case .reauthenticate: onReauthenticate?(todo.name, todo.accountUuid)
         case .subscriptionRecord:
             AccountSubscriptionButton(provider: todo.provider, accountUuid: todo.accountUuid, accountName: todo.name).openRecordDialog()
+        case .recheckAccess:
+            TeamClaudeRecheckCenter.shared.recheck(name: todo.name, accountUuid: todo.accountUuid)
         case .codexRecover(let kind): onRecover?(todo.name, todo.accountUuid, kind)
         case .confirmSubscriptionEnd: openSubscriptionConfirm(provider: todo.provider, name: todo.name, accountUuid: todo.accountUuid)
         }
@@ -4567,6 +4569,36 @@ func runTeamCodexSubscriptionCommand(_ arguments: [String]) -> SubscriptionCLIRe
     let stdout = String(data: result.output, encoding: .utf8) ?? ""
     let stderr = (try? String(contentsOf: errorURL, encoding: .utf8)) ?? ""
     return SubscriptionCLIResult(status: result.terminationStatus, output: stdout + stderr, timedOut: result.timedOut)
+}
+
+/// `teamclaude recheck`를 화면이 읽는 Claude 설정 파일로 고정해 백그라운드에서 돌린다.
+func runTeamClaudeRecheckCommand(_ arguments: [String]) -> SubscriptionCLIResult {
+    let executable = resolveTeamClaudeExecutable()
+    let process = Process()
+    if executable.contains("/") {
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+    } else {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [executable] + arguments
+    }
+    var environment = ProcessInfo.processInfo.environment
+    environment.removeValue(forKey: "TEAMCLAUDE_PROVIDER")
+    if let config = teamClaudeConfigPath(environment: environment, home: NSHomeDirectory()) {
+        environment.removeValue(forKey: "XDG_CONFIG_HOME")
+        environment["TEAMCLAUDE_CONFIG"] = config
+    }
+    environment["HOME"] = NSHomeDirectory()
+    let bin = URL(fileURLWithPath: executable).deletingLastPathComponent().path
+    environment["PATH"] = "\(bin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    process.environment = environment
+    process.standardError = FileHandle.nullDevice
+    guard let result = runTrustedProcessInIsolatedGroup(process, timeoutSeconds: 40, terminationGraceMicroseconds: 700_000,
+                                                        captureOutputLimitBytes: 65_536) else {
+        return SubscriptionCLIResult(status: -1, output: "")
+    }
+    return SubscriptionCLIResult(status: result.terminationStatus,
+                                 output: String(data: result.output, encoding: .utf8) ?? "", timedOut: result.timedOut)
 }
 
 func shellQuote(_ value: String) -> String {
@@ -6634,9 +6666,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watchTeamClaudeConfigAfterExternalCommand(reason: "reauth \(name)")
     }
 
+    /// 접근이 막힌 Claude 계정의 "다시 확인". 결과는 하단 막대에 보이고, 결제 연체면 결제 화면, 토큰 거부면 재인증 창을 연다.
+    func wireTeamClaudeRecheck() {
+        let center = TeamClaudeRecheckCenter.shared
+        center.runner = { arguments, completion in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = runTeamClaudeRecheckCommand(arguments)
+                DispatchQueue.main.async { completion(result) }
+            }
+        }
+        center.onStart = { [weak self] name in
+            (self?.openDashboardView ?? self?.cachedDashboardView)?.showSubscriptionOutcome(
+                SubscriptionOutcome(succeeded: true, message: L10n.recheckRunning(name)))
+        }
+        center.onResult = { [weak self] name, accountUuid, result in
+            guard let self else { return }
+            print("TEAMCLAUDE-RECHECK: \(name) outcome=\(result.outcome)")
+            fflush(stdout)
+            (self.openDashboardView ?? self.cachedDashboardView)?.showSubscriptionOutcome(
+                SubscriptionOutcome(succeeded: result.succeeded, message: result.message))
+            switch result.followUp {
+            case .openBilling(let url): NSWorkspace.shared.open(url)
+            case .reauthenticate:
+                // 차단 깃발이 있는 계정은 일반 재인증 게이트(teamClaudeCanReauthenticate)를 통과하지 못한다.
+                // 프록시가 토큰 거부를 직접 확인했으므로 여기서 바로 재인증 창을 연다. CLI reauth가 깃발도 지운다.
+                var arguments = ["reauth", name]
+                if let accountUuid, !accountUuid.isEmpty { arguments.append(contentsOf: ["--account-uuid", accountUuid]) }
+                self.openTeamClaudeTerminal(commandTitle: L10n.terminalClaudeReauth(name), arguments: arguments)
+                self.watchTeamClaudeConfigAfterExternalCommand(reason: "reauth \(name)")
+            case .refresh, .none: break
+            }
+            self.refreshStatusOnly()
+        }
+    }
+
     /// 구독 처리(해지 기록·종료로 확정·기록 지우기·되돌리기). Codex는 teamcodex CLI를 백그라운드에서 실행한다.
     /// 결과는 하단 막대에 6초 보이고, 표는 바로 다시 그린다. Codex는 프록시 status도 다시 읽는다.
     func wireSubscriptionActions() {
+        wireTeamClaudeRecheck()
         let center = SubscriptionActionCenter.shared
         center.runner = { arguments, completion in
             DispatchQueue.global(qos: .userInitiated).async {
