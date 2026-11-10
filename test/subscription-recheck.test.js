@@ -54,11 +54,22 @@ test('403 with an active subscription is an organization block', async () => {
   assert.equal(r.outcome, 'org-blocked');
 });
 
-test('403 with an unreadable profile stays an organization block', async () => {
-  const { impl } = fakeFetch({ messages: orgDenied, profile: { status: 500 } });
-  const r = await recheckAnthropicAccount({ account, fetchImpl: impl, now: NOW });
-  assert.equal(r.outcome, 'org-blocked');
-  assert.equal(r.subscriptionStatus, null);
+test('403 with an unreadable profile is access-denied with an unknown cause, not an org block', async () => {
+  for (const profile of [{ status: 500 }, { status: 200, body: { organization: {} } }, new Error('net')]) {
+    const { impl } = fakeFetch({ messages: orgDenied, profile });
+    const r = await recheckAnthropicAccount({ account, fetchImpl: impl, now: NOW });
+    assert.equal(r.outcome, 'access-denied');
+    assert.equal(r.subscriptionStatus, null);
+  }
+  assert.equal(isConclusiveRecheck({ outcome: 'access-denied' }), true, 'still parks the account');
+  assert.equal(RECHECK_EXIT['access-denied'], 8);
+});
+
+test('an importFrom account is not probed even with a stale inline token', async () => {
+  const { impl, calls } = fakeFetch({ messages: { status: 401 } });
+  const r = await recheckAnthropicAccount({ account: { ...account, importFrom: '/x.json' }, fetchImpl: impl, now: NOW });
+  assert.equal(r.outcome, 'unknown');
+  assert.equal(calls.length, 0);
 });
 
 test('401 asks for re-authentication', async () => {
@@ -147,6 +158,7 @@ function settleDeps(diskAccounts, { reload = { confirmed: true, failed: false },
     calls,
     deps: {
       atomicUpdate: async updater => { updater(disk); return disk; },
+      readConfig: async () => disk,
       noteReload: async () => { calls.reload += 1; return reload; },
       readServerState: async () => (serverPid ? { pid: serverPid } : null),
       isPidAlive: () => alive,
@@ -198,6 +210,32 @@ test('settle: a re-auth during the probe makes the verdict stale and saves nothi
   assert.equal(r.outcome.errorCode, 'account-changed');
   assert.equal('subscriptionDisabled' in disk.accounts[0], false, 'fresh account is not re-parked');
   assert.equal(calls.reload, 0);
+});
+
+test('settle: a late block verdict does not undo a concurrent lift on the same token', async () => {
+  // A probed while parked; B (same token) lifted the park before A finished.
+  const lifted = { name: 'a', accountUuid: 'u1', accessToken: 'tok' };
+  const { disk, calls, deps } = settleDeps([lifted]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'org-blocked' }, ...deps });
+  assert.equal(r.outcome.errorCode, 'account-changed');
+  assert.equal('subscriptionDisabled' in disk.accounts[0], false);
+  assert.equal(calls.reload, 0);
+});
+
+test('settle: a late auth-invalid on a replaced token does not ask for re-auth', async () => {
+  const stale = settleDeps([{ name: 'a', accountUuid: 'u1', accessToken: 'new', subscriptionDisabled: true }]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'auth-invalid' }, ...stale.deps });
+  assert.equal(r.outcome.outcome, 'unknown');
+  const fresh = settleDeps([parkedTarget]);
+  assert.equal((await settleRecheck({ target: parkedTarget, probe: { outcome: 'auth-invalid' }, ...fresh.deps })).outcome.outcome, 'auth-invalid');
+});
+
+test('settle: access-denied keeps the account parked', async () => {
+  const active = { name: 'a', accountUuid: 'u1', accessToken: 'tok' };
+  const { disk, deps } = settleDeps([active]);
+  const r = await settleRecheck({ target: active, probe: { outcome: 'access-denied' }, ...deps });
+  assert.equal(r.outcome.outcome, 'access-denied');
+  assert.equal(disk.accounts[0].subscriptionDisabled, true);
 });
 
 test('settle: a removal during the probe is not reported as success', async () => {

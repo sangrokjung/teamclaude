@@ -27,6 +27,11 @@ struct TeamClaudeRecheckTests {
         r = teamClaudeRecheckResult(cli(5, "{\"outcome\":\"token-expired\"}"), name: "a")
         precondition(r.followUp == .none)
 
+        // 결제 상태를 못 읽은 접근 거부는 결제 화면도 재인증도 열지 않는다.
+        r = teamClaudeRecheckResult(cli(8, "{\"outcome\":\"access-denied\"}"), name: "a")
+        precondition(r.outcome == "access-denied" && !r.succeeded && r.followUp == .refresh, "\(r)")
+        precondition(teamClaudeRecheckResult(cli(8, ""), name: "a").outcome == "access-denied")
+
         // 서버 반영 미확인은 성공이 아니다(JSON이든 종료 코드든).
         r = teamClaudeRecheckResult(cli(7, "{\"outcome\":\"not-applied\",\"verdict\":\"ok\"}"), name: "a")
         precondition(r.outcome == "not-applied" && !r.succeeded, "\(r)")

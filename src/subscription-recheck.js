@@ -32,7 +32,12 @@ export const RECHECK_EXIT = Object.freeze({
   // The verdict was conclusive and saved, but the running server did not
   // confirm the reload, so it may still route on its previous state.
   'not-applied': 7,
+  // Organization OAuth denied, but the profile (payment status) was unreadable:
+  // the account stays parked and the cause is unknown until a later recheck.
+  'access-denied': 8,
 });
+
+const PARKING_OUTCOMES = new Set(['payment-past-due', 'org-blocked', 'access-denied']);
 
 export const BILLING_URL = 'https://claude.ai/settings/billing';
 
@@ -53,6 +58,9 @@ function probeRequest(account, template) {
   return { headers, body: JSON.stringify(body) };
 }
 
+// The organization's subscription status, or null when it could not be read
+// (HTTP error, network, malformed body, or no status field). null must never
+// be read as "not a payment problem": the cause is then simply unknown.
 async function readSubscriptionStatus(fetchImpl, accessToken) {
   try {
     const res = await fetchImpl(PROFILE_URL, {
@@ -67,18 +75,24 @@ async function readSubscriptionStatus(fetchImpl, accessToken) {
   }
 }
 
+function deniedOutcome(subscriptionStatus) {
+  if (subscriptionStatus == null) return 'access-denied';
+  return PAYMENT_STATES.has(subscriptionStatus) ? 'payment-past-due' : 'org-blocked';
+}
+
 /**
  * Classify one Anthropic OAuth account. Never refreshes tokens (the running
  * server owns the refresh-token chain; a second refresher would race it).
  * Returns { outcome, httpStatus, subscriptionStatus, errorCode }.
  */
 export async function recheckAnthropicAccount({ account, template = null, fetchImpl = fetch, now = Date.now() }) {
+  // An `importFrom` account's live credential lives in another file that the
+  // server resolves (an inline token may be stale). Recheck does not follow
+  // it, so it reports inconclusive instead of probing the wrong token.
+  if (account?.importFrom) {
+    return { outcome: 'unknown', httpStatus: null, subscriptionStatus: null, errorCode: 'import-from-account' };
+  }
   if (!account?.accessToken) {
-    // An `importFrom` account keeps its credential in another file that the
-    // server resolves; a missing inline token here is not an upstream rejection.
-    if (account?.importFrom) {
-      return { outcome: 'unknown', httpStatus: null, subscriptionStatus: null, errorCode: 'import-from-account' };
-    }
     return { outcome: 'auth-invalid', httpStatus: null, subscriptionStatus: null, errorCode: 'no-token' };
   }
   if (account.expiresAt != null
@@ -107,8 +121,7 @@ export async function recheckAnthropicAccount({ account, template = null, fetchI
   }
   if (res.status === 403 && errorCode === ORG_DENIED_CODE) {
     const subscriptionStatus = await readSubscriptionStatus(fetchImpl, account.accessToken);
-    const outcome = PAYMENT_STATES.has(subscriptionStatus) ? 'payment-past-due' : 'org-blocked';
-    return { outcome, httpStatus: 403, subscriptionStatus, errorCode };
+    return { outcome: deniedOutcome(subscriptionStatus), httpStatus: 403, subscriptionStatus, errorCode };
   }
   // A 429 is evidence of access only when it is this account's own quota
   // verdict (unified status rejected): the organization accepted the OAuth
@@ -121,7 +134,26 @@ export async function recheckAnthropicAccount({ account, template = null, fetchI
 
 /** Outcomes conclusive enough to change the stored park. */
 export function isConclusiveRecheck(outcome) {
-  return ['ok', 'payment-past-due', 'org-blocked'].includes(outcome.outcome);
+  return outcome.outcome === 'ok' || PARKING_OUTCOMES.has(outcome.outcome);
+}
+
+function findTargetAccount(accounts, target) {
+  return accounts.findIndex(a => (target.accountUuid
+    ? a.accountUuid === target.accountUuid
+    : a.name === target.name));
+}
+
+// The probed state is still current: same identity, same token, and the same
+// park flag. A re-auth, removal, or a concurrent recheck / `subscription`
+// edit that flipped the park while this probe was in flight makes it stale.
+function isProbedState(current, target) {
+  return Boolean(current)
+    && current.accessToken === target.accessToken
+    && (current.subscriptionDisabled === true) === (target.subscriptionDisabled === true);
+}
+
+function staleOutcome(probe) {
+  return { ...probe, outcome: 'unknown', verdict: probe.outcome, errorCode: 'account-changed' };
 }
 
 /**
@@ -134,7 +166,7 @@ export function recheckedAccount(acct, outcome) {
   if (outcome.outcome === 'ok') {
     next = { ...acct };
     delete next.subscriptionDisabled;
-  } else if (outcome.outcome === 'payment-past-due' || outcome.outcome === 'org-blocked') {
+  } else if (PARKING_OUTCOMES.has(outcome.outcome)) {
     next = { ...acct, subscriptionDisabled: true };
   }
   return { account: next, changed: before !== (next.subscriptionDisabled === true) };
@@ -146,8 +178,10 @@ export function recheckedAccount(acct, outcome) {
  * the whole path is testable without a server or network.
  *
  * - The verdict is saved only onto the exact account state that was probed
- *   (same identity and access token): a re-auth or removal during the probe
- *   makes it stale, and a stale verdict must not re-park a fresh account.
+ *   (see isProbedState): a stale verdict must not re-park a fresh account or
+ *   undo a concurrent lift.
+ * - An auth-invalid verdict (which makes the menubar open re-auth) is also
+ *   dropped when the token was replaced meanwhile.
  * - The reload is requested even when disk already matched (an earlier
  *   recheck may have saved without the reload landing).
  * - "No server" counts as applied only when no live supervisor pid is
@@ -155,28 +189,26 @@ export function recheckedAccount(acct, outcome) {
  *
  * Returns { outcome, changed, applied }.
  */
-export async function settleRecheck({ target, probe, atomicUpdate, noteReload, readServerState, isPidAlive }) {
+export async function settleRecheck({ target, probe, atomicUpdate, readConfig, noteReload, readServerState, isPidAlive }) {
+  if (probe.outcome === 'auth-invalid') {
+    const current = await readConfig().catch(() => null);
+    const accounts = current?.accounts || [];
+    const fresh = isProbedState(accounts[findTargetAccount(accounts, target)], target);
+    return { outcome: fresh ? probe : staleOutcome(probe), changed: false, applied: null };
+  }
   if (!isConclusiveRecheck(probe)) return { outcome: probe, changed: false, applied: null };
   let changed = false;
   let saved = false;
   const config = await atomicUpdate(cfg => {
     const accounts = cfg.accounts || [];
-    const idx = accounts.findIndex(a => (target.accountUuid
-      ? a.accountUuid === target.accountUuid
-      : a.name === target.name));
-    if (idx < 0 || accounts[idx].accessToken !== target.accessToken) return;
+    const idx = findTargetAccount(accounts, target);
+    if (idx < 0 || !isProbedState(accounts[idx], target)) return;
     const result = recheckedAccount(accounts[idx], probe);
     changed = result.changed;
     saved = true;
     accounts[idx] = result.account;
   });
-  if (!saved) {
-    return {
-      outcome: { ...probe, outcome: 'unknown', verdict: probe.outcome, errorCode: 'account-changed' },
-      changed: false,
-      applied: null,
-    };
-  }
+  if (!saved) return { outcome: staleOutcome(probe), changed: false, applied: null };
   const { confirmed, failed } = await noteReload(config);
   let applied = confirmed;
   if (!confirmed && !failed) {
@@ -193,6 +225,8 @@ export function describeRecheck(name, outcome) {
     case 'payment-past-due':
       return `"${name}" subscription payment is ${outcome.subscriptionStatus}. Pay at ${BILLING_URL}, then recheck. Re-login will not fix this.`;
     case 'org-blocked': return `"${name}" organization does not allow Claude Code (OAuth). Re-login will not fix this.`;
+    case 'access-denied':
+      return `"${name}" organization access is denied, but the payment status could not be read. Kept out of rotation; recheck shortly.`;
     case 'auth-invalid': return `"${name}" token was rejected. Re-authenticate with: teamclaude reauth "${name}"`;
     case 'token-expired': return `"${name}" access token is expiring; the running server refreshes it within minutes. Recheck shortly.`;
     case 'not-applied':

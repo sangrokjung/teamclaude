@@ -3841,6 +3841,7 @@ async function recheckCommand() {
     target,
     probe,
     atomicUpdate: atomicConfigUpdate,
+    readConfig: loadConfig,
     noteReload: noteReloadForRecheck,
     readServerState,
     isPidAlive,

@@ -45,7 +45,8 @@ func teamClaudeRecheckResult(_ cli: SubscriptionCLIResult, name: String) -> Team
         break
     }
     if outcome == nil {
-        let byExit: [Int32: String] = [0: "ok", 2: "payment-past-due", 3: "org-blocked", 4: "auth-invalid", 5: "token-expired", 7: "not-applied"]
+        let byExit: [Int32: String] = [0: "ok", 2: "payment-past-due", 3: "org-blocked", 4: "auth-invalid", 5: "token-expired",
+                                       7: "not-applied", 8: "access-denied"]
         outcome = byExit[cli.status]
     }
     // JSON과 종료 코드가 어긋나면(예: ok인데 비정상 종료) 성공으로 보지 않는다.
@@ -58,6 +59,8 @@ func teamClaudeRecheckResult(_ cli: SubscriptionCLIResult, name: String) -> Team
     case "payment-past-due":
         return TeamClaudeRecheckResult(outcome: "payment-past-due", succeeded: false, message: L10n.recheckPastDue(name),
                                        followUp: .openBilling(billing ?? teamClaudeDefaultBillingURL))
+    case "access-denied":
+        return TeamClaudeRecheckResult(outcome: "access-denied", succeeded: false, message: L10n.recheckAccessDenied(name), followUp: .refresh)
     case "org-blocked":
         return TeamClaudeRecheckResult(outcome: "org-blocked", succeeded: false, message: L10n.recheckOrgBlocked(name), followUp: .refresh)
     case "auth-invalid":
