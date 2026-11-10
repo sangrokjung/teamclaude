@@ -275,7 +275,8 @@ func claudeSubscriptionTodoPlan(canReauth: Bool, orgBlocked: Bool, subscription:
                                     reason: "\(baseReason) · \(L10n.subTodoReauthHint)")
     }
     if orgBlocked {
-        return SubscriptionTodoPlan(action: .subscriptionRecord, title: L10n.checkSubscription, primary: false, reason: baseReason)
+        // 막힌 원인(결제 연체·조직 차단·토큰)은 다시 확인해야 안다. 결과에 따라 해제·결제 화면·재인증으로 갈린다.
+        return SubscriptionTodoPlan(action: .recheckAccess, title: L10n.recheckAccess, primary: true, reason: baseReason)
     }
     return SubscriptionTodoPlan(action: .none, title: nil, primary: false, reason: baseReason)
 }

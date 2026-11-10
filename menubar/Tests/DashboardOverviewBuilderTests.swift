@@ -89,7 +89,7 @@ struct DashboardOverviewBuilderTests {
         precondition(model.todos[0].action == .reauthenticate && model.todos[0].primary && model.todos[0].tone == .error)
         // 구독 기록이 없는 인증 오류는 재인증을 유지하고 해지 기록 안내를 붙인다(시안 B 2차본).
         precondition(model.todos[0].reason == "\(L10n.todoReasonReauth) · \(L10n.subTodoReauthHint)", model.todos[0].reason)
-        precondition(model.todos[1].action == .subscriptionRecord && !model.todos[1].primary)
+        precondition(model.todos[1].action == .recheckAccess && model.todos[1].primary)
         precondition(model.todos[1].reason == L10n.todoReasonOrgBlocked, model.todos[1].reason)
         precondition(model.todos[2].action == .none && model.todos[2].actionTitle == nil)
         precondition(model.todos[2].reason == L10n.todoReasonDisabled, model.todos[2].reason)

@@ -340,7 +340,7 @@ struct TeamCodexPoolStatusTests {
         precondition(lapsedAccount.errorReason == "subscription-disabled")
         precondition(lapsedAccount.usableFromProxy == false)
         precondition(!lapsedAccount.isUsable(switchThresholdPercent: reasonThreshold))
-        precondition(teamAccountErrorReasonLabel("subscription-disabled") == "조직차단")
+        precondition(teamAccountErrorReasonLabel("subscription-disabled") == "접근차단")
         precondition(teamAccountErrorReasonLabel("auth-revoked") == "인증만료")
         precondition(teamAccountErrorReasonLabel(nil) == "오류")
 

@@ -19,6 +19,8 @@ enum OverviewTodoAction: Equatable {
     case none
     case reauthenticate
     case subscriptionRecord
+    /// 접근이 막힌 Claude 계정을 지금 다시 확인한다(`teamclaude recheck`).
+    case recheckAccess
     case codexRecover(TeamCodexAccountRecoveryKind)
     /// 해지 기록이 있는 인증 오류 계정. 그 계정 행을 펼쳐 "종료로 확정"을 한 번 더 누르게 한다.
     case confirmSubscriptionEnd

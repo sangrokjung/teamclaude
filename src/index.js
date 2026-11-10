@@ -9,6 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
+import { recheckAnthropicAccount, applyRecheckToAccount, describeRecheck, RECHECK_EXIT, BILLING_URL } from './subscription-recheck.js';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getReloadAckDir, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
@@ -285,6 +286,10 @@ switch (command) {
     break;
   case 'subscription':
     await subscriptionCommand();
+    process.exit();
+    break;
+  case 'recheck':
+    await recheckCommand();
     process.exit();
     break;
   case 'api':
@@ -3785,6 +3790,57 @@ async function setPriorityCommand() {
   await noteRunningServerReload(config);
 }
 
+// `recheck <name> [--account-uuid UUID] [--json]`: re-verify one Anthropic
+// OAuth account now (1-token probe + profile), then lift or keep its
+// organization park. Payment failure (past_due) is reported as such — re-login
+// does not fix it. Tokens are never refreshed here: the running server owns the
+// refresh-token chain. Exit codes: see RECHECK_EXIT.
+async function recheckCommand() {
+  const name = args[1];
+  const asJson = args.includes('--json');
+  const expectedAccountUuid = argValue('--account-uuid');
+  if (!name || name.startsWith('--')) {
+    console.error('Usage: teamclaude recheck <account-name> [--account-uuid UUID] [--json]');
+    process.exit(1);
+  }
+  const initial = await loadConfig();
+  if (isCodexMode(initial)) {
+    console.error('recheck applies to Claude (Anthropic) accounts only, not the Codex pool.');
+    process.exit(1);
+  }
+  const matches = (initial.accounts || []).filter(a => (expectedAccountUuid
+    ? a.accountUuid === expectedAccountUuid && a.name === name
+    : a.name === name));
+  if (matches.length !== 1) {
+    console.error(matches.length ? `Account "${name}" is ambiguous` : `Account "${name}" not found`);
+    process.exit(1);
+  }
+  const target = matches[0];
+  if (target.type !== 'oauth' || (target.provider && target.provider !== 'anthropic')) {
+    console.error(`Account "${name}" is not an Anthropic OAuth account`);
+    process.exit(1);
+  }
+  const quotaCache = await readQuotaCache().catch(() => null);
+  const outcome = await recheckAnthropicAccount({ account: target, template: quotaCache?.probeTemplate ?? null });
+  let changed = false;
+  let config = initial;
+  if (['ok', 'payment-past-due', 'org-blocked'].includes(outcome.outcome)) {
+    config = await atomicConfigUpdate(cfg => {
+      const acct = (cfg.accounts || []).find(a => a.name === name
+        && (!target.accountUuid || a.accountUuid === target.accountUuid));
+      if (acct) changed = applyRecheckToAccount(acct, outcome);
+    });
+  }
+  const message = describeRecheck(name, outcome);
+  if (asJson) {
+    console.log(JSON.stringify({ name, ...outcome, changed, billingUrl: outcome.outcome === 'payment-past-due' ? BILLING_URL : null, message }));
+  } else {
+    console.log(message);
+  }
+  if (changed) await noteRunningServerReload(config);
+  process.exitCode = RECHECK_EXIT[outcome.outcome] ?? RECHECK_EXIT.unknown;
+}
+
 async function anthropicSubscriptionCommand() {
   const name = args[1];
   const state = args[2];
@@ -4199,6 +4255,7 @@ Commands:
   enable <name>       Re-enable a disabled account
   priority <name> <n> Set selection priority (lower = preferred; "auto" to return
                       to automatic ordering — weekly reset soonest drained first)
+  recheck <name>     Re-verify a parked Claude account now (payment / org access)
   subscription <name> <disabled|ok>
                       Mark an account's Claude subscription lapsed (kept out of
                       rotation, survives restarts) or clear the mark
