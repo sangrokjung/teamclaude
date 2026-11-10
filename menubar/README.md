@@ -132,7 +132,7 @@ A build is pushed only after the hub's own menu bar has been running it for 20 s
 build that breaks on the hub never reaches the workers. Each worker is updated in place (the folder its LaunchAgent
 already points at) through `install.py`, then checked by hash, running process and `--selftest`. Workers that are
 offline are retried on the next round; failures are listed in `fleet/FAILED` and `fleet/last-ok` records the last clean
-round. Set `"menubarAutoUpdate": false` on a node to leave it alone. One manual round: `fleet-propagate.py run --manifest ...`.
+round. Set `"menubarAutoUpdate": false` on a node to leave it alone. Set `"menubarOfflineOk": true` on a node that may be powered off (e.g. a laptop): when the first ssh connection cannot reach it, the round skips it instead of failing (failures after connecting still fail). One manual round: `fleet-propagate.py run --manifest ...`.
 
 ## Install from a release
 

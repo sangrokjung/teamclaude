@@ -22,11 +22,12 @@ class FakeRunner:
     """launchctl·ps·selftest·ssh·scp를 흉내 낸다. 실패시킬 호스트를 고를 수 있다."""
 
     def __init__(self, binary, etimes=("01:00",), selftest_rc=0, comm=None, failing_hosts=(), hanging_hosts=(),
-                 on_selftest=None):
+                 on_selftest=None, unreachable_hosts=()):
         self.binary, self.etimes, self.selftest_rc = str(binary), list(etimes), selftest_rc
         self.comm = comm or self.binary
         self.failing_hosts = set(failing_hosts)
         self.hanging_hosts = set(hanging_hosts)
+        self.unreachable_hosts = set(unreachable_hosts)
         self.on_selftest = on_selftest
         self.calls = []
 
@@ -43,6 +44,8 @@ class FakeRunner:
                 self.on_selftest()
             return Result(self.selftest_rc, "SELFTEST reachable=true" if self.selftest_rc == 0 else "")
         host = command[-1].split(":")[0] if command[0].endswith("scp") else command[-2]
+        if host in self.unreachable_hosts:  # 노트북이 꺼짐: ssh·scp 모두 접속 단계에서 255
+            return Result(255, "", "ssh: connect to host %s port 22: Operation timed out" % host)
         if host in self.hanging_hosts and "input" in kwargs:
             raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 1))
         if host in self.failing_hosts:
@@ -309,6 +312,44 @@ class FleetPropagateTest(unittest.TestCase):
         self.assertEqual(fp.elapsed_seconds("00:21"), 21)
         self.assertEqual(fp.elapsed_seconds("01:02:03"), 3723)
         self.assertEqual(fp.elapsed_seconds("2-00:00:01"), 172801)
+
+    def test_offline_ok_node_unreachable_is_skipped_not_failed(self):
+        self.manifest["nodes"].append({"id": "air", "host": "host-air", "menubarOfflineOk": True})
+        runner = FakeRunner(self.binary, unreachable_hosts={"host-air"})
+        self.assertEqual(self.propagate(runner), 0)
+        self.assertEqual(runner.installs(), ["host-a", "host-b"])
+        self.assertTrue((self.state / "last-ok").exists())
+        self.assertFalse((self.state / "FAILED").exists())
+        self.assertNotIn("air", self.state_nodes())   # 기록을 바꾸지 않는다
+        self.assertIn("꺼짐 건너뜀 air", (self.state / "propagate.log").read_text())
+        back = FakeRunner(self.binary)                 # 켜지면 다음 회차가 설치한다
+        self.assertEqual(self.propagate(back), 0)
+        self.assertEqual(back.installs(), ["host-air"])
+
+    def test_unreachable_node_without_flag_still_fails(self):
+        self.manifest["nodes"].append({"id": "air", "host": "host-air"})
+        runner = FakeRunner(self.binary, unreachable_hosts={"host-air"})
+        self.assertEqual(self.propagate(runner), 1)
+        failed = json.loads((self.state / "FAILED").read_text())
+        self.assertTrue(failed["nodes"]["air"].startswith("unreachable "))
+        self.assertFalse((self.state / "last-ok").exists())
+
+    def test_offline_ok_node_that_is_reachable_but_fails_install_still_fails(self):
+        self.manifest["nodes"].append({"id": "air", "host": "host-air", "menubarOfflineOk": True})
+        runner = FakeRunner(self.binary, failing_hosts={"host-air"})
+        self.assertEqual(self.propagate(runner), 1)
+        self.assertIn("air", json.loads((self.state / "FAILED").read_text())["nodes"])
+
+    def test_offline_ok_must_be_bool(self):
+        self.manifest["nodes"].append({"id": "air", "host": "host-air", "menubarOfflineOk": "yes"})
+        with self.assertRaises(ValueError):
+            fp.targets(self.manifest)
+
+    def test_is_unreachable_only_for_ssh_connect_errors(self):
+        self.assertTrue(fp.is_unreachable(255, "ssh: connect to host 100.1.1.1 port 22: Operation timed out"))
+        self.assertTrue(fp.is_unreachable(255, "ssh: Could not resolve hostname air"))
+        self.assertFalse(fp.is_unreachable(255, "Permission denied (publickey)."))
+        self.assertFalse(fp.is_unreachable(1, "connect to host x: Operation timed out"))
 
 
 if __name__ == "__main__":

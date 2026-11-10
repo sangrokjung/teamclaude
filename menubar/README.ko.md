@@ -125,7 +125,7 @@ python3 menubar/fleet-propagate.py install --manifest ~/path/to/manifest.json
 허브 바이너리가 바뀌면 바로, 그 밖에는 10분마다 확인합니다. 허브 메뉴바가 새 판으로 20초 이상 실행되고 `--selftest`가 통과한 뒤에만
 보내므로 허브에서 깨지는 판은 워커로 가지 않습니다. 워커는 LaunchAgent가 가리키던 폴더 그대로 `install.py`로 교체한 뒤
 해시·실행 프로세스·`--selftest`로 확인합니다. 꺼져 있던 워커는 다음 회차에 다시 시도하고, 실패는 `fleet/FAILED`에,
-마지막으로 깨끗이 끝난 회차는 `fleet/last-ok`에 남습니다. 건드리지 않을 노드는 `"menubarAutoUpdate": false`.
+마지막으로 깨끗이 끝난 회차는 `fleet/last-ok`에 남습니다. 건드리지 않을 노드는 `"menubarAutoUpdate": false`. 자주 꺼지는 노트북처럼 꺼져 있어도 되는 노드는 `"menubarOfflineOk": true`로 두면, 첫 ssh 접속부터 닿지 않을 때 실패로 세지 않고 건너뜁니다(접속된 뒤의 실패는 그대로 실패).
 한 회차만 손으로 돌릴 때는 `fleet-propagate.py run --manifest ...`.
 
 ## 외부 사용자 설치
