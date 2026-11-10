@@ -168,8 +168,8 @@ export async function persistModelFields(configPath, fields, {
 
     const next = { ...config, ...fields, additionalModelOptionsAnsweredAt: now };
     const tmpPath = `${configPath}.tmp.${process.pid}.${randomBytes(6).toString('hex')}`;
-    await writeFile(tmpPath, JSON.stringify(next, null, 2), { mode: before.mode & 0o777, flag: 'wx' });
     try {
+      await writeFile(tmpPath, JSON.stringify(next, null, 2), { mode: before.mode & 0o777, flag: 'wx' });
       if (beforeCommit) await beforeCommit();
       const current = await stat(configPath);
       if (current.mtimeMs !== before.mtimeMs || current.size !== before.size

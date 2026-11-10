@@ -206,6 +206,17 @@ test('persistModelFields abandons the write when another writer changed the file
   assert.deepEqual((await readdir(dir)).filter(name => name.includes('.tmp.') || name.endsWith('.lock')), []);
 });
 
+test('persistModelFields removes its temp file and lock when the commit step fails', async t => {
+  const { dir, path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
+  const before = await readFile(path, 'utf8');
+  await assert.rejects(persistModelFields(path, { additionalModelOptionsCache: [] }, {
+    now: NOW,
+    beforeCommit: async () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); },
+  }), /disk full/);
+  assert.equal(await readFile(path, 'utf8'), before);
+  assert.deepEqual((await readdir(dir)).filter(name => name !== '.claude.json'), []);
+});
+
 test('persistModelFields holds Claude Code\'s config lock for the whole read-modify-write', async t => {
   const { dir, path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
   let lockSeen = false;

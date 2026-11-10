@@ -2861,7 +2861,10 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
 // refreshes it once with a pool token. A real inherited OAuth token is left to
 // Claude Code. Accounts are re-read from disk because a proxy started by this
 // launch persists freshly refreshed tokens after our first config read.
-const MODEL_OPTIONS_FAILURES = new Set(['no-account', 'fetch-failed', 'unparseable', 'error']);
+// Every other outcome (no account, fetch failure, lock busy, raced, …) leaves
+// the cache stale and is reported. 'missing' is a first run: Claude Code has
+// not created its config yet and will fetch with nothing cached to go stale.
+const MODEL_OPTIONS_OK = new Set(['updated', 'refreshed', 'unchanged', 'fresh', 'missing']);
 
 async function refreshLaunchModelOptions(childEnv) {
   const token = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
@@ -2874,7 +2877,7 @@ async function refreshLaunchModelOptions(childEnv) {
     env: childEnv,
     home: typeof childEnv.HOME === 'string' && childEnv.HOME.length > 0 ? childEnv.HOME : homedir(),
   });
-  if (MODEL_OPTIONS_FAILURES.has(outcome)) {
+  if (!MODEL_OPTIONS_OK.has(outcome)) {
     console.error(`[TeamClaude] Could not refresh Claude Code's /model list (${outcome}); it may show an older model until the next launch.`);
   }
 }
