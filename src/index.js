@@ -96,6 +96,7 @@ import {
   hasClaudeRecoveryMarker,
   parseClaudeRecoveryAccount,
 } from './claude-auth.js';
+import { refreshClaudeModelOptions } from './claude-model-options.js';
 import {
   createCmuxSessionRescuer,
   defaultCmuxRescuePaths,
@@ -2855,6 +2856,23 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
   }
 }
 
+// A session holding only the local recovery marker cannot refresh Claude
+// Code's /model list itself (see claude-model-options.js), so the launcher
+// refreshes it once with a pool token. A real inherited OAuth token is left to
+// Claude Code.
+async function refreshLaunchModelOptions(config, childEnv) {
+  const token = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
+  if (typeof token !== 'string') return;
+  const preferredUuid = parseClaudeRecoveryAccount(`Bearer ${token}`);
+  if (!preferredUuid) return;
+  await refreshClaudeModelOptions({
+    accounts: config.accounts,
+    preferredUuid,
+    env: childEnv,
+    home: typeof childEnv.HOME === 'string' && childEnv.HOME.length > 0 ? childEnv.HOME : homedir(),
+  });
+}
+
 async function seedClaudeRecoveryAccount(config, childEnv) {
   // Preserve any inherited credential; it may be a real external OAuth token.
   if (Object.hasOwn(childEnv, 'CLAUDE_CODE_OAUTH_TOKEN')) return;
@@ -3158,6 +3176,7 @@ async function runCommand(clientArgsOverride = null) {
   delete childEnv.DISABLE_GROWTHBOOK;
   await syncLaunchModel(runtimeConfig, clientArgs, childEnv);
   await seedClaudeRecoveryAccount(runtimeConfig, childEnv);
+  await refreshLaunchModelOptions(config, childEnv);
 
   // Clear higher-precedence API credentials so Claude Code keeps its OAuth
   // subscription while routing through the proxy.
