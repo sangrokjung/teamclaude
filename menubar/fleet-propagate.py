@@ -232,12 +232,24 @@ def targets(manifest):
         seen.add(node["id"])
         if not isinstance(node.get("menubarAutoUpdate", True), bool):
             raise ValueError("node %r: menubarAutoUpdate must be true or false" % node["id"])
+        if not isinstance(node.get("menubarOfflineOk", False), bool):
+            raise ValueError("node %r: menubarOfflineOk must be true or false" % node["id"])
         for key in ("python", "menubar", "host"):
             if key in node and not isinstance(node[key], str):
                 raise ValueError("node %r: %s must be a string" % (node["id"], key))
         if node.get("menubarAutoUpdate", True) and not node.get("host"):
             raise ValueError("node %r needs a 'host' (or menubarAutoUpdate: false)" % node["id"])
     return [n for n in manifest["nodes"] if n.get("menubarAutoUpdate", True)]
+
+
+# ssh 가 노드에 아예 닿지 못한 경우(노트북이 꺼짐·잠듦). 원격 명령이 돌다 실패한 것과 구분한다.
+_UNREACHABLE = ("connect to host", "operation timed out", "no route to host", "host is down",
+                "connection refused", "could not resolve hostname", "network is unreachable")
+
+
+def is_unreachable(returncode, stderr):
+    text = (stderr or "").lower()
+    return returncode == 255 and any(marker in text for marker in _UNREACHABLE)
 
 
 def is_current(record, node, binary_hash, clock):
@@ -274,9 +286,12 @@ def _push_staged(node, kit, binary_hash, runner, host, stage):
         [*SCP, *[str(kit / name) for name in ("cc-menubar", "install.py", "com.qjc.cc-menubar.plist.template")],
          "%s:%s/" % (host, stage)],
     ]
-    for command in steps:
+    for index, command in enumerate(steps):
         result = runner(command, timeout=REMOTE_TIMEOUT)
         if result.returncode != 0:
+            if index == 0 and is_unreachable(result.returncode, result.stderr):
+                # 첫 접속부터 닿지 않았다: 노드에 아무것도 쓰지 않았다는 뜻이다(propagate 가 menubarOfflineOk 로 가른다)
+                return "unreachable %s" % (result.stderr or "").strip()[-200:], None
             return "copy-failed rc=%d %s" % (result.returncode, (result.stderr or "").strip()[-200:]), None
     python = node.get("python") or "python3"
     remote = " ".join([shlex.quote(python), "-", '"$HOME"/' + shlex.quote(stage), shlex.quote(binary_hash),
@@ -310,11 +325,17 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
             log(state_dir, "대기: 허브 판이 점검 중에 바뀜")
             return 0
         failures = {}
+        offline = []
         for node in nodes:
             record = state["nodes"].get(node["id"], {})
             if is_current(record, node, binary_hash, clock):
                 continue
             error, outcome = push(node, kit, binary_hash, runner)
+            if error and error.startswith("unreachable ") and node.get("menubarOfflineOk", False):
+                # 꺼져 있어도 되는 노드(노트북). 실패로 세지 않고 기록도 바꾸지 않는다 — 켜지면 다음 회차가 다시 확인한다.
+                offline.append(node["id"])
+                log(state_dir, "꺼짐 건너뜀 %s: %s" % (node["id"], error))
+                continue
             if error:
                 # 실패한 시도 뒤에는 노드에 무엇이 남았는지 모른다. 옛 성공 해시를 지워 다음 회차가 반드시 다시 확인하게 한다.
                 failures[node["id"]] = error
