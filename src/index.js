@@ -9,7 +9,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { recheckAnthropicAccount, recheckedAccount, isConclusiveRecheck, describeRecheck, RECHECK_EXIT, BILLING_URL } from './subscription-recheck.js';
+import { recheckAnthropicAccount, settleRecheck, describeRecheck, RECHECK_EXIT, BILLING_URL } from './subscription-recheck.js';
 import { assertSafeProxyConfig, loadOrCreateConfig, loadConfig, atomicConfigUpdate, getConfigPath, getServerStatePath, getReloadAckDir, writeServerState, readServerState, clearServerState, readQuotaCache, writeQuotaCacheSync, normalizeTokenRefreshIntervalMs, readCloudSidecarState, writeCloudSidecarState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { creditStampMatchesConfig, isApiKeyAccount, normalizeCreditExhausted } from './api-credit.js';
@@ -3795,14 +3795,7 @@ async function setPriorityCommand() {
 // organization park. Payment failure (past_due) is reported as such — re-login
 // does not fix it. Tokens are never refreshed here: the running server owns the
 // refresh-token chain. Exit codes: see RECHECK_EXIT.
-async function recheckCommand() {
-  const name = args[1];
-  const asJson = args.includes('--json');
-  const expectedAccountUuid = argValue('--account-uuid');
-  if (!name || name.startsWith('--')) {
-    console.error('Usage: teamclaude recheck <account-name> [--account-uuid UUID] [--json]');
-    process.exit(1);
-  }
+async function recheckTarget(name, expectedAccountUuid) {
   const initial = await loadConfig();
   if (isCodexMode(initial)) {
     console.error('recheck applies to Claude (Anthropic) accounts only, not the Codex pool.');
@@ -3820,30 +3813,38 @@ async function recheckCommand() {
     console.error(`Account "${name}" is not an Anthropic OAuth account`);
     process.exit(1);
   }
+  return target;
+}
+
+// noteRunningServerReload reports a live-server failure through exitCode 1;
+// recheck needs it as a value, without leaking that exit code.
+async function noteReloadForRecheck(config) {
+  const previousExitCode = process.exitCode;
+  process.exitCode = 0;
+  const confirmed = await noteRunningServerReload(config);
+  const failed = process.exitCode === 1;
+  process.exitCode = previousExitCode;
+  return { confirmed, failed };
+}
+
+async function recheckCommand() {
+  const name = args[1];
+  const asJson = args.includes('--json');
+  if (!name || name.startsWith('--')) {
+    console.error('Usage: teamclaude recheck <account-name> [--account-uuid UUID] [--json]');
+    process.exit(1);
+  }
+  const target = await recheckTarget(name, argValue('--account-uuid'));
   const quotaCache = await readQuotaCache().catch(() => null);
   const probe = await recheckAnthropicAccount({ account: target, template: quotaCache?.probeTemplate ?? null });
-  let changed = false;
-  let applied = null;
-  if (isConclusiveRecheck(probe)) {
-    const config = await atomicConfigUpdate(cfg => {
-      const idx = (cfg.accounts || []).findIndex(a => a.name === name
-        && (!target.accountUuid || a.accountUuid === target.accountUuid));
-      if (idx < 0) return;
-      const result = recheckedAccount(cfg.accounts[idx], probe);
-      changed = result.changed;
-      cfg.accounts[idx] = result.account;
-    });
-    // Always ask the running server to converge, even when disk already
-    // matched: an earlier recheck may have saved without the reload landing.
-    // noteRunningServerReload sets exitCode 1 when a live server did not
-    // confirm; no running server is fine (disk is the next start's truth).
-    const previousExitCode = process.exitCode;
-    process.exitCode = 0;
-    await noteRunningServerReload(config);
-    applied = process.exitCode !== 1;
-    process.exitCode = previousExitCode;
-  }
-  const outcome = applied === false ? { ...probe, outcome: 'not-applied', verdict: probe.outcome } : probe;
+  const { outcome, changed, applied } = await settleRecheck({
+    target,
+    probe,
+    atomicUpdate: atomicConfigUpdate,
+    noteReload: noteReloadForRecheck,
+    readServerState,
+    isPidAlive,
+  });
   const message = describeRecheck(name, outcome);
   if (asJson) {
     console.log(JSON.stringify({

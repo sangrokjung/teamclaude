@@ -74,6 +74,11 @@ async function readSubscriptionStatus(fetchImpl, accessToken) {
  */
 export async function recheckAnthropicAccount({ account, template = null, fetchImpl = fetch, now = Date.now() }) {
   if (!account?.accessToken) {
+    // An `importFrom` account keeps its credential in another file that the
+    // server resolves; a missing inline token here is not an upstream rejection.
+    if (account?.importFrom) {
+      return { outcome: 'unknown', httpStatus: null, subscriptionStatus: null, errorCode: 'import-from-account' };
+    }
     return { outcome: 'auth-invalid', httpStatus: null, subscriptionStatus: null, errorCode: 'no-token' };
   }
   if (account.expiresAt != null
@@ -133,6 +138,53 @@ export function recheckedAccount(acct, outcome) {
     next = { ...acct, subscriptionDisabled: true };
   }
   return { account: next, changed: before !== (next.subscriptionDisabled === true) };
+}
+
+/**
+ * Persist a conclusive verdict and confirm the running server converged.
+ * Dependencies are injected (config writer, reload notifier, server state) so
+ * the whole path is testable without a server or network.
+ *
+ * - The verdict is saved only onto the exact account state that was probed
+ *   (same identity and access token): a re-auth or removal during the probe
+ *   makes it stale, and a stale verdict must not re-park a fresh account.
+ * - The reload is requested even when disk already matched (an earlier
+ *   recheck may have saved without the reload landing).
+ * - "No server" counts as applied only when no live supervisor pid is
+ *   recorded; a live pid the status probe could not reach is unverified.
+ *
+ * Returns { outcome, changed, applied }.
+ */
+export async function settleRecheck({ target, probe, atomicUpdate, noteReload, readServerState, isPidAlive }) {
+  if (!isConclusiveRecheck(probe)) return { outcome: probe, changed: false, applied: null };
+  let changed = false;
+  let saved = false;
+  const config = await atomicUpdate(cfg => {
+    const accounts = cfg.accounts || [];
+    const idx = accounts.findIndex(a => (target.accountUuid
+      ? a.accountUuid === target.accountUuid
+      : a.name === target.name));
+    if (idx < 0 || accounts[idx].accessToken !== target.accessToken) return;
+    const result = recheckedAccount(accounts[idx], probe);
+    changed = result.changed;
+    saved = true;
+    accounts[idx] = result.account;
+  });
+  if (!saved) {
+    return {
+      outcome: { ...probe, outcome: 'unknown', verdict: probe.outcome, errorCode: 'account-changed' },
+      changed: false,
+      applied: null,
+    };
+  }
+  const { confirmed, failed } = await noteReload(config);
+  let applied = confirmed;
+  if (!confirmed && !failed) {
+    const state = await readServerState().catch(() => null);
+    applied = !(state?.pid && isPidAlive(state.pid));
+  }
+  const outcome = applied ? probe : { ...probe, outcome: 'not-applied', verdict: probe.outcome };
+  return { outcome, changed, applied };
 }
 
 export function describeRecheck(name, outcome) {

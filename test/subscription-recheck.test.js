@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  recheckAnthropicAccount, recheckedAccount, isConclusiveRecheck, describeRecheck, RECHECK_EXIT, BILLING_URL,
+  recheckAnthropicAccount, recheckedAccount, isConclusiveRecheck, settleRecheck, describeRecheck, RECHECK_EXIT, BILLING_URL,
 } from '../src/subscription-recheck.js';
 
 const NOW = 1_800_000_000_000;
@@ -80,6 +80,15 @@ test('a 403 without the organization-denial code is inconclusive', async () => {
   assert.equal(calls.length, 1, 'no profile lookup for an unrelated 403');
 });
 
+test('an importFrom account without an inline token is inconclusive, not a token rejection', async () => {
+  const { impl, calls } = fakeFetch({ messages: { status: 200 } });
+  const r = await recheckAnthropicAccount({ account: { name: 'x', importFrom: '/elsewhere.json' }, fetchImpl: impl, now: NOW });
+  assert.equal(r.outcome, 'unknown');
+  assert.equal(calls.length, 0);
+  const bare = await recheckAnthropicAccount({ account: { name: 'y' }, fetchImpl: impl, now: NOW });
+  assert.equal(bare.outcome, 'auth-invalid');
+});
+
 test('an expiring token is not probed and never refreshed here', async () => {
   const { impl, calls } = fakeFetch({ messages: { status: 200 } });
   const r = await recheckAnthropicAccount({ account: { ...account, expiresAt: NOW + 10_000 }, fetchImpl: impl, now: NOW });
@@ -128,6 +137,82 @@ test('the stored park changes only on conclusive outcomes, without mutating inpu
     assert.equal(kept.account, parked);
   }
   for (const outcome of ['ok', 'payment-past-due', 'org-blocked']) assert.equal(isConclusiveRecheck({ outcome }), true);
+});
+
+function settleDeps(diskAccounts, { reload = { confirmed: true, failed: false }, serverPid = null, alive = false } = {}) {
+  const disk = { accounts: diskAccounts.map(a => ({ ...a })) };
+  const calls = { reload: 0 };
+  return {
+    disk,
+    calls,
+    deps: {
+      atomicUpdate: async updater => { updater(disk); return disk; },
+      noteReload: async () => { calls.reload += 1; return reload; },
+      readServerState: async () => (serverPid ? { pid: serverPid } : null),
+      isPidAlive: () => alive,
+    },
+  };
+}
+
+const parkedTarget = { name: 'a', accountUuid: 'u1', accessToken: 'tok', subscriptionDisabled: true };
+
+test('settle: ok lifts the park and confirms the live reload', async () => {
+  const { disk, calls, deps } = settleDeps([parkedTarget]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...deps });
+  assert.deepEqual([r.outcome.outcome, r.changed, r.applied], ['ok', true, true]);
+  assert.equal('subscriptionDisabled' in disk.accounts[0], false);
+  assert.equal(calls.reload, 1);
+});
+
+test('settle: a retry still asks the server to reload when disk already matched', async () => {
+  const lifted = { ...parkedTarget };
+  delete lifted.subscriptionDisabled;
+  const { calls, deps } = settleDeps([lifted]);
+  const r = await settleRecheck({ target: lifted, probe: { outcome: 'ok' }, ...deps });
+  assert.deepEqual([r.outcome.outcome, r.changed, r.applied], ['ok', false, true]);
+  assert.equal(calls.reload, 1);
+});
+
+test('settle: an unconfirmed live reload is not-applied', async () => {
+  const { deps } = settleDeps([parkedTarget], { reload: { confirmed: false, failed: true } });
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...deps });
+  assert.equal(r.outcome.outcome, 'not-applied');
+  assert.equal(r.outcome.verdict, 'ok');
+  assert.equal(r.applied, false);
+});
+
+test('settle: an unreachable but live server pid is unverified, a dead or absent one is fine', async () => {
+  const live = settleDeps([parkedTarget], { reload: { confirmed: false, failed: false }, serverPid: 42, alive: true });
+  assert.equal((await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...live.deps })).outcome.outcome, 'not-applied');
+  const dead = settleDeps([parkedTarget], { reload: { confirmed: false, failed: false }, serverPid: 42, alive: false });
+  assert.equal((await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...dead.deps })).outcome.outcome, 'ok');
+  const none = settleDeps([parkedTarget], { reload: { confirmed: false, failed: false } });
+  assert.equal((await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...none.deps })).applied, true);
+});
+
+test('settle: a re-auth during the probe makes the verdict stale and saves nothing', async () => {
+  const reauthed = { name: 'a', accountUuid: 'u1', accessToken: 'new-token' };
+  const { disk, calls, deps } = settleDeps([reauthed]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'org-blocked' }, ...deps });
+  assert.equal(r.outcome.outcome, 'unknown');
+  assert.equal(r.outcome.errorCode, 'account-changed');
+  assert.equal('subscriptionDisabled' in disk.accounts[0], false, 'fresh account is not re-parked');
+  assert.equal(calls.reload, 0);
+});
+
+test('settle: a removal during the probe is not reported as success', async () => {
+  const { calls, deps } = settleDeps([]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'ok' }, ...deps });
+  assert.equal(r.outcome.outcome, 'unknown');
+  assert.equal(calls.reload, 0);
+});
+
+test('settle: inconclusive outcomes touch neither disk nor server', async () => {
+  const { disk, calls, deps } = settleDeps([parkedTarget]);
+  const r = await settleRecheck({ target: parkedTarget, probe: { outcome: 'unknown' }, ...deps });
+  assert.equal(r.outcome.outcome, 'unknown');
+  assert.equal(disk.accounts[0].subscriptionDisabled, true);
+  assert.equal(calls.reload, 0);
 });
 
 test('not-applied has its own message and exit code', () => {
