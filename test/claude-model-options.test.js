@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   BOOTSTRAP_URL,
   MODEL_OPTIONS_REFRESH_MS,
+  acquireConfigLock,
   claudeGlobalConfigPath,
   fetchBootstrapModelFields,
+  modelFieldsFromBootstrap,
   persistModelFields,
   pickBootstrapAccount,
   refreshClaudeModelOptions,
@@ -126,7 +128,7 @@ test('refreshClaudeModelOptions replaces a stale Fable entry and keeps every oth
     additionalModelOptionsAnsweredAt: NOW - 6 * 24 * 3_600_000,
   });
   const result = await refreshClaudeModelOptions({
-    accounts: [account()],
+    loadAccounts: async () => [account()],
     preferredUuid: 'uuid-a',
     env: {},
     home: dir,
@@ -149,7 +151,7 @@ test('refreshClaudeModelOptions skips the network while the cache is fresh', asy
   });
   let calls = 0;
   const result = await refreshClaudeModelOptions({
-    accounts: [account()],
+    loadAccounts: async () => [account()],
     env: {},
     home: dir,
     now: NOW,
@@ -168,13 +170,14 @@ test('refreshClaudeModelOptions never touches the file when the fetch fails', as
     async () => { throw new Error('offline'); },
   ]) {
     const result = await refreshClaudeModelOptions({
-      accounts: [account()], env: {}, home: dir, now: NOW, fetchImpl,
+      loadAccounts: async () => [account()], env: {}, home: dir, now: NOW, fetchImpl,
     });
     assert.ok(['fetch-failed', 'error'].includes(result), result);
     assert.equal(await readFile(path, 'utf8'), before);
   }
   assert.equal(await refreshClaudeModelOptions({
-    accounts: [], env: {}, home: dir, now: NOW, fetchImpl: async () => jsonResponse(200, {}),
+    loadAccounts: async () => [], env: {}, home: dir, now: NOW, accountWaitMs: 0,
+    fetchImpl: async () => jsonResponse(200, {}),
   }), 'no-account');
 });
 
@@ -200,6 +203,110 @@ test('persistModelFields abandons the write when another writer changed the file
   assert.equal(result, 'raced');
   const content = JSON.parse(await readFile(path, 'utf8'));
   assert.equal(content.other, 'writer');
-  const { readdir } = await import('node:fs/promises');
-  assert.deepEqual((await readdir(dir)).filter(name => name.includes('.tmp.')), []);
+  assert.deepEqual((await readdir(dir)).filter(name => name.includes('.tmp.') || name.endsWith('.lock')), []);
+});
+
+test('persistModelFields holds Claude Code\'s config lock for the whole read-modify-write', async t => {
+  const { dir, path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
+  let lockSeen = false;
+  let rivalBlocked = false;
+  const result = await persistModelFields(path, { additionalModelOptionsCache: [] }, {
+    now: NOW,
+    beforeCommit: async () => {
+      lockSeen = (await readdir(dir)).includes('.claude.json.lock');
+      // A Claude Code writer (proper-lockfile mkdir) cannot get in meanwhile.
+      try {
+        await mkdir(`${path}.lock`);
+      } catch (err) {
+        rivalBlocked = err.code === 'EEXIST';
+      }
+    },
+  });
+  assert.equal(result, 'updated');
+  assert.equal(lockSeen, true);
+  assert.equal(rivalBlocked, true);
+  assert.equal((await readdir(dir)).includes('.claude.json.lock'), false);
+});
+
+test('persistModelFields waits for, and never steals, a lock held by Claude Code', async t => {
+  const { path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
+  const before = await readFile(path, 'utf8');
+  await mkdir(`${path}.lock`);
+  assert.equal(await persistModelFields(path, { additionalModelOptionsCache: [] }, { now: NOW, lockWaitMs: 120 }), 'locked');
+  assert.equal(await readFile(path, 'utf8'), before);
+  assert.equal((await stat(`${path}.lock`)).isDirectory(), true);
+
+  // Released mid-wait: we get the lock and write.
+  setTimeout(() => { rmdir(`${path}.lock`); }, 60);
+  assert.equal(await persistModelFields(path, { additionalModelOptionsCache: [] }, { now: NOW, lockWaitMs: 1000 }), 'updated');
+  const lock = await acquireConfigLock(path, { waitMs: 0 });
+  assert.ok(lock, 'lock released after the write');
+  await lock();
+});
+
+test('modelFieldsFromBootstrap rejects answers that do not match Claude Code\'s cache shape', () => {
+  assert.deepEqual(modelFieldsFromBootstrap({}), {
+    additionalModelOptionsCache: [],
+    additionalModelCostsCache: {},
+    modelAccessCache: [],
+    orgModelDefaultCache: null,
+  });
+  assert.equal(modelFieldsFromBootstrap({ org_model_default: 'claude-opus-5-5' }).orgModelDefaultCache, 'claude-opus-5-5');
+  for (const bad of [
+    { additional_model_options: [null] },
+    { additional_model_options: [{ label: 'no value' }] },
+    { model_access: 'invalid' },
+    { additional_model_costs: 42 },
+    { additional_model_costs: [] },
+    { org_model_default: 7 },
+    null,
+    [],
+  ]) {
+    assert.equal(modelFieldsFromBootstrap(bad), null, JSON.stringify(bad));
+  }
+});
+
+test('refreshClaudeModelOptions re-reads accounts until a freshly refreshed token appears', async t => {
+  const { dir, path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
+  // The launcher's snapshot holds an expired token; the proxy it just started
+  // refreshes and persists a new one a moment later.
+  const loads = [
+    [account({ accessToken: 'old', expiresAt: NOW - 1000 })],
+    [account({ accessToken: 'old', expiresAt: NOW - 1000 })],
+    [account({ accessToken: 'refreshed' })],
+  ];
+  let usedToken = null;
+  const result = await refreshClaudeModelOptions({
+    loadAccounts: async () => loads.shift() ?? [],
+    env: {},
+    home: dir,
+    now: NOW,
+    accountWaitMs: 2000,
+    accountRetryMs: 5,
+    fetchImpl: async (url, init) => {
+      usedToken = init.headers.Authorization;
+      return jsonResponse(200, {});
+    },
+  });
+  assert.equal(result, 'updated');
+  assert.equal(usedToken, 'Bearer refreshed');
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).additionalModelOptionsCache, []);
+});
+
+test('refreshClaudeModelOptions gives up after the account wait and leaves the cache alone', async t => {
+  const { dir, path } = await tempHome(t, { additionalModelOptionsCache: [STALE_OPTION] });
+  const before = await readFile(path, 'utf8');
+  let loads = 0;
+  const result = await refreshClaudeModelOptions({
+    loadAccounts: async () => { loads += 1; throw new Error('config unreadable'); },
+    env: {},
+    home: dir,
+    now: NOW,
+    accountWaitMs: 30,
+    accountRetryMs: 5,
+    fetchImpl: async () => { throw new Error('must not fetch'); },
+  });
+  assert.equal(result, 'no-account');
+  assert.ok(loads >= 2);
+  assert.equal(await readFile(path, 'utf8'), before);
 });

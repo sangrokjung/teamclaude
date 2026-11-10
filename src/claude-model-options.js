@@ -16,7 +16,7 @@
 // way Claude Code does (absent fields become empty, so Claude Code falls back
 // to the newest models built into the installed binary).
 
-import { readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,17 @@ const OAUTH_BETA = 'oauth-2025-04-20';
 // One refresh per window is plenty: many sessions launch per minute.
 export const MODEL_OPTIONS_REFRESH_MS = 10 * 60 * 1000;
 const TOKEN_MIN_LIFETIME_MS = 60 * 1000;
+// Claude Code serializes writers of its global config with proper-lockfile:
+// a `<config>.lock` directory, treated as abandoned once its mtime is older
+// than 10s. We take the same lock, never steal it, and give up long before
+// another process could consider our hold stale.
+const LOCK_WAIT_MS = 1500;
+const LOCK_RETRY_MS = 50;
+const LOCK_HOLD_LIMIT_MS = 5000;
+const ACCOUNT_WAIT_MS = 2000;
+const ACCOUNT_RETRY_MS = 250;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function claudeGlobalConfigPath(env = process.env, home = homedir()) {
   const dir = typeof env.CLAUDE_CONFIG_DIR === 'string' && env.CLAUDE_CONFIG_DIR.length > 0
@@ -59,6 +70,31 @@ export function pickBootstrapAccount(accounts, preferredUuid = null, now = Date.
   return chosen ? { account: chosen, token: accountToken(chosen) } : null;
 }
 
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// The four model fields, shaped the way Claude Code stores them; null when the
+// answer does not match that shape (the existing cache is then kept).
+export function modelFieldsFromBootstrap(body) {
+  if (!isPlainObject(body)) return null;
+  const options = body.additional_model_options ?? [];
+  const costs = body.additional_model_costs ?? {};
+  const access = body.model_access ?? [];
+  const orgDefault = body.org_model_default ?? null;
+  if (!Array.isArray(options)
+      || !options.every(option => isPlainObject(option) && typeof option.value === 'string')) return null;
+  if (!isPlainObject(costs)) return null;
+  if (!Array.isArray(access)) return null;
+  if (orgDefault !== null && typeof orgDefault !== 'string' && !isPlainObject(orgDefault)) return null;
+  return {
+    additionalModelOptionsCache: options,
+    additionalModelCostsCache: costs,
+    modelAccessCache: access,
+    orgModelDefaultCache: orgDefault,
+  };
+}
+
 export async function fetchBootstrapModelFields(token, {
   fetchImpl = fetch,
   timeoutMs = 3000,
@@ -73,65 +109,83 @@ export async function fetchBootstrapModelFields(token, {
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) return null;
-  const body = await response.json().catch(() => null);
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
-  const options = body.additional_model_options;
-  if (options != null && !Array.isArray(options)) return null;
-  return {
-    additionalModelOptionsCache: options ?? [],
-    additionalModelCostsCache: body.additional_model_costs ?? {},
-    modelAccessCache: body.model_access ?? [],
-    orgModelDefaultCache: body.org_model_default ?? null,
-  };
+  return modelFieldsFromBootstrap(await response.json().catch(() => null));
 }
 
 function sameJson(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-// Read → merge → write a sibling temp file → rename, the same pattern Claude
-// Code uses. The file is shared by every running session, so the write is
-// abandoned when the file changed between our read and the rename (another
-// writer won; their content must not be clobbered by our older snapshot).
-export async function persistModelFields(configPath, fields, { now = Date.now(), beforeCommit = null } = {}) {
-  let before;
-  let raw;
+// Claude Code's config lock (see LOCK_* above). Resolves to a release function,
+// or null when the lock stayed busy for the whole wait.
+export async function acquireConfigLock(configPath, { waitMs = LOCK_WAIT_MS } = {}) {
+  const lockPath = `${configPath}.lock`;
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      return async () => { await rmdir(lockPath).catch(() => {}); };
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      if (Date.now() >= deadline) return null;
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+}
+
+// Under Claude Code's own config lock: read → merge → write a sibling temp
+// file → rename. Every Claude Code writer takes the same lock, so its writes
+// cannot interleave with ours; the stat check additionally abandons the write
+// if something wrote without the lock since our read.
+export async function persistModelFields(configPath, fields, {
+  now = Date.now(),
+  beforeCommit = null,
+  lockWaitMs = LOCK_WAIT_MS,
+} = {}) {
   try {
-    before = await stat(configPath);
-    raw = await readFile(configPath, 'utf8');
+    await stat(configPath);
   } catch (err) {
     if (err?.code === 'ENOENT') return 'missing';
     throw err;
   }
-  let config;
+  const release = await acquireConfigLock(configPath, { waitMs: lockWaitMs });
+  if (!release) return 'locked';
+  const lockedAt = Date.now();
   try {
-    config = JSON.parse(raw);
-  } catch {
-    return 'unparseable';
-  }
-  if (!config || typeof config !== 'object' || Array.isArray(config)) return 'unparseable';
-
-  const changed = Object.entries(fields).some(([key, value]) => !sameJson(config[key], value));
-  const recent = typeof config.additionalModelOptionsAnsweredAt === 'number'
-    && now - config.additionalModelOptionsAnsweredAt < MODEL_OPTIONS_REFRESH_MS;
-  if (!changed && recent) return 'unchanged';
-
-  const next = { ...config, ...fields, additionalModelOptionsAnsweredAt: now };
-  const tmpPath = `${configPath}.tmp.${process.pid}.${randomBytes(6).toString('hex')}`;
-  await writeFile(tmpPath, JSON.stringify(next, null, 2), { mode: before.mode & 0o777, flag: 'wx' });
-  try {
-    if (beforeCommit) await beforeCommit();
-    const current = await stat(configPath);
-    if (current.mtimeMs !== before.mtimeMs || current.size !== before.size) {
-      await unlink(tmpPath);
-      return 'raced';
+    const before = await stat(configPath);
+    let config;
+    try {
+      config = JSON.parse(await readFile(configPath, 'utf8'));
+    } catch {
+      return 'unparseable';
     }
-    await rename(tmpPath, configPath);
-  } catch (err) {
-    await unlink(tmpPath).catch(() => {});
-    throw err;
+    if (!isPlainObject(config)) return 'unparseable';
+
+    const changed = Object.entries(fields).some(([key, value]) => !sameJson(config[key], value));
+    const recent = typeof config.additionalModelOptionsAnsweredAt === 'number'
+      && now - config.additionalModelOptionsAnsweredAt < MODEL_OPTIONS_REFRESH_MS;
+    if (!changed && recent) return 'unchanged';
+
+    const next = { ...config, ...fields, additionalModelOptionsAnsweredAt: now };
+    const tmpPath = `${configPath}.tmp.${process.pid}.${randomBytes(6).toString('hex')}`;
+    await writeFile(tmpPath, JSON.stringify(next, null, 2), { mode: before.mode & 0o777, flag: 'wx' });
+    try {
+      if (beforeCommit) await beforeCommit();
+      const current = await stat(configPath);
+      if (current.mtimeMs !== before.mtimeMs || current.size !== before.size
+          || Date.now() - lockedAt > LOCK_HOLD_LIMIT_MS) {
+        await unlink(tmpPath);
+        return 'raced';
+      }
+      await rename(tmpPath, configPath);
+    } catch (err) {
+      await unlink(tmpPath).catch(() => {});
+      throw err;
+    }
+    return changed ? 'updated' : 'refreshed';
+  } finally {
+    await release();
   }
-  return changed ? 'updated' : 'refreshed';
 }
 
 // Whether the cached answer is fresh enough to skip the network round trip.
@@ -146,21 +200,41 @@ export async function modelOptionsAreFresh(configPath, now = Date.now()) {
   }
 }
 
+// `loadAccounts` re-reads the pool from disk: a proxy started by this very
+// launch refreshes lapsed tokens in its startup sweep and persists them, so the
+// launcher's earlier snapshot can hold only expired tokens. It is polled for a
+// short while until a usable account appears.
+async function pickWithReload(loadAccounts, preferredUuid, { waitMs, retryMs, now }) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const accounts = await loadAccounts().catch(() => null);
+    const picked = pickBootstrapAccount(accounts, preferredUuid, now);
+    if (picked || Date.now() >= deadline) return picked;
+    await sleep(retryMs);
+  }
+}
+
 // Best effort: any failure leaves Claude Code's cache exactly as it was and
-// never blocks the launch.
+// never blocks the launch beyond a few seconds. Returns an outcome label.
 export async function refreshClaudeModelOptions({
-  accounts,
+  loadAccounts,
   preferredUuid = null,
   env = process.env,
   home = homedir(),
   fetchImpl = fetch,
   now = Date.now(),
   timeoutMs = 3000,
+  accountWaitMs = ACCOUNT_WAIT_MS,
+  accountRetryMs = ACCOUNT_RETRY_MS,
 } = {}) {
   try {
     const configPath = claudeGlobalConfigPath(env, home);
     if (await modelOptionsAreFresh(configPath, now)) return 'fresh';
-    const picked = pickBootstrapAccount(accounts, preferredUuid, now);
+    const picked = await pickWithReload(loadAccounts, preferredUuid, {
+      waitMs: accountWaitMs,
+      retryMs: accountRetryMs,
+      now,
+    });
     if (!picked) return 'no-account';
     const fields = await fetchBootstrapModelFields(picked.token, { fetchImpl, timeoutMs });
     if (!fields) return 'fetch-failed';
