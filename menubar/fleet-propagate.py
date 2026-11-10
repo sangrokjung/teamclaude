@@ -325,7 +325,6 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
             log(state_dir, "대기: 허브 판이 점검 중에 바뀜")
             return 0
         failures = {}
-        offline = []
         for node in nodes:
             record = state["nodes"].get(node["id"], {})
             if is_current(record, node, binary_hash, clock):
@@ -333,7 +332,6 @@ def propagate(manifest, state_dir, kit_source, runner=run, clock=time.time, slee
             error, outcome = push(node, kit, binary_hash, runner)
             if error and error.startswith("unreachable ") and node.get("menubarOfflineOk", False):
                 # 꺼져 있어도 되는 노드(노트북). 실패로 세지 않고 기록도 바꾸지 않는다 — 켜지면 다음 회차가 다시 확인한다.
-                offline.append(node["id"])
                 log(state_dir, "꺼짐 건너뜀 %s: %s" % (node["id"], error))
                 continue
             if error:

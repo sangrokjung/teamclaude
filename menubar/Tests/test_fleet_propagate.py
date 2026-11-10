@@ -313,10 +313,6 @@ class FleetPropagateTest(unittest.TestCase):
         self.assertEqual(fp.elapsed_seconds("01:02:03"), 3723)
         self.assertEqual(fp.elapsed_seconds("2-00:00:01"), 172801)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_offline_ok_node_unreachable_is_skipped_not_failed(self):
         self.manifest["nodes"].append({"id": "air", "host": "host-air", "menubarOfflineOk": True})
         runner = FakeRunner(self.binary, unreachable_hosts={"host-air"})
@@ -354,3 +350,7 @@ if __name__ == "__main__":
         self.assertTrue(fp.is_unreachable(255, "ssh: Could not resolve hostname air"))
         self.assertFalse(fp.is_unreachable(255, "Permission denied (publickey)."))
         self.assertFalse(fp.is_unreachable(1, "connect to host x: Operation timed out"))
+
+
+if __name__ == "__main__":
+    unittest.main()
