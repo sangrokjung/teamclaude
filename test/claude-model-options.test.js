@@ -181,6 +181,21 @@ test('refreshClaudeModelOptions never touches the file when the fetch fails', as
   }), 'no-account');
 });
 
+test('refreshClaudeModelOptions spends no token or network when Claude Code has no config yet', async t => {
+  const { dir } = await tempHome(t);
+  let loads = 0;
+  const result = await refreshClaudeModelOptions({
+    loadAccounts: async () => { loads += 1; return [account()]; },
+    env: {},
+    home: dir,
+    now: NOW,
+    fetchImpl: async () => { throw new Error('must not fetch'); },
+  });
+  assert.equal(result, 'missing');
+  assert.equal(loads, 0);
+  assert.deepEqual(await readdir(dir), []);
+});
+
 test('persistModelFields leaves missing or corrupt configs alone', async t => {
   const { dir, path } = await tempHome(t);
   assert.equal(await persistModelFields(join(dir, '.claude.json'), { additionalModelOptionsCache: [] }, { now: NOW }), 'missing');

@@ -2864,9 +2864,11 @@ async function syncLaunchModel(config, claudeArgs, childEnv) {
 // Every other outcome (no account, fetch failure, lock busy, raced, …) leaves
 // the cache stale and is reported. 'missing' is a first run: Claude Code has
 // not created its config yet and will fetch with nothing cached to go stale.
-const MODEL_OPTIONS_OK = new Set(['updated', 'refreshed', 'unchanged', 'fresh', 'missing']);
-
+// The set lives inside the function: this module runs its command via a
+// top-level await ABOVE this point, so a module-level const would still be in
+// its temporal dead zone when `run` reaches here.
 async function refreshLaunchModelOptions(childEnv) {
+  const okOutcomes = new Set(['updated', 'refreshed', 'unchanged', 'fresh', 'missing']);
   const token = childEnv?.CLAUDE_CODE_OAUTH_TOKEN;
   if (typeof token !== 'string') return;
   const preferredUuid = parseClaudeRecoveryAccount(`Bearer ${token}`);
@@ -2877,7 +2879,7 @@ async function refreshLaunchModelOptions(childEnv) {
     env: childEnv,
     home: typeof childEnv.HOME === 'string' && childEnv.HOME.length > 0 ? childEnv.HOME : homedir(),
   });
-  if (!MODEL_OPTIONS_OK.has(outcome)) {
+  if (!okOutcomes.has(outcome)) {
     console.error(`[TeamClaude] Could not refresh Claude Code's /model list (${outcome}); it may show an older model until the next launch.`);
   }
 }

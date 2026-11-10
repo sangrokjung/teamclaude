@@ -549,11 +549,32 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
       initialToken: 'teamclaude-local-recovery:***',
       expectedToken: 'teamclaude-local-recovery:***',
     },
+    {
+      // The /model refresh runs on this path; with no usable pool token on
+      // disk it must warn and still launch, leaving the cache untouched.
+      name: 'unmarked child with a stale /model cache and no usable pool token',
+      expectedToken: recoveryToken('uuid-b'),
+      claudeConfig: {
+        additionalModelOptionsCache: [{ value: 'claude-fable-5-1[1m]', label: 'Fable' }],
+        additionalModelOptionsAnsweredAt: 1,
+      },
+      stderr: /Could not refresh Claude Code's \/model list \(no-account\)/,
+    },
+    {
+      name: 'unmarked child with a fresh /model cache',
+      expectedToken: recoveryToken('uuid-b'),
+      claudeConfig: { additionalModelOptionsCache: [], additionalModelOptionsAnsweredAt: Date.now() },
+      notStderr: /\/model list/,
+    },
   ];
 
   for (const scenario of cases) {
     await t.test(scenario.name, async () => {
       await writeFile(claudeCalls, '');
+      const claudeConfigPath = join(root, '.claude.json');
+      await rm(claudeConfigPath, { force: true });
+      const claudeConfigText = scenario.claudeConfig ? JSON.stringify(scenario.claudeConfig) : null;
+      if (claudeConfigText) await writeFile(claudeConfigPath, claudeConfigText);
       const env = {
         ...process.env,
         HOME: root,
@@ -578,6 +599,9 @@ appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify({
       assert.equal(result.status, 0, `${scenario.name}: ${result.stderr}`);
       assert.equal(calls.length, 1);
       assert.equal(calls[0].oauthValue, scenario.expectedToken);
+      if (scenario.stderr) assert.match(result.stderr, scenario.stderr);
+      if (scenario.notStderr) assert.doesNotMatch(result.stderr, scenario.notStderr);
+      if (claudeConfigText) assert.equal(await readFile(claudeConfigPath, 'utf8'), claudeConfigText);
     });
   }
   assert.equal(manager.currentIndex, 1);

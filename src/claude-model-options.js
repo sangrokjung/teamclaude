@@ -229,6 +229,14 @@ export async function refreshClaudeModelOptions({
 } = {}) {
   try {
     const configPath = claudeGlobalConfigPath(env, home);
+    // No config yet (first run, or a throwaway HOME): nothing cached can go
+    // stale, so spend no token and no network on it.
+    try {
+      await stat(configPath);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return 'missing';
+      throw err;
+    }
     if (await modelOptionsAreFresh(configPath, now)) return 'fresh';
     const picked = await pickWithReload(loadAccounts, preferredUuid, {
       waitMs: accountWaitMs,
