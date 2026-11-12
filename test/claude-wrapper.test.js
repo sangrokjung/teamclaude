@@ -875,6 +875,7 @@ test('vendor shim execs the native binary with a version-scoped `claude` argv0',
       const result = spawnSync(installed.vendorShimPath, [...argv0Probe, 'space value', '한글'], { encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
       const seen = JSON.parse(result.stdout);
+      assert.equal(result.stderr, '');
       assert.equal(seen.argv0, expectedLink);
       assert.deepEqual(seen.args, ['space value', '한글']);
       assert.equal(await realpath(seen.execPath), await realpath(native));
@@ -933,6 +934,7 @@ test('vendor shim falls back to the native path as argv0 when the link cannot be
     const seen = JSON.parse(result.stdout);
     assert.equal(seen.argv0, native);
     assert.deepEqual(seen.args, ['plain arg']);
+    assert.match(result.stderr, /could not prepare argv0 link/);
     assert.equal(await realpath(seen.execPath), await realpath(native));
   } finally {
     await cleanup(fixture);

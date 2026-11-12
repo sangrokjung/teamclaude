@@ -4,6 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmod,
+  copyFile,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -2579,4 +2581,54 @@ test('direct-child prefilter still adopts the only Claude child launched via the
   });
   assert.equal(result.alive, true);
   assert.equal(result.pid, selected.pid);
+});
+
+// vendor 심은 실제로 `exec -a <버전별 claude 링크> <버전 실행 파일>`로 띄운다.
+// ps 명령줄 첫 단어가 링크가 되므로, 신뢰 판정은 링크를 realpath로 풀어
+// ~/.local/share/claude/versions/<버전>을 가리킬 때만 통과해야 한다.
+test('inspectClaudeProcess trusts a native child whose argv0 is the vendor shim link', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-argv0-trust-'));
+  const previousHome = process.env.HOME;
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  });
+  const versionsDir = join(root, '.local', 'share', 'claude', 'versions');
+  const linkDir = join(root, '.local', 'share', 'teamclaude', 'claude-argv0');
+  await mkdir(versionsDir, { recursive: true });
+  // 운영처럼 버전 경로 자체가 일반 실행 파일이어야 realpath가 versions 안에 머문다.
+  const native = join(versionsDir, '2.1.290');
+  await link(process.execPath, native).catch(() => copyFile(process.execPath, native));
+  await chmod(native, 0o755);
+  await mkdir(join(linkDir, '2.1.290'), { recursive: true });
+  await mkdir(join(linkDir, '2.1.291'), { recursive: true });
+  const goodLink = join(linkDir, '2.1.290', 'claude');
+  const brokenLink = join(linkDir, '2.1.291', 'claude');
+  await symlink(native, goodLink);
+  await symlink(join(versionsDir, '2.1.291'), brokenLink);
+  process.env.HOME = root;
+
+  const launch = async argv0 => {
+    const child = spawn('/bin/zsh', ['-c', 'exec -a "$1" "$2" -e "setInterval(() => {}, 1000)"', 'zsh', argv0, native], {
+      stdio: 'ignore',
+    });
+    await once(child, 'spawn');
+    t.after(() => child.kill('SIGKILL'));
+    // exec가 끝나 ps에 새 argv0이 보일 때까지 기다린다.
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const info = await inspectClaudeProcess(child.pid);
+      if (info.executablePath === argv0) return info;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    throw new Error(`argv0 never became ${argv0}`);
+  };
+
+  const trusted = await launch(goodLink);
+  assert.equal(trusted.alive, true);
+  assert.equal(trusted.nativeExecutableTrusted, true);
+
+  const untrusted = await launch(brokenLink);
+  assert.equal(untrusted.alive, true);
+  assert.equal(untrusted.nativeExecutableTrusted, false);
 });

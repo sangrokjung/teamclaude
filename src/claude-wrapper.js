@@ -329,6 +329,8 @@ if [[ ! -L "$link_path" || "\${link_path:A}" != "$selected_real" ]]; then
 fi
 if [[ -L "$link_path" && "\${link_path:A}" == "$selected_real" ]]; then
   exec_argv0="$link_path"
+else
+  print -u2 -r -- "[TeamClaude] claude-vendor: could not prepare argv0 link $link_path; starting with the versioned name (terminal managers may not detect Claude)"
 fi
 # Drop links whose version is gone, so stale entries do not pile up.
 for stale_dir in "$argv0_dir"/*(N/); do
