@@ -10,6 +10,7 @@ import {
   mkdtemp,
   readFile,
   readlink,
+  realpath,
   readdir,
   rm,
   symlink,
@@ -842,5 +843,98 @@ printf '%s|%s|%s|%s\\n' ${name} "\${TEAMCLAUDE_PROVIDER:-}" "\${TEAMCLAUDE_SESSI
       'teamcodex|anthropic||/tmp/custom.json');
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// herdr(및 비슷한 터미널 관리자)는 pane 전면 프로세스의 argv0 끝 이름이
+// `claude`일 때만 Claude로 감지한다. 심은 실행 파일(=Claude의 execPath,
+// 버전 잠금 기준)은 그대로 두고 argv0만 버전별 `claude` 심볼릭 링크로 준다.
+async function linkNodeNative(fixture, version) {
+  const path = join(fixture.versionsDir, version);
+  await symlink(process.execPath, path);
+  return path;
+}
+
+const argv0Probe = ['-e', 'process.stdout.write(JSON.stringify({ argv0: process.argv0, execPath: process.execPath, args: process.argv.slice(1) }))'];
+
+test('vendor shim execs the native binary with a version-scoped `claude` argv0', async t => {
+  if (spawnSync('zsh', ['-c', 'true']).error) {
+    t.skip('zsh is not installed');
+    return;
+  }
+  const fixture = await makeFixture();
+  try {
+    await writeNative(fixture, '2.1.9');
+    const native = await linkNodeNative(fixture, '2.1.10');
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    const expectedLink = join(fixture.homeDir, '.local', 'share', 'teamclaude', 'claude-argv0', '2.1.10', 'claude');
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = spawnSync(installed.vendorShimPath, [...argv0Probe, 'space value', '한글'], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      const seen = JSON.parse(result.stdout);
+      assert.equal(seen.argv0, expectedLink);
+      assert.deepEqual(seen.args, ['space value', '한글']);
+      assert.equal(await realpath(seen.execPath), await realpath(native));
+      assert.equal(await readlink(expectedLink), native);
+      assert.equal(await realpath(expectedLink), await realpath(native));
+    }
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('vendor shim repoints a stale argv0 link and drops links of removed versions', async t => {
+  if (spawnSync('zsh', ['-c', 'true']).error) {
+    t.skip('zsh is not installed');
+    return;
+  }
+  const fixture = await makeFixture();
+  try {
+    const native = await linkNodeNative(fixture, '2.1.10');
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    const root = join(fixture.homeDir, '.local', 'share', 'teamclaude', 'claude-argv0');
+    await mkdir(join(root, '2.1.10'), { recursive: true });
+    await symlink('/bin/echo', join(root, '2.1.10', 'claude'));
+    await mkdir(join(root, '2.1.1'), { recursive: true });
+    await symlink(join(fixture.versionsDir, '2.1.1'), join(root, '2.1.1', 'claude'));
+
+    const result = spawnSync(installed.vendorShimPath, argv0Probe, { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).argv0, join(root, '2.1.10', 'claude'));
+    assert.equal(await readlink(join(root, '2.1.10', 'claude')), native);
+    assert.deepEqual((await readdir(root)).sort(), ['2.1.10']);
+  } finally {
+    await cleanup(fixture);
+  }
+});
+
+test('vendor shim falls back to the native path as argv0 when the link cannot be made', async t => {
+  if (spawnSync('zsh', ['-c', 'true']).error) {
+    t.skip('zsh is not installed');
+    return;
+  }
+  const fixture = await makeFixture();
+  try {
+    const native = await linkNodeNative(fixture, '2.1.10');
+    const installed = await installClaudeWrapper({
+      homeDir: fixture.homeDir,
+      teamcodexBin: fixture.teamcodexBin,
+    });
+    // 링크 루트 자리에 일반 파일이 있으면 디렉터리를 만들 수 없다.
+    await writeFile(join(fixture.homeDir, '.local', 'share', 'teamclaude'), 'not a directory');
+    const result = spawnSync(installed.vendorShimPath, [...argv0Probe, 'plain arg'], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    const seen = JSON.parse(result.stdout);
+    assert.equal(seen.argv0, native);
+    assert.deepEqual(seen.args, ['plain arg']);
+    assert.equal(await realpath(seen.execPath), await realpath(native));
+  } finally {
+    await cleanup(fixture);
   }
 });

@@ -2531,3 +2531,52 @@ test('cmux binary resolution never consults PATH and honours only an absolute ov
   const result = await resolveCmuxBinary({ PATH: dir }).catch(err => err);
   assert.notEqual(result, bin);
 });
+
+// 버전별 `claude` argv0 링크로 뜬 Claude 자식도 직접 자식 목록의 사전 필터에서
+// selectorless Claude로 세어야 한다. 그래야 세션 지정 자식이 하나 있어도
+// 지정 없는 Claude 자식이 둘 이상이면 모호한 것으로 보고 fail-closed 한다.
+for (const [label, commandFor] of [
+  ['native version path', version => `/Users/example/.local/share/claude/versions/${version} -c`],
+  ['teamclaude argv0 link', version => `/Users/example/.local/share/teamclaude/claude-argv0/${version}/claude -c`],
+]) {
+  test(`direct-child prefilter counts selectorless Claude children launched via the ${label}`, async () => {
+    const supervisorPid = 54341;
+    const selected = {
+      ...selectorlessChildInfo(54344, supervisorPid, '2.1.290'),
+      command: `/Users/example/.local/share/teamclaude/claude-argv0/2.1.290/claude --resume ${SESSION_ID}`,
+    };
+    const processes = new Map([
+      [supervisorPid, supervisorProcessInfo(supervisorPid)],
+      [selected.pid, selected],
+    ]);
+    const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+      inspectProcess: async pid => processes.get(pid) || { alive: false },
+      listDirectChildren: async () => [
+        { pid: 54342, ppid: supervisorPid, command: commandFor('2.1.289') },
+        { pid: 54343, ppid: supervisorPid, command: commandFor('2.1.290') },
+        { pid: selected.pid, ppid: supervisorPid, command: selected.command },
+      ],
+      listProcessTable: async () => [],
+    });
+    assert.equal(result.alive, false);
+  });
+}
+
+test('direct-child prefilter still adopts the only Claude child launched via the argv0 link', async () => {
+  const supervisorPid = 54351;
+  const selected = {
+    ...selectorlessChildInfo(54352, supervisorPid, '2.1.290'),
+    command: `/Users/example/.local/share/teamclaude/claude-argv0/2.1.290/claude --resume ${SESSION_ID}`,
+  };
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [selected.pid, selected],
+  ]);
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [{ pid: selected.pid, ppid: supervisorPid, command: selected.command }],
+    listProcessTable: async () => [],
+  });
+  assert.equal(result.alive, true);
+  assert.equal(result.pid, selected.pid);
+});

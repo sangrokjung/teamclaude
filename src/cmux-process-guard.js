@@ -119,8 +119,12 @@ function childBelongsToSupervisor(child, supervisor, supervisorPid) {
     && (!supervisor.teamClaudeBin || child.teamClaudeBin === supervisor.teamClaudeBin);
 }
 
+// A native Claude row is either the versioned binary itself or the TeamClaude
+// vendor shim's per-version `claude` argv0 link that resolves to it.
+const NATIVE_CLAUDE_COMMAND_RE = /\/claude\/versions\/|\/teamclaude\/claude-argv0\/[^/\s]+\/claude(?:\s|$)/;
+
 function selectorlessNativeRows(rows) {
-  return rows.filter(row => /\/claude\/versions\//.test(row.command)
+  return rows.filter(row => NATIVE_CLAUDE_COMMAND_RE.test(row.command)
     && !hasSessionSelector(row.command));
 }
 
