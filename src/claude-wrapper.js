@@ -32,6 +32,7 @@ function wrapperPaths(homeDir) {
   return {
     binDir,
     versionsDir: join(homeDir, '.local', 'share', 'claude', 'versions'),
+    argv0Dir: join(homeDir, '.local', 'share', 'teamclaude', 'claude-argv0'),
     wrapperPath: join(binDir, 'claude'),
     vendorShimPath: join(binDir, 'claude-vendor'),
     statePath: join(binDir, STATE_FILENAME),
@@ -191,8 +192,19 @@ exec ${shellQuote(teamcodexBin)} run -- "$@"
 `;
 }
 
-export function renderClaudeVendorShim({ versionsDir, wrapperPath, vendorShimPath }) {
-  if (![versionsDir, wrapperPath, vendorShimPath].every(isAbsolute)) {
+// Default home for the per-version `claude` argv0 links, next to Claude's own
+// data directory: <data>/claude/versions -> <data>/teamclaude/claude-argv0.
+function defaultArgv0Dir(versionsDir) {
+  return join(dirname(dirname(versionsDir)), 'teamclaude', 'claude-argv0');
+}
+
+export function renderClaudeVendorShim({
+  versionsDir,
+  wrapperPath,
+  vendorShimPath,
+  argv0Dir = defaultArgv0Dir(versionsDir),
+}) {
+  if (![versionsDir, wrapperPath, vendorShimPath, argv0Dir].every(isAbsolute)) {
     throw new Error('Vendor shim paths must be absolute');
   }
   return `#!/bin/zsh
@@ -202,6 +214,7 @@ setopt local_options no_unset
 versions_dir=${shellQuote(versionsDir)}
 wrapper_path=${shellQuote(wrapperPath)}
 shim_path=${shellQuote(vendorShimPath)}
+argv0_dir=${shellQuote(argv0Dir)}
 
 fail_closed() {
   print -u2 -r -- "[TeamClaude] claude-vendor: $1"
@@ -295,7 +308,37 @@ done
 
 (( semantic_count > 0 )) || fail_closed "no semantic-version native candidate found in $versions_dir" 75
 [[ -n "$selected" ]] || fail_closed "native candidate is not executable in $versions_dir" 126
-exec "$selected" "$@"
+
+# Terminal managers such as herdr recognize Claude by the basename of argv0,
+# while the native binary is named after its version. Exec the same file with
+# argv0 set to a version-scoped symlink named \`claude\` that resolves to it:
+# the kernel still runs "$selected", so Claude's execPath (and the version
+# lock and background-session logic keyed on it) is unchanged. Any failure here
+# keeps the previous behavior (argv0 = "$selected") instead of failing closed.
+exec_argv0="$selected"
+selected_real="\${selected:A}"
+link_dir="$argv0_dir/$selected_version"
+link_path="$link_dir/claude"
+if [[ ! -L "$link_path" || "\${link_path:A}" != "$selected_real" ]]; then
+  if [[ ! -d "$link_path" ]] && mkdir -p -m 700 -- "$link_dir" 2>/dev/null; then
+    link_tmp="$link_dir/.claude.$$.\${RANDOM}"
+    if ln -s -- "$selected" "$link_tmp" 2>/dev/null; then
+      mv -f -- "$link_tmp" "$link_path" 2>/dev/null || rm -f -- "$link_tmp" 2>/dev/null
+    fi
+  fi
+fi
+if [[ -L "$link_path" && "\${link_path:A}" == "$selected_real" ]]; then
+  exec_argv0="$link_path"
+else
+  print -u2 -r -- "[TeamClaude] claude-vendor: could not prepare argv0 link $link_path; starting with the versioned name (terminal managers may not detect Claude)"
+fi
+# Drop links whose version is gone, so stale entries do not pile up.
+for stale_dir in "$argv0_dir"/*(N/); do
+  [[ -e "$versions_dir/\${stale_dir:t}" ]] && continue
+  rm -f -- "$stale_dir/claude" 2>/dev/null
+  rmdir -- "$stale_dir" 2>/dev/null
+done
+exec -a "$exec_argv0" "$selected" "$@"
 status=$?
 print -u2 -r -- "[TeamClaude] claude-vendor: failed to exec $selected (status $status)"
 exit $status

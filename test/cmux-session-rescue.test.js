@@ -4,6 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chmod,
+  copyFile,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -2530,4 +2532,103 @@ test('cmux binary resolution never consults PATH and honours only an absolute ov
   // A cmux on PATH alone is never picked up.
   const result = await resolveCmuxBinary({ PATH: dir }).catch(err => err);
   assert.notEqual(result, bin);
+});
+
+// 버전별 `claude` argv0 링크로 뜬 Claude 자식도 직접 자식 목록의 사전 필터에서
+// selectorless Claude로 세어야 한다. 그래야 세션 지정 자식이 하나 있어도
+// 지정 없는 Claude 자식이 둘 이상이면 모호한 것으로 보고 fail-closed 한다.
+for (const [label, commandFor] of [
+  ['native version path', version => `/Users/example/.local/share/claude/versions/${version} -c`],
+  ['teamclaude argv0 link', version => `/Users/example/.local/share/teamclaude/claude-argv0/${version}/claude -c`],
+]) {
+  test(`direct-child prefilter counts selectorless Claude children launched via the ${label}`, async () => {
+    const supervisorPid = 54341;
+    const selected = {
+      ...selectorlessChildInfo(54344, supervisorPid, '2.1.290'),
+      command: `/Users/example/.local/share/teamclaude/claude-argv0/2.1.290/claude --resume ${SESSION_ID}`,
+    };
+    const processes = new Map([
+      [supervisorPid, supervisorProcessInfo(supervisorPid)],
+      [selected.pid, selected],
+    ]);
+    const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+      inspectProcess: async pid => processes.get(pid) || { alive: false },
+      listDirectChildren: async () => [
+        { pid: 54342, ppid: supervisorPid, command: commandFor('2.1.289') },
+        { pid: 54343, ppid: supervisorPid, command: commandFor('2.1.290') },
+        { pid: selected.pid, ppid: supervisorPid, command: selected.command },
+      ],
+      listProcessTable: async () => [],
+    });
+    assert.equal(result.alive, false);
+  });
+}
+
+test('direct-child prefilter still adopts the only Claude child launched via the argv0 link', async () => {
+  const supervisorPid = 54351;
+  const selected = {
+    ...selectorlessChildInfo(54352, supervisorPid, '2.1.290'),
+    command: `/Users/example/.local/share/teamclaude/claude-argv0/2.1.290/claude --resume ${SESSION_ID}`,
+  };
+  const processes = new Map([
+    [supervisorPid, supervisorProcessInfo(supervisorPid)],
+    [selected.pid, selected],
+  ]);
+  const result = await inspectClaudeProcessTree(supervisorPid, SESSION_ID, {
+    inspectProcess: async pid => processes.get(pid) || { alive: false },
+    listDirectChildren: async () => [{ pid: selected.pid, ppid: supervisorPid, command: selected.command }],
+    listProcessTable: async () => [],
+  });
+  assert.equal(result.alive, true);
+  assert.equal(result.pid, selected.pid);
+});
+
+// vendor 심은 실제로 `exec -a <버전별 claude 링크> <버전 실행 파일>`로 띄운다.
+// ps 명령줄 첫 단어가 링크가 되므로, 신뢰 판정은 링크를 realpath로 풀어
+// ~/.local/share/claude/versions/<버전>을 가리킬 때만 통과해야 한다.
+test('inspectClaudeProcess trusts a native child whose argv0 is the vendor shim link', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'teamclaude-argv0-trust-'));
+  const previousHome = process.env.HOME;
+  t.after(async () => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  });
+  const versionsDir = join(root, '.local', 'share', 'claude', 'versions');
+  const linkDir = join(root, '.local', 'share', 'teamclaude', 'claude-argv0');
+  await mkdir(versionsDir, { recursive: true });
+  // 운영처럼 버전 경로 자체가 일반 실행 파일이어야 realpath가 versions 안에 머문다.
+  const native = join(versionsDir, '2.1.290');
+  await link(process.execPath, native).catch(() => copyFile(process.execPath, native));
+  await chmod(native, 0o755);
+  await mkdir(join(linkDir, '2.1.290'), { recursive: true });
+  await mkdir(join(linkDir, '2.1.291'), { recursive: true });
+  const goodLink = join(linkDir, '2.1.290', 'claude');
+  const brokenLink = join(linkDir, '2.1.291', 'claude');
+  await symlink(native, goodLink);
+  await symlink(join(versionsDir, '2.1.291'), brokenLink);
+  process.env.HOME = root;
+
+  const launch = async argv0 => {
+    const child = spawn('/bin/zsh', ['-c', 'exec -a "$1" "$2" -e "setInterval(() => {}, 1000)"', 'zsh', argv0, native], {
+      stdio: 'ignore',
+    });
+    await once(child, 'spawn');
+    t.after(() => child.kill('SIGKILL'));
+    // exec가 끝나 ps에 새 argv0이 보일 때까지 기다린다.
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const info = await inspectClaudeProcess(child.pid);
+      if (info.executablePath === argv0) return info;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    throw new Error(`argv0 never became ${argv0}`);
+  };
+
+  const trusted = await launch(goodLink);
+  assert.equal(trusted.alive, true);
+  assert.equal(trusted.nativeExecutableTrusted, true);
+
+  const untrusted = await launch(brokenLink);
+  assert.equal(untrusted.alive, true);
+  assert.equal(untrusted.nativeExecutableTrusted, false);
 });
