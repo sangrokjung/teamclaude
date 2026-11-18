@@ -59,9 +59,14 @@ struct MenubarRoutabilityTests {
         var quota = throttled["quota"] as! [String: Any]
         quota["unified7dReset"] = nowMs + 30_000
         throttled["quota"] = quota
-        throttled["rateLimitedUntil"] = nowMs + 60_000
+        // 서버는 ISO 문자열로 준다(account-manager getStatus).
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        throttled["rateLimitedUntil"] = iso.string(from: Date(timeIntervalSince1970: Double(nowMs + 60_000) / 1000))
         let ready = account("ready", usable: true, session: 0.1, weekly: 0.2, now: now)
-        let parsed = health([weeklyOnly, sessionOnly, throttled, ready], now: now)
+        // 앱이 실제로 쓰는 병합 경로(commitTeamClaudeHealth → teamClaudeHealthMergingQuota)를 거친다.
+        let parsed = teamClaudeHealthMergingQuota(candidate: health([weeklyOnly, sessionOnly, throttled, ready], now: now), previous: nil)
+        precondition(parsed.accounts[2].rateLimitedUntil != nil, "merge keeps the throttle expiry")
         let routing = parsed.routingAvailability(now: now)
         precondition(routing.map(\.state) == [.limited, .limited, .limited, .ready], "\(routing.map(\.state))")
         precondition(parsed.weeklyChartShown(now: now), "weekly-limited accounts show the chart")

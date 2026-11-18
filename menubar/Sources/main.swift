@@ -893,6 +893,7 @@ func teamClaudeRetainingQuota(
             subscriptionEndReached: account.subscriptionEndReached,
             subscriptionEndsAt: account.subscriptionEndsAt,
             sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt,
+            rateLimitedUntil: account.rateLimitedUntil,
             sessionWindowAbsent: account.sessionWindowAbsent,
             fableWindowAbsent: account.fableWindowAbsent,
             apiCredit: account.apiCredit
@@ -1071,6 +1072,8 @@ func teamClaudeAccountMergingQuota(
         subscriptionEndReached: candidate.subscriptionEndReached,
         subscriptionEndsAt: candidate.subscriptionEndsAt,
         sessionResetAt: candidate.sessionResetAt, weeklyResetAt: candidate.weeklyResetAt, fableResetAt: candidate.fableResetAt,
+        // throttle 만료는 최신 응답 값을 그대로 쓴다(복귀 일정 그래프, 2026-11-18 교차 검토).
+        rateLimitedUntil: candidate.rateLimitedUntil,
         sessionWindowAbsent: candidate.sessionWindowAbsent,
         fableWindowAbsent: candidate.fableWindowAbsent
     )
