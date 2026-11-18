@@ -252,14 +252,15 @@ enum L10n {
     static func reasonWithWeeklyReset(_ reason: String, _ moment: String, _ remaining: String) -> String {
         t("\(reason) · 리셋 \(moment) (\(remaining) 뒤)", "\(reason) · resets \(moment) (in \(remaining))")
     }
-    /// 한도 대기 띠: 다음 리셋과 마지막 계정 복귀.
-    static func weeklyScheduleDetail(next: String, nextIn: String, nextCount: Int, allBack: String?) -> String {
+    /// 한도 대기 띠: 주간 한도로 막힌 계정들의 다음·마지막 주간 리셋. 세션 한도가 겹친 계정은 더 늦게 돌아올 수 있어
+    /// "복귀"라고 쓰지 않고 주간 리셋 시각만 말한다(2026-11-18 교차 검토).
+    static func weeklyScheduleDetail(next: String, nextIn: String, nextCount: Int, last: String?) -> String {
         // 520pt 띠에 맞게 짧게: 같은 분에 2개 이상 풀릴 때만 개수를 쓴다.
         let head = nextCount > 1
-            ? t("다음 리셋 \(next) (\(nextIn) 뒤, \(nextCount)개)", "Next reset \(next) (in \(nextIn), \(nextCount))")
-            : t("다음 리셋 \(next) (\(nextIn) 뒤)", "Next reset \(next) (in \(nextIn))")
-        guard let allBack else { return head }
-        return head + t(" · 모두 복귀 \(allBack)", " · all back \(allBack)")
+            ? t("주간 리셋: 다음 \(next) (\(nextIn) 뒤, \(nextCount)개)", "Weekly resets: next \(next) (in \(nextIn), \(nextCount))")
+            : t("주간 리셋: 다음 \(next) (\(nextIn) 뒤)", "Weekly resets: next \(next) (in \(nextIn))")
+        guard let last else { return head }
+        return head + t(" · 마지막 \(last)", " · last \(last)")
     }
     static var relink: String { t("재연동", "Re-link") }
     static var relinkMenuButton: String { t("재연동 ▾", "Re-link ▾") }

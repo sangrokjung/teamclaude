@@ -2383,7 +2383,10 @@ final class TeamClaudeTableView: NSView {
         if let subscription, let target {
             subscriptionKey = SubscriptionActionButtons.cacheKey(target: target.target, resolution: subscription)
         }
+        // 재연동 버튼 표시 여부(상태·인증 오류·켜짐)도 키에 넣는다. 같은 계정이 오류→정상, 켜짐→꺼짐으로 바뀌면 버튼을 다시 만든다.
+        let relinkShown = index.map { i in relinkRows().contains { $0.index == i && !$0.needsReauth } } ?? false
         let signature = (index.map { "\($0):\(health.accounts[$0].name):\(health.accounts[$0].accountUuid ?? "-"):\(isMeasuring)" } ?? "")
+            + ":relink=\(relinkShown)"
             + ":\(subscriptionKey):\(target.map { center.isBusy($0.target) } ?? false):\(armedKinds)"
         guard signature != detailSignature else { return }
         detailSignature = signature
@@ -2414,7 +2417,7 @@ final class TeamClaudeTableView: NSView {
         }
         // 재연동: 재인증이 필요한 행은 이미 상태 칸에 "재인증" 버튼이 있으니 그 밖의 재연동 가능 행에만 둔다.
         // 구독 처리 버튼 뒤에 둔다(폭이 모자라면 뒤쪽부터 숨는다).
-        if relinkRows().contains(where: { $0.index == index && !$0.needsReauth }) {
+        if relinkShown {
             let rowName = row.name, rowUuid = row.accountUuid
             let relink = PanelButton(title: L10n.relink, style: .ghost) { [weak self] in
                 self?.onReauthenticate?(rowName, rowUuid)
@@ -2739,7 +2742,7 @@ final class TeamClaudeTableView: NSView {
                     next: L10n.resetMoment(schedule.next),
                     nextIn: L10n.duration(seconds: Int(schedule.next.timeIntervalSince(evaluatedAt).rounded(.up))),
                     nextCount: schedule.nextCount,
-                    allBack: schedule.last > schedule.next ? L10n.resetMoment(schedule.last) : nil)
+                    last: schedule.last > schedule.next ? L10n.resetMoment(schedule.last) : nil)
             } else {
                 actionDetail = L10n.limitedDetail
             }

@@ -124,8 +124,10 @@ struct TeamClaudeRowLinesTests {
         let schedule = teamClaudeWeeklySchedule([r3, reset, now.addingTimeInterval(-60), r2], now: now)
         precondition(schedule == TeamClaudeWeeklySchedule(next: reset, nextCount: 2, last: r3), "\(String(describing: schedule))")
         precondition(teamClaudeWeeklySchedule([now.addingTimeInterval(-1)], now: now) == nil)
-        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 1, allBack: "B") == "다음 리셋 A (1시간 뒤) · 모두 복귀 B")
-        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 3, allBack: nil) == "다음 리셋 A (1시간 뒤, 3개)")
+        // "복귀"가 아니라 주간 리셋 시각만 말한다(세션 한도가 겹친 계정은 더 늦게 돌아올 수 있다).
+        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 1, last: "B") == "주간 리셋: 다음 A (1시간 뒤) · 마지막 B")
+        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 3, last: nil) == "주간 리셋: 다음 A (1시간 뒤, 3개)")
+        precondition(!L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 1, last: "B").contains("복귀"))
         L10n.language = .en
         precondition(L10n.resetMoment(reset, timeZone: seoul) == "11/18 (Wed) 10:00", L10n.resetMoment(reset, timeZone: seoul))
         L10n.language = .ko
