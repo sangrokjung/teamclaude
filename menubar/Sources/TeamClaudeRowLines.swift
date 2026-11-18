@@ -28,6 +28,38 @@ func teamClaudeReasonLineIsInformative(_ reason: String) -> Bool {
     !TeamClaudeRowReason.uninformative.contains(reason)
 }
 
+/// 주간 리셋 시각을 행에 보일지. 구독 계정이고(API 키 제외) 구독이 끝나지 않았고 리셋 시각이 앞에 있을 때만.
+/// 2026-11-18 대표 요청: 계정마다 언제 풀리는지 행을 펼치지 않고 바로 보여야 한다.
+func teamClaudeShowsWeeklyReset(isApiKey: Bool, ended: Bool, weeklyResetAt: Date?, now: Date) -> Bool {
+    guard !isApiKey, !ended, let weeklyResetAt else { return false }
+    return weeklyResetAt > now
+}
+
+/// 2행 문구. 리셋을 보이면 사유가 있는 행은 사유 뒤에, 사유가 없는(정보 없는) 행은 리셋만 쓴다.
+func teamClaudeReasonLineText(reason: String, showsWeeklyReset: Bool, weeklyResetAt: Date?, now: Date) -> String {
+    guard showsWeeklyReset, let resetAt = weeklyResetAt, resetAt > now else { return reason }
+    let moment = L10n.resetMoment(resetAt)
+    let remaining = L10n.duration(seconds: Int(resetAt.timeIntervalSince(now).rounded(.up)))
+    return teamClaudeReasonLineIsInformative(reason)
+        ? L10n.reasonWithWeeklyReset(reason, moment, remaining)
+        : L10n.weeklyResetLine(moment, remaining)
+}
+
+/// 주간 한도로 막힌 계정들의 복귀 일정. 다음 리셋(같은 분에 풀리는 계정 수)과 마지막 계정이 돌아오는 시각.
+struct TeamClaudeWeeklySchedule: Equatable {
+    let next: Date
+    let nextCount: Int
+    let last: Date
+}
+
+func teamClaudeWeeklySchedule(_ resets: [Date], now: Date) -> TeamClaudeWeeklySchedule? {
+    let ahead = resets.filter { $0 > now }.sorted()
+    guard let next = ahead.first, let last = ahead.last else { return nil }
+    let nextMinute = floor(next.timeIntervalSince1970 / 60)
+    let count = ahead.filter { floor($0.timeIntervalSince1970 / 60) == nextMinute }.count
+    return TeamClaudeWeeklySchedule(next: next, nextCount: count, last: last)
+}
+
 /// 3행(구독)을 그릴지. 플랜·확인 기록·입력 결제일·메일 조회 상태 중 하나라도 있어야 한다.
 /// 전부 없으면 "구독 미확인 · 해지 미확인 · 결제일 미확인 · 만료일 미확인"처럼 모든 행에 같은 문구가 반복된다.
 /// 행 외형이 회색(종료·종료일 경과)이면 서버 기록만으로 종료를 말하는 중이라 기록이 비어 있어도 그린다.
@@ -149,13 +181,20 @@ struct TeamClaudeGroupedLayout: Equatable {
     let height: CGFloat
 }
 
-func teamClaudeGroupedLayout(groups: [TeamClaudeRowGroup], lines: [TeamClaudeRowLines], expanded: Int?) -> TeamClaudeGroupedLayout {
+/// `resetKeys`(행별 주간 리셋 시각, 초)가 있으면 한도 대기 묶음만 리셋이 빠른 순으로 놓는다(값 없음은 뒤, 같으면 원래 순서).
+/// 다른 묶음은 원래 순서다. 높이·배치·그리기가 같은 키를 넘겨야 행이 어긋나지 않는다.
+func teamClaudeGroupedLayout(groups: [TeamClaudeRowGroup], lines: [TeamClaudeRowLines], expanded: Int?,
+                             resetKeys: [Double?] = []) -> TeamClaudeGroupedLayout {
     var order: [Int] = []
     var origins: [Int: CGFloat] = [:]
     var headings: [TeamClaudeGroupedLayout.Heading] = []
     var y: CGFloat = 0
     for group in TeamClaudeRowGroup.allCases {
-        let members = groups.indices.filter { groups[$0] == group && lines.indices.contains($0) }
+        var members = groups.indices.filter { groups[$0] == group && lines.indices.contains($0) }
+        if group == .limited, !resetKeys.isEmpty {
+            func key(_ index: Int) -> Double { resetKeys.indices.contains(index) ? (resetKeys[index] ?? .infinity) : .infinity }
+            members.sort { key($0) == key($1) ? $0 < $1 : key($0) < key($1) }
+        }
         guard !members.isEmpty else { continue }
         headings.append(.init(group: group, y: y, count: members.count))
         y += TeamClaudeRowMetrics.groupHeadHeight

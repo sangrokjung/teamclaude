@@ -44,7 +44,11 @@ struct AccountSubscriptionLayoutTests {
         view.health = health
         view.layoutSubtreeIfNeeded()
         let buttons = view.subviews.compactMap { $0 as? AccountSubscriptionButton }
-        let recovery = view.subviews.compactMap { $0 as? NSButton }.filter { !($0 is AccountSubscriptionButton) }
+        // 띠 오른쪽 "재연동 ▾" 메뉴 버튼(2026-11-18)은 행 복구 버튼이 아니다. 한 개만 있어야 한다.
+        let relinkMenu = view.subviews.compactMap { $0 as? NSButton }.filter { $0.title == L10n.relinkMenuButton }
+        precondition(relinkMenu.count == 1, "one re-link menu for the pool")
+        let recovery = view.subviews.compactMap { $0 as? NSButton }
+            .filter { !($0 is AccountSubscriptionButton) && $0.title != L10n.relinkMenuButton }
         precondition(buttons.count == 16 && recovery.count == 11)
         for (index, row) in rows.enumerated() {
             let hasRecovery = recovery.contains { $0.accessibilityLabel() == "재인증 필요: \(row.name)" }
@@ -114,7 +118,8 @@ struct AccountSubscriptionLayoutTests {
         precondition(AccountSubscriptionStore.shared.saveConfirmation(.renewing, date: "2099-10-05", provider: "anthropic", uuid: ids[3]))
         buttons[3].refreshTitle()
         view.layoutSubtreeIfNeeded()
-        precondition(view.subviews.compactMap { $0 as? NSButton }.filter { !($0 is AccountSubscriptionButton) }.count == 12)
+        precondition(view.subviews.compactMap { $0 as? NSButton }
+            .filter { !($0 is AccountSubscriptionButton) && $0.title != L10n.relinkMenuButton }.count == 12)
         precondition(buttons[3].title.contains("자동갱신 확인"))
         precondition(buttons[3].isEnabled)
         precondition(!isGray(buttons[3].attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as! NSColor))

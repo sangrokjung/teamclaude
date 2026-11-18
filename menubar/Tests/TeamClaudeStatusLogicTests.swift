@@ -269,6 +269,14 @@ struct TeamClaudeStatusLogicTests {
             fablePercent: nil, lastUsed: now, now: now
         ) == .fableMissing)
 
+        // 재연동은 상태와 무관하게 켜진 Claude OAuth 계정이면 된다. 구독 접근 차단·API 키·꺼진 계정·Codex는 아니다.
+        precondition(teamClaudeCanRelink(enabled: true, source: "oauth", provider: "anthropic", errorReason: nil))
+        precondition(teamClaudeCanRelink(enabled: true, source: "oauth", provider: nil, errorReason: "auth-revoked"))
+        precondition(!teamClaudeCanRelink(enabled: true, source: "oauth", provider: "anthropic", errorReason: "subscription-disabled"))
+        precondition(!teamClaudeCanRelink(enabled: true, source: "apikey", provider: "anthropic", errorReason: nil))
+        precondition(!teamClaudeCanRelink(enabled: false, source: "oauth", provider: "anthropic", errorReason: nil))
+        precondition(!teamClaudeCanRelink(enabled: true, source: "oauth", provider: "codex", errorReason: nil))
+
         precondition(teamClaudeCanReauthenticate(
             enabled: true,
             status: "error",

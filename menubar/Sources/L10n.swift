@@ -237,6 +237,38 @@ enum L10n {
     static var columnFable: String { t("Fable 주간", "Fable weekly") }
     static var columnStatus: String { t("상태", "Status") }
     static func resetIn(_ duration: String) -> String { t("리셋 \(duration)", "resets \(duration)") }
+    /// 리셋 시각(로컬 시간대). "11/18(수) 10:00" / "11/18 (Wed) 10:00".
+    static func resetMoment(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.locale = Locale(identifier: language == .ko ? "ko_KR" : "en_US_POSIX")
+        formatter.dateFormat = language == .ko ? "M/d(E) HH:mm" : "M/d (EEE) HH:mm"
+        return formatter.string(from: date)
+    }
+    /// 행 보조 줄의 주간 리셋. 사유가 따로 있으면 그 뒤에 붙는다.
+    static func weeklyResetLine(_ moment: String, _ remaining: String) -> String {
+        t("주간 리셋 \(moment) · \(remaining) 뒤", "Weekly resets \(moment) · in \(remaining)")
+    }
+    static func reasonWithWeeklyReset(_ reason: String, _ moment: String, _ remaining: String) -> String {
+        t("\(reason) · 리셋 \(moment) (\(remaining) 뒤)", "\(reason) · resets \(moment) (in \(remaining))")
+    }
+    /// 한도 대기 띠: 주간 한도로 막힌 계정들의 다음·마지막 주간 리셋. 세션 한도가 겹친 계정은 더 늦게 돌아올 수 있어
+    /// "복귀"라고 쓰지 않고 주간 리셋 시각만 말한다(2026-11-18 교차 검토).
+    static func weeklyScheduleDetail(next: String, nextIn: String, nextCount: Int, last: String?) -> String {
+        // 520pt 띠에 맞게 짧게: 같은 분에 2개 이상 풀릴 때만 개수를 쓴다.
+        let head = nextCount > 1
+            ? t("주간 리셋: 다음 \(next) (\(nextIn) 뒤, \(nextCount)개)", "Weekly resets: next \(next) (in \(nextIn), \(nextCount))")
+            : t("주간 리셋: 다음 \(next) (\(nextIn) 뒤)", "Weekly resets: next \(next) (in \(nextIn))")
+        guard let last else { return head }
+        return head + t(" · 마지막 \(last)", " · last \(last)")
+    }
+    static var relink: String { t("재연동", "Re-link") }
+    static var relinkMenuButton: String { t("재연동 ▾", "Re-link ▾") }
+    static var relinkHelp: String { t("로그인이 풀린 계정을 다시 연결합니다. 주간 한도는 풀리지 않습니다.", "Signs an account back in. It does not lift a weekly limit.") }
+    static func relinkToolTip(_ name: String) -> String { t("\(name) 계정 재연동(OAuth 다시 로그인)", "Re-link \(name) (sign in again)") }
+    static var relinkMenuNote: String { t("로그인이 풀린 계정용 · 주간 한도는 리셋 시각에 풀림", "For signed-out accounts · weekly limits lift at reset") }
+    static var relinkMenuNeeded: String { t("재인증 필요", "re-auth needed") }
+    static var relinkMenuEmpty: String { t("재연동할 OAuth 계정 없음", "No OAuth accounts to re-link") }
     static var groupReady: String { t("사용 가능", "Available") }
     static var groupReadyNote: String { t("라우팅 중", "Routing") }
     static var groupLimited: String { t("한도 대기", "At limit") }
