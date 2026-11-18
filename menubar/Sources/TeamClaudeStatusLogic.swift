@@ -277,6 +277,21 @@ func teamClaudeCanReauthenticate(
         && errorReason != "subscription-disabled"
 }
 
+/// 재연동(OAuth 다시 로그인)을 열어 줄 계정. 재인증 버튼(오류 계정 전용)과 달리 상태와 무관하게
+/// 켜져 있는 Claude OAuth 계정이면 된다. CLI `teamclaude reauth`가 프로필 uuid로 같은 계정인지 확인한다.
+/// 구독 접근 차단(subscription-disabled)은 다시 로그인해도 풀리지 않으니 "다시 확인" 경로가 맡는다.
+func teamClaudeCanRelink(
+    enabled: Bool,
+    source: String?,
+    provider: String?,
+    errorReason: String?
+) -> Bool {
+    enabled
+        && (source ?? "").lowercased() == "oauth"
+        && (provider ?? "anthropic").lowercased() == "anthropic"
+        && errorReason != "subscription-disabled"
+}
+
 struct TeamClaudeQuotaWindowState: Equatable {
     let utilization: Double?
     let resetAtMs: Int64?

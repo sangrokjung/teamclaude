@@ -204,11 +204,11 @@ struct SubscriptionStateTests {
 
         // Claude: 로컬 기록만. CLI를 부르지 않는다.
         var outcome: SubscriptionOutcome?
-        precondition(center.perform(.recordCancel(endDate: "2026-11-12", source: "billing-page"), target: claude, current: unknown) { outcome = $0 })
+        precondition(center.perform(.recordCancel(endDate: "2099-11-12", source: "billing-page"), target: claude, current: unknown) { outcome = $0 })
         precondition(outcome?.succeeded == true && calls.isEmpty)
         precondition(outcome?.message == "acct-01 해지 예약으로 기록함")
         let saved = store.localConfirmation(provider: "anthropic", uuid: "uuid-a")
-        precondition(saved?.state == .scheduled && saved?.date == "2026-11-12" && saved?.source == "billing-page")
+        precondition(saved?.state == .scheduled && saved?.date == "2099-11-12" && saved?.source == "billing-page")
         // 되돌리기: 직전 기록(없음)으로.
         let undo = outcome!.undo!
         outcome = nil

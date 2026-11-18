@@ -88,6 +88,48 @@ struct TeamClaudeRowLinesTests {
         precondition(teamClaudeSessionResetPart(sessionWindowAbsent: true, resetLabel: "3h") == "No session")
         L10n.language = .ko
 
-        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns and card metrics passed")
+        // 7. 주간 리셋을 행에 바로 보인다(2026-11-18). 구독 계정·미래 리셋만, API 키·종료·지난 리셋은 아니다.
+        let seoul = TimeZone(identifier: "Asia/Seoul")!
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = seoul
+        let now = cal.date(from: DateComponents(year: 2026, month: 11, day: 17, hour: 23, minute: 10))!
+        let reset = cal.date(from: DateComponents(year: 2026, month: 11, day: 18, hour: 10, minute: 0))!
+        precondition(teamClaudeShowsWeeklyReset(isApiKey: false, ended: false, weeklyResetAt: reset, now: now))
+        precondition(!teamClaudeShowsWeeklyReset(isApiKey: true, ended: false, weeklyResetAt: reset, now: now), "API keys have no weekly window")
+        precondition(!teamClaudeShowsWeeklyReset(isApiKey: false, ended: true, weeklyResetAt: reset, now: now), "an ended plan never comes back")
+        precondition(!teamClaudeShowsWeeklyReset(isApiKey: false, ended: false, weeklyResetAt: now.addingTimeInterval(-1), now: now))
+        precondition(!teamClaudeShowsWeeklyReset(isApiKey: false, ended: false, weeklyResetAt: nil, now: now))
+        precondition(L10n.resetMoment(reset, timeZone: seoul) == "11/18(수) 10:00", L10n.resetMoment(reset, timeZone: seoul))
+        // 시각 문자열은 시스템 시간대를 따른다. 문구 조립만 비교하려고 같은 함수로 기대값을 만든다.
+        let moment = L10n.resetMoment(reset)
+        let readyLine = teamClaudeReasonLineText(reason: TeamClaudeRowReason.opusReady, showsWeeklyReset: true, weeklyResetAt: reset, now: now)
+        precondition(readyLine == "주간 리셋 \(moment) · 10시간 50분 뒤", readyLine)
+        let limitedLine = teamClaudeReasonLineText(reason: "전체 주간 한도 대기", showsWeeklyReset: true, weeklyResetAt: reset, now: now)
+        precondition(limitedLine == "전체 주간 한도 대기 · 리셋 \(moment) (10시간 50분 뒤)", limitedLine)
+        precondition(teamClaudeReasonLineText(reason: "인증 거부", showsWeeklyReset: false, weeklyResetAt: reset, now: now) == "인증 거부",
+                     "without a reset the reason is untouched")
+
+        // 8. 한도 대기 묶음은 리셋이 빠른 순, 다른 묶음은 원래 순서. 값이 없으면 뒤로.
+        let mixed: [TeamClaudeRowGroup] = [.limited, .ready, .limited, .limited, .ready]
+        let plain = Array(repeating: TeamClaudeRowLines.compact, count: mixed.count)
+        let sorted = teamClaudeGroupedLayout(groups: mixed, lines: plain, expanded: nil, resetKeys: [300, 900, nil, 100, 50])
+        precondition(sorted.order == [1, 4, 3, 0, 2], "\(sorted.order)")
+        let unsorted = teamClaudeGroupedLayout(groups: mixed, lines: plain, expanded: nil)
+        precondition(unsorted.order == [1, 4, 0, 2, 3], "no keys keeps the original order")
+        precondition(sorted.height == unsorted.height, "sorting never changes the height")
+        let tie = teamClaudeGroupedLayout(groups: [.limited, .limited], lines: [.compact, .compact], expanded: nil, resetKeys: [100, 100])
+        precondition(tie.order == [0, 1], "ties keep the original order")
+
+        // 9. 복귀 일정: 다음 리셋(같은 분 개수)과 마지막 복귀. 지난 리셋은 뺀다.
+        let r2 = reset.addingTimeInterval(30), r3 = reset.addingTimeInterval(86_400)
+        let schedule = teamClaudeWeeklySchedule([r3, reset, now.addingTimeInterval(-60), r2], now: now)
+        precondition(schedule == TeamClaudeWeeklySchedule(next: reset, nextCount: 2, last: r3), "\(String(describing: schedule))")
+        precondition(teamClaudeWeeklySchedule([now.addingTimeInterval(-1)], now: now) == nil)
+        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 1, allBack: "B") == "다음 리셋 A (1시간 뒤) · 모두 복귀 B")
+        precondition(L10n.weeklyScheduleDetail(next: "A", nextIn: "1시간", nextCount: 3, allBack: nil) == "다음 리셋 A (1시간 뒤, 3개)")
+        L10n.language = .en
+        precondition(L10n.resetMoment(reset, timeZone: seoul) == "11/18 (Wed) 10:00", L10n.resetMoment(reset, timeZone: seoul))
+        L10n.language = .ko
+
+        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns, card metrics, weekly reset and schedule passed")
     }
 }

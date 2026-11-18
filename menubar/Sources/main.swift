@@ -2230,7 +2230,8 @@ final class TeamClaudeTableView: NSView {
         let availability = health.routingAvailability(now: now)
         let lines = health.rowLines(now: now, availability: availability)
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
-                                             expanded: expanded.flatMap { rowIndex(health, name: $0, accountUuid: expandedUuid) })
+                                             expanded: expanded.flatMap { rowIndex(health, name: $0, accountUuid: expandedUuid) },
+                                             resetKeys: health.weeklyResetKeys)
         return teamClaudeCardBaseHeight(hostLine: health.hostSummaryText != nil) + layout.height
     }
 
@@ -2244,7 +2245,8 @@ final class TeamClaudeTableView: NSView {
         guard let health, let index = Self.rowIndex(health, name: name, accountUuid: accountUuid) else { return nil }
         let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt, availability: availability)
-        let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex)
+        let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex,
+                                             resetKeys: health.weeklyResetKeys)
         guard let y = layout.origins[index] else { return nil }
         let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
         return NSRect(x: 0, y: rowsTop + y, width: bounds.width,
@@ -2410,6 +2412,16 @@ final class TeamClaudeTableView: NSView {
                     self?.needsLayout = true
                 })
         }
+        // 재연동: 재인증이 필요한 행은 이미 상태 칸에 "재인증" 버튼이 있으니 그 밖의 재연동 가능 행에만 둔다.
+        // 구독 처리 버튼 뒤에 둔다(폭이 모자라면 뒤쪽부터 숨는다).
+        if relinkRows().contains(where: { $0.index == index && !$0.needsReauth }) {
+            let rowName = row.name, rowUuid = row.accountUuid
+            let relink = PanelButton(title: L10n.relink, style: .ghost) { [weak self] in
+                self?.onReauthenticate?(rowName, rowUuid)
+            }
+            relink.toolTip = L10n.relinkHelp
+            detailButtons.append(relink)
+        }
         let subscriptionButton = subscriptionButtons.indices.contains(index) ? subscriptionButtons[index] : nil
         if subscriptionButton?.isEnabled == true {
             detailButtons.append(PanelButton(title: L10n.subscriptionRecord, style: .quiet) { subscriptionButton?.openRecordDialog() })
@@ -2458,17 +2470,115 @@ final class TeamClaudeTableView: NSView {
         onReauthenticate?(target.name, target.accountUuid)
     }
 
+    // MARK: 재연동 (2026-11-18 대표 요청: 대시보드에 재연동 버튼)
+    // 오류 계정의 "재인증" 버튼과 별개로, 켜져 있는 모든 Claude OAuth 계정을 띠 오른쪽 "재연동 ▾" 메뉴와
+    // 펼친 행의 "재연동" 버튼에서 다시 로그인시킬 수 있다. 실행은 같은 onReauthenticate(CLI `teamclaude reauth`)다.
+
+    /// 재연동 메뉴에 올릴 계정. 재인증이 필요한 계정이 먼저, 그다음 주간 리셋이 빠른 순.
+    func relinkRows() -> [(index: Int, name: String, accountUuid: String?, needsReauth: Bool, resetAt: Date?)] {
+        guard let health else { return [] }
+        let subscriptions = health.subscriptionResolutions(now: evaluatedAt)
+        let rows = health.accounts.enumerated().compactMap { index, row -> (Int, String, String?, Bool, Date?)? in
+            guard teamClaudeCanRelink(enabled: row.enabled, source: row.source, provider: row.provider, errorReason: row.errorReason),
+                  subscriptions.indices.contains(index), subscriptions[index].state != .ended else { return nil }
+            let needs = teamClaudeCanReauthenticate(enabled: row.enabled, status: row.status, source: row.source,
+                                                    provider: row.provider, errorReason: row.errorReason)
+            return (index, row.name, row.accountUuid, needs, row.weeklyResetAt.flatMap { $0 > evaluatedAt ? $0 : nil })
+        }
+        return rows.sorted { a, b in
+            if a.3 != b.3 { return a.3 }
+            let ka = a.4?.timeIntervalSince1970 ?? 0, kb = b.4?.timeIntervalSince1970 ?? 0
+            return ka == kb ? a.0 < b.0 : ka < kb
+        }.map { (index: $0.0, name: $0.1, accountUuid: $0.2, needsReauth: $0.3, resetAt: $0.4) }
+    }
+
+    private var relinkMenuButton: PanelButton?
+    private var relinkMenuTargets: [Int: (name: String, accountUuid: String?)] = [:]
+
+    private func ensureRelinkMenuButton() {
+        let hasRows = !relinkRows().isEmpty
+        if hasRows, relinkMenuButton == nil {
+            let button = PanelButton(title: L10n.relinkMenuButton, style: .ghost)
+            button.onPress = { [weak self, weak button] in
+                guard let self, let button else { return }
+                self.showRelinkMenu(from: button)
+            }
+            button.setAccessibilityHelp(L10n.relinkHelp)
+            button.toolTip = L10n.relinkHelp
+            addSubview(button)
+            relinkMenuButton = button
+        } else if !hasRows, let button = relinkMenuButton {
+            button.removeFromSuperview()
+            relinkMenuButton = nil
+        }
+    }
+
+    private func showRelinkMenu(from button: NSView) {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let note = NSMenuItem(title: L10n.relinkMenuNote, action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        menu.addItem(note)
+        menu.addItem(.separator())
+        relinkMenuTargets.removeAll()
+        let rows = relinkRows()
+        if rows.isEmpty {
+            let empty = NSMenuItem(title: L10n.relinkMenuEmpty, action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        for (tag, row) in rows.enumerated() {
+            let detail: String
+            if row.needsReauth {
+                detail = L10n.relinkMenuNeeded
+            } else if let resetAt = row.resetAt {
+                detail = L10n.weeklyResetLine(L10n.resetMoment(resetAt),
+                                              L10n.duration(seconds: Int(resetAt.timeIntervalSince(evaluatedAt).rounded(.up))))
+            } else {
+                detail = L10n.stateReady
+            }
+            let item = NSMenuItem(title: "\(row.name)  ·  \(detail)", action: #selector(relinkMenuItemChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tag
+            item.toolTip = L10n.relinkToolTip(row.name)
+            relinkMenuTargets[tag] = (row.name, row.accountUuid)
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    }
+
+    @objc private func relinkMenuItemChosen(_ sender: NSMenuItem) {
+        guard let target = relinkMenuTargets[sender.tag] else { return }
+        onReauthenticate?(target.name, target.accountUuid)
+    }
+
+    /// 띠 오른쪽 칩 자리. "지금 측정" 칩이 있으면 그 왼쪽에 재연동 버튼이 온다. draw의 칩 조건과 같아야 한다.
+    private func measureChipShown(_ health: TeamClaudeHealth) -> Bool {
+        health.measurementPendingCount > 0 && !isMeasuring && health.accountConfigDrift == 0
+    }
+
     override func layout() {
         super.layout()
         ensureReauthenticationButtons()
         ensureSubscriptionButtons()
+        ensureRelinkMenuButton()
+        if let button = relinkMenuButton, let health {
+            let hostLine = health.hostSummaryText != nil
+            let stripY = TeamClaudeCardMetrics.stripY(hostLine: hostLine)
+            let stripMaxX = bounds.width - TeamClaudeColumns.padding
+            let chipWidth = measureChipShown(health) ? PanelDraw.width(L10n.measureNow, TeamClaudePalette.buttonFont) + 22 + 8 : 0
+            button.frame = NSRect(x: stripMaxX - 10 - chipWidth - button.fittingWidth,
+                                  y: stripY + (TeamClaudeCardMetrics.stripHeight - PanelButton.height) / 2,
+                                  width: button.fittingWidth, height: PanelButton.height)
+        }
         refreshTime(now: evaluatedAt)
         guard let health else { return }
         let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
         let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt)
         let expanded = expandedIndex
-        let grouped = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expanded)
+        let grouped = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expanded,
+                                              resetKeys: health.weeklyResetKeys)
         laidOutLines = lines
         ensureDetailButtons(index: expanded, availability: availability)
         let textX = TeamClaudeColumns.nameX + 14
@@ -2623,7 +2733,16 @@ final class TeamClaudeTableView: NSView {
         } else if limited > 0 {
             actionTone = .wait
             actionTitle = L10n.limitedTitle(limited)
-            actionDetail = L10n.limitedDetail
+            // 주간 한도로 막힌 계정이 있으면 언제 풀리는지를 쓴다(2026-11-18 대표 요청). 없으면 예전 안내.
+            if let schedule = health.weeklySchedule(availability: availability, now: evaluatedAt) {
+                actionDetail = L10n.weeklyScheduleDetail(
+                    next: L10n.resetMoment(schedule.next),
+                    nextIn: L10n.duration(seconds: Int(schedule.next.timeIntervalSince(evaluatedAt).rounded(.up))),
+                    nextCount: schedule.nextCount,
+                    allBack: schedule.last > schedule.next ? L10n.resetMoment(schedule.last) : nil)
+            } else {
+                actionDetail = L10n.limitedDetail
+            }
         } else {
             actionTone = ready > 0 ? .ready : .off
             actionTitle = ready > 0 ? L10n.routableReadyTitle(ready) : L10n.noAccounts
@@ -2634,9 +2753,13 @@ final class TeamClaudeTableView: NSView {
         markDraw("TeamClaudeTableView.action")
         PanelDraw.card(strip)
         PanelDraw.dot(strip.minX + 12, centerY: strip.midY, actionTone.color)
-        PanelDraw.text(PanelDraw.clipped(actionTitle, TeamClaudePalette.bodyMediumFont, maxWidth: strip.width - 140), strip.minX + 28, strip.minY + 6,
+        // 오른쪽 칩(재연동 ▾ · 지금 측정)이 차지하는 폭만큼 글자를 줄인다. 칩이 없을 때도 예전 여백(140)은 지킨다.
+        let chipReserve = 28 + (relinkMenuButton?.fittingWidth ?? 0)
+            + (measureChipShown(health) ? PanelDraw.width(L10n.measureNow, TeamClaudePalette.buttonFont) + 22 + 8 : 0)
+        let stripTextWidth = strip.width - max(140, chipReserve + 28)
+        PanelDraw.text(PanelDraw.clipped(actionTitle, TeamClaudePalette.bodyMediumFont, maxWidth: stripTextWidth), strip.minX + 28, strip.minY + 6,
                        TeamClaudePalette.bodyMediumFont, fg)
-        PanelDraw.text(PanelDraw.clipped(actionDetail, caption, maxWidth: strip.width - 140), strip.minX + 28, strip.minY + 24, caption, fg3)
+        PanelDraw.text(PanelDraw.clipped(actionDetail, caption, maxWidth: stripTextWidth), strip.minX + 28, strip.minY + 24, caption, fg3)
         if pendingCount > 0, !isMeasuring, health.accountConfigDrift == 0 {
             measureActionRect = strip
             let chip = L10n.measureNow
@@ -2675,7 +2798,7 @@ final class TeamClaudeTableView: NSView {
         let lines = health.rowLines(now: evaluatedAt, availability: availability)
         let groups = availability.map(teamClaudeRowGroup)
         let expanded = expandedIndex
-        let grouped = teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded)
+        let grouped = teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded, resetKeys: health.weeklyResetKeys)
         let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: hostLineShown)
         let subscriptions = health.subscriptionResolutions(now: evaluatedAt)
         for heading in grouped.headings {
@@ -2723,7 +2846,8 @@ final class TeamClaudeTableView: NSView {
                                        progress: subscriptionCancelProgress(subscriptions[i].shown, now: evaluatedAt))
             }
             if let reasonY = teamClaudeReasonLineY(lines[i]) {
-                PanelDraw.text(PanelDraw.clipped(state.reason, micro, maxWidth: rightEdge - textX), textX, y + reasonY - 2, micro,
+                PanelDraw.text(PanelDraw.clipped(health.reasonLineText(i, state: state, now: evaluatedAt), micro, maxWidth: rightEdge - textX),
+                               textX, y + reasonY - 2, micro,
                                dotColor.withAlphaComponent(0.9))
             }
 
@@ -6643,12 +6767,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let candidates = currentTeamClaude?.accounts.filter { row in
             expectedAccountUuid.map { row.accountUuid == $0 } ?? (row.name == name)
         } ?? []
+        // 재인증(오류 계정)과 재연동(켜진 모든 OAuth 계정) 둘 다 이 길로 온다. 넓은 쪽(재연동) 판정을 쓴다.
         guard candidates.count == 1,
               let row = candidates.first,
               row.name == name,
-              teamClaudeCanReauthenticate(
+              teamClaudeCanRelink(
                   enabled: row.enabled,
-                  status: row.status,
                   source: row.source,
                   provider: row.provider,
                   errorReason: row.errorReason

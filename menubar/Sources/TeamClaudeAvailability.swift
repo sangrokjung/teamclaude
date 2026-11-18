@@ -239,10 +239,37 @@ extension TeamClaudeHealth {
             let appearance = state.subscriptionAppearance == .standard ? details.appearance(now: now) : state.subscriptionAppearance
             // 구독 줄은 기록이 있을 때만 그린다. 기록이 없는 행의 입력 진입점은 펼친 행의 상세 칸에 있다.
             // API 키 행은 구독 기록이 없다. 사유 줄(남은 금액·만료·소진)만 그린다.
+            // 주간 리셋 시각을 아는 구독 계정은 사유가 없어도 2행에 리셋을 쓴다(teamClaudeReasonLineText).
+            let showsReset = teamClaudeShowsWeeklyReset(isApiKey: row.isApiKey, ended: state.subscriptionAppearance == .ended,
+                                                        weeklyResetAt: row.weeklyResetAt, now: now)
             return TeamClaudeRowLines(
-                reason: teamClaudeReasonLineIsInformative(state.reason),
+                reason: teamClaudeReasonLineIsInformative(state.reason) || showsReset,
                 subscription: !row.isApiKey && accountSubscriptionLineIsInformative(details, appearance: appearance))
         }
+    }
+
+    /// 행의 2행 문구(사유 + 주간 리셋). 그리기가 이 한 함수를 쓴다(높이 판정은 rowLines).
+    func reasonLineText(_ index: Int, state: TeamClaudeFableAvailability, now: Date) -> String {
+        let row = accounts[index]
+        let showsReset = teamClaudeShowsWeeklyReset(isApiKey: row.isApiKey, ended: state.subscriptionAppearance == .ended,
+                                                    weeklyResetAt: row.weeklyResetAt, now: now)
+        return teamClaudeReasonLineText(reason: state.reason, showsWeeklyReset: showsReset, weeklyResetAt: row.weeklyResetAt, now: now)
+    }
+
+    /// 묶음 안 정렬 키(주간 리셋 시각, 초). 높이·배치·그리기가 teamClaudeGroupedLayout에 같은 값을 넘긴다.
+    var weeklyResetKeys: [Double?] {
+        accounts.map { row in row.isApiKey ? nil : row.weeklyResetAt?.timeIntervalSince1970 }
+    }
+
+    /// 주간 한도로 막힌 구독 계정의 복귀 일정(띠 문구).
+    func weeklySchedule(availability: [TeamClaudeFableAvailability], now: Date) -> TeamClaudeWeeklySchedule? {
+        let threshold = quotaThresholdPercent
+        let resets = zip(accounts, availability).compactMap { row, state -> Date? in
+            guard !row.isApiKey, state.state == .limited, state.subscriptionAppearance != .ended,
+                  let percent = row.weeklyPercent, percent >= threshold else { return nil }
+            return row.weeklyResetAt
+        }
+        return teamClaudeWeeklySchedule(resets, now: now)
     }
 }
 

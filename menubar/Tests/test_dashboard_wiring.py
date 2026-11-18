@@ -334,7 +334,11 @@ class AccountRowLinesWiringTests(unittest.TestCase):
         self.assertIn("teamClaudeSubscriptionLineY(lines[index])", layout)
         draw = self.table[self.table.index("override func draw("):]
         self.assertIn("health.rowLines(now: evaluatedAt, availability: availability)", draw)
-        self.assertIn("teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded)", draw)
+        self.assertIn("teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded, resetKeys: health.weeklyResetKeys)", draw)
+        # 한도 대기 묶음 정렬 키는 높이·rowRect·배치·그리기 네 곳이 같은 값을 넘겨야 행이 어긋나지 않는다(2026-11-18).
+        self.assertEqual(self.table.count("teamClaudeGroupedLayout("), 4)
+        self.assertEqual(self.table.count("resetKeys: health.weeklyResetKeys"), 4)
+        self.assertIn("health.reasonLineText(i, state: state, now: evaluatedAt)", draw)
         self.assertIn("teamClaudeRowHeight(lines[i], expanded: isExpanded)", draw)
         self.assertIn("teamClaudeReasonLineY(lines[i])", draw)
 
