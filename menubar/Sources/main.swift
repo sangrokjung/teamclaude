@@ -2537,10 +2537,14 @@ final class TeamClaudeTableView: NSView {
             } else if let resetAt = row.resetAt {
                 detail = L10n.weeklyResetLine(L10n.resetMoment(resetAt),
                                               L10n.duration(seconds: Int(resetAt.timeIntervalSince(evaluatedAt).rounded(.up))))
-            } else {
+            } else if let health, health.accounts.indices.contains(row.index),
+                      health.routingAvailability(now: evaluatedAt)[row.index].state == .ready {
+                // 리셋 정보가 없다고 쓸 수 있다는 뜻은 아니다. 본문과 같은 판정이 "사용 가능"일 때만 그렇게 쓴다.
                 detail = L10n.stateReady
+            } else {
+                detail = ""
             }
-            let item = NSMenuItem(title: "\(row.name)  ·  \(detail)", action: #selector(relinkMenuItemChosen(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: detail.isEmpty ? row.name : "\(row.name)  ·  \(detail)", action: #selector(relinkMenuItemChosen(_:)), keyEquivalent: "")
             item.target = self
             item.tag = tag
             item.toolTip = L10n.relinkToolTip(row.name)
