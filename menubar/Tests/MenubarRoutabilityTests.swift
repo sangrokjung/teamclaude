@@ -203,7 +203,8 @@ struct MenubarRoutabilityTests {
         table.refreshTime(now: now)
         precondition(table.accessibilityLabel()?.contains("라우팅 가능 2") == true, table.accessibilityLabel() ?? "nil")
         let routingLines = committed.rowLines(now: now, availability: routing)
-        let expectedHeight = teamClaudeCardBaseHeight(hostLine: committed.hostSummaryText != nil)
+        // 주간 한도로 막힌 계정이 있으면 리셋 일정 그래프가 같은 판정(weeklyChartShown)으로 들어간다.
+        let expectedHeight = teamClaudeCardBaseHeight(hostLine: committed.hostSummaryText != nil, chart: committed.weeklyChartShown(now: now))
             + teamClaudeGroupedLayout(groups: routing.map(teamClaudeRowGroup), lines: routingLines, expanded: nil).height
         precondition(TeamClaudeTableView.contentHeight(committed, expanded: nil, now: now) == expectedHeight,
                      "the Claude table groups by the routing judgment")

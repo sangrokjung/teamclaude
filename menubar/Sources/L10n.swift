@@ -262,6 +262,23 @@ enum L10n {
         guard let last else { return head }
         return head + t(" · 마지막 \(last)", " · last \(last)")
     }
+    // 주간 리셋 일정 그래프(A안).
+    static var recoveryChartTitle: String { t("주간 리셋 일정", "Weekly reset schedule") }
+    static func recoveryChartSummary(now: Int, inWeek: Int, total: Int) -> String {
+        t("지금 \(now)개 → 7일 안에 \(inWeek)/\(total)개", "Now \(now) → \(inWeek)/\(total) within 7 days")
+    }
+    static func recoveryChartNext(_ moment: String) -> String { t("다음 \(moment)", "Next \(moment)") }
+    static func recoveryChartDay(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.timeZone = timeZone
+        formatter.locale = Locale(identifier: language == .ko ? "ko_KR" : "en_US_POSIX")
+        formatter.dateFormat = language == .ko ? "d(E)" : "EEE d"
+        return formatter.string(from: date)
+    }
+    static var recoveryChartLegend: String {
+        t("점 = 주간 한도가 풀리는 시각 · 새 사용이 없다고 가정 · 세션 한도가 겹치면 더 늦을 수 있음",
+          "Dot = weekly limit lifts · assumes no new use · a session limit can delay it")
+    }
     static var relink: String { t("재연동", "Re-link") }
     static var relinkMenuButton: String { t("재연동 ▾", "Re-link ▾") }
     static var relinkHelp: String { t("로그인이 풀린 계정을 다시 연결합니다. 주간 한도는 풀리지 않습니다.", "Signs an account back in. It does not lift a weekly limit.") }

@@ -132,6 +132,31 @@ struct TeamClaudeRowLinesTests {
         precondition(L10n.resetMoment(reset, timeZone: seoul) == "11/18 (Wed) 10:00", L10n.resetMoment(reset, timeZone: seoul))
         L10n.language = .ko
 
-        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns, card metrics, weekly reset and schedule passed")
+        // 10. 리셋 일정 그래프(A안): 그래프가 있으면 그 높이와 틈만큼 표가 내려가고, 없으면 예전 치수 그대로다.
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: false) == 120, "no chart keeps the old geometry")
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: true)
+                     == 120 + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
+        precondition(teamClaudeCardBaseHeight(hostLine: true, chart: true)
+                     == teamClaudeCardBaseHeight(hostLine: true) + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
+        precondition(TeamClaudeCardMetrics.chartY(hostLine: false) == TeamClaudeCardMetrics.tableHeadY(hostLine: false),
+                     "the chart takes the place where the table head used to start")
+        // 계단: 지금 수에서 시작해 앞으로 올 리셋마다 +1, 지난 리셋은 뺀다.
+        let steps = teamClaudeRecoverySteps(readyNow: 1, resets: [r3, now.addingTimeInterval(-5), reset], now: now)
+        precondition(steps == [TeamClaudeRecoveryStep(at: now, count: 1), TeamClaudeRecoveryStep(at: reset, count: 2),
+                               TeamClaudeRecoveryStep(at: r3, count: 3)], "\(steps)")
+        precondition(teamClaudeRecoverySteps(readyNow: -2, resets: [], now: now) == [TeamClaudeRecoveryStep(at: now, count: 0)])
+        // 가로 좌표: 지금 0, 7일 뒤 1, 범위 밖은 끝에 붙는다.
+        precondition(teamClaudeRecoveryChartX(now, now: now) == 0)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(3.5 * 86_400), now: now) == 0.5)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(30 * 86_400), now: now) == 1)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(-60), now: now) == 0)
+        // 요약: 7일 밖 리셋은 "7일 안에"에 넣지 않는다.
+        let far = now.addingTimeInterval(8 * 86_400)
+        let summary = teamClaudeRecoveryChartSummary(teamClaudeRecoverySteps(readyNow: 1, resets: [reset, far], now: now), now: now)
+        precondition(summary.now == 1 && summary.inWindow == 2, "\(summary)")
+        precondition(L10n.recoveryChartSummary(now: 1, inWeek: 20, total: 21) == "지금 1개 → 7일 안에 20/21개")
+        precondition(L10n.recoveryChartDay(reset, timeZone: seoul) == "18(수)")
+
+        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns, card metrics, weekly reset, schedule and recovery chart passed")
     }
 }

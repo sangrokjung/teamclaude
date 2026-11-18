@@ -263,13 +263,29 @@ extension TeamClaudeHealth {
 
     /// 주간 한도로 막힌 구독 계정의 복귀 일정(띠 문구).
     func weeklySchedule(availability: [TeamClaudeFableAvailability], now: Date) -> TeamClaudeWeeklySchedule? {
+        teamClaudeWeeklySchedule(weeklyLimitedResets(availability: availability, now: now), now: now)
+    }
+
+    /// 주간 한도(문턱 이상)로 막힌 구독 계정들의 앞으로 올 주간 리셋 시각. 띠 문구와 그래프가 같은 목록을 쓴다.
+    func weeklyLimitedResets(availability: [TeamClaudeFableAvailability], now: Date) -> [Date] {
         let threshold = quotaThresholdPercent
-        let resets = zip(accounts, availability).compactMap { row, state -> Date? in
+        return zip(accounts, availability).compactMap { row, state -> Date? in
             guard !row.isApiKey, state.state == .limited, state.subscriptionAppearance != .ended,
-                  let percent = row.weeklyPercent, percent >= threshold else { return nil }
-            return row.weeklyResetAt
+                  let percent = row.weeklyPercent, percent >= threshold,
+                  let reset = row.weeklyResetAt, reset > now else { return nil }
+            return reset
         }
-        return teamClaudeWeeklySchedule(resets, now: now)
+    }
+
+    /// 리셋 일정 그래프를 그릴지. 높이(contentHeight)·배치(layout)·그리기(draw)가 이 한 판정을 쓴다.
+    func weeklyChartShown(now: Date) -> Bool {
+        !weeklyLimitedResets(availability: routingAvailability(now: now), now: now).isEmpty
+    }
+
+    /// 그래프 계단: 지금 쓸 수 있는 구독 계정 수에서 시작해 주간 리셋마다 하나씩 는다.
+    func weeklyRecoverySteps(availability: [TeamClaudeFableAvailability], now: Date) -> [TeamClaudeRecoveryStep] {
+        let readyNow = zip(accounts, availability).filter { !$0.0.isApiKey && $0.1.state == .ready }.count
+        return teamClaudeRecoverySteps(readyNow: readyNow, resets: weeklyLimitedResets(availability: availability, now: now), now: now)
     }
 }
 

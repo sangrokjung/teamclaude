@@ -230,12 +230,37 @@ enum TeamClaudeCardMetrics {
     static func stripY(hostLine: Bool) -> CGFloat {
         titleY(hostLine: hostLine) + headerHeight + (hostLine ? hostLineHeight : 0)
     }
-    static func tableHeadY(hostLine: Bool) -> CGFloat { stripY(hostLine: hostLine) + stripHeight + stripGap }
+    /// 주간 리셋 일정 그래프(2026-11-18 A안). 주간 한도로 막힌 구독 계정이 있을 때만 띠 아래에 들어간다.
+    static let chartHeight: CGFloat = 164
+    static let chartGap: CGFloat = 12
+    static func chartY(hostLine: Bool) -> CGFloat { stripY(hostLine: hostLine) + stripHeight + stripGap }
+    static func tableHeadY(hostLine: Bool, chart: Bool = false) -> CGFloat {
+        chartY(hostLine: hostLine) + (chart ? chartHeight + chartGap : 0)
+    }
     /// 첫 행(첫 묶음 머리) 원점 y(뷰 bounds 기준).
-    static func rowsTop(hostLine: Bool) -> CGFloat { tableHeadY(hostLine: hostLine) + tableHeadHeight + tableHeadGap }
+    static func rowsTop(hostLine: Bool, chart: Bool = false) -> CGFloat {
+        tableHeadY(hostLine: hostLine, chart: chart) + tableHeadHeight + tableHeadGap
+    }
 }
 
 /// 행을 뺀 표 높이. 전체 높이 = 이 값 + teamClaudeGroupedLayout(...).height.
-func teamClaudeCardBaseHeight(hostLine: Bool) -> CGFloat {
-    TeamClaudeCardMetrics.rowsTop(hostLine: hostLine) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
+func teamClaudeCardBaseHeight(hostLine: Bool, chart: Bool = false) -> CGFloat {
+    TeamClaudeCardMetrics.rowsTop(hostLine: hostLine, chart: chart) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
+}
+
+/// 리셋 일정 그래프의 한 계단: 그 시각 이후 쓸 수 있는 구독 계정 수(새 사용이 없다고 가정한 주간 기준).
+struct TeamClaudeRecoveryStep: Equatable {
+    let at: Date
+    let count: Int
+}
+
+/// 지금 쓸 수 있는 수에서 시작해 주간 리셋마다 하나씩 늘어나는 계단. 지난 리셋은 뺀다.
+func teamClaudeRecoverySteps(readyNow: Int, resets: [Date], now: Date) -> [TeamClaudeRecoveryStep] {
+    var count = max(0, readyNow)
+    var steps = [TeamClaudeRecoveryStep(at: now, count: count)]
+    for reset in resets.filter({ $0 > now }).sorted() {
+        count += 1
+        steps.append(TeamClaudeRecoveryStep(at: reset, count: count))
+    }
+    return steps
 }
