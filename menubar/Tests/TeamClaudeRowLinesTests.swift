@@ -132,6 +132,55 @@ struct TeamClaudeRowLinesTests {
         precondition(L10n.resetMoment(reset, timeZone: seoul) == "11/18 (Wed) 10:00", L10n.resetMoment(reset, timeZone: seoul))
         L10n.language = .ko
 
-        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns, card metrics, weekly reset and schedule passed")
+        // 10. 리셋 일정 그래프(A안): 그래프가 있으면 그 높이와 틈만큼 표가 내려가고, 없으면 예전 치수 그대로다.
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: false) == 120, "no chart keeps the old geometry")
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: true)
+                     == 120 + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
+        precondition(teamClaudeCardBaseHeight(hostLine: true, chart: true)
+                     == teamClaudeCardBaseHeight(hostLine: true) + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
+        precondition(TeamClaudeCardMetrics.chartY(hostLine: false) == TeamClaudeCardMetrics.tableHeadY(hostLine: false),
+                     "the chart takes the place where the table head used to start")
+        // 계단: 지금 수에서 시작해 앞으로 올 리셋마다 +1, 지난 리셋은 뺀다.
+        let steps = teamClaudeRecoverySteps(readyNow: 1, resets: [r3, now.addingTimeInterval(-5), reset], now: now)
+        precondition(steps == [TeamClaudeRecoveryStep(at: now, count: 1), TeamClaudeRecoveryStep(at: reset, count: 2),
+                               TeamClaudeRecoveryStep(at: r3, count: 3)], "\(steps)")
+        precondition(teamClaudeRecoverySteps(readyNow: -2, resets: [], now: now) == [TeamClaudeRecoveryStep(at: now, count: 0)])
+        // 가로 좌표: 지금 0, 7일 뒤 1, 범위 밖은 끝에 붙는다.
+        precondition(teamClaudeRecoveryChartX(now, now: now) == 0)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(3.5 * 86_400), now: now) == 0.5)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(30 * 86_400), now: now) == 1)
+        precondition(teamClaudeRecoveryChartX(now.addingTimeInterval(-60), now: now) == 0)
+        // 요약: 7일 밖 리셋은 "7일 안에"에 넣지 않는다.
+        let far = now.addingTimeInterval(8 * 86_400)
+        let summary = teamClaudeRecoveryChartSummary(teamClaudeRecoverySteps(readyNow: 1, resets: [reset, far], now: now), now: now)
+        precondition(summary.now == 1 && summary.inWindow == 2, "\(summary)")
+        // 복귀 시각(교차 검토 I1): 문턱 이상인 창(세션·주간) 리셋 중 가장 늦은 것. 세션만 막힌 계정도 센다.
+        let hour = now.addingTimeInterval(3600), days3 = now.addingTimeInterval(3 * 86_400)
+        let weeklyOnly = teamClaudeReleaseTime(windows: [(0, hour), (100, days3)], thresholdPercent: 98, now: now)
+        let sessionOnly = teamClaudeReleaseTime(windows: [(100, hour), (30, days3)], thresholdPercent: 98, now: now)
+        let both = teamClaudeReleaseTime(windows: [(100, hour), (100, days3)], thresholdPercent: 98, now: now)
+        precondition(weeklyOnly == days3 && sessionOnly == hour && both == days3, "\(String(describing: weeklyOnly)) \(String(describing: sessionOnly))")
+        precondition(teamClaudeReleaseTime(windows: [(100, nil)], thresholdPercent: 98, now: now) == nil, "unknown reset is not predicted")
+        precondition(teamClaudeReleaseTime(windows: [(100, now.addingTimeInterval(-1))], thresholdPercent: 98, now: now) == nil)
+        precondition(teamClaudeReleaseTime(windows: [(50, hour)], thresholdPercent: 98, now: now) == nil, "nothing blocked, nothing to release")
+        // 혼합 풀: 주간만 막힘(+3일) + 세션만 막힘(+1시간) → 1시간 뒤 1개, 3일 뒤 2개. 둘 다 끝까지 센다.
+        let mixedSteps = teamClaudeRecoverySteps(readyNow: 0, resets: [weeklyOnly!, sessionOnly!], now: now)
+        precondition(mixedSteps.map(\.count) == [0, 1, 2] && mixedSteps.last?.at == days3, "\(mixedSteps)")
+        precondition(teamClaudeRecoveryChartSummary(mixedSteps, now: now).inWindow == 2)
+        // throttle(교차 검토 2차): 만료 전에는 복귀하지 않고, 만료를 모르면 예측하지 않는다.
+        let minute = now.addingTimeInterval(60), half = now.addingTimeInterval(30)
+        precondition(teamClaudeReleaseTime(windows: [(20, hour), (100, half)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == minute)
+        precondition(teamClaudeReleaseTime(windows: [(100, hour)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == hour, "the later of throttle and window")
+        precondition(teamClaudeReleaseTime(windows: [(100, hour)], thresholdPercent: 98, now: now, throttled: true, throttledUntil: nil) == nil)
+        precondition(teamClaudeReleaseTime(windows: [(10, hour)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == minute, "a plain throttle still returns")
+        // 점 중심이 계단 전환 x에 온다(교차 검토 M1).
+        precondition(teamClaudeRecoveryDotLeft(centerX: 100, size: 5) == 97.5)
+        precondition(L10n.recoveryChartSummary(now: 1, inWeek: 20, total: 21) == "지금 1개 → 7일 안에 20/21개")
+        precondition(L10n.recoveryChartDay(reset, timeZone: seoul) == "18(수)")
+
+        print("teamclaude row lines: reason/subscription gating, row geometry, expanded detail, columns, card metrics, weekly reset, schedule and recovery chart passed")
     }
 }

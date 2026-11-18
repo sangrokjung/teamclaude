@@ -273,6 +273,8 @@ struct TeamClaudeAccountHealth {
     var sessionResetAt: Date? = nil
     var weeklyResetAt: Date? = nil
     var fableResetAt: Date? = nil
+    /// 프록시 throttle 만료(status "throttled"일 때). 복귀 일정 그래프가 막힌 창 리셋과 함께 본다(2026-11-18).
+    var rateLimitedUntil: Date? = nil
     /// 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false).
     /// 참이면 세션 값은 비우고, 가용·측정 문제·재시도·소진 전망에서 세션 창을 뺀다. 필드 없음·null·true는 거짓.
     var sessionWindowAbsent = false
@@ -732,6 +734,7 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             sessionResetAt: sessionResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             weeklyResetAt: weeklyResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
+            rateLimitedUntil: parseTeamClaudeTimeMs(account["rateLimitedUntil"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
             sessionWindowAbsent: sessionWindowAbsent,
             fableWindowAbsent: modelWeekly?["7d_oi"] == nil,
             apiCredit: apiCredit
@@ -890,6 +893,7 @@ func teamClaudeRetainingQuota(
             subscriptionEndReached: account.subscriptionEndReached,
             subscriptionEndsAt: account.subscriptionEndsAt,
             sessionResetAt: account.sessionResetAt, weeklyResetAt: account.weeklyResetAt, fableResetAt: account.fableResetAt,
+            rateLimitedUntil: account.rateLimitedUntil,
             sessionWindowAbsent: account.sessionWindowAbsent,
             fableWindowAbsent: account.fableWindowAbsent,
             apiCredit: account.apiCredit
@@ -1068,6 +1072,8 @@ func teamClaudeAccountMergingQuota(
         subscriptionEndReached: candidate.subscriptionEndReached,
         subscriptionEndsAt: candidate.subscriptionEndsAt,
         sessionResetAt: candidate.sessionResetAt, weeklyResetAt: candidate.weeklyResetAt, fableResetAt: candidate.fableResetAt,
+        // throttle 만료는 최신 응답 값을 그대로 쓴다(복귀 일정 그래프, 2026-11-18 교차 검토).
+        rateLimitedUntil: candidate.rateLimitedUntil,
         sessionWindowAbsent: candidate.sessionWindowAbsent,
         fableWindowAbsent: candidate.fableWindowAbsent
     )
@@ -2173,8 +2179,10 @@ final class TeamClaudeTableView: NSView {
         for (button, state) in zip(subscriptionButtons, availability) {
             button.refreshTitle(now: now, appearance: state.subscriptionAppearance)
         }
-        if let laidOutLines, laidOutLines != health.rowLines(now: now, availability: availability) {
+        let chartChanged = laidOutChart.map { $0 != health.weeklyChartShown(now: now) } ?? false
+        if chartChanged || (laidOutLines.map { $0 != health.rowLines(now: now, availability: availability) } ?? false) {
             self.laidOutLines = nil
+            self.laidOutChart = nil
             needsLayout = true
             onContentHeightChange?()
         }
@@ -2211,6 +2219,8 @@ final class TeamClaudeTableView: NSView {
     /// layout()이 마지막으로 배치한 행별 보조 줄. 시간 경과·구독 자동 조회로 판정이 바뀌면 행 높이가 달라지므로
     /// 표 혼자 다시 그리지 않고 onContentHeightChange로 대시보드에 재구성을 맡긴다(표 프레임은 대시보드가 정한다).
     private var laidOutLines: [TeamClaudeRowLines]?
+    /// layout()이 마지막으로 정한 리셋 그래프 표시 여부. 마지막 리셋이 지나 그래프가 사라지면 높이가 바뀐다.
+    private var laidOutChart: Bool?
     var onContentHeightChange: (() -> Void)?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -2232,7 +2242,7 @@ final class TeamClaudeTableView: NSView {
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
                                              expanded: expanded.flatMap { rowIndex(health, name: $0, accountUuid: expandedUuid) },
                                              resetKeys: health.weeklyResetKeys)
-        return teamClaudeCardBaseHeight(hostLine: health.hostSummaryText != nil) + layout.height
+        return teamClaudeCardBaseHeight(hostLine: health.hostSummaryText != nil, chart: health.weeklyChartShown(now: now)) + layout.height
     }
 
     private var expandedIndex: Int? {
@@ -2248,7 +2258,7 @@ final class TeamClaudeTableView: NSView {
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex,
                                              resetKeys: health.weeklyResetKeys)
         guard let y = layout.origins[index] else { return nil }
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil, chart: health.weeklyChartShown(now: evaluatedAt))
         return NSRect(x: 0, y: rowsTop + y, width: bounds.width,
                       height: teamClaudeRowHeight(lines[index], expanded: index == expandedIndex))
     }
@@ -2559,6 +2569,13 @@ final class TeamClaudeTableView: NSView {
         onReauthenticate?(target.name, target.accountUuid)
     }
 
+    /// 리셋 일정 그래프. 전체 수는 구독이 끝나지 않은 구독 계정(API 키 제외)이다.
+    private func drawRecoveryChart(_ rect: NSRect, health: TeamClaudeHealth, availability: [TeamClaudeFableAvailability]) {
+        let total = zip(health.accounts, availability).filter { !$0.0.isApiKey && $0.1.subscriptionAppearance != .ended }.count
+        drawTeamClaudeRecoveryChart(rect, steps: health.weeklyRecoverySteps(availability: availability, now: evaluatedAt),
+                                    total: total, now: evaluatedAt)
+    }
+
     /// 띠 오른쪽 칩 자리. "지금 측정" 칩이 있으면 그 왼쪽에 재연동 버튼이 온다. draw의 칩 조건과 같아야 한다.
     private func measureChipShown(_ health: TeamClaudeHealth) -> Bool {
         health.measurementPendingCount > 0 && !isMeasuring && health.accountConfigDrift == 0
@@ -2580,7 +2597,9 @@ final class TeamClaudeTableView: NSView {
         }
         refreshTime(now: evaluatedAt)
         guard let health else { return }
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil)
+        let chartShown = health.weeklyChartShown(now: evaluatedAt)
+        laidOutChart = chartShown
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil, chart: chartShown)
         let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt)
         let expanded = expandedIndex
@@ -2777,7 +2796,14 @@ final class TeamClaudeTableView: NSView {
         }
 
         // 열 머리 — 리셋은 여기서 한 번 말한다(살아 있는 계정 중 가장 빠른 리셋).
-        let headY = TeamClaudeCardMetrics.tableHeadY(hostLine: hostLineShown)
+        // 리셋 일정 그래프(A안). 띠와 열 머리 사이에 들어간다. 높이·배치와 같은 판정(weeklyChartShown)을 쓴다.
+        let chartShown = health.weeklyChartShown(now: evaluatedAt)
+        if chartShown {
+            markDraw("TeamClaudeTableView.chart")
+            drawRecoveryChart(NSRect(x: left, y: TeamClaudeCardMetrics.chartY(hostLine: hostLineShown), width: rightEdge - left,
+                                     height: TeamClaudeCardMetrics.chartHeight), health: health, availability: availability)
+        }
+        let headY = TeamClaudeCardMetrics.tableHeadY(hostLine: hostLineShown, chart: chartShown)
         func soonest(_ pick: (TeamClaudeAccountHealth) -> (Int?, Date?)) -> String {
             let values = zip(health.accounts, availability).compactMap { row, state -> Double? in
                 guard teamClaudeRowGroup(state) != .excluded else { return nil }
@@ -2806,7 +2832,7 @@ final class TeamClaudeTableView: NSView {
         let groups = availability.map(teamClaudeRowGroup)
         let expanded = expandedIndex
         let grouped = teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded, resetKeys: health.weeklyResetKeys)
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: hostLineShown)
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: hostLineShown, chart: chartShown)
         let subscriptions = health.subscriptionResolutions(now: evaluatedAt)
         for heading in grouped.headings {
             let y = rowsTop + heading.y + 9

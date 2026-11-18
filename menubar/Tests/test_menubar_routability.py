@@ -31,7 +31,7 @@ class MenubarRoutabilityTest(unittest.TestCase):
             result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=120,
                                     env={**os.environ, "CC_MENUBAR_LANG": "ko"})
             self.assertEqual(0, result.returncode, (result.stdout + result.stderr)[-4000:])
-            self.assertIn("MenubarRoutabilityTests: availability, consumers, panel height, grok lane, burn line passed",
+            self.assertIn("MenubarRoutabilityTests: availability, consumers, panel height, grok lane, burn line, recovery schedule passed",
                           result.stdout)
 
 

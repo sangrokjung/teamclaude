@@ -263,13 +263,43 @@ extension TeamClaudeHealth {
 
     /// 주간 한도로 막힌 구독 계정의 복귀 일정(띠 문구).
     func weeklySchedule(availability: [TeamClaudeFableAvailability], now: Date) -> TeamClaudeWeeklySchedule? {
+        teamClaudeWeeklySchedule(weeklyLimitedResets(availability: availability, now: now), now: now)
+    }
+
+    /// 주간 한도(문턱 이상)로 막힌 구독 계정들의 앞으로 올 주간 리셋 시각. 띠 문구와 그래프가 같은 목록을 쓴다.
+    func weeklyLimitedResets(availability: [TeamClaudeFableAvailability], now: Date) -> [Date] {
         let threshold = quotaThresholdPercent
-        let resets = zip(accounts, availability).compactMap { row, state -> Date? in
+        return zip(accounts, availability).compactMap { row, state -> Date? in
             guard !row.isApiKey, state.state == .limited, state.subscriptionAppearance != .ended,
-                  let percent = row.weeklyPercent, percent >= threshold else { return nil }
-            return row.weeklyResetAt
+                  let percent = row.weeklyPercent, percent >= threshold,
+                  let reset = row.weeklyResetAt, reset > now else { return nil }
+            return reset
         }
-        return teamClaudeWeeklySchedule(resets, now: now)
+    }
+
+    /// 리셋 일정 그래프를 그릴지. 높이(contentHeight)·배치(layout)·그리기(draw)가 이 한 판정을 쓴다.
+    func weeklyChartShown(now: Date) -> Bool {
+        !weeklyLimitedResets(availability: routingAvailability(now: now), now: now).isEmpty
+    }
+
+    /// 그래프 계단: 지금 쓸 수 있는 구독 계정 수에서 시작해, 한도 대기 계정마다 막힌 창(세션·주간)이 모두 풀리는
+    /// 시각에 하나씩 는다. 풀리는 시각을 모르는 계정(프록시 제외·리셋 미상)은 세지 않는다.
+    func weeklyRecoverySteps(availability: [TeamClaudeFableAvailability], now: Date) -> [TeamClaudeRecoveryStep] {
+        let threshold = quotaThresholdPercent
+        var readyNow = 0
+        var releases: [Date] = []
+        for (row, state) in zip(accounts, availability) where !row.isApiKey && state.subscriptionAppearance != .ended {
+            if state.state == .ready { readyNow += 1; continue }
+            guard state.state == .limited else { continue }
+            let windows: [(percent: Double?, resetAt: Date?)] = row.sessionWindowAbsent
+                ? [(row.weeklyPercent, row.weeklyResetAt)]
+                : [(row.sessionPercent, row.sessionResetAt), (row.weeklyPercent, row.weeklyResetAt)]
+            if let release = teamClaudeReleaseTime(windows: windows, thresholdPercent: threshold, now: now,
+                                                   throttled: row.status == "throttled", throttledUntil: row.rateLimitedUntil) {
+                releases.append(release)
+            }
+        }
+        return teamClaudeRecoverySteps(readyNow: readyNow, resets: releases, now: now)
     }
 }
 

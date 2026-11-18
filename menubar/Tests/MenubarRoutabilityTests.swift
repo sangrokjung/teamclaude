@@ -21,7 +21,8 @@ struct MenubarRoutabilityTests {
         testPanelHeight(now: now)
         testGrokLane(now: now)
         testBurnLine(now: now)
-        print("MenubarRoutabilityTests: availability, consumers, panel height, grok lane, burn line passed")
+        testRecoverySchedule(now: now)
+        print("MenubarRoutabilityTests: availability, consumers, panel height, grok lane, burn line, recovery schedule passed")
     }
 
     // MARK: 픽스처 — 프록시 /teamclaude/status 모양을 실제 파서로 읽는다
@@ -46,6 +47,38 @@ struct MenubarRoutabilityTests {
         ]
         if let usable { row["usable"] = usable }
         return row
+    }
+
+    /// 복귀 일정 그래프(2026-11-18 교차 검토 I1): 상태 응답 → 라우팅 판정 → 계단까지 실제 파서로 잇는다.
+    /// 주간만 막힘(+3일) · 세션만 막힘(+2시간) · throttle(주간 리셋 +30초지만 throttle 만료 +60초) · 사용 가능 1개.
+    static func testRecoverySchedule(now: Date) {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let weeklyOnly = account("weekly-only", usable: false, session: 0.1, weekly: 1.0, now: now)
+        let sessionOnly = account("session-only", usable: false, session: 1.0, weekly: 0.3, now: now)
+        var throttled = account("throttled", usable: false, session: 0.2, weekly: 1.0, status: "throttled", now: now)
+        var quota = throttled["quota"] as! [String: Any]
+        quota["unified7dReset"] = nowMs + 30_000
+        throttled["quota"] = quota
+        // 서버는 ISO 문자열로 준다(account-manager getStatus).
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        throttled["rateLimitedUntil"] = iso.string(from: Date(timeIntervalSince1970: Double(nowMs + 60_000) / 1000))
+        let ready = account("ready", usable: true, session: 0.1, weekly: 0.2, now: now)
+        // 앱이 실제로 쓰는 병합 경로(commitTeamClaudeHealth → teamClaudeHealthMergingQuota)를 거친다.
+        let parsed = teamClaudeHealthMergingQuota(candidate: health([weeklyOnly, sessionOnly, throttled, ready], now: now), previous: nil)
+        precondition(parsed.accounts[2].rateLimitedUntil != nil, "merge keeps the throttle expiry")
+        let routing = parsed.routingAvailability(now: now)
+        precondition(routing.map(\.state) == [.limited, .limited, .limited, .ready], "\(routing.map(\.state))")
+        precondition(parsed.weeklyChartShown(now: now), "weekly-limited accounts show the chart")
+        let steps = parsed.weeklyRecoverySteps(availability: routing, now: now)
+        let offsets = steps.map { Int(($0.at.timeIntervalSince(now)).rounded()) }
+        precondition(steps.map(\.count) == [1, 2, 3, 4], "\(steps.map(\.count))")
+        precondition(offsets == [0, 60, 2 * 3600, 3 * 86_400],
+                     "throttle waits for rateLimitedUntil, session-only is counted: \(offsets)")
+        // throttle 만료를 모르면 그 계정은 예측하지 않는다.
+        throttled.removeValue(forKey: "rateLimitedUntil")
+        let unknown = health([throttled, ready], now: now)
+        precondition(unknown.weeklyRecoverySteps(availability: unknown.routingAvailability(now: now), now: now).map(\.count) == [1])
     }
 
     static func health(_ accounts: [[String: Any]], now: Date) -> TeamClaudeHealth {
@@ -203,7 +236,8 @@ struct MenubarRoutabilityTests {
         table.refreshTime(now: now)
         precondition(table.accessibilityLabel()?.contains("라우팅 가능 2") == true, table.accessibilityLabel() ?? "nil")
         let routingLines = committed.rowLines(now: now, availability: routing)
-        let expectedHeight = teamClaudeCardBaseHeight(hostLine: committed.hostSummaryText != nil)
+        // 주간 한도로 막힌 계정이 있으면 리셋 일정 그래프가 같은 판정(weeklyChartShown)으로 들어간다.
+        let expectedHeight = teamClaudeCardBaseHeight(hostLine: committed.hostSummaryText != nil, chart: committed.weeklyChartShown(now: now))
             + teamClaudeGroupedLayout(groups: routing.map(teamClaudeRowGroup), lines: routingLines, expanded: nil).height
         precondition(TeamClaudeTableView.contentHeight(committed, expanded: nil, now: now) == expectedHeight,
                      "the Claude table groups by the routing judgment")

@@ -230,12 +230,56 @@ enum TeamClaudeCardMetrics {
     static func stripY(hostLine: Bool) -> CGFloat {
         titleY(hostLine: hostLine) + headerHeight + (hostLine ? hostLineHeight : 0)
     }
-    static func tableHeadY(hostLine: Bool) -> CGFloat { stripY(hostLine: hostLine) + stripHeight + stripGap }
+    /// 주간 리셋 일정 그래프(2026-11-18 A안). 주간 한도로 막힌 구독 계정이 있을 때만 띠 아래에 들어간다.
+    static let chartHeight: CGFloat = 164
+    static let chartGap: CGFloat = 12
+    static func chartY(hostLine: Bool) -> CGFloat { stripY(hostLine: hostLine) + stripHeight + stripGap }
+    static func tableHeadY(hostLine: Bool, chart: Bool = false) -> CGFloat {
+        chartY(hostLine: hostLine) + (chart ? chartHeight + chartGap : 0)
+    }
     /// 첫 행(첫 묶음 머리) 원점 y(뷰 bounds 기준).
-    static func rowsTop(hostLine: Bool) -> CGFloat { tableHeadY(hostLine: hostLine) + tableHeadHeight + tableHeadGap }
+    static func rowsTop(hostLine: Bool, chart: Bool = false) -> CGFloat {
+        tableHeadY(hostLine: hostLine, chart: chart) + tableHeadHeight + tableHeadGap
+    }
 }
 
 /// 행을 뺀 표 높이. 전체 높이 = 이 값 + teamClaudeGroupedLayout(...).height.
-func teamClaudeCardBaseHeight(hostLine: Bool) -> CGFloat {
-    TeamClaudeCardMetrics.rowsTop(hostLine: hostLine) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
+func teamClaudeCardBaseHeight(hostLine: Bool, chart: Bool = false) -> CGFloat {
+    TeamClaudeCardMetrics.rowsTop(hostLine: hostLine, chart: chart) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
+}
+
+/// 리셋 일정 그래프의 한 계단: 그 시각 이후 쓸 수 있는 구독 계정 수(새 사용이 없다고 가정한 주간 기준).
+struct TeamClaudeRecoveryStep: Equatable {
+    let at: Date
+    let count: Int
+}
+
+/// 한도로 막힌 계정이 다시 쓸 수 있게 되는 시각: 문턱 이상인 창(세션·주간) 리셋 중 가장 늦은 것.
+/// 막힌 창의 리셋을 모르거나 이미 지났으면 nil(예측하지 않는다). 막힌 창이 없으면 nil.
+/// 2026-11-18 교차 검토: 주간만 보면 세션만 막힌 계정이 그래프에서 영영 빠지고, 둘 다 막힌 계정은 너무 일찍 오른다.
+/// throttle 중(`throttled`)이면 만료 시각도 함께 본다. 만료를 모르거나 지났는데 throttled면 예측하지 않는다(교차 검토 2차).
+func teamClaudeReleaseTime(windows: [(percent: Double?, resetAt: Date?)], thresholdPercent: Double, now: Date,
+                           throttled: Bool = false, throttledUntil: Date? = nil) -> Date? {
+    var latest: Date?
+    if throttled {
+        guard let until = throttledUntil, until > now else { return nil }
+        latest = until
+    }
+    for window in windows {
+        guard let percent = window.percent, percent.isFinite, percent >= thresholdPercent else { continue }
+        guard let reset = window.resetAt, reset > now else { return nil }
+        latest = max(latest ?? reset, reset)
+    }
+    return latest
+}
+
+/// 지금 쓸 수 있는 수에서 시작해 막힌 계정이 풀릴 때마다 하나씩 늘어나는 계단. 지난 시각은 뺀다.
+func teamClaudeRecoverySteps(readyNow: Int, resets: [Date], now: Date) -> [TeamClaudeRecoveryStep] {
+    var count = max(0, readyNow)
+    var steps = [TeamClaudeRecoveryStep(at: now, count: count)]
+    for reset in resets.filter({ $0 > now }).sorted() {
+        count += 1
+        steps.append(TeamClaudeRecoveryStep(at: reset, count: count))
+    }
+    return steps
 }
