@@ -263,7 +263,7 @@ enum L10n {
         return head + t(" · 마지막 \(last)", " · last \(last)")
     }
     // 주간 리셋 일정 그래프(A안).
-    static var recoveryChartTitle: String { t("주간 리셋 일정", "Weekly reset schedule") }
+    static var recoveryChartTitle: String { t("계정 복귀 일정", "Account return schedule") }
     static func recoveryChartSummary(now: Int, inWeek: Int, total: Int) -> String {
         t("지금 \(now)개 → 7일 안에 \(inWeek)/\(total)개", "Now \(now) → \(inWeek)/\(total) within 7 days")
     }
@@ -276,8 +276,8 @@ enum L10n {
         return formatter.string(from: date)
     }
     static var recoveryChartLegend: String {
-        t("점 = 주간 한도가 풀리는 시각 · 새 사용이 없다고 가정 · 세션 한도가 겹치면 더 늦을 수 있음",
-          "Dot = weekly limit lifts · assumes no new use · a session limit can delay it")
+        t("점 = 걸린 세션·주간 한도가 모두 풀리는 시각 · 새 사용이 없다고 가정",
+          "Dot = when every hit session/weekly limit lifts · assumes no new use")
     }
     static var relink: String { t("재연동", "Re-link") }
     static var relinkMenuButton: String { t("재연동 ▾", "Re-link ▾") }

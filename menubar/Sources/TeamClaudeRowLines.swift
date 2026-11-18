@@ -254,7 +254,20 @@ struct TeamClaudeRecoveryStep: Equatable {
     let count: Int
 }
 
-/// 지금 쓸 수 있는 수에서 시작해 주간 리셋마다 하나씩 늘어나는 계단. 지난 리셋은 뺀다.
+/// 한도로 막힌 계정이 다시 쓸 수 있게 되는 시각: 문턱 이상인 창(세션·주간) 리셋 중 가장 늦은 것.
+/// 막힌 창의 리셋을 모르거나 이미 지났으면 nil(예측하지 않는다). 막힌 창이 없으면 nil.
+/// 2026-11-18 교차 검토: 주간만 보면 세션만 막힌 계정이 그래프에서 영영 빠지고, 둘 다 막힌 계정은 너무 일찍 오른다.
+func teamClaudeReleaseTime(windows: [(percent: Double?, resetAt: Date?)], thresholdPercent: Double, now: Date) -> Date? {
+    var latest: Date?
+    for window in windows {
+        guard let percent = window.percent, percent.isFinite, percent >= thresholdPercent else { continue }
+        guard let reset = window.resetAt, reset > now else { return nil }
+        latest = max(latest ?? reset, reset)
+    }
+    return latest
+}
+
+/// 지금 쓸 수 있는 수에서 시작해 막힌 계정이 풀릴 때마다 하나씩 늘어나는 계단. 지난 시각은 뺀다.
 func teamClaudeRecoverySteps(readyNow: Int, resets: [Date], now: Date) -> [TeamClaudeRecoveryStep] {
     var count = max(0, readyNow)
     var steps = [TeamClaudeRecoveryStep(at: now, count: count)]

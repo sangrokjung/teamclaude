@@ -282,10 +282,23 @@ extension TeamClaudeHealth {
         !weeklyLimitedResets(availability: routingAvailability(now: now), now: now).isEmpty
     }
 
-    /// 그래프 계단: 지금 쓸 수 있는 구독 계정 수에서 시작해 주간 리셋마다 하나씩 는다.
+    /// 그래프 계단: 지금 쓸 수 있는 구독 계정 수에서 시작해, 한도 대기 계정마다 막힌 창(세션·주간)이 모두 풀리는
+    /// 시각에 하나씩 는다. 풀리는 시각을 모르는 계정(프록시 제외·리셋 미상)은 세지 않는다.
     func weeklyRecoverySteps(availability: [TeamClaudeFableAvailability], now: Date) -> [TeamClaudeRecoveryStep] {
-        let readyNow = zip(accounts, availability).filter { !$0.0.isApiKey && $0.1.state == .ready }.count
-        return teamClaudeRecoverySteps(readyNow: readyNow, resets: weeklyLimitedResets(availability: availability, now: now), now: now)
+        let threshold = quotaThresholdPercent
+        var readyNow = 0
+        var releases: [Date] = []
+        for (row, state) in zip(accounts, availability) where !row.isApiKey && state.subscriptionAppearance != .ended {
+            if state.state == .ready { readyNow += 1; continue }
+            guard state.state == .limited else { continue }
+            let windows: [(percent: Double?, resetAt: Date?)] = row.sessionWindowAbsent
+                ? [(row.weeklyPercent, row.weeklyResetAt)]
+                : [(row.sessionPercent, row.sessionResetAt), (row.weeklyPercent, row.weeklyResetAt)]
+            if let release = teamClaudeReleaseTime(windows: windows, thresholdPercent: threshold, now: now) {
+                releases.append(release)
+            }
+        }
+        return teamClaudeRecoverySteps(readyNow: readyNow, resets: releases, now: now)
     }
 }
 

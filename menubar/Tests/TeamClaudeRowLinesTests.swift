@@ -154,6 +154,21 @@ struct TeamClaudeRowLinesTests {
         let far = now.addingTimeInterval(8 * 86_400)
         let summary = teamClaudeRecoveryChartSummary(teamClaudeRecoverySteps(readyNow: 1, resets: [reset, far], now: now), now: now)
         precondition(summary.now == 1 && summary.inWindow == 2, "\(summary)")
+        // 복귀 시각(교차 검토 I1): 문턱 이상인 창(세션·주간) 리셋 중 가장 늦은 것. 세션만 막힌 계정도 센다.
+        let hour = now.addingTimeInterval(3600), days3 = now.addingTimeInterval(3 * 86_400)
+        let weeklyOnly = teamClaudeReleaseTime(windows: [(0, hour), (100, days3)], thresholdPercent: 98, now: now)
+        let sessionOnly = teamClaudeReleaseTime(windows: [(100, hour), (30, days3)], thresholdPercent: 98, now: now)
+        let both = teamClaudeReleaseTime(windows: [(100, hour), (100, days3)], thresholdPercent: 98, now: now)
+        precondition(weeklyOnly == days3 && sessionOnly == hour && both == days3, "\(String(describing: weeklyOnly)) \(String(describing: sessionOnly))")
+        precondition(teamClaudeReleaseTime(windows: [(100, nil)], thresholdPercent: 98, now: now) == nil, "unknown reset is not predicted")
+        precondition(teamClaudeReleaseTime(windows: [(100, now.addingTimeInterval(-1))], thresholdPercent: 98, now: now) == nil)
+        precondition(teamClaudeReleaseTime(windows: [(50, hour)], thresholdPercent: 98, now: now) == nil, "nothing blocked, nothing to release")
+        // 혼합 풀: 주간만 막힘(+3일) + 세션만 막힘(+1시간) → 1시간 뒤 1개, 3일 뒤 2개. 둘 다 끝까지 센다.
+        let mixedSteps = teamClaudeRecoverySteps(readyNow: 0, resets: [weeklyOnly!, sessionOnly!], now: now)
+        precondition(mixedSteps.map(\.count) == [0, 1, 2] && mixedSteps.last?.at == days3, "\(mixedSteps)")
+        precondition(teamClaudeRecoveryChartSummary(mixedSteps, now: now).inWindow == 2)
+        // 점 중심이 계단 전환 x에 온다(교차 검토 M1).
+        precondition(teamClaudeRecoveryDotLeft(centerX: 100, size: 5) == 97.5)
         precondition(L10n.recoveryChartSummary(now: 1, inWeek: 20, total: 21) == "지금 1개 → 7일 안에 20/21개")
         precondition(L10n.recoveryChartDay(reset, timeZone: seoul) == "18(수)")
 
