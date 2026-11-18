@@ -294,7 +294,8 @@ extension TeamClaudeHealth {
             let windows: [(percent: Double?, resetAt: Date?)] = row.sessionWindowAbsent
                 ? [(row.weeklyPercent, row.weeklyResetAt)]
                 : [(row.sessionPercent, row.sessionResetAt), (row.weeklyPercent, row.weeklyResetAt)]
-            if let release = teamClaudeReleaseTime(windows: windows, thresholdPercent: threshold, now: now) {
+            if let release = teamClaudeReleaseTime(windows: windows, thresholdPercent: threshold, now: now,
+                                                   throttled: row.status == "throttled", throttledUntil: row.rateLimitedUntil) {
                 releases.append(release)
             }
         }

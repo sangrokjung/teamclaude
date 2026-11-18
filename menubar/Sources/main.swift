@@ -273,6 +273,8 @@ struct TeamClaudeAccountHealth {
     var sessionResetAt: Date? = nil
     var weeklyResetAt: Date? = nil
     var fableResetAt: Date? = nil
+    /// 프록시 throttle 만료(status "throttled"일 때). 복귀 일정 그래프가 막힌 창 리셋과 함께 본다(2026-11-18).
+    var rateLimitedUntil: Date? = nil
     /// 5시간 창 없이 주간 창만 받는 계정(검증된 Ultra, 프록시 quota.sessionWindowStated=false).
     /// 참이면 세션 값은 비우고, 가용·측정 문제·재시도·소진 전망에서 세션 창을 뺀다. 필드 없음·null·true는 거짓.
     var sessionWindowAbsent = false
@@ -732,6 +734,7 @@ func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
             sessionResetAt: sessionResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             weeklyResetAt: weeklyResetMs.map { Date(timeIntervalSince1970: Double($0) / 1000) },
             fableResetAt: parseTeamClaudeTimeMs(fable?["reset"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
+            rateLimitedUntil: parseTeamClaudeTimeMs(account["rateLimitedUntil"]).map { Date(timeIntervalSince1970: Double($0) / 1000) },
             sessionWindowAbsent: sessionWindowAbsent,
             fableWindowAbsent: modelWeekly?["7d_oi"] == nil,
             apiCredit: apiCredit

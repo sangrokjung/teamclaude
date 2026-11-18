@@ -257,8 +257,14 @@ struct TeamClaudeRecoveryStep: Equatable {
 /// 한도로 막힌 계정이 다시 쓸 수 있게 되는 시각: 문턱 이상인 창(세션·주간) 리셋 중 가장 늦은 것.
 /// 막힌 창의 리셋을 모르거나 이미 지났으면 nil(예측하지 않는다). 막힌 창이 없으면 nil.
 /// 2026-11-18 교차 검토: 주간만 보면 세션만 막힌 계정이 그래프에서 영영 빠지고, 둘 다 막힌 계정은 너무 일찍 오른다.
-func teamClaudeReleaseTime(windows: [(percent: Double?, resetAt: Date?)], thresholdPercent: Double, now: Date) -> Date? {
+/// throttle 중(`throttled`)이면 만료 시각도 함께 본다. 만료를 모르거나 지났는데 throttled면 예측하지 않는다(교차 검토 2차).
+func teamClaudeReleaseTime(windows: [(percent: Double?, resetAt: Date?)], thresholdPercent: Double, now: Date,
+                           throttled: Bool = false, throttledUntil: Date? = nil) -> Date? {
     var latest: Date?
+    if throttled {
+        guard let until = throttledUntil, until > now else { return nil }
+        latest = until
+    }
     for window in windows {
         guard let percent = window.percent, percent.isFinite, percent >= thresholdPercent else { continue }
         guard let reset = window.resetAt, reset > now else { return nil }

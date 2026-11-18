@@ -167,6 +167,15 @@ struct TeamClaudeRowLinesTests {
         let mixedSteps = teamClaudeRecoverySteps(readyNow: 0, resets: [weeklyOnly!, sessionOnly!], now: now)
         precondition(mixedSteps.map(\.count) == [0, 1, 2] && mixedSteps.last?.at == days3, "\(mixedSteps)")
         precondition(teamClaudeRecoveryChartSummary(mixedSteps, now: now).inWindow == 2)
+        // throttle(교차 검토 2차): 만료 전에는 복귀하지 않고, 만료를 모르면 예측하지 않는다.
+        let minute = now.addingTimeInterval(60), half = now.addingTimeInterval(30)
+        precondition(teamClaudeReleaseTime(windows: [(20, hour), (100, half)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == minute)
+        precondition(teamClaudeReleaseTime(windows: [(100, hour)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == hour, "the later of throttle and window")
+        precondition(teamClaudeReleaseTime(windows: [(100, hour)], thresholdPercent: 98, now: now, throttled: true, throttledUntil: nil) == nil)
+        precondition(teamClaudeReleaseTime(windows: [(10, hour)], thresholdPercent: 98, now: now,
+                                           throttled: true, throttledUntil: minute) == minute, "a plain throttle still returns")
         // 점 중심이 계단 전환 x에 온다(교차 검토 M1).
         precondition(teamClaudeRecoveryDotLeft(centerX: 100, size: 5) == 97.5)
         precondition(L10n.recoveryChartSummary(now: 1, inWeek: 20, total: 21) == "지금 1개 → 7일 안에 20/21개")
