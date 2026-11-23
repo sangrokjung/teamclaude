@@ -171,6 +171,13 @@ struct TeamClaudeHealth {
     var serverResponseDelayed = false
     /// 계정 불일치가 worker 재로딩 뒤에도 남았다. 재시작하지 않고 경고만 한다.
     var driftPersistsAfterReload = false
+    /// 본체·워커 머신 활성 상태(하네스 수집기 파일). 없으면 줄을 그리지 않는다.
+    var machines: FleetMachinesSnapshot? = nil
+
+    var machinesSummaryText: String? { FleetMachines.summaryText(machines, now: checkedAt) }
+    var machinesIsWarning: Bool { FleetMachines.isWarning(machines, now: checkedAt) }
+    /// 서버 줄 아래 요약 줄 수(호스트 CPU/RAM 줄 + 머신 줄). 높이·버튼 배치·그리기가 모두 이 값을 쓴다.
+    var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machinesSummaryText != nil ? 1 : 0) }
 
     // 호스트 CPU/RAM 한 줄 요약 (표시할 값이 없으면 nil → 라인 생략)
     var hostSummaryText: String? {
@@ -587,7 +594,9 @@ func loadTeamClaudeHealth() -> TeamClaudeHealth {
         port: port,
         apiKey: tcString(tcDict(config?["proxy"])?["apiKey"])
     )
-    return parseTeamClaudeHealth(config: config, server: server, status: status, port: port)
+    var health = parseTeamClaudeHealth(config: config, server: server, status: status, port: port)
+    health.machines = FleetMachines.load()
+    return health
 }
 
 func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
@@ -962,6 +971,7 @@ func teamClaudeRetainingQuota(
     )
     merged.runtimeSummary = candidate.runtimeSummary
     merged.runtimeSummaryShort = candidate.runtimeSummaryShort
+    merged.machines = candidate.machines
     return merged
 }
 
@@ -1176,6 +1186,7 @@ func teamClaudeHealthMergingQuota(
     )
     merged.runtimeSummary = candidate.runtimeSummary
     merged.runtimeSummaryShort = candidate.runtimeSummaryShort
+    merged.machines = candidate.machines
     return merged
 }
 
@@ -2242,7 +2253,7 @@ final class TeamClaudeTableView: NSView {
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines,
                                              expanded: expanded.flatMap { rowIndex(health, name: $0, accountUuid: expandedUuid) },
                                              resetKeys: health.weeklyResetKeys)
-        return teamClaudeCardBaseHeight(hostLine: health.hostSummaryText != nil, chart: health.weeklyChartShown(now: now)) + layout.height
+        return teamClaudeCardBaseHeight(hostLines: health.hostLineCount, chart: health.weeklyChartShown(now: now)) + layout.height
     }
 
     private var expandedIndex: Int? {
@@ -2258,7 +2269,7 @@ final class TeamClaudeTableView: NSView {
         let layout = teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup), lines: lines, expanded: expandedIndex,
                                              resetKeys: health.weeklyResetKeys)
         guard let y = layout.origins[index] else { return nil }
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil, chart: health.weeklyChartShown(now: evaluatedAt))
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLines: health.hostLineCount, chart: health.weeklyChartShown(now: evaluatedAt))
         return NSRect(x: 0, y: rowsTop + y, width: bounds.width,
                       height: teamClaudeRowHeight(lines[index], expanded: index == expandedIndex))
     }
@@ -2587,8 +2598,7 @@ final class TeamClaudeTableView: NSView {
         ensureSubscriptionButtons()
         ensureRelinkMenuButton()
         if let button = relinkMenuButton, let health {
-            let hostLine = health.hostSummaryText != nil
-            let stripY = TeamClaudeCardMetrics.stripY(hostLine: hostLine)
+            let stripY = TeamClaudeCardMetrics.stripY(hostLines: health.hostLineCount)
             let stripMaxX = bounds.width - TeamClaudeColumns.padding
             let chipWidth = measureChipShown(health) ? PanelDraw.width(L10n.measureNow, TeamClaudePalette.buttonFont) + 22 + 8 : 0
             button.frame = NSRect(x: stripMaxX - 10 - chipWidth - button.fittingWidth,
@@ -2599,7 +2609,7 @@ final class TeamClaudeTableView: NSView {
         guard let health else { return }
         let chartShown = health.weeklyChartShown(now: evaluatedAt)
         laidOutChart = chartShown
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: health.hostSummaryText != nil, chart: chartShown)
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLines: health.hostLineCount, chart: chartShown)
         let availability = health.routingAvailability(now: evaluatedAt)
         let lines = health.rowLines(now: evaluatedAt)
         let expanded = expandedIndex
@@ -2695,8 +2705,8 @@ final class TeamClaudeTableView: NSView {
         }
 
         // 서버 줄
-        let hostLineShown = health.hostSummaryText != nil
-        let topY = TeamClaudeCardMetrics.titleY(hostLine: hostLineShown)
+        let hostLines = health.hostLineCount
+        let topY = TeamClaudeCardMetrics.titleY(hostLines: hostLines)
         markDraw("TeamClaudeTableView.header")
         let titleWidth = PanelDraw.text("TeamClaude", left, topY, TeamClaudePalette.panelTitleFont, fg)
         let serverTone: PanelTone = health.serverReachable ? .ready : (health.serverResponseDelayed ? .wait : .error)
@@ -2715,8 +2725,14 @@ final class TeamClaudeTableView: NSView {
             measure: { PanelDraw.width($0, micro) }
         )
         PanelDraw.right(PanelDraw.clipped(serverLine, micro, maxWidth: rightEdge - serverLineX), rightEdge, topY + 3, micro, serverColor)
+        var summaryY = topY + TeamClaudeCardMetrics.headerHeight
         if let hostText = health.hostSummaryText {
-            PanelDraw.text(hostText, left, topY + TeamClaudeCardMetrics.headerHeight, micro, health.hostIsWarning ? ember : fg3)
+            PanelDraw.text(hostText, left, summaryY, micro, health.hostIsWarning ? ember : fg3)
+            summaryY += TeamClaudeCardMetrics.hostLineHeight
+        }
+        if let machinesText = health.machinesSummaryText {
+            PanelDraw.text(PanelDraw.clipped(machinesText, micro, maxWidth: rightEdge - left), left, summaryY, micro,
+                           health.machinesIsWarning ? amber : fg3)
         }
 
         // 측정·연동 안내
@@ -2774,7 +2790,7 @@ final class TeamClaudeTableView: NSView {
             actionTitle = ready > 0 ? L10n.routableReadyTitle(ready) : L10n.noAccounts
             actionDetail = L10n.allWindowsDetail
         }
-        let strip = NSRect(x: left, y: TeamClaudeCardMetrics.stripY(hostLine: hostLineShown), width: rightEdge - left,
+        let strip = NSRect(x: left, y: TeamClaudeCardMetrics.stripY(hostLines: hostLines), width: rightEdge - left,
                            height: TeamClaudeCardMetrics.stripHeight)
         markDraw("TeamClaudeTableView.action")
         PanelDraw.card(strip)
@@ -2800,10 +2816,10 @@ final class TeamClaudeTableView: NSView {
         let chartShown = health.weeklyChartShown(now: evaluatedAt)
         if chartShown {
             markDraw("TeamClaudeTableView.chart")
-            drawRecoveryChart(NSRect(x: left, y: TeamClaudeCardMetrics.chartY(hostLine: hostLineShown), width: rightEdge - left,
+            drawRecoveryChart(NSRect(x: left, y: TeamClaudeCardMetrics.chartY(hostLines: hostLines), width: rightEdge - left,
                                      height: TeamClaudeCardMetrics.chartHeight), health: health, availability: availability)
         }
-        let headY = TeamClaudeCardMetrics.tableHeadY(hostLine: hostLineShown, chart: chartShown)
+        let headY = TeamClaudeCardMetrics.tableHeadY(hostLines: hostLines, chart: chartShown)
         func soonest(_ pick: (TeamClaudeAccountHealth) -> (Int?, Date?)) -> String {
             let values = zip(health.accounts, availability).compactMap { row, state -> Double? in
                 guard teamClaudeRowGroup(state) != .excluded else { return nil }
@@ -2832,7 +2848,7 @@ final class TeamClaudeTableView: NSView {
         let groups = availability.map(teamClaudeRowGroup)
         let expanded = expandedIndex
         let grouped = teamClaudeGroupedLayout(groups: groups, lines: lines, expanded: expanded, resetKeys: health.weeklyResetKeys)
-        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLine: hostLineShown, chart: chartShown)
+        let rowsTop = TeamClaudeCardMetrics.rowsTop(hostLines: hostLines, chart: chartShown)
         let subscriptions = health.subscriptionResolutions(now: evaluatedAt)
         for heading in grouped.headings {
             let y = rowsTop + heading.y + 9
@@ -7732,8 +7748,16 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     }
     _ = NSApplication.shared
     let burnModel = subscriptionBurnFixture(fixture["burn"] as? [String: Any])
-    let health = (fixture["teamclaude"] as? [String: Any]).map {
-        parseTeamClaudeHealth(config: nil, server: nil, status: $0, port: 3456)
+    // 머신 줄은 수집기 파일 모양(fleetUsage)을 실제 파서로 읽는다. 시각은 픽스처의 나이(초) 기준이다.
+    let fleetUsage: FleetMachinesSnapshot? = (fixture["fleetUsage"] as? [String: Any]).flatMap { raw in
+        var stamped = raw
+        stamped["collected_at"] = Date().timeIntervalSince1970 - ((raw["ageSeconds"] as? NSNumber)?.doubleValue ?? 30)
+        return (try? JSONSerialization.data(withJSONObject: stamped)).flatMap(FleetMachines.parse)
+    }
+    let health = (fixture["teamclaude"] as? [String: Any]).map { status -> TeamClaudeHealth in
+        var parsed = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456)
+        parsed.machines = fleetUsage
+        return parsed
     }
     // Codex 풀은 프록시 status 모양 그대로 받아 실제 파서로 읽는다(make_dash_fixture.py --codex).
     let teamCodex = (fixture["teamcodex"] as? [String: Any]).flatMap { raw in

@@ -325,7 +325,7 @@ class AccountRowLinesWiringTests(unittest.TestCase):
         content = self._method(self.table, "static func contentHeight(")
         self.assertIn("health.rowLines(now: now, availability: availability)", content)
         self.assertIn("teamClaudeGroupedLayout(groups: availability.map(teamClaudeRowGroup)", content)
-        self.assertIn("teamClaudeCardBaseHeight(hostLine:", content)
+        self.assertIn("teamClaudeCardBaseHeight(hostLines:", content)
         self.assertNotIn("* 72", height, "row height is per row now, not a fixed multiple")
         self.assertNotIn("* 72", self.table)
         layout = self._method(self.table, "override func layout()")
@@ -431,11 +431,11 @@ class PanelStructureTests(unittest.TestCase):
     def test_card_metrics_are_shared_by_height_layout_and_draw(self):
         layout = self.table[self.table.index("override func layout()"):]
         layout = layout[:layout.index("\n    }\n")]
-        self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLine:", layout)
+        self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLines:", layout)
         draw = self.table[self.table.index("override func draw("):]
-        self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLine:", draw)
-        self.assertIn("TeamClaudeCardMetrics.stripY(hostLine:", draw)
-        self.assertIn("TeamClaudeCardMetrics.tableHeadY(hostLine:", draw)
+        self.assertIn("TeamClaudeCardMetrics.rowsTop(hostLines:", draw)
+        self.assertIn("TeamClaudeCardMetrics.stripY(hostLines:", draw)
+        self.assertIn("TeamClaudeCardMetrics.tableHeadY(hostLines:", draw)
         for literal in ("tableY + 34", "statY + 88", "topY + 14", "innerX + 790"):
             self.assertNotIn(literal, self.table, f"a hard-coded offset would diverge from the shared metrics: {literal}")
 

@@ -67,11 +67,13 @@ struct TeamClaudeRowLinesTests {
                       TeamClaudeCardMetrics.tableHeadGap, TeamClaudeCardMetrics.footerHeight, TeamClaudeCardMetrics.cardInset] {
             precondition(value.truncatingRemainder(dividingBy: 4) == 0, "card spacing follows a 4pt scale: \(value)")
         }
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false) == 120)
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: true) == 140)
-        precondition(teamClaudeCardBaseHeight(hostLine: false) == 156)
-        precondition(teamClaudeCardBaseHeight(hostLine: true) == 176, "the host line adds exactly its own height")
-        precondition(teamClaudeCardBaseHeight(hostLine: false) < 256, "stage 2 removed the four stat tiles, so the base must shrink")
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLines: 0) == 120)
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLines: 1) == 140)
+        precondition(teamClaudeCardBaseHeight(hostLines: 0) == 156)
+        precondition(teamClaudeCardBaseHeight(hostLines: 1) == 176, "the host line adds exactly its own height")
+        precondition(teamClaudeCardBaseHeight(hostLines: 2) == 196, "the machines line adds exactly one more line")
+        precondition(TeamClaudeCardMetrics.stripY(hostLines: 2) == TeamClaudeCardMetrics.stripY(hostLines: 1) + TeamClaudeCardMetrics.hostLineHeight)
+        precondition(teamClaudeCardBaseHeight(hostLines: 0) < 256, "stage 2 removed the four stat tiles, so the base must shrink")
 
         // 6. 5시간 창이 없는 계정의 세션 칸: 측정 문제 어휘 대신 "없음", 리셋 줄도 "세션 없음".
         L10n.language = .ko
@@ -133,12 +135,12 @@ struct TeamClaudeRowLinesTests {
         L10n.language = .ko
 
         // 10. 리셋 일정 그래프(A안): 그래프가 있으면 그 높이와 틈만큼 표가 내려가고, 없으면 예전 치수 그대로다.
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: false) == 120, "no chart keeps the old geometry")
-        precondition(TeamClaudeCardMetrics.rowsTop(hostLine: false, chart: true)
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLines: 0, chart: false) == 120, "no chart keeps the old geometry")
+        precondition(TeamClaudeCardMetrics.rowsTop(hostLines: 0, chart: true)
                      == 120 + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
-        precondition(teamClaudeCardBaseHeight(hostLine: true, chart: true)
-                     == teamClaudeCardBaseHeight(hostLine: true) + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
-        precondition(TeamClaudeCardMetrics.chartY(hostLine: false) == TeamClaudeCardMetrics.tableHeadY(hostLine: false),
+        precondition(teamClaudeCardBaseHeight(hostLines: 1, chart: true)
+                     == teamClaudeCardBaseHeight(hostLines: 1) + TeamClaudeCardMetrics.chartHeight + TeamClaudeCardMetrics.chartGap)
+        precondition(TeamClaudeCardMetrics.chartY(hostLines: 0) == TeamClaudeCardMetrics.tableHeadY(hostLines: 0),
                      "the chart takes the place where the table head used to start")
         // 계단: 지금 수에서 시작해 앞으로 올 리셋마다 +1, 지난 리셋은 뺀다.
         let steps = teamClaudeRecoverySteps(readyNow: 1, resets: [r3, now.addingTimeInterval(-5), reset], now: now)

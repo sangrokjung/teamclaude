@@ -736,6 +736,11 @@ enum L10n {
 
     static func hostCores(_ cores: Int) -> String { t("\(cores)코어", "\(cores) cores") }
     static var hostPrefix: String { t("호스트  ", "Host  ") }
+    static var fleetPrefix: String { t("머신  ", "Machines  ") }
+    static var fleetHubLabel: String { t("본체", "main") }
+    static var fleetOffline: String { t("끊김", "offline") }
+    static var fleetNoValue: String { t("값 없음", "no data") }
+    static func fleetStale(_ minutes: Int) -> String { t("수집 멈춤 (\(minutes)분 전)", "collector stalled (\(minutes)m ago)") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
