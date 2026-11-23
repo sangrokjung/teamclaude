@@ -179,6 +179,12 @@ struct TeamClaudeHealth {
     /// 서버 줄 아래 요약 줄 수(호스트 CPU/RAM 줄 + 머신 줄). 높이·버튼 배치·그리기가 모두 이 값을 쓴다.
     var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machinesSummaryText != nil ? 1 : 0) }
 
+    func withMachines(_ snapshot: FleetMachinesSnapshot?) -> TeamClaudeHealth {
+        var copy = self
+        copy.machines = snapshot
+        return copy
+    }
+
     // 호스트 CPU/RAM 한 줄 요약 (표시할 값이 없으면 nil → 라인 생략)
     var hostSummaryText: String? {
         guard let host = host else { return nil }
@@ -594,9 +600,8 @@ func loadTeamClaudeHealth() -> TeamClaudeHealth {
         port: port,
         apiKey: tcString(tcDict(config?["proxy"])?["apiKey"])
     )
-    var health = parseTeamClaudeHealth(config: config, server: server, status: status, port: port)
-    health.machines = FleetMachines.load()
-    return health
+    return parseTeamClaudeHealth(config: config, server: server, status: status, port: port)
+        .withMachines(FleetMachines.load())
 }
 
 func parseTeamClaudeHealth(config: [String: Any]?, server: [String: Any]?,
@@ -7754,10 +7759,8 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
         stamped["collected_at"] = Date().timeIntervalSince1970 - ((raw["ageSeconds"] as? NSNumber)?.doubleValue ?? 30)
         return (try? JSONSerialization.data(withJSONObject: stamped)).flatMap(FleetMachines.parse)
     }
-    let health = (fixture["teamclaude"] as? [String: Any]).map { status -> TeamClaudeHealth in
-        var parsed = parseTeamClaudeHealth(config: nil, server: nil, status: status, port: 3456)
-        parsed.machines = fleetUsage
-        return parsed
+    let health = (fixture["teamclaude"] as? [String: Any]).map {
+        parseTeamClaudeHealth(config: nil, server: nil, status: $0, port: 3456).withMachines(fleetUsage)
     }
     // Codex 풀은 프록시 status 모양 그대로 받아 실제 파서로 읽는다(make_dash_fixture.py --codex).
     let teamCodex = (fixture["teamcodex"] as? [String: Any]).flatMap { raw in

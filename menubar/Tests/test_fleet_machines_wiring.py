@@ -34,7 +34,7 @@ class FleetMachinesWiringTests(unittest.TestCase):
     def test_load_reads_collector_and_merges_keep_it(self):
         load = self.main[self.main.index("func loadTeamClaudeHealth()"):]
         load = load[:load.index("\n}\n")]
-        self.assertIn("health.machines = FleetMachines.load()", load)
+        self.assertIn(".withMachines(FleetMachines.load())", load)
         self.assertEqual(self.main.count("merged.machines = candidate.machines"), 2)
 
     def test_draw_places_machine_line_below_host_line(self):
