@@ -65,9 +65,17 @@ enum FleetMachines {
     }
 
     /// 대시보드 스냅샷 픽스처(fleetUsage 키)를 같은 파서로 읽는다. ageSeconds는 now 기준 수집 나이다.
+    /// 기본 나이(30초)는 키를 생략했을 때만 쓴다. 명시한 값의 타입이 틀리면 nil(스냅샷 실패).
     static func fixture(_ raw: [String: Any], now: Date) -> FleetMachinesSnapshot? {
         var stamped = raw
-        stamped["collected_at"] = now.timeIntervalSince1970 - ((raw["ageSeconds"] as? NSNumber)?.doubleValue ?? 30)
+        let ageSeconds: Double
+        if let explicit = raw["ageSeconds"] {
+            guard let value = number(explicit) else { return nil }
+            ageSeconds = value
+        } else {
+            ageSeconds = 30
+        }
+        stamped["collected_at"] = now.timeIntervalSince1970 - ageSeconds
         return (try? JSONSerialization.data(withJSONObject: stamped)).flatMap(parse)
     }
 
@@ -103,13 +111,20 @@ enum FleetMachines {
         return Int((load / Double(cores) * 100).rounded())
     }
 
-    static func isHot(_ machine: FleetMachine) -> Bool {
-        guard machine.online, loadPercent(machine) != nil else { return true }
-        if let load = machine.load1, let cores = machine.cores, load > Double(cores) * hotLoadRatio { return true }
-        if let disk = machine.diskFreeGB, disk < lowDiskGB { return true }
-        if let mem = machine.memFreePercent, mem <= lowMemFreePercent { return true }
-        return false
+    enum Problem: Equatable { case offline, noLoad, overload, lowDisk, lowMemory }
+
+    /// 문제 판정 하나로 요약의 !·정렬·경고색과 전체 목록의 사유 표시를 함께 정한다.
+    static func problems(_ machine: FleetMachine) -> [Problem] {
+        guard machine.online else { return [.offline] }
+        var found: [Problem] = []
+        if loadPercent(machine) == nil { found.append(.noLoad) }
+        if let load = machine.load1, let cores = machine.cores, load > Double(cores) * hotLoadRatio { found.append(.overload) }
+        if let disk = machine.diskFreeGB, disk < lowDiskGB { found.append(.lowDisk) }
+        if let mem = machine.memFreePercent, mem <= lowMemFreePercent { found.append(.lowMemory) }
+        return found
     }
+
+    static func isHot(_ machine: FleetMachine) -> Bool { !problems(machine).isEmpty }
 
     static func machineText(_ machine: FleetMachine) -> String {
         let name = label(machine.name)
@@ -162,14 +177,25 @@ enum FleetMachines {
         let lines = snapshot.machines.map { machine -> String in
             let name = machine.name == "hub" ? "\(L10n.fleetHubLabel) (hub)" : machine.name
             guard machine.online else { return "\(name): \(L10n.fleetOffline)" }
-            guard let percent = loadPercent(machine) else { return "\(name): \(L10n.fleetNoValue)" }
-            var parts = [L10n.fleetLoadDetail(percent)]
+            // 부하·램·디스크를 따로 적는다. 하나가 빠져도 나머지 측정값(예: 디스크 부족)은 남긴다.
+            var parts = [loadPercent(machine).map(L10n.fleetLoadDetail) ?? L10n.fleetLoadMissing]
             if let mem = machine.memFreePercent { parts.append(L10n.fleetMemDetail(Int(max(0, min(mem, 100)).rounded()))) }
             if let disk = machine.diskFreeGB, disk >= 0, disk < 1e9 { parts.append(L10n.fleetDiskDetail(Int(disk))) }
-            return "\(name): " + parts.joined(separator: " · ")
+            let warnings = problems(machine).compactMap(warningLabel)
+            let tail = warnings.isEmpty ? "" : " — " + warnings.joined(separator: ", ")
+            return "\(name): " + parts.joined(separator: " · ") + tail
         }
         let invalid = snapshot.invalidHosts > 0 ? [L10n.fleetInvalidHosts(snapshot.invalidHosts)] : []
         return lines + invalid
+    }
+
+    private static func warningLabel(_ problem: Problem) -> String? {
+        switch problem {
+        case .offline, .noLoad: return nil // 줄 본문(끊김·부하 값 없음)이 이미 말한다
+        case .overload: return L10n.fleetWarnOverload
+        case .lowDisk: return L10n.fleetWarnDisk
+        case .lowMemory: return L10n.fleetWarnMemory
+        }
     }
 
     static func isWarning(_ snapshot: FleetMachinesSnapshot?, now: Date) -> Bool {

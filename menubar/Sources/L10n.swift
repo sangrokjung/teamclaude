@@ -750,6 +750,10 @@ enum L10n {
     static func fleetLoadDetail(_ percent: Int) -> String { t("부하 \(percent)%", "load \(percent)%") }
     static func fleetMemDetail(_ percent: Int) -> String { t("램 여유 \(percent)%", "\(percent)% RAM free") }
     static func fleetDiskDetail(_ gb: Int) -> String { t("디스크 \(gb)G 남음", "\(gb)G disk free") }
+    static var fleetLoadMissing: String { t("부하 값 없음", "load n/a") }
+    static var fleetWarnOverload: String { t("과부하", "overloaded") }
+    static var fleetWarnDisk: String { t("디스크 부족", "low disk") }
+    static var fleetWarnMemory: String { t("램 부족", "low RAM") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }

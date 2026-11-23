@@ -65,8 +65,10 @@ class FleetMachinesWiringTests(unittest.TestCase):
         layout = self.main[self.main.index("override func layout() {\n        super.layout()\n        ensureReauthenticationButtons()"):]
         self.assertIn("layoutMachinesHint()", layout[:layout.index("guard let health else { return }")])
 
-    def test_bad_fleet_fixture_fails_the_snapshot(self):
-        self.assertIn('if fixture["fleetUsage"] != nil && fleetUsage == nil {', self.main)
+    def test_build_runs_the_fleet_fixture_snapshot(self):
+        # 깨진 픽스처의 실제 종료 코드는 snapshot_test_fleet_fixture.py가 후보 바이너리로 확인한다.
+        build = (ROOT / "menubar" / "build.sh").read_text()
+        self.assertIn("Tests/snapshot_test_fleet_fixture.py", build)
 
 
 if __name__ == "__main__":

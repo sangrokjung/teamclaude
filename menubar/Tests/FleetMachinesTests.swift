@@ -125,10 +125,18 @@ struct FleetMachinesTests {
         precondition(FleetMachines.isWarning(allBroken, now: now))
         // 실제로 없는 파일만 줄을 숨긴다. 읽기 권한이 없으면 오류로 드러낸다.
         precondition(FleetMachines.load(path: dir.appendingPathComponent("missing.json").path) == nil)
+        // 정상 스냅샷이 먼저 읽히는 것을 확인한 뒤 권한만 막아, 파싱 실패가 아니라 권한 오류 경로를 탄다.
         let locked = dir.appendingPathComponent("locked.json")
-        try? Data("{}".utf8).write(to: locked)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
-        precondition(FleetMachines.load(path: locked.path) == .unreadable, "a permission error must not look like 'not installed'")
+        do { try Data("{\"collected_at\": \(fresh), \"hosts\": [{\"name\": \"hub\", \"ok\": true}]}".utf8).write(to: locked) }
+        catch { preconditionFailure("could not write the permission fixture: \(error)") }
+        precondition(FleetMachines.load(path: locked.path)?.machines.count == 1, "the fixture is readable before chmod")
+        do { try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path) }
+        catch { preconditionFailure("chmod failed: \(error)") }
+        if FileManager.default.isReadableFile(atPath: locked.path) {
+            print("FleetMachinesTests: permission case skipped (this runner can read mode-000 files)")
+        } else {
+            precondition(FleetMachines.load(path: locked.path) == .unreadable, "a permission error must not look like 'not installed'")
+        }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: locked.path)
 
         // 14. 여러 대가 함께 끊기거나 값이 빠져도 좁은 폭에서 문제 머신이 먼저 보인다. 전체 목록은 원래 이름으로 준다.
@@ -144,12 +152,32 @@ struct FleetMachinesTests {
         precondition(detail.count == 17)
         precondition(detail.first == "본체 (hub): 부하 10%")
         precondition(detail.contains("worker-east-14: 끊김") && detail.contains("worker-east-15: 끊김")
-                     && detail.contains("worker-east-16: 값 없음"), "full names tell the workers apart: \(detail)")
+                     && detail.contains("worker-east-16: 부하 값 없음"), "full names tell the workers apart: \(detail)")
         let rich = FleetMachines.parse(sample)
         precondition(FleetMachines.detailLines(rich, now: now)?[1] == "alpha: 부하 41% · 램 여유 67% · 디스크 17G 남음")
         precondition(FleetMachines.detailLines(old, now: now) == ["수집 멈춤 (10분 전)"])
         precondition(FleetMachines.detailLines(nil, now: now) == nil)
         precondition(FleetMachines.detailLines(mixed, now: now) == ["본체 (hub): 부하 10%", "형식 오류 1대"])
+
+        // 15. 경고 경계 — 표시 수치가 같아도(둘 다 150%) 경고한 머신만 전체 목록에 사유가 붙는다.
+        let boundary = FleetMachines.parse(json("""
+        {"collected_at": \(fresh), "hosts": [
+          {"name": "worker-east-01", "ok": true, "load1": 24.01, "cores": 16},
+          {"name": "worker-east-02", "ok": true, "load1": 23.99, "cores": 16}]}
+        """))
+        precondition(FleetMachines.detailLines(boundary, now: now) == ["worker-east-01: 부하 150% — 과부하", "worker-east-02: 부하 150%"])
+        precondition(FleetMachines.summaryText(boundary, now: now) == "머신  !worker-… 150% · worker-… 150%")
+
+        // 16. 부하만 빠져도 디스크·램 측정값과 경고는 남는다.
+        let partialDisk = FleetMachines.parse(json("""
+        {"collected_at": \(fresh), "hosts": [{"name": "node7", "ok": true, "load1": 2, "mem_free_pct": 9, "disk_free_gb": 2}]}
+        """))
+        precondition(FleetMachines.detailLines(partialDisk, now: now) == ["node7: 부하 값 없음 · 램 여유 9% · 디스크 2G 남음 — 디스크 부족, 램 부족"])
+
+        // 17. 픽스처 나이는 생략만 기본값이고, 타입이 틀리면 실패한다.
+        precondition(FleetMachines.fixture(["ageSeconds": "600", "hosts": [["name": "hub", "ok": true]]], now: now) == nil)
+        precondition(FleetMachines.fixture(["hosts": [["name": "hub", "ok": true, "load1": 3, "cores": 30]]], now: now)
+                     .flatMap { FleetMachines.summaryText($0, now: now) } == "머신  본체 10%")
 
         // 13. 픽스처 변환은 나이(초)로 수집 시각을 만든다.
         let fx = FleetMachines.fixture(["ageSeconds": 600, "hosts": [["name": "hub", "ok": true, "load1": 3, "cores": 30]]], now: now)
