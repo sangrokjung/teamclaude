@@ -27,7 +27,7 @@ class FleetMachinesWiringTests(unittest.TestCase):
 
     def test_line_count_counts_host_and_machine_lines(self):
         self.assertIn(
-            "var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machinesSummaryText != nil ? 1 : 0) }",
+            "var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machines != nil ? 1 : 0) }",
             self.main,
         )
 
@@ -40,9 +40,19 @@ class FleetMachinesWiringTests(unittest.TestCase):
     def test_draw_places_machine_line_below_host_line(self):
         draw = self.main[self.main.index("var summaryY = topY + TeamClaudeCardMetrics.headerHeight"):]
         draw = draw[:draw.index("// 측정·연동 안내")]
-        self.assertLess(draw.index("hostSummaryText"), draw.index("machinesSummaryText"))
+        self.assertLess(draw.index("hostSummaryText"), draw.index("FleetMachines.summaryText"))
         self.assertIn("summaryY += TeamClaudeCardMetrics.hostLineHeight", draw)
-        self.assertIn("PanelDraw.clipped(machinesText", draw)
+        # 신선도는 표를 그리는 시각(1초 주기)으로 판정한다. 상태 조회 시각(10초 주기)이면 멈춤을 늦게 알린다.
+        self.assertIn("FleetMachines.summaryText(health.machines, now: evaluatedAt,", draw)
+        self.assertIn("FleetMachines.isWarning(health.machines, now: evaluatedAt)", draw)
+        self.assertIn("fits: { PanelDraw.width($0, micro) <= machinesWidth }", draw)
+        self.assertNotIn("checkedAt", draw)
+
+    def test_accessibility_label_carries_the_full_machine_list(self):
+        refresh = self.main[self.main.index("func refreshTime(now: Date = Date())"):]
+        refresh = refresh[:refresh.index("setAccessibilityHelp(")]
+        self.assertIn("FleetMachines.summaryText(health.machines, now: now)", refresh)
+        self.assertNotIn("fits:", refresh, "the spoken label must not be shortened to the drawn width")
 
 
 if __name__ == "__main__":

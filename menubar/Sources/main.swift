@@ -174,10 +174,9 @@ struct TeamClaudeHealth {
     /// 본체·워커 머신 활성 상태(하네스 수집기 파일). 없으면 줄을 그리지 않는다.
     var machines: FleetMachinesSnapshot? = nil
 
-    var machinesSummaryText: String? { FleetMachines.summaryText(machines, now: checkedAt) }
-    var machinesIsWarning: Bool { FleetMachines.isWarning(machines, now: checkedAt) }
     /// 서버 줄 아래 요약 줄 수(호스트 CPU/RAM 줄 + 머신 줄). 높이·버튼 배치·그리기가 모두 이 값을 쓴다.
-    var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machinesSummaryText != nil ? 1 : 0) }
+    /// 머신 줄은 스냅샷이 있으면 언제나 한 줄이다(문구·신선도는 그리는 시각에 정한다).
+    var hostLineCount: Int { (hostSummaryText != nil ? 1 : 0) + (machines != nil ? 1 : 0) }
 
     func withMachines(_ snapshot: FleetMachinesSnapshot?) -> TeamClaudeHealth {
         var copy = self
@@ -2190,7 +2189,8 @@ final class TeamClaudeTableView: NSView {
         setAccessibilityLabel(L10n.claudeTableAccessibility(ready: ready, total: total, usable: health.routableCount,
                                                            drift: health.accountConfigDrift, pending: health.measurementPendingCount,
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
-                                                           fableOver: health.fableOver, status: health.statusLabel))
+                                                           fableOver: health.fableOver, status: health.statusLabel)
+                              + (FleetMachines.summaryText(health.machines, now: now).map { ". " + $0 } ?? ""))
         setAccessibilityHelp(health.measurementPendingCount > 0 ? L10n.measureReturnHelp : nil)
         for (button, state) in zip(subscriptionButtons, availability) {
             button.refreshTitle(now: now, appearance: state.subscriptionAppearance)
@@ -2735,9 +2735,11 @@ final class TeamClaudeTableView: NSView {
             PanelDraw.text(hostText, left, summaryY, micro, health.hostIsWarning ? ember : fg3)
             summaryY += TeamClaudeCardMetrics.hostLineHeight
         }
-        if let machinesText = health.machinesSummaryText {
-            PanelDraw.text(PanelDraw.clipped(machinesText, micro, maxWidth: rightEdge - left), left, summaryY, micro,
-                           health.machinesIsWarning ? amber : fg3)
+        let machinesWidth = rightEdge - left
+        if let machinesText = FleetMachines.summaryText(health.machines, now: evaluatedAt,
+                                                         fits: { PanelDraw.width($0, micro) <= machinesWidth }) {
+            PanelDraw.text(PanelDraw.clipped(machinesText, micro, maxWidth: machinesWidth), left, summaryY, micro,
+                           FleetMachines.isWarning(health.machines, now: evaluatedAt) ? amber : fg3)
         }
 
         // 측정·연동 안내
@@ -7754,11 +7756,7 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     _ = NSApplication.shared
     let burnModel = subscriptionBurnFixture(fixture["burn"] as? [String: Any])
     // 머신 줄은 수집기 파일 모양(fleetUsage)을 실제 파서로 읽는다. 시각은 픽스처의 나이(초) 기준이다.
-    let fleetUsage: FleetMachinesSnapshot? = (fixture["fleetUsage"] as? [String: Any]).flatMap { raw in
-        var stamped = raw
-        stamped["collected_at"] = Date().timeIntervalSince1970 - ((raw["ageSeconds"] as? NSNumber)?.doubleValue ?? 30)
-        return (try? JSONSerialization.data(withJSONObject: stamped)).flatMap(FleetMachines.parse)
-    }
+    let fleetUsage = (fixture["fleetUsage"] as? [String: Any]).flatMap { FleetMachines.fixture($0, now: Date()) }
     let health = (fixture["teamclaude"] as? [String: Any]).map {
         parseTeamClaudeHealth(config: nil, server: nil, status: $0, port: 3456).withMachines(fleetUsage)
     }

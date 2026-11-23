@@ -4,7 +4,7 @@ import Foundation
 // 값은 외부 수집기(1분 주기로 본체와 워커의 load·코어·램·디스크를 모으는 스크립트)가 쓰는
 // ~/.claude/cache/fleet-usage.json 하나만 읽는다. 메뉴바가 직접 ssh 하지 않는다.
 // 파일 모양: {"collected_at": <unix 초>, "hosts": [{"name", "ok", "load1", "cores", "mem_free_pct", "disk_free_gb"}]}
-// 파일이 없는 기계(수집기가 없는 노드)에서는 줄 자체를 그리지 않는다.
+// 파일이 없는 기계(수집기가 없는 노드)에서는 줄 자체를 그리지 않는다. 파일이 있는데 못 읽으면 숨기지 않고 오류를 말한다.
 
 struct FleetMachine: Equatable {
     let name: String
@@ -16,34 +16,53 @@ struct FleetMachine: Equatable {
 }
 
 struct FleetMachinesSnapshot: Equatable {
-    let collectedAt: Date
+    /// nil이면 파일은 있는데 읽거나 해석하지 못했다.
+    let collectedAt: Date?
     let machines: [FleetMachine]
+    /// 형식이 맞지 않아 뺀 머신 기록 수(조용히 버리지 않고 줄에 센다).
+    var invalidHosts: Int = 0
+
+    static let unreadable = FleetMachinesSnapshot(collectedAt: nil, machines: [])
 }
 
 enum FleetMachines {
     /// 수집기는 1분마다 쓴다. 3분 넘게 그대로면 수집이 멈춘 것으로 본다(상태줄 mod와 같은 기준).
     static let staleSeconds: TimeInterval = 180
+    static let futureSkewSeconds: TimeInterval = 60
     static let hotLoadRatio = 1.5
     static let lowDiskGB = 15.0
     static let lowMemFreePercent = 15.0
     static let maxMachines = 17 // 수집기 상한(워커 16 + 본체)
+    /// 이 범위를 벗어난 수는 손상된 값으로 보고 쓰지 않는다(Int 변환 트랩 방지).
+    static let maxLoad = 1_000_000.0
+    static let maxEpochSeconds = 10_000_000_000.0
 
     static func defaultPath(home: String = NSHomeDirectory()) -> String {
         (home as NSString).appendingPathComponent(".claude/cache/fleet-usage.json")
     }
 
+    /// 파일이 없으면 nil(줄 생략), 있는데 못 읽거나 해석이 안 되면 `.unreadable`.
     static func load(path: String = defaultPath()) -> FleetMachinesSnapshot? {
-        guard let data = FileManager.default.contents(atPath: path) else { return nil }
-        return parse(data)
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        guard let data = FileManager.default.contents(atPath: path) else { return .unreadable }
+        return parse(data) ?? .unreadable
     }
 
     static func parse(_ data: Data) -> FleetMachinesSnapshot? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let collected = number(object["collected_at"]), collected > 0,
+              let collected = number(object["collected_at"]), collected > 0, collected < maxEpochSeconds,
               let hosts = object["hosts"] as? [Any] else { return nil }
-        let machines = hosts.prefix(maxMachines).compactMap { machine($0) }
-        guard !machines.isEmpty else { return nil }
-        return FleetMachinesSnapshot(collectedAt: Date(timeIntervalSince1970: collected), machines: machines)
+        let considered = Array(hosts.prefix(maxMachines))
+        let machines = considered.compactMap { machine($0) }
+        return FleetMachinesSnapshot(collectedAt: Date(timeIntervalSince1970: collected), machines: machines,
+                                     invalidHosts: considered.count - machines.count)
+    }
+
+    /// 대시보드 스냅샷 픽스처(fleetUsage 키)를 같은 파서로 읽는다. ageSeconds는 now 기준 수집 나이다.
+    static func fixture(_ raw: [String: Any], now: Date) -> FleetMachinesSnapshot? {
+        var stamped = raw
+        stamped["collected_at"] = now.timeIntervalSince1970 - ((raw["ageSeconds"] as? NSNumber)?.doubleValue ?? 30)
+        return (try? JSONSerialization.data(withJSONObject: stamped)).flatMap(parse)
     }
 
     private static func machine(_ raw: Any) -> FleetMachine? {
@@ -51,7 +70,7 @@ enum FleetMachines {
         return FleetMachine(
             name: name,
             online: host["ok"] as? Bool == true,
-            load1: number(host["load1"]).flatMap { $0 >= 0 ? $0 : nil },
+            load1: number(host["load1"]).flatMap { $0 >= 0 && $0 < maxLoad ? $0 : nil },
             cores: number(host["cores"]).flatMap { $0 >= 1 && $0 < 10_000 ? Int($0) : nil },
             memFreePercent: number(host["mem_free_pct"]),
             diskFreeGB: number(host["disk_free_gb"])
@@ -93,23 +112,45 @@ enum FleetMachines {
         return (isHot(machine) ? "!" : "") + "\(name) \(percent)%"
     }
 
-    static func isStale(_ snapshot: FleetMachinesSnapshot, now: Date) -> Bool {
-        let age = now.timeIntervalSince(snapshot.collectedAt)
-        return age > staleSeconds || age < -60
+    /// 수집 나이(초). 파일을 못 읽었으면 nil.
+    private static func age(_ snapshot: FleetMachinesSnapshot, now: Date) -> TimeInterval? {
+        snapshot.collectedAt.map { now.timeIntervalSince($0) }
     }
 
-    /// 표 상단에 그릴 한 줄. 스냅샷이 없으면 nil(줄 생략).
-    static func summaryText(_ snapshot: FleetMachinesSnapshot?, now: Date) -> String? {
+    static func isStale(_ snapshot: FleetMachinesSnapshot, now: Date) -> Bool {
+        guard let age = age(snapshot, now: now) else { return false }
+        return age > staleSeconds || age < -futureSkewSeconds
+    }
+
+    /// 상태 문구(머신 목록이 아닌 경우). nil이면 머신 목록을 보여 줄 상태다.
+    private static func condition(_ snapshot: FleetMachinesSnapshot, now: Date) -> String? {
+        guard let age = age(snapshot, now: now) else { return L10n.fleetUnreadable }
+        if age < -futureSkewSeconds { return L10n.fleetFutureTime }
+        if age > staleSeconds { return L10n.fleetStale(Int(min(age, 1e9) / 60)) }
+        if snapshot.machines.isEmpty { return L10n.fleetEmpty }
+        return nil
+    }
+
+    /// 한 줄 문구. 스냅샷이 없으면 nil(줄 생략).
+    /// fits를 주면 그 폭에 맞춘다: 문제 있는 머신(끊김·과부하·값 없음)을 앞에 두고, 못 넣은 머신은 "외 N대"로 센다.
+    static func summaryText(_ snapshot: FleetMachinesSnapshot?, now: Date, fits: ((String) -> Bool)? = nil) -> String? {
         guard let snapshot = snapshot else { return nil }
-        if isStale(snapshot, now: now) {
-            let minutes = max(0, Int(now.timeIntervalSince(snapshot.collectedAt) / 60))
-            return L10n.fleetPrefix + L10n.fleetStale(minutes)
+        if let condition = condition(snapshot, now: now) { return L10n.fleetPrefix + condition }
+        let invalid = snapshot.invalidHosts > 0 ? [L10n.fleetInvalidHosts(snapshot.invalidHosts)] : []
+        let all = snapshot.machines.map(machineText)
+        let full = L10n.fleetPrefix + (all + invalid).joined(separator: " · ")
+        guard let fits = fits, !fits(full) else { return full }
+        let ordered = snapshot.machines.filter(isHot).map(machineText) + snapshot.machines.filter { !isHot($0) }.map(machineText)
+        for shown in stride(from: ordered.count - 1, through: 0, by: -1) {
+            let rest = [L10n.fleetMore(ordered.count - shown)]
+            let candidate = L10n.fleetPrefix + (invalid + ordered.prefix(shown) + rest).joined(separator: " · ")
+            if fits(candidate) { return candidate }
         }
-        return L10n.fleetPrefix + snapshot.machines.map(machineText).joined(separator: " · ")
+        return L10n.fleetPrefix + L10n.fleetMore(ordered.count)
     }
 
     static func isWarning(_ snapshot: FleetMachinesSnapshot?, now: Date) -> Bool {
         guard let snapshot = snapshot else { return false }
-        return isStale(snapshot, now: now) || snapshot.machines.contains(where: isHot)
+        return condition(snapshot, now: now) != nil || snapshot.invalidHosts > 0 || snapshot.machines.contains(where: isHot)
     }
 }

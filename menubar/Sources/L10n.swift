@@ -741,6 +741,11 @@ enum L10n {
     static var fleetOffline: String { t("끊김", "offline") }
     static var fleetNoValue: String { t("값 없음", "no data") }
     static func fleetStale(_ minutes: Int) -> String { t("수집 멈춤 (\(minutes)분 전)", "collector stalled (\(minutes)m ago)") }
+    static var fleetUnreadable: String { t("수집 파일 읽기 실패", "collector file unreadable") }
+    static var fleetFutureTime: String { t("수집 시각 오류(미래)", "collector time is in the future") }
+    static var fleetEmpty: String { t("수집된 머신 없음", "no machines collected") }
+    static func fleetInvalidHosts(_ count: Int) -> String { t("형식 오류 \(count)대", "\(count) malformed") }
+    static func fleetMore(_ count: Int) -> String { t("외 \(count)대", "+\(count) more") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
