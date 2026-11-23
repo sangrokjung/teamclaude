@@ -2138,6 +2138,8 @@ final class TeamClaudeTableView: NSView {
     }
     private var refreshTimer: Timer?
     private(set) var evaluatedAt = Date()
+    /// 머신 줄 툴팁 영역(전체 목록). 스냅샷이 없으면 숨긴다.
+    private let machinesHint = FleetMachinesHintView()
 
     /// 펼친 계정 이름. 바뀌면 소유자(대시보드)가 표 높이를 다시 잡는다.
     var expandedAccount: String? {
@@ -2190,7 +2192,8 @@ final class TeamClaudeTableView: NSView {
                                                            drift: health.accountConfigDrift, pending: health.measurementPendingCount,
                                                            unavailable: health.measurementUnavailableCount, limited: health.quotaLimitedCount,
                                                            fableOver: health.fableOver, status: health.statusLabel)
-                              + (FleetMachines.summaryText(health.machines, now: now).map { ". " + $0 } ?? ""))
+                              + (FleetMachines.detailLines(health.machines, now: now).map { ". " + L10n.fleetPrefix + $0.joined(separator: ", ") } ?? ""))
+        machinesHint.toolTip = FleetMachines.detailLines(health.machines, now: now)?.joined(separator: "\n")
         setAccessibilityHelp(health.measurementPendingCount > 0 ? L10n.measureReturnHelp : nil)
         for (button, state) in zip(subscriptionButtons, availability) {
             button.refreshTitle(now: now, appearance: state.subscriptionAppearance)
@@ -2597,6 +2600,21 @@ final class TeamClaudeTableView: NSView {
         health.measurementPendingCount > 0 && !isMeasuring && health.accountConfigDrift == 0
     }
 
+    /// 머신 줄과 같은 자리(서버 줄 아래, 호스트 줄이 있으면 그 아래)에 툴팁 영역을 둔다.
+    private func layoutMachinesHint() {
+        if machinesHint.superview !== self { addSubview(machinesHint) }
+        guard let health, health.machines != nil else {
+            machinesHint.isHidden = true
+            return
+        }
+        let y = TeamClaudeCardMetrics.titleY(hostLines: health.hostLineCount) + TeamClaudeCardMetrics.headerHeight
+            + (health.hostSummaryText != nil ? TeamClaudeCardMetrics.hostLineHeight : 0)
+        machinesHint.frame = NSRect(x: TeamClaudeColumns.padding, y: y,
+                                    width: max(0, bounds.width - 2 * TeamClaudeColumns.padding),
+                                    height: TeamClaudeCardMetrics.hostLineHeight)
+        machinesHint.isHidden = false
+    }
+
     override func layout() {
         super.layout()
         ensureReauthenticationButtons()
@@ -2611,6 +2629,7 @@ final class TeamClaudeTableView: NSView {
                                   width: button.fittingWidth, height: PanelButton.height)
         }
         refreshTime(now: evaluatedAt)
+        layoutMachinesHint()
         guard let health else { return }
         let chartShown = health.weeklyChartShown(now: evaluatedAt)
         laidOutChart = chartShown
@@ -7757,6 +7776,10 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
     let burnModel = subscriptionBurnFixture(fixture["burn"] as? [String: Any])
     // 머신 줄은 수집기 파일 모양(fleetUsage)을 실제 파서로 읽는다. 시각은 픽스처의 나이(초) 기준이다.
     let fleetUsage = (fixture["fleetUsage"] as? [String: Any]).flatMap { FleetMachines.fixture($0, now: Date()) }
+    if fixture["fleetUsage"] != nil && fleetUsage == nil {
+        fputs("DASHBOARD-SNAPSHOT: fleetUsage 픽스처 해석 실패 \(fixturePath)\n", stderr)
+        exit(1)
+    }
     let health = (fixture["teamclaude"] as? [String: Any]).map {
         parseTeamClaudeHealth(config: nil, server: nil, status: $0, port: 3456).withMachines(fleetUsage)
     }

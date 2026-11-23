@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 // 본체·워커 머신 활성 상태 한 줄(2026-11-23 대표 요청: 워커 머신까지 모든 머신을 메뉴바에).
 // 값은 외부 수집기(1분 주기로 본체와 워커의 load·코어·램·디스크를 모으는 스크립트)가 쓰는
@@ -41,11 +41,17 @@ enum FleetMachines {
         (home as NSString).appendingPathComponent(".claude/cache/fleet-usage.json")
     }
 
-    /// 파일이 없으면 nil(줄 생략), 있는데 못 읽거나 해석이 안 되면 `.unreadable`.
+    /// 파일이 실제로 없을 때만 nil(줄 생략). 권한 오류·읽기 실패·해석 실패는 `.unreadable`로 드러낸다.
     static func load(path: String = defaultPath()) -> FleetMachinesSnapshot? {
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        guard let data = FileManager.default.contents(atPath: path) else { return .unreadable }
-        return parse(data) ?? .unreadable
+        do {
+            return parse(try Data(contentsOf: URL(fileURLWithPath: path))) ?? .unreadable
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return nil
+        } catch {
+            return .unreadable
+        }
     }
 
     static func parse(_ data: Data) -> FleetMachinesSnapshot? {
@@ -98,7 +104,7 @@ enum FleetMachines {
     }
 
     static func isHot(_ machine: FleetMachine) -> Bool {
-        guard machine.online else { return true }
+        guard machine.online, loadPercent(machine) != nil else { return true }
         if let load = machine.load1, let cores = machine.cores, load > Double(cores) * hotLoadRatio { return true }
         if let disk = machine.diskFreeGB, disk < lowDiskGB { return true }
         if let mem = machine.memFreePercent, mem <= lowMemFreePercent { return true }
@@ -126,8 +132,8 @@ enum FleetMachines {
     private static func condition(_ snapshot: FleetMachinesSnapshot, now: Date) -> String? {
         guard let age = age(snapshot, now: now) else { return L10n.fleetUnreadable }
         if age < -futureSkewSeconds { return L10n.fleetFutureTime }
-        if age > staleSeconds { return L10n.fleetStale(Int(min(age, 1e9) / 60)) }
-        if snapshot.machines.isEmpty { return L10n.fleetEmpty }
+        if age > staleSeconds { return age < 1e9 ? L10n.fleetStale(Int(age / 60)) : L10n.fleetStaleLong }
+        if snapshot.machines.isEmpty { return snapshot.invalidHosts > 0 ? L10n.fleetInvalidHosts(snapshot.invalidHosts) : L10n.fleetEmpty }
         return nil
     }
 
@@ -149,8 +155,32 @@ enum FleetMachines {
         return L10n.fleetPrefix + L10n.fleetMore(ordered.count)
     }
 
+    /// 머신마다 원래 이름과 상태를 담은 전체 목록(툴팁·접근성용). 화면 폭에 맞춰 줄이지 않는다.
+    static func detailLines(_ snapshot: FleetMachinesSnapshot?, now: Date) -> [String]? {
+        guard let snapshot = snapshot else { return nil }
+        if let condition = condition(snapshot, now: now) { return [condition] }
+        let lines = snapshot.machines.map { machine -> String in
+            let name = machine.name == "hub" ? "\(L10n.fleetHubLabel) (hub)" : machine.name
+            guard machine.online else { return "\(name): \(L10n.fleetOffline)" }
+            guard let percent = loadPercent(machine) else { return "\(name): \(L10n.fleetNoValue)" }
+            var parts = [L10n.fleetLoadDetail(percent)]
+            if let mem = machine.memFreePercent { parts.append(L10n.fleetMemDetail(Int(max(0, min(mem, 100)).rounded()))) }
+            if let disk = machine.diskFreeGB, disk >= 0, disk < 1e9 { parts.append(L10n.fleetDiskDetail(Int(disk))) }
+            return "\(name): " + parts.joined(separator: " · ")
+        }
+        let invalid = snapshot.invalidHosts > 0 ? [L10n.fleetInvalidHosts(snapshot.invalidHosts)] : []
+        return lines + invalid
+    }
+
     static func isWarning(_ snapshot: FleetMachinesSnapshot?, now: Date) -> Bool {
         guard let snapshot = snapshot else { return false }
         return condition(snapshot, now: now) != nil || snapshot.invalidHosts > 0 || snapshot.machines.contains(where: isHot)
     }
+}
+
+/// 머신 줄 위에 겹쳐 놓는 투명한 영역. 마우스를 올리면 원래 이름과 상태 전체를 툴팁으로 보여 준다
+/// ('외 N대'로 줄어든 머신도 여기서 확인한다). 그리기는 표가 하고, 클릭은 표로 넘긴다.
+final class FleetMachinesHintView: NSView {
+    override func mouseDown(with event: NSEvent) { superview?.mouseDown(with: event) }
+    override func mouseUp(with event: NSEvent) { superview?.mouseUp(with: event) }
 }

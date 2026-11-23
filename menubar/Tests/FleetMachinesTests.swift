@@ -97,7 +97,11 @@ struct FleetMachinesTests {
         precondition(FleetMachines.summaryText(huge, now: now) == "머신  본체 값 없음")
         precondition(FleetMachines.parse(json("{\"collected_at\": 1e300, \"hosts\": []}")) == nil, "absurd timestamp is rejected")
         let ancient = FleetMachines.parse(json("{\"collected_at\": 1, \"hosts\": [{\"name\": \"hub\", \"ok\": true}]}"))
-        precondition(FleetMachines.summaryText(ancient, now: now)?.hasPrefix("머신  수집 멈춤 (") == true)
+        precondition(FleetMachines.summaryText(ancient, now: now) == "머신  수집 멈춤 (오래 전)", "beyond the exact range it says so instead of a clamped number")
+        let monthOld = FleetMachines.parse(json("{\"collected_at\": \(Int(now.timeIntervalSince1970) - 2_592_000), \"hosts\": [{\"name\": \"hub\", \"ok\": true}]}"))
+        precondition(FleetMachines.summaryText(monthOld, now: now) == "머신  수집 멈춤 (43200분 전)", "exact minutes inside the range")
+        let epochZeroish = FleetMachinesSnapshot(collectedAt: Date(timeIntervalSince1970: 1), machines: [])
+        precondition(FleetMachines.summaryText(epochZeroish, now: Date(timeIntervalSince1970: 5e9)) == "머신  수집 멈춤 (오래 전)")
 
         // 12. 파일이 있는데 못 읽으면 숨기지 않는다. 일부 기록만 깨져도 센다. 빈 목록도 말한다.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("fleet-test-\(UUID().uuidString)")
@@ -116,6 +120,36 @@ struct FleetMachinesTests {
         precondition(FleetMachines.isWarning(mixed, now: now))
         let empty = FleetMachines.parse(json("{\"collected_at\": \(fresh), \"hosts\": []}"))
         precondition(FleetMachines.summaryText(empty, now: now) == "머신  수집된 머신 없음")
+        let allBroken = FleetMachines.parse(json("{\"collected_at\": \(fresh), \"hosts\": [{}, {}]}"))
+        precondition(FleetMachines.summaryText(allBroken, now: now) == "머신  형식 오류 2대", "all-broken is not an empty fleet")
+        precondition(FleetMachines.isWarning(allBroken, now: now))
+        // 실제로 없는 파일만 줄을 숨긴다. 읽기 권한이 없으면 오류로 드러낸다.
+        precondition(FleetMachines.load(path: dir.appendingPathComponent("missing.json").path) == nil)
+        let locked = dir.appendingPathComponent("locked.json")
+        try? Data("{}".utf8).write(to: locked)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        precondition(FleetMachines.load(path: locked.path) == .unreadable, "a permission error must not look like 'not installed'")
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: locked.path)
+
+        // 14. 여러 대가 함께 끊기거나 값이 빠져도 좁은 폭에서 문제 머신이 먼저 보인다. 전체 목록은 원래 이름으로 준다.
+        var many = ["{\"name\": \"hub\", \"ok\": true, \"load1\": 3, \"cores\": 30}"]
+        for i in 1...13 { many.append("{\"name\": \"worker-east-\(i)\", \"ok\": true, \"load1\": 1, \"cores\": 10}") }
+        many.append("{\"name\": \"worker-east-14\", \"ok\": false}")
+        many.append("{\"name\": \"worker-east-15\", \"ok\": false}")
+        many.append("{\"name\": \"worker-east-16\", \"ok\": true}")
+        let storm = FleetMachines.parse(json("{\"collected_at\": \(fresh), \"hosts\": [\(many.joined(separator: ","))]}"))
+        let tight = FleetMachines.summaryText(storm, now: now, fits: { $0.count <= 70 }) ?? ""
+        precondition(tight.hasPrefix("머신  worker-… 끊김 · worker-… 끊김 · worker-… 값 없음 · "), tight)
+        let detail = FleetMachines.detailLines(storm, now: now) ?? []
+        precondition(detail.count == 17)
+        precondition(detail.first == "본체 (hub): 부하 10%")
+        precondition(detail.contains("worker-east-14: 끊김") && detail.contains("worker-east-15: 끊김")
+                     && detail.contains("worker-east-16: 값 없음"), "full names tell the workers apart: \(detail)")
+        let rich = FleetMachines.parse(sample)
+        precondition(FleetMachines.detailLines(rich, now: now)?[1] == "alpha: 부하 41% · 램 여유 67% · 디스크 17G 남음")
+        precondition(FleetMachines.detailLines(old, now: now) == ["수집 멈춤 (10분 전)"])
+        precondition(FleetMachines.detailLines(nil, now: now) == nil)
+        precondition(FleetMachines.detailLines(mixed, now: now) == ["본체 (hub): 부하 10%", "형식 오류 1대"])
 
         // 13. 픽스처 변환은 나이(초)로 수집 시각을 만든다.
         let fx = FleetMachines.fixture(["ageSeconds": 600, "hosts": [["name": "hub", "ok": true, "load1": 3, "cores": 30]]], now: now)

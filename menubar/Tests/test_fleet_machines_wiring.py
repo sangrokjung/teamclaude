@@ -51,8 +51,22 @@ class FleetMachinesWiringTests(unittest.TestCase):
     def test_accessibility_label_carries_the_full_machine_list(self):
         refresh = self.main[self.main.index("func refreshTime(now: Date = Date())"):]
         refresh = refresh[:refresh.index("setAccessibilityHelp(")]
-        self.assertIn("FleetMachines.summaryText(health.machines, now: now)", refresh)
+        # 접근성과 툴팁은 화면 폭에 맞춰 줄인 문구가 아니라 원래 이름의 전체 목록을 쓴다.
+        self.assertIn("FleetMachines.detailLines(health.machines, now: now)", refresh)
+        self.assertIn("machinesHint.toolTip = FleetMachines.detailLines(health.machines, now: now)", self.main)
         self.assertNotIn("fits:", refresh, "the spoken label must not be shortened to the drawn width")
+
+    def test_hint_area_sits_on_the_machine_line(self):
+        hint = self.main[self.main.index("private func layoutMachinesHint()"):]
+        hint = hint[:hint.index("\n    }\n")]
+        self.assertIn("TeamClaudeCardMetrics.titleY(hostLines: health.hostLineCount) + TeamClaudeCardMetrics.headerHeight", hint)
+        self.assertIn("health.hostSummaryText != nil ? TeamClaudeCardMetrics.hostLineHeight : 0", hint)
+        self.assertIn("machinesHint.isHidden = true", hint)
+        layout = self.main[self.main.index("override func layout() {\n        super.layout()\n        ensureReauthenticationButtons()"):]
+        self.assertIn("layoutMachinesHint()", layout[:layout.index("guard let health else { return }")])
+
+    def test_bad_fleet_fixture_fails_the_snapshot(self):
+        self.assertIn('if fixture["fleetUsage"] != nil && fleetUsage == nil {', self.main)
 
 
 if __name__ == "__main__":

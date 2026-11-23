@@ -746,6 +746,10 @@ enum L10n {
     static var fleetEmpty: String { t("수집된 머신 없음", "no machines collected") }
     static func fleetInvalidHosts(_ count: Int) -> String { t("형식 오류 \(count)대", "\(count) malformed") }
     static func fleetMore(_ count: Int) -> String { t("외 \(count)대", "+\(count) more") }
+    static var fleetStaleLong: String { t("수집 멈춤 (오래 전)", "collector stalled (long ago)") }
+    static func fleetLoadDetail(_ percent: Int) -> String { t("부하 \(percent)%", "load \(percent)%") }
+    static func fleetMemDetail(_ percent: Int) -> String { t("램 여유 \(percent)%", "\(percent)% RAM free") }
+    static func fleetDiskDetail(_ gb: Int) -> String { t("디스크 \(gb)G 남음", "\(gb)G disk free") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
