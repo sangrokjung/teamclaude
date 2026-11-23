@@ -152,6 +152,7 @@ GitHub Releases에서 받는 배포본입니다. macOS 13 이상, Apple Silicon�
 탭마다 쓰는 도구(TeamClaude, TeamCodex, Codex CLI, Higgsfield, ccusage, Grok, Antigravity CLI)가 없으면
 그 카드는 오류 대신 "미설치" 또는 "데이터 없음" 안내를 그리고, 메뉴바 제목에도 올리지 않습니다.
 구독 확인 수집기는 선택 기능이라 상태 파일이 없으면 소진 탭에 "수집기 미설치(선택 기능)"로 표시합니다.
+TeamClaude 머리 아래 머신 줄은 `~/.claude/cache/fleet-usage.json`(외부 수집기가 1분마다 쓰는 파일: `{"collected_at", "hosts": [{"name", "ok", "load1", "cores", "mem_free_pct", "disk_free_gb"}]}`)을 읽어 머신마다 부하율(load ÷ 코어)·"끊김"을 보여 주고, 3분 넘게 갱신이 없으면 "수집 멈춤"으로 표시합니다. 파일이 없으면 줄을 숨깁니다.
 
 메뉴바 앱은 셸 PATH를 물려받지 않아 실행 파일을 직접 찾습니다. 순서는 다음과 같습니다.
 

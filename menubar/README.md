@@ -158,6 +158,7 @@ The app is not signed or notarized with an Apple developer ID, so you have to op
 If a tab's tool (TeamClaude, TeamCodex, Codex CLI, Higgsfield, ccusage, Grok, Antigravity CLI) is not on the Mac,
 its card shows a "Not installed" or "No data" notice instead of an error, and the menu-bar title leaves it out.
 The plan collector is optional; without its state file the Burn tab shows "Collector not installed (optional)".
+The machines line under the TeamClaude header reads `~/.claude/cache/fleet-usage.json` (written by an external collector every minute: `{"collected_at", "hosts": [{"name", "ok", "load1", "cores", "mem_free_pct", "disk_free_gb"}]}`) and shows each machine's load ÷ cores, "offline", or "collector stalled" after 3 minutes; without the file the line is hidden.
 If ccusage is installed but a run fails (exit code, timeout, unreadable output), the Usage card shows "Usage Needs check"
 with the cause instead of "No data". When earlier values exist they stay on screen, and the Usage card and its header get
 a "refresh failed (cause) · previous values" note.
