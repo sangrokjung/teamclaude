@@ -215,7 +215,7 @@ enum TeamClaudeCardMetrics {
     static let topInset: CGFloat = 4
     /// 서버 줄 높이.
     static let headerHeight: CGFloat = 24
-    /// 호스트 요약 줄이 있을 때 더해지는 높이(구버전 서버·미측정 시 0).
+    /// 호스트 요약 줄·머신 줄 한 줄마다 더해지는 높이(줄이 없으면 0).
     static let hostLineHeight: CGFloat = 20
     /// 측정·연동 안내 띠.
     static let stripHeight: CGFloat = 44
@@ -226,26 +226,26 @@ enum TeamClaudeCardMetrics {
     /// 마지막 행 아래 범례 한 줄.
     static let footerHeight: CGFloat = 36
 
-    static func titleY(hostLine: Bool) -> CGFloat { cardInset + topInset }
-    static func stripY(hostLine: Bool) -> CGFloat {
-        titleY(hostLine: hostLine) + headerHeight + (hostLine ? hostLineHeight : 0)
+    static func titleY(hostLines: Int) -> CGFloat { cardInset + topInset }
+    static func stripY(hostLines: Int) -> CGFloat {
+        titleY(hostLines: hostLines) + headerHeight + CGFloat(max(0, hostLines)) * hostLineHeight
     }
     /// 주간 리셋 일정 그래프(2026-11-18 A안). 주간 한도로 막힌 구독 계정이 있을 때만 띠 아래에 들어간다.
     static let chartHeight: CGFloat = 164
     static let chartGap: CGFloat = 12
-    static func chartY(hostLine: Bool) -> CGFloat { stripY(hostLine: hostLine) + stripHeight + stripGap }
-    static func tableHeadY(hostLine: Bool, chart: Bool = false) -> CGFloat {
-        chartY(hostLine: hostLine) + (chart ? chartHeight + chartGap : 0)
+    static func chartY(hostLines: Int) -> CGFloat { stripY(hostLines: hostLines) + stripHeight + stripGap }
+    static func tableHeadY(hostLines: Int, chart: Bool = false) -> CGFloat {
+        chartY(hostLines: hostLines) + (chart ? chartHeight + chartGap : 0)
     }
     /// 첫 행(첫 묶음 머리) 원점 y(뷰 bounds 기준).
-    static func rowsTop(hostLine: Bool, chart: Bool = false) -> CGFloat {
-        tableHeadY(hostLine: hostLine, chart: chart) + tableHeadHeight + tableHeadGap
+    static func rowsTop(hostLines: Int, chart: Bool = false) -> CGFloat {
+        tableHeadY(hostLines: hostLines, chart: chart) + tableHeadHeight + tableHeadGap
     }
 }
 
 /// 행을 뺀 표 높이. 전체 높이 = 이 값 + teamClaudeGroupedLayout(...).height.
-func teamClaudeCardBaseHeight(hostLine: Bool, chart: Bool = false) -> CGFloat {
-    TeamClaudeCardMetrics.rowsTop(hostLine: hostLine, chart: chart) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
+func teamClaudeCardBaseHeight(hostLines: Int, chart: Bool = false) -> CGFloat {
+    TeamClaudeCardMetrics.rowsTop(hostLines: hostLines, chart: chart) + TeamClaudeCardMetrics.footerHeight + TeamClaudeCardMetrics.cardInset
 }
 
 /// 리셋 일정 그래프의 한 계단: 그 시각 이후 쓸 수 있는 구독 계정 수(새 사용이 없다고 가정한 주간 기준).

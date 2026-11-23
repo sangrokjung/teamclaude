@@ -736,6 +736,24 @@ enum L10n {
 
     static func hostCores(_ cores: Int) -> String { t("\(cores)코어", "\(cores) cores") }
     static var hostPrefix: String { t("호스트  ", "Host  ") }
+    static var fleetPrefix: String { t("머신  ", "Machines  ") }
+    static var fleetHubLabel: String { t("본체", "main") }
+    static var fleetOffline: String { t("끊김", "offline") }
+    static var fleetNoValue: String { t("값 없음", "no data") }
+    static func fleetStale(_ minutes: Int) -> String { t("수집 멈춤 (\(minutes)분 전)", "collector stalled (\(minutes)m ago)") }
+    static var fleetUnreadable: String { t("수집 파일 읽기 실패", "collector file unreadable") }
+    static var fleetFutureTime: String { t("수집 시각 오류(미래)", "collector time is in the future") }
+    static var fleetEmpty: String { t("수집된 머신 없음", "no machines collected") }
+    static func fleetInvalidHosts(_ count: Int) -> String { t("형식 오류 \(count)대", "\(count) malformed") }
+    static func fleetMore(_ count: Int) -> String { t("외 \(count)대", "+\(count) more") }
+    static var fleetStaleLong: String { t("수집 멈춤 (오래 전)", "collector stalled (long ago)") }
+    static func fleetLoadDetail(_ percent: Int) -> String { t("부하 \(percent)%", "load \(percent)%") }
+    static func fleetMemDetail(_ percent: Int) -> String { t("램 여유 \(percent)%", "\(percent)% RAM free") }
+    static func fleetDiskDetail(_ gb: Int) -> String { t("디스크 \(gb)G 남음", "\(gb)G disk free") }
+    static var fleetLoadMissing: String { t("부하 값 없음", "load n/a") }
+    static var fleetWarnOverload: String { t("과부하", "overloaded") }
+    static var fleetWarnDisk: String { t("디스크 부족", "low disk") }
+    static var fleetWarnMemory: String { t("램 부족", "low RAM") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
