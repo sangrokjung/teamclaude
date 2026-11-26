@@ -206,9 +206,23 @@ final class DashboardPanelFooterView: NSView {
     var actionsOpen = false { didSet { if oldValue != actionsOpen { needsDisplay = true } } }
     var onRefresh: (() -> Void)?
     var onActions: (() -> Void)?
+    /// 링크 버튼(links.json의 첫 항목). 비면 버튼을 그리지 않는다. 나머지는 동작 목록에 있다.
+    var links: [DashboardLink] = [] {
+        didSet {
+            guard oldValue != links else { return }
+            updateAccessibilityLabel()
+            needsDisplay = true
+        }
+    }
+    var onOpenLink: ((DashboardLink) -> Void)?
 
     private var refreshRect = NSRect.zero
     private var actionsRect = NSRect.zero
+    private(set) var linkRect = NSRect.zero
+    private var trackingAreaRef: NSTrackingArea?
+    /// 링크 버튼 위 마우스(hover)·누르는 중(pressed). 다른 하단 버튼처럼 mouseDown에서 연다.
+    private var linkHovered = false { didSet { if oldValue != linkHovered { needsDisplay = true } } }
+    private var linkPressed = false { didSet { if oldValue != linkPressed { needsDisplay = true } } }
 
     override var isFlipped: Bool { true }
 
@@ -216,13 +230,40 @@ final class DashboardPanelFooterView: NSView {
         super.init(frame: frameRect)
         setAccessibilityElement(true)
         setAccessibilityRole(.toolbar)
-        setAccessibilityLabel("\(L10n.refresh) R, \(L10n.actions) ⌘K")
+        updateAccessibilityLabel()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    private func updateAccessibilityLabel() {
+        let link = links.first.map { "\($0.title), " } ?? ""
+        setAccessibilityLabel("\(link)\(L10n.refresh) R, \(L10n.actions) ⌘K")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingAreaRef { removeTrackingArea(trackingAreaRef) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        linkHovered = !linkRect.isEmpty && linkRect.contains(convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) { linkHovered = false; linkPressed = false }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        if !linkRect.isEmpty, linkRect.contains(point), links.first != nil {
+            // 메뉴 추적 중에는 mouseUp이 오지 않을 수 있다. 눌림을 보인 뒤 바로 연다(메뉴가 닫히며 상태도 사라진다).
+            linkPressed = true
+            displayIfNeeded()
+            linkPressed = false
+            if let link = links.first { onOpenLink?(link) }
+            return
+        }
         if refreshRect.contains(point) { onRefresh?(); return }
         if notice?.undo == true, undoRect.contains(point) { onUndo?(); return }
         if actionsRect.contains(point) { onActions?(); return }
@@ -265,7 +306,16 @@ final class DashboardPanelFooterView: NSView {
         let refreshTextWidth = PanelDraw.text(L10n.refresh, refreshRect.minX + 30, midY - 8, font, fg2)
         PanelDraw.keycap("R", refreshRect.minX + 38 + refreshTextWidth, centerY: midY)
 
-        let contextMax = refreshRect.minX - 16 - 12
+        // 링크 버튼(ghost): 바깥 화살표 · 제목. 새로고침 왼쪽에 둔다.
+        linkRect = .zero
+        var contextRight = refreshRect.minX
+        if let link = links.first {
+            linkRect = Self.linkButtonRect(title: link.title, rightEdge: refreshRect.minX - 8, midY: midY)
+            drawLinkButton(link.title, in: linkRect)
+            contextRight = linkRect.minX
+        }
+
+        let contextMax = contextRight - 16 - 12
         if let notice {
             // 처리 결과: 점(성공 민트·실패 빨강) · 결과 문장 · "되돌리기" 테두리 버튼.
             let undoTitle = L10n.subActionUndo
@@ -283,6 +333,37 @@ final class DashboardPanelFooterView: NSView {
         }
         PanelDraw.text(PanelDraw.clipped(context, TeamClaudePalette.legendFont, maxWidth: contextMax), 16, midY - 7.5,
                        TeamClaudePalette.legendFont, TeamClaudePalette.fg3)
+    }
+}
+
+extension DashboardPanelFooterView {
+    static let linkButtonHeight: CGFloat = 26
+    static let linkIconWidth: CGFloat = 12
+
+    /// 링크 버튼 칸. 제목은 buttonFont, 높이 26pt(DESIGN.md 버튼).
+    static func linkButtonRect(title: String, rightEdge: CGFloat, midY: CGFloat) -> NSRect {
+        let width = 10 + linkIconWidth + 6 + ceil(PanelDraw.width(title, TeamClaudePalette.buttonFont)) + 12
+        return NSRect(x: rightEdge - width, y: midY - linkButtonHeight / 2, width: width, height: linkButtonHeight)
+    }
+
+    fileprivate func drawLinkButton(_ title: String, in rect: NSRect) {
+        // 평소 테두리만, 마우스를 올리면 흰 6% 면, 누르는 동안 흰 10% 면.
+        if linkPressed {
+            PanelDraw.fillRound(rect, NSColor.white.withAlphaComponent(0.10), 8)
+        } else if linkHovered {
+            PanelDraw.fillRound(rect, NSColor.white.withAlphaComponent(0.06), 8)
+        }
+        PanelDraw.strokeRound(rect, linkHovered ? TeamClaudePalette.graphite : TeamClaudePalette.lineStrong, 8)
+        let color = TeamClaudePalette.fg
+        let config = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [TeamClaudePalette.fg2]))
+        if let icon = NSImage(systemSymbolName: "arrow.up.right", accessibilityDescription: nil)?.withSymbolConfiguration(config) {
+            let size = icon.size
+            icon.draw(in: NSRect(x: rect.minX + 10 + (Self.linkIconWidth - size.width) / 2, y: rect.midY - size.height / 2,
+                                 width: size.width, height: size.height),
+                      from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+        PanelDraw.text(title, rect.minX + 10 + Self.linkIconWidth + 6, rect.midY - 7.5, TeamClaudePalette.buttonFont, color)
     }
 }
 

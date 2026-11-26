@@ -193,11 +193,15 @@ struct CliFleetTable: Equatable {
             var parts: [String] = []
             if let reset = group.weeklyReset { parts.append(L10n.cliWeeklyReset(shortDuration(reset, now: now))) }
             if let reset = group.fiveHourReset { parts.append(L10n.cliFiveHourReset(shortDuration(reset, now: now))) }
+            // 레인이 여럿이면 첫 레인 값을 보이고 나머지는 세어서 알린다. 조용히 버리면 남은 양을 오독한다.
+            // 주의 판정은 모든 레인의 가장 낮은 남은 양으로 한다.
+            if agy.groups.count > 1 { parts.append(L10n.cliMoreLanes(agy.groups.count - 1)) }
             let reset = parts.isEmpty ? nil : parts.joined(separator: " · ")
             guard weekly != nil || fiveHour != nil else {
                 return CliAgyCell(level: .warn, word: StatusVocabulary.needsCheck, weeklyRemaining: nil, fiveHourRemaining: nil, reset: reset)
             }
-            let lowest = [weekly, fiveHour].compactMap { $0 }.min() ?? 100
+            let every = agy.groups.flatMap { [$0.weeklyRemainingPercent, $0.fiveHourRemainingPercent] }.compactMap { $0?.rounded(.down) }
+            let lowest = every.min() ?? 100
             if lowest < lowRemainingPercent {
                 return CliAgyCell(level: .warn, word: L10n.cliLeft(Int(lowest)), weeklyRemaining: weekly, fiveHourRemaining: fiveHour, reset: reset)
             }

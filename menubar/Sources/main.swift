@@ -3104,6 +3104,15 @@ final class StatusMenuDashboardView: NSView {
     private var modelView: ModelUsageTabView?
     /// 모델 탭 데이터(scripts/model-usage-collector.py 결과). 호스트가 configure·updateContent 전에 넣는다.
     /// 값이 바뀌면 열린 탭만 다시 잡는다(다른 탭·메뉴 기하는 그대로).
+    /// CLI 탭 Grok·agy 머신 표. 호스트가 configure·updateContent 전에 넣는다. 행 수가 바뀌면 구조 재구성을 탄다.
+    var cliTable: CliFleetTable? {
+        didSet { if cliTable != oldValue { cliLanesView?.table = cliTable } }
+    }
+    /// 하단 막대 링크 버튼(links.json). 비면 버튼을 숨긴다.
+    var links: [DashboardLink] = [] {
+        didSet { footer.links = links }
+    }
+    var onOpenLink: ((DashboardLink) -> Void)?
     var modelUsage: ModelUsageReport? {
         didSet {
             let before = oldValue.map { ($0.generatedAt, $0.today, $0.daily.count) }
@@ -3130,6 +3139,7 @@ final class StatusMenuDashboardView: NSView {
     private var subscriptionUndo: SubscriptionUndo?
     private var subscriptionNoticeTimer: Timer?
     private var renderedHiggsfieldHeight: CGFloat = 0
+    private var renderedCliHeight: CGFloat = 0
     private var renderedTeamHeight: CGFloat = 0
     /// 표가 행 높이 변화를 알리면 호출된다. 소유자(AppDelegate)가 갱신을 예약해 updateContent → 재구성으로 이어진다.
     var onTeamRowsChange: (() -> Void)?
@@ -3156,6 +3166,7 @@ final class StatusMenuDashboardView: NSView {
         footer.onRefresh = { [weak self] in self?.onRefresh?() }
         footer.onUndo = { [weak self] in self?.undoSubscriptionAction() }
         footer.onActions = { [weak self] in self?.setActionsOpen(!(self?.actionsOpen ?? true)) }
+        footer.onOpenLink = { [weak self] link in self?.onOpenLink?(link) }
         scrim.onClick = { [weak self] in self?.setActionsOpen(false) }
         scrim.isHidden = true
         actionList.isHidden = true
@@ -3328,8 +3339,8 @@ final class StatusMenuDashboardView: NSView {
         health == nil && teamCodex == nil ? 0 : CodexStatusView.preferredHeight(for: teamCodex)
     }
 
-    /// "CLI 쿼터" 본문 = Grok·agy 두 레인이 든 카드 한 장. 두 모델은 옵셔널이 아니라 항상 그린다.
-    static let cliHeight: CGFloat = CliQuotaLanesView.fixedHeight
+    /// "CLI 쿼터" 본문 = Grok·agy 머신 표 한 장(머신마다 한 줄, 수집 파일이 없으면 이 맥 한 줄).
+    static func cliHeight(_ table: CliFleetTable?) -> CGFloat { CliQuotaLanesView.preferredHeight(table) }
 
     /// 미설치 안내가 있는 섹션은 본문 대신 안내 카드 높이를 쓴다. preferredHeight·configure가 같은 판정을 본다.
     static func bodyHeight(_ id: String, _ natural: CGFloat, _ notices: DashboardToolNotices) -> CGFloat {
@@ -3340,13 +3351,14 @@ final class StatusMenuDashboardView: NSView {
     static func sectionBodies(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?,
                               higgsfield: HiggsfieldCreditsData?, burnModel: SubscriptionBurnModel, notices: DashboardToolNotices,
                               summaries: [String: String], modelUsage: ModelUsageReport? = nil,
-                              modelSelection: ModelUsageSelection = ModelUsageSelection()) -> [DashboardTab: [(id: String, title: String, summary: String, height: CGFloat)]] {
+                              modelSelection: ModelUsageSelection = ModelUsageSelection(),
+                              cliTable: CliFleetTable? = nil) -> [DashboardTab: [(id: String, title: String, summary: String, height: CGFloat)]] {
         [
             .claude: [(id: "claude", title: L10n.sectionClaude, summary: summaries["claude"] ?? "", height: bodyHeight("claude", teamContentHeight(teamClaude), notices))],
             .codex: [(id: "codex", title: L10n.sectionCodex, summary: summaries["codex"] ?? "", height: bodyHeight("codex", codexHeight(codex, teamCodex: teamCodex), notices))],
             .burn: [(id: "burn", title: L10n.sectionBurn, summary: summaries["burn"] ?? "", height: SubscriptionBurnView.preferredHeight(burnModel)),
                     (id: "usage", title: L10n.sectionUsage, summary: summaries["usage"] ?? "", height: bodyHeight("usage", UsageDashboardView.preferredHeight(for: usage), notices))],
-            .cli: [(id: "cli", title: L10n.sectionCli, summary: summaries["cli"] ?? "", height: cliHeight),
+            .cli: [(id: "cli", title: L10n.sectionCli, summary: summaries["cli"] ?? "", height: cliHeight(cliTable)),
                    (id: "higgsfield", title: "Higgsfield", summary: summaries["higgsfield"] ?? "", height: bodyHeight("higgsfield", HiggsfieldCreditsView.preferredHeight(for: higgsfield), notices)),
                    (id: "vocabulary", title: L10n.sectionVocabulary, summary: "", height: EmptyValueVocabularyView.preferredHeight)],
             // 모델 탭은 수집 결과가 없어도 "수집 전" 안내를 그린다(빈 탭 없음).
@@ -3364,10 +3376,10 @@ final class StatusMenuDashboardView: NSView {
 
     static func tabContentHeights(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?,
                                   higgsfield: HiggsfieldCreditsData?, burnModel: SubscriptionBurnModel, notices: DashboardToolNotices,
-                                  overview: OverviewModel) -> [DashboardTab: CGFloat] {
+                                  overview: OverviewModel, cliTable: CliFleetTable? = nil) -> [DashboardTab: CGFloat] {
         var heights: [DashboardTab: CGFloat] = [.overview: OverviewTabView.preferredHeight(overview)]
         let bodies = sectionBodies(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
-                                   burnModel: burnModel, notices: notices, summaries: [:])
+                                   burnModel: burnModel, notices: notices, summaries: [:], cliTable: cliTable)
         for (tab, list) in bodies {
             let layout = dashboardSectionLayout(startY: bodyInset, bodies: list)
             heights[tab] = layout.sections.isEmpty ? PanelEmptyStateView.preferredHeight : layout.totalHeight + bodyInset
@@ -3378,11 +3390,12 @@ final class StatusMenuDashboardView: NSView {
     /// 패널 높이 = 머리 + 본문(개요 탭 자연 높이, 최소 minimumBodyHeight, 최대 maxBodyHeight) + 하단 막대.
     /// 다른 탭은 이 높이 안에서 스크롤한다. tab을 주면 그 탭 내용에 맞춘다(스냅샷).
     static func preferredHeight(teamClaude: TeamClaudeHealth?, codex: CodexHealth?, teamCodex: TeamCodexPoolHealth?, usage: UsageData?, higgsfield: HiggsfieldCreditsData? = nil,
-                                burnModel: SubscriptionBurnModel, notices: DashboardToolNotices, maxBodyHeight: CGFloat, tab: DashboardTab? = nil) -> CGFloat {
+                                burnModel: SubscriptionBurnModel, notices: DashboardToolNotices, maxBodyHeight: CGFloat, tab: DashboardTab? = nil,
+                                cliTable: CliFleetTable? = nil) -> CGFloat {
         let overview = overviewModel(teamClaude: teamClaude, teamCodex: teamCodex, grok: GrokCardModel(headline: "", detail: nil),
                                      agy: AgyCardModel(message: nil, groups: []), burnModel: burnModel, notices: notices)
         let heights = tabContentHeights(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
-                                        burnModel: burnModel, notices: notices, overview: overview)
+                                        burnModel: burnModel, notices: notices, overview: overview, cliTable: cliTable)
         let content = tab.flatMap { heights[$0] } ?? max(heights[.overview] ?? 0, minimumBodyHeight)
         return chromeHeight + min(content, maxBodyHeight)
     }
@@ -3488,6 +3501,7 @@ final class StatusMenuDashboardView: NSView {
         renderedTeamCodexPresent = teamCodex != nil
         renderedUsageHeight = UsageDashboardView.preferredHeight(for: usage)
         renderedHiggsfieldHeight = HiggsfieldCreditsView.preferredHeight(for: higgsfield)
+        renderedCliHeight = Self.cliHeight(cliTable)
         renderedTeamHeight = Self.teamContentHeight(teamClaude)
         renderedCodexHeight = Self.codexHeight(codex, teamCodex: teamCodex)
         let width = bounds.width
@@ -3514,7 +3528,7 @@ final class StatusMenuDashboardView: NSView {
         let summaries = withModelSummary(Self.sectionSummaries(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield, notices: notices, staleNotes: laneStaleNotes))
         let bodies = Self.sectionBodies(teamClaude: teamClaude, codex: codex, teamCodex: teamCodex, usage: usage, higgsfield: higgsfield,
                                         burnModel: burnModel, notices: notices, summaries: summaries,
-                                        modelUsage: modelUsage, modelSelection: modelSelection)
+                                        modelUsage: modelUsage, modelSelection: modelSelection, cliTable: cliTable)
         var allSections: [DashboardSection] = []
         for tab in DashboardTab.allCases where tab != .overview {
             let layout = dashboardSectionLayout(startY: Self.bodyInset, bodies: bodies[tab] ?? [])
@@ -3589,9 +3603,10 @@ final class StatusMenuDashboardView: NSView {
                     burnView = burn
                     view = burn
                 case "cli":
-                    let lanes = CliQuotaLanesView(frame: NSRect(x: 0, y: bodyY, width: width, height: CliQuotaLanesView.fixedHeight))
+                    let lanes = CliQuotaLanesView(frame: NSRect(x: 0, y: bodyY, width: width, height: Self.cliHeight(cliTable)))
                     lanes.grok = grok
                     lanes.agy = agy
+                    lanes.table = cliTable
                     lanes.staleNotes = laneStaleNotes
                     cliLanesView = lanes
                     view = lanes
@@ -3655,6 +3670,12 @@ final class StatusMenuDashboardView: NSView {
     private func withModelSummary(_ summaries: [String: String]) -> [String: String] {
         var out = summaries
         out["model"] = ModelUsageTabView.summary(modelUsage, selection: modelSelection)
+        if let cliTable, out["cli"] != nil {
+            // CLI 섹션 머리: 머신 수와 손볼 머신 수(주의·문제). 수집 파일이 없으면 이 맥만.
+            out["cli"] = cliTable.fromFleet
+                ? L10n.cliFleetSummary(machines: cliTable.rows.count, attention: cliTable.rows.filter { $0.level >= .warn }.count)
+                : L10n.cliThisMac
+        }
         return out
     }
 
@@ -3760,6 +3781,7 @@ final class StatusMenuDashboardView: NSView {
             || (teamCodex != nil) != renderedTeamCodexPresent
             || usageHeight != renderedUsageHeight
             || HiggsfieldCreditsView.preferredHeight(for: higgsfield) != renderedHiggsfieldHeight
+            || Self.cliHeight(cliTable) != renderedCliHeight
             || Self.teamContentHeight(teamClaude) != renderedTeamHeight
             || Self.codexHeight(codex, teamCodex: teamCodex) != renderedCodexHeight
             || OverviewTabView.preferredHeight(overview) != renderedOverviewHeight
@@ -7802,8 +7824,14 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
     delegate.higgsfieldInstalled = !higgsfieldBinCandidates().isEmpty
     delegate.ccusageInstalledState = ccusageInstalled()
     // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다(판정 nil).
-    if let notice = grokPresenceNotice() { delegate.currentGrokCard = grokCardModel(for: notice) }
-    if agyExecutableURL() == nil { delegate.currentAgyCard = agyCardModel(for: agyToolNotice()) }
+    if let notice = grokPresenceNotice() {
+        delegate.currentGrokCard = grokCardModel(for: notice)
+        delegate.localGrokOutcome = (.login, false)
+    }
+    if agyExecutableURL() == nil {
+        delegate.currentAgyCard = agyCardModel(for: agyToolNotice())
+        delegate.localAgyOutcome = .missing
+    }
     delegate.refreshBurnModel()
     // 모델 탭: 실제 로더와 같은 경로(빈 HOME이면 수집 결과가 없어 "수집 전" 안내).
     delegate.currentModelUsage = ModelUsageReport.load()
@@ -7813,9 +7841,11 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
         height: StatusMenuDashboardView.preferredHeight(
             teamClaude: delegate.currentTeamClaude, codex: delegate.currentCodex, teamCodex: delegate.currentTeamCodex,
             usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
-            burnModel: delegate.currentBurnModel, notices: notices, maxBodyHeight: .greatestFiniteMagnitude)
+            burnModel: delegate.currentBurnModel, notices: notices, maxBodyHeight: .greatestFiniteMagnitude,
+            cliTable: delegate.currentCliTable)
     ))
     view.modelUsage = delegate.currentModelUsage
+    view.cliTable = delegate.currentCliTable
     view.configure(
         teamClaude: delegate.currentTeamClaude, codex: delegate.currentCodex, teamCodex: delegate.currentTeamCodex,
         usage: delegate.currentData, higgsfield: delegate.currentHiggsfield,
@@ -7882,15 +7912,33 @@ if let dashIndex = CommandLine.arguments.firstIndex(of: "--dashboard-snapshot") 
                               email: nil, transactions: [], checkedAt: Date(),
                               error: nil, partialError: nil)
     }
+    // CLI 탭 머신 표: cliFleet은 본체 수집 파일 모양, cliLocal은 이 맥 스냅샷 모양을 실제 파서로 읽는다.
+    let cliFleet = fixture["cliFleet"].flatMap { CliFleetReport.parse(object: $0) }
+    if fixture["cliFleet"] != nil && cliFleet == nil {
+        fputs("DASHBOARD-SNAPSHOT: cliFleet 픽스처 해석 실패 \(fixturePath)\n", stderr)
+        exit(1)
+    }
+    let cliLocalSnapshot = fixture["cliLocal"].flatMap { CliStatusSnapshot.parse($0) }
+    if fixture["cliLocal"] != nil && cliLocalSnapshot == nil {
+        fputs("DASHBOARD-SNAPSHOT: cliLocal 픽스처 해석 실패 \(fixturePath)\n", stderr)
+        exit(1)
+    }
+    let cliTable = CliFleetTable.make(
+        report: cliFleet,
+        local: CliLocalCliState(host: cliLocalSnapshot?.host ?? "this-mac", grok: cliLocalSnapshot?.grok, agy: cliLocalSnapshot?.agy),
+        now: Date())
+    let links = (fixture["links"]).flatMap { try? JSONSerialization.data(withJSONObject: ["links": $0]) }.map(DashboardLinks.parse) ?? []
     let view = StatusMenuDashboardView(frame: NSRect(
         x: 0, y: 0,
         width: StatusMenuDashboardView.preferredWidth,
         height: StatusMenuDashboardView.preferredHeight(
             teamClaude: health, codex: nil, teamCodex: teamCodex, usage: nil,
             higgsfield: higgsfield, burnModel: burnModel, notices: DashboardToolNotices(),
-            maxBodyHeight: .greatestFiniteMagnitude
+            maxBodyHeight: .greatestFiniteMagnitude, cliTable: cliTable
         )
     ))
+    view.cliTable = cliTable
+    view.links = links
     // 모델 탭: 픽스처의 "modelUsage"(수집기 JSON 모양)를 실제 파서로 읽는다. 없으면 "수집 전" 안내.
     view.modelUsage = (fixture["modelUsage"] as? [String: Any]).flatMap { raw in
         (try? JSONSerialization.data(withJSONObject: raw)).flatMap(ModelUsageReport.parse)

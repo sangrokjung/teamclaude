@@ -234,9 +234,20 @@ struct CliFleetStatusTests {
         let quiet = CliFleetTable.row(name: "x", status: sampleSnapshot(age: 4 * 60), hostError: nil, now: now)
         precondition(quiet.level == .ok && !quiet.dimmed, "4 minutes is still fresh for a host snapshot")
 
+        // 레인이 여럿이면 첫 레인 값을 보이고 나머지는 센다. 주의 판정은 가장 낮은 레인으로 한다.
+        var twoLanes = fresh
+        twoLanes.agy.groups.append(CliAgyGroupStatus(name: "Gemini Flash", weeklyRemainingPercent: 9, weeklyReset: nil,
+                                                     fiveHourRemainingPercent: nil, fiveHourReset: nil))
+        let twoRow = CliFleetTable.row(name: "x", status: twoLanes, hostError: nil, now: now)
+        precondition(twoRow.agy.reset?.hasSuffix("외 1개 레인") == true, twoRow.agy.reset ?? "nil")
+        precondition(twoRow.agy.level == .warn && twoRow.agy.word == "남음 9%" && twoRow.agy.weeklyRemaining == 78, "\(twoRow.agy)")
+
         // 확인 중: 첫 결과 전의 이 맥 한 줄.
         let pending = CliFleetTable.localRow(CliLocalCliState(host: "this-mac", grok: nil, agy: nil), now: now)
         precondition(pending.level == .pending && pending.grok.word == "확인 중" && pending.agy.word == "확인 중")
+        // 갱신 지연 꼬리말은 값이 없는 줄에도 붙는다(예전 카드의 조기 반환 회귀 방지).
+        let staleNoted = CliQuotaLanesView.withStaleNotes(pending, ["agy": "갱신 없음 5분"])
+        precondition(staleNoted.agy.word == "확인 중 · 갱신 없음 5분" && staleNoted.level == .warn, "\(staleNoted)")
 
         // 표: 수집 파일이 없으면 이 맥 한 줄, 있으면 머신마다 한 줄.
         let local = CliLocalCliState(host: "this-mac", grok: fresh.grok, agy: fresh.agy, writtenAt: now)

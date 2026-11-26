@@ -168,10 +168,17 @@ final class CliQuotaLanesView: NSView {
     static var limitNoteText: String { CliFleetTable.limitNote }
 
     /// 이 맥 줄: 갱신이 실패해 앞선 값을 보이는 중이면 상태 글자에 그 사실을 붙인다.
+    /// 한 번도 성공하지 못해 값이 없는 줄("확인 중")에도 붙인다 — 예전 카드가 조기 반환으로 꼬리말을 빠뜨리던 자리다.
     static func withStaleNotes(_ row: CliFleetRow, _ notes: [String: String]) -> CliFleetRow {
         var out = row
-        if let note = notes["grok"], out.grok.word == nil { out.grok.word = note; out.grok.level = max(out.grok.level, .warn) }
-        if let note = notes["agy"], out.agy.word == nil { out.agy.word = note; out.agy.level = max(out.agy.level, .warn) }
+        if let note = notes["grok"] {
+            out.grok.word = out.grok.word.map { "\($0) · \(note)" } ?? note
+            out.grok.level = max(out.grok.level, .warn)
+        }
+        if let note = notes["agy"] {
+            out.agy.word = out.agy.word.map { "\($0) · \(note)" } ?? note
+            out.agy.level = max(out.agy.level, .warn)
+        }
         let level = max(out.level, out.grok.level, out.agy.level)
         if level != out.level { out.level = level; out.statusWord = CliFleetTable.levelWord(level) }
         return out

@@ -761,6 +761,7 @@ enum L10n {
         t("Grok·agy는 한도 숫자를 주지 않아 % 기준 · Grok 한도: 주간 100%",
           "Grok and agy give no limit numbers, so values are % · Grok limit: weekly 100%")
     }
+    static var cliThisMac: String { t("이 맥", "This Mac") }
     static var cliThisMacOnly: String { t("이 맥만 (본체 수집 파일 없음)", "This Mac only (no hub collector file)") }
     static var cliColMachine: String { t("머신", "Machine") }
     static var cliColGrok: String { t("Grok 사용", "Grok used") }
@@ -787,6 +788,7 @@ enum L10n {
     static func cliFiveHourReset(_ duration: String) -> String { "5h \(duration)" }
     static func cliWeeklyValue(_ percent: Int) -> String { t("주 \(percent)%", "wk \(percent)%") }
     static func cliFiveHourValue(_ percent: Int) -> String { "5h \(percent)%" }
+    static func cliMoreLanes(_ count: Int) -> String { t("외 \(count)개 레인", "+\(count) lanes") }
     static var cliJustNow: String { t("방금", "just now") }
     static func cliAgo(_ duration: String) -> String { t("\(duration) 전", "\(duration) ago") }
     static func cliFleetSummary(machines: Int, attention: Int) -> String {
