@@ -754,6 +754,58 @@ enum L10n {
     static var fleetWarnOverload: String { t("과부하", "overloaded") }
     static var fleetWarnDisk: String { t("디스크 부족", "low disk") }
     static var fleetWarnMemory: String { t("램 부족", "low RAM") }
+
+    // MARK: CLI 탭 Grok·agy 머신 표(CliFleetTable.swift)
+
+    static var cliLimitNote: String {
+        t("Grok·agy는 한도 숫자를 주지 않아 % 기준 · Grok 한도: 주간 100%",
+          "Grok and agy give no limit numbers, so values are % · Grok limit: weekly 100%")
+    }
+    static var cliThisMac: String { t("이 맥", "This Mac") }
+    static var cliThisMacOnly: String { t("이 맥만 (본체 수집 파일 없음)", "This Mac only (no hub collector file)") }
+    static var cliColMachine: String { t("머신", "Machine") }
+    static var cliColGrok: String { t("Grok 사용", "Grok used") }
+    static var cliColAgy: String { t("agy 남음", "agy left") }
+    static var cliColLast: String { t("마지막 사용", "Last used") }
+    static var cliColToday: String { t("오늘", "Today") }
+    static var cliStateOk: String { t("정상", "OK") }
+    static var cliStateWarn: String { t("주의", "Caution") }
+    static var cliStateProblem: String { t("문제", "Problem") }
+    static var cliLoginNeeded: String { t("로그인 필요", "Login needed") }
+    static var cliRefreshNeeded: String { t("갱신 필요", "Refresh needed") }
+    static var cliNoGemini: String { t("Gemini 없음", "No Gemini") }
+    static func cliLeft(_ percent: Int) -> String { t("남음 \(percent)%", "\(percent)% left") }
+    static var cliCollectFailed: String { t("수집 실패", "Fetch failed") }
+    static var cliOffline: String { t("꺼짐", "Offline") }
+    static func cliStalled(_ minutes: Int) -> String { t("멈춤 \(minutes)분", "Stalled \(minutes)m") }
+    static var cliClockSkew: String { t("시각 오류", "Clock skew") }
+    static func cliFetchLag(_ minutes: Int) -> String { t("조회 지연 \(minutes)분", "Fetch lag \(minutes)m") }
+    static func cliLastCollected(_ count: Int) -> String { t("마지막 수집 \(count)대", "\(count) at last collect") }
+    static var cliUnverified: String { t("미확인", "unknown") }
+    static var cliFetchFailed: String { t("조회 실패", "Fetch failing") }
+    static func cliHiddenMachines(_ count: Int, problem: Int, warn: Int) -> String {
+        var parts = [t("외 \(count)대", "+\(count) more")]
+        if problem > 0 { parts.append(t("문제 \(problem)", "\(problem) problem")) }
+        if warn > 0 { parts.append(t("주의 \(warn)", "\(warn) caution")) }
+        return parts.joined(separator: " · ")
+    }
+    static func cliCollectorStalled(_ minutes: Int) -> String { t("수집 멈춤 \(minutes)분", "Collector stalled \(minutes)m") }
+    static var cliCollectorUnreadable: String { t("수집 파일 읽기 실패", "Collector file unreadable") }
+    static func cliResetIn(_ duration: String) -> String { t("초기화 \(duration)", "resets \(duration)") }
+    static var cliResetSoon: String { t("곧 초기화", "resets soon") }
+    static var cliSoon: String { t("곧", "soon") }
+    static func cliWeeklyReset(_ duration: String) -> String { t("주 \(duration)", "wk \(duration)") }
+    static func cliFiveHourReset(_ duration: String) -> String { "5h \(duration)" }
+    static func cliWeeklyValue(_ percent: Int) -> String { t("주 \(percent)%", "wk \(percent)%") }
+    static func cliFiveHourValue(_ percent: Int) -> String { "5h \(percent)%" }
+    static func cliMoreLanes(_ count: Int) -> String { t("외 \(count)개 레인", "+\(count) lanes") }
+    static var cliJustNow: String { t("방금", "just now") }
+    static func cliAgo(_ duration: String) -> String { t("\(duration) 전", "\(duration) ago") }
+    /// 머리 배지("손볼 것 N", Claude·Codex 계정)와 다른 말을 쓴다. 같은 말로 다른 수를 보이면 헷갈린다.
+    static func cliFleetSummary(machines: Int, ok: Int) -> String {
+        ok == machines ? t("\(machines)대 모두 정상", "all \(machines) OK") : t("\(machines)대 중 정상 \(ok)", "\(ok) of \(machines) OK")
+    }
+    static var linkActionDetail: String { t("브라우저에서 열기", "Open in browser") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }

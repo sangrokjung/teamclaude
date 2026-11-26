@@ -156,7 +156,65 @@ def build():
                                  "higgsfield": "48분째 갱신 없음"}
     if "--model" in sys.argv:
         fixture["modelUsage"] = model_usage()
+    if "--cli-fleet" in sys.argv:
+        # CLI 탭 머신 표: 정상·주의(남은 양 부족·Grok 만료)·로그인 필요·수집 실패·꺼짐·멈춤을 한 장에.
+        fixture["cliFleet"] = cli_fleet()
+    if "--cli-fleet-33" in sys.argv:
+        # 표시 상한(32대) 밖의 33번째만 실패. 머리 요약이 숨긴 줄까지 세는지 본다.
+        hosts = [{"name": f"node-{i:02d}", "ok": True, "error": None, "status": cli_snapshot(f"node-{i:02d}")}
+                 for i in range(32)]
+        hosts.append({"name": "node-late", "ok": False, "error": "ssh", "status": None})
+        fixture["cliFleet"] = {"collected_at": int(time.time()) - 20, "hosts": hosts}
+    if "--cli-local" in sys.argv:
+        # 수집 파일이 없는 워커 화면: 이 맥 스냅샷 한 줄.
+        fixture["cliLocal"] = cli_snapshot("worker-a", grok_usage=37.5, agy_week=64, agy_5h=88)
+    if "--links" in sys.argv:
+        # 주소는 가린 예시만 쓴다(공개 저장소).
+        fixture["links"] = [{"title": "AI 비용 대시보드", "url": "http://100.x.y.z:8790/"}]
     return fixture
+
+
+def iso_after(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+def cli_snapshot(host, age=25, grok_auth="ok", grok_usage=12.5, agy_auth="ok", agy_week=78.0, agy_5h=95.0,
+                 grok_installed=True, agy_installed=True, grok_last=-180, agy_last=-7200, sessions=4, conversations=2,
+                 grok_ok_age=30, grok_failed=False, partial=False):
+    groups = [] if agy_auth != "ok" else [{
+        "name": "Gemini Models", "weekly_remaining_pct": agy_week, "weekly_reset": iso_after(5 * 86400 + 3600),
+        "five_hour_remaining_pct": agy_5h, "five_hour_reset": iso_after(2 * 3600 + 600)}]
+    return {
+        "schema": 1, "host": host, "written_at": int(time.time()) - age,
+        "grok": {"installed": grok_installed, "auth": grok_auth,
+                 "usage_pct": grok_usage if grok_auth in ("ok", "expired") else None,
+                 "period_end": iso_after(3 * 86400 + 4 * 3600 + 900) if grok_auth in ("ok", "expired") else None,
+                 "last_used": iso_after(grok_last) if grok_last is not None else None, "sessions_today": sessions,
+                 "sessions_today_partial": partial, "fetch_failed": grok_failed,
+                 "last_ok_at": iso_after(-grok_ok_age) if grok_auth == "ok" else None},
+        "agy": {"installed": agy_installed, "auth": agy_auth, "groups": groups,
+                "last_used": iso_after(agy_last) if agy_last is not None else None, "conversations_today": conversations},
+    }
+
+
+def cli_fleet():
+    def ok(name, status):
+        return {"name": name, "ok": True, "error": None, "status": status}
+
+    return {"collected_at": int(time.time()) - 20, "hosts": [
+        ok("hub", cli_snapshot("hub-mac", grok_usage=12.5, sessions=14, conversations=6)),
+        ok("studio-a", cli_snapshot("studio-a", grok_auth="expired", grok_usage=91.0, agy_5h=12.0, agy_week=41.0,
+                                    grok_last=-26 * 60, agy_last=-40, sessions=3, conversations=9)),
+        ok("mini-b", cli_snapshot("mini-b", grok_auth="login", agy_auth="login", grok_last=-3 * 86400, agy_last=None,
+                                  sessions=0, conversations=0)),
+        {"name": "studio-c", "ok": False, "error": "ssh", "status": None},
+        {"name": "laptop", "ok": False, "error": "offline", "status": None},
+        ok("mini-d", cli_snapshot("mini-d", age=7 * 60 + 10, agy_installed=False, agy_auth="error",
+                                  grok_usage=4.0, sessions=1, conversations=None)),
+        # 파일은 방금 썼지만 Grok 조회가 12분째 실패해 앞선 값을 보이는 머신. 오늘 개수는 열거 상한에 걸린 부분 집계.
+        ok("mini-e", cli_snapshot("mini-e", grok_usage=33.0, grok_failed=True, grok_ok_age=12 * 60 + 5, partial=True,
+                                  sessions=40, conversations=3)),
+    ]}
 
 
 def model_usage():

@@ -29,7 +29,7 @@ the menu is open.
 | Claude | Accounts grouped by state. Resets are stated once in the column heads. A small symbol next to each name shows the plan state, and a recorded cancellation adds a line such as "Cancel scheduled · ends 11/12 · 14d left". Click a row to expand the plan record (state, end date, evidence, when it was recorded), concurrency, request count, per-window resets and the re-auth, measure and plan actions |
 | Codex | The TeamCodex pool (5-hour and 7-day bars with their own resets per account), the plan state at the right of each plan line (click to expand the plan record), recovery buttons, cancel-confirmed accounts grouped below the list, and Codex usage on this Mac |
 | Burn | Subscription spend and per-service verdicts, what to do first, ccusage usage (cost) |
-| CLI | Grok and agy quotas, Higgsfield credits, and the words used for missing values |
+| CLI | Grok and agy per machine (see below), Higgsfield credits, and the words used for missing values |
 | Models | Which models the agent system uses and how much (7d · 14d · all × calls · output tokens · all tokens): Claude calls, Codex demand as Pro 200 accounts per week (estimate, with range and lower-bound marks), five sources each in its own unit (Claude Code, Codex CLI, Codex adversarial review, Codex impl loop, Hermes), stacked daily bars, models compared with the previous period, pool weekly usage, Claude 5-hour cycles that ended exhausted, and Codex capacity facts. Days whose records were deleted are hatched |
 
 Bars turn amber from the 98% routing threshold. The thin sky-blue tick on a bar is how much of that window has elapsed;
@@ -54,6 +54,47 @@ footer shows the result with Undo for six seconds.
   drop out, and a cancelled Codex account is never offered "Re-enable".
 
 The visual rules (colors, type, spacing) are in [DESIGN.md](DESIGN.md).
+
+### Dashboard link
+
+A button in the footer opens a page you choose (for example an AI cost dashboard) in the browser and closes the menu.
+The same entries are in the action list (⌘K, app group). The address is not in this repository; the app reads
+`~/.config/cc-menubar/links.json`:
+
+```json
+{"links": [{"title": "AI cost dashboard", "url": "http://100.x.y.z:8790/"}]}
+```
+
+Only `http` and `https` URLs with a host are used (up to five; titles longer than 24 characters are shortened). The footer shows
+the first one. If the file is missing or broken, or no entry is valid, the button is hidden. The file is read every minute.
+
+### Grok and agy per machine (CLI tab)
+
+The CLI tab shows Grok and agy as a table with one row per machine: Grok (state dot, usage % and bar, time to the weekly
+reset), agy (state dot, weekly and 5-hour remaining, time to each reset), last used and today's count (Grok sessions / agy
+conversations). Neither tool reports a limit number, so values are percentages ("Grok limit: weekly 100%").
+States are written out as well as colored: OK, Caution (less than 20% left, Grok token expired, needs check, machine offline,
+"Fetch lag N m" when the last successful read is older than 5 minutes or the latest read failed, so an old value is never shown as fresh),
+Problem (not installed, login needed, collect failed, a machine's snapshot older than 5 minutes shown as "Stalled N m").
+
+- Every Mac's menu bar writes its own snapshot every minute to `~/.cache/cc-menubar/cli-status.json` (temp file, then
+  rename). It holds states, percentages, times and counts only, never tokens:
+  `{"schema":1,"host","written_at","grok":{"installed","auth","usage_pct","period_end","last_used","sessions_today"},
+  "agy":{"installed","auth","groups":[{"name","weekly_remaining_pct","weekly_reset","five_hour_remaining_pct","five_hour_reset"}],
+  "last_used","conversations_today"}}`, plus per tool `last_ok_at`, `fetch_failed` and `sessions_today_partial` /
+  `conversations_today_partial`. Last used and today's counts come from the modification times under
+  `~/.grok/sessions/` and `~/.gemini/antigravity-cli/conversations/` (`.db-shm` files are ignored because every agy run,
+  including the menu bar's own `/usage` call, touches all of them). A scan stops after 20,000 entries; a capped count is
+  shown as a lower bound such as "40+".
+- On the hub, `python3 scripts/fleet-cli-collect.py --manifest <manifest.json> --once` reads every node's snapshot over
+  `ssh -o BatchMode=yes` (8 at a time, 20 s per host, at most 256 KiB each) and writes `~/.claude/cache/fleet-cli.json` (a host with a wrongly typed field or more than 32 agy lanes is `parse`; a total over
+  2 MiB is not written, and the menu bar refuses a file over 2 MiB):
+  `{"collected_at", "hosts": [{"name", "ok", "error", "status"}]}`. The hub's own file is the `hub` row. A node with
+  `"menubarOfflineOk": true` that cannot be reached is shown as Offline. Without `--once` it repeats every 60 seconds; nothing
+  installs it as a LaunchAgent.
+- The table draws up to 32 machines; the rest are counted on one line ("+N more · M problem") and in the section summary.
+- Without `fleet-cli.json` (a worker Mac) the table shows only this Mac. If the collector file is older than 3 minutes the
+  table head says "Collector stalled".
 
 ## QA hook
 
