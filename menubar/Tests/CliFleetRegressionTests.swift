@@ -67,6 +67,8 @@ struct CliFleetRegressionTests {
     // 재검토 새 지적: 성공한 /usage에 Gemini 레인이 없으면 "확인한 빈 상태"다. 성공 시각을 갱신하고 조회 지연을 띄우지 않는다.
     static func emptyLaneSuccessIsNotFetchLag() {
         var tracker = CliLocalTracker()
+        // 스냅샷은 두 도구 결과가 다 있어야 생긴다. Grok은 정상으로 둔다.
+        tracker.recordGrok(.percent(GrokPercentOutcome(slot: "Grok 12%", productPercent: 12, creditPercent: nil)), now: now)
         let gemini = AgyQuotaGroup(name: "Gemini Models", weekly: AgyQuotaBucket(remaining: 0.8, resetAt: nil), fiveHour: nil)
         let claude = AgyQuotaGroup(name: "Claude Models", weekly: AgyQuotaBucket(remaining: 1, resetAt: nil), fiveHour: nil)
         tracker.recordAgy(.ready([gemini]), now: now.addingTimeInterval(-900))
