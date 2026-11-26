@@ -37,6 +37,8 @@ DEFAULT_OUT = os.path.expanduser("~/.claude/cache/fleet-cli.json")
 MAX_JOBS = 8
 HOST_TIMEOUT = 20.0
 MAX_BYTES = 256 * 1024
+MAX_GROUPS = 32  # 호스트당 agy 레인 상한. 넘으면 그 호스트를 "parse"로 둔다(조용히 자르지 않는다)
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024  # 모은 파일 전체 상한. 넘으면 쓰지 않는다(메뉴바도 2MiB 넘는 파일은 읽지 않는다)
 GROK_AUTH = {"ok", "expired", "login", "unavailable"}
 AGY_AUTH = {"ok", "login", "error"}
 
@@ -94,10 +96,10 @@ def _section(raw: Any, auth_values: set) -> Dict[str, Any]:
 def _groups(raw: Any) -> List[Dict[str, Any]]:
     if raw is None:
         return []
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or len(raw) > MAX_GROUPS:
         raise _BadType()
     groups = []
-    for group in raw:  # 레인은 자르지 않는다. 크기는 MAX_BYTES가 묶는다.
+    for group in raw:  # 레인은 자르지 않는다(상한을 넘으면 위에서 호스트째 거부).
         if not isinstance(group, dict) or _text(group.get("name")) is None:
             raise _BadType()
         groups.append({
@@ -271,13 +273,20 @@ def collect(nodes: List[Tuple[str, bool]], local_path: str, ssh: str = "ssh",
     return {"collected_at": int(now if now is not None else time.time()), "hosts": hosts}
 
 
+class OutputTooLarge(Exception):
+    pass
+
+
 def write_atomic(path: str, payload: Dict[str, Any]) -> None:
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(data.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        raise OutputTooLarge()
     folder = os.path.dirname(path) or "."
     os.makedirs(folder, exist_ok=True)
     temp = os.path.join(folder, ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
     try:
         with open(temp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
@@ -293,7 +302,11 @@ def run_once(args: argparse.Namespace) -> int:
         print("fleet-cli-collect: manifest error: %s" % type(error).__name__, file=sys.stderr)
         return 2
     payload = collect(nodes, args.local, ssh=args.ssh, jobs=args.jobs, timeout=args.timeout)
-    write_atomic(args.out, payload)
+    try:
+        write_atomic(args.out, payload)
+    except OutputTooLarge:
+        print("fleet-cli-collect: output over %d bytes, not written" % MAX_OUTPUT_BYTES, file=sys.stderr)
+        return 3
     failed = [host["name"] for host in payload["hosts"] if not host["ok"]]
     print("fleet-cli-collect: hosts=%d failed=%d%s" % (
         len(payload["hosts"]), len(failed), (" (" + ",".join(failed) + ")") if failed else ""))

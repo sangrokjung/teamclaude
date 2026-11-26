@@ -425,6 +425,17 @@ struct CliFleetStatusTests {
         object["schema"] = 1
         precondition(CliStatusSnapshot.parse(object) != nil)
 
+        // 보안 검토: 수집 파일은 읽기 전에 크기로 거부하고(2MiB), 스냅샷 레인은 32개까지만 받는다.
+        let huge = NSTemporaryDirectory() + "fleet-huge-\(UUID().uuidString).json"
+        fm.createFile(atPath: huge, contents: Data(count: CliFleetReport.maxFileBytes + 1))
+        defer { try? fm.removeItem(atPath: huge) }
+        precondition(CliFleetReport.load(path: huge) == .unreadable, "oversize collector file is refused")
+        var many = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) as? [String: Any] ?? [:]
+        var manyAgy = many["agy"] as! [String: Any]
+        manyAgy["groups"] = (0..<40).map { ["name": "Gemini \($0)"] }
+        many["agy"] = manyAgy
+        precondition(CliStatusSnapshot.parse(many)?.agy.groups.count == CliStatusSnapshot.maxGroups)
+
         // M1: 링크가 바뀌면 동작 목록도 새로 만든다. 지운 링크는 어디서도 실행되지 않는다.
         precondition(dashboardLinkActions([]) { _ in preconditionFailure("removed link must not run") }.isEmpty)
         let footer = DashboardPanelFooterView(frame: NSRect(x: 0, y: 0, width: 520, height: DashboardPanelFooterView.preferredHeight))

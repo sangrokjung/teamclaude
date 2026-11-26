@@ -73,21 +73,26 @@ the first one. If the file is missing or broken, or no entry is valid, the butto
 The CLI tab shows Grok and agy as a table with one row per machine: Grok (state dot, usage % and bar, time to the weekly
 reset), agy (state dot, weekly and 5-hour remaining, time to each reset), last used and today's count (Grok sessions / agy
 conversations). Neither tool reports a limit number, so values are percentages ("Grok limit: weekly 100%").
-States are written out as well as colored: OK, Caution (less than 20% left, Grok token expired, needs check, machine offline),
+States are written out as well as colored: OK, Caution (less than 20% left, Grok token expired, needs check, machine offline,
+"Fetch lag N m" when the last successful read is older than 5 minutes or the latest read failed, so an old value is never shown as fresh),
 Problem (not installed, login needed, collect failed, a machine's snapshot older than 5 minutes shown as "Stalled N m").
 
 - Every Mac's menu bar writes its own snapshot every minute to `~/.cache/cc-menubar/cli-status.json` (temp file, then
   rename). It holds states, percentages, times and counts only, never tokens:
   `{"schema":1,"host","written_at","grok":{"installed","auth","usage_pct","period_end","last_used","sessions_today"},
   "agy":{"installed","auth","groups":[{"name","weekly_remaining_pct","weekly_reset","five_hour_remaining_pct","five_hour_reset"}],
-  "last_used","conversations_today"}}`. Last used and today's counts come from the modification times under
+  "last_used","conversations_today"}}`, plus per tool `last_ok_at`, `fetch_failed` and `sessions_today_partial` /
+  `conversations_today_partial`. Last used and today's counts come from the modification times under
   `~/.grok/sessions/` and `~/.gemini/antigravity-cli/conversations/` (`.db-shm` files are ignored because every agy run,
-  including the menu bar's own `/usage` call, touches all of them).
+  including the menu bar's own `/usage` call, touches all of them). A scan stops after 20,000 entries; a capped count is
+  shown as a lower bound such as "40+".
 - On the hub, `python3 scripts/fleet-cli-collect.py --manifest <manifest.json> --once` reads every node's snapshot over
-  `ssh -o BatchMode=yes` (8 at a time, 20 s per host, at most 256 KiB each) and writes `~/.claude/cache/fleet-cli.json`:
+  `ssh -o BatchMode=yes` (8 at a time, 20 s per host, at most 256 KiB each) and writes `~/.claude/cache/fleet-cli.json` (a host with a wrongly typed field or more than 32 agy lanes is `parse`; a total over
+  2 MiB is not written, and the menu bar refuses a file over 2 MiB):
   `{"collected_at", "hosts": [{"name", "ok", "error", "status"}]}`. The hub's own file is the `hub` row. A node with
   `"menubarOfflineOk": true` that cannot be reached is shown as Offline. Without `--once` it repeats every 60 seconds; nothing
   installs it as a LaunchAgent.
+- The table draws up to 32 machines; the rest are counted on one line ("+N more · M problem") and in the section summary.
 - Without `fleet-cli.json` (a worker Mac) the table shows only this Mac. If the collector file is older than 3 minutes the
   table head says "Collector stalled".
 

@@ -268,6 +268,17 @@ class CliLaneHealthWiringTests(unittest.TestCase):
         # 구독 모니터 캐시도 같은 경로를 타야 한다 — 이쪽은 계정마다 SHA256까지 돈다.
         self.assertIn("AccountSubscriptionFileCache.shared.json(at: url, maxBytes: 1_048_576)", source)
 
+    def test_link_change_rebuilds_both_consumers(self):
+        # 적대 검토 M1: links.json이 바뀌면 하단 버튼과 동작 목록(⌘K)을 함께 새로 만든다.
+        # 캐시를 재사용하는 메뉴 열기 경로가 동작 목록을 다시 만들지 않아도 지운 링크가 남지 않게 한다.
+        body = self.main[self.main.index("    func applyLinks(_ links: [DashboardLink]) {"):]
+        body = body[:body.index("\n    }\n") + 6]
+        self.assertIn("guard links != currentLinks else { return }", body)
+        self.assertIn("dashboard.links = links", body)
+        self.assertIn("dashboard.actions = dashboardActions(menu: menu)", body)
+        self.assertIn("self.applyLinks(scan.links)", self.main)
+        self.assertNotIn("self.currentLinks = links", self.main)
+
     def test_extra_agy_lanes_are_counted_not_dropped(self):
         # 2026-11-26 표 전환 뒤: 셀 모델(CliFleetTable.swift)이 나머지 레인을 세어 초기화 줄에 붙인다.
         table = (SOURCES / "CliFleetTable.swift").read_text()

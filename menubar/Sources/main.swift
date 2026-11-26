@@ -5054,11 +5054,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastAgyFetchedAt: Date?
     private var agyHasValue = false
     var agyTimer: Timer?
-    /// CLI 탭 머신 표의 이 맥 줄. 제목·카드와 같은 판정(일시 실패는 앞선 값을 지킨다)을 따른다.
-    var localGrokOutcome: (outcome: GrokMenuOutcome, installed: Bool)?
-    var localAgyOutcome: AgyFetchOutcome?
-    var localGrokActivity = CliActivity()
-    var localAgyActivity = CliActivity()
+    /// CLI 탭 머신 표의 이 맥 줄(CliLocalTracker.swift). 결과를 넘기기만 하고 판정은 그 타입이 한다.
+    var cliTracker = CliLocalTracker()
     /// 본체 수집 결과(~/.claude/cache/fleet-cli.json). 파일이 없으면 nil(이 맥 한 줄).
     var currentCliFleetReport: CliFleetReport?
     /// 패널 링크(~/.config/cc-menubar/links.json). 없거나 틀리면 빈 목록이라 버튼이 숨는다.
@@ -5937,7 +5934,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.isFetchingGrok = false
                     self.currentGrokSlot = nil
                     self.currentGrokCard = grokCardModel(for: notice)
-                    self.localGrokOutcome = (.login, false)
+                    self.cliTracker.recordGrokMissing()
                     print("GROK-SLOT: \(notice.headline)")
                     fflush(stdout)
                     self.updateTitle()
@@ -5956,7 +5953,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.isFetchingGrok = false
                 if case .percent = outcome { self.grokLastSuccessAt = Date() }
-                self.recordLocalGrokOutcome(outcome)
+                self.cliTracker.recordGrok(outcome, now: Date())
                 // 제목 슬롯과 카드는 한 판정(grokPresentation)에서 함께 나온다.
                 let presented = grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)
                 self.currentGrokSlot = presented.slot
@@ -5982,7 +5979,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isFetchingAgy = false
-                self.recordLocalAgyOutcome(outcome)
+                self.cliTracker.recordAgy(outcome, now: Date())
                 switch outcome {
                 case .missing:
                     self.agyHasValue = false
@@ -6009,49 +6006,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: CLI 탭 머신 표(Grok·agy)
 
-    /// 일시 실패(.unavailable)는 앞선 사용률을 지킨다 — 제목 슬롯(grokPresentation)과 같은 규칙.
-    func recordLocalGrokOutcome(_ outcome: GrokMenuOutcome) {
-        if case .unavailable = outcome, let previous = localGrokOutcome, case .percent = previous.outcome { return }
-        localGrokOutcome = (outcome, true)
-    }
-
-    /// 실패는 앞선 정상 값을 지킨다 — 카드(agyHasValue)와 같은 규칙.
-    func recordLocalAgyOutcome(_ outcome: AgyFetchOutcome) {
-        if case .failed = outcome, case .ready? = localAgyOutcome { return }
-        localAgyOutcome = outcome
-    }
-
-    var localCliState: CliLocalCliState {
-        CliLocalCliState(
-            host: cliHostName,
-            grok: localGrokOutcome.map { cliGrokStatus(outcome: $0.outcome, installed: $0.installed, activity: localGrokActivity) },
-            agy: localAgyOutcome.map { cliAgyStatus(outcome: $0, activity: localAgyActivity) },
-            writtenAt: Date())
-    }
-
     var currentCliTable: CliFleetTable {
-        CliFleetTable.make(report: currentCliFleetReport, local: localCliState, now: Date())
+        CliFleetTable.make(report: currentCliFleetReport, local: cliTracker.state(host: cliHostName, now: Date()), now: Date())
     }
 
-    /// 60초마다: 사용 흔적 스캔·본체 수집 파일·링크 파일을 메인 스레드 밖에서 읽고,
+    /// 60초마다: 사용 흔적 스캔·본체 수집 파일·링크 파일을 메인 스레드 밖에서 읽고(CliBackgroundScan),
     /// 이 맥의 스냅샷(~/.cache/cc-menubar/cli-status.json)을 원자적으로 쓴다. 첫 결과 전에는 쓰지 않는다.
     func loadCliFleetInBackground() {
         guard !isScanningCli else { return }
         isScanningCli = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let now = Date()
-            let grok = CliActivityScanner.grok(root: CliActivityScanner.grokSessionsURL(), now: now)
-            let agy = CliActivityScanner.agy(root: CliActivityScanner.agyConversationsURL(), now: now)
-            let report = CliFleetReport.load()
-            let links = DashboardLinks.load()
+            let scan = CliBackgroundScan.run()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isScanningCli = false
-                self.localGrokActivity = grok
-                self.localAgyActivity = agy
-                self.currentCliFleetReport = report
-                self.currentLinks = links
-                if let snapshot = self.localCliState.snapshot {
+                self.cliTracker.grokActivity = scan.grokActivity
+                self.cliTracker.agyActivity = scan.agyActivity
+                self.currentCliFleetReport = scan.report
+                self.applyLinks(scan.links)
+                if let snapshot = self.cliTracker.state(host: self.cliHostName, now: Date()).snapshot {
                     DispatchQueue.global(qos: .utility).async {
                         if !CliStatusFile.write(snapshot) {
                             print("CLI-STATUS: 스냅샷 쓰기 실패")
@@ -6061,6 +6034,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.scheduleDashboardRefresh(reason: "loadCliFleetInBackground")
             }
+        }
+    }
+
+    /// 링크가 바뀌면 하단 버튼과 동작 목록(⌘K)을 함께 새로 만든다. 지운 링크가 어느 쪽에도 남지 않게 한다(검토 M1).
+    func applyLinks(_ links: [DashboardLink]) {
+        guard links != currentLinks else { return }
+        currentLinks = links
+        for dashboard in [cachedDashboardView, openDashboardView].compactMap({ $0 }) {
+            dashboard.links = links
+            if let menu = statusItem?.menu { dashboard.actions = dashboardActions(menu: menu) }
         }
     }
 
@@ -7826,11 +7809,11 @@ if let emptyIndex = CommandLine.arguments.firstIndex(of: "--empty-home-snapshot"
     // ccusage는 네트워크를 탈 수 있어 스냅샷에서는 실행하지 않는다. 설치돼 있으면 "확인 중"으로 남는다(판정 nil).
     if let notice = grokPresenceNotice() {
         delegate.currentGrokCard = grokCardModel(for: notice)
-        delegate.localGrokOutcome = (.login, false)
+        delegate.cliTracker.recordGrokMissing()
     }
     if agyExecutableURL() == nil {
         delegate.currentAgyCard = agyCardModel(for: agyToolNotice())
-        delegate.localAgyOutcome = .missing
+        delegate.cliTracker.recordAgy(.missing, now: Date())
     }
     delegate.refreshBurnModel()
     // 모델 탭: 실제 로더와 같은 경로(빈 HOME이면 수집 결과가 없어 "수집 전" 안내).

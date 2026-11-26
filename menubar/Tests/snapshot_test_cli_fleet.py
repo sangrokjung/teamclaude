@@ -49,7 +49,7 @@ class CliFleetSnapshotTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(rendered)
         joined = "\n".join(texts)
-        for word in ("본체", "studio-a", "mini-b", "studio-c", "laptop", "mini-d",
+        for word in ("본체", "studio-a", "mini-b", "studio-c", "laptop", "mini-d", "mini-e", "조회 지연 12분", "40+",
                      "정상", "주의", "문제", "수집 실패", "꺼짐", "멈춤 7분",
                      "로그인 필요", "갱신 필요", "남음 12%", "미설치",
                      "한도 숫자를 주지 않아 % 기준", "마지막 사용", "오늘", "AI 비용 대시보드"):

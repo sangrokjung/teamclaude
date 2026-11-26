@@ -779,6 +779,14 @@ enum L10n {
     static var cliOffline: String { t("꺼짐", "Offline") }
     static func cliStalled(_ minutes: Int) -> String { t("멈춤 \(minutes)분", "Stalled \(minutes)m") }
     static var cliClockSkew: String { t("시각 오류", "Clock skew") }
+    static func cliFetchLag(_ minutes: Int) -> String { t("조회 지연 \(minutes)분", "Fetch lag \(minutes)m") }
+    static var cliFetchFailed: String { t("조회 실패", "Fetch failing") }
+    static func cliHiddenMachines(_ count: Int, problem: Int, warn: Int) -> String {
+        var parts = [t("외 \(count)대", "+\(count) more")]
+        if problem > 0 { parts.append(t("문제 \(problem)", "\(problem) problem")) }
+        if warn > 0 { parts.append(t("주의 \(warn)", "\(warn) caution")) }
+        return parts.joined(separator: " · ")
+    }
     static func cliCollectorStalled(_ minutes: Int) -> String { t("수집 멈춤 \(minutes)분", "Collector stalled \(minutes)m") }
     static var cliCollectorUnreadable: String { t("수집 파일 읽기 실패", "Collector file unreadable") }
     static func cliResetIn(_ duration: String) -> String { t("초기화 \(duration)", "resets \(duration)") }

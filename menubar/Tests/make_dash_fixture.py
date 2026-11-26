@@ -173,7 +173,8 @@ def iso_after(seconds):
 
 
 def cli_snapshot(host, age=25, grok_auth="ok", grok_usage=12.5, agy_auth="ok", agy_week=78.0, agy_5h=95.0,
-                 grok_installed=True, agy_installed=True, grok_last=-180, agy_last=-7200, sessions=4, conversations=2):
+                 grok_installed=True, agy_installed=True, grok_last=-180, agy_last=-7200, sessions=4, conversations=2,
+                 grok_ok_age=30, grok_failed=False, partial=False):
     groups = [] if agy_auth != "ok" else [{
         "name": "Gemini Models", "weekly_remaining_pct": agy_week, "weekly_reset": iso_after(5 * 86400 + 3600),
         "five_hour_remaining_pct": agy_5h, "five_hour_reset": iso_after(2 * 3600 + 600)}]
@@ -182,7 +183,9 @@ def cli_snapshot(host, age=25, grok_auth="ok", grok_usage=12.5, agy_auth="ok", a
         "grok": {"installed": grok_installed, "auth": grok_auth,
                  "usage_pct": grok_usage if grok_auth in ("ok", "expired") else None,
                  "period_end": iso_after(3 * 86400 + 4 * 3600 + 900) if grok_auth in ("ok", "expired") else None,
-                 "last_used": iso_after(grok_last) if grok_last is not None else None, "sessions_today": sessions},
+                 "last_used": iso_after(grok_last) if grok_last is not None else None, "sessions_today": sessions,
+                 "sessions_today_partial": partial, "fetch_failed": grok_failed,
+                 "last_ok_at": iso_after(-grok_ok_age) if grok_auth == "ok" else None},
         "agy": {"installed": agy_installed, "auth": agy_auth, "groups": groups,
                 "last_used": iso_after(agy_last) if agy_last is not None else None, "conversations_today": conversations},
     }
@@ -202,6 +205,9 @@ def cli_fleet():
         {"name": "laptop", "ok": False, "error": "offline", "status": None},
         ok("mini-d", cli_snapshot("mini-d", age=7 * 60 + 10, agy_installed=False, agy_auth="error",
                                   grok_usage=4.0, sessions=1, conversations=None)),
+        # 파일은 방금 썼지만 Grok 조회가 12분째 실패해 앞선 값을 보이는 머신. 오늘 개수는 열거 상한에 걸린 부분 집계.
+        ok("mini-e", cli_snapshot("mini-e", grok_usage=33.0, grok_failed=True, grok_ok_age=12 * 60 + 5, partial=True,
+                                  sessions=40, conversations=3)),
     ]}
 
 

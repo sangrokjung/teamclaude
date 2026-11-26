@@ -247,6 +247,26 @@ class FleetCliCollectTests(unittest.TestCase):
         self.assertIsNone(plain["agy"]["last_ok_at"])
         self.assertFalse(plain["agy"]["conversations_today_partial"])
 
+    def test_too_many_lanes_mark_the_host_parse(self):
+        # 보안 검토: 작은 레인 객체 수천 개로 출력이 부풀지 않게 상한(32)을 넘는 호스트는 "parse"다.
+        good = snapshot()
+        good["agy"]["groups"] = [{"name": f"G{i}"} for i in range(collect.MAX_GROUPS + 1)]
+        self.assertIsNone(collect.sanitize_status(good))
+        good["agy"]["groups"] = good["agy"]["groups"][:collect.MAX_GROUPS]
+        self.assertEqual(collect.MAX_GROUPS, len(collect.sanitize_status(good)["agy"]["groups"]))
+
+    def test_oversize_output_is_not_written(self):
+        # 보안 검토: 모은 파일 전체에도 상한을 둔다. 넘으면 쓰지 않고 rc 3.
+        original = collect.MAX_OUTPUT_BYTES
+        try:
+            collect.MAX_OUTPUT_BYTES = 200
+            self.assertEqual(3, self.run_once())
+            self.assertFalse(self.out.exists())
+        finally:
+            collect.MAX_OUTPUT_BYTES = original
+        self.assertEqual(0, self.run_once())
+        self.assertTrue(self.out.exists())
+
     def test_unexpected_parser_error_is_contained(self):
         # 파서가 예상 못 한 예외를 내도 그 호스트만 "parse"다(전체 수집이 멈추지 않는다).
         original = collect.sanitize_status

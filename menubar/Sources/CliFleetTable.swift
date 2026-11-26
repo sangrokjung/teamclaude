@@ -56,7 +56,10 @@ struct CliLocalCliState: Equatable {
 }
 
 struct CliFleetTable: Equatable {
+    /// 그리는 줄(앞 maxRows대).
     var rows: [CliFleetRow]
+    /// 표시 상한 밖의 줄. 그리지 않지만 요약·아래 한 줄에 센다(검토 I3).
+    var hidden: [CliFleetRow] = []
     /// 표 머리의 수집기 경고(수집 멈춤·읽기 실패). 정상이면 nil.
     var collectorNote: String?
     var collectorLevel: CliLevel = .ok
@@ -69,6 +72,20 @@ struct CliFleetTable: Equatable {
     /// 본체 수집기도 1분마다 돈다. 3분 넘게 그대로면 수집이 멈춘 것이다(머신 줄과 같은 기준).
     static let collectorStaleSeconds: TimeInterval = 180
     static let futureSkewSeconds: TimeInterval = 60
+    /// 그릴 머신 수 상한. 넘는 머신은 "외 N대" 한 줄로 센다.
+    static let maxRows = 32
+
+    var totalCount: Int { rows.count + hidden.count }
+    var okCount: Int { (rows + hidden).filter { $0.level == .ok }.count }
+
+    /// 표시 상한 밖 머신 한 줄("외 1대 · 문제 1"). 없으면 nil.
+    var hiddenNote: String? {
+        guard !hidden.isEmpty else { return nil }
+        return L10n.cliHiddenMachines(hidden.count, problem: hidden.filter { $0.level == .problem }.count,
+                                      warn: hidden.filter { $0.level == .warn }.count)
+    }
+
+    var hiddenLevel: CliLevel { hidden.map(\.level).max() ?? .ok }
 
     // 표 기하. 그리기와 높이 계산이 같은 값을 쓴다.
     static let topInset: CGFloat = 6
@@ -77,8 +94,8 @@ struct CliFleetTable: Equatable {
     static let rowHeight: CGFloat = 44
     static let bottomInset: CGFloat = 6
 
-    static func height(rows: Int) -> CGFloat {
-        topInset + noteHeight + headHeight + rowHeight * CGFloat(max(1, rows)) + bottomInset
+    static func height(rows: Int, hidden: Bool = false) -> CGFloat {
+        topInset + noteHeight + headHeight + rowHeight * CGFloat(max(1, rows)) + (hidden ? noteHeight : 0) + bottomInset
     }
 
     static var limitNote: String { L10n.cliLimitNote }
@@ -98,10 +115,11 @@ struct CliFleetTable: Equatable {
             table.collectorLevel = .warn
             return table
         }
-        let rows = report.hosts.map { host in
+        let all = report.hosts.map { host in
             row(name: FleetMachines.label(host.name), status: host.status, hostError: host.ok ? nil : (host.error ?? "unknown"), now: now)
         }
-        var table = CliFleetTable(rows: rows, collectorNote: nil, fromFleet: true)
+        var table = CliFleetTable(rows: Array(all.prefix(maxRows)), collectorNote: nil, fromFleet: true)
+        table.hidden = Array(all.dropFirst(maxRows))
         let age = now.timeIntervalSince(collected)
         if age > collectorStaleSeconds {
             table.collectorNote = age < 1e9 ? L10n.cliCollectorStalled(Int(age / 60)) : L10n.fleetStaleLong
@@ -121,7 +139,8 @@ struct CliFleetTable: Equatable {
         let level = max(grok.level, agy.level)
         return CliFleetRow(name: local.host, level: level, statusWord: levelWord(level), dimmed: false, grok: grok, agy: agy,
                            grokLastUsed: relative(local.grok?.lastUsed, now: now), agyLastUsed: relative(local.agy?.lastUsed, now: now),
-                           grokToday: count(local.grok?.sessionsToday), agyToday: count(local.agy?.conversationsToday))
+                           grokToday: count(local.grok?.sessionsToday, partial: local.grok?.sessionsTodayPartial ?? false),
+                           agyToday: count(local.agy?.conversationsToday, partial: local.agy?.conversationsTodayPartial ?? false))
     }
 
     /// 머신 한 줄. hostError가 있으면 수집 실패(꺼질 수 있는 머신은 "offline"으로 와서 주의)다.
@@ -152,10 +171,28 @@ struct CliFleetTable: Equatable {
         }
         return CliFleetRow(name: name, level: level, statusWord: word, dimmed: dimmed, grok: grok, agy: agy,
                            grokLastUsed: relative(status.grok.lastUsed, now: now), agyLastUsed: relative(status.agy.lastUsed, now: now),
-                           grokToday: count(status.grok.sessionsToday), agyToday: count(status.agy.conversationsToday))
+                           grokToday: count(status.grok.sessionsToday, partial: status.grok.sessionsTodayPartial),
+                           agyToday: count(status.agy.conversationsToday, partial: status.agy.conversationsTodayPartial))
+    }
+
+    /// 조회 지연 문구. 최근 조회가 실패했거나 마지막 성공이 5분을 넘었으면 "조회 지연 N분"(성공 기록이 없으면 "조회 실패").
+    /// 파일 기록 시각(written_at)은 매분 새로 붙으므로 신선함의 근거로 쓰지 않는다.
+    static func fetchLag(lastOkAt: Date?, failed: Bool, now: Date) -> String? {
+        let age = lastOkAt.map { now.timeIntervalSince($0) }
+        guard failed || (age ?? 0) > hostStaleSeconds else { return nil }
+        guard let age else { return L10n.cliFetchFailed }
+        return L10n.cliFetchLag(max(1, Int(min(age, 1e8) / 60)))
     }
 
     static func grokCell(_ grok: CliGrokStatus, now: Date) -> CliGrokCell {
+        let cell = grokCellValue(grok, now: now)
+        guard grok.installed, grok.auth == .ok, let lag = fetchLag(lastOkAt: grok.lastOkAt, failed: grok.fetchFailed, now: now) else {
+            return cell
+        }
+        return CliGrokCell(level: max(cell.level, .warn), word: lag, usagePercent: cell.usagePercent, reset: nil)
+    }
+
+    private static func grokCellValue(_ grok: CliGrokStatus, now: Date) -> CliGrokCell {
         let reset = grok.periodEnd.map { resetText($0, now: now) }
         guard grok.installed else { return CliGrokCell(level: .problem, word: StatusVocabulary.notInstalled, usagePercent: nil, reset: nil) }
         switch grok.auth {
@@ -178,6 +215,15 @@ struct CliFleetTable: Equatable {
     }
 
     static func agyCell(_ agy: CliAgyStatus, now: Date) -> CliAgyCell {
+        let cell = agyCellValue(agy, now: now)
+        guard agy.installed, agy.auth == .ok, let lag = fetchLag(lastOkAt: agy.lastOkAt, failed: agy.fetchFailed, now: now) else {
+            return cell
+        }
+        return CliAgyCell(level: max(cell.level, .warn), word: lag, weeklyRemaining: cell.weeklyRemaining,
+                          fiveHourRemaining: cell.fiveHourRemaining, reset: nil)
+    }
+
+    private static func agyCellValue(_ agy: CliAgyStatus, now: Date) -> CliAgyCell {
         guard agy.installed else {
             return CliAgyCell(level: .problem, word: StatusVocabulary.notInstalled, weeklyRemaining: nil, fiveHourRemaining: nil, reset: nil)
         }
@@ -263,5 +309,8 @@ struct CliFleetTable: Equatable {
         return L10n.cliAgo(L10n.durationDays(hours / 24))
     }
 
-    static func count(_ value: Int?) -> String { value.map(String.init) ?? StatusVocabulary.none }
+    /// 개수. 열거 상한에 걸려 일부만 셌으면 "3+"(하한).
+    static func count(_ value: Int?, partial: Bool = false) -> String {
+        value.map { "\($0)" + (partial ? "+" : "") } ?? StatusVocabulary.none
+    }
 }

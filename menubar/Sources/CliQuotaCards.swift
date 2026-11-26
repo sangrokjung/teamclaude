@@ -10,7 +10,7 @@ final class CliQuotaLanesView: NSView {
     static var fixedHeight: CGFloat { CliFleetTable.height(rows: 1) }
 
     static func preferredHeight(_ table: CliFleetTable?) -> CGFloat {
-        CliFleetTable.height(rows: table?.rows.count ?? 1)
+        CliFleetTable.height(rows: table?.rows.count ?? 1, hidden: !(table?.hidden.isEmpty ?? true))
     }
 
     /// 이 맥의 Grok 카드 모델. 미설치 안내(notice)와 접근성 문구가 이 값을 본다.
@@ -127,11 +127,27 @@ final class CliQuotaLanesView: NSView {
         if let notice = agy.notice { ToolNoticeDrawLog.record("agy", notice) }
         let table = shownTable
         let col = Self.columns(width: bounds.width)
-        let fg3 = TeamClaudePalette.fg3
+        var y = drawHead(table, col: col)
+        // 3. 머신마다 한 줄(두 단).
+        for (index, row) in table.rows.enumerated() {
+            var line = row
+            if index == 0, !table.fromFleet { line = Self.withStaleNotes(row, staleNotes) }
+            drawRow(line, y: y, col: col)
+            y += CliFleetTable.rowHeight
+            if index < table.rows.count - 1 { PanelDraw.hairline(col.machine, col.todayEnd, y - 1) }
+        }
+        // 4. 표시 상한 밖 머신은 한 줄로 센다(잘린 쪽의 주의·문제 수 포함).
+        if let note = table.hiddenNote {
+            PanelDraw.hairline(col.machine, col.todayEnd, y - 1)
+            PanelDraw.dot(col.machine, centerY: y + 11, Self.levelColor(table.hiddenLevel == .ok ? .pending : table.hiddenLevel), size: 6)
+            PanelDraw.text(note, col.machine + 11, y + 4, TeamClaudePalette.legendFont, Self.wordColor(table.hiddenLevel))
+        }
+    }
 
-        // 1. 한도 기준 한 줄 · 오른쪽에 수집기 경고(또는 "이 맥만").
+    /// 1. 한도 기준 한 줄 · 오른쪽에 수집기 경고(또는 "이 맥만"). 2. 열 머리. 다음 줄의 y를 돌려준다.
+    private func drawHead(_ table: CliFleetTable, col: Columns) -> CGFloat {
+        let fg3 = TeamClaudePalette.fg3, legend = TeamClaudePalette.legendFont
         var y = CliFleetTable.topInset
-        let legend = TeamClaudePalette.legendFont
         var rightText: (String, NSColor, CliLevel?)?
         if let note = table.collectorNote {
             rightText = (note, Self.wordColor(table.collectorLevel), table.collectorLevel)
@@ -147,10 +163,7 @@ final class CliQuotaLanesView: NSView {
         }
         PanelDraw.text(PanelDraw.clipped(Self.limitNoteText, legend, maxWidth: noteMax), col.machine, y + 2, legend, fg3)
         y += CliFleetTable.noteHeight
-
-        // 2. 열 머리.
-        let meta = TeamClaudePalette.metaFont
-        let kern = TeamClaudePalette.metaKern
+        let meta = TeamClaudePalette.metaFont, kern = TeamClaudePalette.metaKern
         PanelDraw.text(L10n.cliColMachine, col.machine, y + 3, meta, fg3, kern: kern)
         PanelDraw.text(L10n.cliColGrok, col.grok, y + 3, meta, fg3, kern: kern)
         PanelDraw.text(L10n.cliColAgy, col.agy, y + 3, meta, fg3, kern: kern)
@@ -158,15 +171,7 @@ final class CliQuotaLanesView: NSView {
         PanelDraw.right(L10n.cliColToday, col.todayEnd, y + 3, meta, fg3, kern: kern)
         y += CliFleetTable.headHeight
         PanelDraw.hairline(col.machine, col.todayEnd, y - 1)
-
-        // 3. 머신마다 한 줄(두 단).
-        for (index, row) in table.rows.enumerated() {
-            var line = row
-            if index == 0, !table.fromFleet { line = Self.withStaleNotes(row, staleNotes) }
-            drawRow(line, y: y, col: col)
-            y += CliFleetTable.rowHeight
-            if index < table.rows.count - 1 { PanelDraw.hairline(col.machine, col.todayEnd, y - 1) }
-        }
+        return y
     }
 
     static var limitNoteText: String { CliFleetTable.limitNote }
@@ -189,71 +194,81 @@ final class CliQuotaLanesView: NSView {
     }
 
     private func drawRow(_ row: CliFleetRow, y: CGFloat, col: Columns) {
-        let fg = TeamClaudePalette.fg, fg2 = TeamClaudePalette.fg2, fg3 = TeamClaudePalette.fg3
-        let value = row.dimmed ? fg3 : fg
-        let micro = TeamClaudePalette.microFont
-        let number = TeamClaudePalette.numberFont
-        let small = TeamClaudePalette.smallFont
         let line1 = y + 6, line2 = y + 24
+        drawMachineCell(row, line1: line1, line2: line2, col: col)
+        drawGrokCell(row, line1: line1, line2: line2, col: col)
+        drawAgyCell(row, line1: line1, line2: line2, col: col)
+        drawActivityCells(row, line1: line1, line2: line2, col: col)
+    }
 
-        // 머신: 이름 / 상태 점 + 상태 글자
-        let name = TeamClaudePalette.nameFont
+    /// 머신: 이름 / 상태 점 + 상태 글자.
+    private func drawMachineCell(_ row: CliFleetRow, line1: CGFloat, line2: CGFloat, col: Columns) {
+        let name = TeamClaudePalette.nameFont, micro = TeamClaudePalette.microFont
         PanelDraw.text(PanelDraw.clipped(row.name, name, maxWidth: col.grok - col.machine - 8), col.machine, line1 - 0.5, name,
-                       row.dimmed ? fg2 : fg)
+                       row.dimmed ? TeamClaudePalette.fg2 : TeamClaudePalette.fg)
         PanelDraw.dot(col.machine, centerY: line2 + 7, Self.levelColor(row.level), size: 6)
         PanelDraw.text(PanelDraw.clipped(row.statusWord, micro, maxWidth: col.grok - col.machine - 18), col.machine + 11, line2, micro,
                        Self.wordColor(row.level))
+    }
 
-        // Grok: 점 · 막대 · 사용 % / 상태 글자 또는 초기화까지
-        let grokText = col.grok + 12
-        if row.grok.level != .pending || row.grok.word != nil {
-            PanelDraw.dot(col.grok, centerY: line1 + 8, Self.levelColor(row.grok.level), size: 6)
-        }
-        if let usage = row.grok.usagePercent {
-            let valueText = "\(panelPercentNumber(usage))%"
-            let valueWidth = max(PanelDraw.width("100%", number), PanelDraw.width(valueText, number))
-            PanelDraw.meter(NSRect(x: grokText, y: line1 + 5.5, width: max(10, col.grokEnd - grokText - valueWidth - 8), height: 5),
-                            percent: usage, elapsed: nil, muted: row.dimmed, thresholdPercent: 100 - CliFleetTable.lowRemainingPercent)
-            PanelDraw.right(valueText, col.grokEnd, line1, number, row.grok.level == .warn && !row.dimmed ? TeamClaudePalette.amber : value)
-            let second = [row.grok.word, row.grok.reset].compactMap { $0 }.joined(separator: " · ")
-            PanelDraw.text(PanelDraw.clipped(second, micro, maxWidth: col.grokEnd - col.grok), col.grok, line2, micro,
-                           row.grok.word == nil ? fg3 : Self.wordColor(row.grok.level))
-        } else {
-            let word = row.grok.word ?? StatusVocabulary.none
-            PanelDraw.text(PanelDraw.clipped(word, TeamClaudePalette.captionFont, maxWidth: col.grokEnd - grokText), grokText, line1,
-                           TeamClaudePalette.captionFont, row.grok.word == nil ? fg3 : Self.wordColor(row.grok.level))
-            if let reset = row.grok.reset {
-                PanelDraw.text(PanelDraw.clipped(reset, micro, maxWidth: col.grokEnd - col.grok), col.grok, line2, micro, fg3)
-            }
-        }
+    /// 값이 없는 칸: 윗단에 상태 글자(없으면 —), 아랫단에 초기화 문구.
+    private func drawWordCell(word: String?, level: CliLevel, reset: String?, x: CGFloat, end: CGFloat, line1: CGFloat, line2: CGFloat) {
+        let caption = TeamClaudePalette.captionFont, micro = TeamClaudePalette.microFont
+        PanelDraw.text(PanelDraw.clipped(word ?? StatusVocabulary.none, caption, maxWidth: end - x - 12), x + 12, line1, caption,
+                       word == nil ? TeamClaudePalette.fg3 : Self.wordColor(level))
+        if let reset { PanelDraw.text(PanelDraw.clipped(reset, micro, maxWidth: end - x), x, line2, micro, TeamClaudePalette.fg3) }
+    }
 
-        // agy: 점 · 주간 남음 … 5시간 남음 / 상태 글자 또는 초기화까지
-        let agyText = col.agy + 12
-        if row.agy.level != .pending || row.agy.word != nil {
-            PanelDraw.dot(col.agy, centerY: line1 + 8, Self.levelColor(row.agy.level), size: 6)
-        }
-        if row.agy.weeklyRemaining != nil || row.agy.fiveHourRemaining != nil {
-            func color(_ remaining: Double?) -> NSColor {
-                guard let remaining, !row.dimmed else { return value }
-                return remaining < CliFleetTable.lowRemainingPercent ? TeamClaudePalette.amber : fg
-            }
-            let weekly = row.agy.weeklyRemaining.map { L10n.cliWeeklyValue(Int($0)) } ?? L10n.cliWeeklyReset(StatusVocabulary.none)
-            let five = row.agy.fiveHourRemaining.map { L10n.cliFiveHourValue(Int($0)) } ?? L10n.cliFiveHourReset(StatusVocabulary.none)
-            PanelDraw.text(weekly, agyText, line1, number, color(row.agy.weeklyRemaining))
-            PanelDraw.right(five, col.agyEnd, line1, number, color(row.agy.fiveHourRemaining))
-            let second = [row.agy.word, row.agy.reset].compactMap { $0 }.joined(separator: " · ")
-            PanelDraw.text(PanelDraw.clipped(second, micro, maxWidth: col.agyEnd - col.agy), col.agy, line2, micro,
-                           row.agy.word == nil ? fg3 : Self.wordColor(row.agy.level))
-        } else {
-            let word = row.agy.word ?? StatusVocabulary.none
-            PanelDraw.text(PanelDraw.clipped(word, TeamClaudePalette.captionFont, maxWidth: col.agyEnd - agyText), agyText, line1,
-                           TeamClaudePalette.captionFont, row.agy.word == nil ? fg3 : Self.wordColor(row.agy.level))
-            if let reset = row.agy.reset {
-                PanelDraw.text(PanelDraw.clipped(reset, micro, maxWidth: col.agyEnd - col.agy), col.agy, line2, micro, fg3)
-            }
-        }
+    /// 값이 있는 칸의 아랫단: 상태 글자 · 초기화 문구.
+    private func drawSecondLine(word: String?, level: CliLevel, reset: String?, x: CGFloat, end: CGFloat, line2: CGFloat) {
+        let micro = TeamClaudePalette.microFont
+        let text = [word, reset].compactMap { $0 }.joined(separator: " · ")
+        PanelDraw.text(PanelDraw.clipped(text, micro, maxWidth: end - x), x, line2, micro, word == nil ? TeamClaudePalette.fg3 : Self.wordColor(level))
+    }
 
-        // 마지막 사용 · 오늘: 윗단 Grok, 아랫단 agy. 도구 이름은 한 번만, 숫자는 고정폭으로 오른쪽 맞춤.
+    /// Grok: 점 · 막대 · 사용 % / 상태 글자 또는 초기화까지.
+    private func drawGrokCell(_ row: CliFleetRow, line1: CGFloat, line2: CGFloat, col: Columns) {
+        let cell = row.grok
+        if cell.level != .pending || cell.word != nil { PanelDraw.dot(col.grok, centerY: line1 + 8, Self.levelColor(cell.level), size: 6) }
+        guard let usage = cell.usagePercent else {
+            drawWordCell(word: cell.word, level: cell.level, reset: cell.reset, x: col.grok, end: col.grokEnd, line1: line1, line2: line2)
+            return
+        }
+        let number = TeamClaudePalette.numberFont
+        let valueText = "\(panelPercentNumber(usage))%"
+        let valueWidth = max(PanelDraw.width("100%", number), PanelDraw.width(valueText, number))
+        let barX = col.grok + 12
+        PanelDraw.meter(NSRect(x: barX, y: line1 + 5.5, width: max(10, col.grokEnd - barX - valueWidth - 8), height: 5),
+                        percent: usage, elapsed: nil, muted: row.dimmed, thresholdPercent: 100 - CliFleetTable.lowRemainingPercent)
+        let color = row.dimmed ? TeamClaudePalette.fg3 : cell.level == .warn ? TeamClaudePalette.amber : TeamClaudePalette.fg
+        PanelDraw.right(valueText, col.grokEnd, line1, number, color)
+        drawSecondLine(word: cell.word, level: cell.level, reset: cell.reset, x: col.grok, end: col.grokEnd, line2: line2)
+    }
+
+    /// agy: 점 · 주간 남음 … 5시간 남음 / 상태 글자 또는 초기화까지.
+    private func drawAgyCell(_ row: CliFleetRow, line1: CGFloat, line2: CGFloat, col: Columns) {
+        let cell = row.agy
+        if cell.level != .pending || cell.word != nil { PanelDraw.dot(col.agy, centerY: line1 + 8, Self.levelColor(cell.level), size: 6) }
+        guard cell.weeklyRemaining != nil || cell.fiveHourRemaining != nil else {
+            drawWordCell(word: cell.word, level: cell.level, reset: cell.reset, x: col.agy, end: col.agyEnd, line1: line1, line2: line2)
+            return
+        }
+        func color(_ remaining: Double?) -> NSColor {
+            guard let remaining, !row.dimmed else { return row.dimmed ? TeamClaudePalette.fg3 : TeamClaudePalette.fg }
+            return remaining < CliFleetTable.lowRemainingPercent ? TeamClaudePalette.amber : TeamClaudePalette.fg
+        }
+        let number = TeamClaudePalette.numberFont
+        let weekly = cell.weeklyRemaining.map { L10n.cliWeeklyValue(Int($0)) } ?? L10n.cliWeeklyReset(StatusVocabulary.none)
+        let five = cell.fiveHourRemaining.map { L10n.cliFiveHourValue(Int($0)) } ?? L10n.cliFiveHourReset(StatusVocabulary.none)
+        PanelDraw.text(weekly, col.agy + 12, line1, number, color(cell.weeklyRemaining))
+        PanelDraw.right(five, col.agyEnd, line1, number, color(cell.fiveHourRemaining))
+        drawSecondLine(word: cell.word, level: cell.level, reset: cell.reset, x: col.agy, end: col.agyEnd, line2: line2)
+    }
+
+    /// 마지막 사용 · 오늘: 윗단 Grok, 아랫단 agy. 도구 이름은 한 번만, 숫자는 고정폭으로 오른쪽 맞춤.
+    private func drawActivityCells(_ row: CliFleetRow, line1: CGFloat, line2: CGFloat, col: Columns) {
+        let micro = TeamClaudePalette.microFont, small = TeamClaudePalette.smallFont
+        let fg2 = TeamClaudePalette.fg2, fg3 = TeamClaudePalette.fg3
         PanelDraw.text("Grok", col.tool, line1 + 0.5, micro, fg3)
         PanelDraw.text("agy", col.tool, line2, micro, fg3)
         let lastWidth = col.lastEnd - col.tool - PanelDraw.width("Grok", micro) - 4

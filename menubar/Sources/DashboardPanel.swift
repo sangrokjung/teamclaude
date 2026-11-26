@@ -256,6 +256,8 @@ final class DashboardPanelFooterView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        // 되돌리기가 먼저다. 링크 칸은 그 칸을 비켜 그리지만, 판정 순서로도 한 번 더 지킨다(검토 M2).
+        if notice?.undo == true, undoRect.contains(point) { onUndo?(); return }
         if !linkRect.isEmpty, linkRect.contains(point), links.first != nil {
             // 메뉴 추적 중에는 mouseUp이 오지 않을 수 있다. 눌림을 보인 뒤 바로 연다(메뉴가 닫히며 상태도 사라진다).
             linkPressed = true
@@ -265,7 +267,6 @@ final class DashboardPanelFooterView: NSView {
             return
         }
         if refreshRect.contains(point) { onRefresh?(); return }
-        if notice?.undo == true, undoRect.contains(point) { onUndo?(); return }
         if actionsRect.contains(point) { onActions?(); return }
         super.mouseDown(with: event)
     }
@@ -306,20 +307,26 @@ final class DashboardPanelFooterView: NSView {
         let refreshTextWidth = PanelDraw.text(L10n.refresh, refreshRect.minX + 30, midY - 8, font, fg2)
         PanelDraw.keycap("R", refreshRect.minX + 38 + refreshTextWidth, centerY: midY)
 
-        // 링크 버튼(ghost): 바깥 화살표 · 제목. 새로고침 왼쪽에 둔다.
+        // 처리 결과의 "되돌리기" 칸을 먼저 잡는다. 링크 버튼(ghost: 바깥 화살표 · 제목)은 남은 폭에 맞춰 제목을 줄이고,
+        // 너무 좁으면 처리 결과가 떠 있는 동안 숨긴다(검토 M2: 긴 제목이 되돌리기를 덮던 문제).
+        let undoTitle = L10n.subActionUndo
+        let undoWidth = notice?.undo == true ? ceil(PanelDraw.width(undoTitle, TeamClaudePalette.buttonFont)) + 20 : 0
+        let noticeReserve: CGFloat = notice == nil ? 0
+            : 30 + min(PanelDraw.width(notice?.text ?? "", TeamClaudePalette.legendFont), 120) + (undoWidth > 0 ? 8 + undoWidth : 0) + 12
         linkRect = .zero
         var contextRight = refreshRect.minX
         if let link = links.first {
-            linkRect = Self.linkButtonRect(title: link.title, rightEdge: refreshRect.minX - 8, midY: midY)
-            drawLinkButton(link.title, in: linkRect)
-            contextRight = linkRect.minX
+            let rightEdge = refreshRect.minX - 8
+            if let rect = Self.linkButtonRect(title: link.title, rightEdge: rightEdge, midY: midY, maxWidth: rightEdge - max(noticeReserve, 16)) {
+                linkRect = rect.frame
+                drawLinkButton(rect.title, in: linkRect)
+                contextRight = linkRect.minX
+            }
         }
 
         let contextMax = contextRight - 16 - 12
         if let notice {
             // 처리 결과: 점(성공 민트·실패 빨강) · 결과 문장 · "되돌리기" 테두리 버튼.
-            let undoTitle = L10n.subActionUndo
-            let undoWidth = notice.undo ? ceil(PanelDraw.width(undoTitle, TeamClaudePalette.buttonFont)) + 20 : 0
             let textMax = contextMax - 14 - (notice.undo ? undoWidth + 8 : 0)
             PanelDraw.dot(16, centerY: midY, notice.failed ? TeamClaudePalette.ember : TeamClaudePalette.mint)
             let textWidth = PanelDraw.text(PanelDraw.clipped(notice.text, TeamClaudePalette.legendFont, maxWidth: textMax), 30, midY - 7.5,
@@ -340,10 +347,16 @@ extension DashboardPanelFooterView {
     static let linkButtonHeight: CGFloat = 26
     static let linkIconWidth: CGFloat = 12
 
-    /// 링크 버튼 칸. 제목은 buttonFont, 높이 26pt(DESIGN.md 버튼).
-    static func linkButtonRect(title: String, rightEdge: CGFloat, midY: CGFloat) -> NSRect {
-        let width = 10 + linkIconWidth + 6 + ceil(PanelDraw.width(title, TeamClaudePalette.buttonFont)) + 12
-        return NSRect(x: rightEdge - width, y: midY - linkButtonHeight / 2, width: width, height: linkButtonHeight)
+    /// 링크 버튼 칸과 그릴 제목. 제목은 buttonFont, 높이 26pt(DESIGN.md 버튼). maxWidth 안에 들지 않으면 제목을 줄이고,
+    /// 줄여도 글자 몇 자가 안 들어가면 nil(그리지도 누르지도 않는다).
+    static func linkButtonRect(title: String, rightEdge: CGFloat, midY: CGFloat,
+                               maxWidth: CGFloat = .greatestFiniteMagnitude) -> (frame: NSRect, title: String)? {
+        let chrome = 10 + linkIconWidth + 6 + 12
+        let font = TeamClaudePalette.buttonFont
+        guard maxWidth - chrome >= PanelDraw.width("가나…", font) else { return nil }
+        let shown = PanelDraw.clipped(title, font, maxWidth: maxWidth - chrome)
+        let width = chrome + ceil(PanelDraw.width(shown, font))
+        return (NSRect(x: rightEdge - width, y: midY - linkButtonHeight / 2, width: width, height: linkButtonHeight), shown)
     }
 
     fileprivate func drawLinkButton(_ title: String, in rect: NSRect) {

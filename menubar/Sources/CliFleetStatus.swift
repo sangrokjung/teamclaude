@@ -19,6 +19,12 @@ struct CliGrokStatus: Equatable {
     var periodEnd: Date?
     var lastUsed: Date?
     var sessionsToday: Int?
+    /// 폴더 열거 상한에 걸려 일부만 셌다("오늘 N+").
+    var sessionsTodayPartial: Bool = false
+    /// 마지막으로 사용률을 받은 시각. 조회가 이어서 실패하면 앞선 값을 보이되 이 시각으로 지연을 말한다.
+    var lastOkAt: Date? = nil
+    /// 가장 최근 조회가 실패했다(앞선 값을 지키는 중).
+    var fetchFailed: Bool = false
 }
 
 struct CliAgyGroupStatus: Equatable {
@@ -35,10 +41,14 @@ struct CliAgyStatus: Equatable {
     var groups: [CliAgyGroupStatus]
     var lastUsed: Date?
     var conversationsToday: Int?
+    var conversationsTodayPartial: Bool = false
+    var lastOkAt: Date? = nil
+    var fetchFailed: Bool = false
 }
 
 struct CliStatusSnapshot: Equatable {
     static let schema = 1
+    static let maxGroups = 32
     var host: String
     var writtenAt: Date
     var grok: CliGrokStatus
@@ -99,6 +109,9 @@ extension CliStatusSnapshot {
                 "period_end": CliStatusCodec.isoString(grok.periodEnd),
                 "last_used": CliStatusCodec.isoString(grok.lastUsed),
                 "sessions_today": CliStatusCodec.optional(grok.sessionsToday),
+                "sessions_today_partial": grok.sessionsTodayPartial,
+                "last_ok_at": CliStatusCodec.isoString(grok.lastOkAt),
+                "fetch_failed": grok.fetchFailed,
             ] as [String: Any],
             "agy": [
                 "installed": agy.installed,
@@ -114,6 +127,9 @@ extension CliStatusSnapshot {
                 },
                 "last_used": CliStatusCodec.isoString(agy.lastUsed),
                 "conversations_today": CliStatusCodec.optional(agy.conversationsToday),
+                "conversations_today_partial": agy.conversationsTodayPartial,
+                "last_ok_at": CliStatusCodec.isoString(agy.lastOkAt),
+                "fetch_failed": agy.fetchFailed,
             ] as [String: Any],
         ]
     }
@@ -124,8 +140,9 @@ extension CliStatusSnapshot {
 
     /// schema·필수 키·열거값이 맞지 않으면 nil. 값 칸이 범위를 벗어나면 그 칸만 비운다.
     static func parse(_ raw: Any) -> CliStatusSnapshot? {
+        // schema는 정수 변환 없이 정확히 비교한다(1.5·거대한 수를 1로 받거나 Int 변환에서 멈추지 않게).
         guard let root = raw as? [String: Any],
-              CliStatusCodec.number(root["schema"]).map({ Int($0) }) == schema,
+              CliStatusCodec.number(root["schema"]) == Double(schema),
               let host = root["host"] as? String, !host.isEmpty,
               let written = CliStatusCodec.number(root["written_at"]), written > 0, written < 10_000_000_000,
               let grokRaw = root["grok"] as? [String: Any],
@@ -136,7 +153,8 @@ extension CliStatusSnapshot {
               let agyAuth = (agyRaw["auth"] as? String).flatMap(CliAgyAuth.init(rawValue:)) else {
             return nil
         }
-        let groups = (agyRaw["groups"] as? [Any] ?? []).compactMap { item -> CliAgyGroupStatus? in
+        // 레인 수 상한(수집기와 같은 32). 손상된 입력이 화면·메모리를 부풀리지 않게 한다.
+        let groups = (agyRaw["groups"] as? [Any] ?? []).prefix(maxGroups).compactMap { item -> CliAgyGroupStatus? in
             guard let row = item as? [String: Any], let name = row["name"] as? String, !name.isEmpty else { return nil }
             return CliAgyGroupStatus(
                 name: name,
@@ -152,19 +170,27 @@ extension CliStatusSnapshot {
                                 usagePercent: CliStatusCodec.percent(grokRaw["usage_pct"]),
                                 periodEnd: CliStatusCodec.isoDate(grokRaw["period_end"]),
                                 lastUsed: CliStatusCodec.isoDate(grokRaw["last_used"]),
-                                sessionsToday: CliStatusCodec.count(grokRaw["sessions_today"])),
+                                sessionsToday: CliStatusCodec.count(grokRaw["sessions_today"]),
+                                sessionsTodayPartial: grokRaw["sessions_today_partial"] as? Bool ?? false,
+                                lastOkAt: CliStatusCodec.isoDate(grokRaw["last_ok_at"]),
+                                fetchFailed: grokRaw["fetch_failed"] as? Bool ?? false),
             agy: CliAgyStatus(installed: agyInstalled, auth: agyAuth, groups: groups,
                               lastUsed: CliStatusCodec.isoDate(agyRaw["last_used"]),
-                              conversationsToday: CliStatusCodec.count(agyRaw["conversations_today"])))
+                              conversationsToday: CliStatusCodec.count(agyRaw["conversations_today"]),
+                              conversationsTodayPartial: agyRaw["conversations_today_partial"] as? Bool ?? false,
+                              lastOkAt: CliStatusCodec.isoDate(agyRaw["last_ok_at"]),
+                              fetchFailed: agyRaw["fetch_failed"] as? Bool ?? false))
     }
 }
 
 // MARK: - 앱 상태 → 스냅샷
 
 /// Grok 결과를 스냅샷 칸으로 옮긴다. 미설치 안내가 있으면 installed=false다.
-func cliGrokStatus(outcome: GrokMenuOutcome, installed: Bool, activity: CliActivity) -> CliGrokStatus {
+func cliGrokStatus(outcome: GrokMenuOutcome, installed: Bool, activity: CliActivity,
+                   lastOkAt: Date? = nil, fetchFailed: Bool = false) -> CliGrokStatus {
     var status = CliGrokStatus(installed: installed, auth: .unavailable, usagePercent: nil, periodEnd: nil,
-                               lastUsed: activity.lastUsed, sessionsToday: activity.todayCount)
+                               lastUsed: activity.lastUsed, sessionsToday: activity.todayCount,
+                               sessionsTodayPartial: activity.partial, lastOkAt: lastOkAt, fetchFailed: fetchFailed)
     switch outcome {
     case .percent(let percent):
         status.auth = .ok
@@ -178,14 +204,15 @@ func cliGrokStatus(outcome: GrokMenuOutcome, installed: Bool, activity: CliActiv
 }
 
 /// agy 결과를 스냅샷 칸으로 옮긴다. groups는 화면에 올릴 레인(Gemini)만 받는다.
-func cliAgyStatus(outcome: AgyFetchOutcome, activity: CliActivity) -> CliAgyStatus {
+func cliAgyStatus(outcome: AgyFetchOutcome, activity: CliActivity, lastOkAt: Date? = nil, fetchFailed: Bool = false) -> CliAgyStatus {
     switch outcome {
     case .missing:
         return CliAgyStatus(installed: false, auth: .error, groups: [], lastUsed: activity.lastUsed,
-                            conversationsToday: activity.todayCount)
+                            conversationsToday: activity.todayCount, conversationsTodayPartial: activity.partial)
     case .failed:
         return CliAgyStatus(installed: true, auth: .error, groups: [], lastUsed: activity.lastUsed,
-                            conversationsToday: activity.todayCount)
+                            conversationsToday: activity.todayCount, conversationsTodayPartial: activity.partial,
+                            lastOkAt: lastOkAt, fetchFailed: true)
     case .ready(let groups):
         let mapped = agyVisibleGroups(groups).map { group in
             CliAgyGroupStatus(name: group.name,
@@ -195,7 +222,8 @@ func cliAgyStatus(outcome: AgyFetchOutcome, activity: CliActivity) -> CliAgyStat
                               fiveHourReset: group.fiveHour?.resetAt)
         }
         return CliAgyStatus(installed: true, auth: .ok, groups: mapped, lastUsed: activity.lastUsed,
-                            conversationsToday: activity.todayCount)
+                            conversationsToday: activity.todayCount, conversationsTodayPartial: activity.partial,
+                            lastOkAt: lastOkAt, fetchFailed: fetchFailed)
     }
 }
 
@@ -212,13 +240,13 @@ struct CliActivity: Equatable {
     var lastUsed: Date?
     /// 폴더가 없으면 nil(도구를 안 쓰는 맥), 있으면 0 이상.
     var todayCount: Int?
+    /// 열거 상한에 걸려 일부만 봤다. 값은 하한이다("오늘 N+").
+    var partial: Bool = false
 }
 
 enum CliActivityScanner {
-    /// 정렬해 살펴볼 최근 항목 수 상한.
-    static let entryLimit = 2_000
-    /// 목록에서 읽을 원시 항목 수 상한(폴더가 비정상적으로 커도 스캔이 끝나게 한다).
-    static let rawLimit = 20_000
+    /// 한 번의 스캔에서 열거할 항목(폴더·파일) 수 상한. 넘으면 멈추고 부분 집계로 표시한다.
+    static let scanLimit = 20_000
 
     static func grokSessionsURL(home: String = NSHomeDirectory()) -> URL {
         URL(fileURLWithPath: home).appendingPathComponent(".grok/sessions", isDirectory: true)
@@ -236,47 +264,60 @@ enum CliActivityScanner {
         (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
     }
 
-    private static func children(_ url: URL, limit: Int) -> [URL]? {
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { return nil }
-        return names.prefix(limit).filter { !$0.hasPrefix(".") }.map { url.appendingPathComponent($0) }
+    private static func isDirectory(_ url: URL) -> Bool {
+        var directory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &directory) && directory.boolValue
     }
 
-    /// Grok: <root>/<인코딩된 폴더>/<세션 id>/chat_history.jsonl. 가장 최근 mtime이 마지막 사용,
-    /// 오늘(현지 자정 이후) 만들어졌거나 바뀐 세션 폴더 수가 오늘 세션 수다.
-    static func grok(root: URL, now: Date, calendar: Calendar = .current) -> CliActivity {
-        guard let folders = children(root, limit: rawLimit) else { return CliActivity(lastUsed: nil, todayCount: nil) }
+    /// 한 단계 아래 항목을 하나씩 내주는 열거자(목록 전체를 배열로 읽지 않는다).
+    private static func children(_ url: URL) -> FileManager.DirectoryEnumerator? {
+        FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey],
+                                       options: [.skipsSubdirectoryDescendants, .skipsHiddenFiles, .skipsPackageDescendants])
+    }
+
+    /// Grok: <root>/<인코딩된 폴더>/<세션 id>/chat_history.jsonl. 세션 파일 자체의 mtime으로 센다
+    /// (기존 세션에 이어 써도 상위 폴더 mtime은 바뀌지 않으므로 폴더 순서에 기대지 않는다).
+    /// 폴더·세션을 합쳐 limit개까지만 열거하고, 남은 항목이 있으면 부분 집계로 표시한다.
+    static func grok(root: URL, now: Date, calendar: Calendar = .current, limit: Int = scanLimit) -> CliActivity {
+        guard isDirectory(root), let folders = children(root) else { return CliActivity(lastUsed: nil, todayCount: nil) }
         let midnight = calendar.startOfDay(for: now)
-        // 폴더 mtime(새 세션이 생기면 바뀐다)으로 최근 폴더부터 본다.
-        let ordered = folders.map { ($0, modified($0) ?? .distantPast) }.sorted { $0.1 > $1.1 }
-        var visited = 0
+        var budget = limit
         var last: Date?
         var today = 0
-        outer: for (folder, _) in ordered {
-            guard let sessions = children(folder, limit: rawLimit) else { continue }
-            for session in sessions {
-                if visited >= entryLimit { break outer }
-                visited += 1
+        var partial = false
+        scan: for case let folder as URL in folders {
+            guard budget > 0 else { partial = true; break }
+            budget -= 1
+            guard isDirectory(folder), let sessions = children(folder) else { continue }
+            for case let session as URL in sessions {
+                guard budget > 0 else { partial = true; break scan }
+                budget -= 1
                 let history = session.appendingPathComponent("chat_history.jsonl")
                 guard let stamp = modified(history) else { continue }
-                if last == nil || stamp > last! { last = stamp }
+                if last.map({ stamp > $0 }) ?? true { last = stamp }
                 let born = created(session) ?? stamp
                 if stamp >= midnight || born >= midnight { today += 1 }
             }
         }
-        return CliActivity(lastUsed: last, todayCount: today)
+        return CliActivity(lastUsed: last, todayCount: today, partial: partial)
     }
 
     /// agy: conversations/<id>.db·.db-wal. 같은 id를 한 대화로 센다.
     /// .db-shm은 세지 않는다 — agy가 실행될 때마다 모든 대화의 .db-shm을 건드려서(메뉴바의 /usage 호출 포함,
     /// 2026-11-26 실측: .db-shm 501개 전부 최근 1시간 mtime, .db·.db-wal은 2개) 그대로 세면 매번 "전부 오늘"이 된다.
-    static func agy(root: URL, now: Date, calendar: Calendar = .current) -> CliActivity {
-        guard let files = children(root, limit: rawLimit) else { return CliActivity(lastUsed: nil, todayCount: nil) }
+    static func agy(root: URL, now: Date, calendar: Calendar = .current, limit: Int = scanLimit) -> CliActivity {
+        guard isDirectory(root) else { return CliActivity(lastUsed: nil, todayCount: nil) }
         let midnight = calendar.startOfDay(for: now)
+        var budget = limit
+        var partial = false
         var stamps: [String: (modified: Date, born: Date)] = [:]
-        for file in files {
+        guard let files = children(root) else { return CliActivity(lastUsed: nil, todayCount: nil) }
+        for case let file as URL in files {
+            guard budget > 0 else { partial = true; break }
+            budget -= 1
             let name = file.lastPathComponent
-            guard !name.hasSuffix(".db-shm") else { continue }
-            guard let stem = name.split(separator: ".").first.map(String.init), !stem.isEmpty,
+            guard !name.hasSuffix(".db-shm"),
+                  let stem = name.split(separator: ".").first.map(String.init), !stem.isEmpty,
                   let stamp = modified(file) else { continue }
             let born = created(file) ?? stamp
             if let prior = stamps[stem] {
@@ -285,9 +326,8 @@ enum CliActivityScanner {
                 stamps[stem] = (stamp, born)
             }
         }
-        let recent = stamps.values.sorted { $0.modified > $1.modified }.prefix(entryLimit)
-        let today = recent.filter { $0.modified >= midnight || $0.born >= midnight }.count
-        return CliActivity(lastUsed: recent.first?.modified, todayCount: today)
+        let today = stamps.values.filter { $0.modified >= midnight || $0.born >= midnight }.count
+        return CliActivity(lastUsed: stamps.values.map(\.modified).max(), todayCount: today, partial: partial)
     }
 }
 
@@ -333,14 +373,20 @@ struct CliFleetReport: Equatable {
     let hosts: [CliFleetHost]
 
     static let unreadable = CliFleetReport(collectedAt: nil, hosts: [])
-    static let maxHosts = 32
 
     static func defaultPath(home: String = NSHomeDirectory()) -> String {
         (home as NSString).appendingPathComponent(".claude/cache/fleet-cli.json")
     }
 
-    /// 파일이 없을 때만 nil(워커 화면: 이 맥 한 줄). 읽기·해석 실패는 `.unreadable`로 드러낸다.
+    /// 이보다 큰 수집 파일은 읽지 않는다(수집기 출력 상한과 같은 2MiB).
+    static let maxFileBytes = 2 * 1024 * 1024
+
+    /// 파일이 없을 때만 nil(워커 화면: 이 맥 한 줄). 읽기·해석 실패와 크기 초과는 `.unreadable`로 드러낸다.
     static func load(path: String = defaultPath()) -> CliFleetReport? {
+        if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber,
+           size.int64Value > Int64(maxFileBytes) {
+            return .unreadable // 읽기 전에 크기로 거부한다
+        }
         do {
             return parse(try Data(contentsOf: URL(fileURLWithPath: path))) ?? .unreadable
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
@@ -362,7 +408,7 @@ struct CliFleetReport: Equatable {
         guard let root = object as? [String: Any],
               let collected = CliStatusCodec.number(root["collected_at"]), collected > 0, collected < 10_000_000_000,
               let hosts = root["hosts"] as? [Any] else { return nil }
-        let parsed = hosts.prefix(maxHosts).compactMap { item -> CliFleetHost? in
+        let parsed = hosts.compactMap { item -> CliFleetHost? in
             guard let row = item as? [String: Any], let name = row["name"] as? String, !name.isEmpty else { return nil }
             let ok = row["ok"] as? Bool == true
             let error = row["error"] as? String
