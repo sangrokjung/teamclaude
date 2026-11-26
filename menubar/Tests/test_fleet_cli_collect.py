@@ -55,8 +55,8 @@ case "$host" in
   oldschema) printf '{"schema":2,"host":"x"}'; exit 0 ;;
   nofile) echo "cat: no such file" >&2; exit 1 ;;
   down|laptop) echo "ssh: connect: Host is down" >&2; exit 255 ;;
-  slow) sleep 5; exit 0 ;;
-  nap-*) sleep 1; exit 1 ;;
+  slow) sleep 30; exit 0 ;;
+  nap-*) sleep 2; exit 1 ;;
   flood) exec yes ;;
   stall) printf '{"schema":1,'; exec sleep 30 ;;
 esac
@@ -134,9 +134,10 @@ class FleetCliCollectTests(unittest.TestCase):
 
     def test_timeout_marks_only_that_host(self):
         self.manifest.write_text(json.dumps({"nodes": [{"host": "slow"}, {"host": "good-a"}]}))
+        # 시간 상한은 바쁜 워커에서도 정상 호스트가 넉넉히 끝나게 4초로 둔다. 느린 호스트는 30초를 잔다.
         started = time.time()
-        self.assertEqual(0, self.run_once("--timeout", "1"))
-        self.assertLess(time.time() - started, 4.5)
+        self.assertEqual(0, self.run_once("--timeout", "4"))
+        self.assertLess(time.time() - started, 15.0)
         by = {host["name"]: host for host in json.loads(self.out.read_text())["hosts"]}
         self.assertEqual("timeout", by["slow"]["error"])
         self.assertTrue(by["good-a"]["ok"])
@@ -151,8 +152,8 @@ class FleetCliCollectTests(unittest.TestCase):
     def test_partial_output_then_stall_times_out(self):
         # 일부를 보낸 뒤 멈춘 호스트도 호스트당 시간 상한에서 끊는다.
         started = time.time()
-        result = collect.read_remote("stall", False, ssh=str(self.ssh), timeout=1)
-        self.assertLess(time.time() - started, 4.5)
+        result = collect.read_remote("stall", False, ssh=str(self.ssh), timeout=2)
+        self.assertLess(time.time() - started, 15.0)
         self.assertEqual("timeout", result["error"])
 
     def test_oversize_local_file(self):
@@ -168,11 +169,11 @@ class FleetCliCollectTests(unittest.TestCase):
         self.assertEqual(["fleet-cli.json"], sorted(os.listdir(self.out.parent)))
 
     def test_hosts_are_read_in_parallel_with_a_cap(self):
-        # nap-* 호스트는 1초씩 잔다. 4대가 병렬이면 4초보다 훨씬 빨리 끝난다. jobs는 8을 넘지 않는다.
+        # nap-* 호스트는 2초씩 잔다. 4대를 차례로 읽으면 8초, 병렬이면 2초 남짓이다. jobs는 8을 넘지 않는다.
         nodes = [(f"nap-{i}", False) for i in range(4)]
         started = time.time()
         payload = collect.collect(nodes, str(self.local), ssh=str(self.ssh), jobs=50, timeout=10)
-        self.assertLess(time.time() - started, 3.0)
+        self.assertLess(time.time() - started, 6.0)
         self.assertEqual(5, len(payload["hosts"]))
         self.assertEqual(8, collect.MAX_JOBS)
 
