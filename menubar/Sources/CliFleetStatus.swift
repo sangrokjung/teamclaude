@@ -160,18 +160,9 @@ extension CliStatusSnapshot {
               let agyAuth = (agyRaw["auth"] as? String).flatMap(CliAgyAuth.init(rawValue:)) else {
             return nil
         }
-        // 레인 수 상한(수집기와 같은 32). 넘으면 자르지 않고 스냅샷을 거부한다 — 잘린 레인이 최저 잔량을 숨기지 않게.
-        let rawGroups = agyRaw["groups"] as? [Any] ?? []
-        guard rawGroups.count <= maxGroups else { return nil }
-        let groups = rawGroups.compactMap { item -> CliAgyGroupStatus? in
-            guard let row = item as? [String: Any], let name = row["name"] as? String, !name.isEmpty else { return nil }
-            return CliAgyGroupStatus(
-                name: name,
-                weeklyRemainingPercent: CliStatusCodec.percent(row["weekly_remaining_pct"]),
-                weeklyReset: CliStatusCodec.isoDate(row["weekly_reset"]),
-                fiveHourRemainingPercent: CliStatusCodec.percent(row["five_hour_remaining_pct"]),
-                fiveHourReset: CliStatusCodec.isoDate(row["five_hour_reset"]))
-        }
+        // 레인은 수집기와 같은 규칙으로 엄격히 읽는다: 배열이 아니거나, 32개를 넘거나, 원소 하나라도 틀리면
+        // 스냅샷을 거부한다(그 호스트는 parse). 틀린 원소만 버리면 낮은 잔량 레인이 빠져 정상으로 보일 수 있다.
+        guard let groups = parseGroups(agyRaw["groups"]) else { return nil }
         return CliStatusSnapshot(
             host: host,
             writtenAt: Date(timeIntervalSince1970: written),
@@ -189,6 +180,23 @@ extension CliStatusSnapshot {
                               conversationsTodayPartial: agyRaw["conversations_today_partial"] as? Bool ?? false,
                               lastOkAt: CliStatusCodec.isoDate(agyRaw["last_ok_at"]),
                               fetchFailed: agyRaw["fetch_failed"] as? Bool ?? false))
+    }
+
+    /// 없거나 null이면 빈 목록. 배열이 아니거나 상한을 넘거나 원소 하나라도 틀리면 nil.
+    private static func parseGroups(_ raw: Any?) -> [CliAgyGroupStatus]? {
+        guard let raw, !(raw is NSNull) else { return [] }
+        guard let items = raw as? [Any], items.count <= maxGroups else { return nil }
+        var groups: [CliAgyGroupStatus] = []
+        for item in items {
+            guard let row = item as? [String: Any], let name = row["name"] as? String, !name.isEmpty else { return nil }
+            groups.append(CliAgyGroupStatus(
+                name: name,
+                weeklyRemainingPercent: CliStatusCodec.percent(row["weekly_remaining_pct"]),
+                weeklyReset: CliStatusCodec.isoDate(row["weekly_reset"]),
+                fiveHourRemainingPercent: CliStatusCodec.percent(row["five_hour_remaining_pct"]),
+                fiveHourReset: CliStatusCodec.isoDate(row["five_hour_reset"])))
+        }
+        return groups
     }
 }
 

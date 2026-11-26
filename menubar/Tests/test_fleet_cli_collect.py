@@ -282,6 +282,29 @@ class FleetCliCollectTests(unittest.TestCase):
         self.assertEqual("parse", by["good-sur-lane"]["error"])
         self.assertTrue(by["good-a"]["ok"])
 
+    def test_invalid_utf8_bytes_are_parse_not_replaced(self):
+        # 재검토 3차 Minor: 원시 바이트가 UTF-8이 아니면 대체 문자로 바꿔 통과시키지 않고 그 호스트만 "parse"다.
+        good = json.dumps(snapshot("good-x")).encode("utf-8")
+        (self.dir / "good-rawbad.json").write_bytes(good.replace(b'"host": "good-x"', b'"host": "bad\xff\xfe"'))
+        self.local.write_bytes(good.replace(b'"host": "good-x"', b'"host": "hub\xc3"'))
+        self.manifest.write_text(json.dumps({"nodes": [{"host": "good-rawbad"}, {"host": "good-a"}]}))
+        self.assertEqual(0, self.run_once())
+        by = {host["name"]: host for host in json.loads(self.out.read_text(encoding="utf-8"))["hosts"]}
+        self.assertEqual("parse", by["good-rawbad"]["error"])
+        self.assertEqual("parse", by["hub"]["error"])
+        self.assertTrue(by["good-a"]["ok"])
+
+    def test_unwritable_manifest_host_stays_as_a_numbered_parse_row(self):
+        # 재검토 3차 Minor: 이름을 쓸 수 없는 매니페스트 호스트도 빼지 않는다(전체·실패 대수가 줄지 않게).
+        # 순번 이름(host-<매니페스트 순번>)의 parse 줄로 남기고, 그 호스트로는 ssh 하지 않는다.
+        self.manifest.write_text('{"nodes": [{"host": "good-a"}, {"host": "bad\\ud800"}, {"host": "good-b"}]}')
+        self.assertEqual(0, self.run_once())
+        hosts = json.loads(self.out.read_text(encoding="utf-8"))["hosts"]
+        self.assertEqual(["hub", "good-a", "host-2", "good-b"], [host["name"] for host in hosts])
+        self.assertEqual({"name": "host-2", "ok": False, "error": "parse", "status": None}, hosts[2])
+        calls = (self.dir / "calls.log").read_text()
+        self.assertNotIn("bad", calls)
+
     def test_schema_must_be_the_json_integer_one(self):
         # 재검토 M3: 버전은 JSON 정수 1만 받는다. 1.0·고정밀 소수(파이썬에서 1.0이 된다)는 거부한다.
         good = json.dumps(snapshot())

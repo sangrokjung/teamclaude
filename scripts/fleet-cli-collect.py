@@ -158,8 +158,11 @@ def sanitize_status(raw: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
-def parse_status(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def parse_status(text: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """text는 str 또는 원시 바이트. 바이트는 UTF-8로 엄격히 읽는다(대체 문자로 바꿔 통과시키지 않는다)."""
     try:
+        if isinstance(text, (bytes, bytearray)):
+            text = bytes(text).decode("utf-8")
         status = sanitize_status(json.loads(text))
     except Exception:  # 예상 못 한 모양도 그 호스트만 "parse"다. 전체 수집을 멈추지 않는다.
         return None, "parse"
@@ -178,7 +181,7 @@ def read_local(name: str, path: str) -> Dict[str, Any]:
         return entry(name, None, "missing")
     if len(data) > MAX_BYTES:
         return entry(name, None, "oversize")
-    status, error = parse_status(data.decode("utf-8", "replace"))
+    status, error = parse_status(data)
     return entry(name, status, error)
 
 
@@ -245,39 +248,48 @@ def read_remote(host: str, offline_ok: bool, ssh: str = "ssh", timeout: float = 
         return entry(host, None, "offline" if offline_ok else "ssh")
     if returncode != 0:
         return entry(host, None, "missing")
-    status, error = parse_status(data.decode("utf-8", "replace"))
+    status, error = parse_status(data)
     return entry(host, status, error)
 
 
-def load_nodes(manifest_path: str) -> List[Tuple[str, bool]]:
+def load_nodes(manifest_path: str) -> List[Tuple[Any, ...]]:
+    """(host, offline_ok) 목록. 이름을 보고서에 쓸 수 없는 호스트는 빼지 않고
+    ("host-<매니페스트 순번>", False, "parse")로 남긴다 — 전체·실패 대수가 줄지 않게, ssh는 하지 않는다."""
     with open(manifest_path, "r", encoding="utf-8") as handle:
         manifest = json.load(handle)
     nodes = manifest.get("nodes") if isinstance(manifest, dict) else None
     if not isinstance(nodes, list):
         raise ValueError("manifest has no nodes list")
     seen = set()
-    out: List[Tuple[str, bool]] = []
-    for node in nodes:
+    out: List[Tuple[Any, ...]] = []
+    for index, node in enumerate(nodes, start=1):
         if not isinstance(node, dict):
             continue
         host = node.get("host")
         if not isinstance(host, str) or not host or host.startswith("-") or host in seen:
             continue
         try:
-            host.encode("utf-8")  # 보고서에 이름을 쓸 수 없는 호스트는 건너뛴다
+            host.encode("utf-8")
         except UnicodeEncodeError:
+            out.append(("host-%d" % index, False, "parse"))
             continue
         seen.add(host)
         out.append((host, node.get("menubarOfflineOk") is True))
     return out
 
 
-def collect(nodes: List[Tuple[str, bool]], local_path: str, ssh: str = "ssh",
+def read_node(node: Tuple[Any, ...], ssh: str, timeout: float) -> Dict[str, Any]:
+    if len(node) > 2 and node[2] == "parse":
+        return entry(node[0], None, "parse")
+    return read_remote(node[0], node[1], ssh, timeout)
+
+
+def collect(nodes: List[Tuple[Any, ...]], local_path: str, ssh: str = "ssh",
             jobs: int = MAX_JOBS, timeout: float = HOST_TIMEOUT, now: Optional[float] = None) -> Dict[str, Any]:
     hosts = [read_local("hub", local_path)]
     workers = max(1, min(jobs, MAX_JOBS))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(read_remote, host, offline_ok, ssh, timeout) for host, offline_ok in nodes]
+        futures = [pool.submit(read_node, node, ssh, timeout) for node in nodes]
         hosts.extend(future.result() for future in futures)  # 매니페스트 순서를 지킨다
     return {"collected_at": int(now if now is not None else time.time()), "hosts": hosts}
 

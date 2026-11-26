@@ -780,6 +780,7 @@ enum L10n {
     static func cliStalled(_ minutes: Int) -> String { t("멈춤 \(minutes)분", "Stalled \(minutes)m") }
     static var cliClockSkew: String { t("시각 오류", "Clock skew") }
     static func cliFetchLag(_ minutes: Int) -> String { t("조회 지연 \(minutes)분", "Fetch lag \(minutes)m") }
+    static func cliLastCollected(_ count: Int) -> String { t("마지막 수집 \(count)대", "\(count) at last collect") }
     static var cliUnverified: String { t("미확인", "unknown") }
     static var cliFetchFailed: String { t("조회 실패", "Fetch failing") }
     static func cliHiddenMachines(_ count: Int, problem: Int, warn: Int) -> String {

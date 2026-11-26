@@ -18,6 +18,8 @@ struct CliFleetRegressionTests {
         partialScanLastUsedIsNotDefinite()
         emptyLaneSuccessIsNotFetchLag()
         schemaMustBeJSONIntegerOne()
+        malformedLanesRejectTheHost()
+        stalledCollectorIsNotAllOK()
         if failures.isEmpty {
             print("CliFleetRegressionTests OK")
         } else {
@@ -84,6 +86,45 @@ struct CliFleetRegressionTests {
         tracker.recordAgy(.failed, now: now)
         let kept = CliFleetTable.row(name: "w", status: tracker.state(host: "w", now: now).snapshot!, hostError: nil, now: now)
         check(kept.agy.word == "조회 지연 15분", "a preserved value still shows its age, got \(kept.agy.word ?? "nil")")
+    }
+
+    // 재검토 3차 Minor: groups가 배열이 아니거나 원소 하나라도 잘못되면 그 호스트를 parse로 둔다(수집기와 같다).
+    // 잘못된 원소만 버리면 낮은 잔량 레인이 빠져 머신이 정상으로 보일 수 있다.
+    static func malformedLanesRejectTheHost() {
+        var notArray = snapshotObject()
+        var agy = notArray["agy"] as! [String: Any]
+        agy["groups"] = "Gemini Models"
+        notArray["agy"] = agy
+        var mixed = snapshotObject()
+        agy = mixed["agy"] as! [String: Any]
+        agy["groups"] = [["name": "Gemini Models", "weekly_remaining_pct": 90], ["weekly_remaining_pct": 3], "junk"]
+        mixed["agy"] = agy
+        let report = CliFleetReport.parse(object: [
+            "collected_at": now.timeIntervalSince1970 - 10,
+            "hosts": [["name": "not-array", "ok": true, "status": notArray], ["name": "mixed", "ok": true, "status": mixed],
+                      ["name": "fine", "ok": true, "status": snapshotObject()]],
+        ])
+        for name in ["not-array", "mixed"] {
+            let host = report?.hosts.first { $0.name == name }
+            check(host?.ok == false && host?.error == "parse",
+                  "\(name) lanes must make the host a parse error, got ok=\(String(describing: host?.ok)) lanes=\(host?.status?.agy.groups.count ?? -1)")
+        }
+        check(report?.hosts.first { $0.name == "fine" }?.ok == true, "a well-formed host stays ok")
+    }
+
+    // 재검토 3차 Minor: 수집이 멈췄는데(3분 초과) 머신 줄은 아직 신선하면(5분 이하), 머리가 "모두 정상"이라고 하지 않는다.
+    static func stalledCollectorIsNotAllOK() {
+        let report = CliFleetReport.parse(object: [
+            "collected_at": now.timeIntervalSince1970 - 240,
+            "hosts": [["name": "hub", "ok": true, "status": snapshotObject()], ["name": "node-b", "ok": true, "status": snapshotObject()]],
+        ])!
+        let table = CliFleetTable.make(report: report, local: CliLocalCliState(host: "x"), now: now)
+        check(table.collectorNote == "수집 멈춤 4분", "collector note, got \(table.collectorNote ?? "nil")")
+        check(!table.sectionSummary.contains("모두 정상"), "header must not say all OK while collection is stalled, got \(table.sectionSummary)")
+        check(table.sectionSummary.contains("수집 멈춤 4분"), "header leads with the stall, got \(table.sectionSummary)")
+        let fresh = CliFleetTable.make(report: CliFleetReport(collectedAt: now.addingTimeInterval(-20), hosts: report.hosts),
+                                       local: CliLocalCliState(host: "x"), now: now)
+        check(fresh.sectionSummary == "2대 모두 정상", "fresh collection keeps the count, got \(fresh.sectionSummary)")
     }
 
     // M3: schema는 JSON 정수 1만. 1.0이나 Double에서 1로 반올림되는 고정밀 소수는 거부한다.

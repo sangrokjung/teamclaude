@@ -5982,7 +5982,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.currentAgyCard = agyCardModel(for: agyToolNotice())
                 case .ready(let groups):
                     let lanes = agyVisibleGroups(groups)
-                    if !lanes.isEmpty { self.agyLastSuccessAt = Date() }
+                    // 조회 성공이다. Gemini 레인이 없어도 "확인한 빈 상태"라 감시기의 성공 시각을 갱신한다
+                    // (빈 상태에 "N분째 갱신 없음"이 붙지 않게, CliLocalTracker와 같은 규칙).
+                    self.agyLastSuccessAt = Date()
                     self.agyHasValue = !lanes.isEmpty
                     self.currentAgyCard = lanes.isEmpty
                         ? AgyCardModel(message: L10n.agyNoGeminiLane, groups: [])

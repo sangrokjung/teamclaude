@@ -88,8 +88,12 @@ struct CliFleetTable: Equatable {
     var hiddenLevel: CliLevel { hidden.map(\.level).max() ?? .ok }
 
     /// CLI 섹션 머리 요약. 표시 상한 밖 머신까지 센다("33대 중 정상 32"). 수집 파일이 없으면 "이 맥".
+    /// 수집기 경고(멈춤·읽기 실패)가 있으면 그것을 앞세우고, 대수는 정상 판정 없이 "마지막 수집 N대"로만 말한다.
     var sectionSummary: String {
-        fromFleet ? L10n.cliFleetSummary(machines: totalCount, ok: okCount) : L10n.cliThisMac
+        guard let note = collectorNote else {
+            return fromFleet ? L10n.cliFleetSummary(machines: totalCount, ok: okCount) : L10n.cliThisMac
+        }
+        return fromFleet ? "\(note) · \(L10n.cliLastCollected(totalCount))" : note
     }
 
     // 표 기하. 그리기와 높이 계산이 같은 값을 쓴다.
