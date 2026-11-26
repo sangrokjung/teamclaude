@@ -59,8 +59,10 @@ final class CliQuotaLanesView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    private static let fallbackHost = cliLocalHostName()
+
     private var shownTable: CliFleetTable {
-        table ?? CliFleetTable.make(report: nil, local: CliLocalCliState(host: cliLocalHostName()), now: Date())
+        table ?? CliFleetTable.make(report: nil, local: CliLocalCliState(host: Self.fallbackHost), now: Date())
     }
 
     private var accessibilityText: String {

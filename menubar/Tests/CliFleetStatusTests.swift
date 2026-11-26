@@ -117,7 +117,9 @@ struct CliFleetStatusTests {
         func touch(_ url: URL, _ date: Date) {
             try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             fm.createFile(atPath: url.path, contents: Data("x".utf8))
-            try! fm.setAttributes([.modificationDate: date, .creationDate: date], ofItemAtPath: url.path)
+            // 생성 시각을 먼저, 수정 시각을 나중에 맞춘다(수정 시각이 생성 시각보다 앞서면 파일 시스템이 생성 시각을 끌어내린다).
+            try! fm.setAttributes([.creationDate: date], ofItemAtPath: url.path)
+            try! fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
         }
         // 폴더가 없으면 개수도 모른다(nil).
         let missing = CliActivityScanner.grok(root: base.appendingPathComponent("none"), now: now, calendar: calendar)
