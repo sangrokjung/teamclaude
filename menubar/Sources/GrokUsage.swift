@@ -19,6 +19,8 @@ struct GrokPercentOutcome: Equatable {
     var slot: String
     var productPercent: Double?
     var creditPercent: Double?
+    /// 청구 응답 config.currentPeriod.end(주간 초기화 시각). CLI 탭 머신 표가 쓴다.
+    var periodEnd: Date? = nil
 }
 
 struct GrokCardModel: Equatable {
@@ -142,6 +144,17 @@ func grokBillingParts(fromBilling data: Data) -> GrokBillingParts? {
     return GrokBillingParts(productPercent: product, creditPercent: credit, headline: headline)
 }
 
+/// 청구 응답의 주간 초기화 시각(config.currentPeriod.end). ISO 문자열이나 epoch(초·밀리초)를 받는다.
+func grokPeriodEnd(fromBilling data: Data) -> Date? {
+    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let config = (root["config"] as? [String: Any]) ?? root
+    guard let period = config["currentPeriod"] as? [String: Any] else { return nil }
+    if let date = CliStatusCodec.isoDate(period["end"]) { return date }
+    guard let epoch = CliStatusCodec.number(period["end"]), epoch > 0 else { return nil }
+    let seconds = epoch > 100_000_000_000 ? epoch / 1_000 : epoch
+    return seconds < 10_000_000_000 ? Date(timeIntervalSince1970: seconds) : nil
+}
+
 func grokUsagePercent(fromBilling data: Data) -> Double? {
     grokBillingParts(fromBilling: data)?.headline
 }
@@ -197,7 +210,8 @@ func grokMenuOutcome(billing: Data?, statusCode: Int?) -> GrokMenuOutcome {
           let slot = grokPercentSlot(parts.headline) else {
         return .unavailable
     }
-    return .percent(GrokPercentOutcome(slot: slot, productPercent: parts.productPercent, creditPercent: parts.creditPercent))
+    return .percent(GrokPercentOutcome(slot: slot, productPercent: parts.productPercent, creditPercent: parts.creditPercent,
+                                       periodEnd: grokPeriodEnd(fromBilling: billing)))
 }
 
 /// 결과 → 제목 슬롯과 카드. 둘을 한 판정에서 만들어 제목과 패널이 다른 말을 하지 않게 한다
