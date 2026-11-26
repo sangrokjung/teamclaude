@@ -57,6 +57,15 @@ class CliFleetSnapshotTests(unittest.TestCase):
                 self.assertIn(word, joined)
         self.assertNotIn("이 맥만", joined, "the hub file exists, so this is not the local-only view")
 
+    def test_section_header_counts_hidden_machines(self):
+        # 재검토 I3: 32대 밖의 33번째가 실패하면 머리 요약도 그 한 대를 센다("32대 모두 정상"이 아니다).
+        result, texts, _ = self.render(fixture("--cli-fleet-33"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        joined = "\n".join(texts)
+        self.assertIn("33대 중 정상 32", joined)
+        self.assertNotIn("32대 모두 정상", joined)
+        self.assertIn("외 1대 · 문제 1", joined)
+
     def test_local_only_view_without_links(self):
         result, texts, rendered = self.render(fixture("--cli-local"))
         self.assertEqual(0, result.returncode, result.stderr)

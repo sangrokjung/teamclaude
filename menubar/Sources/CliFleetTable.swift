@@ -87,6 +87,11 @@ struct CliFleetTable: Equatable {
 
     var hiddenLevel: CliLevel { hidden.map(\.level).max() ?? .ok }
 
+    /// CLI 섹션 머리 요약. 표시 상한 밖 머신까지 센다("33대 중 정상 32"). 수집 파일이 없으면 "이 맥".
+    var sectionSummary: String {
+        fromFleet ? L10n.cliFleetSummary(machines: totalCount, ok: okCount) : L10n.cliThisMac
+    }
+
     // 표 기하. 그리기와 높이 계산이 같은 값을 쓴다.
     static let topInset: CGFloat = 6
     static let noteHeight: CGFloat = 22
@@ -138,7 +143,8 @@ struct CliFleetTable: Equatable {
             ?? CliAgyCell(level: .pending, word: StatusVocabulary.checking, weeklyRemaining: nil, fiveHourRemaining: nil, reset: nil)
         let level = max(grok.level, agy.level)
         return CliFleetRow(name: local.host, level: level, statusWord: levelWord(level), dimmed: false, grok: grok, agy: agy,
-                           grokLastUsed: relative(local.grok?.lastUsed, now: now), agyLastUsed: relative(local.agy?.lastUsed, now: now),
+                           grokLastUsed: lastUsed(local.grok?.lastUsed, partial: local.grok?.sessionsTodayPartial ?? false, now: now),
+                           agyLastUsed: lastUsed(local.agy?.lastUsed, partial: local.agy?.conversationsTodayPartial ?? false, now: now),
                            grokToday: count(local.grok?.sessionsToday, partial: local.grok?.sessionsTodayPartial ?? false),
                            agyToday: count(local.agy?.conversationsToday, partial: local.agy?.conversationsTodayPartial ?? false))
     }
@@ -170,7 +176,8 @@ struct CliFleetTable: Equatable {
             word = L10n.cliClockSkew
         }
         return CliFleetRow(name: name, level: level, statusWord: word, dimmed: dimmed, grok: grok, agy: agy,
-                           grokLastUsed: relative(status.grok.lastUsed, now: now), agyLastUsed: relative(status.agy.lastUsed, now: now),
+                           grokLastUsed: lastUsed(status.grok.lastUsed, partial: status.grok.sessionsTodayPartial, now: now),
+                           agyLastUsed: lastUsed(status.agy.lastUsed, partial: status.agy.conversationsTodayPartial, now: now),
                            grokToday: count(status.grok.sessionsToday, partial: status.grok.sessionsTodayPartial),
                            agyToday: count(status.agy.conversationsToday, partial: status.agy.conversationsTodayPartial))
     }
@@ -295,6 +302,11 @@ struct CliFleetTable: Equatable {
         let hours = minutes / 60
         if hours < 48 { return L10n.durationHours(hours) }
         return L10n.durationDays(hours / 24)
+    }
+
+    /// 마지막 사용. 열거 상한에 걸린 부분 스캔이면 본 것보다 최근 사용이 있을 수 있어 "미확인"이다.
+    static func lastUsed(_ date: Date?, partial: Bool, now: Date) -> String {
+        partial ? L10n.cliUnverified : relative(date, now: now)
     }
 
     /// "방금"·"3분 전"·"2시간 전"·"4일 전". 없으면 —.

@@ -73,6 +73,10 @@ def _text(value: Any, limit: int = 64) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise _BadType()
+    try:
+        value.encode("utf-8")  # JSON의 짝 없는 서로게이트는 문자열로 복원되지만 파일에 쓸 수 없다
+    except UnicodeEncodeError:
+        raise _BadType()
     return value[:limit] if value else None
 
 
@@ -114,7 +118,8 @@ def _groups(raw: Any) -> List[Dict[str, Any]]:
 
 def sanitize_status(raw: Any) -> Optional[Dict[str, Any]]:
     """schema 1 스냅샷을 검사해 알려진 키만 담은 사본을 돌려준다. 모양·타입이 틀리면 None."""
-    if not isinstance(raw, dict) or raw.get("schema") != SCHEMA or isinstance(raw.get("schema"), bool):
+    # 버전은 JSON 정수 1만 받는다(1.0·1e0·고정밀 소수는 파이썬에서 float이라 거부).
+    if not isinstance(raw, dict) or type(raw.get("schema")) is not int or raw.get("schema") != SCHEMA:
         return None
     try:
         host = _text(raw.get("host"))
@@ -257,6 +262,10 @@ def load_nodes(manifest_path: str) -> List[Tuple[str, bool]]:
             continue
         host = node.get("host")
         if not isinstance(host, str) or not host or host.startswith("-") or host in seen:
+            continue
+        try:
+            host.encode("utf-8")  # 보고서에 이름을 쓸 수 없는 호스트는 건너뛴다
+        except UnicodeEncodeError:
             continue
         seen.add(host)
         out.append((host, node.get("menubarOfflineOk") is True))

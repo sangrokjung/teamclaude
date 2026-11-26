@@ -159,6 +159,12 @@ def build():
     if "--cli-fleet" in sys.argv:
         # CLI 탭 머신 표: 정상·주의(남은 양 부족·Grok 만료)·로그인 필요·수집 실패·꺼짐·멈춤을 한 장에.
         fixture["cliFleet"] = cli_fleet()
+    if "--cli-fleet-33" in sys.argv:
+        # 표시 상한(32대) 밖의 33번째만 실패. 머리 요약이 숨긴 줄까지 세는지 본다.
+        hosts = [{"name": f"node-{i:02d}", "ok": True, "error": None, "status": cli_snapshot(f"node-{i:02d}")}
+                 for i in range(32)]
+        hosts.append({"name": "node-late", "ok": False, "error": "ssh", "status": None})
+        fixture["cliFleet"] = {"collected_at": int(time.time()) - 20, "hosts": hosts}
     if "--cli-local" in sys.argv:
         # 수집 파일이 없는 워커 화면: 이 맥 스냅샷 한 줄.
         fixture["cliLocal"] = cli_snapshot("worker-a", grok_usage=37.5, agy_week=64, agy_5h=88)

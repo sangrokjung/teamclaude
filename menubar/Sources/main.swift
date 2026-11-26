@@ -3670,12 +3670,8 @@ final class StatusMenuDashboardView: NSView {
     private func withModelSummary(_ summaries: [String: String]) -> [String: String] {
         var out = summaries
         out["model"] = ModelUsageTabView.summary(modelUsage, selection: modelSelection)
-        if let cliTable, out["cli"] != nil {
-            // CLI 섹션 머리: 머신 수와 손볼 머신 수(주의·문제). 수집 파일이 없으면 이 맥만.
-            out["cli"] = cliTable.fromFleet
-                ? L10n.cliFleetSummary(machines: cliTable.rows.count, ok: cliTable.rows.filter { $0.level == .ok }.count)
-                : L10n.cliThisMac
-        }
+        // CLI 섹션 머리: 숨긴 줄까지 센 머신 수와 정상 수(CliFleetTable.sectionSummary).
+        if let cliTable, out["cli"] != nil { out["cli"] = cliTable.sectionSummary }
         return out
     }
 
@@ -5061,7 +5057,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 패널 링크(~/.config/cc-menubar/links.json). 없거나 틀리면 빈 목록이라 버튼이 숨는다.
     var currentLinks: [DashboardLink] = []
     let cliHostName = cliLocalHostName()
-    private var isScanningCli = false
+    let cliRefresher = CliFleetRefresher()
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
     /// 로그 347분 동안 조회 1회). 10분 주기로 다시 부른다 — 함수 자체가 중복 실행을 막는다.
     var higgsfieldTimer: Timer?
@@ -6010,30 +6006,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CliFleetTable.make(report: currentCliFleetReport, local: cliTracker.state(host: cliHostName, now: Date()), now: Date())
     }
 
-    /// 60초마다: 사용 흔적 스캔·본체 수집 파일·링크 파일을 메인 스레드 밖에서 읽고(CliBackgroundScan),
-    /// 이 맥의 스냅샷(~/.cache/cc-menubar/cli-status.json)을 원자적으로 쓴다. 첫 결과 전에는 쓰지 않는다.
+    /// 60초마다 사용 흔적·본체 수집 파일·링크 파일을 읽고 이 맥의 스냅샷을 쓴다(조정은 CliFleetRefresher).
+    /// 첫 결과 전에는 쓰지 않는다(state.snapshot이 nil).
     func loadCliFleetInBackground() {
-        guard !isScanningCli else { return }
-        isScanningCli = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let scan = CliBackgroundScan.run()
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.isScanningCli = false
-                self.cliTracker.grokActivity = scan.grokActivity
-                self.cliTracker.agyActivity = scan.agyActivity
-                self.currentCliFleetReport = scan.report
-                self.applyLinks(scan.links)
-                if let snapshot = self.cliTracker.state(host: self.cliHostName, now: Date()).snapshot {
-                    DispatchQueue.global(qos: .utility).async {
-                        if !CliStatusFile.write(snapshot) {
-                            print("CLI-STATUS: 스냅샷 쓰기 실패")
-                            fflush(stdout)
-                        }
-                    }
-                }
-                self.scheduleDashboardRefresh(reason: "loadCliFleetInBackground")
-            }
+        cliRefresher.refresh { [weak self] scan in
+            guard let self else { return nil }
+            self.cliTracker.apply(scan)
+            self.currentCliFleetReport = scan.report
+            self.applyLinks(scan.links)
+            self.scheduleDashboardRefresh(reason: "loadCliFleetInBackground")
+            return self.cliTracker.state(host: self.cliHostName, now: Date()).snapshot
         }
     }
 

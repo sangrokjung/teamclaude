@@ -91,6 +91,13 @@ enum CliStatusCodec {
         return Int(number)
     }
 
+    /// JSON 정수이고 target과 같은가. 1.0·1e0·Double에서 1로 반올림되는 소수(NSNumber 실수형)와 불리언은 아니다.
+    static func isInteger(_ value: Any?, equalTo target: Int) -> Bool {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number), !(number is NSDecimalNumber) else { return false }
+        return number.int64Value == Int64(target)
+    }
+
     static func optional(_ value: Double?) -> Any { value.map { $0 as Any } ?? NSNull() }
     static func optional(_ value: Int?) -> Any { value.map { $0 as Any } ?? NSNull() }
 }
@@ -140,9 +147,9 @@ extension CliStatusSnapshot {
 
     /// schema·필수 키·열거값이 맞지 않으면 nil. 값 칸이 범위를 벗어나면 그 칸만 비운다.
     static func parse(_ raw: Any) -> CliStatusSnapshot? {
-        // schema는 정수 변환 없이 정확히 비교한다(1.5·거대한 수를 1로 받거나 Int 변환에서 멈추지 않게).
+        // schema는 JSON 정수 1만 받는다(1.5·1.0·고정밀 소수·거대한 수는 거부, Int 변환에서 멈추지 않게).
         guard let root = raw as? [String: Any],
-              CliStatusCodec.number(root["schema"]) == Double(schema),
+              CliStatusCodec.isInteger(root["schema"], equalTo: schema),
               let host = root["host"] as? String, !host.isEmpty,
               let written = CliStatusCodec.number(root["written_at"]), written > 0, written < 10_000_000_000,
               let grokRaw = root["grok"] as? [String: Any],
@@ -153,8 +160,10 @@ extension CliStatusSnapshot {
               let agyAuth = (agyRaw["auth"] as? String).flatMap(CliAgyAuth.init(rawValue:)) else {
             return nil
         }
-        // 레인 수 상한(수집기와 같은 32). 손상된 입력이 화면·메모리를 부풀리지 않게 한다.
-        let groups = (agyRaw["groups"] as? [Any] ?? []).prefix(maxGroups).compactMap { item -> CliAgyGroupStatus? in
+        // 레인 수 상한(수집기와 같은 32). 넘으면 자르지 않고 스냅샷을 거부한다 — 잘린 레인이 최저 잔량을 숨기지 않게.
+        let rawGroups = agyRaw["groups"] as? [Any] ?? []
+        guard rawGroups.count <= maxGroups else { return nil }
+        let groups = rawGroups.compactMap { item -> CliAgyGroupStatus? in
             guard let row = item as? [String: Any], let name = row["name"] as? String, !name.isEmpty else { return nil }
             return CliAgyGroupStatus(
                 name: name,

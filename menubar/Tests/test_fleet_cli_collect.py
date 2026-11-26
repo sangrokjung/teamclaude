@@ -267,6 +267,29 @@ class FleetCliCollectTests(unittest.TestCase):
         self.assertEqual(0, self.run_once())
         self.assertTrue(self.out.exists())
 
+    def test_unencodable_string_marks_only_that_host(self):
+        # 재검토 Minor: JSON의 짝 없는 서로게이트는 파이썬 문자열로 복원되지만 UTF-8로 쓸 수 없다.
+        # 그 호스트만 "parse"이고, 보고서는 정상적으로 써진다.
+        good = json.dumps(snapshot("good-x"))
+        (self.dir / "good-sur-host.json").write_text(good.replace('"host": "good-x"', '"host": "bad\\ud800"'))
+        lane = snapshot()
+        lane["agy"]["groups"] = [{"name": "LANE_MARK"}]
+        (self.dir / "good-sur-lane.json").write_text(json.dumps(lane).replace("LANE_MARK", "\\udfff"))
+        self.manifest.write_text(json.dumps({"nodes": [{"host": "good-sur-host"}, {"host": "good-sur-lane"}, {"host": "good-a"}]}))
+        self.assertEqual(0, self.run_once())
+        by = {host["name"]: host for host in json.loads(self.out.read_text(encoding="utf-8"))["hosts"]}
+        self.assertEqual("parse", by["good-sur-host"]["error"])
+        self.assertEqual("parse", by["good-sur-lane"]["error"])
+        self.assertTrue(by["good-a"]["ok"])
+
+    def test_schema_must_be_the_json_integer_one(self):
+        # 재검토 M3: 버전은 JSON 정수 1만 받는다. 1.0·고정밀 소수(파이썬에서 1.0이 된다)는 거부한다.
+        good = json.dumps(snapshot())
+        for literal in ('1.0', '1.00000000000000001', '1e0'):
+            with self.subTest(schema=literal):
+                self.assertEqual("parse", collect.parse_status(good.replace('"schema": 1,', f'"schema": {literal},'))[1])
+        self.assertIsNone(collect.parse_status(good)[1])
+
     def test_unexpected_parser_error_is_contained(self):
         # 파서가 예상 못 한 예외를 내도 그 호스트만 "parse"다(전체 수집이 멈추지 않는다).
         original = collect.sanitize_status

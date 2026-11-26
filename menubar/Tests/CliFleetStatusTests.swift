@@ -316,10 +316,20 @@ struct CliFleetStatusTests {
         _ = actions[0].run()
         precondition(opened == valid[0].url)
     }
-    // MARK: 8. 적대 검토 1차(2026-11-27) 지적 고정
+    // MARK: 8. 적대 검토 지적 고정(2026-11-27) — 동작별 함수
     static func reviewRound1() {
-        let fm = FileManager.default
+        fetchLagIsReported()
+        hiddenMachinesAreCounted()
+        partialScanIsMarked()
+        schemaIsExact()
+        inputLimits()
+        linkConsumers()
+        sectionSummaryCountsEveryMachine()
+        refresherCoordinatesScanAndWrite()
+    }
 
+    /// 조회가 이어서 실패하면 앞선 값을 보이되 지연을 말한다(재검토 I1)
+    static func fetchLagIsReported() {
         // I1: 조회가 계속 실패하면 앞선 값을 보이더라도 실패와 마지막 성공 시각을 따로 싣고, 표는 그것으로 지연을 말한다.
         var tracker = CliLocalTracker()
         let billing = GrokPercentOutcome(slot: "Grok 12%", productPercent: 12, creditPercent: nil)
@@ -361,6 +371,10 @@ struct CliFleetStatusTests {
         tracker.recordGrokMissing()
         precondition(tracker.state(host: "w", now: now).grok?.installed == false)
 
+    }
+
+    /// 표시 상한 밖 머신·모든 레인을 센다(재검토 I3)
+    static func hiddenMachinesAreCounted() {
         // I3: 표시 상한 밖의 머신도 요약에 센다. 잘린 쪽에 실패가 있으면 문제로 집계한다.
         let good = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) ?? [:]
         var hosts: [[String: Any]] = (0..<CliFleetTable.maxRows).map { ["name": "n\($0)", "ok": true, "status": good] }
@@ -379,6 +393,11 @@ struct CliFleetStatusTests {
                                                           weeklyReset: nil, fiveHourRemainingPercent: nil, fiveHourReset: nil) }
         precondition(CliFleetTable.row(name: "x", status: nine, hostError: nil, now: now).agy.word == "남음 5%")
 
+    }
+
+    /// 세션 파일 mtime으로 세고 열거 상한이면 부분 집계(재검토 I4)
+    static func partialScanIsMarked() {
+        let fm = FileManager.default
         // I4: 상위 폴더 mtime이 아니라 세션 파일 mtime으로 센다. 열거 상한에 걸리면 부분 집계다.
         let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cli-scan-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: base) }
@@ -414,6 +433,10 @@ struct CliFleetStatusTests {
         precondition(!CliActivityScanner.agy(root: agyRoot, now: now, calendar: calendar).partial)
         precondition(CliActivityScanner.agy(root: agyRoot, now: now, calendar: calendar, limit: 2).partial)
 
+    }
+
+    /// schema 정확 비교(재검토 M3)
+    static func schemaIsExact() {
         // M3: schema는 정확히 1이어야 한다. 소수·거대한 수는 앱을 멈추지 않고 거부한다.
         var object = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) as? [String: Any] ?? [:]
         object["schema"] = 1.5
@@ -425,7 +448,12 @@ struct CliFleetStatusTests {
         object["schema"] = 1
         precondition(CliStatusSnapshot.parse(object) != nil)
 
-        // 보안 검토: 수집 파일은 읽기 전에 크기로 거부하고(2MiB), 스냅샷 레인은 32개까지만 받는다.
+    }
+
+    /// 수집 파일 크기·레인 수 상한(보안 검토)
+    static func inputLimits() {
+        let fm = FileManager.default
+        // 보안 검토: 수집 파일은 읽기 전에 크기로 거부하고(2MiB), 레인이 32개를 넘는 스냅샷은 거부한다.
         let huge = NSTemporaryDirectory() + "fleet-huge-\(UUID().uuidString).json"
         fm.createFile(atPath: huge, contents: Data(count: CliFleetReport.maxFileBytes + 1))
         defer { try? fm.removeItem(atPath: huge) }
@@ -434,8 +462,12 @@ struct CliFleetStatusTests {
         var manyAgy = many["agy"] as! [String: Any]
         manyAgy["groups"] = (0..<40).map { ["name": "Gemini \($0)"] }
         many["agy"] = manyAgy
-        precondition(CliStatusSnapshot.parse(many)?.agy.groups.count == CliStatusSnapshot.maxGroups)
+        precondition(CliStatusSnapshot.parse(many) == nil, "over the lane cap the snapshot is refused, not cut")
 
+    }
+
+    /// 링크 소비자와 되돌리기 칸(재검토 M1·M2)
+    static func linkConsumers() {
         // M1: 링크가 바뀌면 동작 목록도 새로 만든다. 지운 링크는 어디서도 실행되지 않는다.
         precondition(dashboardLinkActions([]) { _ in preconditionFailure("removed link must not run") }.isEmpty)
         let footer = DashboardPanelFooterView(frame: NSRect(x: 0, y: 0, width: 520, height: DashboardPanelFooterView.preferredHeight))
@@ -453,6 +485,46 @@ struct CliFleetStatusTests {
         render(footer)
         precondition(!footer.undoRect.isEmpty, "undo button is drawn")
         precondition(!footer.linkRect.intersects(footer.undoRect), "link \(footer.linkRect) overlaps undo \(footer.undoRect)")
+    }
+
+    /// CLI 섹션 머리는 숨긴 줄까지 센다(재검토 I3, 실제 머리 문자열을 만드는 sectionSummary).
+    static func sectionSummaryCountsEveryMachine() {
+        let good = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) ?? [:]
+        var hosts: [[String: Any]] = (0..<CliFleetTable.maxRows).map { ["name": "n\($0)", "ok": true, "status": good] }
+        hosts.append(["name": "late-fail", "ok": false, "error": "ssh"])
+        let report = CliFleetReport.parse(object: ["collected_at": now.timeIntervalSince1970 - 10, "hosts": hosts])!
+        let table = CliFleetTable.make(report: report, local: CliLocalCliState(host: "x"), now: now)
+        precondition(table.sectionSummary == "33대 중 정상 32", table.sectionSummary)
+        let alone = CliFleetTable.make(report: nil, local: CliLocalCliState(host: "x"), now: now)
+        precondition(alone.sectionSummary == "이 맥")
+    }
+
+    /// 배경 읽기·쓰기 조정(CliFleetRefresher): 겹쳐 돌지 않고, 반영 뒤 스냅샷을 쓰며, 쓸 것이 없으면 쓰지 않는다(재검토 M4).
+    static func refresherCoordinatesScanAndWrite() {
+        let queue = DispatchQueue(label: "cli-refresher-test")
+        let gate = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        var written: [String] = []
+        let lock = NSLock()
+        let scan = CliBackgroundScan(grokActivity: CliActivity(lastUsed: now, todayCount: 2), agyActivity: CliActivity(),
+                                     report: nil, links: [])
+        let refresher = CliFleetRefresher(work: DispatchQueue(label: "cli-refresher-work", attributes: .concurrent), callback: queue,
+                                          scan: { gate.wait(); return scan },
+                                          write: { snapshot in lock.lock(); written.append(snapshot.host); lock.unlock(); return true })
+        var applied: CliActivity?
+        var result: Bool??
+        precondition(refresher.refresh(apply: { scan in applied = scan.grokActivity; return sampleSnapshot(host: "w1") },
+                                       done: { result = $0; finished.signal() }))
+        precondition(!refresher.refresh(apply: { _ in preconditionFailure("overlapping refresh must be skipped") }),
+                     "a second refresh while one runs is skipped")
+        gate.signal()
+        precondition(finished.wait(timeout: .now() + 10) == .success, "refresh finishes")
+        precondition(applied?.todayCount == 2 && written == ["w1"] && result == .some(true), "\(written) \(String(describing: result))")
+        // 쓸 스냅샷이 없으면(첫 결과 전) 파일을 쓰지 않는다. 앞선 실행이 끝났으니 다시 돈다.
+        precondition(refresher.refresh(apply: { _ in nil }, done: { result = $0; finished.signal() }))
+        gate.signal()
+        precondition(finished.wait(timeout: .now() + 10) == .success)
+        precondition(written == ["w1"] && result == .some(nil), "no snapshot → no write")
     }
 
     static func render(_ view: NSView) {
