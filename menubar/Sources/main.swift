@@ -5032,6 +5032,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastAgyFetchedAt: Date?
     private var agyHasValue = false
     var agyTimer: Timer?
+    /// CLI 탭 머신 표의 이 맥 줄. 제목·카드와 같은 판정(일시 실패는 앞선 값을 지킨다)을 따른다.
+    var localGrokOutcome: (outcome: GrokMenuOutcome, installed: Bool)?
+    var localAgyOutcome: AgyFetchOutcome?
+    var localGrokActivity = CliActivity()
+    var localAgyActivity = CliActivity()
+    /// 본체 수집 결과(~/.claude/cache/fleet-cli.json). 파일이 없으면 nil(이 맥 한 줄).
+    var currentCliFleetReport: CliFleetReport?
+    /// 패널 링크(~/.config/cc-menubar/links.json). 없거나 틀리면 빈 목록이라 버튼이 숨는다.
+    var currentLinks: [DashboardLink] = []
+    let cliHostName = cliLocalHostName()
+    private var isScanningCli = false
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
     /// 로그 347분 동안 조회 1회). 10분 주기로 다시 부른다 — 함수 자체가 중복 실행을 막는다.
     var higgsfieldTimer: Timer?
@@ -5325,6 +5336,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         refresh()
         updateActivity() // 즉시 첫 감지
+        loadCliFleetInBackground()
         scheduleMenuPrewarm()
 
         // 1초마다: 펄스 프레임 회전 + tickCount 누적 (5의 배수에서 슬롯 전환)
@@ -5349,6 +5361,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         codexScanTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.loadCodexStatusInBackground()
             self?.loadModelUsageInBackground()
+            self?.loadCliFleetInBackground()
         }
         if let t = codexScanTimer { RunLoop.main.add(t, forMode: .common) }
 
@@ -5854,6 +5867,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         dashboard.modelUsage = currentModelUsage
+        dashboard.cliTable = currentCliTable
+        dashboard.links = currentLinks
         dashboard.updateContent(
             teamClaude: currentTeamClaude,
             codex: currentCodex,
@@ -5900,6 +5915,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.isFetchingGrok = false
                     self.currentGrokSlot = nil
                     self.currentGrokCard = grokCardModel(for: notice)
+                    self.localGrokOutcome = (.login, false)
                     print("GROK-SLOT: \(notice.headline)")
                     fflush(stdout)
                     self.updateTitle()
@@ -5918,6 +5934,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.isFetchingGrok = false
                 if case .percent = outcome { self.grokLastSuccessAt = Date() }
+                self.recordLocalGrokOutcome(outcome)
                 // 제목 슬롯과 카드는 한 판정(grokPresentation)에서 함께 나온다.
                 let presented = grokPresentation(outcome, previousSlot: self.currentGrokSlot, previousCard: self.currentGrokCard)
                 self.currentGrokSlot = presented.slot
@@ -5943,6 +5960,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isFetchingAgy = false
+                self.recordLocalAgyOutcome(outcome)
                 switch outcome {
                 case .missing:
                     self.agyHasValue = false
@@ -5965,6 +5983,69 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.scheduleDashboardRefresh(reason: "loadAgyUsageInBackground")
             }
         }
+    }
+
+    // MARK: CLI 탭 머신 표(Grok·agy)
+
+    /// 일시 실패(.unavailable)는 앞선 사용률을 지킨다 — 제목 슬롯(grokPresentation)과 같은 규칙.
+    func recordLocalGrokOutcome(_ outcome: GrokMenuOutcome) {
+        if case .unavailable = outcome, let previous = localGrokOutcome, case .percent = previous.outcome { return }
+        localGrokOutcome = (outcome, true)
+    }
+
+    /// 실패는 앞선 정상 값을 지킨다 — 카드(agyHasValue)와 같은 규칙.
+    func recordLocalAgyOutcome(_ outcome: AgyFetchOutcome) {
+        if case .failed = outcome, case .ready? = localAgyOutcome { return }
+        localAgyOutcome = outcome
+    }
+
+    var localCliState: CliLocalCliState {
+        CliLocalCliState(
+            host: cliHostName,
+            grok: localGrokOutcome.map { cliGrokStatus(outcome: $0.outcome, installed: $0.installed, activity: localGrokActivity) },
+            agy: localAgyOutcome.map { cliAgyStatus(outcome: $0, activity: localAgyActivity) },
+            writtenAt: Date())
+    }
+
+    var currentCliTable: CliFleetTable {
+        CliFleetTable.make(report: currentCliFleetReport, local: localCliState, now: Date())
+    }
+
+    /// 60초마다: 사용 흔적 스캔·본체 수집 파일·링크 파일을 메인 스레드 밖에서 읽고,
+    /// 이 맥의 스냅샷(~/.cache/cc-menubar/cli-status.json)을 원자적으로 쓴다. 첫 결과 전에는 쓰지 않는다.
+    func loadCliFleetInBackground() {
+        guard !isScanningCli else { return }
+        isScanningCli = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let now = Date()
+            let grok = CliActivityScanner.grok(root: CliActivityScanner.grokSessionsURL(), now: now)
+            let agy = CliActivityScanner.agy(root: CliActivityScanner.agyConversationsURL(), now: now)
+            let report = CliFleetReport.load()
+            let links = DashboardLinks.load()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isScanningCli = false
+                self.localGrokActivity = grok
+                self.localAgyActivity = agy
+                self.currentCliFleetReport = report
+                self.currentLinks = links
+                if let snapshot = self.localCliState.snapshot {
+                    DispatchQueue.global(qos: .utility).async {
+                        if !CliStatusFile.write(snapshot) {
+                            print("CLI-STATUS: 스냅샷 쓰기 실패")
+                            fflush(stdout)
+                        }
+                    }
+                }
+                self.scheduleDashboardRefresh(reason: "loadCliFleetInBackground")
+            }
+        }
+    }
+
+    /// 링크를 브라우저로 열고 메뉴를 닫는다.
+    func openDashboardLink(_ url: URL, menu: NSMenu?) {
+        NSWorkspace.shared.open(url)
+        menu?.cancelTracking()
     }
 
     func commitTeamClaudeHealth(_ candidate: TeamClaudeHealth, outageDuration: TimeInterval = 0) {
@@ -6382,6 +6463,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let previousScrollOrigin = dashboard.bodyScrollOrigin
         dashboard.maxBodyHeight = dashboardMaxBodyHeight()
         dashboard.modelUsage = currentModelUsage
+        dashboard.cliTable = currentCliTable
+        dashboard.links = currentLinks
 
         dashboard.updateContent(
             teamClaude: currentTeamClaude,
@@ -6451,10 +6534,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DashboardAction(id: "codex-oauth", group: .account, title: L10n.actionCodexOAuth, detail: L10n.actionWebLoginDetail) { [weak self] in
                 self?.addCodexOAuthAccountAction(); closeMenu(); return nil
             },
-            DashboardAction(id: "restart", group: .app, title: L10n.actionRestart, detail: L10n.actionRestartDetail) { [weak self] in
-                self?.restartTeamClaudeAction(); closeMenu(); return nil
-            },
         ]
+        // 패널 링크(links.json). 앱 묶음 맨 앞, 누르면 브라우저로 열고 메뉴를 닫는다.
+        actions += dashboardLinkActions(currentLinks) { [weak self, weak menu] url in self?.openDashboardLink(url, menu: menu) }
+        actions.append(DashboardAction(id: "restart", group: .app, title: L10n.actionRestart, detail: L10n.actionRestartDetail) { [weak self] in
+            self?.restartTeamClaudeAction(); closeMenu(); return nil
+        })
         // 외부 배포본(.app)에서만 보인다. 내부 설치는 install.py의 LaunchAgent가 로그인 시 띄운다.
         if menubarLoginItemAvailable(bundlePath: Bundle.main.bundlePath) {
             actions.append(menubarLoginItemAction(enabled: menubarLoginItemIsEnabled(home: NSHomeDirectory())) { [weak self] in
@@ -6525,7 +6610,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu?.cancelTracking()
         }
         dashboard.actions = dashboardActions(menu: menu)
+        dashboard.onOpenLink = { [weak self, weak menu] link in self?.openDashboardLink(link.url, menu: menu) }
         dashboard.modelUsage = currentModelUsage
+        dashboard.cliTable = currentCliTable
+        dashboard.links = currentLinks
         dashboard.configure(
             teamClaude: currentTeamClaude,
             codex: currentCodex,

@@ -45,7 +45,7 @@ FAKE_SSH = """#!/bin/sh
 echo "$@" >> "$FAKE_SSH_DIR/calls.log"
 for arg in "$@"; do
   case "$arg" in
-    -o|BatchMode=yes|ConnectTimeout=5|cat|"~/.cache/cc-menubar/cli-status.json") ;;
+    -o|BatchMode=yes|ConnectTimeout=5|head|-c|262145|"~/.cache/cc-menubar/cli-status.json") ;;
     *) host="$arg" ;;
   esac
 done
@@ -57,6 +57,8 @@ case "$host" in
   down|laptop) echo "ssh: connect: Host is down" >&2; exit 255 ;;
   slow) sleep 5; exit 0 ;;
   nap-*) sleep 1; exit 1 ;;
+  flood) exec yes ;;
+  stall) printf '{"schema":1,'; exec sleep 30 ;;
 esac
 exit 1
 """
@@ -127,7 +129,7 @@ class FleetCliCollectTests(unittest.TestCase):
         self.assertTrue(calls)
         for line in calls:
             self.assertTrue(line.startswith("-o BatchMode=yes -o ConnectTimeout=5 "), line)
-            self.assertTrue(line.endswith(" cat ~/.cache/cc-menubar/cli-status.json"), line)
+            self.assertTrue(line.endswith(" head -c 262145 ~/.cache/cc-menubar/cli-status.json"), line)
         self.assertFalse(any("ProxyCommand" in line for line in calls))
 
     def test_timeout_marks_only_that_host(self):
@@ -138,6 +140,24 @@ class FleetCliCollectTests(unittest.TestCase):
         by = {host["name"]: host for host in json.loads(self.out.read_text())["hosts"]}
         self.assertEqual("timeout", by["slow"]["error"])
         self.assertTrue(by["good-a"]["ok"])
+
+    def test_oversize_output_is_cut_without_reading_it_all(self):
+        # 끝없는 출력(yes)도 상한+1바이트에서 끊고 "oversize"로 둔다. 시간 초과까지 기다리지 않는다.
+        started = time.time()
+        result = collect.read_remote("flood", False, ssh=str(self.ssh), timeout=10)
+        self.assertLess(time.time() - started, 5.0)
+        self.assertEqual({"name": "flood", "ok": False, "error": "oversize", "status": None}, result)
+
+    def test_partial_output_then_stall_times_out(self):
+        # 일부를 보낸 뒤 멈춘 호스트도 호스트당 시간 상한에서 끊는다.
+        started = time.time()
+        result = collect.read_remote("stall", False, ssh=str(self.ssh), timeout=1)
+        self.assertLess(time.time() - started, 4.5)
+        self.assertEqual("timeout", result["error"])
+
+    def test_oversize_local_file(self):
+        self.local.write_bytes(b"{" + b" " * (collect.MAX_BYTES + 10) + b"}")
+        self.assertEqual("oversize", collect.read_local("hub", str(self.local))["error"])
 
     def test_missing_local_file_and_atomic_write(self):
         self.local.unlink()

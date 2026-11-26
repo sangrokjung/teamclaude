@@ -3,13 +3,14 @@
 
 각 머신의 cc-menubar는 60초마다 ~/.cache/cc-menubar/cli-status.json을 쓴다(schema 1).
 이 스크립트는 fleet 매니페스트(nodes[].host, nodes[].menubarOfflineOk)의 호스트마다
-`ssh -o BatchMode=yes -o ConnectTimeout=5 <host> cat ~/.cache/cc-menubar/cli-status.json`을
-병렬(최대 8, 호스트당 20초)로 읽고, 본체 자기 파일("hub")과 함께
+`ssh -o BatchMode=yes -o ConnectTimeout=5 <host> head -c 262145 ~/.cache/cc-menubar/cli-status.json`을
+병렬(최대 8, 호스트당 20초)로 읽고(출력은 256KiB+1바이트까지만 받는다), 본체 자기 파일("hub")과 함께
 ~/.claude/cache/fleet-cli.json에 원자적으로(임시 파일 → rename) 쓴다.
 
     {"collected_at": <epoch>, "hosts": [{"name", "ok", "error", "status"}]}
 
 error: "ssh"(연결 실패) · "offline"(menubarOfflineOk 노드의 연결 실패) · "timeout" · "missing"(파일 없음)
+       · "oversize"(256KiB 초과)
        · "parse"(JSON이 아니거나 schema·필수 키가 틀림). 실패한 호스트만 ok=false다.
 status는 알려진 키만 다시 담는다(원격 파일의 다른 내용을 옮기지 않는다). 토큰·키 값은 다루지 않는다.
 
@@ -22,8 +23,10 @@ import argparse
 import concurrent.futures
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -124,33 +127,79 @@ def entry(name: str, status: Optional[Dict[str, Any]], error: Optional[str]) -> 
 def read_local(name: str, path: str) -> Dict[str, Any]:
     try:
         with open(path, "rb") as handle:
-            data = handle.read(MAX_BYTES + 1)
-    except FileNotFoundError:
-        return entry(name, None, "missing")
+            data = handle.read(MAX_BYTES + 1)  # 상한까지만 읽는다
     except OSError:
         return entry(name, None, "missing")
     if len(data) > MAX_BYTES:
-        return entry(name, None, "parse")
+        return entry(name, None, "oversize")
     status, error = parse_status(data.decode("utf-8", "replace"))
     return entry(name, status, error)
 
 
-def read_remote(host: str, offline_ok: bool, ssh: str = "ssh", timeout: float = HOST_TIMEOUT) -> Dict[str, Any]:
-    command = [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "cat", REMOTE_PATH]
+def remote_command(ssh: str, host: str) -> List[str]:
+    # 원격에서도 상한+1바이트까지만 보낸다. 넘쳤는지는 받은 길이로 판정한다.
+    return [ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+            "head", "-c", str(MAX_BYTES + 1), REMOTE_PATH]
+
+
+def _bounded_read(stream: Any, limit: int, sink: List[bytes]) -> None:
+    total = 0
+    while total <= limit:
+        chunk = stream.read(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        sink.append(chunk)
+        total += len(chunk)
+
+
+def _stop(process: "subprocess.Popen[bytes]") -> None:
+    # 프로세스 묶음 전체를 끊는다. ssh가 남긴 자식이 파이프를 붙잡아 읽기가 끝나지 않는 일을 막는다.
     try:
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        os.killpg(process.pid, signal.SIGKILL)  # 묶음 우두머리가 이미 끝났어도 남은 자식까지
+    except OSError:
+        if process.poll() is None:
+            process.kill()
+    try:
+        process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        return entry(host, None, "timeout")
+        pass
+
+
+def read_remote(host: str, offline_ok: bool, ssh: str = "ssh", timeout: float = HOST_TIMEOUT) -> Dict[str, Any]:
+    """출력은 MAX_BYTES+1바이트까지만 메모리에 담는다. 넘치거나 시간을 넘기면 프로세스를 끊는다."""
+    deadline = time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(remote_command(ssh, host), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
         return entry(host, None, "ssh")
-    if result.returncode == 255:
+    chunks: List[bytes] = []
+    reader = threading.Thread(target=_bounded_read, args=(process.stdout, MAX_BYTES, chunks), daemon=True)
+    reader.start()
+    reader.join(max(0.0, deadline - time.monotonic()))
+    try:
+        if reader.is_alive():
+            _stop(process)
+            reader.join(2)
+            return entry(host, None, "timeout")
+        data = b"".join(chunks)
+        if len(data) > MAX_BYTES:
+            _stop(process)
+            return entry(host, None, "oversize")
+        try:
+            returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _stop(process)
+            return entry(host, None, "timeout")
+    finally:
+        if process.stdout:
+            process.stdout.close()
+    if returncode == 255:
         # ssh 자체 실패(연결·인증). 꺼질 수 있는 노드(노트북)는 꺼짐으로 둔다.
         return entry(host, None, "offline" if offline_ok else "ssh")
-    if result.returncode != 0:
+    if returncode != 0:
         return entry(host, None, "missing")
-    if len(result.stdout) > MAX_BYTES:
-        return entry(host, None, "parse")
-    status, error = parse_status(result.stdout.decode("utf-8", "replace"))
+    status, error = parse_status(data.decode("utf-8", "replace"))
     return entry(host, status, error)
 
 
