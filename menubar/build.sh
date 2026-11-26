@@ -47,6 +47,8 @@ if [ "${CC_MENUBAR_SKIP_SNAPSHOT:-0}" != "1" ]; then
     CC_MENUBAR_BINARY="$CANDIDATE" python3 "$SCRIPT_DIR/Tests/snapshot_test_locale.py"
     # 머신 줄 픽스처(fleetUsage): 정상은 렌더, 깨진 값은 비정상 종료.
     CC_MENUBAR_BINARY="$CANDIDATE" python3 "$SCRIPT_DIR/Tests/snapshot_test_fleet_fixture.py"
+    # CLI 탭 Grok·agy 머신 표(cliFleet·cliLocal)와 하단 링크 버튼(links).
+    CC_MENUBAR_BINARY="$CANDIDATE" python3 "$SCRIPT_DIR/Tests/snapshot_test_cli_fleet.py"
 fi
 mv -f "$CANDIDATE" "$BINARY"
 
