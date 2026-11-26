@@ -193,6 +193,69 @@ class FleetCliCollectTests(unittest.TestCase):
         clamped = collect.sanitize_status({**good, "grok": {**good["grok"], "usage_pct": 400}})
         self.assertIsNone(clamped["grok"]["usage_pct"])
 
+    def test_wrong_field_types_mark_only_that_host(self):
+        # 적대 검토 I2: 필드 타입이 틀린 호스트는 그 호스트만 "parse"이고, 나머지 수집은 계속된다.
+        good = snapshot()
+        bad_cases = {
+            "groups-int": {**good, "agy": {**good["agy"], "groups": 3}},
+            "groups-str": {**good, "agy": {**good["agy"], "groups": "Gemini"}},
+            "group-item-str": {**good, "agy": {**good["agy"], "groups": ["Gemini"]}},
+            "group-name-int": {**good, "agy": {**good["agy"], "groups": [{"name": 5}]}},
+            "group-pct-str": {**good, "agy": {**good["agy"], "groups": [{"name": "G", "weekly_remaining_pct": "80"}]}},
+            "auth-int": {**good, "grok": {**good["grok"], "auth": 1}},
+            "auth-list": {**good, "agy": {**good["agy"], "auth": ["ok"]}},
+            "installed-str": {**good, "grok": {**good["grok"], "installed": "yes"}},
+            "usage-str": {**good, "grok": {**good["grok"], "usage_pct": "12"}},
+            "usage-bool": {**good, "grok": {**good["grok"], "usage_pct": True}},
+            "last-used-int": {**good, "grok": {**good["grok"], "last_used": 5}},
+            "sessions-str": {**good, "grok": {**good["grok"], "sessions_today": "4"}},
+            "partial-str": {**good, "grok": {**good["grok"], "sessions_today_partial": "no"}},
+            "fetch-failed-int": {**good, "agy": {**good["agy"], "fetch_failed": 1}},
+            "last-ok-int": {**good, "agy": {**good["agy"], "last_ok_at": 1700000000}},
+            "grok-list": {**good, "grok": []},
+            "agy-null": {**good, "agy": None},
+            "host-int": {**good, "host": 7},
+            "written-str": {**good, "written_at": "now"},
+        }
+        nodes = []
+        for name, payload in bad_cases.items():
+            (self.dir / f"good-{name}.json").write_text(json.dumps(payload))
+            nodes.append({"host": f"good-{name}"})
+        nodes.append({"host": "good-a"})
+        self.manifest.write_text(json.dumps({"nodes": nodes}))
+        self.assertEqual(0, self.run_once())
+        by = {host["name"]: host for host in json.loads(self.out.read_text())["hosts"]}
+        for name in bad_cases:
+            with self.subTest(case=name):
+                self.assertEqual({"name": f"good-{name}", "ok": False, "error": "parse", "status": None}, by[f"good-{name}"])
+        self.assertTrue(by["good-a"]["ok"], "a bad host must not stop the rest")
+        self.assertTrue(by["hub"]["ok"])
+
+    def test_every_lane_and_fetch_state_is_passed_on(self):
+        # 적대 검토 I1·I3: 실패 표지·마지막 성공 시각·부분 집계 표지를 옮기고, 레인은 자르지 않는다.
+        good = snapshot()
+        good["grok"].update({"fetch_failed": True, "last_ok_at": "2026-11-26T09:00:00Z", "sessions_today_partial": True})
+        good["agy"]["groups"] = [{"name": f"Gemini {i}", "weekly_remaining_pct": 90} for i in range(12)]
+        status = collect.sanitize_status(good)
+        self.assertEqual(12, len(status["agy"]["groups"]))
+        self.assertTrue(status["grok"]["fetch_failed"])
+        self.assertEqual("2026-11-26T09:00:00Z", status["grok"]["last_ok_at"])
+        self.assertTrue(status["grok"]["sessions_today_partial"])
+        # 없으면 기본값(실패 아님, 부분 아님, 성공 시각 모름).
+        plain = collect.sanitize_status(snapshot())
+        self.assertFalse(plain["agy"]["fetch_failed"])
+        self.assertIsNone(plain["agy"]["last_ok_at"])
+        self.assertFalse(plain["agy"]["conversations_today_partial"])
+
+    def test_unexpected_parser_error_is_contained(self):
+        # 파서가 예상 못 한 예외를 내도 그 호스트만 "parse"다(전체 수집이 멈추지 않는다).
+        original = collect.sanitize_status
+        try:
+            collect.sanitize_status = lambda raw: (_ for _ in ()).throw(RuntimeError("boom"))
+            self.assertEqual("parse", collect.read_remote("good-a", False, ssh=str(self.ssh), timeout=10)["error"])
+        finally:
+            collect.sanitize_status = original
+
     def test_cli_once_runs_as_a_script(self):
         result = subprocess.run([sys.executable, str(SCRIPT), "--manifest", str(self.manifest), "--out", str(self.out),
                                  "--local", str(self.local), "--ssh", str(self.ssh), "--once"],

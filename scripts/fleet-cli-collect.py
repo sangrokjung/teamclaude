@@ -41,9 +41,16 @@ GROK_AUTH = {"ok", "expired", "login", "unavailable"}
 AGY_AUTH = {"ok", "login", "error"}
 
 
+class _BadType(Exception):
+    """필드 타입이 틀렸다. 그 호스트만 "parse"로 둔다."""
+
+
 def _number(value: Any) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """없으면 None. 수가 아니면(불리언 포함) 타입 오류. NaN·무한은 값만 비운다."""
+    if value is None:
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _BadType()
     if value != value or value in (float("inf"), float("-inf")):
         return None
     return float(value)
@@ -60,28 +67,39 @@ def _count(value: Any) -> Optional[int]:
 
 
 def _text(value: Any, limit: int = 64) -> Optional[str]:
-    return value[:limit] if isinstance(value, str) and value else None
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _BadType()
+    return value[:limit] if value else None
 
 
-def sanitize_status(raw: Any) -> Optional[Dict[str, Any]]:
-    """schema 1 스냅샷을 검사해 알려진 키만 담은 사본을 돌려준다. 틀리면 None."""
-    if not isinstance(raw, dict) or raw.get("schema") != SCHEMA or isinstance(raw.get("schema"), bool):
-        return None
-    host = _text(raw.get("host"))
-    written = _number(raw.get("written_at"))
-    grok, agy = raw.get("grok"), raw.get("agy")
-    if host is None or written is None or not (0 < written < 10_000_000_000):
-        return None
-    if not isinstance(grok, dict) or not isinstance(agy, dict):
-        return None
-    if not isinstance(grok.get("installed"), bool) or grok.get("auth") not in GROK_AUTH:
-        return None
-    if not isinstance(agy.get("installed"), bool) or agy.get("auth") not in AGY_AUTH:
-        return None
+def _flag(value: Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise _BadType()
+    return value
+
+
+def _section(raw: Any, auth_values: set) -> Dict[str, Any]:
+    if not isinstance(raw, dict) or not isinstance(raw.get("installed"), bool):
+        raise _BadType()
+    auth = raw.get("auth")
+    if not isinstance(auth, str) or auth not in auth_values:
+        raise _BadType()
+    return raw
+
+
+def _groups(raw: Any) -> List[Dict[str, Any]]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise _BadType()
     groups = []
-    for group in agy.get("groups") or []:
+    for group in raw:  # 레인은 자르지 않는다. 크기는 MAX_BYTES가 묶는다.
         if not isinstance(group, dict) or _text(group.get("name")) is None:
-            continue
+            raise _BadType()
         groups.append({
             "name": _text(group.get("name")),
             "weekly_remaining_pct": _percent(group.get("weekly_remaining_pct")),
@@ -89,34 +107,55 @@ def sanitize_status(raw: Any) -> Optional[Dict[str, Any]]:
             "five_hour_remaining_pct": _percent(group.get("five_hour_remaining_pct")),
             "five_hour_reset": _text(group.get("five_hour_reset")),
         })
-    return {
-        "schema": SCHEMA,
-        "host": host,
-        "written_at": int(written),
-        "grok": {
-            "installed": grok["installed"],
-            "auth": grok["auth"],
-            "usage_pct": _percent(grok.get("usage_pct")),
-            "period_end": _text(grok.get("period_end")),
-            "last_used": _text(grok.get("last_used")),
-            "sessions_today": _count(grok.get("sessions_today")),
-        },
-        "agy": {
-            "installed": agy["installed"],
-            "auth": agy["auth"],
-            "groups": groups[:8],
-            "last_used": _text(agy.get("last_used")),
-            "conversations_today": _count(agy.get("conversations_today")),
-        },
-    }
+    return groups
+
+
+def sanitize_status(raw: Any) -> Optional[Dict[str, Any]]:
+    """schema 1 스냅샷을 검사해 알려진 키만 담은 사본을 돌려준다. 모양·타입이 틀리면 None."""
+    if not isinstance(raw, dict) or raw.get("schema") != SCHEMA or isinstance(raw.get("schema"), bool):
+        return None
+    try:
+        host = _text(raw.get("host"))
+        written = _number(raw.get("written_at"))
+        if host is None or written is None or not (0 < written < 10_000_000_000):
+            return None
+        grok = _section(raw.get("grok"), GROK_AUTH)
+        agy = _section(raw.get("agy"), AGY_AUTH)
+        return {
+            "schema": SCHEMA,
+            "host": host,
+            "written_at": int(written),
+            "grok": {
+                "installed": grok["installed"],
+                "auth": grok["auth"],
+                "usage_pct": _percent(grok.get("usage_pct")),
+                "period_end": _text(grok.get("period_end")),
+                "last_used": _text(grok.get("last_used")),
+                "sessions_today": _count(grok.get("sessions_today")),
+                "sessions_today_partial": _flag(grok.get("sessions_today_partial")),
+                "last_ok_at": _text(grok.get("last_ok_at")),
+                "fetch_failed": _flag(grok.get("fetch_failed")),
+            },
+            "agy": {
+                "installed": agy["installed"],
+                "auth": agy["auth"],
+                "groups": _groups(agy.get("groups")),
+                "last_used": _text(agy.get("last_used")),
+                "conversations_today": _count(agy.get("conversations_today")),
+                "conversations_today_partial": _flag(agy.get("conversations_today_partial")),
+                "last_ok_at": _text(agy.get("last_ok_at")),
+                "fetch_failed": _flag(agy.get("fetch_failed")),
+            },
+        }
+    except _BadType:
+        return None
 
 
 def parse_status(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        raw = json.loads(text)
-    except (ValueError, TypeError):
+        status = sanitize_status(json.loads(text))
+    except Exception:  # 예상 못 한 모양도 그 호스트만 "parse"다. 전체 수집을 멈추지 않는다.
         return None, "parse"
-    status = sanitize_status(raw)
     return (status, None) if status is not None else (None, "parse")
 
 

@@ -1,4 +1,4 @@
-import Foundation
+import Cocoa
 
 // Grok·agy 머신별 상세 표(CliFleetStatus.swift·CliFleetTable.swift)와 대시보드 링크(DashboardLinks.swift).
 // 스냅샷 직렬화·사용 흔적 스캔·수집 결과 해석·표 행 상태 판정·링크 파일 해석을 고정한다.
@@ -30,6 +30,7 @@ struct CliFleetStatusTests {
         fleetReport()
         tableRows()
         links()
+        reviewRound1()
         print("CliFleetStatusTests OK")
     }
 
@@ -44,9 +45,11 @@ struct CliFleetStatusTests {
         precondition(object["written_at"] as? Int == Int(snapshot.writtenAt.timeIntervalSince1970))
         let grok = object["grok"] as? [String: Any] ?? [:]
         precondition(grok["auth"] as? String == "ok" && grok["period_end"] as? String != nil)
-        precondition(Set(grok.keys) == ["installed", "auth", "usage_pct", "period_end", "last_used", "sessions_today"], "\(grok.keys)")
+        precondition(Set(grok.keys) == ["installed", "auth", "usage_pct", "period_end", "last_used", "sessions_today",
+                                        "sessions_today_partial", "last_ok_at", "fetch_failed"], "\(grok.keys)")
         let agy = object["agy"] as? [String: Any] ?? [:]
-        precondition(Set(agy.keys) == ["installed", "auth", "groups", "last_used", "conversations_today"], "\(agy.keys)")
+        precondition(Set(agy.keys) == ["installed", "auth", "groups", "last_used", "conversations_today",
+                                       "conversations_today_partial", "last_ok_at", "fetch_failed"], "\(agy.keys)")
         let text = String(decoding: data, as: UTF8.self)
         for banned in ["token", "key", "Bearer"] { precondition(!text.contains(banned), "no credential fields: \(banned)") }
         guard let back = CliStatusSnapshot.parse(object) else { preconditionFailure("round trip must parse") }
@@ -312,5 +315,137 @@ struct CliFleetStatusTests {
         precondition(actions.count == 2 && actions[0].group == .app && actions[0].closesMenu && actions[0].title == "AI 비용 대시보드")
         _ = actions[0].run()
         precondition(opened == valid[0].url)
+    }
+    // MARK: 8. 적대 검토 1차(2026-11-27) 지적 고정
+    static func reviewRound1() {
+        let fm = FileManager.default
+
+        // I1: 조회가 계속 실패하면 앞선 값을 보이더라도 실패와 마지막 성공 시각을 따로 싣고, 표는 그것으로 지연을 말한다.
+        var tracker = CliLocalTracker()
+        let billing = GrokPercentOutcome(slot: "Grok 12%", productPercent: 12, creditPercent: nil)
+        tracker.recordGrok(.percent(billing), now: now.addingTimeInterval(-600))
+        tracker.recordGrok(.unavailable, now: now.addingTimeInterval(-60))
+        let lanes = [AgyQuotaGroup(name: "Gemini Models", weekly: AgyQuotaBucket(remaining: 0.8, resetAt: nil),
+                                   fiveHour: AgyQuotaBucket(remaining: 0.9, resetAt: nil))]
+        tracker.recordAgy(.ready(lanes), now: now.addingTimeInterval(-900))
+        tracker.recordAgy(.failed, now: now.addingTimeInterval(-30))
+        let state = tracker.state(host: "w", now: now)
+        guard let grok = state.grok, let agy = state.agy, let snapshot = state.snapshot else { preconditionFailure("state must exist") }
+        precondition(grok.auth == .ok && grok.usagePercent == 12, "previous value is kept")
+        precondition(grok.fetchFailed && grok.lastOkAt == now.addingTimeInterval(-600), "\(grok)")
+        precondition(agy.auth == .ok && agy.fetchFailed && agy.lastOkAt == now.addingTimeInterval(-900), "\(agy)")
+        precondition(snapshot.writtenAt == now)
+        let lagged = CliFleetTable.row(name: "w", status: snapshot, hostError: nil, now: now)
+        precondition(lagged.grok.level == .warn && lagged.grok.word == "조회 지연 10분" && lagged.grok.usagePercent == 12, "\(lagged.grok)")
+        precondition(lagged.agy.level == .warn && lagged.agy.word == "조회 지연 15분", "\(lagged.agy)")
+        precondition(lagged.level == .warn && lagged.statusWord == "주의", "a fresh written_at alone is not fresh")
+        // 직렬화를 지나도 같다(수집기가 옮기는 칸).
+        let reparsed = CliStatusSnapshot.parse(try! JSONSerialization.jsonObject(with: snapshot.jsonData()!))!
+        precondition(reparsed.grok.fetchFailed && reparsed.grok.lastOkAt == grok.lastOkAt && reparsed.agy.lastOkAt == agy.lastOkAt)
+        // 다시 성공하면 실패 표지가 풀린다. 실패 표지 없이도 마지막 성공이 5분 넘게 지났으면 지연이다.
+        tracker.recordGrok(.percent(billing), now: now)
+        precondition(tracker.state(host: "w", now: now).grok?.fetchFailed == false)
+        var quietOld = snapshot
+        quietOld.grok.fetchFailed = false
+        quietOld.grok.lastOkAt = now.addingTimeInterval(-420)
+        precondition(CliFleetTable.row(name: "w", status: quietOld, hostError: nil, now: now).grok.word == "조회 지연 7분")
+        quietOld.grok.lastOkAt = now.addingTimeInterval(-120)
+        precondition(CliFleetTable.row(name: "w", status: quietOld, hostError: nil, now: now).grok.level == .ok)
+        // 한 번도 성공하지 못한 실패는 확인 필요로 남는다(앞선 값이 없다).
+        var fresh = CliLocalTracker()
+        fresh.recordAgy(.failed, now: now)
+        precondition(fresh.state(host: "w", now: now).agy?.auth == .error)
+        // 결정된 상태(로그인·만료·미설치)는 실패 표지를 풀고 그대로 보인다.
+        tracker.recordGrok(.login, now: now)
+        precondition(tracker.state(host: "w", now: now).grok?.auth == .login && tracker.state(host: "w", now: now).grok?.fetchFailed == false)
+        tracker.recordGrokMissing()
+        precondition(tracker.state(host: "w", now: now).grok?.installed == false)
+
+        // I3: 표시 상한 밖의 머신도 요약에 센다. 잘린 쪽에 실패가 있으면 문제로 집계한다.
+        let good = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) ?? [:]
+        var hosts: [[String: Any]] = (0..<CliFleetTable.maxRows).map { ["name": "n\($0)", "ok": true, "status": good] }
+        hosts.append(["name": "late-fail", "ok": false, "error": "ssh"])
+        let big = CliFleetReport.parse(object: ["collected_at": now.timeIntervalSince1970 - 10, "hosts": hosts])!
+        precondition(big.hosts.count == CliFleetTable.maxRows + 1, "the report keeps every host")
+        let bigTable = CliFleetTable.make(report: big, local: CliLocalCliState(host: "x"), now: now)
+        precondition(bigTable.rows.count == CliFleetTable.maxRows && bigTable.hidden.count == 1)
+        precondition(bigTable.totalCount == CliFleetTable.maxRows + 1 && bigTable.okCount == CliFleetTable.maxRows)
+        precondition(bigTable.hiddenNote == "외 1대 · 문제 1", bigTable.hiddenNote ?? "nil")
+        precondition(L10n.cliFleetSummary(machines: bigTable.totalCount, ok: bigTable.okCount) == "33대 중 정상 32")
+        precondition(CliFleetTable.height(rows: CliFleetTable.maxRows, hidden: true) > CliFleetTable.height(rows: CliFleetTable.maxRows))
+        // 레인: 첫 레인 뒤의 모든 레인으로 최저 잔량을 본다(이미 고정, 여기서는 9번째 레인까지).
+        var nine = sampleSnapshot()
+        nine.agy.groups = (0..<9).map { CliAgyGroupStatus(name: "Gemini \($0)", weeklyRemainingPercent: $0 == 8 ? 5 : 90,
+                                                          weeklyReset: nil, fiveHourRemainingPercent: nil, fiveHourReset: nil) }
+        precondition(CliFleetTable.row(name: "x", status: nine, hostError: nil, now: now).agy.word == "남음 5%")
+
+        // I4: 상위 폴더 mtime이 아니라 세션 파일 mtime으로 센다. 열거 상한에 걸리면 부분 집계다.
+        let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cli-scan-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: base) }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Seoul")!
+        let midnight = calendar.startOfDay(for: now)
+        func put(_ url: URL, _ date: Date) {
+            try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            fm.createFile(atPath: url.path, contents: Data("x".utf8))
+            try! fm.setAttributes([.creationDate: midnight.addingTimeInterval(-90_000)], ofItemAtPath: url.path)
+            try! fm.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
+        }
+        let grokRoot = base.appendingPathComponent("grok")
+        for index in 0..<6 { put(grokRoot.appendingPathComponent("%2Fnew/s\(index)/chat_history.jsonl"), midnight.addingTimeInterval(-86_400)) }
+        put(grokRoot.appendingPathComponent("%2Fold/today/chat_history.jsonl"), midnight.addingTimeInterval(3_600))
+        for dir in ["%2Fnew", "%2Fold", "%2Fnew/s0", "%2Fnew/s1", "%2Fnew/s2", "%2Fnew/s3", "%2Fnew/s4", "%2Fnew/s5", "%2Fold/today"] {
+            try! fm.setAttributes([.creationDate: midnight.addingTimeInterval(-90_000)], ofItemAtPath: grokRoot.appendingPathComponent(dir).path)
+        }
+        // 오래된 프로젝트 폴더의 mtime은 옛날이다. 기존 세션에 이어 써도 상위 폴더 mtime은 바뀌지 않는다.
+        try! fm.setAttributes([.modificationDate: midnight.addingTimeInterval(-30 * 86_400)], ofItemAtPath: grokRoot.appendingPathComponent("%2Fold").path)
+        let full = CliActivityScanner.grok(root: grokRoot, now: now, calendar: calendar)
+        precondition(full.todayCount == 1 && full.lastUsed == midnight.addingTimeInterval(3_600) && !full.partial, "\(full)")
+        let cut = CliActivityScanner.grok(root: grokRoot, now: now, calendar: calendar, limit: 4)
+        precondition(cut.partial, "a capped scan says so: \(cut)")
+        var partialStatus = sampleSnapshot()
+        partialStatus.grok.sessionsToday = 3
+        partialStatus.grok.sessionsTodayPartial = true
+        partialStatus.agy.conversationsTodayPartial = true
+        let partialRow = CliFleetTable.row(name: "x", status: partialStatus, hostError: nil, now: now)
+        precondition(partialRow.grokToday == "3+" && partialRow.agyToday == "2+", "\(partialRow.grokToday) \(partialRow.agyToday)")
+        let agyRoot = base.appendingPathComponent("agy")
+        for index in 0..<5 { put(agyRoot.appendingPathComponent("c\(index).db"), midnight.addingTimeInterval(60)) }
+        precondition(!CliActivityScanner.agy(root: agyRoot, now: now, calendar: calendar).partial)
+        precondition(CliActivityScanner.agy(root: agyRoot, now: now, calendar: calendar, limit: 2).partial)
+
+        // M3: schema는 정확히 1이어야 한다. 소수·거대한 수는 앱을 멈추지 않고 거부한다.
+        var object = (try? JSONSerialization.jsonObject(with: sampleSnapshot().jsonData()!)) as? [String: Any] ?? [:]
+        object["schema"] = 1.5
+        precondition(CliStatusSnapshot.parse(object) == nil, "fractional schema is rejected")
+        object["schema"] = 1e300
+        precondition(CliStatusSnapshot.parse(object) == nil, "huge schema is rejected without trapping")
+        object["schema"] = true
+        precondition(CliStatusSnapshot.parse(object) == nil)
+        object["schema"] = 1
+        precondition(CliStatusSnapshot.parse(object) != nil)
+
+        // M1: 링크가 바뀌면 동작 목록도 새로 만든다. 지운 링크는 어디서도 실행되지 않는다.
+        precondition(dashboardLinkActions([]) { _ in preconditionFailure("removed link must not run") }.isEmpty)
+        let footer = DashboardPanelFooterView(frame: NSRect(x: 0, y: 0, width: 520, height: DashboardPanelFooterView.preferredHeight))
+        footer.links = [DashboardLink(title: "A", url: URL(string: "http://a.test/")!)]
+        render(footer)
+        precondition(!footer.linkRect.isEmpty)
+        footer.links = []
+        render(footer)
+        precondition(footer.linkRect.isEmpty, "no link → no hit area")
+
+        // M2: 긴 링크 제목이 되돌리기 칸을 덮지 않는다(클릭은 되돌리기가 먼저).
+        let wide = String(repeating: "가", count: DashboardLinks.maxTitleLength)
+        footer.links = [DashboardLink(title: wide, url: URL(string: "http://a.test/")!)]
+        footer.notice = DashboardFooterNotice(text: "구독 처리를 기록했습니다 결과 문장이 깁니다", failed: false, undo: true)
+        render(footer)
+        precondition(!footer.undoRect.isEmpty, "undo button is drawn")
+        precondition(!footer.linkRect.intersects(footer.undoRect), "link \(footer.linkRect) overlaps undo \(footer.undoRect)")
+    }
+
+    static func render(_ view: NSView) {
+        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { preconditionFailure("bitmap") }
+        view.cacheDisplay(in: view.bounds, to: rep)
     }
 }
