@@ -149,8 +149,17 @@ func grokPeriodEnd(fromBilling data: Data) -> Date? {
     guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let config = (root["config"] as? [String: Any]) ?? root
     guard let period = config["currentPeriod"] as? [String: Any] else { return nil }
-    if let date = CliStatusCodec.isoDate(period["end"]) { return date }
-    guard let epoch = CliStatusCodec.number(period["end"]), epoch > 0 else { return nil }
+    // 이 파일은 단독으로도 컴파일된다(test_usage_regressions.py). 다른 파일의 도우미를 쓰지 않는다.
+    if let raw = period["end"] as? String {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return fractional.date(from: raw) ?? plain.date(from: raw)
+    }
+    guard let number = period["end"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    let epoch = number.doubleValue
+    guard epoch.isFinite, epoch > 0 else { return nil }
     let seconds = epoch > 100_000_000_000 ? epoch / 1_000 : epoch
     return seconds < 10_000_000_000 ? Date(timeIntervalSince1970: seconds) : nil
 }
