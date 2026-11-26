@@ -208,13 +208,16 @@ struct CliFleetStatusTests {
         let lowRow = CliFleetTable.row(name: "node-a", status: low, hostError: nil, now: now)
         precondition(lowRow.level == .warn && lowRow.agy.level == .warn && lowRow.agy.word == "남음 12%", "\(lowRow.agy)")
         precondition(lowRow.statusWord == "주의")
+        precondition(lowRow.agy.reset == "5h 2시간", "only the short window's reset: \(lowRow.agy.reset ?? "nil")")
         var heavy = fresh
         heavy.grok.usagePercent = 85
-        precondition(CliFleetTable.row(name: "x", status: heavy, hostError: nil, now: now).grok.word == "남음 15%")
+        let heavyRow = CliFleetTable.row(name: "x", status: heavy, hostError: nil, now: now)
+        precondition(heavyRow.grok.word == "남음 15%" && heavyRow.grok.reset == "초기화 3일", heavyRow.grok.reset ?? "nil")
         var expired = fresh
         expired.grok.auth = .expired
         let expiredRow = CliFleetTable.row(name: "x", status: expired, hostError: nil, now: now)
-        precondition(expiredRow.grok.level == .warn && expiredRow.grok.word == "갱신 필요")
+        precondition(expiredRow.grok.level == .warn && expiredRow.grok.word == "갱신 필요" && expiredRow.grok.reset == nil)
+        precondition(L10n.cliFleetSummary(machines: 6, ok: 1) == "6대 중 정상 1" && L10n.cliFleetSummary(machines: 2, ok: 2) == "2대 모두 정상")
 
         // 문제: 로그인 필요·미설치·수집 실패·묵음.
         var login = fresh

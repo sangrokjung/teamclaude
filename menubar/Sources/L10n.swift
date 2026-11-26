@@ -775,7 +775,7 @@ enum L10n {
     static var cliRefreshNeeded: String { t("갱신 필요", "Refresh needed") }
     static var cliNoGemini: String { t("Gemini 없음", "No Gemini") }
     static func cliLeft(_ percent: Int) -> String { t("남음 \(percent)%", "\(percent)% left") }
-    static var cliCollectFailed: String { t("수집 실패", "Collect failed") }
+    static var cliCollectFailed: String { t("수집 실패", "Fetch failed") }
     static var cliOffline: String { t("꺼짐", "Offline") }
     static func cliStalled(_ minutes: Int) -> String { t("멈춤 \(minutes)분", "Stalled \(minutes)m") }
     static var cliClockSkew: String { t("시각 오류", "Clock skew") }
@@ -791,8 +791,9 @@ enum L10n {
     static func cliMoreLanes(_ count: Int) -> String { t("외 \(count)개 레인", "+\(count) lanes") }
     static var cliJustNow: String { t("방금", "just now") }
     static func cliAgo(_ duration: String) -> String { t("\(duration) 전", "\(duration) ago") }
-    static func cliFleetSummary(machines: Int, attention: Int) -> String {
-        attention == 0 ? t("\(machines)대 정상", "\(machines) OK") : t("\(machines)대 · 손볼 것 \(attention)", "\(machines) · \(attention) to fix")
+    /// 머리 배지("손볼 것 N", Claude·Codex 계정)와 다른 말을 쓴다. 같은 말로 다른 수를 보이면 헷갈린다.
+    static func cliFleetSummary(machines: Int, ok: Int) -> String {
+        ok == machines ? t("\(machines)대 모두 정상", "all \(machines) OK") : t("\(machines)대 중 정상 \(ok)", "\(ok) of \(machines) OK")
     }
     static var linkActionDetail: String { t("브라우저에서 열기", "Open in browser") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }

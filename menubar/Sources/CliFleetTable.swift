@@ -160,15 +160,18 @@ struct CliFleetTable: Equatable {
         guard grok.installed else { return CliGrokCell(level: .problem, word: StatusVocabulary.notInstalled, usagePercent: nil, reset: nil) }
         switch grok.auth {
         case .login: return CliGrokCell(level: .problem, word: L10n.cliLoginNeeded, usagePercent: nil, reset: nil)
-        case .expired: return CliGrokCell(level: .warn, word: L10n.cliRefreshNeeded, usagePercent: grok.usagePercent, reset: reset)
-        case .unavailable: return CliGrokCell(level: .warn, word: StatusVocabulary.needsCheck, usagePercent: grok.usagePercent, reset: reset)
+        // 만료·확인 필요는 할 일이 먼저다. 둘째 줄에는 상태 글자만 두고 초기화 시각은 싣지 않는다(좁은 칸에서 잘리지 않게).
+        case .expired: return CliGrokCell(level: .warn, word: L10n.cliRefreshNeeded, usagePercent: grok.usagePercent, reset: nil)
+        case .unavailable: return CliGrokCell(level: .warn, word: StatusVocabulary.needsCheck, usagePercent: grok.usagePercent, reset: nil)
         case .ok:
             guard let usage = grok.usagePercent else {
-                return CliGrokCell(level: .warn, word: StatusVocabulary.needsCheck, usagePercent: nil, reset: reset)
+                return CliGrokCell(level: .warn, word: StatusVocabulary.needsCheck, usagePercent: nil, reset: nil)
             }
             let remaining = max(0, 100 - usage)
             if remaining < lowRemainingPercent {
-                return CliGrokCell(level: .warn, word: L10n.cliLeft(Int(remaining.rounded(.down))), usagePercent: usage, reset: reset)
+                // 남은 양이 적으면 언제 돌아오는지가 중요하다. 상태 글자 옆에 한 단위로 줄인 초기화 시각을 둔다.
+                let short = grok.periodEnd.map { L10n.cliResetIn(shortDuration($0, now: now)) }
+                return CliGrokCell(level: .warn, word: L10n.cliLeft(Int(remaining.rounded(.down))), usagePercent: usage, reset: short)
             }
             return CliGrokCell(level: .ok, word: nil, usagePercent: usage, reset: reset)
         }
@@ -190,20 +193,32 @@ struct CliFleetTable: Equatable {
             // 남은 양은 낮춰 말한다(99.5%를 100%로 보이지 않게, 제목 슬롯과 같은 규칙).
             let weekly = group.weeklyRemainingPercent.map { $0.rounded(.down) }
             let fiveHour = group.fiveHourRemainingPercent.map { $0.rounded(.down) }
+            // 창마다 (남은 양, 초기화 문구). 레인이 여럿이면 첫 레인 값을 보이고 나머지는 세어서 알린다.
+            // 조용히 버리면 남은 양을 오독한다. 주의 판정은 모든 레인의 가장 낮은 남은 양으로 한다.
+            let windows: [(remaining: Double, reset: String?)] = agy.groups.flatMap { lane -> [(Double, String?)] in
+                var out: [(Double, String?)] = []
+                if let left = lane.weeklyRemainingPercent {
+                    out.append((left.rounded(.down), lane.weeklyReset.map { L10n.cliWeeklyReset(shortDuration($0, now: now)) }))
+                }
+                if let left = lane.fiveHourRemainingPercent {
+                    out.append((left.rounded(.down), lane.fiveHourReset.map { L10n.cliFiveHourReset(shortDuration($0, now: now)) }))
+                }
+                return out
+            }
+            let more = agy.groups.count > 1 ? [L10n.cliMoreLanes(agy.groups.count - 1)] : []
             var parts: [String] = []
             if let reset = group.weeklyReset { parts.append(L10n.cliWeeklyReset(shortDuration(reset, now: now))) }
             if let reset = group.fiveHourReset { parts.append(L10n.cliFiveHourReset(shortDuration(reset, now: now))) }
-            // 레인이 여럿이면 첫 레인 값을 보이고 나머지는 세어서 알린다. 조용히 버리면 남은 양을 오독한다.
-            // 주의 판정은 모든 레인의 가장 낮은 남은 양으로 한다.
             if agy.groups.count > 1 { parts.append(L10n.cliMoreLanes(agy.groups.count - 1)) }
             let reset = parts.isEmpty ? nil : parts.joined(separator: " · ")
             guard weekly != nil || fiveHour != nil else {
                 return CliAgyCell(level: .warn, word: StatusVocabulary.needsCheck, weeklyRemaining: nil, fiveHourRemaining: nil, reset: reset)
             }
-            let every = agy.groups.flatMap { [$0.weeklyRemainingPercent, $0.fiveHourRemainingPercent] }.compactMap { $0?.rounded(.down) }
-            let lowest = every.min() ?? 100
-            if lowest < lowRemainingPercent {
-                return CliAgyCell(level: .warn, word: L10n.cliLeft(Int(lowest)), weeklyRemaining: weekly, fiveHourRemaining: fiveHour, reset: reset)
+            if let lowest = windows.min(by: { $0.remaining < $1.remaining }), lowest.remaining < lowRemainingPercent {
+                // 둘째 줄은 "남음 12% · 5h 2시간": 모자란 창의 초기화만 붙여 좁은 칸에 들어가게 한다.
+                let lowReset = ([lowest.reset].compactMap { $0 } + more).joined(separator: " · ")
+                return CliAgyCell(level: .warn, word: L10n.cliLeft(Int(lowest.remaining)), weeklyRemaining: weekly, fiveHourRemaining: fiveHour,
+                                  reset: lowReset.isEmpty ? nil : lowReset)
             }
             return CliAgyCell(level: .ok, word: nil, weeklyRemaining: weekly, fiveHourRemaining: fiveHour, reset: reset)
         }

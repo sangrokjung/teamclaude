@@ -90,18 +90,20 @@ final class CliQuotaLanesView: NSView {
 
     struct Columns {
         let machine: CGFloat, grok: CGFloat, grokEnd: CGFloat, agy: CGFloat, agyEnd: CGFloat
-        let last: CGFloat, lastEnd: CGFloat, today: CGFloat, todayEnd: CGFloat
+        /// 마지막 사용·오늘 두 열이 같이 쓰는 도구 이름 칸(윗단 Grok, 아랫단 agy).
+        let tool: CGFloat, lastEnd: CGFloat, todayEnd: CGFloat
     }
 
     static func columns(width: CGFloat) -> Columns {
         let left: CGFloat = 16, right = width - 16
-        let todayEnd = right, today = right - 48
-        let lastEnd = today - 10, last = lastEnd - 82
-        let machine = left
-        let grok = left + 80
-        let agy = grok + (last - 12 - grok) / 2 + 4
-        return Columns(machine: machine, grok: grok, grokEnd: agy - 14, agy: agy, agyEnd: last - 12,
-                       last: last, lastEnd: lastEnd, today: today, todayEnd: todayEnd)
+        let todayEnd = right, lastEnd = right - 40
+        let tool = lastEnd - 74
+        let agyEnd = tool - 12
+        let grok = left + 92
+        let span = agyEnd - grok - 14
+        let grokEnd = grok + span / 2
+        return Columns(machine: left, grok: grok, grokEnd: grokEnd, agy: grokEnd + 14, agyEnd: agyEnd,
+                       tool: tool, lastEnd: lastEnd, todayEnd: todayEnd)
     }
 
     static func levelColor(_ level: CliLevel) -> NSColor {
@@ -152,7 +154,7 @@ final class CliQuotaLanesView: NSView {
         PanelDraw.text(L10n.cliColMachine, col.machine, y + 3, meta, fg3, kern: kern)
         PanelDraw.text(L10n.cliColGrok, col.grok, y + 3, meta, fg3, kern: kern)
         PanelDraw.text(L10n.cliColAgy, col.agy, y + 3, meta, fg3, kern: kern)
-        PanelDraw.right(L10n.cliColLast, col.lastEnd, y + 3, meta, fg3, kern: kern)
+        PanelDraw.right(L10n.cliColLast, col.lastEnd, y + 3, meta, fg3, kern: kern) // 도구 이름 칸 위는 비운다
         PanelDraw.right(L10n.cliColToday, col.todayEnd, y + 3, meta, fg3, kern: kern)
         y += CliFleetTable.headHeight
         PanelDraw.hairline(col.machine, col.todayEnd, y - 1)
@@ -251,12 +253,13 @@ final class CliQuotaLanesView: NSView {
             }
         }
 
-        // 마지막 사용 · 오늘: 윗단 Grok, 아랫단 agy. 숫자는 고정폭으로 오른쪽 맞춤.
-        for (top, bottom, x, end) in [(row.grokLastUsed, row.agyLastUsed, col.last, col.lastEnd),
-                                      (row.grokToday, row.agyToday, col.today, col.todayEnd)] {
-            PanelDraw.text("Grok", x, line1 + 0.5, micro, fg3)
-            PanelDraw.text("agy", x, line2, micro, fg3)
-            let width = end - x - PanelDraw.width("Grok", micro) - 4
+        // 마지막 사용 · 오늘: 윗단 Grok, 아랫단 agy. 도구 이름은 한 번만, 숫자는 고정폭으로 오른쪽 맞춤.
+        PanelDraw.text("Grok", col.tool, line1 + 0.5, micro, fg3)
+        PanelDraw.text("agy", col.tool, line2, micro, fg3)
+        let lastWidth = col.lastEnd - col.tool - PanelDraw.width("Grok", micro) - 4
+        let todayWidth = col.todayEnd - col.lastEnd - 6
+        for (top, bottom, end, width) in [(row.grokLastUsed, row.agyLastUsed, col.lastEnd, lastWidth),
+                                          (row.grokToday, row.agyToday, col.todayEnd, todayWidth)] {
             PanelDraw.right(PanelDraw.clipped(top, small, maxWidth: width), end, line1 + 0.5, small, top == StatusVocabulary.none ? fg3 : fg2)
             PanelDraw.right(PanelDraw.clipped(bottom, small, maxWidth: width), end, line2, small, bottom == StatusVocabulary.none ? fg3 : fg2)
         }

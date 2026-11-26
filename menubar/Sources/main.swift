@@ -3673,7 +3673,7 @@ final class StatusMenuDashboardView: NSView {
         if let cliTable, out["cli"] != nil {
             // CLI 섹션 머리: 머신 수와 손볼 머신 수(주의·문제). 수집 파일이 없으면 이 맥만.
             out["cli"] = cliTable.fromFleet
-                ? L10n.cliFleetSummary(machines: cliTable.rows.count, attention: cliTable.rows.filter { $0.level >= .warn }.count)
+                ? L10n.cliFleetSummary(machines: cliTable.rows.count, ok: cliTable.rows.filter { $0.level == .ok }.count)
                 : L10n.cliThisMac
         }
         return out
