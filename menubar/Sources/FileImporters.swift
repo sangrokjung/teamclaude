@@ -401,6 +401,7 @@ final class ResultLineCapture {
             case 0x7D, 0x5D:  // } ]
                 depth -= 1
                 expectingKey = false
+                if depth <= 0 { return false }  // 첫 객체가 닫혔다. 그 뒤 글자는 이 줄의 결과가 아니다
             case 0x2C:  // ,
                 expectingKey = depth == 1
             case 0x22:

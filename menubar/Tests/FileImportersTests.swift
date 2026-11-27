@@ -289,7 +289,8 @@ struct FileImportersTests {
               && ResultLineCapture.hasTopLevelResultKey(Data("{\"to\":\"2026-11-27\",\"added\":9".utf8))
               && !ResultLineCapture.hasTopLevelResultKey(Data("{\"event\":\"added\"".utf8))
               && !ResultLineCapture.hasTopLevelResultKey(Data("{\"rows\":[{\"added\":1}],\"x\":\"a\\\"added\\\"\"".utf8))
-              && !ResultLineCapture.hasTopLevelResultKey(Data("not json added".utf8)),
+              && !ResultLineCapture.hasTopLevelResultKey(Data("not json added".utf8))
+              && !ResultLineCapture.hasTopLevelResultKey(Data("{\"event\":\"x\"} {\"added\":1".utf8)),
               "only top-level result keys count, in any order; values, nested keys and escaped quotes do not")
         // 검토 5차: 결과 키가 첫 키가 아니어도 긴 최종 결과는 앞 결과로 대신하지 않는다.
         let reordered = ResultLineCapture()
