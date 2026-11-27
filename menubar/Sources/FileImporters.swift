@@ -338,7 +338,8 @@ final class FileImportRunner {
 /// 결과를 형식 오류(nil)로 둔다.
 final class ResultLineCapture {
     static let maxLineBytes = 64 * 1024
-    private static let headBytes = 512
+    /// 긴 줄에서 최상위 키를 찾아볼 앞부분 크기.
+    private static let headBytes = 64 * 1024
     private let lock = NSLock()
     private var pending = Data()
     private var overflow = false
@@ -366,9 +367,53 @@ final class ResultLineCapture {
         take(Data()[...])
     }
 
-    static func startsWithResultKey(_ head: String) -> Bool {
-        let pattern = #"^\s*\{\s*"(added|duplicates|failed)"\s*:"#
-        return head.range(of: pattern, options: .regularExpression) != nil
+    /// JSON 객체 앞부분을 한 글자씩 훑어 최상위(깊이 1) 키만 모은다. 결과 키가 하나라도 있으면 true.
+    /// 끝이 잘린 입력이어도 그때까지 본 키로 판단한다.
+    static func hasTopLevelResultKey(_ head: Data) -> Bool {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var expectingKey = false
+        var readingKey = false
+        var key: [UInt8] = []
+        var sawOpen = false
+        for byte in head {
+            if inString {
+                if escaped { escaped = false; if readingKey { key.append(byte) }; continue }
+                if byte == 0x5C { escaped = true; continue }  // \
+                if byte == 0x22 {  // "
+                    inString = false
+                    if readingKey {
+                        readingKey = false
+                        if FileImportResult.resultKeys.contains(String(decoding: key, as: UTF8.self)) { return true }
+                    }
+                    continue
+                }
+                if readingKey { key.append(byte) }
+                continue
+            }
+            switch byte {
+            case 0x20, 0x09, 0x0D, 0x0A: continue
+            case 0x7B, 0x5B:  // { [
+                if !sawOpen { guard byte == 0x7B else { return false }; sawOpen = true }
+                depth += 1
+                expectingKey = depth == 1 && byte == 0x7B
+            case 0x7D, 0x5D:  // } ]
+                depth -= 1
+                expectingKey = false
+            case 0x2C:  // ,
+                expectingKey = depth == 1
+            case 0x22:
+                inString = true
+                readingKey = expectingKey && depth == 1
+                key.removeAll(keepingCapacity: true)
+                expectingKey = false
+            default:
+                guard sawOpen else { return false }
+                expectingKey = false
+            }
+        }
+        return false
     }
 
     var result: FileImportResult? {
@@ -381,8 +426,9 @@ final class ResultLineCapture {
         defer { pending.removeAll(keepingCapacity: true); overflow = false; overflowHead.removeAll() }
         guard !overflow, pending.count + tail.count <= Self.maxLineBytes else {
             let head = overflow ? overflowHead : Data((pending + tail).prefix(Self.headBytes))
-            // 긴 줄은 해석하지 않는다. 첫 키가 결과 키일 때만 결과로 본다(값 속의 "added" 같은 글자는 무시).
-            if Self.startsWithResultKey(String(decoding: head, as: UTF8.self)) { lastWasOversizedResult = true }
+            // 긴 줄은 해석하지 않는다. 앞부분에서 최상위 키에 결과 키가 있을 때만 결과로 본다
+            // (문자열 값·안쪽 객체의 "added" 같은 글자는 무시, 키 순서는 무관).
+            if Self.hasTopLevelResultKey(head) { lastWasOversizedResult = true }
             return
         }
         let line = Substring(String(decoding: pending + tail, as: UTF8.self))

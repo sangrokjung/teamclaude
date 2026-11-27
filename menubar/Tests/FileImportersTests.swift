@@ -285,8 +285,18 @@ struct FileImportersTests {
         jsonLog.append(Data(("{\"added\": 6, \"duplicates\": 1}\n{\"event\":\"batch.detail\",\"rows\":[" + rows + "]}\n").utf8))
         jsonLog.finish()
         check(jsonLog.result?.added == 6, "a long JSON log whose values mention added keeps the result")
-        check(ResultLineCapture.startsWithResultKey(" { \"failed\" : 1") && !ResultLineCapture.startsWithResultKey("{\"event\":\"added\""),
-              "only a leading result key marks an oversized line as a result")
+        check(ResultLineCapture.hasTopLevelResultKey(Data(" { \"failed\" : 1".utf8))
+              && ResultLineCapture.hasTopLevelResultKey(Data("{\"to\":\"2026-11-27\",\"added\":9".utf8))
+              && !ResultLineCapture.hasTopLevelResultKey(Data("{\"event\":\"added\"".utf8))
+              && !ResultLineCapture.hasTopLevelResultKey(Data("{\"rows\":[{\"added\":1}],\"x\":\"a\\\"added\\\"\"".utf8))
+              && !ResultLineCapture.hasTopLevelResultKey(Data("not json added".utf8)),
+              "only top-level result keys count, in any order; values, nested keys and escaped quotes do not")
+        // 검토 5차: 결과 키가 첫 키가 아니어도 긴 최종 결과는 앞 결과로 대신하지 않는다.
+        let reordered = ResultLineCapture()
+        reordered.append(Data("{\"added\": 1, \"duplicates\": 0}\n".utf8))
+        reordered.append(Data(("{\"to\": \"2026-11-27\", \"added\": 9, \"duplicates\": 2, \"failed\": 3, \"message\": \"" + String(repeating: "m", count: 70_000) + "\"}\n").utf8))
+        reordered.finish()
+        check(reordered.result == nil, "an oversized final result with result keys after other keys is an error")
         // 줄바꿈 없이 끝난 마지막 결과도 읽는다.
         let noNewline = ResultLineCapture()
         noNewline.append(Data("{\"added\": 2, \"duplicates\": 1}".utf8))
