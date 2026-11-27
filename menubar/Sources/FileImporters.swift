@@ -95,14 +95,17 @@ struct FileImportResult: Equatable {
 
     static let maxMessageLength = 160
 
-    /// 결과 후보: added·duplicates 키 가운데 하나라도 있는 JSON 객체 줄(값의 형식은 아직 보지 않는다).
+    /// 결과 줄을 알아보는 최상위 키.
+    static let resultKeys = ["added", "duplicates", "failed"]
+
+    /// 결과 후보: 결과 키 가운데 하나라도 최상위에 있는 JSON 객체 줄(값의 형식은 아직 보지 않는다).
     static func isCandidate(_ line: Substring) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("{"), trimmed.contains("\"added\"") || trimmed.contains("\"duplicates\""),
+        guard trimmed.hasPrefix("{"), resultKeys.contains(where: { trimmed.contains("\"\($0)\"") }),
               let data = trimmed.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
-        // 둘 중 하나라도 있으면 결과 줄이다. 하나가 빠졌거나 값이 틀리면 parse(line:)이 형식 오류(nil)로 돌려준다.
-        return object["added"] != nil || object["duplicates"] != nil
+        // 결과 키 가운데 하나라도 최상위에 있으면 결과 줄이다. 필수 키가 빠졌거나 값이 틀리면 parse(line:)이 형식 오류(nil)로 돌려준다.
+        return resultKeys.contains { object[$0] != nil }
     }
 
     /// 표준 출력의 마지막 결과 후보 줄을 읽는다. 후보가 없거나, 마지막 후보의 값 형식이 틀리면 nil
@@ -363,6 +366,11 @@ final class ResultLineCapture {
         take(Data()[...])
     }
 
+    static func startsWithResultKey(_ head: String) -> Bool {
+        let pattern = #"^\s*\{\s*"(added|duplicates|failed)"\s*:"#
+        return head.range(of: pattern, options: .regularExpression) != nil
+    }
+
     var result: FileImportResult? {
         lock.lock(); defer { lock.unlock() }
         guard !lastWasOversizedResult else { return nil }
@@ -373,8 +381,8 @@ final class ResultLineCapture {
         defer { pending.removeAll(keepingCapacity: true); overflow = false; overflowHead.removeAll() }
         guard !overflow, pending.count + tail.count <= Self.maxLineBytes else {
             let head = overflow ? overflowHead : Data((pending + tail).prefix(Self.headBytes))
-            let text = String(decoding: head, as: UTF8.self).trimmingCharacters(in: .whitespaces)
-            if text.hasPrefix("{"), text.contains("\"added\"") || text.contains("\"duplicates\"") { lastWasOversizedResult = true }
+            // 긴 줄은 해석하지 않는다. 첫 키가 결과 키일 때만 결과로 본다(값 속의 "added" 같은 글자는 무시).
+            if Self.startsWithResultKey(String(decoding: head, as: UTF8.self)) { lastWasOversizedResult = true }
             return
         }
         let line = Substring(String(decoding: pending + tail, as: UTF8.self))

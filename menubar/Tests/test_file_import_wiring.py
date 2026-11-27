@@ -34,7 +34,7 @@ class FileImportWiringTests(unittest.TestCase):
     def test_apply_importers_rebuilds_actions_and_drop_target(self):
         apply = function_body(self.host, "    func applyImporters(_ importers: [FileImporter]) {")
         self.assertIn("ensureFileDropTarget()", apply)
-        self.assertIn("fileDropVerdict = nil", apply, "a config change drops the cached drag verdict")
+        self.assertNotIn("fileDropVerdict = nil", apply, "the session keeps its first target so a change is refused")
         self.assertIn("dashboard.actions = dashboardActions(menu: menu)", apply)
 
     def test_choose_closes_menu_and_runs_import(self):

@@ -279,6 +279,14 @@ struct FileImportersTests {
         logAfter.append(Data(("{\"added\": 9, \"duplicates\": 0}\n" + String(repeating: "z", count: 70_000) + "\n").utf8))
         logAfter.finish()
         check(logAfter.result?.added == 9, "an oversized plain log line after a result keeps the result")
+        // 검토 4차: 값 속에 "added"가 든 긴 JSON 로그 줄은 결과가 아니다(성공을 실패로 바꾸지 않는다).
+        let jsonLog = ResultLineCapture()
+        let rows = (0..<2_500).map { "{\"status\":\"added\",\"id\":\($0)}" }.joined(separator: ",")
+        jsonLog.append(Data(("{\"added\": 6, \"duplicates\": 1}\n{\"event\":\"batch.detail\",\"rows\":[" + rows + "]}\n").utf8))
+        jsonLog.finish()
+        check(jsonLog.result?.added == 6, "a long JSON log whose values mention added keeps the result")
+        check(ResultLineCapture.startsWithResultKey(" { \"failed\" : 1") && !ResultLineCapture.startsWithResultKey("{\"event\":\"added\""),
+              "only a leading result key marks an oversized line as a result")
         // 줄바꿈 없이 끝난 마지막 결과도 읽는다.
         let noNewline = ResultLineCapture()
         noNewline.append(Data("{\"added\": 2, \"duplicates\": 1}".utf8))
@@ -299,6 +307,8 @@ struct FileImportersTests {
         // 검토 3차 M2: 키 하나가 빠진 최종 결과도 형식 오류다.
         check(FileImportResult.parse(stdout: "{\"added\": 9, \"duplicates\": 0}\n{\"added\": 1, \"failed\": 2}") == nil,
               "a final result missing duplicates is an error, not the earlier one")
+        check(FileImportResult.parse(stdout: "{\"added\": 9, \"duplicates\": 0}\n{\"failed\": 2}") == nil,
+              "a final failed-only line is an error, not the earlier success")
     }
 
     // 검토 I3: 끌어다 놓기 중 판단은 첫 일치에서 멈춘다.

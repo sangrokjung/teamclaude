@@ -13,7 +13,7 @@ extension AppDelegate {
     func applyImporters(_ importers: [FileImporter]) {
         guard importers != currentImporters else { return }
         currentImporters = importers
-        fileDropVerdict = nil  // 드래그 중 설정이 바뀌면 옛 판단을 버린다
+        // 드래그 판단(fileDropVerdict)은 지우지 않는다. 세션의 처음 대상과 지금 첫 항목을 비교해 바뀌었으면 그 드래그를 거절한다.
         ensureFileDropTarget()
         for dashboard in [cachedDashboardView, openDashboardView].compactMap({ $0 }) {
             if let menu = statusItem?.menu { dashboard.actions = dashboardActions(menu: menu) }
