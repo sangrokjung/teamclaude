@@ -1,5 +1,4 @@
 import Cocoa
-import UniformTypeIdentifiers
 import Darwin
 import Foundation
 
@@ -5060,8 +5059,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 파일 넣기(~/.config/cc-menubar/importers.json, FileImporters.swift). 비면 동작과 끌어다 놓기를 숨긴다.
     var currentImporters: [FileImporter] = []
     let fileImportRunner = FileImportRunner()
-    /// 끌어다 놓기를 등록한 메뉴바 아이콘 창. 시스템이 창을 바꾸면 다시 등록한다.
+    /// 끌어다 놓기를 등록한 메뉴바 아이콘 창. 시스템이 창을 바꾸면 다시 등록한다(FileImportHost.swift).
     weak var fileDropWindow: NSWindow?
+    /// 지금 드래그 세션의 수락 여부(세션 번호별 한 번만 판단한다).
+    var fileDropVerdict: (session: Int, accept: Bool)?
     let cliHostName = cliLocalHostName()
     let cliRefresher = CliFleetRefresher()
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
@@ -6037,71 +6038,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dashboard.links = links
             if let menu = statusItem?.menu { dashboard.actions = dashboardActions(menu: menu) }
         }
-    }
-
-    /// 넣기 설정이 바뀌면 동작 목록(⌘K)을 새로 만든다. 끌어다 놓기는 currentImporters를 그때그때 본다.
-    func applyImporters(_ importers: [FileImporter]) {
-        guard importers != currentImporters else { return }
-        currentImporters = importers
-        ensureFileDropTarget()
-        for dashboard in [cachedDashboardView, openDashboardView].compactMap({ $0 }) {
-            if let menu = statusItem?.menu { dashboard.actions = dashboardActions(menu: menu) }
-        }
-    }
-
-    /// 메뉴를 닫고 파일 고르기 창을 띄운다. 메뉴 추적이 끝난 뒤에 열어야 창이 앞에 뜬다.
-    func chooseFilesForImport(_ importer: FileImporter, menu: NSMenu?) {
-        menu?.cancelTracking()
-        DispatchQueue.main.async { [weak self] in
-            NSApp.activate(ignoringOtherApps: true)
-            let panel = NSOpenPanel()
-            panel.title = importer.title
-            panel.prompt = L10n.importPanelPrompt
-            panel.canChooseFiles = true
-            panel.canChooseDirectories = false
-            panel.allowsMultipleSelection = true
-            panel.resolvesAliases = true
-            if !importer.extensions.isEmpty {
-                panel.allowedContentTypes = importer.extensions.compactMap { UTType(filenameExtension: $0) }
-            }
-            guard panel.runModal() == .OK else { return }
-            self?.runFileImport(importer, urls: panel.urls)
-        }
-    }
-
-    /// 고른 파일·끌어다 놓은 파일을 넣기 명령에 넘긴다. 결과는 알림으로 보인다.
-    func runFileImport(_ importer: FileImporter, urls: [URL]) {
-        let files = fileImportCandidates(urls, importer: importer)
-        guard !files.isEmpty else {
-            postFileImportNotification(title: importer.title, body: L10n.importNoFiles)
-            return
-        }
-        let started = fileImportRunner.run(importer, files: files) { outcome in
-            let note = fileImportNotification(title: importer.title, outcome: outcome)
-            print("FILE-IMPORT: \(outcome)")
-            fflush(stdout)
-            postFileImportNotification(title: note.title, body: note.body)
-        }
-        postFileImportNotification(title: importer.title, body: started ? L10n.importStarted(files.count) : L10n.importBusy)
-    }
-
-    /// 메뉴바 아이콘에 파일을 끌어다 놓을 수 있게 아이콘 창을 끌어다 놓기 대상으로 등록한다(창의 델리게이트가 받는다).
-    /// 넣기 설정이 없으면 등록을 풀어 다른 앱처럼 아무 반응이 없게 한다.
-    func ensureFileDropTarget() {
-        guard let window = statusItem?.button?.window else { return }
-        if currentImporters.isEmpty {
-            if fileDropWindow === window { window.unregisterDraggedTypes(); fileDropWindow = nil }
-            return
-        }
-        guard fileDropWindow !== window else { return }
-        window.registerForDraggedTypes([.fileURL])
-        if window.delegate == nil { window.delegate = self }
-        fileDropWindow = window
-    }
-
-    func droppedFileURLs(_ sender: NSDraggingInfo) -> [URL] {
-        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-        return (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]) ?? []
     }
 
     /// 링크를 브라우저로 열고 메뉴를 닫는다.
@@ -7223,24 +7159,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-/// 메뉴바 아이콘 창에 끌어다 놓은 파일을 받는다(ensureFileDropTarget이 창을 등록하고 이 델리게이트를 건다).
-extension AppDelegate: NSWindowDelegate, NSDraggingDestination {
-    func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let importer = currentImporters.first,
-              !fileImportCandidates(droppedFileURLs(sender), importer: importer).isEmpty else { return [] }
-        return .copy
-    }
-
-    func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        draggingEntered(sender)
-    }
-
-    func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let importer = currentImporters.first else { return false }
-        runFileImport(importer, urls: droppedFileURLs(sender))
-        return true
-    }
-}
 
 // MARK: - 진입점
 

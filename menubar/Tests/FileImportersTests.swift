@@ -27,6 +27,10 @@ struct FileImportersTests {
         runnerLaunchFailure()
         runnerRejectsSecondRun(temp)
         actionsFollowImporters()
+        resultIsReadFromTheEndOfLongOutput(temp)
+        invalidFailedIsNotASuccess()
+        dropCheckStopsAtFirstMatch()
+        preparedRunRefusesNoFilesAndTooMany(temp)
 
         if failures.isEmpty {
             print("FileImportersTests OK")
@@ -198,14 +202,16 @@ struct FileImportersTests {
         let runner = FileImportRunner(callback: DispatchQueue.global())
         let done = DispatchSemaphore(value: 0)
         var outcomes: [FileImportOutcome] = []
-        let first = runner.run(importer, files: []) { outcomes.append($0); done.signal() }
-        let second = runner.run(importer, files: []) { _ in }
+        let file = temp.appendingPathComponent("hold-input.csv")
+        FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8))
+        let first = runner.run(importer, urls: [file]) { outcomes.append($0); done.signal() }
+        let second = runner.run(importer, urls: [file]) { _ in }
         check(first && !second && runner.isRunning, "second run is refused while the first runs")
         check(done.wait(timeout: .now() + 10) == .success, "first run completes")
         check(outcomes.count == 1, "only the first run reports")
         Thread.sleep(forTimeInterval: 0.1)
         check(!runner.isRunning, "runner is free afterwards")
-        let third = runner.run(importer, files: []) { _ in done.signal() }
+        let third = runner.run(importer, urls: [file]) { _ in done.signal() }
         check(third && done.wait(timeout: .now() + 10) == .success, "runner accepts a new run after finishing")
     }
 
@@ -219,5 +225,59 @@ struct FileImportersTests {
         _ = actions.last?.run()
         check(chosen == ["B"], "running an action chooses its importer")
         check(fileImportActions([]) { _ in }.isEmpty, "no importers, no actions")
+    }
+
+    // 검토 I1: 결과는 마지막 줄이다. 1MiB를 넘는 진행 로그 앞뒤에 결과가 있으면 뒤의 것을 읽는다.
+    static func resultIsReadFromTheEndOfLongOutput(_ temp: URL) {
+        let path = script(temp, "long-stdout.sh", """
+        echo '{"added": 99, "duplicates": 99}'
+        i=0; while [ $i -lt 30000 ]; do echo "progress line $i padding padding padding padding padding"; i=$((i+1)); done
+        echo '{"added": 7, "duplicates": 1}'
+        """)
+        let outcome = FileImportRunner.execute(FileImporter(title: "t", command: [path], extensions: [], timeoutSeconds: 30), files: [])
+        check(outcome == .finished(FileImportResult(added: 7, duplicates: 1, from: nil, to: nil, failed: 0, message: nil), exitCode: 0),
+              "final result after >1MiB of progress output: \(outcome)")
+        let buffer = CapturedOutput()
+        buffer.append(Data("abcdef".utf8), limit: 4)
+        buffer.append(Data("gh".utf8), limit: 4)
+        check(String(decoding: buffer.data, as: UTF8.self) == "efgh", "the buffer keeps the tail")
+    }
+
+    // 검토 Minor: failed가 있는데 정수가 아니면 결과로 보지 않는다(실패를 성공으로 바꾸지 않는다).
+    static func invalidFailedIsNotASuccess() {
+        check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0, "failed": "2"}"#) == nil, "string failed is not a result")
+        check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0, "failed": -1}"#) == nil, "negative failed is not a result")
+        check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0}"#)?.failed == 0, "missing failed is 0")
+    }
+
+    // 검토 I3: 끌어다 놓기 중 판단은 첫 일치에서 멈춘다.
+    static func dropCheckStopsAtFirstMatch() {
+        let importer = FileImporter(title: "t", command: ["/usr/bin/true"], extensions: ["csv"], timeoutSeconds: 10)
+        let urls = (0..<1000).map { URL(fileURLWithPath: "/tmp/f\($0).csv") }
+        var checked = 0
+        let accept = fileImportHasCandidate(urls, importer: importer) { _ in checked += 1; return true }
+        check(accept && checked == 1, "stops at the first regular file, checked \(checked)")
+        checked = 0
+        let none = fileImportHasCandidate([URL(fileURLWithPath: "/tmp/a.txt")], importer: importer) { _ in checked += 1; return true }
+        check(!none && checked == 0, "extension mismatch is decided without touching the disk")
+    }
+
+    // 검토 I4: 맞는 파일이 없거나 너무 많으면 명령을 부르지 않는다.
+    static func preparedRunRefusesNoFilesAndTooMany(_ temp: URL) {
+        let marker = temp.appendingPathComponent("called.txt")
+        let path = script(temp, "mark.sh", "touch '\(marker.path)'\necho '{\"added\":0,\"duplicates\":0}'\n")
+        let importer = FileImporter(title: "t", command: [path], extensions: ["csv"], timeoutSeconds: 10)
+        check(FileImportRunner.prepareAndExecute(importer, urls: [temp.appendingPathComponent("missing.csv")]) == .noFiles, "no files")
+        var many: [URL] = []
+        for index in 0...FileImportRunner.maxFiles {
+            let url = temp.appendingPathComponent("many-\(index).csv")
+            FileManager.default.createFile(atPath: url.path, contents: Data())
+            many.append(url)
+        }
+        check(FileImportRunner.prepareAndExecute(importer, urls: many) == .tooMany(limit: FileImportRunner.maxFiles), "too many files")
+        check(!FileManager.default.fileExists(atPath: marker.path), "the command was never called")
+        check(fileImportNotification(title: "t", outcome: .tooMany(limit: 200)).body.contains("200"), "too-many notice names the limit")
+        check(FileImportRunner.prepareAndExecute(importer, urls: Array(many.prefix(2))) ==
+              .finished(FileImportResult(added: 0, duplicates: 0, from: nil, to: nil, failed: 0, message: nil), exitCode: 0), "within limits runs")
     }
 }

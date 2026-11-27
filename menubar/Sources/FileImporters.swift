@@ -92,10 +92,18 @@ struct FileImportResult: Equatable {
             guard trimmed.hasPrefix("{"), let data = trimmed.data(using: .utf8),
                   let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let added = count(object["added"]), let duplicates = count(object["duplicates"]) else { continue }
+            // failed는 없으면 0이지만, 있는데 정수가 아니면 결과 형식 오류다(실패를 성공으로 바꾸지 않는다).
+            let failed: Int
+            if let raw = object["failed"] {
+                guard let value = count(raw) else { continue }
+                failed = value
+            } else {
+                failed = 0
+            }
             return FileImportResult(
                 added: added, duplicates: duplicates,
                 from: day(object["from"]), to: day(object["to"]),
-                failed: count(object["failed"]) ?? 0,
+                failed: failed,
                 message: text(object["message"]))
         }
         return nil
@@ -124,6 +132,10 @@ enum FileImportOutcome: Equatable {
     case finished(FileImportResult?, exitCode: Int32)
     case timedOut
     case launchFailed
+    /// 확장자·일반 파일 조건에 맞는 파일이 없다(명령을 부르지 않음).
+    case noFiles
+    /// 한 번에 넘기기에 파일이 너무 많거나 경로가 너무 길다(명령을 부르지 않음).
+    case tooMany(limit: Int)
 }
 
 /// 알림 제목·본문. 제목은 설정의 title, 본문은 결과 요약.
@@ -145,7 +157,19 @@ func fileImportNotification(title: String, outcome: FileImportOutcome) -> (title
         return (title, L10n.importTimedOut)
     case .launchFailed:
         return (title, L10n.importLaunchFailed)
+    case .noFiles:
+        return (title, L10n.importNoFiles)
+    case .tooMany(let limit):
+        return (title, L10n.importTooMany(limit))
     }
+}
+
+/// 끌어다 놓기 중 수락 여부: 넣을 수 있는 파일이 하나라도 있는지. 첫 일치에서 멈춘다.
+func fileImportHasCandidate(_ urls: [URL], importer: FileImporter,
+                            isRegularFile: (URL) -> Bool = { url in
+                                (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                            }) -> Bool {
+    urls.contains { $0.isFileURL && importer.accepts($0) && isRegularFile($0) }
 }
 
 /// 넣을 파일만 남긴다(일반 파일·확장자 일치). 순서를 지키고 같은 경로는 한 번만.
@@ -163,7 +187,11 @@ func fileImportCandidates(_ urls: [URL], importer: FileImporter,
 
 /// 한 번에 하나만 돌린다. 명령은 배경 큐에서 실행하고 결과는 callback 큐(기본 메인)로 돌려준다.
 final class FileImportRunner {
+    /// 표준 출력은 끝부분만 보관한다(결과는 마지막 줄이므로 앞부분 진행 로그는 버려도 된다).
     static let maxOutputBytes = 1 << 20
+    /// 한 번에 넘기는 파일 수와 경로 바이트 합의 상한. 시스템 실행 한도(ARG_MAX)보다 훨씬 낮게 둔다.
+    static let maxFiles = 200
+    static let maxArgumentBytes = 200_000
 
     private let lock = NSLock()
     private var running = false
@@ -180,19 +208,27 @@ final class FileImportRunner {
         return running
     }
 
-    /// 이미 돌고 있으면 false(아무것도 하지 않음).
+    /// 이미 돌고 있으면 false(아무것도 하지 않음). 파일 고르기·상한 검사도 배경 큐에서 한다.
     @discardableResult
-    func run(_ importer: FileImporter, files: [URL], completion: @escaping (FileImportOutcome) -> Void) -> Bool {
+    func run(_ importer: FileImporter, urls: [URL], completion: @escaping (FileImportOutcome) -> Void) -> Bool {
         lock.lock()
         guard !running else { lock.unlock(); return false }
         running = true
         lock.unlock()
         work.async { [self] in
-            let outcome = Self.execute(importer, files: files)
+            let outcome = Self.prepareAndExecute(importer, urls: urls)
             lock.lock(); running = false; lock.unlock()
             callback.async { completion(outcome) }
         }
         return true
+    }
+
+    static func prepareAndExecute(_ importer: FileImporter, urls: [URL]) -> FileImportOutcome {
+        let files = fileImportCandidates(urls, importer: importer)
+        guard !files.isEmpty else { return .noFiles }
+        let argumentBytes = (importer.command + files.map { $0.standardizedFileURL.path }).reduce(0) { $0 + $1.utf8.count + 1 }
+        guard files.count <= maxFiles, argumentBytes <= maxArgumentBytes else { return .tooMany(limit: maxFiles) }
+        return execute(importer, files: files)
     }
 
     static func execute(_ importer: FileImporter, files: [URL]) -> FileImportOutcome {
@@ -213,7 +249,7 @@ final class FileImportRunner {
         } catch {
             return .launchFailed
         }
-        // 파이프가 차서 자식이 멈추지 않게 두 출력을 따로 끝까지 읽는다(앞 1MiB만 보관).
+        // 파이프가 차서 자식이 멈추지 않게 두 출력을 따로 끝까지 읽는다(표준 출력은 끝 1MiB만 보관).
         let readers = DispatchGroup()
         let captured = CapturedOutput()
         for (pipe, keep) in [(out, true), (err, false)] {
@@ -241,15 +277,16 @@ final class FileImportRunner {
     }
 }
 
-/// 읽기 스레드와 결과를 만드는 스레드가 함께 쓰는 출력 버퍼.
-private final class CapturedOutput {
+/// 읽기 스레드와 결과를 만드는 스레드가 함께 쓰는 출력 버퍼. 상한을 넘으면 앞부분을 버리고 끝부분을 남긴다.
+/// 잘린 첫 줄은 JSON으로 읽히지 않아 결과 후보에서 자연히 빠진다.
+final class CapturedOutput {
     private let lock = NSLock()
     private var buffer = Data()
 
     func append(_ chunk: Data, limit: Int) {
         lock.lock(); defer { lock.unlock() }
-        guard buffer.count < limit else { return }
-        buffer.append(chunk.prefix(limit - buffer.count))
+        buffer.append(chunk)
+        if buffer.count > limit { buffer = Data(buffer.suffix(limit)) }
     }
 
     var data: Data {
@@ -270,7 +307,19 @@ func postFileImportNotification(title: String, body: String) {
     ]
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
-    try? task.run()
+    // 알림을 못 띄워도 결과는 로그(FILE-IMPORT 줄)에 남는다. 전송 실패만 따로 적는다.
+    task.terminationHandler = { finished in
+        if finished.terminationStatus != 0 {
+            print("FILE-IMPORT: 알림 전송 실패(osascript 종료 코드 \(finished.terminationStatus))")
+            fflush(stdout)
+        }
+    }
+    do {
+        try task.run()
+    } catch {
+        print("FILE-IMPORT: 알림 전송 실패(osascript 실행 불가)")
+        fflush(stdout)
+    }
 }
 
 /// 하단 동작 목록(앱 묶음)에 넣을 파일 넣기 항목. choose는 호스트가 메뉴 닫기와 파일 고르기 창을 묶어 넘긴다.
@@ -281,4 +330,26 @@ func fileImportActions(_ importers: [FileImporter], choose: @escaping (FileImpor
             return nil
         }
     }
+}
+
+// 화면 문구(R5 표의 이 기능 몫). 한국어·영어 한 쌍으로 쓴다.
+extension L10n {
+    static var importActionDetail: String { t("파일 고르기 · 아이콘에 끌어다 놓기도 됨", "Choose files · or drop them on the icon") }
+    static func importAdded(_ count: Int) -> String { t("새로 넣음 \(count)건", "\(count) added") }
+    static func importDuplicates(_ count: Int) -> String { t("중복 \(count)건", "\(count) duplicates") }
+    static func importFailedFiles(_ count: Int) -> String {
+        count > 0 ? t("실패 \(count)개 파일", "\(count) files failed") : t("일부 실패", "partly failed")
+    }
+    static func importStarted(_ count: Int) -> String { t("파일 \(count)개 넣는 중…", "Importing \(count) files…") }
+    static var importBusy: String { t("이미 넣는 중입니다. 끝난 뒤 다시 하세요.", "An import is already running. Try again after it ends.") }
+    static var importNoFiles: String { t("넣을 수 있는 파일이 없습니다(확장자 확인).", "No file this import accepts (check the extension).") }
+    static func importNoResult(_ code: Int32) -> String {
+        t("넣기 실패: 결과를 읽지 못했습니다(종료 코드 \(code)).", "Import failed: no result (exit code \(code)).")
+    }
+    static var importTimedOut: String { t("넣기 실패: 시간이 초과돼 중단했습니다.", "Import failed: timed out and stopped.") }
+    static var importLaunchFailed: String { t("넣기 실패: 명령을 실행하지 못했습니다.", "Import failed: could not run the command.") }
+    static func importTooMany(_ limit: Int) -> String {
+        t("한 번에 넣을 파일이 너무 많습니다(\(limit)개까지, 경로가 길면 더 적게).", "Too many files at once (up to \(limit); fewer with long paths).")
+    }
+    static var importPanelPrompt: String { t("넣기", "Import") }
 }

@@ -806,24 +806,6 @@ enum L10n {
         ok == machines ? t("\(machines)대 모두 정상", "all \(machines) OK") : t("\(machines)대 중 정상 \(ok)", "\(ok) of \(machines) OK")
     }
     static var linkActionDetail: String { t("브라우저에서 열기", "Open in browser") }
-
-    // MARK: 파일 넣기(importers.json)
-
-    static var importActionDetail: String { t("파일 고르기 · 아이콘에 끌어다 놓기도 됨", "Choose files · or drop them on the icon") }
-    static func importAdded(_ count: Int) -> String { t("새로 넣음 \(count)건", "\(count) added") }
-    static func importDuplicates(_ count: Int) -> String { t("중복 \(count)건", "\(count) duplicates") }
-    static func importFailedFiles(_ count: Int) -> String {
-        count > 0 ? t("실패 \(count)개 파일", "\(count) files failed") : t("일부 실패", "partly failed")
-    }
-    static func importStarted(_ count: Int) -> String { t("파일 \(count)개 넣는 중…", "Importing \(count) files…") }
-    static var importBusy: String { t("이미 넣는 중입니다. 끝난 뒤 다시 하세요.", "An import is already running. Try again after it ends.") }
-    static var importNoFiles: String { t("넣을 수 있는 파일이 없습니다(확장자 확인).", "No file this import accepts (check the extension).") }
-    static func importNoResult(_ code: Int32) -> String {
-        t("넣기 실패: 결과를 읽지 못했습니다(종료 코드 \(code)).", "Import failed: no result (exit code \(code)).")
-    }
-    static var importTimedOut: String { t("넣기 실패: 시간이 초과돼 중단했습니다.", "Import failed: timed out and stopped.") }
-    static var importLaunchFailed: String { t("넣기 실패: 명령을 실행하지 못했습니다.", "Import failed: could not run the command.") }
-    static var importPanelPrompt: String { t("넣기", "Import") }
     static var titleClaudeSlow: String { t("Claude 응답 지연", "Claude slow") }
     static var titleClaudeMeasuring: String { t("Claude 측정 중", "Claude measuring") }
     static var hintServerConnectFailed: String { t("teamclaude 서버 연결 실패", "Could not reach the teamclaude server") }
