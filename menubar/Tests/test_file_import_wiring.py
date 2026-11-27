@@ -34,6 +34,7 @@ class FileImportWiringTests(unittest.TestCase):
     def test_apply_importers_rebuilds_actions_and_drop_target(self):
         apply = function_body(self.host, "    func applyImporters(_ importers: [FileImporter]) {")
         self.assertIn("ensureFileDropTarget()", apply)
+        self.assertIn("fileDropVerdict = nil", apply, "a config change drops the cached drag verdict")
         self.assertIn("dashboard.actions = dashboardActions(menu: menu)", apply)
 
     def test_choose_closes_menu_and_runs_import(self):
@@ -42,6 +43,7 @@ class FileImportWiringTests(unittest.TestCase):
         self.assertIn("menu?.cancelTracking()", choose)
         self.assertIn("allowsMultipleSelection = true", choose)
         self.assertIn("runFileImport(importer, urls: panel.urls)", choose)
+        self.assertIn("guard self.currentImporters.contains(importer) else { return }", choose, "removed entries are not run")
 
     def test_drop_target_follows_config(self):
         ensure = function_body(self.host, "    func ensureFileDropTarget() {")
@@ -49,6 +51,7 @@ class FileImportWiringTests(unittest.TestCase):
         self.assertIn("previous.unregisterDraggedTypes()", ensure)
         self.assertIn("if window.delegate == nil { window.delegate = self }", ensure)
         self.assertIn("guard window.delegate === self else {", ensure)
+        self.assertIn("fileDropWindow?.delegate !== self", ensure, "a delegate swap on the same window is noticed")
         self.assertLess(ensure.index("guard window.delegate === self"), ensure.index("fileDropWindow = window"),
                         "the window is remembered only after this app is its receiver")
         self.assertIn("self.ensureFileDropTarget()", self.main.split("func updateTitle()", 1)[1][:400])
@@ -61,7 +64,7 @@ class FileImportWiringTests(unittest.TestCase):
         verdict = function_body(self.host, "    func fileDropOperation(")
         self.assertIn("sender.draggingSequenceNumber", verdict, "one check per drag session")
         self.assertIn("fileImportHasCandidate(", verdict)
-        self.assertIn("!fileImportRunner.isRunning", verdict, "no drop while an import runs")
+        self.assertIn("guard !fileImportRunner.isRunning else { return [] }", verdict, "busy is refused before anything else")
 
     def test_host_is_kept_out_of_the_library_bundle(self):
         self.assertIn("EXCLUDE_SOURCES+=(FileImportHost.swift)", (ROOT / "menubar" / "run-tests.sh").read_text())

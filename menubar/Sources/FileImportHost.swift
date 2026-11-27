@@ -5,11 +5,15 @@ import UniformTypeIdentifiers
 // 판단·실행은 FileImporters.swift가 맡고 여기서는 화면과 이어 주기만 한다.
 // main.swift의 AppDelegate에 의존하므로 run-tests.sh의 라이브러리 묶음에서는 뺀다(EXCLUDE_SOURCES).
 
+/// 다른 델리게이트 때문에 끌어다 놓기를 못 켰다는 로그를 한 번만 남기기 위한 표식.
+private var fileDropDelegateWarned = false
+
 extension AppDelegate {
     /// 넣기 설정이 바뀌면 동작 목록(⌘K)을 새로 만든다. 끌어다 놓기는 currentImporters를 그때그때 본다.
     func applyImporters(_ importers: [FileImporter]) {
         guard importers != currentImporters else { return }
         currentImporters = importers
+        fileDropVerdict = nil  // 드래그 중 설정이 바뀌면 옛 판단을 버린다
         ensureFileDropTarget()
         for dashboard in [cachedDashboardView, openDashboardView].compactMap({ $0 }) {
             if let menu = statusItem?.menu { dashboard.actions = dashboardActions(menu: menu) }
@@ -31,8 +35,10 @@ extension AppDelegate {
             if !importer.extensions.isEmpty {
                 panel.allowedContentTypes = importer.extensions.compactMap { UTType(filenameExtension: $0) }
             }
-            guard panel.runModal() == .OK else { return }
-            self?.runFileImport(importer, urls: panel.urls)
+            guard panel.runModal() == .OK, let self else { return }
+            // 창을 열어 둔 사이 설정에서 이 항목이 빠졌으면 실행하지 않는다.
+            guard self.currentImporters.contains(importer) else { return }
+            self.runFileImport(importer, urls: panel.urls)
         }
     }
 
@@ -46,7 +52,7 @@ extension AppDelegate {
             fflush(stdout)
             postFileImportNotification(title: note.title, body: note.body)
         }
-        postFileImportNotification(title: importer.title, body: started ? L10n.importStarted(urls.count) : L10n.importBusy)
+        postFileImportNotification(title: importer.title, body: started ? L10n.importStarted : L10n.importBusy)
         return started
     }
 
@@ -54,7 +60,8 @@ extension AppDelegate {
     /// 새 창에 건다. 다른 델리게이트가 이미 있으면 받을 수 없으므로 등록하지 않는다. 넣기 설정이 없으면 등록을 푼다.
     func ensureFileDropTarget() {
         let window = statusItem?.button?.window
-        if currentImporters.isEmpty || window == nil || fileDropWindow !== window {
+        // 설정이 비었거나, 창이 바뀌었거나, 같은 창이라도 델리게이트가 이 앱이 아니게 됐으면 등록을 다시 본다.
+        if currentImporters.isEmpty || window == nil || fileDropWindow !== window || fileDropWindow?.delegate !== self {
             if let previous = fileDropWindow {
                 previous.unregisterDraggedTypes()
                 if previous.delegate === self { previous.delegate = nil }
@@ -64,8 +71,11 @@ extension AppDelegate {
         guard !currentImporters.isEmpty, let window, fileDropWindow !== window else { return }
         if window.delegate == nil { window.delegate = self }
         guard window.delegate === self else {
-            print("FILE-IMPORT: 메뉴바 아이콘 창에 다른 델리게이트가 있어 끌어다 놓기를 켜지 않음")
-            fflush(stdout)
+            if !fileDropDelegateWarned {  // 1초마다 다시 보므로 한 번만 적는다
+                fileDropDelegateWarned = true
+                print("FILE-IMPORT: 메뉴바 아이콘 창에 다른 델리게이트가 있어 끌어다 놓기를 켜지 않음")
+                fflush(stdout)
+            }
             return
         }
         window.registerForDraggedTypes([.fileURL])
@@ -77,8 +87,9 @@ extension AppDelegate {
         return (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]) ?? []
     }
 
-    /// 드래그 세션마다 한 번만 판단한다(포인터가 움직일 때마다 파일을 다시 보지 않는다). 넣는 중이면 받지 않는다.
+    /// 드래그 세션마다 한 번만, 디스크를 보지 않고 확장자로만 판단한다. 넣는 중이면 바로 거절한다.
     func fileDropOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard !fileImportRunner.isRunning else { return [] }
         let session = sender.draggingSequenceNumber
         if let verdict = fileDropVerdict, verdict.session == session {
             return verdict.accept && !fileImportRunner.isRunning ? .copy : []

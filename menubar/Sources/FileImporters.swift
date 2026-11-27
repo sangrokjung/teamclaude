@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // 파일 넣기: 메뉴 동작(⌘K)이나 메뉴바 아이콘에 끌어다 놓은 파일을 이 맥의 로컬 명령에 넘기고,
@@ -85,28 +86,35 @@ struct FileImportResult: Equatable {
 
     static let maxMessageLength = 160
 
-    /// 표준 출력에서 added·duplicates가 정수인 마지막 JSON 객체 줄. 없으면 nil.
+    /// 결과 후보: added·duplicates 키가 모두 있는 JSON 객체 줄(값의 형식은 아직 보지 않는다).
+    static func isCandidate(_ line: Substring) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix("{"), trimmed.contains("\"added\""), trimmed.contains("\"duplicates\""),
+              let data = trimmed.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        return object["added"] != nil && object["duplicates"] != nil
+    }
+
+    /// 표준 출력의 마지막 결과 후보 줄을 읽는다. 후보가 없거나, 마지막 후보의 값 형식이 틀리면 nil
+    /// (앞의 중간 결과로 대신하지 않는다).
     static func parse(stdout: String) -> FileImportResult? {
-        for line in stdout.split(whereSeparator: \.isNewline).reversed() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.hasPrefix("{"), let data = trimmed.data(using: .utf8),
-                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                  let added = count(object["added"]), let duplicates = count(object["duplicates"]) else { continue }
-            // failed는 없으면 0이지만, 있는데 정수가 아니면 결과 형식 오류다(실패를 성공으로 바꾸지 않는다).
-            let failed: Int
-            if let raw = object["failed"] {
-                guard let value = count(raw) else { continue }
-                failed = value
-            } else {
-                failed = 0
-            }
-            return FileImportResult(
-                added: added, duplicates: duplicates,
-                from: day(object["from"]), to: day(object["to"]),
-                failed: failed,
-                message: text(object["message"]))
+        guard let line = stdout.split(whereSeparator: \.isNewline).last(where: isCandidate) else { return nil }
+        return parse(line: line)
+    }
+
+    static func parse(line: Substring) -> FileImportResult? {
+        guard let data = line.trimmingCharacters(in: .whitespaces).data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let added = count(object["added"]), let duplicates = count(object["duplicates"]) else { return nil }
+        // failed는 없으면 0이지만, 있는데 정수가 아니면 형식 오류다(실패를 성공으로 바꾸지 않는다).
+        var failed = 0
+        if let raw = object["failed"] {
+            guard let value = count(raw) else { return nil }
+            failed = value
         }
-        return nil
+        return FileImportResult(added: added, duplicates: duplicates,
+                                from: day(object["from"]), to: day(object["to"]),
+                                failed: failed, message: text(object["message"]))
     }
 
     private static func count(_ raw: Any?) -> Int? {
@@ -129,7 +137,8 @@ struct FileImportResult: Equatable {
 }
 
 enum FileImportOutcome: Equatable {
-    case finished(FileImportResult?, exitCode: Int32)
+    /// excluded: 넘긴 것 가운데 일반 파일·확장자 조건에 맞지 않아 명령에 주지 않은 항목 수.
+    case finished(FileImportResult?, exitCode: Int32, excluded: Int = 0)
     case timedOut
     case launchFailed
     /// 확장자·일반 파일 조건에 맞는 파일이 없다(명령을 부르지 않음).
@@ -141,7 +150,7 @@ enum FileImportOutcome: Equatable {
 /// 알림 제목·본문. 제목은 설정의 title, 본문은 결과 요약.
 func fileImportNotification(title: String, outcome: FileImportOutcome) -> (title: String, body: String) {
     switch outcome {
-    case .finished(let result?, let code):
+    case .finished(let result?, let code, let excluded):
         var parts = [L10n.importAdded(result.added), L10n.importDuplicates(result.duplicates)]
         if let from = result.from, let to = result.to {
             parts.append(from == to ? from : "\(from) ~ \(to)")
@@ -149,10 +158,11 @@ func fileImportNotification(title: String, outcome: FileImportOutcome) -> (title
         if result.failed > 0 || code != 0 {
             parts.append(L10n.importFailedFiles(result.failed))
         }
+        if excluded > 0 { parts.append(L10n.importExcluded(excluded)) }
         if let message = result.message { parts.append(message) }
         return (title, parts.joined(separator: " · "))
-    case .finished(nil, let code):
-        return (title, L10n.importNoResult(code))
+    case .finished(nil, let code, let excluded):
+        return (title, L10n.importNoResult(code) + (excluded > 0 ? " · " + L10n.importExcluded(excluded) : ""))
     case .timedOut:
         return (title, L10n.importTimedOut)
     case .launchFailed:
@@ -164,12 +174,10 @@ func fileImportNotification(title: String, outcome: FileImportOutcome) -> (title
     }
 }
 
-/// 끌어다 놓기 중 수락 여부: 넣을 수 있는 파일이 하나라도 있는지. 첫 일치에서 멈춘다.
-func fileImportHasCandidate(_ urls: [URL], importer: FileImporter,
-                            isRegularFile: (URL) -> Bool = { url in
-                                (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                            }) -> Bool {
-    urls.contains { $0.isFileURL && importer.accepts($0) && isRegularFile($0) }
+/// 끌어다 놓기 중 수락 여부: 파일 URL이고 확장자가 맞는 항목이 하나라도 있는지. 디스크는 보지 않는다
+/// (일반 파일인지는 놓은 뒤 배경에서 fileImportCandidates가 가린다).
+func fileImportHasCandidate(_ urls: [URL], importer: FileImporter) -> Bool {
+    urls.contains { $0.isFileURL && importer.accepts($0) }
 }
 
 /// 넣을 파일만 남긴다(일반 파일·확장자 일치). 순서를 지키고 같은 경로는 한 번만.
@@ -187,8 +195,6 @@ func fileImportCandidates(_ urls: [URL], importer: FileImporter,
 
 /// 한 번에 하나만 돌린다. 명령은 배경 큐에서 실행하고 결과는 callback 큐(기본 메인)로 돌려준다.
 final class FileImportRunner {
-    /// 표준 출력은 끝부분만 보관한다(결과는 마지막 줄이므로 앞부분 진행 로그는 버려도 된다).
-    static let maxOutputBytes = 1 << 20
     /// 한 번에 넘기는 파일 수와 경로 바이트 합의 상한. 시스템 실행 한도(ARG_MAX)보다 훨씬 낮게 둔다.
     static let maxFiles = 200
     static let maxArgumentBytes = 200_000
@@ -226,9 +232,14 @@ final class FileImportRunner {
     static func prepareAndExecute(_ importer: FileImporter, urls: [URL]) -> FileImportOutcome {
         let files = fileImportCandidates(urls, importer: importer)
         guard !files.isEmpty else { return .noFiles }
+        let excluded = Set(urls.map { $0.standardizedFileURL.path }).count - files.count
         let argumentBytes = (importer.command + files.map { $0.standardizedFileURL.path }).reduce(0) { $0 + $1.utf8.count + 1 }
         guard files.count <= maxFiles, argumentBytes <= maxArgumentBytes else { return .tooMany(limit: maxFiles) }
-        return execute(importer, files: files)
+        let outcome = execute(importer, files: files)
+        if case .finished(let result, let code, _) = outcome {
+            return .finished(result, exitCode: code, excluded: max(0, excluded))
+        }
+        return outcome
     }
 
     static func execute(_ importer: FileImporter, files: [URL]) -> FileImportOutcome {
@@ -249,9 +260,9 @@ final class FileImportRunner {
         } catch {
             return .launchFailed
         }
-        // 파이프가 차서 자식이 멈추지 않게 두 출력을 따로 끝까지 읽는다(표준 출력은 끝 1MiB만 보관).
+        // 파이프가 차서 자식이 멈추지 않게 두 출력을 따로 끝까지 읽는다. 표준 출력은 줄 단위로 보며 마지막 결과 후보 줄만 남긴다.
         let readers = DispatchGroup()
-        let captured = CapturedOutput()
+        let captured = ResultLineCapture()
         for (pipe, keep) in [(out, true), (err, false)] {
             readers.enter()
             DispatchQueue.global(qos: .utility).async {
@@ -259,39 +270,86 @@ final class FileImportRunner {
                 while true {
                     let chunk = handle.availableData
                     if chunk.isEmpty { break }
-                    if keep { captured.append(chunk, limit: maxOutputBytes) }
+                    if keep { captured.append(chunk) }
                 }
+                if keep { captured.finish() }
                 readers.leave()
             }
         }
         if done.wait(timeout: .now() + .seconds(importer.timeoutSeconds)) == .timedOut {
-            process.terminate()
-            if done.wait(timeout: .now() + 5) == .timedOut { kill(process.processIdentifier, SIGKILL); done.wait() }
+            // 명령이 띄운 하위 프로세스까지 멈추고, 모두 사라진 뒤에야 다음 넣기를 받는다.
+            terminateTree(process.processIdentifier, signal: SIGTERM)
+            if done.wait(timeout: .now() + 5) == .timedOut { terminateTree(process.processIdentifier, signal: SIGKILL); done.wait() }
             _ = readers.wait(timeout: .now() + 5)
             return .timedOut
         }
         // 자식이 남긴 손자 프로세스가 파이프를 쥐고 있어도 오래 기다리지 않는다.
         _ = readers.wait(timeout: .now() + 5)
-        let text = String(decoding: captured.data, as: UTF8.self)
-        return .finished(FileImportResult.parse(stdout: text), exitCode: process.terminationStatus)
+        return .finished(captured.result, exitCode: process.terminationStatus)
+    }
+
+    /// pid와 그 하위 프로세스 전부에 신호를 보낸다(자식부터 모은 뒤 위에서 아래로). SIGKILL이면 하위가 사라질 때까지 잠깐 기다린다.
+    static func terminateTree(_ pid: pid_t, signal: Int32) {
+        let tree = [pid] + descendants(of: pid)
+        for member in tree { kill(member, signal) }
+        guard signal == SIGKILL else { return }
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, tree.dropFirst().contains(where: { kill($0, 0) == 0 }) {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    static func descendants(of pid: pid_t) -> [pid_t] {
+        var result: [pid_t] = []
+        var queue = [pid]
+        while let current = queue.popLast(), result.count < 512 {
+            var buffer = [pid_t](repeating: 0, count: 256)
+            // 돌려주는 값은 바이트가 아니라 자식 PID 개수다(macOS 27에서 확인).
+            let found = proc_listchildpids(current, &buffer, Int32(buffer.count * MemoryLayout<pid_t>.size))
+            guard found > 0 else { continue }
+            let children = buffer.prefix(min(Int(found), buffer.count)).filter { $0 > 0 }
+            result += children
+            queue += children
+        }
+        return result
     }
 }
 
-/// 읽기 스레드와 결과를 만드는 스레드가 함께 쓰는 출력 버퍼. 상한을 넘으면 앞부분을 버리고 끝부분을 남긴다.
-/// 잘린 첫 줄은 JSON으로 읽히지 않아 결과 후보에서 자연히 빠진다.
-final class CapturedOutput {
+/// 표준 출력을 줄 단위로 보며 마지막 결과 후보 줄만 남긴다(긴 진행 로그가 앞뒤에 있어도 메모리는 한 줄 상한).
+/// 64KiB를 넘는 한 줄은 결과가 아니므로 버린다.
+final class ResultLineCapture {
+    static let maxLineBytes = 64 * 1024
     private let lock = NSLock()
-    private var buffer = Data()
+    private var pending = Data()
+    private var overflow = false
+    private var lastCandidate: String?
 
-    func append(_ chunk: Data, limit: Int) {
+    func append(_ chunk: Data) {
         lock.lock(); defer { lock.unlock() }
-        buffer.append(chunk)
-        if buffer.count > limit { buffer = Data(buffer.suffix(limit)) }
+        var rest = chunk[...]
+        while let newline = rest.firstIndex(of: 0x0A) {
+            take(rest[rest.startIndex..<newline])
+            rest = rest[rest.index(after: newline)...]
+        }
+        if !overflow { pending.append(contentsOf: rest) }
+        if pending.count > Self.maxLineBytes { pending.removeAll(); overflow = true }
     }
 
-    var data: Data {
+    func finish() {
         lock.lock(); defer { lock.unlock() }
-        return buffer
+        take(Data()[...])
+    }
+
+    var result: FileImportResult? {
+        lock.lock(); defer { lock.unlock() }
+        return lastCandidate.flatMap { FileImportResult.parse(line: Substring($0)) }
+    }
+
+    private func take(_ tail: Data.SubSequence) {
+        defer { pending.removeAll(keepingCapacity: true); overflow = false }
+        guard !overflow, pending.count + tail.count <= Self.maxLineBytes else { return }
+        let line = Substring(String(decoding: pending + tail, as: UTF8.self))
+        if FileImportResult.isCandidate(line) { lastCandidate = String(line) }
     }
 }
 
@@ -325,7 +383,9 @@ func postFileImportNotification(title: String, body: String) {
 /// 하단 동작 목록(앱 묶음)에 넣을 파일 넣기 항목. choose는 호스트가 메뉴 닫기와 파일 고르기 창을 묶어 넘긴다.
 func fileImportActions(_ importers: [FileImporter], choose: @escaping (FileImporter) -> Void) -> [DashboardAction] {
     importers.enumerated().map { index, importer in
-        DashboardAction(id: "import-file-\(index)", group: .app, title: importer.title, detail: L10n.importActionDetail) {
+        // 끌어다 놓기는 첫 항목만 받으므로 그 안내도 첫 항목에만 붙인다.
+        DashboardAction(id: "import-file-\(index)", group: .app, title: importer.title,
+                        detail: index == 0 ? L10n.importActionDetail : L10n.importActionDetailChooseOnly) {
             choose(importer)
             return nil
         }
@@ -340,7 +400,9 @@ extension L10n {
     static func importFailedFiles(_ count: Int) -> String {
         count > 0 ? t("실패 \(count)개 파일", "\(count) files failed") : t("일부 실패", "partly failed")
     }
-    static func importStarted(_ count: Int) -> String { t("파일 \(count)개 넣는 중…", "Importing \(count) files…") }
+    static var importActionDetailChooseOnly: String { t("파일 고르기", "Choose files") }
+    static var importStarted: String { t("넣는 중…", "Importing…") }
+    static func importExcluded(_ count: Int) -> String { t("제외 \(count)개(폴더·형식 불일치)", "\(count) skipped (folders or other types)") }
     static var importBusy: String { t("이미 넣는 중입니다. 끝난 뒤 다시 하세요.", "An import is already running. Try again after it ends.") }
     static var importNoFiles: String { t("넣을 수 있는 파일이 없습니다(확장자 확인).", "No file this import accepts (check the extension).") }
     static func importNoResult(_ code: Int32) -> String {

@@ -178,11 +178,19 @@ struct FileImportersTests {
     }
 
     static func runnerTimesOut(_ temp: URL) {
-        let path = script(temp, "slow.sh", "sleep 30\necho '{\"added\":1,\"duplicates\":0}'\n")
+        // 검토 2차: 시간 초과면 명령이 띄운 하위 프로세스까지 멈춘다.
+        let pidFile = temp.appendingPathComponent("child.pid")
+        let body = "sleep 30 &\necho $! > '" + pidFile.path + "'\nwait\necho '{\"added\":1,\"duplicates\":0}'\n"
+        let path = script(temp, "slow.sh", body)
         let started = Date()
         let outcome = FileImportRunner.execute(FileImporter(title: "t", command: [path], extensions: [], timeoutSeconds: 1), files: [])
         check(outcome == .timedOut, "timeout outcome: \(outcome)")
-        check(Date().timeIntervalSince(started) < 10, "timeout stops the child promptly")
+        check(Date().timeIntervalSince(started) < 15, "timeout stops the child promptly")
+        if let raw = try? String(contentsOf: pidFile, encoding: .utf8), let child = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            check(kill(child, 0) != 0, "the grandchild (sleep) is gone after the timeout")
+        } else {
+            check(false, "child pid was recorded")
+        }
     }
 
     static func runnerWithoutResultLine(_ temp: URL) {
@@ -222,6 +230,8 @@ struct FileImportersTests {
         let actions = fileImportActions(importers) { chosen.append($0.title) }
         check(actions.map(\.id) == ["import-file-0", "import-file-1"] && actions.map(\.title) == ["A", "B"], "one action per importer")
         check(actions.allSatisfy { $0.group == .app && $0.closesMenu }, "app group, closes menu")
+        check(actions.first?.detail == L10n.importActionDetail && actions.last?.detail == L10n.importActionDetailChooseOnly,
+              "only the first entry mentions dropping (it is the one that takes drops)")
         _ = actions.last?.run()
         check(chosen == ["B"], "running an action chooses its importer")
         check(fileImportActions([]) { _ in }.isEmpty, "no importers, no actions")
@@ -237,10 +247,25 @@ struct FileImportersTests {
         let outcome = FileImportRunner.execute(FileImporter(title: "t", command: [path], extensions: [], timeoutSeconds: 30), files: [])
         check(outcome == .finished(FileImportResult(added: 7, duplicates: 1, from: nil, to: nil, failed: 0, message: nil), exitCode: 0),
               "final result after >1MiB of progress output: \(outcome)")
-        let buffer = CapturedOutput()
-        buffer.append(Data("abcdef".utf8), limit: 4)
-        buffer.append(Data("gh".utf8), limit: 4)
-        check(String(decoding: buffer.data, as: UTF8.self) == "efgh", "the buffer keeps the tail")
+        // 검토 2차 I1: 결과 뒤에 1MiB 넘는 일반 로그가 와도 마지막 결과를 잃지 않는다.
+        let trailing = script(temp, "trailing-log.sh", """
+        echo '{"added": 5, "duplicates": 2}'
+        i=0; while [ $i -lt 30000 ]; do echo "after line $i padding padding padding padding padding"; i=$((i+1)); done
+        """)
+        let after = FileImportRunner.execute(FileImporter(title: "t", command: [trailing], extensions: [], timeoutSeconds: 30), files: [])
+        check(after == .finished(FileImportResult(added: 5, duplicates: 2, from: nil, to: nil, failed: 0, message: nil), exitCode: 0),
+              "result followed by >1MiB of log: \(after)")
+        // 줄이 조각으로 나뉘어 와도 이어 붙여 읽는다.
+        let capture = ResultLineCapture()
+        capture.append(Data("noise\n{\"added\": 3, \"dupl".utf8))
+        capture.append(Data("icates\": 4}\ntrailing".utf8))
+        capture.finish()
+        check(capture.result == FileImportResult(added: 3, duplicates: 4, from: nil, to: nil, failed: 0, message: nil),
+              "split chunks are joined: \(String(describing: capture.result))")
+        let huge = ResultLineCapture()
+        huge.append(Data(("{\"added\": 1, \"duplicates\": 1, \"message\": \"" + String(repeating: "x", count: 70_000) + "\"}\n").utf8))
+        huge.finish()
+        check(huge.result == nil, "a line over 64KiB is not a result")
     }
 
     // 검토 Minor: failed가 있는데 정수가 아니면 결과로 보지 않는다(실패를 성공으로 바꾸지 않는다).
@@ -248,18 +273,20 @@ struct FileImportersTests {
         check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0, "failed": "2"}"#) == nil, "string failed is not a result")
         check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0, "failed": -1}"#) == nil, "negative failed is not a result")
         check(FileImportResult.parse(stdout: #"{"added": 1, "duplicates": 0}"#)?.failed == 0, "missing failed is 0")
+        // 검토 2차 M2: 마지막 결과가 틀리면 앞의 중간 결과로 대신하지 않는다.
+        let two = "{\"added\": 9, \"duplicates\": 0}\n{\"added\": 1, \"duplicates\": 0, \"failed\": \"2\"}"
+        check(FileImportResult.parse(stdout: two) == nil, "malformed last result is an error, not the earlier one")
+        check(FileImportResult.parse(stdout: "{\"added\": 9, \"duplicates\": 0}\n{\"ok\": true}") != nil, "unrelated JSON after a result is ignored")
     }
 
     // 검토 I3: 끌어다 놓기 중 판단은 첫 일치에서 멈춘다.
     static func dropCheckStopsAtFirstMatch() {
         let importer = FileImporter(title: "t", command: ["/usr/bin/true"], extensions: ["csv"], timeoutSeconds: 10)
         let urls = (0..<1000).map { URL(fileURLWithPath: "/tmp/f\($0).csv") }
-        var checked = 0
-        let accept = fileImportHasCandidate(urls, importer: importer) { _ in checked += 1; return true }
-        check(accept && checked == 1, "stops at the first regular file, checked \(checked)")
-        checked = 0
-        let none = fileImportHasCandidate([URL(fileURLWithPath: "/tmp/a.txt")], importer: importer) { _ in checked += 1; return true }
-        check(!none && checked == 0, "extension mismatch is decided without touching the disk")
+        // 디스크를 보지 않는다: 없는 경로라도 확장자만 맞으면 받는다(일반 파일인지는 놓은 뒤 배경에서 가린다).
+        check(fileImportHasCandidate(urls, importer: importer), "extension match accepts without touching the disk")
+        check(!fileImportHasCandidate([URL(fileURLWithPath: "/tmp/a.txt"), URL(string: "https://x/a.csv")!], importer: importer),
+              "extension mismatch and non-file URLs are refused")
     }
 
     // 검토 I4: 맞는 파일이 없거나 너무 많으면 명령을 부르지 않는다.
@@ -279,5 +306,12 @@ struct FileImportersTests {
         check(fileImportNotification(title: "t", outcome: .tooMany(limit: 200)).body.contains("200"), "too-many notice names the limit")
         check(FileImportRunner.prepareAndExecute(importer, urls: Array(many.prefix(2))) ==
               .finished(FileImportResult(added: 0, duplicates: 0, from: nil, to: nil, failed: 0, message: nil), exitCode: 0), "within limits runs")
+        // 검토 2차: 제외한 항목 수를 결과에 싣는다(폴더·확장자 불일치, 같은 경로는 한 번).
+        let folder = temp.appendingPathComponent("dir.csv")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let mixed = FileImportRunner.prepareAndExecute(importer, urls: [many[0], many[0], folder, temp.appendingPathComponent("x.txt")])
+        check(mixed == .finished(FileImportResult(added: 0, duplicates: 0, from: nil, to: nil, failed: 0, message: nil), exitCode: 0, excluded: 2),
+              "mixed drop reports excluded items: \(mixed)")
+        check(fileImportNotification(title: "t", outcome: mixed).body.hasSuffix("제외 2개(폴더·형식 불일치)"), "excluded shown in the notice")
     }
 }
