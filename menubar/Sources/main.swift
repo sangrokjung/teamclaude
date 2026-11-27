@@ -5062,7 +5062,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 끌어다 놓기를 등록한 메뉴바 아이콘 창. 시스템이 창을 바꾸면 다시 등록한다(FileImportHost.swift).
     weak var fileDropWindow: NSWindow?
     /// 지금 드래그 세션의 수락 여부(세션 번호별 한 번만 판단한다).
-    var fileDropVerdict: (session: Int, accept: Bool)?
+    var fileDropVerdict: (session: Int, target: FileImporter?, accept: Bool)?
     let cliHostName = cliLocalHostName()
     let cliRefresher = CliFleetRefresher()
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:

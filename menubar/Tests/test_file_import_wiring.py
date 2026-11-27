@@ -49,6 +49,8 @@ class FileImportWiringTests(unittest.TestCase):
         ensure = function_body(self.host, "    func ensureFileDropTarget() {")
         self.assertIn("registerForDraggedTypes([.fileURL])", ensure)
         self.assertIn("previous.unregisterDraggedTypes()", ensure)
+        self.assertLess(ensure.index("if previous.delegate === self {"), ensure.index("previous.unregisterDraggedTypes()"),
+                        "another receiver's registration is left alone")
         self.assertIn("if window.delegate == nil { window.delegate = self }", ensure)
         self.assertIn("guard window.delegate === self else {", ensure)
         self.assertIn("fileDropWindow?.delegate !== self", ensure, "a delegate swap on the same window is noticed")
@@ -63,6 +65,7 @@ class FileImportWiringTests(unittest.TestCase):
         self.assertIn("return runFileImport(importer, urls: droppedFileURLs(sender))", ext, "the drop reports whether it was taken")
         verdict = function_body(self.host, "    func fileDropOperation(")
         self.assertIn("sender.draggingSequenceNumber", verdict, "one check per drag session")
+        self.assertIn("verdict.target == target", verdict, "a target change during a drag refuses that drag")
         self.assertIn("fileImportHasCandidate(", verdict)
         self.assertIn("guard !fileImportRunner.isRunning else { return [] }", verdict, "busy is refused before anything else")
 

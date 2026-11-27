@@ -63,8 +63,11 @@ extension AppDelegate {
         // 설정이 비었거나, 창이 바뀌었거나, 같은 창이라도 델리게이트가 이 앱이 아니게 됐으면 등록을 다시 본다.
         if currentImporters.isEmpty || window == nil || fileDropWindow !== window || fileDropWindow?.delegate !== self {
             if let previous = fileDropWindow {
-                previous.unregisterDraggedTypes()
-                if previous.delegate === self { previous.delegate = nil }
+                // 아직 이 앱이 받는 창일 때만 등록을 푼다. 다른 수신자가 델리게이트를 가져갔으면 그쪽 등록은 건드리지 않는다.
+                if previous.delegate === self {
+                    previous.unregisterDraggedTypes()
+                    previous.delegate = nil
+                }
                 fileDropWindow = nil
             }
         }
@@ -91,12 +94,14 @@ extension AppDelegate {
     func fileDropOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard !fileImportRunner.isRunning else { return [] }
         let session = sender.draggingSequenceNumber
+        let target = currentImporters.first
         if let verdict = fileDropVerdict, verdict.session == session {
-            return verdict.accept && !fileImportRunner.isRunning ? .copy : []
+            // 드래그 도중 받는 항목이 바뀌면 이 드래그는 받지 않는다(새로 끌어 오게 한다).
+            return verdict.accept && verdict.target == target ? .copy : []
         }
-        let accept = currentImporters.first.map { fileImportHasCandidate(droppedFileURLs(sender), importer: $0) } ?? false
-        fileDropVerdict = (session, accept)
-        return accept && !fileImportRunner.isRunning ? .copy : []
+        let accept = target.map { fileImportHasCandidate(droppedFileURLs(sender), importer: $0) } ?? false
+        fileDropVerdict = (session, target, accept)
+        return accept ? .copy : []
     }
 }
 

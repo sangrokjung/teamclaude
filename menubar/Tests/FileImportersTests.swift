@@ -23,6 +23,9 @@ struct FileImportersTests {
         candidateFiltering(temp)
         runnerPassesFilesAndReadsResult(temp)
         runnerTimesOut(temp)
+        timeoutWaitsForStubbornChild(temp)
+        stdoutHeldByGrandchild(temp)
+        configReadIsBounded(temp)
         runnerWithoutResultLine(temp)
         runnerLaunchFailure()
         runnerRejectsSecondRun(temp)
@@ -266,6 +269,22 @@ struct FileImportersTests {
         huge.append(Data(("{\"added\": 1, \"duplicates\": 1, \"message\": \"" + String(repeating: "x", count: 70_000) + "\"}\n").utf8))
         huge.finish()
         check(huge.result == nil, "a line over 64KiB is not a result")
+        // 검토 3차 I1: 정상 중간 결과 뒤에 64KiB를 넘는 최종 결과가 오면 중간 결과로 대신하지 않는다.
+        let shadowed = ResultLineCapture()
+        shadowed.append(Data("{\"added\": 9, \"duplicates\": 0}\n".utf8))
+        shadowed.append(Data(("{\"added\": 1, \"duplicates\": 0, \"failed\": 3, \"message\": \"" + String(repeating: "y", count: 70_000) + "\"}\n").utf8))
+        shadowed.finish()
+        check(shadowed.result == nil, "an oversized final result is an error, not the earlier result")
+        let logAfter = ResultLineCapture()
+        logAfter.append(Data(("{\"added\": 9, \"duplicates\": 0}\n" + String(repeating: "z", count: 70_000) + "\n").utf8))
+        logAfter.finish()
+        check(logAfter.result?.added == 9, "an oversized plain log line after a result keeps the result")
+        // 줄바꿈 없이 끝난 마지막 결과도 읽는다.
+        let noNewline = ResultLineCapture()
+        noNewline.append(Data("{\"added\": 2, \"duplicates\": 1}".utf8))
+        noNewline.finish()
+        noNewline.finish()
+        check(noNewline.result?.added == 2, "final result without a newline is read (finish is idempotent)")
     }
 
     // 검토 Minor: failed가 있는데 정수가 아니면 결과로 보지 않는다(실패를 성공으로 바꾸지 않는다).
@@ -277,6 +296,9 @@ struct FileImportersTests {
         let two = "{\"added\": 9, \"duplicates\": 0}\n{\"added\": 1, \"duplicates\": 0, \"failed\": \"2\"}"
         check(FileImportResult.parse(stdout: two) == nil, "malformed last result is an error, not the earlier one")
         check(FileImportResult.parse(stdout: "{\"added\": 9, \"duplicates\": 0}\n{\"ok\": true}") != nil, "unrelated JSON after a result is ignored")
+        // 검토 3차 M2: 키 하나가 빠진 최종 결과도 형식 오류다.
+        check(FileImportResult.parse(stdout: "{\"added\": 9, \"duplicates\": 0}\n{\"added\": 1, \"failed\": 2}") == nil,
+              "a final result missing duplicates is an error, not the earlier one")
     }
 
     // 검토 I3: 끌어다 놓기 중 판단은 첫 일치에서 멈춘다.
@@ -302,6 +324,11 @@ struct FileImportersTests {
             many.append(url)
         }
         check(FileImportRunner.prepareAndExecute(importer, urls: many) == .tooMany(limit: FileImportRunner.maxFiles), "too many files")
+        // 검토 3차: 상한을 넘는 입력은 디스크를 보기 전에 거절한다(없는 경로 1만 개도 즉시).
+        let flood = (0..<10_000).map { URL(fileURLWithPath: "/nonexistent/flood-\($0).csv") }
+        let floodStarted = Date()
+        check(FileImportRunner.prepareAndExecute(importer, urls: flood) == .tooMany(limit: FileImportRunner.maxFiles)
+              && Date().timeIntervalSince(floodStarted) < 1, "flood is refused before any file check")
         check(!FileManager.default.fileExists(atPath: marker.path), "the command was never called")
         check(fileImportNotification(title: "t", outcome: .tooMany(limit: 200)).body.contains("200"), "too-many notice names the limit")
         check(FileImportRunner.prepareAndExecute(importer, urls: Array(many.prefix(2))) ==
@@ -313,5 +340,41 @@ struct FileImportersTests {
         check(mixed == .finished(FileImportResult(added: 0, duplicates: 0, from: nil, to: nil, failed: 0, message: nil), exitCode: 0, excluded: 2),
               "mixed drop reports excluded items: \(mixed)")
         check(fileImportNotification(title: "t", outcome: mixed).body.hasSuffix("제외 2개(폴더·형식 불일치)"), "excluded shown in the notice")
+    }
+
+    // 검토 3차: 래퍼가 먼저 끝나도 SIGTERM을 무시하는 하위 프로세스가 사라진 뒤에 끝난다.
+    static func timeoutWaitsForStubbornChild(_ temp: URL) {
+        let pidFile = temp.appendingPathComponent("stubborn.pid")
+        let body = "/bin/sh -c 'trap \"\" TERM; sleep 30' &\necho $! > '" + pidFile.path + "'\ntrap 'exit 0' TERM\nwait\n"
+        let path = script(temp, "stubborn.sh", body)
+        let outcome = FileImportRunner.execute(FileImporter(title: "t", command: [path], extensions: [], timeoutSeconds: 1), files: [])
+        check(outcome == .timedOut, "stubborn timeout outcome: \(outcome)")
+        if let raw = try? String(contentsOf: pidFile, encoding: .utf8), let child = pid_t(raw.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            check(kill(child, 0) != 0, "a child that ignores SIGTERM is killed before the runner is free")
+        } else {
+            check(false, "stubborn child pid was recorded")
+        }
+    }
+
+    // 검토 3차: 하위 프로세스가 표준 출력을 물려받아 EOF가 늦어도, 줄바꿈 없는 최종 결과를 읽는다.
+    static func stdoutHeldByGrandchild(_ temp: URL) {
+        let path = script(temp, "held.sh", "sleep 8 &\nprintf '{\"added\": 4, \"duplicates\": 1}'\n")
+        let started = Date()
+        let outcome = FileImportRunner.execute(FileImporter(title: "t", command: [path], extensions: [], timeoutSeconds: 30), files: [])
+        check(outcome == .finished(FileImportResult(added: 4, duplicates: 1, from: nil, to: nil, failed: 0, message: nil), exitCode: 0),
+              "result read although a grandchild holds stdout: \(outcome)")
+        check(Date().timeIntervalSince(started) < 8, "does not wait for the grandchild to exit")
+    }
+
+    // 검토 3차 Minor: 설정은 64KiB까지만 읽고, 유효한 셋째 항목에서 멈춘다.
+    static func configReadIsBounded(_ temp: URL) {
+        let big = temp.appendingPathComponent("big.json")
+        let padding = String(repeating: " ", count: FileImporters.maxConfigBytes)
+        try? ("{\"importers\":[{\"title\":\"x\",\"command\":[\"/usr/bin/true\"]}]" + padding + "}").write(to: big, atomically: true, encoding: .utf8)
+        check(FileImporters.load(path: big.path).isEmpty, "an oversized config is ignored")
+        var calls = 0
+        let rows = (0..<50).map { _ in ["title": "x", "command": ["/usr/bin/true"]] as [String: Any] }
+        let parsed = FileImporters.parse(json(["importers": rows])) { _ in calls += 1; return true }
+        check(parsed.count == 3 && calls == 3, "parsing stops at the third valid entry, executable checks \(calls)")
     }
 }

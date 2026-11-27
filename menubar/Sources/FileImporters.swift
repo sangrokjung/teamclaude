@@ -26,6 +26,7 @@ enum FileImporters {
     static let maxTitleLength = 24
     static let maxExtensions = 16
     static let defaultTimeout = 900
+    static let maxConfigBytes = 64 * 1024
     static let timeoutRange = 10...3600
 
     static func defaultPath(home: String = NSHomeDirectory()) -> String {
@@ -34,7 +35,10 @@ enum FileImporters {
 
     static func load(path: String = defaultPath(),
                      isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> [FileImporter] {
-        guard let data = FileManager.default.contents(atPath: path) else { return [] }
+        guard let handle = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? handle.close() }
+        // 설정은 작다. 상한을 넘으면 통째로 읽지 않고 버린다(끝이 잘린 JSON은 어차피 해석되지 않는다).
+        guard let data = try? handle.read(upToCount: maxConfigBytes + 1), data.count <= maxConfigBytes else { return [] }
         return parse(data, isExecutable: isExecutable)
     }
 
@@ -42,7 +46,12 @@ enum FileImporters {
                       isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> [FileImporter] {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let items = root["importers"] as? [Any] else { return [] }
-        return Array(items.compactMap { importer($0, isExecutable: isExecutable) }.prefix(maxImporters))
+        var found: [FileImporter] = []
+        for item in items {
+            guard found.count < maxImporters else { break }  // 유효한 셋째 항목에서 멈춘다
+            if let valid = importer(item, isExecutable: isExecutable) { found.append(valid) }
+        }
+        return found
     }
 
     private static func importer(_ raw: Any, isExecutable: (String) -> Bool) -> FileImporter? {
@@ -61,8 +70,8 @@ enum FileImporters {
                     .trimmingCharacters(in: CharacterSet(charactersIn: "."))
                 guard !ext.isEmpty, ext.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) }) else { return nil }
                 if !extensions.contains(ext) { extensions.append(ext) }
+                guard extensions.count <= maxExtensions else { return nil }  // 열일곱째 고유 확장자에서 멈춘다
             }
-            guard extensions.count <= maxExtensions else { return nil }
         }
         var timeout = defaultTimeout
         if let rawTimeout = row["timeout_seconds"] {
@@ -86,13 +95,14 @@ struct FileImportResult: Equatable {
 
     static let maxMessageLength = 160
 
-    /// 결과 후보: added·duplicates 키가 모두 있는 JSON 객체 줄(값의 형식은 아직 보지 않는다).
+    /// 결과 후보: added·duplicates 키 가운데 하나라도 있는 JSON 객체 줄(값의 형식은 아직 보지 않는다).
     static func isCandidate(_ line: Substring) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("{"), trimmed.contains("\"added\""), trimmed.contains("\"duplicates\""),
+        guard trimmed.hasPrefix("{"), trimmed.contains("\"added\"") || trimmed.contains("\"duplicates\""),
               let data = trimmed.data(using: .utf8),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
-        return object["added"] != nil && object["duplicates"] != nil
+        // 둘 중 하나라도 있으면 결과 줄이다. 하나가 빠졌거나 값이 틀리면 parse(line:)이 형식 오류(nil)로 돌려준다.
+        return object["added"] != nil || object["duplicates"] != nil
     }
 
     /// 표준 출력의 마지막 결과 후보 줄을 읽는다. 후보가 없거나, 마지막 후보의 값 형식이 틀리면 nil
@@ -230,6 +240,8 @@ final class FileImportRunner {
     }
 
     static func prepareAndExecute(_ importer: FileImporter, urls: [URL]) -> FileImportOutcome {
+        // 넘긴 항목이 상한보다 많으면 디스크를 보기 전에 거절한다(1만 개를 놓아도 검사하지 않는다).
+        guard urls.count <= maxFiles else { return .tooMany(limit: maxFiles) }
         let files = fileImportCandidates(urls, importer: importer)
         guard !files.isEmpty else { return .noFiles }
         let excluded = Set(urls.map { $0.standardizedFileURL.path }).count - files.count
@@ -277,24 +289,27 @@ final class FileImportRunner {
             }
         }
         if done.wait(timeout: .now() + .seconds(importer.timeoutSeconds)) == .timedOut {
-            // 명령이 띄운 하위 프로세스까지 멈추고, 모두 사라진 뒤에야 다음 넣기를 받는다.
-            terminateTree(process.processIdentifier, signal: SIGTERM)
-            if done.wait(timeout: .now() + 5) == .timedOut { terminateTree(process.processIdentifier, signal: SIGKILL); done.wait() }
+            // 명령과 그 하위 프로세스 전부를 멈추고, 래퍼가 먼저 끝나도 하위가 모두 사라진 뒤에야 다음 넣기를 받는다.
+            let tree = [process.processIdentifier] + descendants(of: process.processIdentifier)
+            signalAndWait(tree, signal: SIGTERM, seconds: 5)
+            signalAndWait(tree.filter { kill($0, 0) == 0 }, signal: SIGKILL, seconds: 5)
+            _ = done.wait(timeout: .now() + 5)
             _ = readers.wait(timeout: .now() + 5)
             return .timedOut
         }
-        // 자식이 남긴 손자 프로세스가 파이프를 쥐고 있어도 오래 기다리지 않는다.
+        // 하위 프로세스가 표준 출력을 물려받아 EOF가 늦어도 오래 기다리지 않는다. 그때까지 받은 출력
+        // (줄바꿈 없이 끝난 마지막 줄 포함)으로 결과를 읽는다.
         _ = readers.wait(timeout: .now() + 5)
+        captured.finish()
         return .finished(captured.result, exitCode: process.terminationStatus)
     }
 
-    /// pid와 그 하위 프로세스 전부에 신호를 보낸다(자식부터 모은 뒤 위에서 아래로). SIGKILL이면 하위가 사라질 때까지 잠깐 기다린다.
-    static func terminateTree(_ pid: pid_t, signal: Int32) {
-        let tree = [pid] + descendants(of: pid)
-        for member in tree { kill(member, signal) }
-        guard signal == SIGKILL else { return }
-        let deadline = Date().addingTimeInterval(5)
-        while Date() < deadline, tree.dropFirst().contains(where: { kill($0, 0) == 0 }) {
+    /// 목록 전부에 신호를 보내고 모두 사라질 때까지(최대 seconds초) 기다린다.
+    static func signalAndWait(_ pids: [pid_t], signal: Int32, seconds: Double) {
+        guard !pids.isEmpty else { return }
+        for member in pids { kill(member, signal) }
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline, pids.contains(where: { kill($0, 0) == 0 }) {
             Thread.sleep(forTimeInterval: 0.05)
         }
     }
@@ -316,13 +331,17 @@ final class FileImportRunner {
 }
 
 /// 표준 출력을 줄 단위로 보며 마지막 결과 후보 줄만 남긴다(긴 진행 로그가 앞뒤에 있어도 메모리는 한 줄 상한).
-/// 64KiB를 넘는 한 줄은 결과가 아니므로 버린다.
+/// 64KiB를 넘는 줄은 읽지 않는다. 다만 그 줄이 결과처럼 시작하면(`{`와 "added"/"duplicates") 앞의 결과로 대신하지 않고
+/// 결과를 형식 오류(nil)로 둔다.
 final class ResultLineCapture {
     static let maxLineBytes = 64 * 1024
+    private static let headBytes = 512
     private let lock = NSLock()
     private var pending = Data()
     private var overflow = false
+    private var overflowHead = Data()
     private var lastCandidate: String?
+    private var lastWasOversizedResult = false
 
     func append(_ chunk: Data) {
         lock.lock(); defer { lock.unlock() }
@@ -332,7 +351,11 @@ final class ResultLineCapture {
             rest = rest[rest.index(after: newline)...]
         }
         if !overflow { pending.append(contentsOf: rest) }
-        if pending.count > Self.maxLineBytes { pending.removeAll(); overflow = true }
+        if pending.count > Self.maxLineBytes {
+            overflowHead = Data(pending.prefix(Self.headBytes))
+            pending.removeAll()
+            overflow = true
+        }
     }
 
     func finish() {
@@ -342,14 +365,23 @@ final class ResultLineCapture {
 
     var result: FileImportResult? {
         lock.lock(); defer { lock.unlock() }
+        guard !lastWasOversizedResult else { return nil }
         return lastCandidate.flatMap { FileImportResult.parse(line: Substring($0)) }
     }
 
     private func take(_ tail: Data.SubSequence) {
-        defer { pending.removeAll(keepingCapacity: true); overflow = false }
-        guard !overflow, pending.count + tail.count <= Self.maxLineBytes else { return }
+        defer { pending.removeAll(keepingCapacity: true); overflow = false; overflowHead.removeAll() }
+        guard !overflow, pending.count + tail.count <= Self.maxLineBytes else {
+            let head = overflow ? overflowHead : Data((pending + tail).prefix(Self.headBytes))
+            let text = String(decoding: head, as: UTF8.self).trimmingCharacters(in: .whitespaces)
+            if text.hasPrefix("{"), text.contains("\"added\"") || text.contains("\"duplicates\"") { lastWasOversizedResult = true }
+            return
+        }
         let line = Substring(String(decoding: pending + tail, as: UTF8.self))
-        if FileImportResult.isCandidate(line) { lastCandidate = String(line) }
+        if FileImportResult.isCandidate(line) {
+            lastCandidate = String(line)
+            lastWasOversizedResult = false
+        }
     }
 }
 
