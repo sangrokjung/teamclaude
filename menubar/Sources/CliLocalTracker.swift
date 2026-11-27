@@ -82,13 +82,15 @@ struct CliBackgroundScan {
     let agyActivity: CliActivity
     let report: CliFleetReport?
     let links: [DashboardLink]
+    var importers: [FileImporter] = []
 
     static func run(now: Date = Date()) -> CliBackgroundScan {
         CliBackgroundScan(
             grokActivity: CliActivityScanner.grok(root: CliActivityScanner.grokSessionsURL(), now: now),
             agyActivity: CliActivityScanner.agy(root: CliActivityScanner.agyConversationsURL(), now: now),
             report: CliFleetReport.load(),
-            links: DashboardLinks.load())
+            links: DashboardLinks.load(),
+            importers: FileImporters.load())
     }
 }
 
