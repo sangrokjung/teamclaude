@@ -68,6 +68,26 @@ The same entries are in the action list (⌘K, app group). The address is not in
 Only `http` and `https` URLs with a host are used (up to five; titles longer than 24 characters are shortened). The footer shows
 the first one. If the file is missing or broken, or no entry is valid, the button is hidden. The file is read every minute.
 
+### File import
+
+The action list (⌘K, app group) can hand files to a command on this Mac, for example a script that imports bank or card
+exports into your own ledger. Pick one or more files, or drop them on the menu-bar icon (the first entry takes drops).
+The command and its paths are not in this repository; the app reads `~/.config/cc-menubar/importers.json`:
+
+```json
+{"importers": [{"title": "Import files", "command": ["/usr/bin/python3", "/path/to/import.py"],
+                "extensions": ["csv"], "timeout_seconds": 900}]}
+```
+
+- `command[0]` must be an executable absolute path. It runs without a shell, with the fixed arguments followed by one
+  argument per file. Files stay on this Mac; the app only passes their paths.
+- The last line of standard output that is a JSON object with `added` and `duplicates` is the result:
+  `{"added": 12, "duplicates": 3, "from": "2026-10-01", "to": "2026-11-27", "failed": 0, "message": "…"}`.
+  A notification shows "12 added · 3 duplicates · 2026-10-01 ~ 2026-11-27", plus failures and the message.
+- One import runs at a time. `timeout_seconds` is 10–3600 (default 900); on timeout the command is stopped.
+- Up to three entries; `extensions` filters the file picker and drops (empty means any file). If the file is missing or
+  broken, or no entry is valid, the action and the drop target are hidden. The file is read every minute.
+
 ### Grok and agy per machine (CLI tab)
 
 The CLI tab shows Grok and agy as a table with one row per machine: Grok (state dot, usage % and bar, time to the weekly

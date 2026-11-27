@@ -5056,6 +5056,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var currentCliFleetReport: CliFleetReport?
     /// 패널 링크(~/.config/cc-menubar/links.json). 없거나 틀리면 빈 목록이라 버튼이 숨는다.
     var currentLinks: [DashboardLink] = []
+    /// 파일 넣기(~/.config/cc-menubar/importers.json, FileImporters.swift). 비면 동작과 끌어다 놓기를 숨긴다.
+    var currentImporters: [FileImporter] = []
+    let fileImportRunner = FileImportRunner()
+    /// 끌어다 놓기를 등록한 메뉴바 아이콘 창. 시스템이 창을 바꾸면 다시 등록한다(FileImportHost.swift).
+    weak var fileDropWindow: NSWindow?
+    /// 지금 드래그 세션의 수락 여부(세션 번호별 한 번만 판단한다).
+    var fileDropVerdict: (session: Int, target: FileImporter?, accept: Bool)?
     let cliHostName = cliLocalHostName()
     let cliRefresher = CliFleetRefresher()
     /// 힉스필드는 기동 시 1회만 부르면 그 한 번의 실패가 영구 공백이 된다(2026-09-24 실측:
@@ -5648,6 +5655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func updateTitle() {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, let button = self.statusItem?.button else { return }
+            self.ensureFileDropTarget()
 
             let slots = self.displaySlots()
             let info = slots.isEmpty ? "Claude" : slots[self.rollIndex % slots.count]
@@ -6016,6 +6024,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.cliTracker.apply(scan)
             self.currentCliFleetReport = scan.report
             self.applyLinks(scan.links)
+            self.applyImporters(scan.importers)
             self.scheduleDashboardRefresh(reason: "loadCliFleetInBackground")
             return self.cliTracker.state(host: self.cliHostName, now: Date()).snapshot
         }
@@ -6526,6 +6535,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ]
         // 패널 링크(links.json). 앱 묶음 맨 앞, 누르면 브라우저로 열고 메뉴를 닫는다.
         actions += dashboardLinkActions(currentLinks) { [weak self, weak menu] url in self?.openDashboardLink(url, menu: menu) }
+        // 파일 넣기(importers.json). 메뉴를 닫고 파일 고르기 창을 띄운다.
+        actions += fileImportActions(currentImporters) { [weak self, weak menu] importer in self?.chooseFilesForImport(importer, menu: menu) }
         actions.append(DashboardAction(id: "restart", group: .app, title: L10n.actionRestart, detail: L10n.actionRestartDetail) { [weak self] in
             self?.restartTeamClaudeAction(); closeMenu(); return nil
         })
@@ -7147,6 +7158,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 }
+
 
 // MARK: - 진입점
 
