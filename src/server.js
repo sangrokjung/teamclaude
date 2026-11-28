@@ -725,8 +725,6 @@ const SESSION_ID_HEADER = 'x-claude-code-session-id';
 const AGENT_ID_HEADER = 'x-claude-code-agent-id';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const DEFAULT_SESSION_AFFINITY_MAX_KEYS = 10_000;
-const DEFAULT_AFFINITY_HOLD_MS = 10_000;
-const DEFAULT_AFFINITY_HOLD_MIN_BYTES = 256 * 1024;
 
 /** Short, non-reversible label for an id in the route log (never the id itself). */
 function routeLabel(value) {
@@ -824,14 +822,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     const agent = typeof agentId === 'string' && SESSION_ID_PATTERN.test(agentId) ? agentId : '';
     return sessionAffinityKeys.keyFor(agent ? `${sessionId}\u0000${agent}` : sessionId);
   };
-  // Cache hold (see AccountManager.acquireAccount): how long a large request
-  // waits for its cache-warm account's slot before spilling to a cold one.
-  const affinityHoldMs = Number.isFinite(config.affinityHoldMs)
-    ? Math.max(0, config.affinityHoldMs)
-    : DEFAULT_AFFINITY_HOLD_MS;
-  const affinityHoldMinBytes = Number.isFinite(config.affinityHoldMinBytes)
-    ? Math.max(0, config.affinityHoldMinBytes)
-    : DEFAULT_AFFINITY_HOLD_MIN_BYTES;
   const routeLog = config.routeLog !== false;
   // After an upstream failure is passed through unreplayed, steer the client's
   // own retry to a different account for this long (0 disables). See
@@ -2268,6 +2258,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
         const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, codexCreditRefusalMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
+        ctx.routeLog = routeLog;
         try {
           if (isStatusRequest) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -2280,16 +2271,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           const requestModel = extractRequestModel(body);
           ctx.model = requestModel.model;
           ctx.advisorToolIndex = requestModel.advisorToolIndex;
-          // Cache hold applies to the first acquire of a large Claude Code
-          // message request with a session-keyed home (never a socket key,
-          // /byok, or the Codex backend).
-          ctx.routeLog = routeLog;
-          ctx.affinityHoldMs = provider === 'anthropic' && affinityHoldMs > 0 && ctx.byok !== true
-            && ctx.affinityKey != null && ctx.affinityKey !== req.socket
-            && req.method === 'POST' && req.url.split('?')[0] === '/v1/messages'
-            && body.length >= affinityHoldMinBytes
-            ? affinityHoldMs
-            : 0;
 
           // Session reserve: keep the fleet's last 5-hour slice for work in
           // progress — a new user turn waits for the reset, a tool-loop
@@ -3231,13 +3212,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           && !selectionHasUsable && selectionHasCapped) {
         acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
       }
-      let holdMs = ctx.affinityHoldMs || 0;
-      ctx.affinityHoldMs = 0; // one hold per request, never on a retry
-      // A hold is waiting too: start the continuity clock now so the hold
-      // counts against the same wait budget, and never outlast it.
-      if (holdMs > 0 && acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0) {
-        holdMs = Math.min(holdMs, Math.max(0, startContinuityDeadline(ctx) - Date.now()));
-      }
       const acquireStartedAt = Date.now();
       const routed = await accountManager.acquireAccountRouted(
         excludeForSelect,
@@ -3247,7 +3221,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.model,
         ctx.preferredAccountUuid,
         creditScope(),
-        holdMs,
       );
       account = routed.account;
       if (account) {

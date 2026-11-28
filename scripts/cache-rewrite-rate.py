@@ -18,11 +18,12 @@ Run the same command over a window before and after a proxy change and compare
 the two rates. Prints JSON only; no transcript content.
 
 Completeness: the output reports files_scanned, files_unreadable,
-dirs_unreadable, bad_lines and partial_tail_lines. An unterminated last line of
-a file (a live session mid-write) is expected and only counted. Exit codes:
+dirs_unreadable, bad_lines and partial_tail_lines. Exit codes:
 0 complete, 2 root missing or nothing scanned, 3 a file or directory could not
-be read, 4 a malformed complete line was found. Any non-zero result is an
-incomplete measurement and must not be compared as if it were clean.
+be read, 4 a malformed complete line was found, 5 only an unterminated last
+line (a live session mid-write) was skipped. Any non-zero result is an
+incomplete measurement: compare windows that are closed (until in the past),
+or re-run until it exits 0.
 """
 import argparse
 import json
@@ -43,39 +44,39 @@ def calls_in(path, counters):
     seen = set()
     out = []
     interactive = False
-    with open(path, 'rb') as fh:
-        data = fh.read()
-    lines = data.split(b'\n')
-    terminated = data.endswith(b'\n')
-    for n, raw in enumerate(lines):
-        if not raw.strip():
-            continue
-        try:
-            row = json.loads(raw)
-        except ValueError:
-            if n == len(lines) - 1 and not terminated:
-                counters['partial_tail_lines'] += 1
-            else:
+    with open(path, 'rb') as fh:  # streamed line by line: memory stays per-line
+        for raw in fh:
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                # Only the last line can lack its newline: a live session mid-write.
+                counters['bad_lines' if raw.endswith(b'\n') else 'partial_tail_lines'] += 1
+                continue
+            if not isinstance(row, dict):
                 counters['bad_lines'] += 1
-            continue
-        if not isinstance(row, dict):
-            counters['bad_lines'] += 1
-            continue
-        if row.get('entrypoint') == 'cli':
-            interactive = True
-        msg = row.get('message') or {}
-        usage = msg.get('usage') if isinstance(msg, dict) else None
-        if row.get('type') != 'assistant' or not usage or not row.get('timestamp'):
-            continue
-        mid = msg.get('id')
-        if mid in seen:
-            continue
-        seen.add(mid)
-        cr = usage.get('cache_read_input_tokens') or 0
-        cc = usage.get('cache_creation_input_tokens') or 0
-        it = usage.get('input_tokens') or 0
-        out.append((parse_ts(row['timestamp']), msg.get('model'), cc, cr + cc + it))
+                continue
+            interactive = interactive or row.get('entrypoint') == 'cli'
+            call = assistant_call(row, seen)
+            if call:
+                out.append(call)
     return out if interactive else []
+
+
+def assistant_call(row, seen):
+    msg = row.get('message')
+    usage = msg.get('usage') if isinstance(msg, dict) else None
+    if row.get('type') != 'assistant' or not usage or not row.get('timestamp'):
+        return None
+    mid = msg.get('id')
+    if mid in seen:
+        return None
+    seen.add(mid)
+    cr = usage.get('cache_read_input_tokens') or 0
+    cc = usage.get('cache_creation_input_tokens') or 0
+    it = usage.get('input_tokens') or 0
+    return (parse_ts(row['timestamp']), msg.get('model'), cc, cr + cc + it)
 
 
 def transcript_files(root, counters):
@@ -134,6 +135,8 @@ def main():
         return 3
     if counters['bad_lines']:
         return 4
+    if counters['partial_tail_lines']:
+        return 5
     return 0
 
 

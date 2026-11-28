@@ -411,38 +411,6 @@ export class AccountManager {
   }
 
   /**
-   * Accounts whose cache for this key is still alive (used within the warm
-   * TTL): the home first when it is among them, then the rest, most recent
-   * first. A home whose cache has expired is not worth waiting for.
-   */
-  _warmCandidates(affinityKey, model) {
-    const home = this._affinity.get(affinityKey);
-    const recent = this._warmList(affinityKey, model).map(w => w.account);
-    return recent.includes(home) ? [home, ...recent.filter(a => a !== home)] : recent;
-  }
-
-  /**
-   * The cache-warm account worth briefly waiting for: usable but at its cap,
-   * with fewer holders queued for it than its cap (a chronically overloaded
-   * account spills instead of only adding latency). null when none, or when a
-   * warm account has a free slot right now (no reason to wait).
-   */
-  _holdTarget(affinityKey, model, exclude, creditScope) {
-    const affOk = affinityKey != null
-      && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
-    if (!this._affinityApplies(affOk, model, creditScope)) return null;
-    let target = null;
-    for (const a of this._warmCandidates(affinityKey, model)) {
-      if (!this._warmCandidateOk(a, model, exclude, creditScope)) continue;
-      if (this._hasCapacity(a)) return null;
-      if (target) continue;
-      const holders = this._waiters.filter(w => w.hold && w.holdFor === a).length;
-      if (holders < a.maxConcurrent) target = a;
-    }
-    return target;
-  }
-
-  /**
    * Get the account to use for the next request.
    *
    * Policy:
@@ -671,7 +639,6 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
-    warmOnly = false,
   ) {
     this._lastVia = null;
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
@@ -742,8 +709,6 @@ export class AccountManager {
         return cand;
       }
     }
-    // Holding for a cache-warm slot: never take a cold account.
-    if (warmOnly) return null;
 
     const capped = this._cappedSet(exclude, model, creditScope);
     const pick = extra => {
@@ -980,15 +945,14 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
-    holdMs = 0,
   ) {
     const route = { via: null };
-    const account = await this.acquireAccount(
-      exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, holdMs, route);
+    const account = await this._acquire(
+      exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, route);
     return { account, via: account ? route.via : null };
   }
 
-  async acquireAccount(
+  acquireAccount(
     exclude = null,
     timeoutMs = 0,
     signal = null,
@@ -996,22 +960,13 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
-    holdMs = 0,
-    info = null,
   ) {
+    return this._acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, null);
+  }
+
+  /** acquireAccount body; `route` (manager-created, or null) receives the routing reason. */
+  async _acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, route) {
     if (signal?.aborted) return null;
-    // Cache hold: when this key's home (or a recently used account) is merely at
-    // its cap, wait briefly for ITS slot instead of spilling to a cold account
-    // that would rewrite the whole prompt cache. Only on a fresh acquire (no
-    // failover exclusions, no recovery pin); after `holdMs` the request takes
-    // the normal path below (including the ordinary overflow queue).
-    if (holdMs > 0 && preferredAccountUuid == null && !(exclude && exclude.size > 0)
-        && !this.isQueueFull()) {
-      const target = this._holdTarget(affinityKey, model, exclude, creditScope);
-      if (target) {
-        return this._enqueueHold(target, exclude, timeoutMs, signal, affinityKey, model, creditScope, holdMs, info);
-      }
-    }
     const account = this._tryAcquire(
       exclude,
       affinityKey,
@@ -1020,7 +975,7 @@ export class AccountManager {
       creditScope,
     );
     if (account) {
-      if (info) info.via = this._lastVia;
+      if (route) route.via = this._lastVia;
       return account;
     }
     // Queue only when the blockage is cap-saturation (a slot WILL free as
@@ -1043,7 +998,7 @@ export class AccountManager {
       model,
       preferredAccountUuid,
       creditScope,
-      info,
+      route,
     );
   }
 
@@ -1080,11 +1035,11 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
-    info = null,
+    route = null,
   ) {
     return new Promise(resolve => {
       const waiter = {
-        info,
+        route,
         exclude,
         creditScope,
         resolve,
@@ -1107,87 +1062,6 @@ export class AccountManager {
     });
   }
 
-  /**
-   * Queue a request that holds for a cache-warm account's slot. While holding
-   * it only takes a home / recently used account (drained before ordinary
-   * waiters). When the hold ends it tries the normal path once; if nothing is
-   * acquirable it either keeps waiting as an ordinary waiter or resolves null —
-   * what an immediate acquire would have done. The hold spends the request's
-   * own queue budget: with `timeoutMs > 0` the whole wait (hold + queue) ends
-   * at `timeoutMs` from now, so a caller deadline (continuity) is never
-   * exceeded; with `timeoutMs <= 0` (no queue) only the hold itself waits.
-   */
-  _enqueueHold(target, exclude, timeoutMs, signal, affinityKey, model, creditScope, holdMs, info = null) {
-    const deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : null;
-    const holdFor = deadlineAt != null ? Math.min(holdMs, timeoutMs) : holdMs;
-    return new Promise(resolve => {
-      const waiter = {
-        info,
-        deadlineAt,
-        exclude,
-        creditScope,
-        resolve,
-        done: false,
-        timer: null,
-        signal,
-        onAbort: null,
-        affinityKey,
-        model,
-        preferredAccountUuid: null,
-        hold: true,
-        holdFor: target,
-      };
-      waiter.timer = setTimeout(() => this._endHold(waiter), holdFor);
-      if (signal) {
-        waiter.onAbort = () => this._settleWaiter(waiter, null);
-        signal.addEventListener('abort', waiter.onAbort, { once: true });
-      }
-      this._waiters.push(waiter);
-    });
-  }
-
-  _endHold(waiter) {
-    if (waiter.done || !waiter.hold) return;
-    waiter.hold = false;
-    clearTimeout(waiter.timer);
-    const remaining = waiter.deadlineAt != null ? waiter.deadlineAt - Date.now() : 0;
-    if (waiter.deadlineAt != null && remaining <= 0) {
-      this._settleWaiter(waiter, null);
-      return;
-    }
-    const account = this._tryAcquire(
-      waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope);
-    if (account) {
-      if (!this._settleWaiter(waiter, account)) account.inflight--;
-      return;
-    }
-    if (remaining <= 0 || !this.anyCapped(waiter.exclude, waiter.model, waiter.creditScope)) {
-      this._settleWaiter(waiter, null);
-      return;
-    }
-    waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), remaining);
-  }
-
-  /** One drain step for a cache holder (see _drainWaiters). */
-  _drainHolder(waiter) {
-    if (waiter.deadlineAt != null && Date.now() >= waiter.deadlineAt) {
-      this._settleWaiter(waiter, null); // past the caller's wait budget
-      return;
-    }
-    const account = this._tryAcquire(
-      waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope, true);
-    if (account) {
-      if (!this._settleWaiter(waiter, account)) account.inflight--;
-      return;
-    }
-    // The warm accounts went away (exhausted, disabled, removed): stop holding
-    // now rather than wait out the hold for nothing.
-    if (!this._warmCandidates(waiter.affinityKey, waiter.model)
-      .some(a => this._warmCandidateOk(a, waiter.model, waiter.exclude, waiter.creditScope))) {
-      this._endHold(waiter);
-    }
-  }
-
   /** Resolve a queued waiter exactly once, cleaning up its timer/abort listener. */
   _settleWaiter(waiter, value) {
     if (waiter.done) return false;
@@ -1198,7 +1072,7 @@ export class AccountManager {
     if (i >= 0) this._waiters.splice(i, 1);
     // Every caller settles with an account right after the _tryAcquire that
     // reserved it, so _lastVia is that acquisition's reason.
-    if (value && waiter.info) waiter.info.via = this._lastVia;
+    if (value && waiter.route) waiter.route.via = this._lastVia;
     waiter.resolve(value);
     return true;
   }
@@ -1220,17 +1094,8 @@ export class AccountManager {
   }
 
   _drainWaiters() {
-    // Strict FIFO. A cache holder only accepts a slot on one of its cache-warm
-    // accounts (it never takes a cold one while holding) and never jumps the
-    // queue, so ordinary waiters keep their turn.
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      if (waiter.hold) {
-        const before = this._waiters.length;
-        this._drainHolder(waiter);
-        if (this._waiters.length >= before) i++;
-        continue;
-      }
       const account = this._tryAcquire(
         waiter.exclude,
         waiter.affinityKey,

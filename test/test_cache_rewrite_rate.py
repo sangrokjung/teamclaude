@@ -43,11 +43,11 @@ class CacheRewriteRateTest(unittest.TestCase):
             self.assertEqual(out['main']['calls'], 2)
             self.assertEqual(out['main']['rewrites'], 1)
 
-    def test_partial_tail_is_tolerated_but_counted(self):
+    def test_partial_tail_is_reported_as_incomplete(self):
         with tempfile.TemporaryDirectory() as root:
             self.write(root, [call('2026-06-01T00:00:00Z', 'A', 1, 1, 'm1')], tail='{"usage":')
             code, out = run(root)
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 5)
             self.assertEqual(out['partial_tail_lines'], 1)
 
     def test_malformed_complete_line_fails(self):

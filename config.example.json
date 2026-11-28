@@ -8,8 +8,6 @@
   "switchThreshold": 0.98,
   "maxConcurrentPerAccount": 3,
   "sessionAffinity": true,
-  "affinityHoldMs": 10000,
-  "affinityHoldMinBytes": 262144,
   "affinityWarmAccounts": 4,
   "routeLog": true,
   "upstreamFailureAvoidMs": 30000,
