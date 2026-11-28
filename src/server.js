@@ -726,34 +726,12 @@ const AGENT_ID_HEADER = 'x-claude-code-agent-id';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const DEFAULT_SESSION_AFFINITY_MAX_KEYS = 10_000;
 
+// Placeholder key between request start and body parsing (see affinityKeyFor).
+// Always replaced before any account is acquired.
+const DEFERRED_SESSION_KEY = Object.freeze({ deferred: true });
+
 function isInferencePath(req) {
   return req.method === 'POST' && (req.url || '').split('?')[0] === '/v1/messages';
-}
-
-const CACHE_TTL_1H_MS = 60 * 60 * 1000;
-const CACHE_TTL_5M_MS = 5 * 60 * 1000;
-
-/**
- * The longest prompt-cache TTL a Messages request asks for (cache_control on
- * system / tools / message content blocks): 1 h for `ttl: "1h"`, else 5 min;
- * 0 when the request sets no cache breakpoint (it builds no reusable cache).
- */
-export function promptCacheTtlMs(json) {
-  if (!json || typeof json !== 'object') return 0;
-  let ttl = 0;
-  const visit = block => {
-    const cc = block && typeof block === 'object' ? block.cache_control : null;
-    if (!cc || typeof cc !== 'object') return;
-    ttl = Math.max(ttl, cc.ttl === '1h' ? CACHE_TTL_1H_MS : CACHE_TTL_5M_MS);
-  };
-  if (Array.isArray(json.system)) json.system.forEach(visit);
-  if (Array.isArray(json.tools)) json.tools.forEach(visit);
-  if (Array.isArray(json.messages)) {
-    for (const message of json.messages) {
-      if (message && Array.isArray(message.content)) message.content.forEach(visit);
-    }
-  }
-  return ttl;
 }
 
 /** Short, non-reversible label for an id in the route log (never the id itself). */
@@ -843,12 +821,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // session + subagent + the body's top-level model, because the prompt cache
   // is per conversation AND per model (the advisor-tool model used for quota
   // routing is not the cache model). Codex keeps its session key unchanged.
-  const affinityKeyFor = (req, cacheModel = '') => {
+  // `defer`: at request start the body's model is not parsed yet, so an
+  // Anthropic inference request gets DEFERRED_SESSION_KEY and its real key is
+  // made once, after parsing (a single LRU insert per request).
+  const affinityKeyFor = (req, cacheModel = '', defer = false) => {
     if (!sessionAffinity) return null;
     const sessionId = req.headers[SESSION_ID_HEADER];
     if (!(typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId))) return req.socket;
     if (provider !== 'anthropic') return sessionAffinityKeys.keyFor(sessionId);
     if (!isInferencePath(req)) return req.socket;
+    if (defer) return DEFERRED_SESSION_KEY;
     const agentId = req.headers[AGENT_ID_HEADER];
     const agent = typeof agentId === 'string' && SESSION_ID_PATTERN.test(agentId) ? agentId : '';
     const model = typeof cacheModel === 'string' && SESSION_ID_PATTERN.test(cacheModel) ? cacheModel : '';
@@ -2289,7 +2271,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         // auth401 = accounts that answered 401 after their refresh chance (cascade
         // guard input + per-request exclusion); authParked = what THIS request parked,
         // kept so a cascade can put it back.
-        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req), upstreamFailureAvoidMs, codexCreditRefusalMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
+        const ctx = { account: null, status: null, model: null, provider, authRetried: new Set(), auth401: new Set(), authParked: [], authCascade: false, tried429: new Set(), tried5xx: new Set(), overloadRetries: 0, capacityWaits: 0, held: null, queueTimeoutMs, abortSignal: null, affinityKey: affinityKeyFor(req, '', true), upstreamFailureAvoidMs, codexCreditRefusalMs, preferredAccountUuid: recoveryAccountUuid, sawModelWeekly: false, byok: byokMatch != null, continuity, continuityDeadlineAt: null, failedFast: false, last429: null, modelFallbacks: config.modelFallbacks || null, fallbackQueue: undefined, streamRecovery, maxResponseBytes, reserveResponseBytes, releaseReservedResponseBytes, reserveAuxiliaryResponseBytes, releaseAuxiliaryResponseBytes, reserveLogResponseBytes, releaseLogResponseBytes, registerIdleLogReservation, upstreamResponseTimeoutMs, streamIdleTimeoutMs, streamTotalTimeoutMs, subscriptionRecheckIntervalMs, resetCredits: resetCreditController, resetCreditAttempts: 0, resetCreditRetried: new Set(), resetCreditBackstopYielded: false, codexOverloadHeldSince: null };
         ctx.routeLog = routeLog;
         try {
           if (isStatusRequest) {
@@ -2303,9 +2285,8 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           const requestModel = extractRequestModel(body);
           ctx.model = requestModel.model;
           ctx.advisorToolIndex = requestModel.advisorToolIndex;
-          if (provider === 'anthropic' && ctx.affinityKey != null && ctx.affinityKey !== req.socket) {
+          if (ctx.affinityKey === DEFERRED_SESSION_KEY) {
             ctx.affinityKey = affinityKeyFor(req, requestModel.json?.model);
-            ctx.cacheTtlMs = promptCacheTtlMs(requestModel.json);
           }
 
           // Session reserve: keep the fleet's last 5-hour slice for work in
@@ -3249,6 +3230,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
       }
       const acquireStartedAt = Date.now();
+      // Defensive: the deferred placeholder must never act as a shared key.
+      if (ctx.affinityKey === DEFERRED_SESSION_KEY) ctx.affinityKey = null;
       const routed = await accountManager.acquireAccountRouted(
         excludeForSelect,
         acquireTimeoutMs,
@@ -3747,11 +3730,6 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
     accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders, { status: upstreamRes.status });
-    // The prompt was accepted, so this account now holds its cache: remember
-    // it (with the request's cache TTL) as a cache-warm fallback for the key.
-    if (ctx.cacheTtlMs > 0 && upstreamRes.status >= 200 && upstreamRes.status < 300) {
-      accountManager.noteCacheUse(ctx.affinityKey, account, ctx.cacheTtlMs);
-    }
     // B7: upstream refused this API key for credit. The refusal arrived as a
     // complete error response before any byte went to the client, so the key
     // is parked persistently and the request moves on (never back to the same

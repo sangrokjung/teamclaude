@@ -224,10 +224,6 @@ export function normalizeQuotaReserve(raw) {
   return { accountUuid, name, session, weekly, guardBand };
 }
 
-// A cache entry is treated as alive for this share of its stated TTL, so an
-// entry about to expire upstream is not preferred.
-const WARM_TTL_SAFETY = 0.9;
-
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256, quotaReserve = null) {
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
@@ -338,16 +334,6 @@ export class AccountManager {
     // no leak. The stored value is the account *object* (not its index, which
     // shifts on removeAccount); a stale entry is detected and ignored.
     this._affinity = new WeakMap();
-    // Accounts holding a live prompt cache for an affinity key (most recent
-    // first, each with the time its cache expires). Recorded only from a
-    // successful inference response (noteCacheUse) with the request's own cache
-    // TTL, so a failed or cache-less call never marks an account warm. When the
-    // home cannot take a request, such an account still has a cache-warm
-    // prefix — far cheaper than a cold account that must write the whole
-    // prompt again. The affinity key already carries the model (caches are per
-    // model). 0 disables.
-    this._warm = new WeakMap();
-    this.affinityWarmAccounts = 4;
     // How the most recent successful _tryAcquire chose its account. Read
     // synchronously by the caller right after that call (route log), so it is
     // always the reason for THAT acquisition.
@@ -358,47 +344,10 @@ export class AccountManager {
     this._lastVia = via;
   }
 
-  /** Accounts whose cache for this key is still alive, most recent first. */
-  _warmList(affinityKey) {
-    if (affinityKey == null || (typeof affinityKey !== 'object' && typeof affinityKey !== 'function')) return [];
-    const list = this._warm.get(affinityKey);
-    if (!list) return [];
-    const now = Date.now();
-    const live = list.filter(w => this.accounts[w.account.index] === w.account && w.until > now);
-    if (live.length !== list.length) this._warm.set(affinityKey, live);
-    return live;
-  }
-
-  /**
-   * Record that `account` now holds a prompt cache for `affinityKey`, alive
-   * for `ttlMs` (the request's own cache_control TTL). Call only after a
-   * successful inference response. Anthropic accounts only.
-   */
-  noteCacheUse(affinityKey, account, ttlMs) {
-    if (affinityKey == null || (typeof affinityKey !== 'object' && typeof affinityKey !== 'function')) return;
-    if (!(this.affinityWarmAccounts > 0) || !account || account.provider === 'codex'
-        || this.accounts[account.index] !== account || !(ttlMs > 0)) return;
-    const list = this._warmList(affinityKey).filter(w => w.account !== account);
-    list.unshift({ account, until: Date.now() + ttlMs * WARM_TTL_SAFETY });
-    if (list.length > this.affinityWarmAccounts) list.length = this.affinityWarmAccounts;
-    this._warm.set(affinityKey, list);
-  }
-
-  /** Whether affinity (home / warm accounts) applies to this acquire at all. */
+  /** Whether connection/session affinity applies to this acquire at all. */
   _affinityApplies(affOk, model, creditScope) {
     return affOk && !this._isByokScope(creditScope)
       && !this.accounts.some(acc => this._isWarmupTarget(acc, model));
-  }
-
-  /**
-   * A cache-warm account (home or recently used) that could serve this request
-   * except that it may be at its cap: the same gates the home path applies.
-   */
-  _warmCandidateOk(a, model, exclude, creditScope) {
-    return Boolean(a) && a.provider !== 'codex' && this.accounts[a.index] === a
-      && (isApiKeyAccount(a) || this._isMeasured(a))
-      && this._isAvailable(a, model, { scope: creditScope })
-      && !(exclude && exclude.has(a)) && !this._isAvoided(a);
   }
 
   /**
@@ -681,21 +630,6 @@ export class AccountManager {
         this._setVia('home');
         return a;
       }
-      // The home cannot take this request right now. Before a cold pick, try
-      // the other accounts this key used recently: their cache still holds a
-      // prefix of this conversation, so only the tail is written again.
-      for (const w of this._warmList(affinityKey)) {
-        const cand = w.account;
-        if (cand === a || !this._warmCandidateOk(cand, model, exclude, creditScope)
-            || !this._hasCapacity(cand)) continue;
-        cand.inflight++;
-        const homeUsable = a && this.accounts[a.index] === a
-          && this._isAvailable(a, model) && !this._isAvoided(a)
-          && !(this._isCreditBacked(a, model) && !this._isCreditBacked(cand, model));
-        if (!homeUsable) this._affinity.set(affinityKey, cand);
-        this._setVia('warm');
-        return cand;
-      }
     }
 
     const capped = this._cappedSet(exclude, model, creditScope);
@@ -923,6 +857,18 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
+  acquireAccount(
+    exclude = null,
+    timeoutMs = 0,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+    creditScope = exclude,
+  ) {
+    return this._acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, null);
+  }
+
   /**
    * acquireAccount plus how the account was chosen (route log). Returns a new
    * `{ account, via }`; the route record it fills is created here, so no
@@ -941,18 +887,6 @@ export class AccountManager {
     const account = await this._acquire(
       exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, route);
     return { account, via: account ? route.via : null };
-  }
-
-  acquireAccount(
-    exclude = null,
-    timeoutMs = 0,
-    signal = null,
-    affinityKey = null,
-    model = null,
-    preferredAccountUuid = null,
-    creditScope = exclude,
-  ) {
-    return this._acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, null);
   }
 
   /** acquireAccount body; `route` (manager-created, or null) receives the routing reason. */
