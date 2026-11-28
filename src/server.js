@@ -810,10 +810,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // each of its subagents are separate prompts with separate caches, so they
   // need separate homes (sharing one home made a few parallel subagents fill
   // the main conversation's account and push it to a cold one).
+  // Only inference (`POST /v1/messages`) uses the session key: side calls
+  // such as count_tokens build no prompt cache and must not refresh a key's
+  // cache-warm memory. The subagent split is Anthropic-only (Codex keeps its
+  // session key unchanged).
   const affinityKeyFor = req => {
     if (!sessionAffinity) return null;
     const sessionId = req.headers[SESSION_ID_HEADER];
     if (!(typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId))) return req.socket;
+    if (provider !== 'anthropic') return sessionAffinityKeys.keyFor(sessionId);
+    if (!(req.method === 'POST' && (req.url || '').split('?')[0] === '/v1/messages')) return req.socket;
     const agentId = req.headers[AGENT_ID_HEADER];
     const agent = typeof agentId === 'string' && SESSION_ID_PATTERN.test(agentId) ? agentId : '';
     return sessionAffinityKeys.keyFor(agent ? `${sessionId}\u0000${agent}` : sessionId);
@@ -3225,11 +3231,15 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           && !selectionHasUsable && selectionHasCapped) {
         acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
       }
-      const holdMs = ctx.affinityHoldMs || 0;
+      let holdMs = ctx.affinityHoldMs || 0;
       ctx.affinityHoldMs = 0; // one hold per request, never on a retry
+      // A hold is waiting too: start the continuity clock now so the hold
+      // counts against the same wait budget, and never outlast it.
+      if (holdMs > 0 && acquireTimeoutMs > 0 && ctx.continuity.enabled && ctx.continuity.maxWaitMs > 0) {
+        holdMs = Math.min(holdMs, Math.max(0, startContinuityDeadline(ctx) - Date.now()));
+      }
       const acquireStartedAt = Date.now();
-      const routeInfo = { via: null };
-      account = await accountManager.acquireAccount(
+      const routed = await accountManager.acquireAccountRouted(
         excludeForSelect,
         acquireTimeoutMs,
         ctx.abortSignal,
@@ -3238,11 +3248,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.preferredAccountUuid,
         creditScope(),
         holdMs,
-        routeInfo,
       );
+      account = routed.account;
       if (account) {
         ctx.held = account;
-        if (ctx.routeLog && ctx.provider === 'anthropic') logRoute(ctx, account, routeInfo.via, Date.now() - acquireStartedAt);
+        if (ctx.routeLog && ctx.provider === 'anthropic') logRoute(ctx, account, routed.via, Date.now() - acquireStartedAt);
       }
     }
 

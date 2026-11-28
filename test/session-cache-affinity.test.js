@@ -30,11 +30,9 @@ function fleet(n) {
   return am;
 }
 
-// acquireAccount with a route-info out-param; returns { account, via }.
-async function acquire(am, key, { timeoutMs = 1000, holdMs = 0, exclude = null } = {}) {
-  const info = { via: null };
-  const account = await am.acquireAccount(exclude, timeoutMs, null, key, null, null, exclude, holdMs, info);
-  return { account, via: info.via };
+// Routed acquire for model 'm' (warm memory is per model); returns { account, via }.
+function acquire(am, key, { timeoutMs = 1000, holdMs = 0, exclude = null, model = 'm' } = {}) {
+  return am.acquireAccountRouted(exclude, timeoutMs, null, key, model, null, exclude, holdMs);
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -163,45 +161,47 @@ test('holders per account are capped so an overloaded home spills instead of que
   am.releaseAccount(k2Again.account);
 });
 
-test('a released home slot goes to its holder before an earlier ordinary waiter', async () => {
+test('holders never jump the queue: an earlier ordinary waiter gets the freed slot first', async () => {
   const am = fleet(1);
-  const kOrdinary = {};
   const kHolder = {};
   const owner = await acquire(am, kHolder);
-  const ordinary = acquire(am, kOrdinary); // ordinary waiter queued first
+  const ordinary = acquire(am, {}); // ordinary waiter queued first
   const holder = acquire(am, kHolder, { holdMs: 2000 });
   await sleep(5);
   am.releaseAccount(owner.account);
-  const got = await holder;
-  assert.equal(got.account.name, 'a0');
-  am.releaseAccount(got.account);
-  const later = await ordinary;
-  assert.equal(later.account.name, 'a0', 'the ordinary waiter still gets the next slot');
-  am.releaseAccount(later.account);
+  const first = await ordinary;
+  assert.equal(first.account.name, 'a0', 'FIFO: the earlier waiter is served first');
+  am.releaseAccount(first.account);
+  const second = await holder;
+  assert.equal(second.account.name, 'a0', 'the holder gets the next slot');
+  am.releaseAccount(second.account);
 });
 
-test('holders cannot starve an ordinary waiter: it is overtaken at most maxHolderOvertakes times', async () => {
+test('a holder past its wait budget is not handed a slot by the drain', async () => {
   const am = fleet(1);
-  const holderKey = {};
-  let current = (await acquire(am, holderKey)).account;
-  const ordinary = acquire(am, {}, { timeoutMs: 5000 });
-  let ordinaryDone = null;
-  ordinary.then(r => { ordinaryDone = r; });
-  for (let round = 0; round < 4 && !ordinaryDone; round++) {
-    const holder = acquire(am, holderKey, { timeoutMs: 5000, holdMs: 5000 }); // a fresh holder every time
-    await sleep(2);
-    am.releaseAccount(current);
-    await sleep(2);
-    if (ordinaryDone) {
-      am.releaseAccount(ordinaryDone.account);
-      current = (await holder).account;
-      break;
-    }
-    current = (await holder).account;
-  }
-  assert.ok(ordinaryDone, 'the ordinary waiter got a slot');
-  assert.equal(ordinaryDone.account.name, 'a0');
-  am.releaseAccount(current);
+  const key = {};
+  const owner = await acquire(am, key);
+  const holder = acquire(am, key, { timeoutMs: 5000, holdMs: 5000 });
+  await sleep(5);
+  assert.equal(am._waiters.length, 1);
+  am._waiters[0].deadlineAt = Date.now() - 1; // the budget ran out before its timer fired
+  am.releaseAccount(owner.account);
+  const got = await holder;
+  assert.equal(got.account, null);
+  assert.equal(am.accounts[0].inflight, 0, 'the freed slot was not consumed');
+});
+
+test('warm memory is per model: a side call on another model warms nothing for the main prompt', async () => {
+  const am = fleet(3);
+  const key = {};
+  const home = await acquire(am, key);                       // a0 home, model m
+  const side = await acquire(am, key, { model: 'side' });   // spills to a1 on another model
+  assert.equal(side.account.name, 'a1');
+  am.releaseAccount(side.account);
+  assert.deepEqual(am._warmList(key, 'm').map(w => w.account.name), ['a0']);
+  assert.deepEqual(am._warmList(key, 'side').map(w => w.account.name), ['a1']);
+  assert.deepEqual(am._warmList(key, null), [], 'no model, no warm accounts');
+  am.releaseAccount(home.account);
 });
 
 test('no hold for an excluded (failover) acquire', async () => {
@@ -218,7 +218,7 @@ test('codex accounts take no part in warm memory', async () => {
   measureAll(am);
   const key = {};
   const first = await acquire(am, key);
-  assert.deepEqual(am._warmList(key), [], 'nothing remembered for a codex account');
+  assert.deepEqual(am._warmList(key, 'm'), [], 'nothing remembered for a codex account');
   am.releaseAccount(first.account);
 });
 
@@ -251,13 +251,19 @@ test('main conversation and subagents get separate keys; every request is route-
     await call({ 'x-claude-code-session-id': sessionId, 'x-claude-code-agent-id': agentId });
     await call({ 'x-claude-code-session-id': sessionId });
     await call({});
+    // count_tokens builds no prompt cache: it must not use (or refresh) the session key.
+    await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-claude-code-session-id': sessionId },
+      body: '{"model":"m"}',
+    }).then(r => r.arrayBuffer());
   } finally {
     console.log = orig;
     upstream.close();
     proxy.close();
   }
   const routes = lines.filter(l => l.includes('[TeamClaude] Route '));
-  assert.equal(routes.length, 4, 'one line per request, header-less included');
+  assert.equal(routes.length, 5, 'one line per request, header-less included');
+  assert.match(routes[4], /s=- g=- /, 'count_tokens is not session-keyed');
   assert.match(routes[0], /s=[0-9a-f]{8} g=main acct=#\d via=new held=\d+/);
   assert.match(routes[1], /g=[0-9a-f]{8} acct=#\d via=new/, 'the subagent is a separate key');
   assert.match(routes[2], /g=main acct=#\d via=home/);
@@ -292,16 +298,19 @@ test('a large session request reaches the hold through the proxy (256 KiB bounda
   const small = JSON.stringify({ model: 'side-model' }); // side calls use another model
   const post = body => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: session, body })
     .then(r => r.arrayBuffer());
+  const until = async (cond, what) => {
+    for (let i = 0; i < 400 && !cond(); i++) await sleep(5);
+    assert.ok(cond(), `timed out waiting for ${what}`);
+  };
   try {
     const first = post(big);
-    await sleep(50);
-    const smallReq = post(small); // small: spills to the other account at once
-    await smallReq;
+    await until(() => served.length === 1, 'the first request upstream');
+    await post(small); // small: never holds, spills to the other account at once
     assert.equal(served.length, 2);
     assert.notEqual(served[1], served[0], 'a small request does not hold');
-    const bigReq = post(big);     // large: holds for the busy home
-    await sleep(100);
-    assert.equal(served.length, 2, 'the large request is waiting, not sent to a cold account');
+    const bigReq = post(big); // large: holds for the busy home
+    await until(() => am._waiters.some(w => w.hold), 'the large request to hold');
+    assert.equal(served.length, 2, 'the holder was not sent to a cold account');
     release();
     await first;
     await bigReq;

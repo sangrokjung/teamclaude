@@ -224,6 +224,15 @@ export function normalizeQuotaReserve(raw) {
   return { accountUuid, name, session, weekly, guardBand };
 }
 
+// Warm-account memory bounds: models remembered per affinity key, and what
+// counts as a model id worth remembering (bounded, no free-form input).
+const WARM_MODELS_PER_KEY = 4;
+const WARM_MODEL_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function isWarmModel(model) {
+  return typeof model === 'string' && WARM_MODEL_PATTERN.test(model);
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256, quotaReserve = null) {
     this.maxConcurrentDefault = coerceMaxConcurrent(maxConcurrentDefault, 3);
@@ -346,9 +355,6 @@ export class AccountManager {
     // synchronously by the caller right after that call (route log), so it is
     // always the reason for THAT acquisition.
     this._lastVia = null;
-    // An ordinary waiter can be overtaken by a cache holder at most this many
-    // times, so holders never starve the FIFO queue.
-    this.maxHolderOvertakes = 2;
   }
 
   _setVia(via) {
@@ -356,27 +362,35 @@ export class AccountManager {
   }
 
   /**
-   * Live warm accounts for a key, most recent first (expired / removed entries
-   * dropped). The prompt cache is per model, so only entries for `model` count
-   * (a session's small side calls on another model warm nothing for its main
-   * prompt); a null model matches any entry.
+   * Live warm accounts for a key and model, most recent first (expired /
+   * removed entries dropped). The prompt cache is per model, so the memory is
+   * kept per model; a request without a valid model has no warm accounts.
    */
-  _warmList(affinityKey, model = null) {
-    const list = this._warm.get(affinityKey);
+  _warmList(affinityKey, model) {
+    if (!isWarmModel(model)) return [];
+    const byModel = this._warm.get(affinityKey);
+    const list = byModel?.get(model);
     if (!list) return [];
     const now = Date.now();
     const live = list.filter(w => this.accounts[w.account.index] === w.account
       && now - w.at < this.affinityWarmTtlMs);
-    if (live.length !== list.length) this._warm.set(affinityKey, live);
-    return model == null ? live : live.filter(w => w.model == null || w.model === model);
+    if (live.length !== list.length) {
+      if (live.length) byModel.set(model, live); else byModel.delete(model);
+    }
+    return live;
   }
 
-  _noteWarm(affOk, affinityKey, account, model = null) {
-    if (!affOk || !(this.affinityWarmAccounts > 0) || account.provider === 'codex') return;
-    const list = this._warmList(affinityKey).filter(w => !(w.account === account && w.model === model));
-    list.unshift({ account, at: Date.now(), model });
+  _noteWarm(affOk, affinityKey, account, model) {
+    if (!affOk || !(this.affinityWarmAccounts > 0) || account.provider === 'codex'
+        || !isWarmModel(model)) return;
+    const byModel = this._warm.get(affinityKey) ?? new Map();
+    const list = this._warmList(affinityKey, model).filter(w => w.account !== account);
+    list.unshift({ account, at: Date.now() });
     if (list.length > this.affinityWarmAccounts) list.length = this.affinityWarmAccounts;
-    this._warm.set(affinityKey, list);
+    byModel.delete(model); // re-insert: Map order = least recently used model first
+    byModel.set(model, list);
+    while (byModel.size > WARM_MODELS_PER_KEY) byModel.delete(byModel.keys().next().value);
+    this._warm.set(affinityKey, byModel);
   }
 
   /** Whether affinity (home / warm accounts) applies to this acquire at all. */
@@ -401,9 +415,9 @@ export class AccountManager {
    * TTL): the home first when it is among them, then the rest, most recent
    * first. A home whose cache has expired is not worth waiting for.
    */
-  _warmCandidates(affinityKey, model = null) {
+  _warmCandidates(affinityKey, model) {
     const home = this._affinity.get(affinityKey);
-    const recent = [...new Set(this._warmList(affinityKey, model).map(w => w.account))];
+    const recent = this._warmList(affinityKey, model).map(w => w.account);
     return recent.includes(home) ? [home, ...recent.filter(a => a !== home)] : recent;
   }
 
@@ -953,6 +967,27 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
+  /**
+   * acquireAccount plus how the account was chosen (route log). Returns a new
+   * `{ account, via }`; the route record it fills is created here, so no
+   * caller-owned object is mutated.
+   */
+  async acquireAccountRouted(
+    exclude = null,
+    timeoutMs = 0,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+    creditScope = exclude,
+    holdMs = 0,
+  ) {
+    const route = { via: null };
+    const account = await this.acquireAccount(
+      exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, holdMs, route);
+    return { account, via: account ? route.via : null };
+  }
+
   async acquireAccount(
     exclude = null,
     timeoutMs = 0,
@@ -1050,7 +1085,6 @@ export class AccountManager {
     return new Promise(resolve => {
       const waiter = {
         info,
-        overtaken: 0,
         exclude,
         creditScope,
         resolve,
@@ -1089,7 +1123,6 @@ export class AccountManager {
     return new Promise(resolve => {
       const waiter = {
         info,
-        overtaken: 0,
         deadlineAt,
         exclude,
         creditScope,
@@ -1135,6 +1168,26 @@ export class AccountManager {
     waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), remaining);
   }
 
+  /** One drain step for a cache holder (see _drainWaiters). */
+  _drainHolder(waiter) {
+    if (waiter.deadlineAt != null && Date.now() >= waiter.deadlineAt) {
+      this._settleWaiter(waiter, null); // past the caller's wait budget
+      return;
+    }
+    const account = this._tryAcquire(
+      waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope, true);
+    if (account) {
+      if (!this._settleWaiter(waiter, account)) account.inflight--;
+      return;
+    }
+    // The warm accounts went away (exhausted, disabled, removed): stop holding
+    // now rather than wait out the hold for nothing.
+    if (!this._warmCandidates(waiter.affinityKey, waiter.model)
+      .some(a => this._warmCandidateOk(a, waiter.model, waiter.exclude, waiter.creditScope))) {
+      this._endHold(waiter);
+    }
+  }
+
   /** Resolve a queued waiter exactly once, cleaning up its timer/abort listener. */
   _settleWaiter(waiter, value) {
     if (waiter.done) return false;
@@ -1167,35 +1220,17 @@ export class AccountManager {
   }
 
   _drainWaiters() {
-    // Holders first: a freed slot on a cache-warm account goes to a request
-    // whose cache lives there before an ordinary waiter can take it.
-    // Bounded: an ordinary waiter queued ahead is overtaken at most
-    // maxHolderOvertakes times, after which holders wait their FIFO turn.
+    // Strict FIFO. A cache holder only accepts a slot on one of its cache-warm
+    // accounts (it never takes a cold one while holding) and never jumps the
+    // queue, so ordinary waiters keep their turn.
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
-      if (!waiter.hold) { i++; continue; }
-      const ahead = this._waiters.slice(0, i).filter(w => !w.hold);
-      if (ahead.some(w => w.overtaken >= this.maxHolderOvertakes)) { i++; continue; }
-      const account = this._tryAcquire(
-        waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope, true);
-      if (account) {
-        if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; continue; }
-        for (const w of ahead) w.overtaken = (w.overtaken || 0) + 1;
+      if (waiter.hold) {
+        const before = this._waiters.length;
+        this._drainHolder(waiter);
+        if (this._waiters.length >= before) i++;
         continue;
       }
-      // The warm accounts went away (exhausted, disabled, removed): stop holding
-      // now rather than wait out the hold for nothing.
-      if (!this._warmCandidates(waiter.affinityKey, waiter.model)
-        .some(a => this._warmCandidateOk(a, waiter.model, waiter.exclude, waiter.creditScope))) {
-        const before = this._waiters.length;
-        this._endHold(waiter);
-        if (this._waiters.length < before) continue;
-      }
-      i++;
-    }
-    for (let i = 0; i < this._waiters.length;) {
-      const waiter = this._waiters[i];
-      if (waiter.hold) { i++; continue; }
       const account = this._tryAcquire(
         waiter.exclude,
         waiter.affinityKey,
