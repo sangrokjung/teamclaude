@@ -726,6 +726,36 @@ const AGENT_ID_HEADER = 'x-claude-code-agent-id';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const DEFAULT_SESSION_AFFINITY_MAX_KEYS = 10_000;
 
+function isInferencePath(req) {
+  return req.method === 'POST' && (req.url || '').split('?')[0] === '/v1/messages';
+}
+
+const CACHE_TTL_1H_MS = 60 * 60 * 1000;
+const CACHE_TTL_5M_MS = 5 * 60 * 1000;
+
+/**
+ * The longest prompt-cache TTL a Messages request asks for (cache_control on
+ * system / tools / message content blocks): 1 h for `ttl: "1h"`, else 5 min;
+ * 0 when the request sets no cache breakpoint (it builds no reusable cache).
+ */
+export function promptCacheTtlMs(json) {
+  if (!json || typeof json !== 'object') return 0;
+  let ttl = 0;
+  const visit = block => {
+    const cc = block && typeof block === 'object' ? block.cache_control : null;
+    if (!cc || typeof cc !== 'object') return;
+    ttl = Math.max(ttl, cc.ttl === '1h' ? CACHE_TTL_1H_MS : CACHE_TTL_5M_MS);
+  };
+  if (Array.isArray(json.system)) json.system.forEach(visit);
+  if (Array.isArray(json.tools)) json.tools.forEach(visit);
+  if (Array.isArray(json.messages)) {
+    for (const message of json.messages) {
+      if (message && Array.isArray(message.content)) message.content.forEach(visit);
+    }
+  }
+  return ttl;
+}
+
 /** Short, non-reversible label for an id in the route log (never the id itself). */
 function routeLabel(value) {
   return createHash('sha256').update(String(value)).digest('hex').slice(0, 8);
@@ -809,18 +839,20 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // need separate homes (sharing one home made a few parallel subagents fill
   // the main conversation's account and push it to a cold one).
   // Only inference (`POST /v1/messages`) uses the session key: side calls
-  // such as count_tokens build no prompt cache and must not refresh a key's
-  // cache-warm memory. The subagent split is Anthropic-only (Codex keeps its
-  // session key unchanged).
-  const affinityKeyFor = req => {
+  // such as count_tokens build no prompt cache. In Anthropic mode the key is
+  // session + subagent + the body's top-level model, because the prompt cache
+  // is per conversation AND per model (the advisor-tool model used for quota
+  // routing is not the cache model). Codex keeps its session key unchanged.
+  const affinityKeyFor = (req, cacheModel = '') => {
     if (!sessionAffinity) return null;
     const sessionId = req.headers[SESSION_ID_HEADER];
     if (!(typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId))) return req.socket;
     if (provider !== 'anthropic') return sessionAffinityKeys.keyFor(sessionId);
-    if (!(req.method === 'POST' && (req.url || '').split('?')[0] === '/v1/messages')) return req.socket;
+    if (!isInferencePath(req)) return req.socket;
     const agentId = req.headers[AGENT_ID_HEADER];
     const agent = typeof agentId === 'string' && SESSION_ID_PATTERN.test(agentId) ? agentId : '';
-    return sessionAffinityKeys.keyFor(agent ? `${sessionId}\u0000${agent}` : sessionId);
+    const model = typeof cacheModel === 'string' && SESSION_ID_PATTERN.test(cacheModel) ? cacheModel : '';
+    return sessionAffinityKeys.keyFor(`${sessionId}\u0000${agent}\u0000${model}`);
   };
   const routeLog = config.routeLog !== false;
   // After an upstream failure is passed through unreplayed, steer the client's
@@ -2271,6 +2303,10 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           const requestModel = extractRequestModel(body);
           ctx.model = requestModel.model;
           ctx.advisorToolIndex = requestModel.advisorToolIndex;
+          if (provider === 'anthropic' && ctx.affinityKey != null && ctx.affinityKey !== req.socket) {
+            ctx.affinityKey = affinityKeyFor(req, requestModel.json?.model);
+            ctx.cacheTtlMs = promptCacheTtlMs(requestModel.json);
+          }
 
           // Session reserve: keep the fleet's last 5-hour slice for work in
           // progress — a new user turn waits for the reset, a tool-loop
@@ -3711,6 +3747,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // A held fold still records the request itself (usage counters / lastUsed
     // live in updateQuota): fold an empty header set instead of skipping.
     accountManager.updateQuota(account, holdHeaderFold ? {} : rateLimitHeaders, { status: upstreamRes.status });
+    // The prompt was accepted, so this account now holds its cache: remember
+    // it (with the request's cache TTL) as a cache-warm fallback for the key.
+    if (ctx.cacheTtlMs > 0 && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+      accountManager.noteCacheUse(ctx.affinityKey, account, ctx.cacheTtlMs);
+    }
     // B7: upstream refused this API key for credit. The refusal arrived as a
     // complete error response before any byte went to the client, so the key
     // is parked persistently and the request moves on (never back to the same

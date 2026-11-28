@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, promptCacheTtlMs } from '../src/server.js';
 
 const HOUR = 3600_000;
 
@@ -61,6 +61,7 @@ test('when the home is busy a recently used account beats a cold one', async () 
   assert.equal(busyHome.account.name, 'a0');
   const spill = await acquire(am, key);
   assert.equal(spill.account.name, 'a1');
+  am.noteCacheUse(key, spill.account, HOUR); // its inference succeeded: a1 holds the cache
   am.releaseAccount(spill.account);
   // Make a1 the worst cold choice so only the warm memory can pick it.
   am.updateQuota(1, {
@@ -81,13 +82,13 @@ test('an expired warm account is not preferred over a cold one', async () => {
   const home = await acquire(am, key);
   am.releaseAccount(home.account);
   const busyHome = await acquire(am, blocker);
-  const spill = await acquire(am, key); // a1 becomes warm
+  const spill = await acquire(am, key);
+  am.noteCacheUse(key, spill.account, 2); // a 2 ms cache: expires right away
   am.releaseAccount(spill.account);
   am.updateQuota(1, {
     'anthropic-ratelimit-unified-5h-utilization': '0.6',
     'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
   });
-  am.affinityWarmTtlMs = 1; // a1's cache has expired
   await sleep(5);
   const again = await acquire(am, key);
   assert.equal(again.account.name, 'a2', 'normal use-or-lose order, no stale warm preference');
@@ -113,17 +114,42 @@ test('routed acquire returns a fresh result and queued requests keep their own r
   am.releaseAccount(r2.account);
 });
 
-test('warm memory is per model: a side call on another model warms nothing for the main prompt', async () => {
+test('an account is warm only after a recorded cache use, never just from being assigned', async () => {
   const am = fleet(3);
   const key = {};
-  const home = await acquire(am, key);                       // a0 home, model m
-  const side = await acquire(am, key, { model: 'side' });   // spills to a1 on another model
-  assert.equal(side.account.name, 'a1');
-  am.releaseAccount(side.account);
-  assert.deepEqual(am._warmList(key, 'm').map(w => w.account.name), ['a0']);
-  assert.deepEqual(am._warmList(key, 'side').map(w => w.account.name), ['a1']);
-  assert.deepEqual(am._warmList(key, null), [], 'no model, no warm accounts');
+  const blocker = {};
+  const home = await acquire(am, key);
   am.releaseAccount(home.account);
+  const busyHome = await acquire(am, blocker);
+  const spill = await acquire(am, key); // assigned, but (say) answered 400: no noteCacheUse
+  am.releaseAccount(spill.account);
+  assert.deepEqual(am._warmList(key), []);
+  am.updateQuota(1, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.6',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  const again = await acquire(am, key);
+  assert.equal(again.account.name, 'a2', 'no warm preference without a cache');
+  am.releaseAccount(again.account);
+  am.releaseAccount(busyHome.account);
+});
+
+test('route reason is home/bypass, not spill, when warm-up bypasses affinity', async () => {
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
+  });
+  // a1 stays unmeasured → a warm-up target → affinity is bypassed.
+  const key = {};
+  const first = await acquire(am, key);
+  assert.equal(first.account.name, 'a1');
+  assert.equal(first.via, 'bypass');
+  const second = await acquire(am, key);
+  assert.equal(second.account.name, 'a1');
+  assert.equal(second.via, 'home', 'same account as the home is not a spill');
+  am.releaseAccount(first.account);
+  am.releaseAccount(second.account);
 });
 
 test('codex accounts take no part in warm memory', async () => {
@@ -131,7 +157,8 @@ test('codex accounts take no part in warm memory', async () => {
   measureAll(am);
   const key = {};
   const first = await acquire(am, key);
-  assert.deepEqual(am._warmList(key, 'm'), [], 'nothing remembered for a codex account');
+  am.noteCacheUse(key, first.account, HOUR);
+  assert.deepEqual(am._warmList(key), [], 'nothing remembered for a codex account');
   am.releaseAccount(first.account);
 });
 
@@ -187,3 +214,57 @@ test('main conversation and subagents get separate keys; every request is route-
   }
 });
 
+test('promptCacheTtlMs reads the longest cache_control TTL, 0 without breakpoints', () => {
+  assert.equal(promptCacheTtlMs(null), 0);
+  assert.equal(promptCacheTtlMs({ messages: [{ role: 'user', content: 'hi' }] }), 0);
+  assert.equal(promptCacheTtlMs({ system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }] }), 5 * 60_000);
+  assert.equal(promptCacheTtlMs({
+    system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }],
+  }), HOUR);
+});
+
+test('the proxy records a cache use only for a 2xx cache-building inference, keyed per model', async () => {
+  let status = 200;
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(status === 200 ? '{"ok":true}' : '{"type":"error","error":{"type":"invalid_request_error","message":"x"}}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
+  measureAll(am);
+  const notes = [];
+  const orig = am.noteCacheUse.bind(am);
+  am.noteCacheUse = (key, account, ttl) => { notes.push({ key, account: account.name, ttl }); orig(key, account, ttl); };
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: `fixture-${randomUUID()}` }, upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false,
+  });
+  const port = await listen(proxy);
+  const headers = { 'content-type': 'application/json', 'x-claude-code-session-id': randomUUID() };
+  const cached = model => JSON.stringify({
+    model, messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }],
+  });
+  const post = body => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers, body })
+    .then(r => r.arrayBuffer());
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => { lines.push(args.join(' ')); };
+  try {
+    await post(cached('model-a'));
+    await post(JSON.stringify({ model: 'model-a', messages: [] })); // no breakpoint: builds no cache
+    await post(cached('model-b'));
+    status = 400;
+    await post(cached('model-a'));
+  } finally {
+    console.log = log;
+    upstream.close();
+    proxy.close();
+  }
+  assert.equal(notes.length, 2, 'only the two cache-building 2xx calls were recorded');
+  assert.equal(notes[0].ttl, HOUR);
+  assert.notEqual(notes[0].key, notes[1].key, 'a different model is a different key (separate cache)');
+  const routes = lines.filter(l => l.includes('[TeamClaude] Route '));
+  assert.match(routes[2], /via=new/, 'model-b starts its own key');
+  assert.match(routes[3], /via=home/, 'model-a keeps its home');
+});

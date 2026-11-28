@@ -11,10 +11,13 @@ SCRIPT = Path(__file__).resolve().parent.parent / 'scripts' / 'cache-rewrite-rat
 SINCE = '2026-01-01T00:00:00+00:00'
 
 
-def call(ts, model, cc, cr, mid):
+def call(ts, model, cc, cr, mid, ttl='1h'):
+    split = {'ephemeral_1h_input_tokens': cc if ttl == '1h' else 0,
+             'ephemeral_5m_input_tokens': cc if ttl == '5m' else 0}
     return {'type': 'assistant', 'timestamp': ts, 'message': {
         'id': mid, 'model': model,
-        'usage': {'input_tokens': 10, 'cache_creation_input_tokens': cc, 'cache_read_input_tokens': cr}}}
+        'usage': {'input_tokens': 10, 'cache_creation_input_tokens': cc, 'cache_read_input_tokens': cr,
+                  'cache_creation': split}}}
 
 
 def run(root):
@@ -43,6 +46,33 @@ class CacheRewriteRateTest(unittest.TestCase):
             self.assertEqual(out['main']['calls'], 2)
             self.assertEqual(out['main']['rewrites'], 1)
 
+    def test_five_minute_cache_expiry_is_not_a_rewrite(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write(root, [
+                call('2026-06-01T00:00:00Z', 'A', 60_000, 0, 'm1', ttl='5m'),
+                call('2026-06-01T00:10:00Z', 'A', 60_000, 0, 'm2', ttl='5m'),  # 10 min later: cache expired
+            ])
+            code, out = run(root)
+            self.assertEqual(code, 0)
+            self.assertEqual(out['main']['calls'], 0)
+
+    def test_complete_json_without_newline_is_partial(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write(root, [call('2026-06-01T00:00:00Z', 'A', 1, 1, 'm1')],
+                       tail=json.dumps(call('2026-06-01T00:01:00Z', 'A', 1, 1, 'm2')))
+            code, out = run(root)
+            self.assertEqual(code, 5)
+            self.assertEqual(out['partial_tail_lines'], 1)
+
+    def test_call_without_id_or_timestamp_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            bad_id = call('2026-06-01T00:00:00Z', 'A', 1, 1, None)
+            bad_ts = call('not-a-time', 'A', 1, 1, 'm2')
+            self.write(root, [bad_id, bad_ts])
+            code, out = run(root)
+            self.assertEqual(code, 4)
+            self.assertEqual(out['bad_calls'], 2)
+
     def test_partial_tail_is_reported_as_incomplete(self):
         with tempfile.TemporaryDirectory() as root:
             self.write(root, [call('2026-06-01T00:00:00Z', 'A', 1, 1, 'm1')], tail='{"usage":')
@@ -62,7 +92,7 @@ class CacheRewriteRateTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('error', out)
 
-    @unittest.skipIf(os.geteuid() == 0, 'root can read anything')
+    @unittest.skipIf(not hasattr(os, 'geteuid') or os.geteuid() == 0, 'needs a non-root POSIX user')
     def test_unreadable_directory_fails(self):
         with tempfile.TemporaryDirectory() as root:
             self.write(root, [call('2026-06-01T00:00:00Z', 'A', 1, 1, 'm1')])

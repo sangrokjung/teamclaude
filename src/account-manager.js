@@ -224,14 +224,9 @@ export function normalizeQuotaReserve(raw) {
   return { accountUuid, name, session, weekly, guardBand };
 }
 
-// Warm-account memory bounds: models remembered per affinity key, and what
-// counts as a model id worth remembering (bounded, no free-form input).
-const WARM_MODELS_PER_KEY = 4;
-const WARM_MODEL_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
-
-function isWarmModel(model) {
-  return typeof model === 'string' && WARM_MODEL_PATTERN.test(model);
-}
+// A cache entry is treated as alive for this share of its stated TTL, so an
+// entry about to expire upstream is not preferred.
+const WARM_TTL_SAFETY = 0.9;
 
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98, reevalIntervalMs = 5 * 60 * 1000, maxConcurrentDefault = 3, overflowQueueMaxDepth = 256, quotaReserve = null) {
@@ -343,14 +338,16 @@ export class AccountManager {
     // no leak. The stored value is the account *object* (not its index, which
     // shifts on removeAccount); a stale entry is detected and ignored.
     this._affinity = new WeakMap();
-    // Recently used accounts per affinity key (most recent first, each with its
-    // last-use time). The prompt cache an account holds for a session survives
-    // about an hour, so when the home cannot take a request, an account this
-    // session used recently still has a cache-warm prefix — far cheaper than a
-    // cold account that must write the whole prompt again. 0 disables.
+    // Accounts holding a live prompt cache for an affinity key (most recent
+    // first, each with the time its cache expires). Recorded only from a
+    // successful inference response (noteCacheUse) with the request's own cache
+    // TTL, so a failed or cache-less call never marks an account warm. When the
+    // home cannot take a request, such an account still has a cache-warm
+    // prefix — far cheaper than a cold account that must write the whole
+    // prompt again. The affinity key already carries the model (caches are per
+    // model). 0 disables.
     this._warm = new WeakMap();
     this.affinityWarmAccounts = 4;
-    this.affinityWarmTtlMs = 55 * 60 * 1000;
     // How the most recent successful _tryAcquire chose its account. Read
     // synchronously by the caller right after that call (route log), so it is
     // always the reason for THAT acquisition.
@@ -361,36 +358,30 @@ export class AccountManager {
     this._lastVia = via;
   }
 
-  /**
-   * Live warm accounts for a key and model, most recent first (expired /
-   * removed entries dropped). The prompt cache is per model, so the memory is
-   * kept per model; a request without a valid model has no warm accounts.
-   */
-  _warmList(affinityKey, model) {
-    if (!isWarmModel(model)) return [];
-    const byModel = this._warm.get(affinityKey);
-    const list = byModel?.get(model);
+  /** Accounts whose cache for this key is still alive, most recent first. */
+  _warmList(affinityKey) {
+    if (affinityKey == null || (typeof affinityKey !== 'object' && typeof affinityKey !== 'function')) return [];
+    const list = this._warm.get(affinityKey);
     if (!list) return [];
     const now = Date.now();
-    const live = list.filter(w => this.accounts[w.account.index] === w.account
-      && now - w.at < this.affinityWarmTtlMs);
-    if (live.length !== list.length) {
-      if (live.length) byModel.set(model, live); else byModel.delete(model);
-    }
+    const live = list.filter(w => this.accounts[w.account.index] === w.account && w.until > now);
+    if (live.length !== list.length) this._warm.set(affinityKey, live);
     return live;
   }
 
-  _noteWarm(affOk, affinityKey, account, model) {
-    if (!affOk || !(this.affinityWarmAccounts > 0) || account.provider === 'codex'
-        || !isWarmModel(model)) return;
-    const byModel = this._warm.get(affinityKey) ?? new Map();
-    const list = this._warmList(affinityKey, model).filter(w => w.account !== account);
-    list.unshift({ account, at: Date.now() });
+  /**
+   * Record that `account` now holds a prompt cache for `affinityKey`, alive
+   * for `ttlMs` (the request's own cache_control TTL). Call only after a
+   * successful inference response. Anthropic accounts only.
+   */
+  noteCacheUse(affinityKey, account, ttlMs) {
+    if (affinityKey == null || (typeof affinityKey !== 'object' && typeof affinityKey !== 'function')) return;
+    if (!(this.affinityWarmAccounts > 0) || !account || account.provider === 'codex'
+        || this.accounts[account.index] !== account || !(ttlMs > 0)) return;
+    const list = this._warmList(affinityKey).filter(w => w.account !== account);
+    list.unshift({ account, until: Date.now() + ttlMs * WARM_TTL_SAFETY });
     if (list.length > this.affinityWarmAccounts) list.length = this.affinityWarmAccounts;
-    byModel.delete(model); // re-insert: Map order = least recently used model first
-    byModel.set(model, list);
-    while (byModel.size > WARM_MODELS_PER_KEY) byModel.delete(byModel.keys().next().value);
-    this._warm.set(affinityKey, byModel);
+    this._warm.set(affinityKey, list);
   }
 
   /** Whether affinity (home / warm accounts) applies to this acquire at all. */
@@ -656,7 +647,6 @@ export class AccountManager {
       }
       preferred.inflight++;
       if (affOk) this._affinity.set(affinityKey, preferred);
-      this._noteWarm(affOk, affinityKey, preferred, model);
       this._setVia('preferred');
       return preferred;
     }
@@ -688,14 +678,13 @@ export class AccountManager {
           && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
-        this._noteWarm(affOk, affinityKey, a, model);
         this._setVia('home');
         return a;
       }
       // The home cannot take this request right now. Before a cold pick, try
       // the other accounts this key used recently: their cache still holds a
       // prefix of this conversation, so only the tail is written again.
-      for (const w of this._warmList(affinityKey, model)) {
+      for (const w of this._warmList(affinityKey)) {
         const cand = w.account;
         if (cand === a || !this._warmCandidateOk(cand, model, exclude, creditScope)
             || !this._hasCapacity(cand)) continue;
@@ -704,7 +693,6 @@ export class AccountManager {
           && this._isAvailable(a, model) && !this._isAvoided(a)
           && !(this._isCreditBacked(a, model) && !this._isCreditBacked(cand, model));
         if (!homeUsable) this._affinity.set(affinityKey, cand);
-        this._noteWarm(affOk, affinityKey, cand, model);
         this._setVia('warm');
         return cand;
       }
@@ -748,11 +736,15 @@ export class AccountManager {
           && this._isAvailable(home, model) && !this._isAvoided(home)
           && !(this._isCreditBacked(home, model) && !this._isCreditBacked(account, model));
         if (!homeUsable) this._affinity.set(affinityKey, account);
-        this._setVia(!home ? 'new' : (homeUsable ? 'spill' : 'rehome'));
+        let via = 'rehome';
+        if (account === home) via = 'home';        // normal selection landed on the home anyway
+        else if (!affinityOn) via = 'bypass';      // affinity skipped (warm-up / byok)
+        else if (!home) via = 'new';
+        else if (homeUsable) via = 'spill';
+        this._setVia(via);
       } else {
         this._setVia('pick');
       }
-      this._noteWarm(affOk, affinityKey, account, model);
       return account;
     }
     // Nothing normally usable. If no available account is merely at its cap
@@ -767,7 +759,6 @@ export class AccountManager {
           const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
           if (!homeUsable) this._affinity.set(affinityKey, grace);
         }
-        this._noteWarm(affOk, affinityKey, grace, model);
         this._setVia('grace');
         console.log(`[TeamClaude] Account "${grace.name}" hit its 5-hour limit — forwarding under usage-limit grace`);
         return grace;

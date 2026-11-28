@@ -6,9 +6,12 @@ main conversations and subagent files), dedupes assistant `usage` by message
 id, and reports, for calls whose start falls inside [--since, --until):
 
   calls         API calls that follow an earlier call of the SAME model in the
-                same transcript within 55 minutes (that model's cache is still
-                alive). The first call of each model is excluded: it has no
-                cache to lose.
+                same transcript while that model's cache is still alive: within
+                90% of the TTL the previous call wrote with (1 h or 5 min, from
+                usage.cache_creation.ephemeral_1h/5m_input_tokens). When the
+                TTL is unknown, 55 minutes is assumed and the call is counted in
+                ttl_unknown_calls. The first call of each model is excluded: it
+                has no cache to lose.
   rewrites      those whose cache_creation is >= half the input and the input
                 is >= 50k tokens (the whole prompt was written again)
   cache_write   total cache_creation tokens over those calls
@@ -18,10 +21,11 @@ Run the same command over a window before and after a proxy change and compare
 the two rates. Prints JSON only; no transcript content.
 
 Completeness: the output reports files_scanned, files_unreadable,
-dirs_unreadable, bad_lines and partial_tail_lines. Exit codes:
+dirs_unreadable, bad_lines, bad_calls and partial_tail_lines. Exit codes:
 0 complete, 2 root missing or nothing scanned, 3 a file or directory could not
-be read, 4 a malformed complete line was found, 5 only an unterminated last
-line (a live session mid-write) was skipped. Any non-zero result is an
+be read, 4 a malformed complete line or an assistant call without a valid id /
+timestamp was found, 5 only an unterminated last line (a live session
+mid-write) was seen. Any non-zero result is an
 incomplete measurement: compare windows that are closed (until in the past),
 or re-run until it exits 0.
 """
@@ -31,7 +35,10 @@ import os
 import sys
 from datetime import datetime, timezone
 
-GAP_LIMIT_S = 55 * 60
+DEFAULT_GAP_S = 55 * 60
+TTL_SAFETY = 0.9
+TTL_1H_S = 3600
+TTL_5M_S = 300
 MIN_INPUT = 50_000
 
 
@@ -40,43 +47,67 @@ def parse_ts(value):
 
 
 def calls_in(path, counters):
-    """(timestamp, model, cache_creation, input_total) per deduped assistant call."""
+    """(timestamp, model, cache_creation, input_total, ttl_s|None) per deduped assistant call."""
     seen = set()
     out = []
     interactive = False
     with open(path, 'rb') as fh:  # streamed line by line: memory stays per-line
         for raw in fh:
+            if not raw.endswith(b'\n'):
+                # Only the last line can lack its newline: a live session
+                # mid-write. Even if it parses, it may not be complete.
+                if raw.strip():
+                    counters['partial_tail_lines'] += 1
+                continue
             if not raw.strip():
                 continue
             try:
                 row = json.loads(raw)
             except ValueError:
-                # Only the last line can lack its newline: a live session mid-write.
-                counters['bad_lines' if raw.endswith(b'\n') else 'partial_tail_lines'] += 1
+                counters['bad_lines'] += 1
                 continue
             if not isinstance(row, dict):
                 counters['bad_lines'] += 1
                 continue
             interactive = interactive or row.get('entrypoint') == 'cli'
-            call = assistant_call(row, seen)
+            call = assistant_call(row, seen, counters)
             if call:
                 out.append(call)
     return out if interactive else []
 
 
-def assistant_call(row, seen):
+def assistant_call(row, seen, counters):
     msg = row.get('message')
     usage = msg.get('usage') if isinstance(msg, dict) else None
-    if row.get('type') != 'assistant' or not usage or not row.get('timestamp'):
+    if row.get('type') != 'assistant' or not isinstance(usage, dict):
         return None
     mid = msg.get('id')
+    try:
+        ts = parse_ts(row['timestamp'])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        ts = None
+    if not isinstance(mid, str) or not mid or ts is None:
+        counters['bad_calls'] += 1  # cannot be deduped or ordered: incomplete
+        return None
     if mid in seen:
         return None
     seen.add(mid)
     cr = usage.get('cache_read_input_tokens') or 0
     cc = usage.get('cache_creation_input_tokens') or 0
     it = usage.get('input_tokens') or 0
-    return (parse_ts(row['timestamp']), msg.get('model'), cc, cr + cc + it)
+    return (ts, msg.get('model'), cc, cr + cc + it, written_ttl_s(usage))
+
+
+def written_ttl_s(usage):
+    """TTL the call wrote its cache with, or None when unknown / nothing written."""
+    split = usage.get('cache_creation')
+    if not isinstance(split, dict):
+        return None
+    if (split.get('ephemeral_1h_input_tokens') or 0) > 0:
+        return TTL_1H_S
+    if (split.get('ephemeral_5m_input_tokens') or 0) > 0:
+        return TTL_5M_S
+    return None
 
 
 def transcript_files(root, counters):
@@ -100,7 +131,7 @@ def main():
         print(json.dumps({'error': f'transcript root not found: {args.root}'}))
         return 2
     counters = {'files_scanned': 0, 'files_unreadable': 0, 'dirs_unreadable': 0,
-                'bad_lines': 0, 'partial_tail_lines': 0}
+                'bad_lines': 0, 'bad_calls': 0, 'partial_tail_lines': 0, 'ttl_unknown_calls': 0}
     stats = {k: {'calls': 0, 'rewrites': 0, 'cache_write': 0, 'rewrite_write': 0}
              for k in ('main', 'subagent')}
     for path in transcript_files(args.root, counters):
@@ -113,12 +144,18 @@ def main():
             continue
         counters['files_scanned'] += 1
         kind = 'subagent' if f'{os.sep}subagents{os.sep}' in path else 'main'
-        last_by_model = {}
-        for ts, model, cc, total in calls:
+        last_by_model = {}  # model -> (last call ts, TTL of the cache it relies on)
+        for ts, model, cc, total, ttl in calls:
             prev = last_by_model.get(model)
-            last_by_model[model] = ts
-            if prev is None or ts - prev > GAP_LIMIT_S or not (since <= ts < until):
+            prev_ts, prev_ttl = prev if prev else (None, None)
+            last_by_model[model] = (ts, ttl if ttl is not None else prev_ttl)
+            if prev_ts is None or not (since <= ts < until):
                 continue
+            gap_limit = prev_ttl * TTL_SAFETY if prev_ttl else DEFAULT_GAP_S
+            if ts - prev_ts > gap_limit:
+                continue
+            if prev_ttl is None:
+                counters['ttl_unknown_calls'] += 1
             s = stats[kind]
             s['calls'] += 1
             s['cache_write'] += cc
@@ -133,7 +170,7 @@ def main():
         return 2
     if counters['files_unreadable'] or counters['dirs_unreadable']:
         return 3
-    if counters['bad_lines']:
+    if counters['bad_lines'] or counters['bad_calls']:
         return 4
     if counters['partial_tail_lines']:
         return 5
