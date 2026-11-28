@@ -37,7 +37,7 @@ NODE = find_node_runtime()
 
 WATCHDOG = ROOT / "scripts/codex_502_watchdog.py"
 ACCOUNT_MANAGER = ROOT / "src/account-manager.js"
-ACCOUNT_MANAGER_SHA256 = "c3c1cb560ddb1f1e6121fa4e8703b6e162a14d5a077f3f095d2fcff73ae6ac66"
+ACCOUNT_MANAGER_SHA256 = "0ab443c77e981ab3559f66ce6cdc03ae582ccf8aa47fcc7b548d54aa84febd68"
 CONFIG = ROOT / "src/config.js"
 CONFIG_SHA256 = "7e7b69c0694357055a3cf515969a050936b9fb07d5de346295d86bce7456b45f"
 WATCHDOG_TESTS = (

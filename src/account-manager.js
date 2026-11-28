@@ -334,6 +334,20 @@ export class AccountManager {
     // no leak. The stored value is the account *object* (not its index, which
     // shifts on removeAccount); a stale entry is detected and ignored.
     this._affinity = new WeakMap();
+    // How the most recent successful _tryAcquire chose its account. Read
+    // synchronously by the caller right after that call (route log), so it is
+    // always the reason for THAT acquisition.
+    this._lastVia = null;
+  }
+
+  _setVia(via) {
+    this._lastVia = via;
+  }
+
+  /** Whether connection/session affinity applies to this acquire at all. */
+  _affinityApplies(affOk, model, creditScope) {
+    return affOk && !this._isByokScope(creditScope)
+      && !this.accounts.some(acc => this._isWarmupTarget(acc, model));
   }
 
   /**
@@ -566,6 +580,7 @@ export class AccountManager {
     preferredAccountUuid = null,
     creditScope = exclude,
   ) {
+    this._lastVia = null;
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
     const affOk = affinityKey != null
@@ -581,6 +596,7 @@ export class AccountManager {
       }
       preferred.inflight++;
       if (affOk) this._affinity.set(affinityKey, preferred);
+      this._setVia('preferred');
       return preferred;
     }
 
@@ -596,8 +612,8 @@ export class AccountManager {
     // a stale entry left by a removeAccount that re-indexed the array.)
     // A /byok request skips the hint: its lane prefers API-key credit over
     // whatever subscription account the connection last used.
-    if (affOk && !this._isByokScope(creditScope)
-        && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
+    const affinityOn = this._affinityApplies(affOk, model, creditScope);
+    if (affinityOn) {
       const a = this._affinity.get(affinityKey);
       // Require the home to be MEASURED — not just past its warm-up tries. A
       // headerless account stays unmeasured forever; pinning a connection to it
@@ -611,6 +627,7 @@ export class AccountManager {
           && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
+        this._setVia('home');
         return a;
       }
     }
@@ -653,6 +670,14 @@ export class AccountManager {
           && this._isAvailable(home, model) && !this._isAvoided(home)
           && !(this._isCreditBacked(home, model) && !this._isCreditBacked(account, model));
         if (!homeUsable) this._affinity.set(affinityKey, account);
+        let via = 'rehome';
+        if (account === home) via = 'home';        // normal selection landed on the home anyway
+        else if (!affinityOn) via = 'bypass';      // affinity skipped (warm-up / byok)
+        else if (!home) via = 'new';
+        else if (homeUsable) via = 'spill';
+        this._setVia(via);
+      } else {
+        this._setVia('pick');
       }
       return account;
     }
@@ -668,6 +693,7 @@ export class AccountManager {
           const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
           if (!homeUsable) this._affinity.set(affinityKey, grace);
         }
+        this._setVia('grace');
         console.log(`[TeamClaude] Account "${grace.name}" hit its 5-hour limit — forwarding under usage-limit grace`);
         return grace;
       }
@@ -831,7 +857,7 @@ export class AccountManager {
    * not its index, so a concurrent removeAccount() can't misattribute the slot.
    * `exclude` is a Set of account OBJECTS (per-request failover).
    */
-  async acquireAccount(
+  acquireAccount(
     exclude = null,
     timeoutMs = 0,
     signal = null,
@@ -840,6 +866,31 @@ export class AccountManager {
     preferredAccountUuid = null,
     creditScope = exclude,
   ) {
+    return this._acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, null);
+  }
+
+  /**
+   * acquireAccount plus how the account was chosen (route log). Returns a new
+   * `{ account, via }`; the route record it fills is created here, so no
+   * caller-owned object is mutated.
+   */
+  async acquireAccountRouted(
+    exclude = null,
+    timeoutMs = 0,
+    signal = null,
+    affinityKey = null,
+    model = null,
+    preferredAccountUuid = null,
+    creditScope = exclude,
+  ) {
+    const route = { via: null };
+    const account = await this._acquire(
+      exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, route);
+    return { account, via: account ? route.via : null };
+  }
+
+  /** acquireAccount body; `route` (manager-created, or null) receives the routing reason. */
+  async _acquire(exclude, timeoutMs, signal, affinityKey, model, preferredAccountUuid, creditScope, route) {
     if (signal?.aborted) return null;
     const account = this._tryAcquire(
       exclude,
@@ -848,7 +899,10 @@ export class AccountManager {
       preferredAccountUuid,
       creditScope,
     );
-    if (account) return account;
+    if (account) {
+      if (route) route.via = this._lastVia;
+      return account;
+    }
     // Queue only when the blockage is cap-saturation (a slot WILL free as
     // in-flight requests finish) AND the queue isn't already full. If no
     // available account exists at all, or the queue is at its depth cap, return
@@ -869,6 +923,7 @@ export class AccountManager {
       model,
       preferredAccountUuid,
       creditScope,
+      route,
     );
   }
 
@@ -905,9 +960,11 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
+    route = null,
   ) {
     return new Promise(resolve => {
       const waiter = {
+        route,
         exclude,
         creditScope,
         resolve,
@@ -938,6 +995,9 @@ export class AccountManager {
     if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener('abort', waiter.onAbort);
     const i = this._waiters.indexOf(waiter);
     if (i >= 0) this._waiters.splice(i, 1);
+    // Every caller settles with an account right after the _tryAcquire that
+    // reserved it, so _lastVia is that acquisition's reason.
+    if (value && waiter.route) waiter.route.via = this._lastVia;
     waiter.resolve(value);
     return true;
   }
