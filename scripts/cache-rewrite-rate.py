@@ -14,7 +14,14 @@ and reports, for calls whose start falls inside [--since, --until):
 
 Run the same command over a window before and after a proxy change and compare
 the two rates. Prints JSON only; no transcript content.
+
+The output also reports files_scanned, files_unreadable and bad_lines. Exit 2
+when the root is missing or no transcript was scanned, exit 3 when any file
+could not be read: an incomplete measurement must not look like a clean one.
+A malformed line (e.g. the half-written last line of a live session) is only
+counted, since it is expected while sessions are running.
 """
+import sys
 import argparse
 import glob
 import json
@@ -29,7 +36,7 @@ def parse_ts(value):
     return datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
 
 
-def calls_in(path):
+def calls_in(path, counters):
     seen = set()
     out = []
     interactive = False
@@ -40,6 +47,7 @@ def calls_in(path):
             try:
                 row = json.loads(line)
             except ValueError:
+                counters['bad_lines'] += 1
                 continue
             if row.get('entrypoint') == 'cli':
                 interactive = True
@@ -68,15 +76,21 @@ def main():
     until = parse_ts(args.until) if args.until else datetime.now(timezone.utc).timestamp()
     stats = {k: {'calls': 0, 'rewrites': 0, 'cache_write': 0, 'rewrite_write': 0}
              for k in ('main', 'subagent')}
+    if not os.path.isdir(args.root):
+        print(json.dumps({'error': f'transcript root not found: {args.root}'}))
+        return 2
+    counters = {'files_scanned': 0, 'files_unreadable': 0, 'bad_lines': 0}
     files = glob.glob(os.path.join(args.root, '*', '*.jsonl'))
     files += glob.glob(os.path.join(args.root, '*', '*', 'subagents', '*.jsonl'))
     for path in files:
         try:
             if os.path.getmtime(path) < since:
                 continue
-            calls = sorted(calls_in(path))
+            calls = sorted(calls_in(path, counters))
         except OSError:
+            counters['files_unreadable'] += 1
             continue
+        counters['files_scanned'] += 1
         kind = 'subagent' if '/subagents/' in path else 'main'
         for prev, cur in zip(calls, calls[1:]):
             ts, _cr, cc, total = cur
@@ -91,8 +105,11 @@ def main():
     for s in stats.values():
         s['rewrite_rate'] = round(s['rewrites'] / s['calls'], 4) if s['calls'] else None
         s['rewrite_write_share'] = round(s['rewrite_write'] / s['cache_write'], 4) if s['cache_write'] else None
-    print(json.dumps({'since': args.since, 'until': args.until, **stats}, indent=2))
+    print(json.dumps({'since': args.since, 'until': args.until, **counters, **stats}, indent=2))
+    if counters['files_scanned'] == 0:
+        return 2
+    return 3 if counters['files_unreadable'] else 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

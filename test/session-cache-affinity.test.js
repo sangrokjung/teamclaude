@@ -1,14 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 
 const HOUR = 3600_000;
 
-function makeAccounts(n) {
+// One-off credentials per run (never fixed literals in fixtures).
+function makeAccounts(n, extra = {}) {
   return Array.from({ length: n }, (_, i) => ({
-    name: `a${i}`, type: 'oauth', accessToken: `tok-${i}`, refreshToken: 'r', expiresAt: Date.now() + HOUR,
+    name: `a${i}`, type: 'oauth', accessToken: `fixture-${randomUUID()}`, refreshToken: `fixture-${randomUUID()}`,
+    expiresAt: Date.now() + HOUR, ...extra,
   }));
 }
 
@@ -27,138 +30,204 @@ function fleet(n) {
   return am;
 }
 
+// acquireAccount with a route-info out-param; returns { account, via }.
+async function acquire(am, key, { timeoutMs = 1000, holdMs = 0, exclude = null } = {}) {
+  const info = { via: null };
+  const account = await am.acquireAccount(exclude, timeoutMs, null, key, null, null, exclude, holdMs, info);
+  return { account, via: info.via };
+}
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 test('a large request holds for its busy home instead of spilling to a free cold account', async () => {
   const am = fleet(2);
   const key = {};
-  const first = await am.acquireAccount(null, 1000, null, key);
-  assert.equal(first.name, 'a0');
-  assert.equal(am.routeVia(key), 'new');
+  const first = await acquire(am, key);
+  assert.equal(first.account.name, 'a0');
+  assert.equal(first.via, 'new');
 
-  const pending = am.acquireAccount(null, 1000, null, key, null, null, null, 2000);
+  const pending = acquire(am, key, { holdMs: 2000 });
   await sleep(30);
-  am.releaseAccount(first);
+  am.releaseAccount(first.account);
   const second = await pending;
-  assert.equal(second.name, 'a0', 'waited for the cache-warm home');
-  assert.equal(am.routeVia(key), 'home');
+  assert.equal(second.account.name, 'a0', 'waited for the cache-warm home');
+  assert.equal(second.via, 'home');
   assert.equal(am.accounts[1].inflight, 0, 'the cold account was never taken');
-  am.releaseAccount(second);
+  am.releaseAccount(second.account);
 });
 
 test('without a hold a request spills at once and keeps its home', async () => {
   const am = fleet(2);
   const key = {};
-  const first = await am.acquireAccount(null, 1000, null, key);
-  const spill = await am.acquireAccount(null, 1000, null, key);
-  assert.equal(spill.name, 'a1');
-  assert.equal(am.routeVia(key), 'spill');
-  am.releaseAccount(first);
-  am.releaseAccount(spill);
-  const back = await am.acquireAccount(null, 1000, null, key);
-  assert.equal(back.name, 'a0', 'the home is kept across a spill');
-  am.releaseAccount(back);
+  const first = await acquire(am, key);
+  const spill = await acquire(am, key);
+  assert.equal(spill.account.name, 'a1');
+  assert.equal(spill.via, 'spill');
+  am.releaseAccount(first.account);
+  am.releaseAccount(spill.account);
+  const back = await acquire(am, key);
+  assert.equal(back.account.name, 'a0', 'the home is kept across a spill');
+  am.releaseAccount(back.account);
 });
 
 test('a hold that runs out falls back to the normal path', async () => {
   const am = fleet(2);
   const key = {};
-  const first = await am.acquireAccount(null, 1000, null, key);
+  const first = await acquire(am, key);
   const started = Date.now();
-  const second = await am.acquireAccount(null, 1000, null, key, null, null, null, 60);
-  assert.equal(second.name, 'a1', 'spilled after the hold');
+  const second = await acquire(am, key, { holdMs: 60 });
+  assert.equal(second.account.name, 'a1', 'spilled after the hold');
+  assert.equal(second.via, 'spill');
   assert.ok(Date.now() - started >= 50, 'it did wait for the hold');
-  am.releaseAccount(first);
-  am.releaseAccount(second);
+  am.releaseAccount(first.account);
+  am.releaseAccount(second.account);
 });
 
 test('a hold that runs out with nothing free and no queue time resolves null', async () => {
   const am = fleet(1);
   const key = {};
-  const first = await am.acquireAccount(null, 1000, null, key);
-  const second = await am.acquireAccount(null, 0, null, key, null, null, null, 40);
-  assert.equal(second, null);
-  am.releaseAccount(first);
+  const first = await acquire(am, key);
+  const second = await acquire(am, key, { timeoutMs: 0, holdMs: 40 });
+  assert.equal(second.account, null);
+  am.releaseAccount(first.account);
+});
+
+test('the hold spends the caller deadline instead of extending it', async () => {
+  const am = fleet(1);
+  const key = {};
+  const first = await acquire(am, key);
+  const started = Date.now();
+  // queue budget 80 ms, hold 10 s: the whole wait must end near 80 ms.
+  const second = await acquire(am, key, { timeoutMs: 80, holdMs: 10_000 });
+  const waited = Date.now() - started;
+  assert.equal(second.account, null);
+  assert.ok(waited < 1000, `waited ${waited}ms, the deadline is 80ms`);
+  // A slot freed after the deadline must not be handed to the expired request.
+  am.releaseAccount(first.account);
+  assert.equal(am.accounts[0].inflight, 0);
 });
 
 test('when the home is busy a recently used account beats a cold one', async () => {
   const am = fleet(3);
   const key = {};
   const blocker = {};
-  const home = await am.acquireAccount(null, 1000, null, key);
-  am.releaseAccount(home);
-  const busyHome = await am.acquireAccount(null, 1000, null, blocker); // other session takes a0
-  assert.equal(busyHome.name, 'a0');
-  const spill = await am.acquireAccount(null, 1000, null, key);
-  assert.equal(spill.name, 'a1');
-  am.releaseAccount(spill);
+  const home = await acquire(am, key);
+  am.releaseAccount(home.account);
+  const busyHome = await acquire(am, blocker); // another session takes a0
+  assert.equal(busyHome.account.name, 'a0');
+  const spill = await acquire(am, key);
+  assert.equal(spill.account.name, 'a1');
+  am.releaseAccount(spill.account);
   // Make a1 the worst cold choice so only the warm memory can pick it.
   am.updateQuota(1, {
     'anthropic-ratelimit-unified-5h-utilization': '0.6',
     'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + HOUR) / 1000)),
   });
-  const again = await am.acquireAccount(null, 1000, null, key);
-  assert.equal(again.name, 'a1', 'the cache-warm spill account, not cold a2');
-  assert.equal(am.routeVia(key), 'warm');
-  am.releaseAccount(again);
-  am.releaseAccount(busyHome);
+  const again = await acquire(am, key);
+  assert.equal(again.account.name, 'a1', 'the cache-warm spill account, not cold a2');
+  assert.equal(again.via, 'warm');
+  am.releaseAccount(again.account);
+  am.releaseAccount(busyHome.account);
+});
+
+test('no hold for a home whose cache has expired', async () => {
+  const am = fleet(2);
+  const key = {};
+  const first = await acquire(am, key);
+  am.affinityWarmTtlMs = 1; // the home's last use is now older than the cache TTL
+  await sleep(5);
+  const started = Date.now();
+  const second = await acquire(am, key, { holdMs: 2000 });
+  assert.equal(second.account.name, 'a1', 'spilled at once: nothing warm to wait for');
+  assert.ok(Date.now() - started < 500);
+  am.releaseAccount(first.account);
+  am.releaseAccount(second.account);
 });
 
 test('holders per account are capped so an overloaded home spills instead of queuing', async () => {
   const am = fleet(2);
   const k1 = {};
   const k2 = {};
-  const first = await am.acquireAccount(null, 1000, null, k1);
-  // k2 also homes on a0 (first pick); release so the next k1 hold sees a0 busy.
-  am.releaseAccount(first);
-  const k2Home = await am.acquireAccount(null, 1000, null, k2);
-  assert.equal(k2Home.name, 'a0');
-  const holder = am.acquireAccount(null, 1000, null, k1, null, null, null, 2000);
+  const first = await acquire(am, k1);
+  am.releaseAccount(first.account);
+  const k2Home = await acquire(am, k2); // k2 also homes on a0
+  assert.equal(k2Home.account.name, 'a0');
+  const holder = acquire(am, k1, { holdMs: 2000 });
   await sleep(10);
-  const k2Again = await am.acquireAccount(null, 1000, null, k2, null, null, null, 2000);
-  assert.equal(k2Again.name, 'a1', 'a0 already has a full hold queue (cap 1): spill now');
-  am.releaseAccount(k2Home);
+  const k2Again = await acquire(am, k2, { holdMs: 2000 });
+  assert.equal(k2Again.account.name, 'a1', 'a0 already has a full hold queue (cap 1): spill now');
+  am.releaseAccount(k2Home.account);
   const held = await holder;
-  assert.equal(held.name, 'a0');
-  am.releaseAccount(held);
-  am.releaseAccount(k2Again);
+  assert.equal(held.account.name, 'a0');
+  am.releaseAccount(held.account);
+  am.releaseAccount(k2Again.account);
 });
 
 test('a released home slot goes to its holder before an earlier ordinary waiter', async () => {
   const am = fleet(1);
   const kOrdinary = {};
   const kHolder = {};
-  const owner = await am.acquireAccount(null, 1000, null, kHolder);
-  // ordinary waiter (no key) queued first
-  const ordinary = am.acquireAccount(null, 1000, null, kOrdinary);
-  const holder = am.acquireAccount(null, 1000, null, kHolder, null, null, null, 2000);
+  const owner = await acquire(am, kHolder);
+  const ordinary = acquire(am, kOrdinary); // ordinary waiter queued first
+  const holder = acquire(am, kHolder, { holdMs: 2000 });
   await sleep(5);
-  am.releaseAccount(owner);
+  am.releaseAccount(owner.account);
   const got = await holder;
-  assert.equal(got.name, 'a0');
-  am.releaseAccount(got);
+  assert.equal(got.account.name, 'a0');
+  am.releaseAccount(got.account);
   const later = await ordinary;
-  assert.equal(later.name, 'a0', 'the ordinary waiter still gets the next slot');
-  am.releaseAccount(later);
+  assert.equal(later.account.name, 'a0', 'the ordinary waiter still gets the next slot');
+  am.releaseAccount(later.account);
+});
+
+test('holders cannot starve an ordinary waiter: it is overtaken at most maxHolderOvertakes times', async () => {
+  const am = fleet(1);
+  const holderKey = {};
+  let current = (await acquire(am, holderKey)).account;
+  const ordinary = acquire(am, {}, { timeoutMs: 5000 });
+  let ordinaryDone = null;
+  ordinary.then(r => { ordinaryDone = r; });
+  for (let round = 0; round < 4 && !ordinaryDone; round++) {
+    const holder = acquire(am, holderKey, { timeoutMs: 5000, holdMs: 5000 }); // a fresh holder every time
+    await sleep(2);
+    am.releaseAccount(current);
+    await sleep(2);
+    if (ordinaryDone) {
+      am.releaseAccount(ordinaryDone.account);
+      current = (await holder).account;
+      break;
+    }
+    current = (await holder).account;
+  }
+  assert.ok(ordinaryDone, 'the ordinary waiter got a slot');
+  assert.equal(ordinaryDone.account.name, 'a0');
+  am.releaseAccount(current);
 });
 
 test('no hold for an excluded (failover) acquire', async () => {
   const am = fleet(2);
   const key = {};
-  const first = await am.acquireAccount(null, 1000, null, key);
-  const retry = await am.acquireAccount(new Set([am.accounts[1]]), 0, null, key, null, null, null, 2000);
-  assert.equal(retry, null, 'a failover attempt never holds');
-  am.releaseAccount(first);
+  const first = await acquire(am, key);
+  const retry = await acquire(am, key, { timeoutMs: 0, holdMs: 2000, exclude: new Set([am.accounts[1]]) });
+  assert.equal(retry.account, null, 'a failover attempt never holds');
+  am.releaseAccount(first.account);
+});
+
+test('codex accounts take no part in warm memory', async () => {
+  const am = new AccountManager(makeAccounts(2, { provider: 'codex' }), 0.98, 0, 1);
+  measureAll(am);
+  const key = {};
+  const first = await acquire(am, key);
+  assert.deepEqual(am._warmList(key), [], 'nothing remembered for a codex account');
+  am.releaseAccount(first.account);
 });
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
-test('main conversation and subagents of one session get separate homes; route log hides ids', async () => {
-  const served = [];
+test('main conversation and subagents get separate keys; every request is route-logged without ids', async () => {
   const upstream = http.createServer((req, res) => {
-    served.push((req.headers['authorization'] || '').replace('Bearer ', ''));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"ok":true}');
   });
@@ -166,10 +235,11 @@ test('main conversation and subagents of one session get separate homes; route l
   const am = new AccountManager(makeAccounts(2), 0.98, 0, 3);
   measureAll(am);
   const proxy = createProxyServer(am, {
-    proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false,
+    proxy: { apiKey: `fixture-${randomUUID()}` }, upstream: `http://127.0.0.1:${upstreamPort}`, activeWarmup: false,
   });
   const port = await listen(proxy);
-  const sessionId = '259c09b3-071c-46f5-a4c3-2e069497c59f';
+  const sessionId = randomUUID();
+  const agentId = `agent-${randomUUID().slice(0, 8)}`;
   const lines = [];
   const orig = console.log;
   console.log = (...args) => { lines.push(args.join(' ')); };
@@ -178,21 +248,67 @@ test('main conversation and subagents of one session get separate homes; route l
   }).then(r => r.arrayBuffer());
   try {
     await call({ 'x-claude-code-session-id': sessionId });
-    const mainHome = served[0];
-    await call({ 'x-claude-code-session-id': sessionId, 'x-claude-code-agent-id': 'agent-1' });
+    await call({ 'x-claude-code-session-id': sessionId, 'x-claude-code-agent-id': agentId });
     await call({ 'x-claude-code-session-id': sessionId });
-    assert.equal(served[2], mainHome, 'main conversation keeps its home');
+    await call({});
   } finally {
     console.log = orig;
     upstream.close();
     proxy.close();
   }
   const routes = lines.filter(l => l.includes('[TeamClaude] Route '));
-  assert.equal(routes.length, 3);
+  assert.equal(routes.length, 4, 'one line per request, header-less included');
   assert.match(routes[0], /s=[0-9a-f]{8} g=main acct=#\d via=new held=\d+/);
   assert.match(routes[1], /g=[0-9a-f]{8} acct=#\d via=new/, 'the subagent is a separate key');
   assert.match(routes[2], /g=main acct=#\d via=home/);
+  assert.match(routes[3], /s=- g=- acct=#\d via=/);
+  const secrets = [sessionId, agentId, ...am.accounts.map(a => a.credential || a.accessToken)];
   for (const l of routes) {
-    assert.ok(!l.includes(sessionId) && !l.includes('agent-1') && !l.includes('tok-'), 'no raw ids or tokens');
+    for (const v of secrets) assert.ok(!l.includes(v), 'no raw ids or tokens in the route log');
+  }
+});
+
+test('a large session request reaches the hold through the proxy (256 KiB boundary)', async () => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  const served = [];
+  const upstream = http.createServer(async (req, res) => {
+    served.push(req.headers['authorization']);
+    if (served.length === 1) await gate; // keep the home's only slot busy
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"ok":true}');
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager(makeAccounts(2), 0.98, 0, 1);
+  measureAll(am);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: `fixture-${randomUUID()}` }, upstream: `http://127.0.0.1:${upstreamPort}`,
+    activeWarmup: false, affinityHoldMs: 3000,
+  });
+  const port = await listen(proxy);
+  const session = { 'content-type': 'application/json', 'x-claude-code-session-id': randomUUID() };
+  const big = JSON.stringify({ model: 'm', pad: 'x'.repeat(300 * 1024) });
+  const small = JSON.stringify({ model: 'side-model' }); // side calls use another model
+  const post = body => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: session, body })
+    .then(r => r.arrayBuffer());
+  try {
+    const first = post(big);
+    await sleep(50);
+    const smallReq = post(small); // small: spills to the other account at once
+    await smallReq;
+    assert.equal(served.length, 2);
+    assert.notEqual(served[1], served[0], 'a small request does not hold');
+    const bigReq = post(big);     // large: holds for the busy home
+    await sleep(100);
+    assert.equal(served.length, 2, 'the large request is waiting, not sent to a cold account');
+    release();
+    await first;
+    await bigReq;
+    assert.equal(served[2], served[0], 'the large request went to its home');
+  } finally {
+    release();
+    upstream.close();
+    proxy.close();
   }
 });

@@ -3098,12 +3098,16 @@ function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
  * the fact: hashed session / subagent ids, the account's index (never its
  * name or credentials), how it was chosen, and how long the acquire waited.
  */
-function logRoute(ctx, accountManager, account, waitedMs) {
+function logRoute(ctx, account, via, waitedMs) {
   const key = ctx.affinityKey;
-  if (!key || typeof key.sessionId !== 'string') return;
-  const [session, agent] = key.sessionId.split('\u0000');
-  const via = accountManager.routeVia(key) ?? 'none';
-  console.log(`[TeamClaude] Route s=${routeLabel(session)} g=${agent ? routeLabel(agent) : 'main'} acct=#${account.index} via=${via} held=${waitedMs}`);
+  let s = '-';
+  let g = '-';
+  if (key && typeof key.sessionId === 'string') {
+    const [session, agent] = key.sessionId.split('\u0000');
+    s = routeLabel(session);
+    g = agent ? routeLabel(agent) : 'main';
+  }
+  console.log(`[TeamClaude] Route s=${s} g=${g} acct=#${account.index} via=${via ?? 'none'} held=${waitedMs}`);
 }
 
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
@@ -3224,6 +3228,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const holdMs = ctx.affinityHoldMs || 0;
       ctx.affinityHoldMs = 0; // one hold per request, never on a retry
       const acquireStartedAt = Date.now();
+      const routeInfo = { via: null };
       account = await accountManager.acquireAccount(
         excludeForSelect,
         acquireTimeoutMs,
@@ -3233,10 +3238,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.preferredAccountUuid,
         creditScope(),
         holdMs,
+        routeInfo,
       );
       if (account) {
         ctx.held = account;
-        if (ctx.routeLog && ctx.provider === 'anthropic') logRoute(ctx, accountManager, account, Date.now() - acquireStartedAt);
+        if (ctx.routeLog && ctx.provider === 'anthropic') logRoute(ctx, account, routeInfo.via, Date.now() - acquireStartedAt);
       }
     }
 
