@@ -334,6 +334,90 @@ export class AccountManager {
     // no leak. The stored value is the account *object* (not its index, which
     // shifts on removeAccount); a stale entry is detected and ignored.
     this._affinity = new WeakMap();
+    // Recently used accounts per affinity key (most recent first, each with its
+    // last-use time). The prompt cache an account holds for a session survives
+    // about an hour, so when the home cannot take a request, an account this
+    // session used recently still has a cache-warm prefix — far cheaper than a
+    // cold account that must write the whole prompt again. 0 disables.
+    this._warm = new WeakMap();
+    this.affinityWarmAccounts = 4;
+    this.affinityWarmTtlMs = 55 * 60 * 1000;
+    // How the last acquire for an affinity key was routed (route log).
+    this._routeVia = new WeakMap();
+  }
+
+  /** How the most recent acquire for `affinityKey` was routed, or null. */
+  routeVia(affinityKey) {
+    if (affinityKey == null || (typeof affinityKey !== 'object' && typeof affinityKey !== 'function')) return null;
+    return this._routeVia.get(affinityKey) ?? null;
+  }
+
+  _setVia(affOk, affinityKey, via) {
+    if (affOk) this._routeVia.set(affinityKey, via);
+  }
+
+  /** Live warm accounts for a key, most recent first (expired / removed entries dropped). */
+  _warmList(affinityKey) {
+    const list = this._warm.get(affinityKey);
+    if (!list) return [];
+    const now = Date.now();
+    const live = list.filter(w => this.accounts[w.account.index] === w.account
+      && now - w.at < this.affinityWarmTtlMs);
+    if (live.length !== list.length) this._warm.set(affinityKey, live);
+    return live;
+  }
+
+  _noteWarm(affOk, affinityKey, account) {
+    if (!affOk || !(this.affinityWarmAccounts > 0)) return;
+    const list = this._warmList(affinityKey).filter(w => w.account !== account);
+    list.unshift({ account, at: Date.now() });
+    if (list.length > this.affinityWarmAccounts) list.length = this.affinityWarmAccounts;
+    this._warm.set(affinityKey, list);
+  }
+
+  /** Whether affinity (home / warm accounts) applies to this acquire at all. */
+  _affinityApplies(affOk, model, creditScope) {
+    return affOk && !this._isByokScope(creditScope)
+      && !this.accounts.some(acc => this._isWarmupTarget(acc, model));
+  }
+
+  /**
+   * A cache-warm account (home or recently used) that could serve this request
+   * except that it may be at its cap: the same gates the home path applies.
+   */
+  _warmCandidateOk(a, model, exclude, creditScope) {
+    return Boolean(a) && this.accounts[a.index] === a && (isApiKeyAccount(a) || this._isMeasured(a))
+      && this._isAvailable(a, model, { scope: creditScope })
+      && !(exclude && exclude.has(a)) && !this._isAvoided(a);
+  }
+
+  /** Home first, then the other warm accounts, most recent first. */
+  _warmCandidates(affinityKey) {
+    const home = this._affinity.get(affinityKey);
+    const out = home ? [home] : [];
+    for (const w of this._warmList(affinityKey)) if (w.account !== home) out.push(w.account);
+    return out;
+  }
+
+  /**
+   * The cache-warm account worth briefly waiting for: usable but at its cap,
+   * with fewer holders queued for it than its cap (a chronically overloaded
+   * account spills instead of only adding latency). null when none, or when a
+   * warm account has a free slot right now (no reason to wait).
+   */
+  _holdTarget(affinityKey, model, exclude, creditScope) {
+    const affOk = affinityKey != null
+      && (typeof affinityKey === 'object' || typeof affinityKey === 'function');
+    if (!this._affinityApplies(affOk, model, creditScope)) return null;
+    let target = null;
+    for (const a of this._warmCandidates(affinityKey)) {
+      if (!this._warmCandidateOk(a, model, exclude, creditScope)) continue;
+      if (this._hasCapacity(a)) return null;
+      if (target) continue;
+      const holders = this._waiters.filter(w => w.hold && w.holdFor === a).length;
+      if (holders < a.maxConcurrent) target = a;
+    }
+    return target;
   }
 
   /**
@@ -565,6 +649,7 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
+    warmOnly = false,
   ) {
     // Only an object/function is a valid WeakMap key. Ignore anything else (a
     // primitive key from an external caller would otherwise throw on get/set).
@@ -581,6 +666,8 @@ export class AccountManager {
       }
       preferred.inflight++;
       if (affOk) this._affinity.set(affinityKey, preferred);
+      this._noteWarm(affOk, affinityKey, preferred);
+      this._setVia(affOk, affinityKey, 'preferred');
       return preferred;
     }
 
@@ -596,8 +683,8 @@ export class AccountManager {
     // a stale entry left by a removeAccount that re-indexed the array.)
     // A /byok request skips the hint: its lane prefers API-key credit over
     // whatever subscription account the connection last used.
-    if (affOk && !this._isByokScope(creditScope)
-        && !this.accounts.some(acc => this._isWarmupTarget(acc, model))) {
+    const affinityOn = this._affinityApplies(affOk, model, creditScope);
+    if (affinityOn) {
       const a = this._affinity.get(affinityKey);
       // Require the home to be MEASURED — not just past its warm-up tries. A
       // headerless account stays unmeasured forever; pinning a connection to it
@@ -611,9 +698,29 @@ export class AccountManager {
           && this._isAvailable(a, model, { scope: creditScope })
           && this._hasCapacity(a) && !(exclude && exclude.has(a)) && !this._isAvoided(a)) {
         a.inflight++;
+        this._noteWarm(affOk, affinityKey, a);
+        this._setVia(affOk, affinityKey, 'home');
         return a;
       }
+      // The home cannot take this request right now. Before a cold pick, try
+      // the other accounts this key used recently: their cache still holds a
+      // prefix of this conversation, so only the tail is written again.
+      for (const w of this._warmList(affinityKey)) {
+        const cand = w.account;
+        if (cand === a || !this._warmCandidateOk(cand, model, exclude, creditScope)
+            || !this._hasCapacity(cand)) continue;
+        cand.inflight++;
+        const homeUsable = a && this.accounts[a.index] === a
+          && this._isAvailable(a, model) && !this._isAvoided(a)
+          && !(this._isCreditBacked(a, model) && !this._isCreditBacked(cand, model));
+        if (!homeUsable) this._affinity.set(affinityKey, cand);
+        this._noteWarm(affOk, affinityKey, cand);
+        this._setVia(affOk, affinityKey, 'warm');
+        return cand;
+      }
     }
+    // Holding for a cache-warm slot: never take a cold account.
+    if (warmOnly) return null;
 
     const capped = this._cappedSet(exclude, model, creditScope);
     const pick = extra => {
@@ -653,7 +760,9 @@ export class AccountManager {
           && this._isAvailable(home, model) && !this._isAvoided(home)
           && !(this._isCreditBacked(home, model) && !this._isCreditBacked(account, model));
         if (!homeUsable) this._affinity.set(affinityKey, account);
+        this._setVia(affOk, affinityKey, !home ? 'new' : (homeUsable ? 'spill' : 'rehome'));
       }
+      this._noteWarm(affOk, affinityKey, account);
       return account;
     }
     // Nothing normally usable. If no available account is merely at its cap
@@ -668,6 +777,8 @@ export class AccountManager {
           const homeUsable = home && this.accounts[home.index] === home && this._isAvailable(home, model);
           if (!homeUsable) this._affinity.set(affinityKey, grace);
         }
+        this._noteWarm(affOk, affinityKey, grace);
+        this._setVia(affOk, affinityKey, 'grace');
         console.log(`[TeamClaude] Account "${grace.name}" hit its 5-hour limit — forwarding under usage-limit grace`);
         return grace;
       }
@@ -839,8 +950,21 @@ export class AccountManager {
     model = null,
     preferredAccountUuid = null,
     creditScope = exclude,
+    holdMs = 0,
   ) {
     if (signal?.aborted) return null;
+    // Cache hold: when this key's home (or a recently used account) is merely at
+    // its cap, wait briefly for ITS slot instead of spilling to a cold account
+    // that would rewrite the whole prompt cache. Only on a fresh acquire (no
+    // failover exclusions, no recovery pin); after `holdMs` the request takes
+    // the normal path below (including the ordinary overflow queue).
+    if (holdMs > 0 && preferredAccountUuid == null && !(exclude && exclude.size > 0)
+        && !this.isQueueFull()) {
+      const target = this._holdTarget(affinityKey, model, exclude, creditScope);
+      if (target) {
+        return this._enqueueHold(target, exclude, timeoutMs, signal, affinityKey, model, creditScope, holdMs);
+      }
+    }
     const account = this._tryAcquire(
       exclude,
       affinityKey,
@@ -930,6 +1054,56 @@ export class AccountManager {
     });
   }
 
+  /**
+   * Queue a request that holds for a cache-warm account's slot. While holding
+   * it only takes a home / recently used account (drained before ordinary
+   * waiters). When the hold ends it tries the normal path once; if nothing is
+   * acquirable it either keeps waiting as an ordinary waiter (for `timeoutMs`)
+   * or resolves null — exactly what an immediate acquire would have done.
+   */
+  _enqueueHold(target, exclude, timeoutMs, signal, affinityKey, model, creditScope, holdMs) {
+    return new Promise(resolve => {
+      const waiter = {
+        exclude,
+        creditScope,
+        resolve,
+        done: false,
+        timer: null,
+        signal,
+        onAbort: null,
+        affinityKey,
+        model,
+        preferredAccountUuid: null,
+        hold: true,
+        holdFor: target,
+        timeoutMs,
+      };
+      waiter.timer = setTimeout(() => this._endHold(waiter, timeoutMs), holdMs);
+      if (signal) {
+        waiter.onAbort = () => this._settleWaiter(waiter, null);
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      this._waiters.push(waiter);
+    });
+  }
+
+  _endHold(waiter, timeoutMs) {
+    if (waiter.done || !waiter.hold) return;
+    waiter.hold = false;
+    clearTimeout(waiter.timer);
+    const account = this._tryAcquire(
+      waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope);
+    if (account) {
+      if (!this._settleWaiter(waiter, account)) account.inflight--;
+      return;
+    }
+    if (timeoutMs <= 0 || !this.anyCapped(waiter.exclude, waiter.model, waiter.creditScope)) {
+      this._settleWaiter(waiter, null);
+      return;
+    }
+    waiter.timer = setTimeout(() => this._settleWaiter(waiter, null), timeoutMs);
+  }
+
   /** Resolve a queued waiter exactly once, cleaning up its timer/abort listener. */
   _settleWaiter(waiter, value) {
     if (waiter.done) return false;
@@ -959,8 +1133,30 @@ export class AccountManager {
   }
 
   _drainWaiters() {
+    // Holders first: a freed slot on a cache-warm account goes to a request
+    // whose cache lives there before an ordinary waiter can take it.
     for (let i = 0; i < this._waiters.length;) {
       const waiter = this._waiters[i];
+      if (!waiter.hold) { i++; continue; }
+      const account = this._tryAcquire(
+        waiter.exclude, waiter.affinityKey, waiter.model, null, waiter.creditScope, true);
+      if (account) {
+        if (!this._settleWaiter(waiter, account)) { account.inflight--; i++; }
+        continue;
+      }
+      // The warm accounts went away (exhausted, disabled, removed): stop holding
+      // now rather than wait out the hold for nothing.
+      if (!this._warmCandidates(waiter.affinityKey)
+        .some(a => this._warmCandidateOk(a, waiter.model, waiter.exclude, waiter.creditScope))) {
+        const before = this._waiters.length;
+        this._endHold(waiter, waiter.timeoutMs ?? 0);
+        if (this._waiters.length < before) continue;
+      }
+      i++;
+    }
+    for (let i = 0; i < this._waiters.length;) {
+      const waiter = this._waiters[i];
+      if (waiter.hold) { i++; continue; }
       const account = this._tryAcquire(
         waiter.exclude,
         waiter.affinityKey,

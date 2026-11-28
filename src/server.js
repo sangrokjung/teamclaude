@@ -3,7 +3,7 @@ import https from 'node:https';
 import { mkdir, open, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import {
   brotliDecompressSync,
@@ -722,8 +722,16 @@ function splitSseEvents(pending, bytes) {
 }
 
 const SESSION_ID_HEADER = 'x-claude-code-session-id';
+const AGENT_ID_HEADER = 'x-claude-code-agent-id';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const DEFAULT_SESSION_AFFINITY_MAX_KEYS = 10_000;
+const DEFAULT_AFFINITY_HOLD_MS = 10_000;
+const DEFAULT_AFFINITY_HOLD_MIN_BYTES = 256 * 1024;
+
+/** Short, non-reversible label for an id in the route log (never the id itself). */
+function routeLabel(value) {
+  return createHash('sha256').update(String(value)).digest('hex').slice(0, 8);
+}
 
 /**
  * Stable affinity key objects per Claude Code session id. The account manager
@@ -798,13 +806,27 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   // Claude Code sends its session id on every request, so a session keeps its
   // account even after the keep-alive socket closes between turns.
   const sessionAffinityKeys = createSessionAffinityKeys();
+  // The key is session id + subagent id: a session's main conversation and
+  // each of its subagents are separate prompts with separate caches, so they
+  // need separate homes (sharing one home made a few parallel subagents fill
+  // the main conversation's account and push it to a cold one).
   const affinityKeyFor = req => {
     if (!sessionAffinity) return null;
     const sessionId = req.headers[SESSION_ID_HEADER];
-    return typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId)
-      ? sessionAffinityKeys.keyFor(sessionId)
-      : req.socket;
+    if (!(typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId))) return req.socket;
+    const agentId = req.headers[AGENT_ID_HEADER];
+    const agent = typeof agentId === 'string' && SESSION_ID_PATTERN.test(agentId) ? agentId : '';
+    return sessionAffinityKeys.keyFor(agent ? `${sessionId}\u0000${agent}` : sessionId);
   };
+  // Cache hold (see AccountManager.acquireAccount): how long a large request
+  // waits for its cache-warm account's slot before spilling to a cold one.
+  const affinityHoldMs = Number.isFinite(config.affinityHoldMs)
+    ? Math.max(0, config.affinityHoldMs)
+    : DEFAULT_AFFINITY_HOLD_MS;
+  const affinityHoldMinBytes = Number.isFinite(config.affinityHoldMinBytes)
+    ? Math.max(0, config.affinityHoldMinBytes)
+    : DEFAULT_AFFINITY_HOLD_MIN_BYTES;
+  const routeLog = config.routeLog !== false;
   // After an upstream failure is passed through unreplayed, steer the client's
   // own retry to a different account for this long (0 disables). See
   // AccountManager.noteUpstreamFailure.
@@ -2252,6 +2274,16 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           const requestModel = extractRequestModel(body);
           ctx.model = requestModel.model;
           ctx.advisorToolIndex = requestModel.advisorToolIndex;
+          // Cache hold applies to the first acquire of a large Claude Code
+          // message request with a session-keyed home (never a socket key,
+          // /byok, or the Codex backend).
+          ctx.routeLog = routeLog;
+          ctx.affinityHoldMs = provider === 'anthropic' && affinityHoldMs > 0 && ctx.byok !== true
+            && ctx.affinityKey != null && ctx.affinityKey !== req.socket
+            && req.method === 'POST' && req.url.split('?')[0] === '/v1/messages'
+            && body.length >= affinityHoldMinBytes
+            ? affinityHoldMs
+            : 0;
 
           // Session reserve: keep the fleet's last 5-hour slice for work in
           // progress — a new user turn waits for the reset, a tool-loop
@@ -3061,6 +3093,19 @@ function codexRecoveryResponseHeaders(req, body, ctx, method, headers = {}) {
   return headers;
 }
 
+/**
+ * One line per acquired attempt so cache-affinity routing can be checked after
+ * the fact: hashed session / subagent ids, the account's index (never its
+ * name or credentials), how it was chosen, and how long the acquire waited.
+ */
+function logRoute(ctx, accountManager, account, waitedMs) {
+  const key = ctx.affinityKey;
+  if (!key || typeof key.sessionId !== 'string') return;
+  const [session, agent] = key.sessionId.split('\u0000');
+  const via = accountManager.routeVia(key) ?? 'none';
+  console.log(`[TeamClaude] Route s=${routeLabel(session)} g=${agent ? routeLabel(agent) : 'main'} acct=#${account.index} via=${via} held=${waitedMs}`);
+}
+
 async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
   const maxRetries = accountManager.accounts.length;
   // Fresh retry cycle = retryCount 0: the initial dispatch or ANY restart that
@@ -3176,6 +3221,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
           && !selectionHasUsable && selectionHasCapped) {
         acquireTimeoutMs = Math.max(0, startContinuityDeadline(ctx) - Date.now());
       }
+      const holdMs = ctx.affinityHoldMs || 0;
+      ctx.affinityHoldMs = 0; // one hold per request, never on a retry
+      const acquireStartedAt = Date.now();
       account = await accountManager.acquireAccount(
         excludeForSelect,
         acquireTimeoutMs,
@@ -3184,9 +3232,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         ctx.model,
         ctx.preferredAccountUuid,
         creditScope(),
+        holdMs,
       );
       if (account) {
         ctx.held = account;
+        if (ctx.routeLog && ctx.provider === 'anthropic') logRoute(ctx, accountManager, account, Date.now() - acquireStartedAt);
       }
     }
 

@@ -1596,6 +1596,9 @@ async function proxyWorkerCommand() {
     : 256;
   const accountManager = new AccountManager(accounts, threshold, reevalIntervalMs, maxConcurrentDefault, overflowQueueMaxDepth, config.quotaReserve);
   accountManager.usageLimitGrace = config.usageLimitGrace !== false;
+  if (Number.isFinite(config.affinityWarmAccounts)) {
+    accountManager.affinityWarmAccounts = Math.max(0, Math.floor(config.affinityWarmAccounts));
+  }
 
   // Restore the last run's quota snapshot so a restart doesn't blank the
   // dashboard (quota otherwise lives only in memory and is re-learned from
